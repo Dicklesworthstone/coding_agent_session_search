@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Frankensqlite parameter list builder.
 macro_rules! fparams {
@@ -293,9 +293,10 @@ pub(crate) fn open_current_schema_storage_with_timeout(
         return Ok(None);
     }
 
-    let mut storage = FrankenStorage {
-        conn: open_franken_raw_connection_with_timeout(path, timeout)?,
-    };
+    let mut storage = FrankenStorage::new(
+        open_franken_raw_connection_with_timeout(path, timeout)?,
+        path.to_path_buf(),
+    );
     storage.apply_open_stage_busy_timeout();
 
     let version = storage
@@ -597,7 +598,7 @@ impl FrankenConnectionManager {
                 )));
             }
         };
-        let storage = FrankenStorage { conn };
+        let storage = FrankenStorage::new(conn, self.db_path.clone());
         if let Err(e) = storage.apply_config() {
             let _ = self.writer_tokens.0.send(());
             return Err(e);
@@ -629,7 +630,7 @@ impl FrankenConnectionManager {
                 )));
             }
         };
-        let storage = FrankenStorage { conn };
+        let storage = FrankenStorage::new(conn, self.db_path.clone());
         if let Err(e) = storage.apply_config() {
             let _ = self.writer_tokens.0.send(());
             return Err(e);
@@ -2810,6 +2811,8 @@ pub type SqliteStorage = FrankenStorage;
 /// Primary frankensqlite-backed storage backend.
 pub struct FrankenStorage {
     conn: FrankenConnection,
+    db_path: PathBuf,
+    ephemeral_writer_preflight_verified: AtomicBool,
 }
 
 const AUTOCOMMIT_RETAIN_OFF_PRAGMAS: [&str; 2] = [
@@ -2850,6 +2853,14 @@ where
 }
 
 impl FrankenStorage {
+    fn new(conn: FrankenConnection, db_path: PathBuf) -> Self {
+        Self {
+            conn,
+            db_path,
+            ephemeral_writer_preflight_verified: AtomicBool::new(false),
+        }
+    }
+
     fn apply_open_stage_busy_timeout(&self) {
         if let Err(err) = self.conn.execute("PRAGMA busy_timeout = 5000;") {
             tracing::debug!(
@@ -2873,7 +2884,7 @@ impl FrankenStorage {
         let path_str = path.to_string_lossy().to_string();
         let conn = FrankenConnection::open(&path_str)
             .with_context(|| format!("opening frankensqlite db at {}", path.display()))?;
-        let storage = Self { conn };
+        let storage = Self::new(conn, path.to_path_buf());
         storage.apply_open_stage_busy_timeout();
         storage.run_migrations()?;
         storage.repair_missing_current_schema_objects()?;
@@ -2890,7 +2901,7 @@ impl FrankenStorage {
         let path_str = path.to_string_lossy().to_string();
         let conn = FrankenConnection::open(&path_str)
             .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
-        let storage = Self { conn };
+        let storage = Self::new(conn, path.to_path_buf());
         storage.apply_config()?;
         Ok(storage)
     }
@@ -2900,7 +2911,7 @@ impl FrankenStorage {
         let path_str = path.to_string_lossy().to_string();
         let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening frankensqlite db readonly at {}", path.display()))?;
-        let storage = Self { conn };
+        let storage = Self::new(conn, path.to_path_buf());
         storage.apply_readonly_config()?;
         Ok(storage)
     }
@@ -3149,16 +3160,17 @@ impl FrankenStorage {
 
     /// Resolve the database file path for this connection.
     pub fn database_path(&self) -> Result<PathBuf> {
-        let rows = self.conn.query("PRAGMA database_list;")?;
-        for row in &rows {
-            if let Ok(name) = row.get_typed::<String>(1)
-                && name == "main"
-            {
-                let file_path: String = row.get_typed(2)?;
-                return Ok(PathBuf::from(file_path));
-            }
-        }
-        Err(anyhow!("could not resolve database file path"))
+        Ok(self.db_path.clone())
+    }
+
+    pub(crate) fn ephemeral_writer_preflight_verified(&self) -> bool {
+        self.ephemeral_writer_preflight_verified
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_ephemeral_writer_preflight_verified(&self) {
+        self.ephemeral_writer_preflight_verified
+            .store(true, Ordering::Relaxed);
     }
 
     /// Open database with migration, backing up if schema is incompatible.
@@ -4281,58 +4293,32 @@ impl FrankenStorage {
     pub fn ensure_agent(&self, agent: &Agent) -> Result<i64> {
         let now = Self::now_millis();
         let kind = agent_kind_str(agent.kind.clone());
-        let updated = self.conn.execute_compat(
-            "UPDATE agents
-             SET name = ?2, version = ?3, kind = ?4, updated_at = ?5
-             WHERE slug = ?1",
+        self.conn.execute_compat(
+            "INSERT INTO agents(slug, name, version, kind, created_at, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(slug) DO UPDATE SET
+                 name = excluded.name,
+                 version = excluded.version,
+                 kind = excluded.kind,
+                 updated_at = excluded.updated_at
+             WHERE NOT (
+                 agents.name IS excluded.name
+                 AND agents.version IS excluded.version
+                 AND agents.kind IS excluded.kind
+             )",
             fparams![
                 agent.slug.as_str(),
                 agent.name.as_str(),
                 agent.version.as_deref(),
                 kind.as_str(),
+                now,
                 now
             ],
         )?;
-        if updated == 0 {
-            let insert_result = self.conn.execute_compat(
-                "INSERT INTO agents(slug, name, version, kind, created_at, updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6)",
-                fparams![
-                    agent.slug.as_str(),
-                    agent.name.as_str(),
-                    agent.version.as_deref(),
-                    kind.as_str(),
-                    now,
-                    now
-                ],
-            );
-            if let Err(err) = insert_result {
-                if !matches!(err, frankensqlite::FrankenError::UniqueViolation { .. }) {
-                    return Err(err.into());
-                }
-                self.conn.execute_compat(
-                    "UPDATE agents
-                     SET name = ?2, version = ?3, kind = ?4, updated_at = ?5
-                     WHERE slug = ?1",
-                    fparams![
-                        agent.slug.as_str(),
-                        agent.name.as_str(),
-                        agent.version.as_deref(),
-                        kind.as_str(),
-                        now
-                    ],
-                )?;
-            } else {
-                let inserted_id = self.conn.last_insert_rowid();
-                if inserted_id > 0 {
-                    return Ok(inserted_id);
-                }
-            }
-        }
 
         self.conn
             .query_row_map(
-                "SELECT id FROM agents NOT INDEXED WHERE slug = ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT id FROM agents WHERE slug = ?1 LIMIT 1",
                 fparams![agent.slug.as_str()],
                 |row| row.get_typed(0),
             )
@@ -4342,38 +4328,25 @@ impl FrankenStorage {
     /// Ensure a workspace exists in the database, returning its ID.
     pub fn ensure_workspace(&self, path: &Path, display_name: Option<&str>) -> Result<i64> {
         let path_str = path.to_string_lossy().to_string();
-        let updated = self.conn.execute_compat(
-            "UPDATE workspaces
-             SET display_name = COALESCE(?2, display_name)
-             WHERE path = ?1",
-            fparams![path_str.as_str(), display_name],
-        )?;
-        if updated == 0 {
-            let insert_result = self.conn.execute_compat(
-                "INSERT INTO workspaces(path, display_name) VALUES(?1,?2)",
+        if let Some(display_name) = display_name {
+            self.conn.execute_compat(
+                "INSERT INTO workspaces(path, display_name)
+                 VALUES(?1, ?2)
+                 ON CONFLICT(path) DO UPDATE SET
+                     display_name = excluded.display_name
+                 WHERE NOT (workspaces.display_name IS excluded.display_name)",
                 fparams![path_str.as_str(), display_name],
-            );
-            if let Err(err) = insert_result {
-                if !matches!(err, frankensqlite::FrankenError::UniqueViolation { .. }) {
-                    return Err(err.into());
-                }
-                self.conn.execute_compat(
-                    "UPDATE workspaces
-                     SET display_name = COALESCE(?2, display_name)
-                     WHERE path = ?1",
-                    fparams![path_str.as_str(), display_name],
-                )?;
-            } else {
-                let inserted_id = self.conn.last_insert_rowid();
-                if inserted_id > 0 {
-                    return Ok(inserted_id);
-                }
-            }
+            )?;
+        } else {
+            self.conn.execute_compat(
+                "INSERT OR IGNORE INTO workspaces(path, display_name) VALUES(?1, NULL)",
+                fparams![path_str.as_str()],
+            )?;
         }
 
         self.conn
             .query_row_map(
-                "SELECT id FROM workspaces NOT INDEXED WHERE path = ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT id FROM workspaces WHERE path = ?1 LIMIT 1",
                 fparams![path_str.as_str()],
                 |row| row.get_typed(0),
             )
@@ -5326,15 +5299,26 @@ impl FrankenStorage {
             .map(serde_json::to_string)
             .transpose()?;
 
-        let updated = self.conn.execute_compat(
-            "UPDATE sources
-             SET kind = ?2,
-                 host_label = ?3,
-                 machine_id = ?4,
-                 platform = ?5,
-                 config_json = ?6,
-                 updated_at = ?7
-             WHERE id = ?1",
+        // Re-indexing commonly reuses the same normalized source metadata
+        // across many conversations. Skip the write entirely when the row is
+        // already identical so we avoid needless WAL churn and timestamp bumps.
+        self.conn.execute_compat(
+            "INSERT INTO sources(id, kind, host_label, machine_id, platform, config_json, created_at, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                 kind = excluded.kind,
+                 host_label = excluded.host_label,
+                 machine_id = excluded.machine_id,
+                 platform = excluded.platform,
+                 config_json = excluded.config_json,
+                 updated_at = excluded.updated_at
+             WHERE NOT (
+                 sources.kind IS excluded.kind
+                 AND sources.host_label IS excluded.host_label
+                 AND sources.machine_id IS excluded.machine_id
+                 AND sources.platform IS excluded.platform
+                 AND sources.config_json IS excluded.config_json
+             )",
             fparams![
                 source.id.as_str(),
                 kind_str.as_str(),
@@ -5342,49 +5326,10 @@ impl FrankenStorage {
                 source.machine_id.as_deref(),
                 source.platform.as_deref(),
                 config_json_str.as_deref(),
+                source.created_at.unwrap_or(now),
                 now
             ],
         )?;
-        if updated == 0 {
-            let insert_result = self.conn.execute_compat(
-                "INSERT INTO sources(id, kind, host_label, machine_id, platform, config_json, created_at, updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                fparams![
-                    source.id.as_str(),
-                    kind_str.as_str(),
-                    source.host_label.as_deref(),
-                    source.machine_id.as_deref(),
-                    source.platform.as_deref(),
-                    config_json_str.as_deref(),
-                    source.created_at.unwrap_or(now),
-                    now
-                ],
-            );
-            if let Err(err) = insert_result {
-                if !matches!(err, frankensqlite::FrankenError::UniqueViolation { .. }) {
-                    return Err(err.into());
-                }
-                self.conn.execute_compat(
-                    "UPDATE sources
-                     SET kind = ?2,
-                         host_label = ?3,
-                         machine_id = ?4,
-                         platform = ?5,
-                         config_json = ?6,
-                         updated_at = ?7
-                     WHERE id = ?1",
-                    fparams![
-                        source.id.as_str(),
-                        kind_str.as_str(),
-                        source.host_label.as_deref(),
-                        source.machine_id.as_deref(),
-                        source.platform.as_deref(),
-                        config_json_str.as_deref(),
-                        now
-                    ],
-                )?;
-            }
-        }
         Ok(())
     }
 
@@ -17114,6 +17059,44 @@ mod tests {
     }
 
     #[test]
+    fn ensure_agent_unchanged_preserves_updated_at() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("1.0".into()),
+            kind: AgentKind::Cli,
+        };
+
+        storage.ensure_agent(&agent).unwrap();
+        let initial_updated_at: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT updated_at FROM agents WHERE slug = ?1",
+                fparams![agent.slug.as_str()],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        storage.ensure_agent(&agent).unwrap();
+        let fetched_updated_at: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT updated_at FROM agents WHERE slug = ?1",
+                fparams![agent.slug.as_str()],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        assert_eq!(fetched_updated_at, initial_updated_at);
+    }
+
+    #[test]
     fn list_agents_returns_inserted() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
@@ -17238,6 +17221,37 @@ mod tests {
         let fetched = storage.get_source("my-source").unwrap().unwrap();
         assert_eq!(fetched.host_label, Some("Updated Label".into()));
         assert!(fetched.platform.is_some());
+    }
+
+    #[test]
+    fn upsert_source_unchanged_preserves_updated_at() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let source = Source {
+            id: "stable-source".into(),
+            kind: SourceKind::Ssh,
+            host_label: Some("builder.local".into()),
+            machine_id: None,
+            platform: Some("linux".into()),
+            config_json: Some(serde_json::json!({"role": "bench"})),
+            created_at: None,
+            updated_at: None,
+        };
+
+        storage.upsert_source(&source).unwrap();
+        let initial = storage.get_source("stable-source").unwrap().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        storage.upsert_source(&source).unwrap();
+        let fetched = storage.get_source("stable-source").unwrap().unwrap();
+
+        assert_eq!(fetched.created_at, initial.created_at);
+        assert_eq!(fetched.updated_at, initial.updated_at);
+        assert_eq!(fetched.host_label, initial.host_label);
+        assert_eq!(fetched.platform, initial.platform);
+        assert_eq!(fetched.config_json, initial.config_json);
     }
 
     #[test]
@@ -18213,7 +18227,7 @@ mod tests {
     /// file-based pagers).
     fn franken_storage_in_memory() -> FrankenStorage {
         let conn = FrankenConnection::open(":memory:").unwrap();
-        let storage = FrankenStorage { conn };
+        let storage = FrankenStorage::new(conn, PathBuf::from(":memory:"));
         storage.run_migrations().unwrap();
         storage.apply_config().unwrap();
         storage

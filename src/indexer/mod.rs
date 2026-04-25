@@ -15436,7 +15436,8 @@ pub mod persist {
     use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
     use crate::search::tantivy::TantivyIndex;
-    use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
+    #[cfg(test)]
+    use crate::sources::provenance::{Source, SourceKind};
     use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome};
 
     /// `coding_agent_session_search-5b9p0` (ibuuh.32 follow-up):
@@ -15751,20 +15752,25 @@ pub mod persist {
             )
         })?;
 
-        // CASS #162 item 2: Preflight write check to catch "attempt to write
-        // a readonly database" early with a clear diagnostic instead of letting
-        // it surface deep inside a batched insert.  The PRAGMA integrity_check
-        // is read-only, so we use a benign idempotent meta-table write instead.
-        if let Err(err) = writer
-            .raw()
-            .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
-        {
-            anyhow::bail!(
-                "ephemeral writer preflight write failed for {context} at {}: {err}. \
-                 The database may be locked by another process or opened in \
-                 readonly mode. Try closing other cass instances and retrying.",
-                db_path.display()
-            );
+        if !storage.ephemeral_writer_preflight_verified() {
+            // CASS #162 item 2: Preflight write check to catch "attempt to write
+            // a readonly database" early with a clear diagnostic instead of letting
+            // it surface deep inside a batched insert. Once one writer open has
+            // succeeded on this storage handle, repeating the same idempotent
+            // meta-table write on every steady-state persist just adds fixed
+            // overhead without improving correctness.
+            if let Err(err) = writer
+                .raw()
+                .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
+            {
+                anyhow::bail!(
+                    "ephemeral writer preflight write failed for {context} at {}: {err}. \
+                     The database may be locked by another process or opened in \
+                     readonly mode. Try closing other cass instances and retrying.",
+                    db_path.display()
+                );
+            }
+            storage.mark_ephemeral_writer_preflight_verified();
         }
 
         apply_index_writer_busy_timeout(&writer);
@@ -15892,11 +15898,9 @@ pub mod persist {
 
             // Wrap the entire ensure_agent + ensure_workspace +
             // insert_conversation_tree sequence in the retry loop, since
-            // ensure_agent/workspace also write and can hit page conflicts.
+            // those writes can all hit page conflicts under begin-concurrent.
             let agent_slug = conv.agent_slug.clone();
             let workspace = conv.workspace.clone();
-
-            ensure_embedded_source_registered(franken, &conv.metadata, "begin-concurrent chunk")?;
 
             match with_concurrent_retry(max_retries, || {
                 let agent_id = if let Some(id) = agent_cache.get(&agent_slug) {
@@ -16272,35 +16276,6 @@ pub mod persist {
         (source_id, origin_host)
     }
 
-    fn ensure_embedded_source_registered(
-        writer: &FrankenStorage,
-        metadata: &serde_json::Value,
-        context: &str,
-    ) -> Result<()> {
-        let (source_id, origin_host) = extract_provenance(metadata);
-        if source_id == LOCAL_SOURCE_ID {
-            return Ok(());
-        }
-
-        let placeholder = Source {
-            id: source_id,
-            kind: SourceKind::Ssh,
-            host_label: origin_host,
-            machine_id: None,
-            platform: None,
-            config_json: None,
-            created_at: None,
-            updated_at: None,
-        };
-        writer.upsert_source(&placeholder).with_context(|| {
-            format!(
-                "auto-registering embedded provenance source {} for {context}",
-                placeholder.id
-            )
-        })?;
-        Ok(())
-    }
-
     /// Convert a NormalizedConversation to the internal Conversation type for SQLite storage.
     ///
     /// Extracts provenance from `metadata.cass.origin` if present, otherwise defaults to local.
@@ -16390,18 +16365,23 @@ pub mod persist {
         conv: &NormalizedConversation,
     ) -> Result<()> {
         tracing::info!(agent = %conv.agent_slug, messages = conv.messages.len(), "persist_conversation");
+        // Keep the single-conversation path aligned with the batched ingest path:
+        // map_to_internal is pure, allocator-heavy work, so do it before opening
+        // the short-lived writer instead of burning writer-held time on clones
+        // and optional redaction.
+        let internal_conv = map_to_internal(conv);
+        let agent = Agent {
+            id: None,
+            slug: conv.agent_slug.clone(),
+            name: conv.agent_slug.clone(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
         let InsertOutcome {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
         } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
-            let agent = Agent {
-                id: None,
-                slug: conv.agent_slug.clone(),
-                name: conv.agent_slug.clone(),
-                version: None,
-                kind: AgentKind::Cli,
-            };
             let agent_id = writer.ensure_agent(&agent)?;
 
             let workspace_id = if let Some(ws) = &conv.workspace {
@@ -16410,8 +16390,6 @@ pub mod persist {
                 None
             };
 
-            ensure_embedded_source_registered(writer, &conv.metadata, "persist_conversation")?;
-            let internal_conv = map_to_internal(conv);
             writer.insert_conversation_tree(agent_id, workspace_id, &internal_conv)
         })?;
 
@@ -16570,11 +16548,6 @@ pub mod persist {
                         None
                     };
 
-                    ensure_embedded_source_registered(
-                        writer,
-                        &conv.metadata,
-                        "serial batched indexing",
-                    )?;
                     prepared.push((agent_id, workspace_id, internal_conv));
                 }
 
@@ -16989,6 +16962,25 @@ pub mod persist {
             let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1000));
+        }
+
+        #[test]
+        fn with_ephemeral_writer_marks_preflight_verified_after_first_success() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("preflight-cache.db");
+            let storage = create_franken_db(&db_path);
+
+            assert!(!storage.ephemeral_writer_preflight_verified());
+
+            with_ephemeral_writer(&storage, false, "preflight-cache-test", |_writer| Ok(()))
+                .unwrap();
+
+            assert!(storage.ephemeral_writer_preflight_verified());
+
+            with_ephemeral_writer(&storage, false, "preflight-cache-test", |_writer| Ok(()))
+                .unwrap();
+
+            assert!(storage.ephemeral_writer_preflight_verified());
         }
 
         #[test]

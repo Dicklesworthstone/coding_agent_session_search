@@ -71,6 +71,20 @@ fn generate_conversation(conv_id: i64, msg_count: i64) -> NormalizedConversation
     }
 }
 
+fn generate_remote_conversation(conv_id: i64, msg_count: i64) -> NormalizedConversation {
+    let mut conv = generate_conversation(conv_id, msg_count);
+    conv.metadata = serde_json::json!({
+        "bench": true,
+        "cass": {
+            "origin": {
+                "source_id": "bench-remote-source",
+                "host": "bench-remote-host"
+            }
+        }
+    });
+    conv
+}
+
 fn make_conversation(conv_id: i64, msg_count: i64) -> Conversation {
     let base_ts = 1_700_000_000_000 + conv_id * 100_000;
     let messages: Vec<Message> = (0..msg_count)
@@ -112,6 +126,13 @@ fn make_conversation(conv_id: i64, msg_count: i64) -> Conversation {
         source_id: "local".into(),
         origin_host: None,
     }
+}
+
+fn make_remote_conversation(conv_id: i64, msg_count: i64) -> Conversation {
+    let mut conv = make_conversation(conv_id, msg_count);
+    conv.source_id = "bench-remote-source".into();
+    conv.origin_host = Some("bench-remote-host".into());
+    conv
 }
 
 fn make_agent(id: i64) -> Agent {
@@ -273,6 +294,81 @@ fn bench_insert_comparison(c: &mut Criterion) {
                     let agent_id = agent_ids[(conv_id % 10) as usize];
                     let ws_id = ws_ids[(conv_id % 20) as usize];
                     let conv = make_conversation(conv_id, msg_count);
+                    black_box(
+                        fs.insert_conversation_tree(agent_id, Some(ws_id), &conv)
+                            .unwrap(),
+                    );
+                    conv_id += 1;
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_insert_remote_source_reuse(c: &mut Criterion) {
+    let mut group = c.benchmark_group("insert_remote_source_reuse");
+    group.sample_size(20);
+
+    for &msg_count in &[5i64, 20, 50] {
+        group.throughput(Throughput::Elements(msg_count as u64));
+
+        // Warm each database once so the measured path reflects steady-state
+        // reuse of a single remote provenance source across many inserts.
+        group.bench_with_input(
+            BenchmarkId::new("persist", format!("{msg_count}_msgs")),
+            &msg_count,
+            |b, &msg_count| {
+                let temp = TempDir::new().unwrap();
+                let db_path = temp.path().join("bench.db");
+                let index_path = index_dir(temp.path()).expect("index path");
+                let storage = FrankenStorage::open(&db_path).unwrap();
+                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+                persist_conversation(
+                    &storage,
+                    &mut t_index,
+                    &generate_remote_conversation(0, msg_count),
+                )
+                .unwrap();
+
+                let mut conv_id = 1i64;
+                b.iter(|| {
+                    let conv = generate_remote_conversation(conv_id, msg_count);
+                    persist_conversation(&storage, &mut t_index, &conv).unwrap();
+                    conv_id += 1;
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("direct", format!("{msg_count}_msgs")),
+            &msg_count,
+            |b, &msg_count| {
+                let temp = TempDir::new().unwrap();
+                let db_path = temp.path().join("bench.db");
+                let fs = FrankenStorage::open(&db_path).unwrap();
+
+                let mut agent_ids = Vec::new();
+                let mut ws_ids = Vec::new();
+                for i in 0..10i64 {
+                    agent_ids.push(fs.ensure_agent(&make_agent(i)).unwrap());
+                }
+                for i in 0..20i64 {
+                    let ws_path = PathBuf::from(format!("/workspace/project-{}", i));
+                    ws_ids.push(fs.ensure_workspace(&ws_path, None).unwrap());
+                }
+
+                let warmup = make_remote_conversation(0, msg_count);
+                fs.insert_conversation_tree(agent_ids[0], Some(ws_ids[0]), &warmup)
+                    .unwrap();
+
+                let mut conv_id = 1i64;
+                b.iter(|| {
+                    let agent_id = agent_ids[(conv_id % 10) as usize];
+                    let ws_id = ws_ids[(conv_id % 20) as usize];
+                    let conv = make_remote_conversation(conv_id, msg_count);
                     black_box(
                         fs.insert_conversation_tree(agent_id, Some(ws_id), &conv)
                             .unwrap(),
@@ -580,6 +676,7 @@ criterion_group! {
     targets =
         bench_db_open_comparison,
         bench_insert_comparison,
+        bench_insert_remote_source_reuse,
         bench_query_comparison,
         bench_concurrent_writes,
         bench_insert_scaling,
