@@ -4548,6 +4548,16 @@ fn fresh_franken_count_retry(
 // analytics status — delegates to crate::analytics::query
 // ---------------------------------------------------------------------------
 
+fn analytics_query_cli_error(e: analytics::AnalyticsError) -> CliError {
+    CliError {
+        code: 9,
+        kind: CliErrorKind::DbError.kind_str(),
+        message: e.to_string(),
+        hint: Some("Check that the analytics tables exist and are not corrupt.".into()),
+        retryable: false,
+    }
+}
+
 /// Run `cass analytics status` — analytics health/quality endpoint.
 fn run_analytics_status(
     common: &AnalyticsCommon,
@@ -4558,13 +4568,7 @@ fn run_analytics_status(
 
     analytics::query::query_status(&conn, &filter)
         .map(|r| r.to_json())
-        .map_err(|e| CliError {
-            code: 9,
-            kind: CliErrorKind::DbError.kind_str(),
-            message: e.to_string(),
-            hint: Some("Check that the analytics tables exist and are not corrupt.".into()),
-            retryable: false,
-        })
+        .map_err(analytics_query_cli_error)
 }
 
 // ---------------------------------------------------------------------------
@@ -4582,13 +4586,7 @@ fn run_analytics_tokens(
 
     analytics::query::query_tokens_timeseries(&conn, &filter, group_by.into())
         .map(|r| r.to_cli_json())
-        .map_err(|e| CliError {
-            code: 9,
-            kind: CliErrorKind::DbError.kind_str(),
-            message: e.to_string(),
-            hint: Some("Check that the analytics tables exist and are not corrupt.".into()),
-            retryable: false,
-        })
+        .map_err(analytics_query_cli_error)
 }
 
 // ---------------------------------------------------------------------------
@@ -4683,13 +4681,26 @@ fn run_analytics_tools(
 
     analytics::query::query_tools(&conn, &filter, group_by.into(), limit)
         .map(|r| r.to_cli_json())
-        .map_err(|e| CliError {
-            code: 9,
-            kind: CliErrorKind::DbError.kind_str(),
-            message: e.to_string(),
-            hint: Some("Check that the analytics tables exist and are not corrupt.".into()),
-            retryable: false,
-        })
+        .map_err(analytics_query_cli_error)
+}
+
+#[cfg(test)]
+mod analytics_query_cli_error_tests {
+    use super::*;
+
+    #[test]
+    fn analytics_query_cli_error_preserves_shape() {
+        let err = analytics_query_cli_error(analytics::AnalyticsError::Db("boom".to_string()));
+
+        assert_eq!(err.code, 9);
+        assert_eq!(err.kind, CliErrorKind::DbError.kind_str());
+        assert_eq!(err.message, "analytics db error: boom");
+        assert_eq!(
+            err.hint.as_deref(),
+            Some("Check that the analytics tables exist and are not corrupt.")
+        );
+        assert!(!err.retryable);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5034,13 +5045,6 @@ fn run_analytics_models(
 ) -> CliResult<serde_json::Value> {
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics_query_filter(&conn, common)?;
-    let db_err = |e: crate::analytics::AnalyticsError| CliError {
-        code: 9,
-        kind: CliErrorKind::DbError.kind_str(),
-        message: e.to_string(),
-        hint: Some("Check that the analytics tables exist and are not corrupt.".into()),
-        retryable: false,
-    };
 
     // Model breakdown by API tokens.
     let by_tokens = analytics::query::query_breakdown(
@@ -5050,11 +5054,11 @@ fn run_analytics_models(
         analytics::Metric::ApiTotal,
         50,
     )
-    .map_err(db_err)?;
+    .map_err(analytics_query_cli_error)?;
 
     // Time series for aggregate stats.
     let ts = analytics::query::query_tokens_timeseries(&conn, &filter, group_by.into())
-        .map_err(db_err)?;
+        .map_err(analytics_query_cli_error)?;
 
     // Human-readable stderr summary.
     {
@@ -6778,7 +6782,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Resume { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
-        Commands::Upgrade { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Upgrade { json, .. } => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
         Commands::ExportHtml { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
