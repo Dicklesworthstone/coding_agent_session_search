@@ -64,6 +64,9 @@ fn resolve_site_dir(path: &std::path::Path) -> Result<PathBuf, PreviewError> {
         .map_err(|_| PreviewError::SiteDirectoryNotFound(path.to_path_buf()))
 }
 
+const MIME_APPLICATION_OCTET_STREAM: &str = "application/octet-stream";
+const MIME_TEXT_PLAIN: &str = "text/plain";
+
 /// Guess MIME type from file extension.
 fn guess_mime_type(path: &std::path::Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
@@ -81,7 +84,7 @@ fn guess_mime_type(path: &std::path::Path) -> &'static str {
         Some("txt") => "text/plain; charset=utf-8",
         Some("xml") => "application/xml",
         Some("pdf") => "application/pdf",
-        Some("bin") => "application/octet-stream",
+        Some("bin") => MIME_APPLICATION_OCTET_STREAM,
         Some("woff") => "font/woff",
         Some("woff2") => "font/woff2",
         Some("ttf") => "font/ttf",
@@ -95,7 +98,7 @@ fn guess_mime_type(path: &std::path::Path) -> &'static str {
         Some("zip") => "application/zip",
         Some("gz") => "application/gzip",
         Some("tar") => "application/x-tar",
-        _ => "application/octet-stream",
+        _ => MIME_APPLICATION_OCTET_STREAM,
     }
 }
 
@@ -192,7 +195,7 @@ fn handle_request_with_site_root(site_root_canonical: &std::path::Path, request:
     let parts: Vec<&str> = request_line.split_whitespace().collect();
 
     if parts.len() < 2 {
-        return build_response(400, "text/plain", b"Bad Request".to_vec());
+        return build_response(400, MIME_TEXT_PLAIN, b"Bad Request".to_vec());
     }
 
     let method = parts[0];
@@ -200,7 +203,7 @@ fn handle_request_with_site_root(site_root_canonical: &std::path::Path, request:
 
     // Only support GET and HEAD
     if method != "GET" && method != "HEAD" {
-        return build_response(405, "text/plain", b"Method Not Allowed".to_vec());
+        return build_response(405, MIME_TEXT_PLAIN, b"Method Not Allowed".to_vec());
     }
 
     // Strip query/fragment, then decode URL and sanitize path
@@ -216,7 +219,7 @@ fn handle_request_with_site_root(site_root_canonical: &std::path::Path, request:
 
     // Prevent directory traversal
     if request_path.contains("..") {
-        return build_response(400, "text/plain", b"Invalid Path".to_vec());
+        return build_response(400, MIME_TEXT_PLAIN, b"Invalid Path".to_vec());
     }
 
     // Determine the file path
@@ -235,7 +238,7 @@ fn handle_request_with_site_root(site_root_canonical: &std::path::Path, request:
             match with_index.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
-                    return build_response(404, "text/plain", b"Not Found".to_vec());
+                    return build_response(404, MIME_TEXT_PLAIN, b"Not Found".to_vec());
                 }
             }
         }
@@ -243,7 +246,7 @@ fn handle_request_with_site_root(site_root_canonical: &std::path::Path, request:
 
     // Ensure the path is within the site directory
     if !canonical.starts_with(site_root_canonical) {
-        return build_response(400, "text/plain", b"Invalid Path".to_vec());
+        return build_response(400, MIME_TEXT_PLAIN, b"Invalid Path".to_vec());
     }
 
     // Check if it's a directory and append index.html if so
@@ -285,7 +288,7 @@ fn handle_request_with_site_root(site_root_canonical: &std::path::Path, request:
                     elapsed_ms = request_started.elapsed().as_millis(),
                     "Preview HEAD request failed"
                 );
-                build_response(404, "text/plain", b"Not Found".to_vec())
+                build_response(404, MIME_TEXT_PLAIN, b"Not Found".to_vec())
             }
         }
     } else {
@@ -315,7 +318,7 @@ fn handle_request_with_site_root(site_root_canonical: &std::path::Path, request:
                     elapsed_ms = request_started.elapsed().as_millis(),
                     "Preview GET request failed"
                 );
-                build_response(404, "text/plain", b"Not Found".to_vec())
+                build_response(404, MIME_TEXT_PLAIN, b"Not Found".to_vec())
             }
         }
     }
@@ -330,7 +333,7 @@ fn handle_request(site_dir: &std::path::Path, request: &str) -> Vec<u8> {
     let site_root_canonical = match site_dir.canonicalize() {
         Ok(p) => p,
         Err(_) => {
-            return build_response(500, "text/plain", b"Internal Server Error".to_vec());
+            return build_response(500, MIME_TEXT_PLAIN, b"Internal Server Error".to_vec());
         }
     };
     handle_request_with_site_root(&site_root_canonical, request)
