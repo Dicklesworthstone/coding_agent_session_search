@@ -15,6 +15,8 @@
 use crate::pages::summary::{KeySlotType, PrePublishSummary};
 use chrono::Utc;
 
+const CASS_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Location where a generated document should be placed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocLocation {
@@ -137,7 +139,6 @@ impl DocumentationGenerator {
         );
 
         let slot_count = self.summary.key_slots.len();
-        let version = env!("CARGO_PKG_VERSION");
         let date = Utc::now().format("%Y-%m-%d");
 
         let content = README_TEMPLATE
@@ -151,7 +152,7 @@ impl DocumentationGenerator {
             .replace("{end_date}", &end_date)
             .replace("{argon_params}", &argon_params)
             .replace("{slot_count}", &slot_count.to_string())
-            .replace("{version}", version)
+            .replace("{version}", CASS_VERSION)
             .replace("{date}", &date.to_string());
 
         GeneratedDoc {
@@ -197,7 +198,6 @@ impl DocumentationGenerator {
         let argon_iterations = self.config.argon_iterations.to_string();
         let argon_parallelism = self.config.argon_parallelism.to_string();
         let slot_count = self.summary.key_slots.len().to_string();
-        let version = env!("CARGO_PKG_VERSION");
 
         let content = SECURITY_TEMPLATE
             .replace("{memory}", &argon_memory)
@@ -206,7 +206,7 @@ impl DocumentationGenerator {
             .replace("{slot_count}", &slot_count)
             .replace("{slot_descriptions}", &slot_descriptions)
             .replace("{repo_url}", &self.config.cass_repo_url)
-            .replace("{version}", version);
+            .replace("{version}", CASS_VERSION);
 
         GeneratedDoc {
             filename: "SECURITY.md".to_string(),
@@ -257,13 +257,12 @@ impl DocumentationGenerator {
 
         let conversation_count = self.summary.total_conversations.to_string();
         let date = Utc::now().format("%Y-%m-%d");
-        let version = env!("CARGO_PKG_VERSION");
 
         let content = ABOUT_TXT_TEMPLATE
             .replace("{url}", url_display)
             .replace("{conversation_count}", &conversation_count)
             .replace("{date}", &date.to_string())
-            .replace("{version}", version);
+            .replace("{version}", CASS_VERSION);
 
         GeneratedDoc {
             filename: "about.txt".to_string(),
