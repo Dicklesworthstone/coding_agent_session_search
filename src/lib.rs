@@ -722,8 +722,13 @@ pub enum Commands {
         #[arg(long, value_enum, default_value_t = ConvExportFormat::Markdown)]
         format: ConvExportFormat,
         /// Output file (stdout if not specified)
-        #[arg(long, short = 'o')]
+        #[arg(long, short = 'o', conflicts_with = "clipboard")]
         output: Option<PathBuf>,
+        /// Copy the formatted export to the system clipboard instead of
+        /// printing to stdout. Falls back to stdout with a stderr warning
+        /// when no clipboard tool is available (e.g. headless / SSH).
+        #[arg(long, short = 'c', default_value_t = false)]
+        clipboard: bool,
         /// Include tool use details in export
         #[arg(long)]
         include_tools: bool,
@@ -3974,6 +3979,7 @@ async fn execute_cli(
                     source,
                     format,
                     output,
+                    clipboard,
                     include_tools,
                     include_skills,
                 } => {
@@ -3983,6 +3989,7 @@ async fn execute_cli(
                         source.as_deref(),
                         format,
                         output.as_deref(),
+                        clipboard,
                         include_tools,
                         include_skills,
                     )?;
@@ -20759,6 +20766,7 @@ fn run_export(
     source_id: Option<&str>,
     format: ConvExportFormat,
     output: Option<&Path>,
+    clipboard: bool,
     include_tools: bool,
     include_skills: bool,
 ) -> CliResult<()> {
@@ -20996,11 +21004,105 @@ fn run_export(
                 retryable: false,
             })?;
         println!("Exported to: {}", out_path.display());
+    } else if clipboard {
+        match copy_to_system_clipboard(&formatted) {
+            Ok(tool) => {
+                let bytes = formatted.as_bytes().len();
+                eprintln!(
+                    "Copied {bytes} bytes to clipboard via {tool}. Paste into your coding agent's chat to resume the conversation."
+                );
+            }
+            Err(err) => {
+                // Headless/SSH and similar — fall back to stdout so the
+                // caller still gets the export, but make the failure
+                // legible on stderr so a wrapper script knows clipboard
+                // handoff didn't happen.
+                eprintln!("warning: clipboard not available ({err}); falling back to stdout.");
+                println!("{formatted}");
+            }
+        }
     } else {
         println!("{formatted}");
     }
 
     Ok(())
+}
+
+/// Stream `text` into the system clipboard by spawning the platform's
+/// canonical clipboard tool. Returns the name of the tool used on success.
+///
+/// Used by `cass export --clipboard` so users can hand a freshly-found
+/// thread into their coding agent (Cursor, Claude Code, …) with one
+/// keystroke. Shells out instead of taking a clipboard-crate dependency
+/// because (a) no current dep covers all four targets we care about and
+/// (b) the sub-process approach degrades cleanly to the stdout fallback
+/// when no tool is on PATH (headless servers, SSH sessions).
+fn copy_to_system_clipboard(text: &str) -> Result<&'static str, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // (program, args). First match wins. Order matters on Linux:
+    // Wayland sessions ignore X11 selections, so wl-copy must be tried
+    // before xclip / xsel even though the latter are more common.
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(target_os = "windows") {
+        &[("clip", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+
+    let mut last_err: Option<String> = None;
+    for (program, args) in candidates {
+        let spawn_result = Command::new(program)
+            .args(args.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child = match spawn_result {
+            Ok(c) => c,
+            Err(e) => {
+                // ENOENT etc.: tool not installed, try the next candidate.
+                last_err = Some(format!("{program}: {e}"));
+                continue;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(text.as_bytes()) {
+                last_err = Some(format!("{program}: write stdin: {e}"));
+                let _ = child.wait();
+                continue;
+            }
+        }
+        match child.wait_with_output() {
+            Ok(out) if out.status.success() => return Ok(program),
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                last_err = Some(format!(
+                    "{program} exited with status {}: {}",
+                    out.status, stderr
+                ));
+            }
+            Err(e) => {
+                last_err = Some(format!("{program}: wait: {e}"));
+            }
+        }
+    }
+
+    let tried = candidates
+        .iter()
+        .map(|(p, _)| *p)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(match last_err {
+        Some(detail) => format!("no clipboard tool succeeded (tried {tried}; last error: {detail})"),
+        None => format!("no clipboard tool found on PATH (tried {tried})"),
+    })
 }
 
 fn strip_stdin_line_ending(mut input: String) -> String {
@@ -21024,6 +21126,49 @@ mod export_html_password_tests {
             strip_stdin_line_ending("\tpass phrase\t\r\n".to_string()),
             "\tpass phrase\t"
         );
+    }
+}
+
+#[cfg(test)]
+mod clipboard_helper_tests {
+    use super::copy_to_system_clipboard;
+
+    /// On a host with **no** clipboard tool on PATH (PATH=""), the helper
+    /// must return Err so the caller can fall back to stdout. The
+    /// previous failure mode was a silent success that dropped the
+    /// export on the floor.
+    #[test]
+    fn returns_err_when_no_tool_is_available() {
+        // Save and clear PATH so spawn() can't find pbcopy/wl-copy/xclip
+        // /xsel/clip. Restore on exit even if the assertion panics.
+        struct PathGuard(Option<std::ffi::OsString>);
+        impl Drop for PathGuard {
+            fn drop(&mut self) {
+                // Tests touch process env: required for an end-to-end
+                // check of the spawn fallback chain.
+                unsafe {
+                    match self.0.take() {
+                        Some(prev) => std::env::set_var("PATH", prev),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+        let guard = PathGuard(std::env::var_os("PATH"));
+        unsafe {
+            std::env::set_var("PATH", "");
+        }
+
+        let err = copy_to_system_clipboard("hello").expect_err(
+            "with PATH cleared, no clipboard tool should be findable",
+        );
+        assert!(
+            err.contains("no clipboard tool")
+                || err.contains("tried"),
+            "error should describe what was tried, got: {err}"
+        );
+
+        drop(guard);
     }
 }
 
@@ -23222,6 +23367,7 @@ mod indexed_conversation_fallback_tests {
             Some("work-laptop"),
             ConvExportFormat::Markdown,
             Some(output_path.as_path()),
+            false, // clipboard
             false,
             true,
         )
@@ -23291,6 +23437,7 @@ mod indexed_conversation_fallback_tests {
             None,
             ConvExportFormat::Markdown,
             Some(output_path.as_path()),
+            false, // clipboard
             false,
             true,
         )
@@ -23835,6 +23982,7 @@ This is not JSONL.
             None,
             ConvExportFormat::Markdown,
             Some(output_path.as_path()),
+            false, // clipboard
             false,
             true,
         )
@@ -23904,6 +24052,7 @@ This should stay behind the indexed export.
             None,
             ConvExportFormat::Markdown,
             Some(output_path.as_path()),
+            false, // clipboard
             false,
             true,
         )
