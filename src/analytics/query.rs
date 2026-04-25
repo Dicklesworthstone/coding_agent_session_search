@@ -100,6 +100,15 @@ fn normalized_analytics_source_identity_value(source_id: &str, origin_host: &str
     }
 }
 
+fn breakdown_row_with_value(key: String, bucket: UsageBucket, value: i64) -> BreakdownRow {
+    BreakdownRow {
+        message_count: bucket.message_count,
+        key,
+        value,
+        bucket,
+    }
+}
+
 fn normalized_analytics_source_id_sql_expr(column: &str) -> String {
     format!(
         "CASE WHEN TRIM(COALESCE({column}, '')) = '' THEN '{local}'          WHEN LOWER(TRIM(COALESCE({column}, ''))) = '{local}' THEN '{local}'          ELSE TRIM(COALESCE({column}, '')) END",
@@ -2211,10 +2220,8 @@ fn query_track_b_breakdown_from_token_usage(
 
     let rows = raw_rows
         .into_iter()
-        .map(|(key, bucket)| BreakdownRow {
-            message_count: bucket.message_count,
-            key,
-            value: match metric {
+        .map(|(key, bucket)| {
+            let value = match metric {
                 Metric::ApiTotal => bucket.api_tokens_total,
                 Metric::ApiInput => bucket.api_input_tokens_total,
                 Metric::ApiOutput => bucket.api_output_tokens_total,
@@ -2230,8 +2237,8 @@ fn query_track_b_breakdown_from_token_usage(
                 }
                 Metric::MessageCount => bucket.message_count,
                 Metric::EstimatedCostUsd => bucket.estimated_cost_usd.round() as i64,
-            },
-            bucket,
+            };
+            breakdown_row_with_value(key, bucket, value)
         })
         .collect();
 
@@ -2464,8 +2471,8 @@ fn query_track_a_breakdown_from_raw(
 
     let mut rows: Vec<BreakdownRow> = grouped_buckets
         .into_iter()
-        .map(|(key, bucket)| BreakdownRow {
-            value: match metric {
+        .map(|(key, bucket)| {
+            let value = match metric {
                 Metric::ApiTotal => bucket.api_tokens_total,
                 Metric::ApiInput => bucket.api_input_tokens_total,
                 Metric::ApiOutput => bucket.api_output_tokens_total,
@@ -2481,10 +2488,8 @@ fn query_track_a_breakdown_from_raw(
                 }
                 Metric::MessageCount => bucket.message_count,
                 Metric::EstimatedCostUsd => bucket.estimated_cost_usd.round() as i64,
-            },
-            message_count: bucket.message_count,
-            key,
-            bucket,
+            };
+            breakdown_row_with_value(key, bucket, value)
         })
         .collect();
 
@@ -2824,12 +2829,7 @@ fn read_breakdown_rows_track_a(
             Metric::EstimatedCostUsd => 0,
             _ => sort_value,
         };
-        result.push(BreakdownRow {
-            message_count: bucket.message_count,
-            key,
-            value,
-            bucket,
-        });
+        result.push(breakdown_row_with_value(key, bucket, value));
     }
     Ok(result)
 }
@@ -2897,12 +2897,7 @@ fn read_breakdown_rows_track_b(
             Metric::PlanCount => 0,
             _ => sort_value,
         };
-        result.push(BreakdownRow {
-            message_count: bucket.message_count,
-            key,
-            value,
-            bucket,
-        });
+        result.push(breakdown_row_with_value(key, bucket, value));
     }
     Ok(result)
 }
