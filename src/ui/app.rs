@@ -4392,8 +4392,6 @@ pub struct SourcesViewItem {
     pub error: Option<String>,
 }
 
-type SourcesRowEphemeralState = (bool, Option<(usize, usize, usize)>);
-
 /// State for the Sources management surface.
 #[derive(Clone, Debug, Default)]
 pub struct SourcesViewState {
@@ -12809,7 +12807,7 @@ impl CassApp {
             .get(previous_selected)
             .map(|item| item.name.clone());
         let previous_scroll = self.sources_view.scroll;
-        let previous_row_state: HashMap<String, SourcesRowEphemeralState> = self
+        let previous_row_state: HashMap<String, (bool, Option<(usize, usize, usize)>)> = self
             .sources_view
             .items
             .iter()
