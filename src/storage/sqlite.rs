@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 /// Frankensqlite parameter list builder.
 macro_rules! fparams {
@@ -2813,11 +2813,11 @@ pub struct FrankenStorage {
     conn: FrankenConnection,
     db_path: PathBuf,
     ephemeral_writer_preflight_verified: AtomicBool,
+    index_writer_checkpoint_pages: AtomicI64,
 }
 
-const DEFAULT_CACHE_SIZE_KIB: i64 = 65_536;
-const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1000;
+const UNSET_INDEX_WRITER_CHECKPOINT_PAGES: i64 = i64::MIN;
 
 const AUTOCOMMIT_RETAIN_OFF_PRAGMAS: [&str; 2] = [
     "PRAGMA fsqlite.autocommit_retain = OFF;",
@@ -2862,6 +2862,7 @@ impl FrankenStorage {
             conn,
             db_path,
             ephemeral_writer_preflight_verified: AtomicBool::new(false),
+            index_writer_checkpoint_pages: AtomicI64::new(UNSET_INDEX_WRITER_CHECKPOINT_PAGES),
         }
     }
 
@@ -2907,26 +2908,6 @@ impl FrankenStorage {
             .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_config()?;
-        Ok(storage)
-    }
-
-    /// Open a short-lived writer with the exact per-connection tuning cass's
-    /// indexer wants for steady-state persists, without paying for generic
-    /// defaults that get overridden immediately after open.
-    pub fn open_ephemeral_writer(
-        path: &Path,
-        busy_timeout_ms: u64,
-        wal_autocheckpoint_pages: i64,
-    ) -> Result<Self> {
-        let path_str = path.to_string_lossy().to_string();
-        let conn = FrankenConnection::open(&path_str).with_context(|| {
-            format!(
-                "opening frankensqlite ephemeral writer at {}",
-                path.display()
-            )
-        })?;
-        let storage = Self::new(conn, path.to_path_buf());
-        storage.apply_writable_config(busy_timeout_ms, wal_autocheckpoint_pages, false)?;
         Ok(storage)
     }
 
@@ -2980,19 +2961,6 @@ impl FrankenStorage {
     /// WAL and default synchronous is NORMAL, matching cass's requirements.
     ///
     pub fn apply_config(&self) -> Result<()> {
-        self.apply_writable_config(
-            DEFAULT_BUSY_TIMEOUT_MS,
-            DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
-            true,
-        )
-    }
-
-    fn apply_writable_config(
-        &self,
-        busy_timeout_ms: u64,
-        wal_autocheckpoint_pages: i64,
-        foreign_keys_enabled: bool,
-    ) -> Result<()> {
         // journal_mode: frankensqlite defaults to WAL, same as cass.
         // synchronous: frankensqlite defaults to NORMAL, same as cass.
         // Both are set explicitly for clarity.
@@ -3004,30 +2972,18 @@ impl FrankenStorage {
             .with_context(|| "setting synchronous")?;
 
         // cache_size: 64MB (negative value = KiB).
-        let cache_size_pragma = format!("PRAGMA cache_size = -{DEFAULT_CACHE_SIZE_KIB};");
         self.conn
-            .execute(&cache_size_pragma)
+            .execute("PRAGMA cache_size = -65536;")
             .with_context(|| "setting cache_size")?;
 
-        // foreign_keys: enable constraint enforcement on general-purpose
-        // handles, but keep it off for short-lived index writers because the
-        // application already guarantees parent rows exist and the engine can
-        // report false positives after sustained write activity.
-        let foreign_keys_pragma = if foreign_keys_enabled {
-            "PRAGMA foreign_keys = ON;"
-        } else {
-            "PRAGMA foreign_keys = OFF;"
-        };
+        // foreign_keys: enable constraint enforcement.
         self.conn
-            .execute(foreign_keys_pragma)
+            .execute("PRAGMA foreign_keys = ON;")
             .with_context(|| "setting foreign_keys")?;
 
-        // busy_timeout: per-call so the steady-state index writer path can use a
-        // longer timeout than the generic storage open path without reopening
-        // and then overriding the same connection setting.
-        let busy_timeout_pragma = format!("PRAGMA busy_timeout = {busy_timeout_ms};");
+        // busy_timeout: 5 seconds (in milliseconds).
         self.conn
-            .execute(&busy_timeout_pragma)
+            .execute("PRAGMA busy_timeout = 5000;")
             .with_context(|| "setting busy_timeout")?;
 
         // temp_store = MEMORY and mmap_size are C SQLite performance knobs.
@@ -3037,9 +2993,9 @@ impl FrankenStorage {
 
         // wal_autocheckpoint: frankensqlite manages WAL internally, but the
         // PRAGMA is accepted for compatibility.
-        let wal_autocheckpoint_pragma =
-            format!("PRAGMA wal_autocheckpoint = {wal_autocheckpoint_pages};");
-        let _ = self.conn.execute(&wal_autocheckpoint_pragma);
+        let _ = self.conn.execute("PRAGMA wal_autocheckpoint = 1000;");
+        self.index_writer_checkpoint_pages
+            .store(DEFAULT_WAL_AUTOCHECKPOINT_PAGES, Ordering::Relaxed);
         // Explicitly enable concurrent writer mode for BEGIN/transaction paths.
         // Try both namespace variants for compatibility across fsqlite builds.
         let _ = self.conn.execute("PRAGMA fsqlite.concurrent_mode = ON;");
@@ -3222,6 +3178,16 @@ impl FrankenStorage {
     pub(crate) fn mark_ephemeral_writer_preflight_verified(&self) {
         self.ephemeral_writer_preflight_verified
             .store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn index_writer_checkpoint_pages(&self) -> Option<i64> {
+        let pages = self.index_writer_checkpoint_pages.load(Ordering::Relaxed);
+        (pages != UNSET_INDEX_WRITER_CHECKPOINT_PAGES).then_some(pages)
+    }
+
+    pub(crate) fn mark_index_writer_checkpoint_pages(&self, pages: i64) {
+        self.index_writer_checkpoint_pages
+            .store(pages, Ordering::Relaxed);
     }
 
     /// Open database with migration, backing up if schema is incompatible.

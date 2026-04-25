@@ -15719,6 +15719,9 @@ pub mod persist {
         defer_checkpoints: bool,
     ) {
         let wal_autocheckpoint_pages = index_writer_wal_autocheckpoint_pages(defer_checkpoints);
+        if storage.index_writer_checkpoint_pages() == Some(wal_autocheckpoint_pages) {
+            return;
+        }
         let pragma = format!("PRAGMA wal_autocheckpoint = {wal_autocheckpoint_pages};");
         if let Err(err) = storage.raw().execute(&pragma) {
             tracing::debug!(
@@ -15726,6 +15729,8 @@ pub mod persist {
                 error = %err,
                 "failed_to_apply_index_writer_checkpoint_policy"
             );
+        } else {
+            storage.mark_index_writer_checkpoint_pages(wal_autocheckpoint_pages);
         }
     }
 
@@ -15741,18 +15746,11 @@ pub mod persist {
         let db_path = storage
             .database_path()
             .with_context(|| format!("resolving database path for {context}"))?;
-        let busy_timeout_ms = index_writer_busy_timeout_ms();
-        let wal_autocheckpoint_pages = index_writer_wal_autocheckpoint_pages(defer_checkpoints);
         // Keep the long-lived handle's connection-local checkpoint state aligned
         // with the short-lived writer so watch-mode observability and follow-up
         // policy transitions still reflect the active ingestion mode.
         apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
-        let writer = FrankenStorage::open_ephemeral_writer(
-            &db_path,
-            busy_timeout_ms,
-            wal_autocheckpoint_pages,
-        )
-        .with_context(|| {
+        let writer = FrankenStorage::open_writer(&db_path).with_context(|| {
             format!(
                 "opening short-lived frankensqlite writer for {context}: {}",
                 db_path.display()
@@ -15778,6 +15776,24 @@ pub mod persist {
                 );
             }
             storage.mark_ephemeral_writer_preflight_verified();
+        }
+
+        apply_index_writer_busy_timeout(&writer);
+        apply_index_writer_checkpoint_policy(&writer, defer_checkpoints);
+
+        // CASS #169: Disable database-level FK enforcement on ephemeral writers.
+        // All insert paths already guarantee FK parent records exist at the
+        // application level (ensure_agent, ensure_workspace,
+        // ensure_embedded_source_registered), so SQLite FK checks are redundant.
+        // After sustained write activity (~39 min), frankensqlite's cursor cache
+        // can report false-positive FK constraint violations that PRAGMA
+        // foreign_key_check confirms do not actually exist.
+        if let Err(err) = writer.raw().execute("PRAGMA foreign_keys = OFF") {
+            tracing::debug!(
+                error = %err,
+                context,
+                "failed to disable FK enforcement on ephemeral writer"
+            );
         }
 
         let result = f(&writer);
@@ -16938,42 +16954,19 @@ pub mod persist {
             let db_path = dir.path().join("checkpoint-policy.db");
             let storage = create_franken_db(&db_path);
 
+            assert_eq!(storage.index_writer_checkpoint_pages(), Some(1000));
+
             apply_index_writer_checkpoint_policy(&storage, true);
             let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+            assert_eq!(storage.index_writer_checkpoint_pages(), Some(0));
 
             apply_index_writer_checkpoint_policy(&storage, false);
             let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1000));
-        }
-
-        #[test]
-        fn open_ephemeral_writer_applies_specialized_writer_pragmas() {
-            let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("ephemeral-writer-config.db");
-            let storage = create_franken_db(&db_path);
-            drop(storage);
-
-            let writer = FrankenStorage::open_ephemeral_writer(&db_path, 60_000, 0).unwrap();
-
-            let foreign_keys = writer.raw().query("PRAGMA foreign_keys;").unwrap();
-            assert_eq!(foreign_keys.len(), 1);
-            assert_eq!(foreign_keys[0].get(0).unwrap(), &SqliteValue::Integer(0));
-
-            let wal_autocheckpoint = writer.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
-            assert_eq!(wal_autocheckpoint.len(), 1);
-            assert_eq!(
-                wal_autocheckpoint[0].get(0).unwrap(),
-                &SqliteValue::Integer(0)
-            );
-
-            let busy_timeout: i64 = writer
-                .raw()
-                .query_row_map("PRAGMA busy_timeout;", &[], |row| row.get_typed(0))
-                .unwrap();
-            assert_eq!(busy_timeout, 60_000);
+            assert_eq!(storage.index_writer_checkpoint_pages(), Some(1000));
         }
 
         #[test]
