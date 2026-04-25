@@ -17,61 +17,30 @@ use std::fmt;
 ///
 /// These errors are designed to be user-friendly and security-conscious.
 /// They never leak sensitive information like passwords or internal state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecryptError {
     /// Password authentication failed.
+    #[error("The password you entered is incorrect.")]
     AuthenticationFailed,
     /// Empty password provided.
+    #[error("Please enter a password.")]
     EmptyPassword,
     /// Invalid archive format.
+    #[error("This file is not a valid archive.")]
     InvalidFormat(String),
     /// Archive integrity check failed (tampering detected).
+    #[error("The archive appears to be corrupted or tampered with.")]
     IntegrityCheckFailed,
     /// Archive version not supported.
+    #[error("This archive requires a newer version of the software (version {0}).")]
     UnsupportedVersion(u8),
     /// No matching key slot found.
+    #[error("No matching key slot found for the provided credentials.")]
     NoMatchingKeySlot,
     /// Internal cryptographic error.
+    #[error("An error occurred during decryption.")]
     CryptoError(String),
 }
-
-impl fmt::Display for DecryptError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AuthenticationFailed => {
-                write!(f, "The password you entered is incorrect.")
-            }
-            Self::EmptyPassword => {
-                write!(f, "Please enter a password.")
-            }
-            Self::InvalidFormat(_) => {
-                write!(f, "This file is not a valid archive.")
-            }
-            Self::IntegrityCheckFailed => {
-                write!(f, "The archive appears to be corrupted or tampered with.")
-            }
-            Self::UnsupportedVersion(v) => {
-                write!(
-                    f,
-                    "This archive requires a newer version of the software (version {}).",
-                    v
-                )
-            }
-            Self::NoMatchingKeySlot => {
-                write!(
-                    f,
-                    "No matching key slot found for the provided credentials."
-                )
-            }
-            Self::CryptoError(_) => {
-                // Don't expose internal crypto details to users
-                write!(f, "An error occurred during decryption.")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DecryptError {}
 
 impl DecryptError {
     /// Get a user-friendly recovery suggestion for this error.
@@ -440,6 +409,42 @@ mod tests {
                 expected_substring,
                 message
             );
+        }
+    }
+
+    #[test]
+    fn test_decrypt_error_display_and_source_are_preserved() {
+        let cases = vec![
+            (
+                DecryptError::AuthenticationFailed,
+                "The password you entered is incorrect.",
+            ),
+            (DecryptError::EmptyPassword, "Please enter a password."),
+            (
+                DecryptError::InvalidFormat("header mismatch".into()),
+                "This file is not a valid archive.",
+            ),
+            (
+                DecryptError::IntegrityCheckFailed,
+                "The archive appears to be corrupted or tampered with.",
+            ),
+            (
+                DecryptError::UnsupportedVersion(99),
+                "This archive requires a newer version of the software (version 99).",
+            ),
+            (
+                DecryptError::NoMatchingKeySlot,
+                "No matching key slot found for the provided credentials.",
+            ),
+            (
+                DecryptError::CryptoError("GCM tag mismatch".into()),
+                "An error occurred during decryption.",
+            ),
+        ];
+
+        for (error, expected_display) in cases {
+            assert_eq!(error.to_string(), expected_display);
+            assert!(std::error::Error::source(&error).is_none());
         }
     }
 
