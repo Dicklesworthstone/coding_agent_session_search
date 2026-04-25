@@ -407,6 +407,20 @@ mod tests {
         (store, dir)
     }
 
+    fn assert_single_search_path(store: &BookmarkStore, query: &str, expected_path: &str) {
+        let results = store.search(query).unwrap();
+        let paths = results
+            .iter()
+            .map(|bookmark| bookmark.source_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![expected_path],
+            "query {query:?} should match exactly one source path"
+        );
+    }
+
     #[test]
     fn test_create_bookmark() {
         let bookmark = Bookmark::new("Test", "/path/file.rs", "claude_code", "/workspace")
@@ -536,17 +550,9 @@ mod tests {
             .add(&Bookmark::new("Plain row", "/plain.rs", "a", "/w"))
             .unwrap();
 
-        let percent_results = store.search("%").unwrap();
-        assert_eq!(percent_results.len(), 1);
-        assert_eq!(percent_results[0].source_path, "/percent.rs");
-
-        let underscore_results = store.search("_").unwrap();
-        assert_eq!(underscore_results.len(), 1);
-        assert_eq!(underscore_results[0].source_path, "/underscore.rs");
-
-        let backslash_results = store.search("\\").unwrap();
-        assert_eq!(backslash_results.len(), 1);
-        assert_eq!(backslash_results[0].source_path, "/backslash.rs");
+        assert_single_search_path(&store, "%", "/percent.rs");
+        assert_single_search_path(&store, "_", "/underscore.rs");
+        assert_single_search_path(&store, "\\", "/backslash.rs");
     }
 
     #[test]
