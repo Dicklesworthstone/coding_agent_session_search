@@ -25,16 +25,9 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
 struct AeadSourceError(aes_gcm::Error);
-
-impl std::fmt::Display for AeadSourceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for AeadSourceError {}
 
 /// Default chunk size for streaming encryption (8 MiB)
 pub const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
