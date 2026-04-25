@@ -143,6 +143,14 @@ pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn assert_err_contains<T>(result: Result<T, String>, expected: &str) {
+        let err = result.err().expect("operation should fail");
+        assert!(
+            err.contains(expected),
+            "expected error containing {expected:?}, got {err:?}"
+        );
+    }
+
     // =========================================================================
     // AES-GCM Encrypt/Decrypt Tests
     // =========================================================================
@@ -213,8 +221,7 @@ mod tests {
         let aad = b"";
 
         let result = aes_gcm_encrypt(&key, &nonce, plaintext, aad);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("key length invalid"));
+        assert_err_contains(result, "key length invalid");
     }
 
     #[test]
@@ -225,8 +232,7 @@ mod tests {
         let aad = b"";
 
         let result = aes_gcm_encrypt(&key, &nonce, plaintext, aad);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("nonce length invalid"));
+        assert_err_contains(result, "nonce length invalid");
     }
 
     #[test]
@@ -238,8 +244,7 @@ mod tests {
         let tag = [0u8; 16];
 
         let result = aes_gcm_decrypt(&key, &nonce, ciphertext, aad, &tag);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("key length invalid"));
+        assert_err_contains(result, "key length invalid");
     }
 
     #[test]
@@ -251,8 +256,7 @@ mod tests {
         let tag = [0u8; 16];
 
         let result = aes_gcm_decrypt(&key, &nonce, ciphertext, aad, &tag);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("nonce length invalid"));
+        assert_err_contains(result, "nonce length invalid");
     }
 
     #[test]
@@ -264,8 +268,7 @@ mod tests {
         let tag = [0u8; 8]; // Should be 16 bytes
 
         let result = aes_gcm_decrypt(&key, &nonce, ciphertext, aad, &tag);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("tag length invalid"));
+        assert_err_contains(result, "tag length invalid");
     }
 
     #[test]
@@ -280,8 +283,7 @@ mod tests {
         // Use different key for decryption
         let wrong_key = [1u8; 32];
         let result = aes_gcm_decrypt(&wrong_key, &nonce, &ciphertext, aad, &tag);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("decryption failed"));
+        assert_err_contains(result, "decryption failed");
     }
 
     #[test]
@@ -296,8 +298,7 @@ mod tests {
         // Use different AAD for decryption
         let wrong_aad = b"wrong aad";
         let result = aes_gcm_decrypt(&key, &nonce, &ciphertext, wrong_aad, &tag);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("decryption failed"));
+        assert_err_contains(result, "decryption failed");
     }
 
     #[test]
@@ -312,8 +313,7 @@ mod tests {
         // Tamper with ciphertext
         ciphertext[0] ^= 0xff;
         let result = aes_gcm_decrypt(&key, &nonce, &ciphertext, aad, &tag);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("decryption failed"));
+        assert_err_contains(result, "decryption failed");
     }
 
     #[test]
@@ -328,8 +328,7 @@ mod tests {
         // Tamper with tag
         tag[0] ^= 0xff;
         let result = aes_gcm_decrypt(&key, &nonce, &ciphertext, aad, &tag);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("decryption failed"));
+        assert_err_contains(result, "decryption failed");
     }
 
     #[test]
