@@ -166,6 +166,16 @@ impl std::fmt::Debug for EncryptionEngine {
     }
 }
 
+fn key_slot_id_for_len(slot_count: usize) -> Result<u8> {
+    u8::try_from(slot_count).map_err(|err| {
+        anyhow::anyhow!(
+            "maximum of 256 key slots exceeded ({} slots already allocated): {}",
+            slot_count,
+            err
+        )
+    })
+}
+
 impl Default for EncryptionEngine {
     fn default() -> Self {
         Self::new(DEFAULT_CHUNK_SIZE).expect("default chunk size must be valid")
@@ -206,13 +216,7 @@ impl EncryptionEngine {
             anyhow::bail!("Password cannot be whitespace-only");
         }
 
-        let slot_id = u8::try_from(self.key_slots.len()).map_err(|err| {
-            anyhow::anyhow!(
-                "maximum of 256 key slots exceeded ({} slots already allocated): {}",
-                self.key_slots.len(),
-                err
-            )
-        })?;
+        let slot_id = key_slot_id_for_len(self.key_slots.len())?;
 
         // Generate salt
         let salt = SaltString::generate(&mut PasswordHashOsRng);
@@ -239,13 +243,7 @@ impl EncryptionEngine {
 
     /// Add a recovery secret slot using HKDF-SHA256
     pub fn add_recovery_slot(&mut self, secret: &[u8]) -> Result<u8> {
-        let slot_id = u8::try_from(self.key_slots.len()).map_err(|err| {
-            anyhow::anyhow!(
-                "maximum of 256 key slots exceeded ({} slots already allocated): {}",
-                self.key_slots.len(),
-                err
-            )
-        })?;
+        let slot_id = key_slot_id_for_len(self.key_slots.len())?;
 
         // Generate salt
         let mut salt = [0u8; 16];
@@ -931,6 +929,17 @@ mod tests {
 
         // Wrong password should fail
         assert!(DecryptionEngine::unlock_with_password(config, "wrong").is_err());
+    }
+
+    #[test]
+    fn key_slot_id_for_len_rejects_overflow() {
+        assert_eq!(key_slot_id_for_len(255).unwrap(), 255);
+
+        let err = key_slot_id_for_len(256).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "maximum of 256 key slots exceeded (256 slots already allocated): out of range integral type conversion attempted"
+        );
     }
 
     #[test]
