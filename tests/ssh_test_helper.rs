@@ -29,30 +29,21 @@ use std::time::{Duration, Instant};
 static CONTAINER_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Errors that can occur during SSH test setup.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SshTestError {
+    #[error("Docker is not available")]
     DockerNotAvailable,
+    #[error("Failed to start container: {0}")]
     ContainerStartFailed(String),
+    #[error("Failed to generate SSH key: {0}")]
     SshKeyGenFailed(String),
+    #[error("SSH connection failed: {0}")]
     SshConnectionFailed(String),
+    #[error("Command failed: {0}")]
     CommandFailed(String),
+    #[error("Operation timed out")]
     Timeout,
 }
-
-impl std::fmt::Display for SshTestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DockerNotAvailable => write!(f, "Docker is not available"),
-            Self::ContainerStartFailed(msg) => write!(f, "Failed to start container: {}", msg),
-            Self::SshKeyGenFailed(msg) => write!(f, "Failed to generate SSH key: {}", msg),
-            Self::SshConnectionFailed(msg) => write!(f, "SSH connection failed: {}", msg),
-            Self::CommandFailed(msg) => write!(f, "Command failed: {}", msg),
-            Self::Timeout => write!(f, "Operation timed out"),
-        }
-    }
-}
-
-impl std::error::Error for SshTestError {}
 
 /// RAII guard that manages an SSH test server container.
 ///
