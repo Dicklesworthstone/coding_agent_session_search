@@ -14177,7 +14177,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
                         std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
                     ) =>
             {
-                let backup_path = unique_replace_backup_path(final_path);
+                let backup_path = unique_atomic_sidecar_path(final_path, "bak", "tui_state.json");
                 std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
                     let _ = std::fs::remove_file(temp_path);
                     format!(
@@ -14258,11 +14258,6 @@ fn sync_parent_directory(_path: &Path) -> Result<(), String> {
 
 fn unique_atomic_temp_path(path: &Path) -> PathBuf {
     unique_atomic_sidecar_path(path, "tmp", "tui_state.json")
-}
-
-#[cfg(windows)]
-fn unique_replace_backup_path(path: &Path) -> PathBuf {
-    unique_atomic_sidecar_path(path, "bak", "tui_state.json")
 }
 
 fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
