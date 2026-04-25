@@ -12801,6 +12801,11 @@ fn run_health(
                     .get("database")
                     .and_then(|d| d.get("counts_skipped"))
                     .cloned()
+                    .unwrap_or(serde_json::Value::Bool(false)),
+                "open_skipped": state
+                    .get("database")
+                    .and_then(|d| d.get("open_skipped"))
+                    .cloned()
                     .unwrap_or(serde_json::Value::Bool(false))
             },
             "responsiveness": responsiveness,
@@ -17156,7 +17161,8 @@ fn response_schema_health_db() -> serde_json::Value {
             "conversations": { "type": ["integer", "null"] },
             "messages": { "type": ["integer", "null"] },
             "open_error": { "type": ["string", "null"] },
-            "counts_skipped": { "type": "boolean" }
+            "counts_skipped": { "type": "boolean" },
+            "open_skipped": { "type": "boolean" }
         }
     })
 }
@@ -18173,6 +18179,10 @@ mod response_schema_tests {
         assert_eq!(
             schemas["health"]["properties"]["db"]["properties"]["open_error"]["type"],
             serde_json::json!(["string", "null"])
+        );
+        assert_eq!(
+            schemas["health"]["properties"]["db"]["properties"]["open_skipped"]["type"],
+            serde_json::json!("boolean")
         );
     }
 

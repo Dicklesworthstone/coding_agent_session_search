@@ -586,6 +586,14 @@ fn health_json_large_seeded_db_p50_stays_under_50ms() {
         // open path trips this AND the latency assertion below.
         assert_eq!(
             payload
+                .get("db")
+                .and_then(|db| db.get("open_skipped"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "top-level health db MUST report open_skipped=true for skipped regular-file opens"
+        );
+        assert_eq!(
+            payload
                 .get("state")
                 .and_then(|s| s.get("database"))
                 .and_then(|db| db.get("open_skipped"))

@@ -2745,6 +2745,11 @@ fn health_json_reports_open_error_for_unopenable_db_path() {
     assert_eq!(json["status"], Value::String("degraded".to_string()));
     assert_eq!(json["db"]["exists"], Value::Bool(true));
     assert_eq!(json["db"]["opened"], Value::Bool(false));
+    assert_eq!(
+        json["db"]["open_skipped"],
+        Value::Bool(false),
+        "top-level health db MUST report open_skipped=false when probe_state_db ran: {json}"
+    );
     assert!(
         json["db"]["open_error"]
             .as_str()
