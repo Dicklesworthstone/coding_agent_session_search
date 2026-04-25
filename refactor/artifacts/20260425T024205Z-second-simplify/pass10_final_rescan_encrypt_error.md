@@ -48,4 +48,7 @@ Great, now I want you to carefully read over all of the new code you just wrote 
 - Passed: `rustfmt --edition 2024 --check src/pages/encrypt.rs`
 - Passed: `git diff --check -- src/pages/encrypt.rs refactor/artifacts/20260425T024205Z-second-simplify/pass10_final_rescan_encrypt_error.md`
 - Passed: `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_cass_second_simplify cargo test --lib pages::encrypt::tests::unwrap_key_chains_aead_source_error_into_diagnostic_message` (1 passed)
-- Pending: final run gates.
+- Passed: final touched-file rustfmt check.
+- Passed: `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_cass_second_simplify cargo check --all-targets`
+- Passed: `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_cass_second_simplify cargo clippy --all-targets -- -D warnings`
+- Full `cargo fmt --check`: red on pre-existing formatting drift in `tests/golden_robot_docs.rs`, `tests/golden_robot_json.rs`, and `tests/metamorphic_agent_detection.rs`.

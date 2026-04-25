@@ -21,7 +21,7 @@ Run id: `20260425T024205Z-second-simplify`
 | 7 | Centralize Cloudflare env literals | `ba7ee5a7` | Productive |
 | 8 | Extract analytics breakdown projection | `a6fe7d76` | Productive |
 | 9 | Remove chart slice type alias | `e1ad7716` | Productive |
-| 10 | Derive private AEAD source error wrapper | pending | Productive |
+| 10 | Derive private AEAD source error wrapper | `4426e6cb` | Productive |
 
 ## Fresh-Eyes Status
 
@@ -34,9 +34,10 @@ Each pass includes a proof card with the requested fresh-eyes prompt, an equival
 
 - Pass-specific rustfmt and `git diff --check` gates: passed for passes 1-10.
 - Pass-specific focused tests: passed for passes 1-10.
-- Final `cargo check --all-targets`: pending.
-- Final `cargo clippy --all-targets -- -D warnings`: pending.
-- Final touched-file rustfmt: pending.
+- Final touched-file rustfmt: passed.
+- Final `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_cass_second_simplify cargo check --all-targets`: passed.
+- Final `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_cass_second_simplify cargo clippy --all-targets -- -D warnings`: passed.
+- Full `cargo fmt --check`: red only on pre-existing formatting drift in `tests/golden_robot_docs.rs`, `tests/golden_robot_json.rs`, and `tests/metamorphic_agent_detection.rs`.
 
 ## Residual Scope Notes
 
