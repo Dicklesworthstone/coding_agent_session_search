@@ -31,6 +31,7 @@ use asupersync::bytes::Buf;
 use asupersync::http::Body;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 use url::Url;
 
 use crate::search::policy::{ModelDownloadPolicy, SemanticPolicy};
@@ -914,23 +915,29 @@ pub struct DownloadProgress {
 }
 
 /// Download error types.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum DownloadError {
     /// Network error during download.
+    #[error("network error: {0}")]
     NetworkError(String),
     /// File I/O error.
-    IoError(std::io::Error),
+    #[error("I/O error: {0}")]
+    IoError(#[from] std::io::Error),
     /// SHA256 verification failed.
+    #[error("verification failed for {file}: expected {expected}, got {actual}")]
     VerificationFailed {
         file: String,
         expected: String,
         actual: String,
     },
     /// Download was cancelled.
+    #[error("download cancelled")]
     Cancelled,
     /// Timeout during download.
+    #[error("download timed out")]
     Timeout,
     /// HTTP error response.
+    #[error("HTTP error {status}: {message}")]
     HttpError { status: u16, message: String },
     /// Manifest has placeholder checksums and is not production-ready.
     ///
@@ -938,66 +945,23 @@ pub enum DownloadError {
     /// model that has not yet been verified. The model files need to be:
     /// 1. Downloaded manually to compute SHA256 checksums
     /// 2. Revision pinned to a specific commit (not "main")
+    #[error(
+        "model '{model_id}' is not production-ready: {} file(s) have placeholder checksums{}",
+        unverified_files.len(),
+        if *revision_unpinned {
+            " and revision is not pinned"
+        } else {
+            ""
+        }
+    )]
     ManifestNotVerified {
         model_id: String,
         unverified_files: Vec<String>,
         revision_unpinned: bool,
     },
     /// Mirror URL failed validation.
+    #[error("invalid mirror URL '{url}': {reason}")]
     InvalidMirrorUrl { url: String, reason: String },
-}
-
-impl std::fmt::Display for DownloadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DownloadError::NetworkError(msg) => write!(f, "network error: {msg}"),
-            DownloadError::IoError(err) => write!(f, "I/O error: {err}"),
-            DownloadError::VerificationFailed {
-                file,
-                expected,
-                actual,
-            } => {
-                write!(
-                    f,
-                    "verification failed for {file}: expected {expected}, got {actual}"
-                )
-            }
-            DownloadError::Cancelled => write!(f, "download cancelled"),
-            DownloadError::Timeout => write!(f, "download timed out"),
-            DownloadError::HttpError { status, message } => {
-                write!(f, "HTTP error {status}: {message}")
-            }
-            DownloadError::ManifestNotVerified {
-                model_id,
-                unverified_files,
-                revision_unpinned,
-            } => {
-                write!(
-                    f,
-                    "model '{}' is not production-ready: {} file(s) have placeholder checksums{}",
-                    model_id,
-                    unverified_files.len(),
-                    if *revision_unpinned {
-                        " and revision is not pinned"
-                    } else {
-                        ""
-                    }
-                )
-            }
-            DownloadError::InvalidMirrorUrl { url, reason } => {
-                write!(f, "invalid mirror URL '{url}': {reason}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DownloadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            DownloadError::IoError(err) => Some(err),
-            _ => None,
-        }
-    }
 }
 
 impl DownloadError {
@@ -1018,12 +982,6 @@ impl DownloadError {
 
     fn should_discard_temp(&self) -> bool {
         matches!(self, DownloadError::VerificationFailed { .. })
-    }
-}
-
-impl From<std::io::Error> for DownloadError {
-    fn from(err: std::io::Error) -> Self {
-        DownloadError::IoError(err)
     }
 }
 
@@ -2007,6 +1965,7 @@ fn sync_parent_directory(_path: &Path) -> Result<(), DownloadError> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::error::Error as _;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2697,27 +2656,69 @@ mod tests {
 
     #[test]
     fn test_download_error_display() {
-        let err = DownloadError::NetworkError("connection refused".into());
-        assert!(err.to_string().contains("network error"));
+        let display_cases = [
+            (
+                DownloadError::NetworkError("connection refused".into()),
+                "network error: connection refused",
+            ),
+            (
+                DownloadError::VerificationFailed {
+                    file: "test.onnx".into(),
+                    expected: "abc".into(),
+                    actual: "def".into(),
+                },
+                "verification failed for test.onnx: expected abc, got def",
+            ),
+            (DownloadError::Cancelled, "download cancelled"),
+            (DownloadError::Timeout, "download timed out"),
+            (
+                DownloadError::HttpError {
+                    status: 503,
+                    message: "service unavailable".into(),
+                },
+                "HTTP error 503: service unavailable",
+            ),
+            (
+                DownloadError::ManifestNotVerified {
+                    model_id: "test-model".into(),
+                    unverified_files: vec!["model.onnx".into(), "config.json".into()],
+                    revision_unpinned: true,
+                },
+                "model 'test-model' is not production-ready: 2 file(s) have placeholder checksums and revision is not pinned",
+            ),
+            (
+                DownloadError::ManifestNotVerified {
+                    model_id: "test-model".into(),
+                    unverified_files: vec!["model.onnx".into()],
+                    revision_unpinned: false,
+                },
+                "model 'test-model' is not production-ready: 1 file(s) have placeholder checksums",
+            ),
+            (
+                DownloadError::InvalidMirrorUrl {
+                    url: "ftp://mirror.example/model.onnx".into(),
+                    reason: "unsupported scheme".into(),
+                },
+                "invalid mirror URL 'ftp://mirror.example/model.onnx': unsupported scheme",
+            ),
+        ];
 
-        let err = DownloadError::VerificationFailed {
-            file: "test.onnx".into(),
-            expected: "abc".into(),
-            actual: "def".into(),
-        };
-        assert!(err.to_string().contains("verification failed"));
-        assert!(err.to_string().contains("test.onnx"));
+        for (err, expected) in display_cases {
+            assert_eq!(err.to_string(), expected);
+        }
 
-        let err = DownloadError::ManifestNotVerified {
-            model_id: "test-model".into(),
-            unverified_files: vec!["model.onnx".into(), "config.json".into()],
-            revision_unpinned: true,
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("test-model"));
-        assert!(msg.contains("not production-ready"));
-        assert!(msg.contains("2 file(s)"));
-        assert!(msg.contains("revision is not pinned"));
+        let err: DownloadError = std::io::Error::other("disk full").into();
+
+        assert_eq!(err.to_string(), "I/O error: disk full");
+        let source = err.source().expect("I/O errors expose their source");
+        assert_eq!(source.to_string(), "disk full");
+
+        assert!(
+            DownloadError::NetworkError("connection refused".into())
+                .source()
+                .is_none(),
+            "non-source variants must not gain an error source"
+        );
     }
 
     #[test]
