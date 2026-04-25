@@ -797,17 +797,24 @@ pub(crate) fn write_private_artifacts_encrypted(
     }
 
     // Write master key backup (encrypted DEK wrapped with KEK)
-    let master_key_backup = serde_json::json!({
-        "export_id": enc_config.export_id,
-        "key_slots": enc_config.key_slots,
-        "note": "This file contains the wrapped DEK. Keep it with your recovery secret.",
-        "generated_at": Utc::now().to_rfc3339(),
-    });
+    let master_key_backup = master_key_backup_json(enc_config, Utc::now().to_rfc3339());
     let master_key_path = private_dir.join("master-key.json");
     let master_key_file = File::create(&master_key_path)?;
     serde_json::to_writer_pretty(BufWriter::new(master_key_file), &master_key_backup)?;
 
     Ok(())
+}
+
+fn master_key_backup_json(
+    enc_config: &EncryptionConfig,
+    generated_at: String,
+) -> serde_json::Value {
+    serde_json::json!({
+        "export_id": &enc_config.export_id,
+        "key_slots": &enc_config.key_slots,
+        "note": "This file contains the wrapped DEK. Keep it with your recovery secret.",
+        "generated_at": generated_at,
+    })
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<()> {
@@ -1022,6 +1029,35 @@ mod tests {
         // Same manifest should produce same fingerprint
         let fingerprint2 = compute_fingerprint(&manifest);
         assert_eq!(fingerprint, fingerprint2);
+    }
+
+    #[test]
+    fn test_master_key_backup_json_shape() {
+        let config = EncryptionConfig {
+            version: 2,
+            export_id: "export-123".to_string(),
+            base_nonce: "nonce".to_string(),
+            compression: "deflate".to_string(),
+            kdf_defaults: crate::pages::encrypt::Argon2Params::default(),
+            payload: crate::pages::encrypt::PayloadMeta {
+                chunk_size: 1024,
+                chunk_count: 0,
+                total_compressed_size: 0,
+                total_plaintext_size: 0,
+                files: Vec::new(),
+            },
+            key_slots: Vec::new(),
+        };
+
+        let backup = master_key_backup_json(&config, "2026-04-25T19:08:00Z".to_string());
+
+        assert_eq!(backup["export_id"], "export-123");
+        assert_eq!(backup["key_slots"], serde_json::json!([]));
+        assert_eq!(
+            backup["note"],
+            "This file contains the wrapped DEK. Keep it with your recovery secret."
+        );
+        assert_eq!(backup["generated_at"], "2026-04-25T19:08:00Z");
     }
 
     #[test]
