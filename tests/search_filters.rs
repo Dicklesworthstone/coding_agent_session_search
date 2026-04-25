@@ -4,6 +4,13 @@ use tempfile::TempDir;
 
 mod util;
 
+fn commit_and_open_client(index: &mut TantivyIndex, dir: &TempDir) -> SearchClient {
+    index.commit().unwrap();
+    SearchClient::open(dir.path(), None)
+        .unwrap()
+        .expect("client")
+}
+
 /// Agent filter should constrain results to the selected agent only.
 #[test]
 fn agent_filter_limits_results() {
@@ -27,11 +34,7 @@ fn agent_filter_limits_results() {
 
     index.add_conversation(&conv_codex).unwrap();
     index.add_conversation(&conv_claude).unwrap();
-    index.commit().unwrap();
-
-    let client = SearchClient::open(dir.path(), None)
-        .unwrap()
-        .expect("client");
+    let client = commit_and_open_client(&mut index, &dir);
 
     let mut filters = SearchFilters::default();
     filters.agents.insert("codex".into());
@@ -68,11 +71,7 @@ fn workspace_filter_limits_results() {
 
     index.add_conversation(&conv_a).unwrap();
     index.add_conversation(&conv_b).unwrap();
-    index.commit().unwrap();
-
-    let client = SearchClient::open(dir.path(), None)
-        .unwrap()
-        .expect("client");
+    let client = commit_and_open_client(&mut index, &dir);
     let mut filters = SearchFilters::default();
     filters
         .workspaces
@@ -111,11 +110,7 @@ fn time_filter_respects_since_until() {
     index.add_conversation(&conv_old).unwrap();
     index.add_conversation(&conv_mid).unwrap();
     index.add_conversation(&conv_new).unwrap();
-    index.commit().unwrap();
-
-    let client = SearchClient::open(dir.path(), None)
-        .unwrap()
-        .expect("client");
+    let client = commit_and_open_client(&mut index, &dir);
 
     let filters = SearchFilters {
         created_from: Some(1_750_000_000_000), // between old and mid
@@ -154,11 +149,7 @@ fn minimal_field_mask_preserves_order() {
 
     index.add_conversation(&conv_strong).unwrap();
     index.add_conversation(&conv_weak).unwrap();
-    index.commit().unwrap();
-
-    let client = SearchClient::open(dir.path(), None)
-        .unwrap()
-        .expect("client");
+    let client = commit_and_open_client(&mut index, &dir);
 
     let full_hits = client
         .search("repeat", SearchFilters::default(), 10, 0, FieldMask::FULL)
