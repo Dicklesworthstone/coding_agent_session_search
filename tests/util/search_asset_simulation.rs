@@ -629,18 +629,9 @@ impl SearchAssetSimulationHarness {
         let summary_path = root.join("summary.json");
 
         fs::write(&phase_log_path, self.phase_log_jsonl())?;
-        fs::write(
-            &failpoints_path,
-            serde_json::to_vec_pretty(&self.failpoint_markers).map_err(std::io::Error::other)?,
-        )?;
-        fs::write(
-            &actor_traces_path,
-            serde_json::to_vec_pretty(&self.actor_traces).map_err(std::io::Error::other)?,
-        )?;
-        fs::write(
-            &summary_path,
-            serde_json::to_vec_pretty(&self.summary()).map_err(std::io::Error::other)?,
-        )?;
+        write_pretty_json_file(&failpoints_path, &self.failpoint_markers)?;
+        write_pretty_json_file(&actor_traces_path, &self.actor_traces)?;
+        write_pretty_json_file(&summary_path, &self.summary())?;
 
         Ok(SimulationArtifacts {
             root,
@@ -651,6 +642,13 @@ impl SearchAssetSimulationHarness {
             snapshot_dir,
         })
     }
+}
+
+fn write_pretty_json_file<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?,
+    )
 }
 
 fn sanitize_label(label: &str) -> String {
