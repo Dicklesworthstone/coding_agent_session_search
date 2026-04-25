@@ -115,14 +115,9 @@ impl Default for BundleConfig {
 }
 
 /// Bundle builder for creating static site exports
+#[derive(Default)]
 pub struct BundleBuilder {
     config: BundleConfig,
-}
-
-impl Default for BundleBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl BundleBuilder {
