@@ -143,12 +143,7 @@ pub fn key_add_password(
 
     // Create new slot (use max ID + 1 since IDs are stable after revocation)
     // If no slots exist, start at 0; otherwise use max + 1
-    let slot_id = match config.key_slots.iter().map(|s| s.id).max() {
-        Some(max_id) => max_id.checked_add(1).ok_or_else(|| {
-            anyhow::anyhow!("Cannot add more key slots: maximum slot ID (255) reached")
-        })?,
-        None => 0,
-    };
+    let slot_id = next_key_slot_id(&config.key_slots)?;
     let new_slot = create_password_slot(new_password, &dek, &config.export_id, slot_id)?;
 
     config.key_slots.push(new_slot);
@@ -181,12 +176,7 @@ pub fn key_add_recovery(
 
     // Create new slot (use max ID + 1 since IDs are stable after revocation)
     // If no slots exist, start at 0; otherwise use max + 1
-    let slot_id = match config.key_slots.iter().map(|s| s.id).max() {
-        Some(max_id) => max_id.checked_add(1).ok_or_else(|| {
-            anyhow::anyhow!("Cannot add more key slots: maximum slot ID (255) reached")
-        })?,
-        None => 0,
-    };
+    let slot_id = next_key_slot_id(&config.key_slots)?;
     let new_slot = create_recovery_slot(secret.as_bytes(), &dek, &config.export_id, slot_id)?;
 
     config.key_slots.push(new_slot);
@@ -206,6 +196,15 @@ pub fn key_add_recovery(
 
     info!(slot_id, "Added recovery key slot");
     Ok((slot_id, secret))
+}
+
+fn next_key_slot_id(key_slots: &[KeySlot]) -> Result<u8> {
+    match key_slots.iter().map(|s| s.id).max() {
+        Some(max_id) => max_id.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("Cannot add more key slots: maximum slot ID (255) reached")
+        }),
+        None => Ok(0),
+    }
 }
 
 /// Revoke a key slot
@@ -1534,6 +1533,20 @@ mod tests {
         assert!(unwrap_dek_with_password(&config, "password-1").is_err()); // Revoked
         assert!(unwrap_dek_with_password(&config, "password-2").is_ok());
         assert!(unwrap_dek_with_password(&config, "password-3").is_ok());
+    }
+
+    #[test]
+    fn test_next_key_slot_id_rejects_max_id() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let mut config = load_config(&archive_dir).unwrap();
+        config.key_slots[0].id = u8::MAX;
+
+        let err = next_key_slot_id(&config.key_slots).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Cannot add more key slots: maximum slot ID (255) reached"
+        );
     }
 
     #[test]
