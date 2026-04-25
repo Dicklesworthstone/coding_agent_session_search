@@ -306,6 +306,10 @@ fn default_output_dir() -> String {
     "cass-export".to_string()
 }
 
+fn resolve_env_var(env_var: &str) -> Result<String, ConfigError> {
+    dotenvy::var(env_var).map_err(|_| ConfigError::EnvVarNotFound(env_var.to_string()))
+}
+
 impl PagesConfig {
     fn normalized_path_mode(&self) -> Option<String> {
         self.filters
@@ -350,34 +354,24 @@ impl PagesConfig {
         if let Some(ref password) = self.encryption.password
             && let Some(env_var) = password.strip_prefix("env:")
         {
-            self.encryption.password = Some(
-                dotenvy::var(env_var)
-                    .map_err(|_| ConfigError::EnvVarNotFound(env_var.to_string()))?,
-            );
+            self.encryption.password = Some(resolve_env_var(env_var)?);
         }
 
         // Resolve env vars in output_dir if prefixed
         if let Some(env_var) = self.deployment.output_dir.strip_prefix("env:") {
-            self.deployment.output_dir = dotenvy::var(env_var)
-                .map_err(|_| ConfigError::EnvVarNotFound(env_var.to_string()))?;
+            self.deployment.output_dir = resolve_env_var(env_var)?;
         }
 
         if let Some(ref account_id) = self.deployment.account_id
             && let Some(env_var) = account_id.strip_prefix("env:")
         {
-            self.deployment.account_id = Some(
-                dotenvy::var(env_var)
-                    .map_err(|_| ConfigError::EnvVarNotFound(env_var.to_string()))?,
-            );
+            self.deployment.account_id = Some(resolve_env_var(env_var)?);
         }
 
         if let Some(ref api_token) = self.deployment.api_token
             && let Some(env_var) = api_token.strip_prefix("env:")
         {
-            self.deployment.api_token = Some(
-                dotenvy::var(env_var)
-                    .map_err(|_| ConfigError::EnvVarNotFound(env_var.to_string()))?,
-            );
+            self.deployment.api_token = Some(resolve_env_var(env_var)?);
         }
 
         Ok(())
