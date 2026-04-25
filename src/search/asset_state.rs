@@ -370,6 +370,7 @@ pub(crate) struct InspectSearchAssetsInput<'a> {
     pub semantic_preference: SemanticPreference,
     pub db_available: bool,
     pub compute_lexical_fingerprint: bool,
+    pub inspect_semantic: bool,
 }
 
 const LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS: i64 = 1_000;
@@ -425,6 +426,7 @@ pub(crate) fn inspect_search_assets(
         semantic_preference,
         db_available,
         compute_lexical_fingerprint,
+        inspect_semantic,
     } = input;
 
     let lexical = inspect_lexical_assets(InspectLexicalAssetsInput {
@@ -437,14 +439,60 @@ pub(crate) fn inspect_search_assets(
         db_available,
         compute_lexical_fingerprint,
     })?;
-    let semantic = inspect_semantic_assets(
-        data_dir,
-        db_path,
-        semantic_preference,
-        lexical.fingerprint.current_db_fingerprint.as_deref(),
-    );
+    let current_db_fingerprint = lexical.fingerprint.current_db_fingerprint.as_deref();
+    let semantic = if inspect_semantic {
+        inspect_semantic_assets(
+            data_dir,
+            db_path,
+            semantic_preference,
+            current_db_fingerprint,
+        )
+    } else {
+        semantic_state_not_inspected(data_dir, semantic_preference, current_db_fingerprint)
+    };
 
     Ok(SearchAssetSnapshot { lexical, semantic })
+}
+
+fn semantic_state_not_inspected(
+    data_dir: &Path,
+    preference: SemanticPreference,
+    current_db_fingerprint: Option<&str>,
+) -> SemanticAssetState {
+    let (fast_tier, quality_tier, backlog, checkpoint) =
+        semantic_manifest_progress(data_dir, current_db_fingerprint);
+    let preferred_backend = match preference {
+        SemanticPreference::DefaultModel => "fastembed",
+        SemanticPreference::HashFallback => "hash",
+    };
+    let model_dir = match preference {
+        SemanticPreference::DefaultModel => Some(FastEmbedder::default_model_dir(data_dir)),
+        SemanticPreference::HashFallback => None,
+    };
+
+    SemanticAssetState {
+        status: "not_inspected",
+        availability: "not_inspected",
+        summary: "semantic assets were not inspected for this fast path".to_string(),
+        available: false,
+        can_search: false,
+        fallback_mode: Some("lexical"),
+        preferred_backend,
+        embedder_id: None,
+        vector_index_path: None,
+        model_dir,
+        hnsw_path: None,
+        hnsw_ready: false,
+        progressive_ready: semantic_progressive_assets_ready(data_dir),
+        hint: Some(
+            "Use 'cass status --json' or 'cass models status --json' for semantic readiness."
+                .to_string(),
+        ),
+        fast_tier,
+        quality_tier,
+        backlog,
+        checkpoint,
+    }
 }
 
 pub(crate) fn inspect_semantic_assets(
@@ -2054,6 +2102,7 @@ mod tests {
             semantic_preference: SemanticPreference::HashFallback,
             db_available: false,
             compute_lexical_fingerprint: false,
+            inspect_semantic: true,
         })
         .expect("asset inspection should not fail when db availability is already known");
 
@@ -2062,6 +2111,41 @@ mod tests {
         assert_eq!(snapshot.semantic.availability, "database_unavailable");
         assert_eq!(snapshot.semantic.fallback_mode, Some("lexical"));
         assert!(snapshot.semantic.summary.contains("db unavailable"));
+    }
+
+    #[test]
+    fn inspect_search_assets_can_skip_semantic_db_open_for_fast_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::create_dir_all(&db_path).expect("create unopenable db path");
+
+        let vector_path = vector_index_path(temp.path(), HashEmbedder::default().id());
+        std::fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector dir");
+        std::fs::write(&vector_path, b"index").expect("write vector index");
+
+        let snapshot = inspect_search_assets(InspectSearchAssetsInput {
+            data_dir: temp.path(),
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_secs: 1_733_000_001,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            semantic_preference: SemanticPreference::HashFallback,
+            db_available: false,
+            compute_lexical_fingerprint: false,
+            inspect_semantic: false,
+        })
+        .expect("asset inspection should not open semantic DB when semantic inspection is skipped");
+
+        assert_ne!(snapshot.lexical.status, "error");
+        assert_eq!(snapshot.semantic.status, "not_inspected");
+        assert_eq!(snapshot.semantic.availability, "not_inspected");
+        assert_eq!(snapshot.semantic.fallback_mode, Some("lexical"));
     }
 
     #[test]

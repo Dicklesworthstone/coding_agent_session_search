@@ -5710,6 +5710,7 @@ fn state_meta_json_inner(
             semantic_preference: crate::search::asset_state::SemanticPreference::DefaultModel,
             db_available: db_opened,
             compute_lexical_fingerprint: include_counts,
+            inspect_semantic: allow_db_open && !skip_db_open,
         },
     )
     .unwrap_or_else(|err| {
