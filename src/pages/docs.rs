@@ -717,6 +717,12 @@ mod tests {
         ScanReportSummary, WorkspaceSummaryItem,
     };
 
+    macro_rules! assert_doc_contains {
+        ($doc:expr, $needle:literal) => {
+            assert!($doc.content.contains($needle));
+        };
+    }
+
     fn create_test_summary() -> PrePublishSummary {
         PrePublishSummary {
             total_conversations: 42,
@@ -784,12 +790,12 @@ mod tests {
 
         assert_eq!(doc.filename, "README.md");
         assert_eq!(doc.location, DocLocation::RepoRoot);
-        assert!(doc.content.contains("Encrypted Coding Session Archive"));
-        assert!(doc.content.contains("42 conversations"));
-        assert!(doc.content.contains("claude-code"));
-        assert!(doc.content.contains("aider"));
-        assert!(doc.content.contains("https://example.github.io/archive"));
-        assert!(doc.content.contains("2 independent decryption key(s)"));
+        assert_doc_contains!(doc, "Encrypted Coding Session Archive");
+        assert_doc_contains!(doc, "42 conversations");
+        assert_doc_contains!(doc, "claude-code");
+        assert_doc_contains!(doc, "aider");
+        assert_doc_contains!(doc, "https://example.github.io/archive");
+        assert_doc_contains!(doc, "2 independent decryption key(s)");
     }
 
     #[test]
@@ -802,15 +808,15 @@ mod tests {
 
         assert_eq!(doc.filename, "SECURITY.md");
         assert_eq!(doc.location, DocLocation::RepoRoot);
-        assert!(doc.content.contains("Security Model"));
-        assert!(doc.content.contains("AES-256-GCM"));
-        assert!(doc.content.contains("Argon2id"));
-        assert!(doc.content.contains("m=131072KB"));
-        assert!(doc.content.contains("t=4"));
-        assert!(doc.content.contains("p=8"));
-        assert!(doc.content.contains("2 key slot(s)"));
-        assert!(doc.content.contains("Password-derived"));
-        assert!(doc.content.contains("Recovery phrase"));
+        assert_doc_contains!(doc, "Security Model");
+        assert_doc_contains!(doc, "AES-256-GCM");
+        assert_doc_contains!(doc, "Argon2id");
+        assert_doc_contains!(doc, "m=131072KB");
+        assert_doc_contains!(doc, "t=4");
+        assert_doc_contains!(doc, "p=8");
+        assert_doc_contains!(doc, "2 key slot(s)");
+        assert_doc_contains!(doc, "Password-derived");
+        assert_doc_contains!(doc, "Recovery phrase");
     }
 
     #[test]
@@ -823,11 +829,11 @@ mod tests {
 
         assert_eq!(doc.filename, "help.html");
         assert_eq!(doc.location, DocLocation::WebRoot);
-        assert!(doc.content.contains("<!DOCTYPE html>"));
-        assert!(doc.content.contains("<title>Help - CASS Archive</title>"));
-        assert!(doc.content.contains("Accessing the Archive"));
-        assert!(doc.content.contains("Searching"));
-        assert!(doc.content.contains("Troubleshooting"));
+        assert_doc_contains!(doc, "<!DOCTYPE html>");
+        assert_doc_contains!(doc, "<title>Help - CASS Archive</title>");
+        assert_doc_contains!(doc, "Accessing the Archive");
+        assert_doc_contains!(doc, "Searching");
+        assert_doc_contains!(doc, "Troubleshooting");
     }
 
     #[test]
@@ -840,9 +846,9 @@ mod tests {
 
         assert_eq!(doc.filename, "recovery.html");
         assert_eq!(doc.location, DocLocation::WebRoot);
-        assert!(doc.content.contains("Password Recovery"));
-        assert!(doc.content.contains("Using Your Recovery Key"));
-        assert!(doc.content.contains("Good news!"));
+        assert_doc_contains!(doc, "Password Recovery");
+        assert_doc_contains!(doc, "Using Your Recovery Key");
+        assert_doc_contains!(doc, "Good news!");
     }
 
     #[test]
@@ -860,7 +866,7 @@ mod tests {
 
         let doc = generator.generate_recovery_html();
 
-        assert!(doc.content.contains("not configured with a recovery key"));
+        assert_doc_contains!(doc, "not configured with a recovery key");
         assert!(!doc.content.contains("Good news!"));
     }
 
@@ -874,9 +880,9 @@ mod tests {
 
         assert_eq!(doc.filename, "about.txt");
         assert_eq!(doc.location, DocLocation::WebRoot);
-        assert!(doc.content.contains("ENCRYPTED CODING SESSION ARCHIVE"));
-        assert!(doc.content.contains("42 conversations"));
-        assert!(doc.content.contains("https://example.com/archive"));
+        assert_doc_contains!(doc, "ENCRYPTED CODING SESSION ARCHIVE");
+        assert_doc_contains!(doc, "42 conversations");
+        assert_doc_contains!(doc, "https://example.com/archive");
     }
 
     #[test]
@@ -930,8 +936,8 @@ mod tests {
 
         let doc = generator.generate_security_doc();
 
-        assert!(doc.content.contains("0 key slot(s)"));
-        assert!(doc.content.contains("No key slots configured yet"));
+        assert_doc_contains!(doc, "0 key slot(s)");
+        assert_doc_contains!(doc, "No key slots configured yet");
     }
 
     #[test]
@@ -942,7 +948,7 @@ mod tests {
 
         let doc = generator.generate_readme();
 
-        assert!(doc.content.contains("[deployment URL]"));
+        assert_doc_contains!(doc, "[deployment URL]");
     }
 
     #[test]

@@ -4392,6 +4392,21 @@ pub struct SourcesViewItem {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SourcesRowEphemeralState {
+    busy: bool,
+    doctor_summary: Option<(usize, usize, usize)>,
+}
+
+impl SourcesRowEphemeralState {
+    fn from_item(item: &SourcesViewItem) -> Self {
+        Self {
+            busy: item.busy,
+            doctor_summary: item.doctor_summary,
+        }
+    }
+}
+
 /// State for the Sources management surface.
 #[derive(Clone, Debug, Default)]
 pub struct SourcesViewState {
@@ -12807,19 +12822,16 @@ impl CassApp {
             .get(previous_selected)
             .map(|item| item.name.clone());
         let previous_scroll = self.sources_view.scroll;
-        let previous_row_state: HashMap<String, (bool, Option<(usize, usize, usize)>)> = self
+        let previous_row_state: HashMap<String, SourcesRowEphemeralState> = self
             .sources_view
             .items
             .iter()
-            .map(|item| (item.name.clone(), (item.busy, item.doctor_summary)))
+            .map(|item| (item.name.clone(), SourcesRowEphemeralState::from_item(item)))
             .collect();
         let mut items = Vec::new();
 
         // Always show the "local" pseudo-source first.
-        let (local_busy, local_doctor_summary) = previous_row_state
-            .get("local")
-            .copied()
-            .unwrap_or((false, None));
+        let local_state = previous_row_state.get("local").copied().unwrap_or_default();
         items.push(SourcesViewItem {
             name: "local".into(),
             kind: crate::sources::SourceKind::Local,
@@ -12830,17 +12842,17 @@ impl CassApp {
             last_result: "n/a".into(),
             files_synced: 0,
             bytes_transferred: 0,
-            busy: local_busy,
-            doctor_summary: local_doctor_summary,
+            busy: local_state.busy,
+            doctor_summary: local_state.doctor_summary,
             error: None,
         });
 
         for src in &config.sources {
             let info = sync_status.sources.get(&src.name);
-            let (busy, doctor_summary) = previous_row_state
+            let row_state = previous_row_state
                 .get(&src.name)
                 .copied()
-                .unwrap_or((false, None));
+                .unwrap_or_default();
             items.push(SourcesViewItem {
                 name: src.name.clone(),
                 kind: src.source_type,
@@ -12854,8 +12866,8 @@ impl CassApp {
                     .into(),
                 files_synced: info.map(|i| i.files_synced).unwrap_or(0),
                 bytes_transferred: info.map(|i| i.bytes_transferred).unwrap_or(0),
-                busy,
-                doctor_summary,
+                busy: row_state.busy,
+                doctor_summary: row_state.doctor_summary,
                 error: info.and_then(|i| i.last_result.error_message().map(str::to_owned)),
             });
         }
