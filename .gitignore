@@ -189,3 +189,10 @@ storage.sqlite3-wal.corrupt-*
 # tests/pages_export_golden.rs when a golden diverges from expected, strictly
 # for local diffing ahead of UPDATE_GOLDENS=1 regeneration. Never committed.
 tests/golden/**/*.actual
+
+# cargo-fuzz duplicate corpus tree, created when cargo-fuzz is invoked from
+# inside the fuzz/ subcrate (default destination is `./fuzz/corpus/<target>/`,
+# which from within fuzz/ resolves to `fuzz/fuzz/corpus/<target>/`). The real
+# tracked corpus lives at fuzz/corpus/<target>/; this nested tree is a
+# regeneratable mirror of the same seed files.
+fuzz/fuzz/
