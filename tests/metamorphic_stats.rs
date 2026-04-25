@@ -19,10 +19,86 @@
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod util;
 use util::EnvGuard;
+
+struct StatsFixture {
+    _tmp: tempfile::TempDir,
+    home: PathBuf,
+    codex_home: PathBuf,
+    data_dir: PathBuf,
+}
+
+impl StatsFixture {
+    fn new() -> Self {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().to_path_buf();
+        let codex_home = home.join(".codex");
+        let data_dir = home.join("cass_data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        Self {
+            _tmp: tmp,
+            home,
+            codex_home,
+            data_dir,
+        }
+    }
+
+    fn env_guards(&self) -> (EnvGuard, EnvGuard) {
+        (
+            EnvGuard::set("HOME", self.home.to_string_lossy().as_ref()),
+            EnvGuard::set("CODEX_HOME", self.codex_home.to_string_lossy().as_ref()),
+        )
+    }
+
+    fn index_full(&self) {
+        cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--data-dir"])
+            .arg(&self.data_dir)
+            .env("CODEX_HOME", &self.codex_home)
+            .env("HOME", &self.home)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .assert()
+            .success();
+    }
+
+    fn stats_json(&self, by_source: bool) -> serde_json::Value {
+        let mut args: Vec<&str> = vec!["stats", "--json"];
+        if by_source {
+            args.push("--by-source");
+        }
+        args.push("--data-dir");
+        let data_dir_str = self.data_dir.to_str().expect("utf8 data dir");
+        args.push(data_dir_str);
+
+        let output = cargo_bin_cmd!("cass")
+            .args(&args)
+            .env("HOME", &self.home)
+            .env("CODEX_HOME", &self.codex_home)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass stats");
+        assert!(
+            output.status.success(),
+            "cass stats {args:?} exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        serde_json::from_slice(&output.stdout).expect("cass stats --json output is valid JSON")
+    }
+
+    fn seed(&self, day: &str, rollout: &str, content: &str, ts_millis: u64) {
+        let date_path = format!("2024/11/{day}");
+        let filename = format!("rollout-{rollout}.jsonl");
+        write_codex_session(&self.codex_home, &date_path, &filename, content, ts_millis);
+    }
+}
 
 /// Creates a Codex session JSONL file mirroring the helper used by
 /// tests/e2e_filters.rs::make_codex_session_at. Inlined here so this
@@ -46,34 +122,6 @@ fn write_codex_session(
     fs::write(file, sample).unwrap();
 }
 
-fn capture_stats_json(home: &Path, codex_home: &Path, data_dir: &Path, by_source: bool) -> serde_json::Value {
-    let mut args: Vec<&str> = vec!["stats", "--json"];
-    if by_source {
-        args.push("--by-source");
-    }
-    args.push("--data-dir");
-    let data_dir_str = data_dir.to_str().expect("utf8 data dir");
-    args.push(data_dir_str);
-
-    let output = cargo_bin_cmd!("cass")
-        .args(&args)
-        .env("HOME", home)
-        .env("CODEX_HOME", codex_home)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .output()
-        .expect("run cass stats");
-    assert!(
-        output.status.success(),
-        "cass stats {args:?} exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    serde_json::from_slice(&output.stdout)
-        .expect("cass stats --json output is valid JSON")
-}
-
 /// `coding_agent_session_search-5v5b4`: pin the metamorphic relation
 /// `total_messages == sum(by_source[*].messages)` AND
 /// `total_conversations == sum(by_source[*].conversations)`. Even
@@ -82,54 +130,22 @@ fn capture_stats_json(home: &Path, codex_home: &Path, data_dir: &Path, by_source
 /// regression in the by_source aggregator or the total counter.
 #[test]
 fn mr_stats_total_equals_sum_of_by_source() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let home = tmp.path();
-    let codex_home = home.join(".codex");
-    let data_dir = home.join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let fixture = StatsFixture::new();
+    let _guards = fixture.env_guards();
 
     // Seed three distinct Codex sessions across different dates so
     // the row count is unambiguously > 1. Each session contributes 2
     // messages (one user + one assistant) and 1 conversation, so the
     // expected aggregate is 3 conversations / 6 messages.
-    write_codex_session(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "first session content",
-        1_732_118_400_000,
-    );
-    write_codex_session(
-        &codex_home,
-        "2024/11/21",
-        "rollout-2.jsonl",
-        "second session content",
-        1_732_204_800_000,
-    );
-    write_codex_session(
-        &codex_home,
-        "2024/11/22",
-        "rollout-3.jsonl",
-        "third session content",
-        1_732_291_200_000,
-    );
+    fixture.seed("20", "1", "first session content", 1_732_118_400_000);
+    fixture.seed("21", "2", "second session content", 1_732_204_800_000);
+    fixture.seed("22", "3", "third session content", 1_732_291_200_000);
 
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .assert()
-        .success();
+    fixture.index_full();
 
     // Capture both stats variants.
-    let total = capture_stats_json(home, &codex_home, &data_dir, false);
-    let breakdown = capture_stats_json(home, &codex_home, &data_dir, true);
+    let total = fixture.stats_json(false);
+    let breakdown = fixture.stats_json(true);
 
     let total_conversations = total["conversations"]
         .as_i64()
@@ -196,21 +212,16 @@ fn mr_stats_total_equals_sum_of_by_source() {
 /// expecting the documented contract.
 #[test]
 fn mr_stats_empty_data_dir_produces_zero_counters_or_structured_error() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let home = tmp.path();
-    let codex_home = home.join(".codex");
-    let data_dir = home.join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-    fs::create_dir_all(&codex_home).unwrap();
+    let fixture = StatsFixture::new();
+    fs::create_dir_all(&fixture.codex_home).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let _guards = fixture.env_guards();
 
     let output = cargo_bin_cmd!("cass")
         .args(["stats", "--json", "--data-dir"])
-        .arg(&data_dir)
-        .env("HOME", home)
-        .env("CODEX_HOME", &codex_home)
+        .arg(&fixture.data_dir)
+        .env("HOME", &fixture.home)
+        .env("CODEX_HOME", &fixture.codex_home)
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .output()
@@ -230,8 +241,8 @@ fn mr_stats_empty_data_dir_produces_zero_counters_or_structured_error() {
     }
 
     // Success path on empty: every counter MUST be zero.
-    let total: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .expect("stats --json on empty dir emits valid JSON");
+    let total: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stats --json on empty dir emits valid JSON");
     assert_eq!(
         total["conversations"].as_i64(),
         Some(0),
@@ -258,41 +269,15 @@ fn mr_stats_empty_data_dir_produces_zero_counters_or_structured_error() {
 /// lexicographically by chronology, so string comparison is valid.
 #[test]
 fn mr_stats_date_range_oldest_lte_newest() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let home = tmp.path();
-    let codex_home = home.join(".codex");
-    let data_dir = home.join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
+    let fixture = StatsFixture::new();
+    let _guards = fixture.env_guards();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    fixture.seed("20", "1", "first", 1_732_118_400_000);
+    fixture.seed("22", "2", "second", 1_732_291_200_000);
 
-    write_codex_session(
-        &codex_home,
-        "2024/11/20",
-        "rollout-1.jsonl",
-        "first",
-        1_732_118_400_000,
-    );
-    write_codex_session(
-        &codex_home,
-        "2024/11/22",
-        "rollout-2.jsonl",
-        "second",
-        1_732_291_200_000,
-    );
+    fixture.index_full();
 
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .assert()
-        .success();
-
-    let total = capture_stats_json(home, &codex_home, &data_dir, false);
+    let total = fixture.stats_json(false);
     let date_range = &total["date_range"];
 
     let oldest_str = date_range["oldest"].as_str();
