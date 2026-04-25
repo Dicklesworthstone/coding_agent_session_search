@@ -221,14 +221,20 @@ pub enum SyncMethod {
     Sftp,
 }
 
+impl SyncMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rsync => "rsync",
+            Self::WslRsync => "wsl-rsync",
+            Self::Scp => "scp",
+            Self::Sftp => "sftp",
+        }
+    }
+}
+
 impl std::fmt::Display for SyncMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Rsync => write!(f, "rsync"),
-            Self::WslRsync => write!(f, "wsl-rsync"),
-            Self::Scp => write!(f, "scp"),
-            Self::Sftp => write!(f, "sftp"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -2451,10 +2457,15 @@ Total transferred file size: 1,234 bytes
 
     #[test]
     fn test_sync_method_display() {
-        assert_eq!(SyncMethod::Rsync.to_string(), "rsync");
-        assert_eq!(SyncMethod::WslRsync.to_string(), "wsl-rsync");
-        assert_eq!(SyncMethod::Scp.to_string(), "scp");
-        assert_eq!(SyncMethod::Sftp.to_string(), "sftp");
+        for (method, expected) in [
+            (SyncMethod::Rsync, "rsync"),
+            (SyncMethod::WslRsync, "wsl-rsync"),
+            (SyncMethod::Scp, "scp"),
+            (SyncMethod::Sftp, "sftp"),
+        ] {
+            assert_eq!(method.as_str(), expected);
+            assert_eq!(method.to_string(), expected);
+        }
     }
 
     #[test]
