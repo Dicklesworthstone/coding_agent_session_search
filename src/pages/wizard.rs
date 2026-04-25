@@ -1840,18 +1840,28 @@ impl PagesWizard {
         Ok(())
     }
 
+    fn deploy_site_dir(&self) -> PathBuf {
+        self.state
+            .final_site_dir
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.state.output_dir.join("site"))
+    }
+
+    fn deploy_project_name(&self) -> String {
+        self.state
+            .repo_name
+            .clone()
+            .unwrap_or_else(|| "cass-archive".to_string())
+    }
+
     fn step_deploy(&self, term: &mut Term) -> Result<()> {
         writeln!(term, "\n{}", style("Step 9 of 9: Deployment").bold())?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
 
         match self.state.target {
             DeployTarget::Local => {
-                let site_dir = self
-                    .state
-                    .final_site_dir
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| self.state.output_dir.join("site"));
+                let site_dir = self.deploy_site_dir();
                 writeln!(term)?;
                 writeln!(term, "{}", style("✓ Export complete!").green().bold())?;
                 writeln!(term)?;
@@ -1886,19 +1896,10 @@ impl PagesWizard {
             }
             DeployTarget::GitHubPages => {
                 writeln!(term, "  {} GitHub Pages deployment...", style("→").cyan())?;
-                let site_dir = self
-                    .state
-                    .final_site_dir
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| self.state.output_dir.join("site"));
+                let site_dir = self.deploy_site_dir();
 
                 // Determine repository name
-                let repo_name = self
-                    .state
-                    .repo_name
-                    .clone()
-                    .unwrap_or_else(|| "cass-archive".to_string());
+                let repo_name = self.deploy_project_name();
 
                 // Configure the deployer
                 let deployer = GitHubDeployer::new(repo_name.clone());
@@ -1978,19 +1979,10 @@ impl PagesWizard {
                     "  {} Cloudflare Pages deployment...",
                     style("→").cyan()
                 )?;
-                let site_dir = self
-                    .state
-                    .final_site_dir
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| self.state.output_dir.join("site"));
+                let site_dir = self.deploy_site_dir();
 
                 // Determine project name from repo_name or use default
-                let project_name = self
-                    .state
-                    .repo_name
-                    .clone()
-                    .unwrap_or_else(|| "cass-archive".to_string());
+                let project_name = self.deploy_project_name();
 
                 // Configure the deployer
                 let deployer = CloudflareDeployer::new(CloudflareConfig {
