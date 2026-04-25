@@ -18750,6 +18750,27 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    /// Regression test for issue #201: `staged_*` progress fields must
+    /// surface as JSON `null` when the lexical rebuild pipeline isn't
+    /// running, not as `0`. The post-init zeros from
+    /// `capture_lexical_rebuild_pipeline_runtime` look identical to
+    /// the #196-class "broken-to-zero workers_max" semaphore bug, and
+    /// triage was misled exactly that way.
+    #[test]
+    fn staged_field_or_null_emits_null_outside_rebuild() {
+        // During an active rebuild the controller's actual workers_max
+        // (always >= 1 by construction) flows through verbatim.
+        assert_eq!(staged_field_or_null(true, 6), serde_json::json!(6));
+        assert_eq!(staged_field_or_null(true, 0), serde_json::json!(0));
+
+        // Outside the rebuild window the field carries no meaningful
+        // signal — emit null so consumers (humans, dashboards, the
+        // stall watchdog's diagnostic dump) don't read it as a 0-worker
+        // configuration bug.
+        assert_eq!(staged_field_or_null(false, 6), serde_json::Value::Null);
+        assert_eq!(staged_field_or_null(false, 0), serde_json::Value::Null);
+    }
+
     struct EnvGuard {
         key: &'static str,
         previous: Option<String>,
