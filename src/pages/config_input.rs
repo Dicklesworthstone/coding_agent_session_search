@@ -306,6 +306,10 @@ fn default_output_dir() -> String {
     "cass-export".to_string()
 }
 
+const DEFAULT_PATH_MODE: &str = "relative";
+const DEFAULT_COMPRESSION: &str = "deflate";
+const DEFAULT_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+
 fn resolve_env_var(env_var: &str) -> Result<String, ConfigError> {
     dotenvy::var(env_var).map_err(|_| ConfigError::EnvVarNotFound(env_var.to_string()))
 }
@@ -322,6 +326,22 @@ impl PagesConfig {
 
     fn normalized_target(&self) -> String {
         self.deployment.target.trim().to_ascii_lowercase()
+    }
+
+    fn resolved_path_mode(&self) -> String {
+        self.normalized_path_mode()
+            .unwrap_or_else(|| DEFAULT_PATH_MODE.to_string())
+    }
+
+    fn resolved_compression(&self) -> String {
+        self.encryption
+            .compression
+            .clone()
+            .unwrap_or_else(|| DEFAULT_COMPRESSION.to_string())
+    }
+
+    fn resolved_chunk_size(&self) -> u64 {
+        self.encryption.chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE)
     }
 
     /// Load configuration from a file path.
@@ -537,21 +557,15 @@ impl PagesConfig {
                 workspaces: self.filters.workspaces.iter().map(PathBuf::from).collect(),
                 since_ts: self.filters.since.as_deref().and_then(parse_time_input),
                 until_ts: self.filters.until.as_deref().and_then(parse_time_input),
-                path_mode: self
-                    .normalized_path_mode()
-                    .unwrap_or_else(|| "relative".to_string()),
+                path_mode: self.resolved_path_mode(),
             },
             encryption: ResolvedEncryption {
                 enabled: !self.encryption.no_encryption,
                 password_set: self.encryption.password.is_some(),
                 generate_recovery: self.encryption.generate_recovery,
                 generate_qr: self.encryption.generate_qr,
-                compression: self
-                    .encryption
-                    .compression
-                    .clone()
-                    .unwrap_or_else(|| "deflate".to_string()),
-                chunk_size: self.encryption.chunk_size.unwrap_or(8 * 1024 * 1024),
+                compression: self.resolved_compression(),
+                chunk_size: self.resolved_chunk_size(),
             },
             bundle: ResolvedBundle {
                 title: self.bundle.title.clone(),
@@ -891,6 +905,20 @@ mod tests {
 
         let resolved = result.resolved.expect("resolved config should exist");
         assert_eq!(resolved.filters.path_mode, "full");
+    }
+
+    #[test]
+    fn test_resolved_config_applies_export_defaults() {
+        let mut config = PagesConfig::default();
+        config.encryption.password = Some("test123".to_string());
+
+        let result = config.validate();
+        assert!(result.valid, "{:?}", result.errors);
+
+        let resolved = result.resolved.expect("resolved config should exist");
+        assert_eq!(resolved.filters.path_mode, DEFAULT_PATH_MODE);
+        assert_eq!(resolved.encryption.compression, DEFAULT_COMPRESSION);
+        assert_eq!(resolved.encryption.chunk_size, DEFAULT_CHUNK_SIZE);
     }
 
     #[test]
