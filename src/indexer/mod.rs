@@ -97,8 +97,6 @@ mod linux_publish_swap {
     }
 }
 
-type LexicalRebuildMessageBatch = Vec<LexicalRebuildConversationPacket>;
-
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LexicalRebuildPacketSource {
@@ -2422,7 +2420,7 @@ struct LexicalRebuildPacketSemanticView {
 
 #[allow(clippy::too_many_arguments)]
 fn flush_streamed_lexical_rebuild_batch(
-    pending_batch: &mut LexicalRebuildMessageBatch,
+    pending_batch: &mut Vec<LexicalRebuildConversationPacket>,
     pending_batch_message_count: &mut usize,
     pending_batch_message_bytes: &mut usize,
     lexical_rebuild_flow_limiter: Option<&StreamingByteLimiter>,
@@ -3314,7 +3312,7 @@ fn apply_staged_shard_build_runtime_snapshot(
 fn flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
     planned_shard_index: Option<usize>,
     finishes_planned_shard: bool,
-    pending_batch: &mut LexicalRebuildMessageBatch,
+    pending_batch: &mut Vec<LexicalRebuildConversationPacket>,
     pending_batch_message_count: &mut usize,
     pending_batch_message_bytes: &mut usize,
     lexical_rebuild_flow_limiter: Option<&StreamingByteLimiter>,
@@ -13300,7 +13298,7 @@ fn rebuild_tantivy_from_db_with_options(
     let mut message_bytes_since_commit = 0usize;
     let mut conversations_since_progress_persist = 0usize;
     let mut last_progress_persist = Instant::now();
-    let mut pending_batch: LexicalRebuildMessageBatch = Vec::with_capacity(
+    let mut pending_batch: Vec<LexicalRebuildConversationPacket> = Vec::with_capacity(
         batch_conversation_limit
             .max(initial_batch_conversation_limit)
             .max(1),
