@@ -994,18 +994,24 @@ fn query_token_daily_stats_status(conn: &Connection, filter: &AnalyticsFilter) -
 
 /// Run the analytics status query — returns table health, coverage, and drift.
 pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsResult<StatusResult> {
-    let has_message_metrics = table_exists(conn, "message_metrics");
-    let has_usage_hourly = table_exists(conn, "usage_hourly");
-    let has_usage_daily = table_exists(conn, "usage_daily");
-    let has_token_usage = table_exists(conn, "token_usage");
-    let has_token_daily_stats = table_exists(conn, "token_daily_stats");
+    const TABLE_MESSAGE_METRICS: &str = "message_metrics";
+    const TABLE_USAGE_HOURLY: &str = "usage_hourly";
+    const TABLE_USAGE_DAILY: &str = "usage_daily";
+    const TABLE_TOKEN_USAGE: &str = "token_usage";
+    const TABLE_TOKEN_DAILY_STATS: &str = "token_daily_stats";
+
+    let has_message_metrics = table_exists(conn, TABLE_MESSAGE_METRICS);
+    let has_usage_hourly = table_exists(conn, TABLE_USAGE_HOURLY);
+    let has_usage_daily = table_exists(conn, TABLE_USAGE_DAILY);
+    let has_token_usage = table_exists(conn, TABLE_TOKEN_USAGE);
+    let has_token_daily_stats = table_exists(conn, TABLE_TOKEN_DAILY_STATS);
 
     let (message_metrics_from_sql, message_metrics_source_sql) =
         message_metrics_from_sql_and_source_sql(conn);
     let message_metrics_time_sql = message_metrics_time_sql(conn);
     let mm = query_table_stats_from_source(
         conn,
-        "message_metrics",
+        TABLE_MESSAGE_METRICS,
         &message_metrics_from_sql,
         "mm.day_id",
         None,
@@ -1022,13 +1028,13 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
     );
     let uh = query_track_a_rollup_status_with_message_metrics_fallback(
         conn,
-        "usage_hourly",
+        TABLE_USAGE_HOURLY,
         "hour_id",
         filter,
     );
     let ud = query_track_a_rollup_status_with_message_metrics_fallback(
         conn,
-        "usage_daily",
+        TABLE_USAGE_DAILY,
         "day_id",
         filter,
     );
@@ -1037,7 +1043,7 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
     let token_usage_time_sql = token_usage_time_sql(conn);
     let tu = query_table_stats_from_source(
         conn,
-        "token_usage",
+        TABLE_TOKEN_USAGE,
         &token_usage_from_sql,
         "tu.day_id",
         None,
@@ -1185,11 +1191,11 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
 
     Ok(StatusResult {
         tables: vec![
-            make_table_info("message_metrics", has_message_metrics, &mm),
-            make_table_info("usage_hourly", has_usage_hourly, &uh),
-            make_table_info("usage_daily", has_usage_daily, &ud),
-            make_table_info("token_usage", has_token_usage, &tu),
-            make_table_info("token_daily_stats", has_token_daily_stats, &tds),
+            make_table_info(TABLE_MESSAGE_METRICS, has_message_metrics, &mm),
+            make_table_info(TABLE_USAGE_HOURLY, has_usage_hourly, &uh),
+            make_table_info(TABLE_USAGE_DAILY, has_usage_daily, &ud),
+            make_table_info(TABLE_TOKEN_USAGE, has_token_usage, &tu),
+            make_table_info(TABLE_TOKEN_DAILY_STATS, has_token_daily_stats, &tds),
         ],
         coverage: CoverageInfo {
             total_messages,
