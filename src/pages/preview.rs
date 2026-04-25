@@ -501,6 +501,12 @@ mod tests {
         })
     }
 
+    fn temp_site_with_index(contents: impl AsRef<[u8]>) -> TempDir {
+        let temp_dir = TempDir::new().expect("temp dir");
+        std::fs::write(temp_dir.path().join("index.html"), contents).expect("write index");
+        temp_dir
+    }
+
     #[test]
     fn test_guess_mime_type() {
         assert_eq!(
@@ -629,14 +635,9 @@ mod tests {
 
     #[test]
     fn test_handle_request_serves_index_with_coi_headers() {
-        let temp_dir = TempDir::new().expect("temp dir");
+        let temp_dir = temp_site_with_index("<!doctype html><html>ok</html>");
         let site_dir = temp_dir.path();
 
-        std::fs::write(
-            site_dir.join("index.html"),
-            "<!doctype html><html>ok</html>",
-        )
-        .expect("write index.html");
         std::fs::write(
             site_dir.join("sw.js"),
             "self.addEventListener('install', () => {});",
@@ -660,10 +661,9 @@ mod tests {
 
     #[test]
     fn test_handle_request_head_preserves_content_length() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let site_dir = temp_dir.path();
         let body = "<!doctype html><html>head-check</html>";
-        std::fs::write(site_dir.join("index.html"), body).expect("write index");
+        let temp_dir = temp_site_with_index(body);
+        let site_dir = temp_dir.path();
 
         let get_response = handle_request(site_dir, "GET / HTTP/1.1\r\n");
         let head_response = handle_request(site_dir, "HEAD / HTTP/1.1\r\n");
@@ -715,10 +715,9 @@ mod tests {
 
     #[test]
     fn test_handle_request_head_large_file_content_length() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let site_dir = temp_dir.path();
         let body = vec![b'z'; 512 * 1024];
-        std::fs::write(site_dir.join("index.html"), &body).expect("write index");
+        let temp_dir = temp_site_with_index(&body);
+        let site_dir = temp_dir.path();
 
         let head_response = handle_request(site_dir, "HEAD / HTTP/1.1\r\n");
         let head_str = String::from_utf8_lossy(&head_response);
@@ -741,9 +740,8 @@ mod tests {
 
     #[test]
     fn test_handle_request_with_site_root_precanonicalized() {
-        let temp_dir = TempDir::new().expect("temp dir");
+        let temp_dir = temp_site_with_index("<html>canonical</html>");
         let site_dir = temp_dir.path();
-        std::fs::write(site_dir.join("index.html"), "<html>canonical</html>").expect("write index");
         let canonical_root = site_dir.canonicalize().expect("canonicalize root");
 
         let response = handle_request_with_site_root(&canonical_root, "GET / HTTP/1.1\r\n");
@@ -754,9 +752,8 @@ mod tests {
 
     #[test]
     fn test_handle_request_wrapper_accepts_uncanonicalized_site_dir() {
-        let temp_dir = TempDir::new().expect("temp dir");
+        let temp_dir = temp_site_with_index("<html>wrapper</html>");
         let site_dir = temp_dir.path();
-        std::fs::write(site_dir.join("index.html"), "<html>wrapper</html>").expect("write index");
         let dotted = site_dir.join(".");
 
         let response = handle_request(&dotted, "GET / HTTP/1.1\r\n");
