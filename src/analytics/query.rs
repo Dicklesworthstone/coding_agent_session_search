@@ -562,6 +562,11 @@ fn token_usage_from_sql_agent_and_source_sql(
         source_sql,
     )
 }
+
+fn token_usage_agent_sql_or_unknown(agent_sql: Option<String>) -> String {
+    agent_sql.unwrap_or_else(|| "'unknown'".to_string())
+}
+
 fn token_usage_time_sql(conn: &Connection) -> Option<String> {
     let has_timestamp_ms = table_has_column(conn, "token_usage", "timestamp_ms");
     let has_conversations = table_exists(conn, "conversations");
@@ -957,7 +962,7 @@ fn query_token_daily_stats_status(conn: &Connection, filter: &AnalyticsFilter) -
 
     let (token_usage_from_sql, token_usage_agent_sql, token_usage_source_sql) =
         token_usage_from_sql_agent_and_source_sql(conn);
-    let token_usage_agent_sql = token_usage_agent_sql.unwrap_or_else(|| "'unknown'".to_string());
+    let token_usage_agent_sql = token_usage_agent_sql_or_unknown(token_usage_agent_sql);
     let token_usage_model_sql = normalized_analytics_model_family_sql_expr("tu.model_family");
     let token_usage_time_sql = token_usage_time_sql(conn);
     let (where_sql, params) = build_filtered_where_sql(
@@ -2106,7 +2111,7 @@ fn query_track_b_breakdown_from_token_usage(
 
     let (token_usage_from_sql, token_usage_agent_sql, token_usage_source_sql) =
         token_usage_from_sql_agent_and_source_sql(conn);
-    let token_usage_agent_sql = token_usage_agent_sql.unwrap_or_else(|| "'unknown'".to_string());
+    let token_usage_agent_sql = token_usage_agent_sql_or_unknown(token_usage_agent_sql);
     let key_sql = match dim {
         Dim::Model => normalized_analytics_model_family_sql_expr("tu.model_family"),
         Dim::Agent => token_usage_agent_sql.clone(),
