@@ -221,30 +221,17 @@ impl FailpointEffect {
 }
 
 /// Failure returned from an injected deterministic crash or staged error.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SimulationFailure {
-    Crash {
-        failpoint: FailpointId,
-    },
+    #[error("simulated crash at {}", failpoint.as_str())]
+    Crash { failpoint: FailpointId },
+    #[error("simulated failure at {}: {reason}", failpoint.as_str())]
     InjectedError {
         failpoint: FailpointId,
         reason: String,
     },
 }
-
-impl std::fmt::Display for SimulationFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Crash { failpoint } => write!(f, "simulated crash at {}", failpoint.as_str()),
-            Self::InjectedError { failpoint, reason } => {
-                write!(f, "simulated failure at {}: {reason}", failpoint.as_str())
-            }
-        }
-    }
-}
-
-impl std::error::Error for SimulationFailure {}
 
 /// High-level actors that contend in maintenance-orchestration scenarios.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]

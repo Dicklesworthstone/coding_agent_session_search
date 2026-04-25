@@ -193,6 +193,31 @@ fn failpoint_crashes_once_and_then_clears() {
 }
 
 #[test]
+fn simulation_failure_display_and_source_are_preserved() {
+    use std::error::Error;
+
+    let failpoint = FailpointId::Publish(PublishCrashWindow::SwapPublishedGeneration);
+    let crash = SimulationFailure::Crash {
+        failpoint: failpoint.clone(),
+    };
+    assert_eq!(
+        crash.to_string(),
+        "simulated crash at publish:swap_published_generation"
+    );
+    assert!(crash.source().is_none());
+
+    let injected = SimulationFailure::InjectedError {
+        failpoint,
+        reason: "bad checksum".to_owned(),
+    };
+    assert_eq!(
+        injected.to_string(),
+        "simulated failure at publish:swap_published_generation: bad checksum"
+    );
+    assert!(injected.source().is_none());
+}
+
+#[test]
 fn contention_plan_records_per_actor_traces_and_outcomes() {
     let mut harness = SearchAssetSimulationHarness::new(
         "contention_traces",
