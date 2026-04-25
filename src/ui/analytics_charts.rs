@@ -1174,7 +1174,7 @@ pub fn render_explorer(
     let mut overlay_data: Vec<Vec<(f64, f64)>> = Vec::new();
     let mut overlay_labels: Vec<String> = Vec::new();
     let mut overlay_colors: Vec<PackedRgba> = Vec::new();
-    let dim_breakdown: Option<StrF64Slice<'_>> = match state.overlay {
+    let dim_breakdown: Option<&[(String, f64)]> = match state.overlay {
         ExplorerOverlay::None => Option::None,
         ExplorerOverlay::ByAgent => Some(match state.metric {
             ExplorerMetric::Messages | ExplorerMetric::PlanMessages => &data.agent_messages,
@@ -1734,10 +1734,8 @@ fn metric_series(
 /// Simplified proportional overlay — distributes the daily totals by each
 /// dimension item's share of the overall breakdown total. A full implementation
 /// would query per-dimension timeseries, but this approximation works for v1.
-type StrF64Slice<'a> = &'a [(String, f64)];
-
 fn build_dimension_overlay(
-    breakdown: StrF64Slice<'_>,
+    breakdown: &[(String, f64)],
     daily_series: &[(String, f64)],
 ) -> Vec<Vec<(f64, f64)>> {
     let total: f64 = breakdown.iter().map(|(_, v)| *v).sum();
