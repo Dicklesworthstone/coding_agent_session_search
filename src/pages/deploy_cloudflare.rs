@@ -28,6 +28,11 @@ const BASE_DELAY_MS: u64 = 1000;
 /// Timeout for direct Cloudflare API calls.
 const API_TIMEOUT_SECS: u64 = 30;
 
+const ENV_CLOUDFLARE_ACCOUNT_ID: &str = "CLOUDFLARE_ACCOUNT_ID";
+const ENV_CLOUDFLARE_API_TOKEN: &str = "CLOUDFLARE_API_TOKEN";
+const ENV_CLOUDFLARE_API_BASE_URL: &str = "CLOUDFLARE_API_BASE_URL";
+const ENV_CF_API_BASE_URL: &str = "CF_API_BASE_URL";
+
 /// Prerequisites for Cloudflare Pages deployment
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prerequisites {
@@ -189,12 +194,12 @@ impl CloudflareDeployer {
             .config
             .account_id
             .clone()
-            .or_else(|| dotenvy::var("CLOUDFLARE_ACCOUNT_ID").ok());
+            .or_else(|| dotenvy::var(ENV_CLOUDFLARE_ACCOUNT_ID).ok());
         let api_token = self
             .config
             .api_token
             .clone()
-            .or_else(|| dotenvy::var("CLOUDFLARE_API_TOKEN").ok());
+            .or_else(|| dotenvy::var(ENV_CLOUDFLARE_API_TOKEN).ok());
         let api_credentials_present = account_id.is_some() && api_token.is_some();
 
         let disk_space_mb = get_available_space_mb().unwrap_or(0);
@@ -262,12 +267,12 @@ impl CloudflareDeployer {
             .config
             .account_id
             .clone()
-            .or_else(|| dotenvy::var("CLOUDFLARE_ACCOUNT_ID").ok());
+            .or_else(|| dotenvy::var(ENV_CLOUDFLARE_ACCOUNT_ID).ok());
         let api_token = self
             .config
             .api_token
             .clone()
-            .or_else(|| dotenvy::var("CLOUDFLARE_API_TOKEN").ok());
+            .or_else(|| dotenvy::var(ENV_CLOUDFLARE_API_TOKEN).ok());
         let account_id_ref = account_id.as_deref();
         let api_token_ref = api_token.as_deref();
 
@@ -436,10 +441,10 @@ fn resolve_deploy_site_dir(path: &Path) -> Result<PathBuf> {
 
 fn apply_api_credentials(cmd: &mut Command, account_id: Option<&str>, api_token: Option<&str>) {
     if let Some(id) = account_id {
-        cmd.env("CLOUDFLARE_ACCOUNT_ID", id);
+        cmd.env(ENV_CLOUDFLARE_ACCOUNT_ID, id);
     }
     if let Some(token) = api_token {
-        cmd.env("CLOUDFLARE_API_TOKEN", token);
+        cmd.env(ENV_CLOUDFLARE_API_TOKEN, token);
     }
 }
 
@@ -736,8 +741,8 @@ const MAX_BUCKET_SIZE_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_BUCKET_FILE_COUNT: usize = if cfg!(windows) { 1000 } else { 2000 };
 
 fn api_base_url() -> String {
-    dotenvy::var("CLOUDFLARE_API_BASE_URL")
-        .or_else(|_| dotenvy::var("CF_API_BASE_URL"))
+    dotenvy::var(ENV_CLOUDFLARE_API_BASE_URL)
+        .or_else(|_| dotenvy::var(ENV_CF_API_BASE_URL))
         .unwrap_or_else(|_| "https://api.cloudflare.com/client/v4".to_string())
 }
 
