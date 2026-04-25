@@ -80,10 +80,6 @@ struct SelectedHostNameConflict {
     kept_source_name: String,
 }
 
-fn generated_source_name_for_host(host_name: &str) -> String {
-    super::config::normalize_generated_remote_source_name(host_name)
-}
-
 fn dedupe_selected_hosts_by_generated_name(
     selected_hosts: Vec<&HostProbeResult>,
 ) -> (Vec<&HostProbeResult>, Vec<SelectedHostNameConflict>) {
@@ -92,7 +88,7 @@ fn dedupe_selected_hosts_by_generated_name(
     let mut seen_name_keys: HashMap<String, (String, String)> = HashMap::new();
 
     for host in selected_hosts {
-        let generated_name = generated_source_name_for_host(&host.host_name);
+        let generated_name = super::config::normalize_generated_remote_source_name(&host.host_name);
         let generated_name_key = super::config::source_name_key(&generated_name);
         if let Some((kept_host_name, kept_source_name)) = seen_name_keys.get(&generated_name_key) {
             conflicts.push(SelectedHostNameConflict {
@@ -514,9 +510,9 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             let auto_selected: Vec<_> = reachable_hosts
                 .iter()
                 .filter(|h| {
-                    selected_name_keys.insert(super::config::source_name_key(
-                        &generated_source_name_for_host(&h.host_name),
-                    ))
+                    let generated_name =
+                        super::config::normalize_generated_remote_source_name(&h.host_name);
+                    selected_name_keys.insert(super::config::source_name_key(&generated_name))
                 })
                 .copied()
                 .collect();
