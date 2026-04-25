@@ -84,10 +84,6 @@ fn generated_source_name_for_host(host_name: &str) -> String {
     super::config::normalize_generated_remote_source_name(host_name)
 }
 
-fn generated_source_name_key_for_host(host_name: &str) -> String {
-    super::config::source_name_key(&generated_source_name_for_host(host_name))
-}
-
 fn dedupe_selected_hosts_by_generated_name(
     selected_hosts: Vec<&HostProbeResult>,
 ) -> (Vec<&HostProbeResult>, Vec<SelectedHostNameConflict>) {
@@ -518,7 +514,9 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             let auto_selected: Vec<_> = reachable_hosts
                 .iter()
                 .filter(|h| {
-                    selected_name_keys.insert(generated_source_name_key_for_host(&h.host_name))
+                    selected_name_keys.insert(super::config::source_name_key(
+                        &generated_source_name_for_host(&h.host_name),
+                    ))
                 })
                 .copied()
                 .collect();
