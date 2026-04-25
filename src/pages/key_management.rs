@@ -985,10 +985,6 @@ fn unique_staged_site_dir(path: &Path) -> std::path::PathBuf {
     unique_atomic_sidecar_path(path, "rotate", "site")
 }
 
-fn unique_staged_site_backup_dir(path: &Path) -> std::path::PathBuf {
-    unique_atomic_sidecar_path(path, "bak", "site")
-}
-
 fn unique_atomic_sidecar_path(
     path: &Path,
     suffix: &str,
@@ -1027,7 +1023,7 @@ fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let backup_dir = unique_staged_site_backup_dir(final_dir);
+    let backup_dir = unique_atomic_sidecar_path(final_dir, "bak", "site");
     std::fs::rename(final_dir, &backup_dir).with_context(|| {
         format!(
             "failed preparing backup {} before replacing {}",
