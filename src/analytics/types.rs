@@ -576,6 +576,16 @@ pub struct DriftSignal {
     pub severity: String,
 }
 
+impl DriftSignal {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "signal": self.signal,
+            "detail": self.detail,
+            "severity": self.severity,
+        })
+    }
+}
+
 /// Full status result.
 pub struct StatusResult {
     pub tables: Vec<TableInfo>,
@@ -592,13 +602,7 @@ impl StatusResult {
             .drift
             .signals
             .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "signal": s.signal,
-                    "detail": s.detail,
-                    "severity": s.severity,
-                })
-            })
+            .map(DriftSignal::to_json)
             .collect();
 
         serde_json::json!({
@@ -799,6 +803,21 @@ mod tests {
             assert_eq!(metric.as_str(), expected);
             assert_eq!(metric.to_string(), expected);
         }
+    }
+
+    #[test]
+    fn drift_signal_to_json_shape() {
+        let signal = DriftSignal {
+            signal: "track-a-stale".to_string(),
+            detail: "usage_daily is older than token_usage".to_string(),
+            severity: "warning".to_string(),
+        };
+
+        let json = signal.to_json();
+        assert_eq!(json["signal"], "track-a-stale");
+        assert_eq!(json["detail"], "usage_daily is older than token_usage");
+        assert_eq!(json["severity"], "warning");
+        assert_eq!(json.as_object().expect("object").len(), 3);
     }
 
     #[test]
