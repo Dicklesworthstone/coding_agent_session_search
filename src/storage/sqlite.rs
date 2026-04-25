@@ -7964,6 +7964,17 @@ fn normalized_source_for_conversation(conv: &Conversation) -> Source {
     }
 }
 
+fn is_bootstrap_local_source(source: &Source) -> bool {
+    source.id == LOCAL_SOURCE_ID
+        && matches!(source.kind, SourceKind::Local)
+        && source.host_label.is_none()
+        && source.machine_id.is_none()
+        && source.platform.is_none()
+        && source.config_json.is_none()
+        && source.created_at.is_none()
+        && source.updated_at.is_none()
+}
+
 fn normalized_conversation_for_storage<'a>(conv: &'a Conversation) -> Cow<'a, Conversation> {
     let normalized_source = normalized_source_for_conversation(conv);
     if normalized_source.id == conv.source_id && normalized_source.host_label == conv.origin_host {
@@ -7979,6 +7990,11 @@ fn normalized_conversation_for_storage<'a>(conv: &'a Conversation) -> Cow<'a, Co
 impl FrankenStorage {
     fn ensure_source_for_conversation(&self, conv: &Conversation) -> Result<()> {
         let source = normalized_source_for_conversation(conv);
+        if is_bootstrap_local_source(&source) {
+            // `open()` and schema repair always seed the canonical local source row.
+            // Avoid an autocommit UPDATE on every local conversation insert.
+            return Ok(());
+        }
         self.upsert_source(&source)
     }
 
@@ -7990,6 +8006,9 @@ impl FrankenStorage {
         for &(_, _, conv) in conversations {
             let source = normalized_source_for_conversation(conv);
             if seen.insert(source.id.clone()) {
+                if is_bootstrap_local_source(&source) {
+                    continue;
+                }
                 self.upsert_source(&source)?;
             }
         }
@@ -17323,6 +17342,86 @@ mod tests {
         assert_eq!(conversations.len(), 1);
         assert_eq!(conversations[0].source_id, LOCAL_SOURCE_ID);
         assert_eq!(conversations[0].origin_host, None);
+    }
+
+    #[test]
+    fn repeated_local_inserts_do_not_touch_bootstrap_source_row() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+
+        let bootstrap_updated_at: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT updated_at FROM sources WHERE id = ?1",
+                fparams![LOCAL_SOURCE_ID],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        let make_conversation = |external_id: &str, suffix: &str| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some(external_id.into()),
+            title: Some(format!("Local source {suffix}")),
+            source_path: dir.path().join(format!("local-{suffix}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: format!("hello-{suffix}"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        storage
+            .insert_conversation_tree(agent_id, None, &make_conversation("local-source-1", "one"))
+            .unwrap();
+        let after_first_insert: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT updated_at FROM sources WHERE id = ?1",
+                fparams![LOCAL_SOURCE_ID],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        storage
+            .insert_conversation_tree(agent_id, None, &make_conversation("local-source-2", "two"))
+            .unwrap();
+        let after_second_insert: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT updated_at FROM sources WHERE id = ?1",
+                fparams![LOCAL_SOURCE_ID],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        assert_eq!(after_first_insert, bootstrap_updated_at);
+        assert_eq!(after_second_insert, bootstrap_updated_at);
     }
 
     #[test]
