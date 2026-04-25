@@ -64,25 +64,35 @@ fuzz_target!(|raw: &str| {
     // could emit an unbalanced `(` or `)`. FTS5 rejects unbalanced
     // parens at query time with an opaque error — catching that here
     // keeps the boundary clean.
-    let mut depth: i32 = 0;
+    // `saturating_sub` floors at 0, so an early `)` would silently
+    // leave `depth = 0` and pass the original `assert!(depth >= 0)`
+    // (which is `0 >= 0` ⇒ true). Use `checked_sub` so a stray
+    // closing paren before any opener trips the assertion as
+    // intended; mirror with `checked_add` so a runaway `(` storm
+    // panics on overflow rather than silently saturating.
+    let mut depth: u32 = 0;
     for ch in transpiled.chars() {
         match ch {
-            '(' => depth = depth.saturating_add(1),
-            ')' => {
-                depth = depth.saturating_sub(1);
-                assert!(
-                    depth >= 0,
-                    "unbalanced closing paren in transpiled query: {transpiled:?} \
-                     (from raw: {query:?})"
+            '(' => {
+                depth = depth.checked_add(1).expect(
+                    "transpiled paren depth overflowed u32 — pathological input",
                 );
+            }
+            ')' => {
+                depth = depth.checked_sub(1).unwrap_or_else(|| {
+                    panic!(
+                        "unbalanced closing paren in transpiled query: {transpiled:?} \
+                         (from raw: {query:?})"
+                    )
+                });
             }
             _ => {}
         }
     }
     assert_eq!(
         depth, 0,
-        "unbalanced parens — depth {depth} at end of transpiled query: {transpiled:?} \
-         (from raw: {query:?})"
+        "unbalanced parens — {depth} unclosed `(` at end of transpiled query: \
+         {transpiled:?} (from raw: {query:?})"
     );
 
     // Null byte injection guard — FTS5 parses queries as C strings
