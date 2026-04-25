@@ -20,7 +20,7 @@
 | 7 | Rollup stats projection helper | `8e50de04` | `analytics::query::` |
 | 8 | Inline JS assertion macro | `5dbcff26` | `html_export::scripts::tests::` |
 | 9 | Source setup wrapper collapse | `8de9e349` | `sources::setup::` |
-| 10 | Docs assertion macro plus clippy row-state fix | pending | `pages::docs::`, `rebuild_sources_view`, final gates |
+| 10 | Docs assertion macro plus clippy row-state fix | `543bf92b` | `pages::docs::`, `rebuild_sources_view`, final gates |
 
 ## Final Gates
 
