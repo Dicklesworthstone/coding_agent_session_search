@@ -390,6 +390,14 @@ mod tests {
         }
     }
 
+    fn assert_json_field(value: &serde_json::Value, key: &str, expected: serde_json::Value) {
+        assert_eq!(
+            value.get(key),
+            Some(&expected),
+            "unexpected JSON field `{key}` in {value}"
+        );
+    }
+
     #[test]
     fn test_export_format_cycle() {
         let format = ExportFormat::Markdown;
@@ -455,22 +463,32 @@ mod tests {
 
         let projected = export_hit_json(&hit, &options);
 
-        assert_eq!(projected["title"], serde_json::json!("Test Result"));
-        assert_eq!(projected["agent"], serde_json::json!("claude_code"));
-        assert_eq!(projected["workspace"], serde_json::json!("/projects/test"));
-        assert_eq!(projected["snippet"], serde_json::json!("This is..."));
-        assert_eq!(projected["score"], serde_json::json!(0.0));
-        assert_eq!(
-            projected["source_path"],
-            serde_json::json!("/path/to/file.jsonl")
+        assert_json_field(&projected, "title", serde_json::json!("Test Result"));
+        assert_json_field(&projected, "agent", serde_json::json!("claude_code"));
+        assert_json_field(&projected, "workspace", serde_json::json!("/projects/test"));
+        assert_json_field(&projected, "snippet", serde_json::json!("This is..."));
+        assert_json_field(&projected, "score", serde_json::json!(0.0));
+        assert_json_field(
+            &projected,
+            "source_path",
+            serde_json::json!("/path/to/file.jsonl"),
         );
-        assert_eq!(projected["line_number"], serde_json::json!(42));
-        assert_eq!(projected["created_at"], serde_json::json!(1700000000000i64));
-        assert_eq!(
-            projected["created_at_formatted"],
-            serde_json::json!("2023-11-14T22:13:20+00:00")
+        assert_json_field(&projected, "line_number", serde_json::json!(42));
+        assert_json_field(
+            &projected,
+            "created_at",
+            serde_json::json!(1700000000000i64),
         );
-        assert_eq!(projected["content"], serde_json::json!("Full content here"));
+        assert_json_field(
+            &projected,
+            "created_at_formatted",
+            serde_json::json!("2023-11-14T22:13:20+00:00"),
+        );
+        assert_json_field(
+            &projected,
+            "content",
+            serde_json::json!("Full content here"),
+        );
         assert_eq!(projected.as_object().expect("object").len(), 10);
     }
 
