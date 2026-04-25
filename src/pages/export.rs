@@ -541,7 +541,7 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 }
 
 fn derive_message_model(extra_json: Option<&str>) -> Option<String> {
-    let value = parse_message_extra_json(extra_json)?;
+    let value: Value = serde_json::from_str(extra_json?).ok()?;
 
     [
         value.pointer("/model"),
@@ -560,7 +560,7 @@ fn derive_message_model(extra_json: Option<&str>) -> Option<String> {
 }
 
 fn derive_attachment_refs(extra_json: Option<&str>) -> Option<String> {
-    let value = parse_message_extra_json(extra_json)?;
+    let value: Value = serde_json::from_str(extra_json?).ok()?;
 
     [
         value.pointer("/attachment_refs"),
@@ -582,10 +582,6 @@ fn derive_attachment_refs(extra_json: Option<&str>) -> Option<String> {
             serde_json::to_string(candidate).ok()
         }
     })
-}
-
-fn parse_message_extra_json(extra_json: Option<&str>) -> Option<Value> {
-    serde_json::from_str(extra_json?).ok()
 }
 
 fn unique_atomic_temp_path(path: &Path) -> PathBuf {
