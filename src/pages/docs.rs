@@ -110,6 +110,13 @@ impl DocumentationGenerator {
         ]
     }
 
+    fn target_url_display(&self) -> &str {
+        self.config
+            .target_url
+            .as_deref()
+            .unwrap_or("[deployment URL]")
+    }
+
     /// Generate README.md for repository root.
     pub fn generate_readme(&self) -> GeneratedDoc {
         let agent_list = self
@@ -120,11 +127,7 @@ impl DocumentationGenerator {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let url_display = self
-            .config
-            .target_url
-            .as_deref()
-            .unwrap_or("[deployment URL]");
+        let url_display = self.target_url_display();
 
         let start_date = format_optional_doc_date(self.summary.earliest_timestamp, "Unknown");
         let end_date = format_optional_doc_date(self.summary.latest_timestamp, "Unknown");
@@ -244,11 +247,7 @@ impl DocumentationGenerator {
 
     /// Generate about.txt for non-technical users.
     pub fn generate_about_txt(&self) -> GeneratedDoc {
-        let url_display = self
-            .config
-            .target_url
-            .as_deref()
-            .unwrap_or("[deployment URL]");
+        let url_display = self.target_url_display();
 
         let conversation_count = self.summary.total_conversations.to_string();
         let date = Utc::now().format("%Y-%m-%d");
@@ -947,6 +946,17 @@ mod tests {
         let generator = DocumentationGenerator::new(config, summary);
 
         let doc = generator.generate_readme();
+
+        assert_doc_contains!(doc, "[deployment URL]");
+    }
+
+    #[test]
+    fn test_about_without_url() {
+        let config = DocConfig::new();
+        let summary = create_test_summary();
+        let generator = DocumentationGenerator::new(config, summary);
+
+        let doc = generator.generate_about_txt();
 
         assert_doc_contains!(doc, "[deployment URL]");
     }
