@@ -18,7 +18,7 @@
 - `7b1d1c8f` - `refactor(sources): collapse remote spec wrapper`
 - `4aaf4297` - `refactor(search): share embedder registry test fixture`
 - `66e1a0c5` - `refactor(analytics): centralize group by strings`
-- Pass 10 commit: pending
+- `1a313d9f` - `refactor(analytics): centralize dimension strings`
 
 ## Verification Summary
 
@@ -40,4 +40,3 @@ Re-read all files touched in this run at the point of their pass and checked the
 diffs against the isomorphism cards. The loop avoided dirty peer files
 `src/indexer/mod.rs` and `src/storage/sqlite.rs`; those remain uncommitted by
 this run.
-
