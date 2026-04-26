@@ -197,45 +197,36 @@ impl SetupState {
 }
 
 /// Errors that can occur during setup.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SetupError {
     /// IO error.
+    #[error("IO error: {0}")]
     Io(std::io::Error),
     /// JSON serialization error.
+    #[error("JSON error: {0}")]
     Json(serde_json::Error),
     /// Configuration error.
+    #[error("Config error: {0}")]
     Config(super::config::ConfigError),
     /// Installation error.
+    #[error("Install error: {0}")]
     Install(super::install::InstallError),
     /// Index error.
+    #[error("Index error: {0}")]
     Index(super::index::IndexError),
     /// Interactive UI error.
+    #[error("Interactive error: {0}")]
     Interactive(super::interactive::InteractiveError),
     /// User cancelled.
+    #[error("Setup cancelled by user")]
     Cancelled,
     /// No hosts found.
+    #[error("No SSH hosts found or selected")]
     NoHosts,
     /// Setup interrupted.
+    #[error("Setup interrupted")]
     Interrupted,
 }
-
-impl std::fmt::Display for SetupError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "IO error: {e}"),
-            Self::Json(e) => write!(f, "JSON error: {e}"),
-            Self::Config(e) => write!(f, "Config error: {e}"),
-            Self::Install(e) => write!(f, "Install error: {e}"),
-            Self::Index(e) => write!(f, "Index error: {e}"),
-            Self::Interactive(e) => write!(f, "Interactive error: {e}"),
-            Self::Cancelled => write!(f, "Setup cancelled by user"),
-            Self::NoHosts => write!(f, "No SSH hosts found or selected"),
-            Self::Interrupted => write!(f, "Setup interrupted"),
-        }
-    }
-}
-
-impl std::error::Error for SetupError {}
 
 /// Result of the setup wizard.
 #[derive(Debug)]
@@ -1141,6 +1132,21 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
         let err = SetupError::Io(io_err);
         assert!(format!("{err}").contains("IO error"));
+    }
+
+    #[test]
+    fn test_setup_error_source_is_preserved_as_none() {
+        let errors = [
+            SetupError::Cancelled,
+            SetupError::NoHosts,
+            SetupError::Interrupted,
+            SetupError::Io(std::io::Error::other("io")),
+            SetupError::Json(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
+        ];
+
+        for err in errors {
+            assert!(std::error::Error::source(&err).is_none(), "{err}");
+        }
     }
 
     #[test]
