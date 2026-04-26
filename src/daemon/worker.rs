@@ -21,6 +21,9 @@ use crate::search::vector_index::{
 };
 use crate::storage::sqlite::FrankenStorage;
 
+const HASH_EMBEDDER_MODEL: &str = "hash";
+const DEFAULT_SEMANTIC_MODEL: &str = "minilm";
+
 /// Configuration for a single embedding job.
 #[derive(Debug, Clone)]
 pub struct EmbeddingJobConfig {
@@ -101,14 +104,14 @@ fn resolve_embedder_kind(
     use_semantic: bool,
 ) -> anyhow::Result<WorkerEmbedderKind> {
     if !use_semantic
-        || model_name.eq_ignore_ascii_case("hash")
+        || model_name.eq_ignore_ascii_case(HASH_EMBEDDER_MODEL)
         || model_name.eq_ignore_ascii_case("fnv1a-384")
     {
         return Ok(WorkerEmbedderKind::Hash);
     }
 
     let normalized_name = match model_name.to_ascii_lowercase().as_str() {
-        "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => "minilm",
+        "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => DEFAULT_SEMANTIC_MODEL,
         "snowflake-arctic-s" | "snowflake-arctic-s-384" | "snowflake-arctic-embed-s" => {
             "snowflake-arctic-s"
         }
@@ -248,14 +251,14 @@ impl EmbeddingWorker {
             let fast = config
                 .fast_model
                 .clone()
-                .unwrap_or_else(|| "hash".to_string());
+                .unwrap_or_else(|| HASH_EMBEDDER_MODEL.to_string());
             passes.push((fast, false));
 
             // Quality semantic pass
             let quality = config
                 .quality_model
                 .clone()
-                .unwrap_or_else(|| "minilm".to_string());
+                .unwrap_or_else(|| DEFAULT_SEMANTIC_MODEL.to_string());
             passes.push((quality, true));
         } else {
             // Single pass with best available
@@ -263,8 +266,8 @@ impl EmbeddingWorker {
                 .quality_model
                 .clone()
                 .or_else(|| config.fast_model.clone())
-                .unwrap_or_else(|| "hash".to_string());
-            let is_semantic = model != "hash";
+                .unwrap_or_else(|| HASH_EMBEDDER_MODEL.to_string());
+            let is_semantic = model != HASH_EMBEDDER_MODEL;
             passes.push((model, is_semantic));
         }
 
@@ -366,7 +369,7 @@ impl EmbeddingWorker {
 
         // Create the appropriate embedder/indexer
         let indexer = match embedder_kind {
-            WorkerEmbedderKind::Hash => SemanticIndexer::new("hash", None)?,
+            WorkerEmbedderKind::Hash => SemanticIndexer::new(HASH_EMBEDDER_MODEL, None)?,
             WorkerEmbedderKind::FastEmbed { ref model_name, .. } => {
                 SemanticIndexer::new(model_name, Some(index_path))?
             }
