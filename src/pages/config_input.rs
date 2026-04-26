@@ -344,6 +344,15 @@ impl PagesConfig {
         self.encryption.chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE)
     }
 
+    fn resolved_time_range(&self) -> Option<String> {
+        match (&self.filters.since, &self.filters.until) {
+            (Some(since), Some(until)) => Some(format!("{} to {}", since, until)),
+            (Some(since), None) => Some(format!("since {}", since)),
+            (None, Some(until)) => Some(format!("until {}", until)),
+            (None, None) => None,
+        }
+    }
+
     /// Load configuration from a file path.
     ///
     /// If path is "-", reads from stdin.
@@ -585,14 +594,6 @@ impl PagesConfig {
 
     /// Convert to WizardState for execution.
     pub fn to_wizard_state(&self, db_path: PathBuf) -> Result<WizardState, ConfigError> {
-        // Parse time filters
-        let time_range = match (&self.filters.since, &self.filters.until) {
-            (Some(since), Some(until)) => Some(format!("{} to {}", since, until)),
-            (Some(since), None) => Some(format!("since {}", since)),
-            (None, Some(until)) => Some(format!("until {}", until)),
-            (None, None) => None,
-        };
-
         // Parse deploy target
         let target = match self.normalized_target().as_str() {
             "github" => DeployTarget::GitHubPages,
@@ -609,7 +610,7 @@ impl PagesConfig {
 
         Ok(WizardState {
             agents: self.filters.agents.clone(),
-            time_range,
+            time_range: self.resolved_time_range(),
             workspaces,
             password: self.encryption.password.clone(),
             recovery_secret: None,
@@ -942,5 +943,30 @@ mod tests {
             .expect("wizard state should parse");
 
         assert!(matches!(state.target, DeployTarget::CloudflarePages));
+    }
+
+    #[test]
+    fn test_resolved_time_range_priority() {
+        let mut config = PagesConfig::default();
+
+        assert_eq!(config.resolved_time_range(), None);
+
+        config.filters.since = Some("30 days ago".to_string());
+        assert_eq!(
+            config.resolved_time_range(),
+            Some("since 30 days ago".to_string())
+        );
+
+        config.filters.until = Some("today".to_string());
+        assert_eq!(
+            config.resolved_time_range(),
+            Some("30 days ago to today".to_string())
+        );
+
+        config.filters.since = None;
+        assert_eq!(
+            config.resolved_time_range(),
+            Some("until today".to_string())
+        );
     }
 }
