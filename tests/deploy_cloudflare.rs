@@ -14,6 +14,17 @@ fn temp_cloudflare_deployer() -> Result<(TempDir, CloudflareDeployer)> {
     Ok((TempDir::new()?, CloudflareDeployer::default()))
 }
 
+fn prereqs_fixture() -> Prerequisites {
+    Prerequisites {
+        wrangler_version: Some("wrangler 3.0.0".to_string()),
+        wrangler_authenticated: false,
+        account_email: None,
+        api_credentials_present: false,
+        account_id: None,
+        disk_space_mb: 10000,
+    }
+}
+
 // ============================================
 // Prerequisites Tests
 // ============================================
@@ -21,12 +32,9 @@ fn temp_cloudflare_deployer() -> Result<(TempDir, CloudflareDeployer)> {
 #[test]
 fn test_prerequisites_all_ready_with_auth() {
     let prereqs = Prerequisites {
-        wrangler_version: Some("wrangler 3.0.0".to_string()),
         wrangler_authenticated: true,
         account_email: Some("test@example.com".to_string()),
-        api_credentials_present: false,
-        account_id: None,
-        disk_space_mb: 10000,
+        ..prereqs_fixture()
     };
 
     assert!(prereqs.is_ready());
@@ -37,12 +45,9 @@ fn test_prerequisites_all_ready_with_auth() {
 fn test_prerequisites_ready_with_api_credentials() {
     // API credentials can be used instead of interactive auth
     let prereqs = Prerequisites {
-        wrangler_version: Some("wrangler 3.0.0".to_string()),
-        wrangler_authenticated: false,
-        account_email: None,
         api_credentials_present: true,
         account_id: Some("abc123".to_string()),
-        disk_space_mb: 10000,
+        ..prereqs_fixture()
     };
 
     assert!(prereqs.is_ready());
@@ -53,11 +58,9 @@ fn test_prerequisites_ready_with_api_credentials() {
 fn test_prerequisites_ready_with_api_credentials_without_wrangler() {
     let prereqs = Prerequisites {
         wrangler_version: None,
-        wrangler_authenticated: false,
-        account_email: None,
         api_credentials_present: true,
         account_id: Some("abc123".to_string()),
-        disk_space_mb: 10000,
+        ..prereqs_fixture()
     };
 
     assert!(prereqs.is_ready());
@@ -68,11 +71,7 @@ fn test_prerequisites_ready_with_api_credentials_without_wrangler() {
 fn test_prerequisites_wrangler_not_installed() {
     let prereqs = Prerequisites {
         wrangler_version: None,
-        wrangler_authenticated: false,
-        account_email: None,
-        api_credentials_present: false,
-        account_id: None,
-        disk_space_mb: 10000,
+        ..prereqs_fixture()
     };
 
     assert!(!prereqs.is_ready());
@@ -87,14 +86,7 @@ fn test_prerequisites_wrangler_not_installed() {
 
 #[test]
 fn test_prerequisites_not_authenticated() {
-    let prereqs = Prerequisites {
-        wrangler_version: Some("wrangler 3.0.0".to_string()),
-        wrangler_authenticated: false,
-        account_email: None,
-        api_credentials_present: false,
-        account_id: None,
-        disk_space_mb: 10000,
-    };
+    let prereqs = prereqs_fixture();
 
     assert!(!prereqs.is_ready());
     let missing = prereqs.missing();
