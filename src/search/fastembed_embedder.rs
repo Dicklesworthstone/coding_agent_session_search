@@ -160,22 +160,22 @@ impl FastEmbedder {
     /// Load an ONNX embedder with custom configuration.
     pub fn load_with_config(model_dir: &Path, config: OnnxEmbedderConfig) -> EmbedderResult<Self> {
         if !model_dir.is_dir() {
-            return Err(EmbedderError::EmbedderUnavailable {
-                model: config.embedder_id.clone(),
-                reason: format!("model directory not found: {}", model_dir.display()),
-            });
+            return Err(Self::unavailable_error(
+                &config.embedder_id,
+                format!("model directory not found: {}", model_dir.display()),
+            ));
         }
 
         let onnx_path = Self::select_model_file(model_dir).ok_or_else(|| {
-            EmbedderError::EmbedderUnavailable {
-                model: config.embedder_id.clone(),
-                reason: format!(
+            Self::unavailable_error(
+                &config.embedder_id,
+                format!(
                     "no ONNX model file in {} (checked {} and {})",
                     model_dir.display(),
                     MODEL_ONNX_SUBDIR,
                     MODEL_ONNX_LEGACY
                 ),
-            }
+            )
         })?;
 
         let required = Self::required_model_files();
@@ -187,14 +187,14 @@ impl FastEmbedder {
             }
         }
         if !missing.is_empty() {
-            return Err(EmbedderError::EmbedderUnavailable {
-                model: config.embedder_id.clone(),
-                reason: format!(
+            return Err(Self::unavailable_error(
+                &config.embedder_id,
+                format!(
                     "model files missing in {}: {}",
                     model_dir.display(),
                     missing.join(", ")
                 ),
-            });
+            ));
         }
 
         let model_file = Self::read_required(onnx_path, "model.onnx", &config.embedder_id)?;
@@ -249,16 +249,17 @@ impl FastEmbedder {
     /// Load an embedder by name from the data directory.
     pub fn load_by_name(data_dir: &Path, embedder_name: &str) -> EmbedderResult<Self> {
         let model_dir = Self::model_dir_for(data_dir, embedder_name).ok_or_else(|| {
-            EmbedderError::EmbedderUnavailable {
-                model: embedder_name.to_string(),
-                reason: format!("unknown embedder: {}", embedder_name),
-            }
+            Self::unavailable_error(
+                embedder_name,
+                format!("unknown embedder: {}", embedder_name),
+            )
         })?;
-        let config =
-            Self::config_for(embedder_name).ok_or_else(|| EmbedderError::EmbedderUnavailable {
-                model: embedder_name.to_string(),
-                reason: format!("no config for embedder: {}", embedder_name),
-            })?;
+        let config = Self::config_for(embedder_name).ok_or_else(|| {
+            Self::unavailable_error(
+                embedder_name,
+                format!("no config for embedder: {}", embedder_name),
+            )
+        })?;
         Self::load_with_config(&model_dir, config)
     }
 
@@ -268,10 +269,19 @@ impl FastEmbedder {
     }
 
     fn read_required(path: PathBuf, label: &str, model_id: &str) -> EmbedderResult<Vec<u8>> {
-        fs::read(&path).map_err(|e| EmbedderError::EmbedderUnavailable {
-            model: model_id.to_string(),
-            reason: format!("unable to read {label} at {}: {e}", path.display()),
+        fs::read(&path).map_err(|e| {
+            Self::unavailable_error(
+                model_id,
+                format!("unable to read {label} at {}: {e}", path.display()),
+            )
         })
+    }
+
+    fn unavailable_error(model: impl Into<String>, reason: impl Into<String>) -> EmbedderError {
+        EmbedderError::EmbedderUnavailable {
+            model: model.into(),
+            reason: reason.into(),
+        }
     }
 
     fn normalize_in_place(embedding: &mut [f32]) {
@@ -432,6 +442,19 @@ mod tests {
             matches!(err, EmbedderError::EmbedderUnavailable { .. }),
             "expected EmbedderUnavailable, got {err:?}"
         );
+    }
+
+    #[test]
+    fn unavailable_error_preserves_shape() {
+        let err = FastEmbedder::unavailable_error("test-model", "missing files");
+        assert!(std::error::Error::source(&err).is_none());
+        match err {
+            EmbedderError::EmbedderUnavailable { model, reason } => {
+                assert_eq!(model, "test-model");
+                assert_eq!(reason, "missing files");
+            }
+            other => panic!("expected EmbedderUnavailable, got {other:?}"),
+        }
     }
 
     #[test]
