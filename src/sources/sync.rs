@@ -1244,20 +1244,12 @@ impl SyncEngine {
             .unwrap_or(ssh_host);
         let port = host_config.and_then(|h| h.port).unwrap_or(22);
         // Resolve username deterministically; never guess with a sentinel value.
-        let normalize_username = |value: Option<String>| {
-            value.and_then(|candidate| {
-                let trimmed = candidate.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            })
-        };
-        let username = match normalize_username(ssh_user.map(|s| s.to_string()))
-            .or_else(|| normalize_username(host_config.and_then(|h| h.user.clone())))
-            .or_else(|| normalize_username(dotenvy::var("USER").ok()))
-            .or_else(|| normalize_username(dotenvy::var("LOGNAME").ok()))
+        let username = match first_nonblank_username([
+            ssh_user,
+            host_config.and_then(|h| h.user.as_deref()),
+        ])
+        .or_else(|| env_username("USER"))
+        .or_else(|| env_username("LOGNAME"))
         {
             Some(user) => user,
             None => {
@@ -1767,6 +1759,25 @@ fn parse_ssh_host(host: &str) -> (Option<&str>, &str) {
     } else {
         (None, host)
     }
+}
+
+fn first_nonblank_username<'a>(
+    candidates: impl IntoIterator<Item = Option<&'a str>>,
+) -> Option<String> {
+    candidates.into_iter().find_map(|candidate| {
+        let trimmed = candidate?.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn env_username(key: &str) -> Option<String> {
+    dotenvy::var(key)
+        .ok()
+        .and_then(|value| first_nonblank_username([Some(value.as_str())]))
 }
 
 /// Expand tilde in local paths.
@@ -2752,6 +2763,19 @@ Total transferred file size: 1,234 bytes
         let (user, host) = parse_ssh_host("user@host");
         assert_eq!(user, Some("user"));
         assert_eq!(host, "host");
+    }
+
+    #[test]
+    fn test_first_nonblank_username_priority_and_trimming() {
+        assert_eq!(
+            first_nonblank_username([Some("  alice  "), Some("bob")]),
+            Some("alice".to_string())
+        );
+        assert_eq!(
+            first_nonblank_username([Some("  "), None, Some("carol")]),
+            Some("carol".to_string())
+        );
+        assert_eq!(first_nonblank_username([None, Some("\t")]), None);
     }
 
     #[test]
