@@ -28,6 +28,10 @@ use serde::{Deserialize, Serialize};
 // Re-export core provenance types from franken_agent_detection.
 pub use franken_agent_detection::{LOCAL_SOURCE_ID, Origin, SourceKind};
 
+const SOURCE_FILTER_ALL: &str = "all";
+const SOURCE_FILTER_LOCAL: &str = "local";
+const SOURCE_FILTER_REMOTE: &str = "remote";
+
 /// A registered source in the system.
 ///
 /// This struct represents a source record as stored in SQLite.
@@ -147,9 +151,9 @@ impl SourceFilter {
     pub fn parse(s: &str) -> Self {
         let trimmed = s.trim();
         match trimmed.to_ascii_lowercase().as_str() {
-            "" | "all" | "*" => Self::All,
-            "local" => Self::Local,
-            "remote" => Self::Remote,
+            "" | SOURCE_FILTER_ALL | "*" => Self::All,
+            SOURCE_FILTER_LOCAL => Self::Local,
+            SOURCE_FILTER_REMOTE => Self::Remote,
             _ => Self::SourceId(trimmed.to_string()),
         }
     }
@@ -189,10 +193,10 @@ impl SourceFilter {
 impl std::fmt::Display for SourceFilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::All => write!(f, "all"),
-            Self::Local => write!(f, "local"),
-            Self::Remote => write!(f, "remote"),
-            Self::SourceId(id) => write!(f, "{}", id),
+            Self::All => f.write_str(SOURCE_FILTER_ALL),
+            Self::Local => f.write_str(SOURCE_FILTER_LOCAL),
+            Self::Remote => f.write_str(SOURCE_FILTER_REMOTE),
+            Self::SourceId(id) => f.write_str(id),
         }
     }
 }
@@ -360,12 +364,18 @@ mod tests {
 
     #[test]
     fn test_source_filter_parse() {
-        assert_eq!(SourceFilter::parse("all"), SourceFilter::All);
+        assert_eq!(SourceFilter::parse(SOURCE_FILTER_ALL), SourceFilter::All);
         assert_eq!(SourceFilter::parse("ALL"), SourceFilter::All);
         assert_eq!(SourceFilter::parse("*"), SourceFilter::All);
-        assert_eq!(SourceFilter::parse("local"), SourceFilter::Local);
+        assert_eq!(
+            SourceFilter::parse(SOURCE_FILTER_LOCAL),
+            SourceFilter::Local
+        );
         assert_eq!(SourceFilter::parse("LOCAL"), SourceFilter::Local);
-        assert_eq!(SourceFilter::parse("remote"), SourceFilter::Remote);
+        assert_eq!(
+            SourceFilter::parse(SOURCE_FILTER_REMOTE),
+            SourceFilter::Remote
+        );
         assert_eq!(SourceFilter::parse("REMOTE"), SourceFilter::Remote);
         assert_eq!(
             SourceFilter::parse("laptop"),
@@ -409,9 +419,9 @@ mod tests {
 
     #[test]
     fn test_source_filter_display() {
-        assert_eq!(SourceFilter::All.to_string(), "all");
-        assert_eq!(SourceFilter::Local.to_string(), "local");
-        assert_eq!(SourceFilter::Remote.to_string(), "remote");
+        assert_eq!(SourceFilter::All.to_string(), SOURCE_FILTER_ALL);
+        assert_eq!(SourceFilter::Local.to_string(), SOURCE_FILTER_LOCAL);
+        assert_eq!(SourceFilter::Remote.to_string(), SOURCE_FILTER_REMOTE);
         assert_eq!(
             SourceFilter::SourceId("laptop".to_string()).to_string(),
             "laptop"
