@@ -167,7 +167,7 @@ impl GitHubDeployer {
 
     /// Check size of bundle directory
     pub fn check_size(&self, bundle_dir: &Path) -> Result<SizeCheck> {
-        let bundle_dir = resolve_deploy_site_dir(bundle_dir)?;
+        let bundle_dir = super::resolve_site_dir(bundle_dir)?;
         let mut total_bytes = 0u64;
         let mut file_count = 0usize;
         let mut large_files = Vec::new();
@@ -214,7 +214,7 @@ impl GitHubDeployer {
         bundle_dir: P,
         mut progress: impl FnMut(&str, &str),
     ) -> Result<DeployResult> {
-        let bundle_dir = resolve_deploy_site_dir(bundle_dir.as_ref())?;
+        let bundle_dir = super::resolve_site_dir(bundle_dir.as_ref())?;
 
         // Step 1: Check prerequisites
         progress("prereq", "Checking prerequisites...");
@@ -370,10 +370,6 @@ fn create_temp_dir() -> Result<PathBuf> {
     Ok(temp_dir)
 }
 
-fn resolve_deploy_site_dir(path: &Path) -> Result<PathBuf> {
-    super::resolve_site_dir(path)
-}
-
 /// Get gh CLI version
 fn get_gh_version() -> Option<String> {
     Command::new("gh")
@@ -525,7 +521,7 @@ fn clone_repo(repo_url: &str, dest: &Path) -> Result<()> {
 
 /// Copy bundle contents to repository directory
 fn copy_bundle_to_repo(bundle_dir: &Path, repo_dir: &Path) -> Result<()> {
-    let bundle_dir = resolve_deploy_site_dir(bundle_dir)?;
+    let bundle_dir = super::resolve_site_dir(bundle_dir)?;
 
     // Clear existing files (except .git)
     if repo_dir.exists() {
@@ -920,19 +916,19 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_deploy_site_dir_accepts_direct_site_directory() {
+    fn test_resolve_site_dir_accepts_direct_site_directory() {
         use tempfile::TempDir;
 
         let temp = TempDir::new().unwrap();
         std::fs::write(temp.path().join("index.html"), "<html></html>").unwrap();
 
-        let resolved = resolve_deploy_site_dir(temp.path()).unwrap();
+        let resolved = super::super::resolve_site_dir(temp.path()).unwrap();
         assert_eq!(resolved, temp.path());
     }
 
     #[test]
     #[cfg(unix)]
-    fn test_resolve_deploy_site_dir_rejects_symlinked_site_directory() {
+    fn test_resolve_site_dir_rejects_symlinked_site_directory() {
         use std::os::unix::fs::symlink;
         use tempfile::TempDir;
 
@@ -943,12 +939,12 @@ mod tests {
         std::fs::write(outside_site.join("index.html"), "<html></html>").unwrap();
         symlink(&outside_site, bundle_root.path().join("site")).unwrap();
 
-        let err = resolve_deploy_site_dir(bundle_root.path())
+        let err = super::super::resolve_site_dir(bundle_root.path())
             .unwrap_err()
             .to_string();
         assert!(err.contains("must not be a symlink"));
 
-        let direct_err = resolve_deploy_site_dir(&bundle_root.path().join("site"))
+        let direct_err = super::super::resolve_site_dir(&bundle_root.path().join("site"))
             .unwrap_err()
             .to_string();
         assert!(direct_err.contains("must not be a symlink"));
