@@ -11,7 +11,9 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use tracing::{debug, error, info, warn};
 
-use crate::indexer::semantic::{EmbeddingInput, SemanticIndexer};
+use crate::indexer::semantic::{
+    EmbeddingInput, SemanticIndexer, message_id_from_db, saturating_u32_from_i64,
+};
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::vector_index::{
@@ -83,18 +85,6 @@ impl EmbeddingWorkerHandle {
 pub struct EmbeddingWorker {
     receiver: Receiver<WorkerMessage>,
     cancel_flag: Arc<AtomicBool>,
-}
-
-fn message_id_from_db(raw: i64) -> Option<u64> {
-    u64::try_from(raw).ok()
-}
-
-fn saturating_u32_from_i64(raw: i64) -> u32 {
-    match u32::try_from(raw) {
-        Ok(value) => value,
-        Err(_) if raw.is_negative() => 0,
-        Err(_) => u32::MAX,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -508,11 +508,11 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
     Ok(u64::try_from(count.max(0)).unwrap_or(u64::MAX))
 }
 
-fn message_id_from_db(raw: i64) -> Option<u64> {
+pub(crate) fn message_id_from_db(raw: i64) -> Option<u64> {
     u64::try_from(raw).ok()
 }
 
-fn saturating_u32_from_i64(raw: i64) -> u32 {
+pub(crate) fn saturating_u32_from_i64(raw: i64) -> u32 {
     match u32::try_from(raw) {
         Ok(value) => value,
         Err(_) if raw.is_negative() => 0,
