@@ -22,6 +22,11 @@ const HTTP_TIMEOUT_SECS: u64 = 5;
 
 /// GitHub repo for release checks
 const GITHUB_REPO: &str = "Dicklesworthstone/coding_agent_session_search";
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+const UNIX_INSTALL_ASSET: &str = "install.sh";
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_INSTALL_ASSET: &str = "install.ps1";
+const CHECKSUMS_ASSET: &str = "SHA256SUMS.txt";
 
 fn updates_disabled() -> bool {
     dotenvy::var("CASS_SKIP_UPDATE").is_ok()
@@ -346,8 +351,8 @@ pub fn run_self_update(version: &str) -> ! {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use std::os::unix::process::CommandExt;
-        let install_url = release_asset_url(version, "install.sh");
-        let checksums_url = release_asset_url(version, "SHA256SUMS.txt");
+        let install_url = release_asset_url(version, UNIX_INSTALL_ASSET);
+        let checksums_url = release_asset_url(version, CHECKSUMS_ASSET);
         // Use positional args instead of string interpolation to prevent injection.
         let err = std::process::Command::new("bash")
             .args([
@@ -366,8 +371,8 @@ pub fn run_self_update(version: &str) -> ! {
 
     #[cfg(target_os = "windows")]
     {
-        let install_url = release_asset_url(version, "install.ps1");
-        let checksums_url = release_asset_url(version, "SHA256SUMS.txt");
+        let install_url = release_asset_url(version, WINDOWS_INSTALL_ASSET);
+        let checksums_url = release_asset_url(version, CHECKSUMS_ASSET);
         // Windows doesn't have exec(), so we spawn and wait.
         let status = std::process::Command::new("powershell")
             .args([
@@ -630,20 +635,22 @@ mod tests {
     #[test]
     fn test_release_asset_url_uses_immutable_release_downloads() {
         assert_eq!(
-            release_asset_url("v1.2.3", "install.sh"),
-            "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v1.2.3/install.sh"
+            release_asset_url("v1.2.3", UNIX_INSTALL_ASSET),
+            format!(
+                "https://github.com/{GITHUB_REPO}/releases/download/v1.2.3/{UNIX_INSTALL_ASSET}"
+            )
         );
         assert_eq!(
-            release_asset_url("v1.2.3", "SHA256SUMS.txt"),
-            "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v1.2.3/SHA256SUMS.txt"
+            release_asset_url("v1.2.3", CHECKSUMS_ASSET),
+            format!("https://github.com/{GITHUB_REPO}/releases/download/v1.2.3/{CHECKSUMS_ASSET}")
         );
     }
 
     #[test]
     fn test_unix_self_update_verifies_installer_script_before_running() {
         let script = unix_self_update_script();
-        assert!(script.contains("SHA256SUMS.txt"));
-        assert!(script.contains(r#"$2 == "install.sh""#));
+        assert!(script.contains(CHECKSUMS_ASSET));
+        assert!(script.contains(&format!(r#"$2 == "{UNIX_INSTALL_ASSET}""#)));
         assert!(script.contains("sha256sum -c -"));
         assert!(script.contains("shasum -a 256"));
         assert!(script.contains("openssl dgst -sha256"));
@@ -653,8 +660,8 @@ mod tests {
     #[test]
     fn test_windows_self_update_verifies_installer_script_before_running() {
         let script = windows_self_update_script();
-        assert!(script.contains("SHA256SUMS.txt"));
-        assert!(script.contains(r#"$Parts[1] -eq "install.ps1""#));
+        assert!(script.contains(CHECKSUMS_ASSET));
+        assert!(script.contains(&format!(r#"$Parts[1] -eq "{WINDOWS_INSTALL_ASSET}""#)));
         assert!(script.contains("Get-FileHash"));
         assert!(script.contains("-EasyMode -Verify -Version $Version"));
         assert!(script.contains("Remove-Item -LiteralPath $Temp"));
