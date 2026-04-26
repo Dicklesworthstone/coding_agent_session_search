@@ -1660,16 +1660,7 @@ impl PagesWizard {
 
             // Write minimal config.json for unencrypted bundle
             let db_size = std::fs::metadata(&dest_db).map(|m| m.len()).unwrap_or(0);
-            let config = serde_json::json!({
-                "encrypted": false,
-                "version": "1.0.0",
-                "payload": {
-                    "path": "payload/data.db",
-                    "format": "sqlite",
-                    "size_bytes": db_size
-                },
-                "warning": "UNENCRYPTED - All content is publicly readable"
-            });
+            let config = unencrypted_bundle_config(db_size);
             let config_path = encrypted_dir.join("config.json");
             crate::pages::write_file_durably(
                 &config_path,
@@ -2094,6 +2085,19 @@ impl PagesWizard {
     }
 }
 
+fn unencrypted_bundle_config(db_size: u64) -> serde_json::Value {
+    serde_json::json!({
+        "encrypted": false,
+        "version": "1.0.0",
+        "payload": {
+            "path": "payload/data.db",
+            "format": "sqlite",
+            "size_bytes": db_size
+        },
+        "warning": "UNENCRYPTED - All content is publicly readable"
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2126,6 +2130,25 @@ mod tests {
         let target = DeployTarget::CloudflarePages;
         let cloned = target;
         assert_eq!(target, cloned);
+    }
+
+    #[test]
+    fn unencrypted_bundle_config_shape() {
+        let config = unencrypted_bundle_config(1234);
+
+        assert_eq!(
+            config,
+            serde_json::json!({
+                "encrypted": false,
+                "version": "1.0.0",
+                "payload": {
+                    "path": "payload/data.db",
+                    "format": "sqlite",
+                    "size_bytes": 1234
+                },
+                "warning": "UNENCRYPTED - All content is publicly readable"
+            })
+        );
     }
 
     // =========================
