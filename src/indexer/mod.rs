@@ -15447,6 +15447,8 @@ pub mod persist {
     use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use std::time::Duration;
+    #[cfg(test)]
+    use std::time::Instant;
 
     use anyhow::{Context, Result, anyhow};
     use frankensqlite::FrankenError;
@@ -15504,6 +15506,60 @@ pub mod persist {
             .filter(|(_, message)| inserted.contains(&message.idx))
             .map(|(position, _)| position)
             .collect()
+    }
+
+    #[cfg(test)]
+    #[derive(Debug, Clone, Default)]
+    struct PersistConversationPerfProfile {
+        invocations: usize,
+        messages: usize,
+        inserted_messages: usize,
+        total_duration: Duration,
+        db_duration: Duration,
+        packet_duration: Duration,
+        positional_duration: Duration,
+        tantivy_add_duration: Duration,
+    }
+
+    #[cfg(test)]
+    impl PersistConversationPerfProfile {
+        fn millis(duration: Duration) -> f64 {
+            duration.as_secs_f64() * 1000.0
+        }
+
+        fn log_summary(&self, label: &str) {
+            let calls = self.invocations.max(1) as f64;
+            let accounted_duration = self.db_duration
+                + self.packet_duration
+                + self.positional_duration
+                + self.tantivy_add_duration;
+            let residual_duration = self.total_duration.saturating_sub(accounted_duration);
+            eprintln!(
+                concat!(
+                    "CASS_PERSIST_STAGE_PROFILE ",
+                    "label={} calls={} messages={} inserted_messages={} ",
+                    "total_ms={:.3} db_ms={:.3} packet_ms={:.3} positional_ms={:.3} ",
+                    "tantivy_add_ms={:.3} residual_ms={:.3} ",
+                    "avg_total_ms={:.3} avg_db_ms={:.3} avg_packet_ms={:.3} ",
+                    "avg_positional_ms={:.3} avg_tantivy_add_ms={:.3}"
+                ),
+                label,
+                self.invocations,
+                self.messages,
+                self.inserted_messages,
+                Self::millis(self.total_duration),
+                Self::millis(self.db_duration),
+                Self::millis(self.packet_duration),
+                Self::millis(self.positional_duration),
+                Self::millis(self.tantivy_add_duration),
+                Self::millis(residual_duration),
+                Self::millis(self.total_duration) / calls,
+                Self::millis(self.db_duration) / calls,
+                Self::millis(self.packet_duration) / calls,
+                Self::millis(self.positional_duration) / calls,
+                Self::millis(self.tantivy_add_duration) / calls,
+            );
+        }
     }
 
     #[derive(Debug, Clone, Default)]
@@ -15775,12 +15831,34 @@ pub mod persist {
         // with the short-lived writer so watch-mode observability and follow-up
         // policy transitions still reflect the active ingestion mode.
         apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
-        let writer = FrankenStorage::open_writer(&db_path).with_context(|| {
+        let (writer, reusable) = storage.acquire_cached_ephemeral_writer().with_context(|| {
             format!(
                 "opening short-lived frankensqlite writer for {context}: {}",
                 db_path.display()
             )
         })?;
+
+        let release_writer = |writer: FrankenStorage| -> Result<()> {
+            if reusable {
+                storage.release_cached_ephemeral_writer(writer);
+                Ok(())
+            } else {
+                writer.close().with_context(|| {
+                    format!(
+                        "closing short-lived frankensqlite writer for {context}: {}",
+                        db_path.display()
+                    )
+                })
+            }
+        };
+
+        let discard_writer = |mut writer: FrankenStorage| {
+            if reusable {
+                storage.discard_cached_ephemeral_writer(writer);
+            } else {
+                writer.close_best_effort_in_place();
+            }
+        };
 
         if !storage.ephemeral_writer_preflight_verified() {
             // CASS #162 item 2: Preflight write check to catch "attempt to write
@@ -15793,6 +15871,7 @@ pub mod persist {
                 .raw()
                 .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
             {
+                discard_writer(writer);
                 anyhow::bail!(
                     "ephemeral writer preflight write failed for {context} at {}: {err}. \
                      The database may be locked by another process or opened in \
@@ -15822,20 +15901,14 @@ pub mod persist {
         }
 
         let result = f(&writer);
-        let close_result = writer.close().with_context(|| {
-            format!(
-                "closing short-lived frankensqlite writer for {context}: {}",
-                db_path.display()
-            )
-        });
 
         match result {
             Ok(value) => {
-                close_result?;
+                release_writer(writer)?;
                 Ok(value)
             }
             Err(err) => {
-                if let Err(close_err) = close_result {
+                if let Err(close_err) = release_writer(writer) {
                     tracing::warn!(
                         error = %close_err,
                         db_path = %db_path.display(),
@@ -16438,6 +16511,70 @@ pub mod persist {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn persist_conversation_with_profile(
+        storage: &FrankenStorage,
+        t_index: &mut TantivyIndex,
+        conv: &NormalizedConversation,
+        profile: &mut PersistConversationPerfProfile,
+    ) -> Result<()> {
+        let total_started = Instant::now();
+        let db_started = Instant::now();
+        let InsertOutcome {
+            conversation_id,
+            conversation_inserted: _conversation_inserted,
+            inserted_indices,
+        } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
+            let internal_conv = map_to_internal(conv);
+            let agent = Agent {
+                id: None,
+                slug: conv.agent_slug.clone(),
+                name: conv.agent_slug.clone(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = writer.ensure_agent(&agent)?;
+
+            let workspace_id = if let Some(ws) = &conv.workspace {
+                Some(writer.ensure_workspace(ws, None)?)
+            } else {
+                None
+            };
+
+            writer.insert_conversation_tree(agent_id, workspace_id, &internal_conv)
+        })?;
+        profile.db_duration += db_started.elapsed();
+
+        if !defer_lexical_updates_enabled() && !inserted_indices.is_empty() {
+            let packet_started = Instant::now();
+            let packet = lexical_packet_for_persist(conv);
+            profile.packet_duration += packet_started.elapsed();
+
+            let positional_started = Instant::now();
+            let positional = positional_indices_for_inserted(&packet, &inserted_indices);
+            profile.positional_duration += positional_started.elapsed();
+
+            if !positional.is_empty() {
+                let tantivy_add_started = Instant::now();
+                t_index.add_messages_from_packet(
+                    &packet,
+                    Some(&positional),
+                    Some(conversation_id),
+                    |_| Ok(()),
+                )?;
+                profile.tantivy_add_duration += tantivy_add_started.elapsed();
+            }
+        }
+
+        profile.invocations = profile.invocations.saturating_add(1);
+        profile.messages = profile.messages.saturating_add(conv.messages.len());
+        profile.inserted_messages = profile
+            .inserted_messages
+            .saturating_add(inserted_indices.len());
+        profile.total_duration += total_started.elapsed();
+        Ok(())
+    }
+
     /// Persist multiple conversations in a single database transaction for better performance.
     /// This reduces SQLite transaction overhead when indexing many conversations at once.
     ///
@@ -17011,6 +17148,36 @@ pub mod persist {
                 .unwrap();
 
             assert!(storage.ephemeral_writer_preflight_verified());
+        }
+
+        #[test]
+        fn with_ephemeral_writer_reuses_cached_connection_when_idle() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("ephemeral-writer-reuse.db");
+            let storage = create_franken_db(&db_path);
+
+            with_ephemeral_writer(&storage, false, "ephemeral-writer-reuse", |writer| {
+                writer
+                    .raw()
+                    .execute("CREATE TEMP TABLE temp_writer_reuse(marker INTEGER NOT NULL);")?;
+                writer
+                    .raw()
+                    .execute("INSERT INTO temp_writer_reuse(marker) VALUES (1);")?;
+                Ok(())
+            })
+            .unwrap();
+
+            let count: i64 =
+                with_ephemeral_writer(&storage, false, "ephemeral-writer-reuse", |writer| {
+                    Ok(writer.raw().query_row_map(
+                        "SELECT COUNT(*) FROM temp_writer_reuse;",
+                        &[],
+                        |row| row.get_typed(0),
+                    )?)
+                })
+                .unwrap();
+
+            assert_eq!(count, 1, "temp table should persist on the reused writer");
         }
 
         #[test]
@@ -18553,6 +18720,100 @@ pub mod persist {
                 provenance,
                 vec![("builder-4".to_string(), Some("builder-4".to_string()))]
             );
+        }
+
+        fn make_profiled_remote_conversation(
+            external_id: i64,
+            msg_count: usize,
+        ) -> NormalizedConversation {
+            NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: Some(format!("profiled-remote-{external_id}")),
+                title: Some(format!("Profiled remote conversation {external_id}")),
+                workspace: Some(std::path::PathBuf::from("/ws/profiled-remote")),
+                source_path: std::path::PathBuf::from(format!(
+                    "/log/profiled-remote-{external_id}.jsonl"
+                )),
+                started_at: Some(10_000 + external_id * 100),
+                ended_at: Some(10_000 + external_id * 100 + msg_count as i64),
+                metadata: serde_json::json!({
+                    "cass": {
+                        "origin": {
+                            "source_id": "profiled-remote-source",
+                            "host": "builder-profile"
+                        }
+                    }
+                }),
+                messages: (0..msg_count)
+                    .map(|idx| NormalizedMessage {
+                        idx: idx as i64,
+                        role: if idx % 2 == 0 { "user" } else { "assistant" }.into(),
+                        author: Some("tester".into()),
+                        created_at: Some(20_000 + external_id * 100 + idx as i64),
+                        content: format!(
+                            "profiled remote content ext={external_id} idx={idx} {}",
+                            "x".repeat(64)
+                        ),
+                        extra: serde_json::json!({ "idx": idx }),
+                        snippets: vec![],
+                        invocations: Vec::new(),
+                    })
+                    .collect(),
+            }
+        }
+
+        #[test]
+        fn persist_conversation_stage_profile_tracks_steady_state_remote_reuse() {
+            use crate::search::tantivy::TantivyIndex;
+
+            let _defer_guard = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+            let log_profile = std::env::var_os("CASS_PERSIST_STAGE_PROFILE").is_some();
+
+            for &(msg_count, iterations) in &[(5usize, 80usize), (20, 50), (50, 24)] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let db_path = dir.path().join(format!("profile-{msg_count}.db"));
+                let index_path = dir.path().join(format!("tantivy-{msg_count}"));
+
+                let storage = create_franken_db(&db_path);
+                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+                persist_conversation(
+                    &storage,
+                    &mut t_index,
+                    &make_profiled_remote_conversation(0, msg_count),
+                )
+                .unwrap();
+
+                let mut profile = PersistConversationPerfProfile::default();
+                for external_id in 1..=iterations {
+                    persist_conversation_with_profile(
+                        &storage,
+                        &mut t_index,
+                        &make_profiled_remote_conversation(external_id as i64, msg_count),
+                        &mut profile,
+                    )
+                    .unwrap();
+                }
+
+                assert_eq!(profile.invocations, iterations);
+                assert_eq!(profile.messages, iterations * msg_count);
+                assert_eq!(profile.inserted_messages, iterations * msg_count);
+                assert!(
+                    profile.total_duration >= profile.db_duration,
+                    "db stage cannot exceed total duration"
+                );
+                assert!(
+                    profile.total_duration
+                        >= profile.db_duration
+                            + profile.packet_duration
+                            + profile.positional_duration
+                            + profile.tantivy_add_duration,
+                    "accounted stage durations cannot exceed total duration"
+                );
+
+                if log_profile {
+                    profile.log_summary(&format!("remote_reuse_{msg_count}_msgs"));
+                }
+            }
         }
 
         #[test]

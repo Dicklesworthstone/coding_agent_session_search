@@ -20,7 +20,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+};
 
 /// Frankensqlite parameter list builder.
 macro_rules! fparams {
@@ -74,6 +77,10 @@ unsafe impl Send for SendFrankenConnection {}
 impl SendFrankenConnection {
     pub(crate) fn new(conn: FrankenConnection) -> Self {
         Self(conn)
+    }
+
+    pub(crate) fn into_inner(self) -> FrankenConnection {
+        self.0
     }
 }
 
@@ -2814,10 +2821,35 @@ pub struct FrankenStorage {
     db_path: PathBuf,
     ephemeral_writer_preflight_verified: AtomicBool,
     index_writer_checkpoint_pages: AtomicI64,
+    cached_ephemeral_writer: parking_lot::Mutex<CachedEphemeralWriter>,
+    ensured_conversation_sources: Arc<parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>>,
 }
 
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1000;
 const UNSET_INDEX_WRITER_CHECKPOINT_PAGES: i64 = i64::MIN;
+
+enum CachedEphemeralWriter {
+    Uninitialized,
+    Cached(Box<SendFrankenConnection>),
+    InUse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EnsuredConversationSourceKey {
+    id: String,
+    kind: SourceKind,
+    host_label: Option<String>,
+}
+
+impl EnsuredConversationSourceKey {
+    fn from_source(source: &Source) -> Self {
+        Self {
+            id: source.id.clone(),
+            kind: source.kind,
+            host_label: source.host_label.clone(),
+        }
+    }
+}
 
 const AUTOCOMMIT_RETAIN_OFF_PRAGMAS: [&str; 2] = [
     "PRAGMA fsqlite.autocommit_retain = OFF;",
@@ -2858,11 +2890,27 @@ where
 
 impl FrankenStorage {
     fn new(conn: FrankenConnection, db_path: PathBuf) -> Self {
+        Self::new_with_shared_sources(
+            conn,
+            db_path,
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
+        )
+    }
+
+    fn new_with_shared_sources(
+        conn: FrankenConnection,
+        db_path: PathBuf,
+        ensured_conversation_sources: Arc<
+            parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>,
+        >,
+    ) -> Self {
         Self {
             conn,
             db_path,
             ephemeral_writer_preflight_verified: AtomicBool::new(false),
             index_writer_checkpoint_pages: AtomicI64::new(UNSET_INDEX_WRITER_CHECKPOINT_PAGES),
+            cached_ephemeral_writer: parking_lot::Mutex::new(CachedEphemeralWriter::Uninitialized),
+            ensured_conversation_sources,
         }
     }
 
@@ -2903,12 +2951,119 @@ impl FrankenStorage {
     /// own connection with config applied, but migrations have already been run
     /// by the primary connection.
     pub fn open_writer(path: &Path) -> Result<Self> {
+        Self::open_writer_with_shared_sources(
+            path,
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
+        )
+    }
+
+    fn open_writer_with_shared_sources(
+        path: &Path,
+        ensured_conversation_sources: Arc<
+            parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>,
+        >,
+    ) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
         let conn = FrankenConnection::open(&path_str)
             .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
-        let storage = Self::new(conn, path.to_path_buf());
+        let storage =
+            Self::new_with_shared_sources(conn, path.to_path_buf(), ensured_conversation_sources);
         storage.apply_config()?;
         Ok(storage)
+    }
+
+    pub(crate) fn acquire_cached_ephemeral_writer(&self) -> Result<(Self, bool)> {
+        let mut cached = self.cached_ephemeral_writer.lock();
+        match std::mem::replace(&mut *cached, CachedEphemeralWriter::InUse) {
+            CachedEphemeralWriter::Cached(conn) => Ok((
+                Self::new_with_shared_sources(
+                    (*conn).into_inner(),
+                    self.db_path.clone(),
+                    Arc::clone(&self.ensured_conversation_sources),
+                ),
+                true,
+            )),
+            CachedEphemeralWriter::Uninitialized => {
+                drop(cached);
+                match Self::open_writer_with_shared_sources(
+                    &self.db_path,
+                    Arc::clone(&self.ensured_conversation_sources),
+                ) {
+                    Ok(writer) => Ok((writer, true)),
+                    Err(err) => {
+                        let mut cached = self.cached_ephemeral_writer.lock();
+                        if matches!(&*cached, CachedEphemeralWriter::InUse) {
+                            *cached = CachedEphemeralWriter::Uninitialized;
+                        }
+                        Err(err)
+                    }
+                }
+            }
+            CachedEphemeralWriter::InUse => {
+                *cached = CachedEphemeralWriter::InUse;
+                drop(cached);
+                Ok((
+                    Self::open_writer_with_shared_sources(
+                        &self.db_path,
+                        Arc::clone(&self.ensured_conversation_sources),
+                    )?,
+                    false,
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn release_cached_ephemeral_writer(&self, writer: Self) {
+        let conn = writer.into_raw();
+        let mut cached = self.cached_ephemeral_writer.lock();
+        debug_assert!(
+            matches!(&*cached, CachedEphemeralWriter::InUse),
+            "cached ephemeral writer state should be in-use when releasing"
+        );
+        *cached = CachedEphemeralWriter::Cached(Box::new(SendFrankenConnection::new(conn)));
+    }
+
+    pub(crate) fn discard_cached_ephemeral_writer(&self, mut writer: Self) {
+        writer.close_best_effort_in_place();
+        let mut cached = self.cached_ephemeral_writer.lock();
+        if matches!(&*cached, CachedEphemeralWriter::InUse) {
+            *cached = CachedEphemeralWriter::Uninitialized;
+        }
+    }
+
+    fn conversation_source_already_ensured(&self, key: &EnsuredConversationSourceKey) -> bool {
+        self.ensured_conversation_sources.lock().contains(key)
+    }
+
+    fn mark_conversation_source_ensured(&self, key: EnsuredConversationSourceKey) {
+        self.ensured_conversation_sources.lock().insert(key);
+    }
+
+    fn invalidate_conversation_source_cache(&self, source_id: &str) {
+        self.ensured_conversation_sources
+            .lock()
+            .retain(|key| key.id != source_id);
+    }
+
+    fn close_cached_ephemeral_writer_best_effort_in_place(&mut self) {
+        let cached = self.cached_ephemeral_writer.get_mut();
+        if let CachedEphemeralWriter::Cached(conn) =
+            std::mem::replace(cached, CachedEphemeralWriter::Uninitialized)
+        {
+            let mut conn = conn;
+            conn.0.close_best_effort_in_place();
+        }
+    }
+
+    fn close_cached_ephemeral_writer_without_checkpoint_in_place(&mut self) -> Result<()> {
+        let cached = self.cached_ephemeral_writer.get_mut();
+        match std::mem::replace(cached, CachedEphemeralWriter::Uninitialized) {
+            CachedEphemeralWriter::Cached(mut conn) => conn
+                .0
+                .close_without_checkpoint_in_place()
+                .with_context(|| "closing cached frankensqlite writer without final checkpoint"),
+            CachedEphemeralWriter::Uninitialized | CachedEphemeralWriter::InUse => Ok(()),
+        }
     }
 
     /// Open in read-only mode using frankensqlite compat flags.
@@ -2922,22 +3077,28 @@ impl FrankenStorage {
     }
 
     pub fn close(self) -> Result<()> {
-        self.conn
+        let mut this = self;
+        this.close_cached_ephemeral_writer_best_effort_in_place();
+        this.conn
             .close()
             .with_context(|| "closing frankensqlite connection")
     }
 
     pub fn close_without_checkpoint(self) -> Result<()> {
-        self.conn
+        let mut this = self;
+        this.close_cached_ephemeral_writer_without_checkpoint_in_place()?;
+        this.conn
             .close_without_checkpoint()
             .with_context(|| "closing frankensqlite connection without final checkpoint")
     }
 
     pub fn close_best_effort_in_place(&mut self) {
+        self.close_cached_ephemeral_writer_best_effort_in_place();
         self.conn.close_best_effort_in_place();
     }
 
     pub fn close_without_checkpoint_in_place(&mut self) -> Result<()> {
+        self.close_cached_ephemeral_writer_without_checkpoint_in_place()?;
         self.conn
             .close_without_checkpoint_in_place()
             .with_context(|| "closing frankensqlite connection without final checkpoint")
@@ -2951,7 +3112,9 @@ impl FrankenStorage {
     /// Consume the storage wrapper and return the underlying frankensqlite
     /// connection after migrations/repair have already been applied.
     pub fn into_raw(self) -> FrankenConnection {
-        self.conn
+        let mut this = self;
+        this.close_cached_ephemeral_writer_best_effort_in_place();
+        this.conn
     }
 
     /// Apply connection PRAGMAs for parity with SqliteStorage's `apply_pragmas()`.
@@ -4104,6 +4267,79 @@ pub struct InsertOutcome {
     pub conversation_id: i64,
     pub conversation_inserted: bool,
     pub inserted_indices: Vec<i64>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct InsertConversationTreePerfProfile {
+    invocations: usize,
+    messages: usize,
+    inserted_messages: usize,
+    total_duration: Duration,
+    source_duration: Duration,
+    tx_open_duration: Duration,
+    existing_lookup_duration: Duration,
+    conversation_row_duration: Duration,
+    message_insert_duration: Duration,
+    snippet_insert_duration: Duration,
+    fts_entry_duration: Duration,
+    fts_flush_duration: Duration,
+    analytics_duration: Duration,
+    commit_duration: Duration,
+}
+
+#[cfg(test)]
+impl InsertConversationTreePerfProfile {
+    fn millis(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+
+    fn log_summary(&self, label: &str) {
+        let calls = self.invocations.max(1) as f64;
+        let accounted_duration = self.source_duration
+            + self.tx_open_duration
+            + self.existing_lookup_duration
+            + self.conversation_row_duration
+            + self.message_insert_duration
+            + self.snippet_insert_duration
+            + self.fts_entry_duration
+            + self.fts_flush_duration
+            + self.analytics_duration
+            + self.commit_duration;
+        let residual_duration = self.total_duration.saturating_sub(accounted_duration);
+        eprintln!(
+            concat!(
+                "CASS_INSERT_TREE_STAGE_PROFILE ",
+                "label={} calls={} messages={} inserted_messages={} ",
+                "total_ms={:.3} source_ms={:.3} tx_open_ms={:.3} existing_lookup_ms={:.3} ",
+                "conversation_row_ms={:.3} message_insert_ms={:.3} snippet_insert_ms={:.3} ",
+                "fts_entry_ms={:.3} fts_flush_ms={:.3} analytics_ms={:.3} commit_ms={:.3} ",
+                "residual_ms={:.3} avg_total_ms={:.3} avg_message_insert_ms={:.3} ",
+                "avg_snippet_insert_ms={:.3} avg_fts_entry_ms={:.3} avg_commit_ms={:.3}"
+            ),
+            label,
+            self.invocations,
+            self.messages,
+            self.inserted_messages,
+            Self::millis(self.total_duration),
+            Self::millis(self.source_duration),
+            Self::millis(self.tx_open_duration),
+            Self::millis(self.existing_lookup_duration),
+            Self::millis(self.conversation_row_duration),
+            Self::millis(self.message_insert_duration),
+            Self::millis(self.snippet_insert_duration),
+            Self::millis(self.fts_entry_duration),
+            Self::millis(self.fts_flush_duration),
+            Self::millis(self.analytics_duration),
+            Self::millis(self.commit_duration),
+            Self::millis(residual_duration),
+            Self::millis(self.total_duration) / calls,
+            Self::millis(self.message_insert_duration) / calls,
+            Self::millis(self.snippet_insert_duration) / calls,
+            Self::millis(self.fts_entry_duration) / calls,
+            Self::millis(self.commit_duration) / calls,
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -5308,6 +5544,7 @@ impl FrankenStorage {
 
     /// Create or update a source.
     pub fn upsert_source(&self, source: &Source) -> Result<()> {
+        self.invalidate_conversation_source_cache(source.id.as_str());
         let now = Self::now_millis();
         let kind_str = source.kind.to_string();
         let config_json_str = source
@@ -6185,6 +6422,9 @@ impl FrankenStorage {
         let count = self
             .conn
             .execute_compat("DELETE FROM sources WHERE id = ?1", fparams![id])?;
+        if count > 0 {
+            self.invalidate_conversation_source_cache(id);
+        }
         Ok(count > 0)
     }
 
@@ -6401,6 +6641,172 @@ impl FrankenStorage {
         }
 
         tx.commit()?;
+        Ok(InsertOutcome {
+            conversation_id: conv_id,
+            conversation_inserted: true,
+            inserted_indices,
+        })
+    }
+
+    #[cfg(test)]
+    fn insert_conversation_tree_with_profile(
+        &self,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        conv: &Conversation,
+        profile: &mut InsertConversationTreePerfProfile,
+    ) -> Result<InsertOutcome> {
+        let total_start = Instant::now();
+        let normalized_conv = normalized_conversation_for_storage(conv);
+        let conv = normalized_conv.as_ref();
+
+        let source_start = Instant::now();
+        self.ensure_source_for_conversation(conv)?;
+        profile.source_duration += source_start.elapsed();
+
+        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
+        let defer_analytics_updates = defer_analytics_updates_enabled();
+        let conversation_key = conversation_merge_key(agent_id, conv);
+
+        let tx_open_start = Instant::now();
+        let mut tx = self.conn.transaction()?;
+        profile.tx_open_duration += tx_open_start.elapsed();
+
+        let existing_lookup_start = Instant::now();
+        let existing =
+            franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))?;
+        profile.existing_lookup_duration += existing_lookup_start.elapsed();
+        if let Some(existing_id) = existing {
+            return Err(anyhow!(
+                "profile helper expects new conversation path, found existing id {existing_id}"
+            ));
+        }
+
+        let conversation_row_start = Instant::now();
+        let conv_id = match franken_insert_conversation_or_get_existing(
+            &tx,
+            agent_id,
+            workspace_id,
+            conv,
+        )? {
+            ConversationInsertStatus::Inserted(conv_id) => conv_id,
+            ConversationInsertStatus::Existing(existing_id) => {
+                return Err(anyhow!(
+                    "profile helper expected inserted conversation row, reused existing id {existing_id}"
+                ));
+            }
+        };
+        profile.conversation_row_duration += conversation_row_start.elapsed();
+
+        let mut fts_entries = Vec::new();
+        let mut fts_pending_chars = 0usize;
+        let mut fts_inserted_total = 0usize;
+        let mut total_chars: i64 = 0;
+        let mut inserted_indices = Vec::new();
+        let mut pending_messages = HashMap::new();
+        let mut pending_replay_fingerprints = HashSet::new();
+        let mut idx_collision_count = 0usize;
+        let mut first_collision_idx: Option<i64> = None;
+
+        for msg in &conv.messages {
+            let incoming_fingerprint = message_merge_fingerprint(msg);
+            if let Some(existing_fingerprint) = pending_messages.get(&msg.idx) {
+                if existing_fingerprint != &incoming_fingerprint {
+                    idx_collision_count = idx_collision_count.saturating_add(1);
+                    first_collision_idx.get_or_insert(msg.idx);
+                }
+                continue;
+            }
+
+            let incoming_replay = message_replay_fingerprint(msg);
+            if pending_replay_fingerprints.contains(&incoming_replay) {
+                tracing::debug!(
+                    conversation_id = conv_id,
+                    idx = msg.idx,
+                    source_path = %conv.source_path.display(),
+                    "skipping replay-equivalent duplicate message within profiled new conversation insert"
+                );
+                continue;
+            }
+
+            let message_insert_start = Instant::now();
+            let Some(msg_id) = franken_insert_message(&tx, conv_id, msg)? else {
+                continue;
+            };
+            profile.message_insert_duration += message_insert_start.elapsed();
+
+            let snippet_insert_start = Instant::now();
+            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+            profile.snippet_insert_duration += snippet_insert_start.elapsed();
+
+            if !defer_lexical_updates {
+                let fts_entry_start = Instant::now();
+                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+                profile.fts_entry_duration += fts_entry_start.elapsed();
+                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                {
+                    let fts_flush_start = Instant::now();
+                    flush_pending_fts_entries(
+                        &tx,
+                        &mut fts_entries,
+                        &mut fts_pending_chars,
+                        &mut fts_inserted_total,
+                    )?;
+                    profile.fts_flush_duration += fts_flush_start.elapsed();
+                }
+            }
+
+            total_chars += msg.content.len() as i64;
+            inserted_indices.push(msg.idx);
+            pending_messages.insert(msg.idx, incoming_fingerprint);
+            pending_replay_fingerprints.insert(incoming_replay);
+        }
+
+        if idx_collision_count > 0 {
+            tracing::warn!(
+                conversation_id = conv_id,
+                collision_count = idx_collision_count,
+                first_idx = first_collision_idx,
+                source_path = %conv.source_path.display(),
+                "message idx collisions encountered while profiling a new conversation insert; retaining the first canonical variant per idx"
+            );
+        }
+
+        if !defer_lexical_updates {
+            let fts_flush_start = Instant::now();
+            flush_pending_fts_entries(
+                &tx,
+                &mut fts_entries,
+                &mut fts_pending_chars,
+                &mut fts_inserted_total,
+            )?;
+            profile.fts_flush_duration += fts_flush_start.elapsed();
+        }
+
+        if !defer_analytics_updates {
+            let analytics_start = Instant::now();
+            franken_update_daily_stats_in_tx(
+                &tx,
+                &conv.agent_slug,
+                &conv.source_id,
+                conversation_effective_started_at(conv),
+                1,
+                inserted_indices.len() as i64,
+                total_chars,
+            )?;
+            profile.analytics_duration += analytics_start.elapsed();
+        }
+
+        let commit_start = Instant::now();
+        tx.commit()?;
+        profile.commit_duration += commit_start.elapsed();
+        profile.invocations += 1;
+        profile.messages += conv.messages.len();
+        profile.inserted_messages += inserted_indices.len();
+        profile.total_duration += total_start.elapsed();
+
         Ok(InsertOutcome {
             conversation_id: conv_id,
             conversation_inserted: true,
@@ -7957,7 +8363,13 @@ impl FrankenStorage {
             // Avoid an autocommit UPDATE on every local conversation insert.
             return Ok(());
         }
-        self.upsert_source(&source)
+        let cache_key = EnsuredConversationSourceKey::from_source(&source);
+        if self.conversation_source_already_ensured(&cache_key) {
+            return Ok(());
+        }
+        self.upsert_source(&source)?;
+        self.mark_conversation_source_ensured(cache_key);
+        Ok(())
     }
 
     fn ensure_sources_for_batch(
@@ -7972,6 +8384,9 @@ impl FrankenStorage {
                     continue;
                 }
                 self.upsert_source(&source)?;
+                self.mark_conversation_source_ensured(EnsuredConversationSourceKey::from_source(
+                    &source,
+                ));
             }
         }
         Ok(())
@@ -10961,7 +11376,38 @@ fn agent_kind_str(kind: AgentKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                // SAFETY: test helper restores prior process env for isolation.
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            } else {
+                // SAFETY: test helper restores prior process env for isolation.
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn set_env_var(key: &'static str, value: impl AsRef<str>) -> EnvGuard {
+        let previous = dotenvy::var(key).ok();
+        // SAFETY: test helper toggles a process-local env var for isolation.
+        unsafe {
+            std::env::set_var(key, value.as_ref());
+        }
+        EnvGuard { key, previous }
+    }
 
     #[test]
     fn autocommit_retain_disable_tries_compat_then_canonical_pragma() {
@@ -12759,6 +13205,113 @@ mod tests {
 
         assert_eq!(message_count, conv.messages.len() as i64);
         assert_eq!(fts_count, conv.messages.len() as i64);
+    }
+
+    fn make_profiled_storage_remote_conversation(
+        external_id: i64,
+        msg_count: usize,
+    ) -> Conversation {
+        Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/ws/profiled-storage-remote")),
+            external_id: Some(format!("profiled-storage-remote-{external_id}")),
+            title: Some(format!(
+                "Profiled storage remote conversation {external_id}"
+            )),
+            source_path: PathBuf::from(format!("/log/profiled-storage-remote-{external_id}.jsonl")),
+            started_at: Some(10_000 + external_id * 100),
+            ended_at: Some(10_000 + external_id * 100 + msg_count as i64),
+            approx_tokens: Some(msg_count as i64 * 32),
+            metadata_json: serde_json::json!({ "bench": true }),
+            messages: (0..msg_count)
+                .map(|idx| Message {
+                    id: None,
+                    idx: idx as i64,
+                    role: if idx % 2 == 0 {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Agent
+                    },
+                    author: Some("tester".into()),
+                    created_at: Some(20_000 + external_id * 100 + idx as i64),
+                    content: format!(
+                        "profiled storage remote content ext={external_id} idx={idx} {}",
+                        "x".repeat(64)
+                    ),
+                    extra_json: serde_json::json!({ "idx": idx }),
+                    snippets: Vec::new(),
+                })
+                .collect(),
+            source_id: "profiled-storage-remote-source".into(),
+            origin_host: Some("builder-profile".into()),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn insert_conversation_tree_stage_profile_tracks_steady_state_remote_reuse() {
+        let _defer_guard = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let log_profile = dotenvy::var("CASS_INSERT_TREE_STAGE_PROFILE").is_ok();
+
+        for &(msg_count, iterations) in &[(5usize, 80usize), (20, 50), (50, 24)] {
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join(format!("profile-{msg_count}.db"));
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "codex".into(),
+                    name: "Codex".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let workspace = PathBuf::from("/ws/profiled-storage-remote");
+            let workspace_id = storage.ensure_workspace(&workspace, None).unwrap();
+
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    Some(workspace_id),
+                    &make_profiled_storage_remote_conversation(0, msg_count),
+                )
+                .unwrap();
+
+            let mut profile = InsertConversationTreePerfProfile::default();
+            for external_id in 1..=iterations {
+                storage
+                    .insert_conversation_tree_with_profile(
+                        agent_id,
+                        Some(workspace_id),
+                        &make_profiled_storage_remote_conversation(external_id as i64, msg_count),
+                        &mut profile,
+                    )
+                    .unwrap();
+            }
+
+            let accounted_duration = profile.source_duration
+                + profile.tx_open_duration
+                + profile.existing_lookup_duration
+                + profile.conversation_row_duration
+                + profile.message_insert_duration
+                + profile.snippet_insert_duration
+                + profile.fts_entry_duration
+                + profile.fts_flush_duration
+                + profile.analytics_duration
+                + profile.commit_duration;
+            assert_eq!(profile.invocations, iterations);
+            assert_eq!(profile.messages, iterations * msg_count);
+            assert_eq!(profile.inserted_messages, iterations * msg_count);
+            assert!(
+                profile.total_duration >= accounted_duration,
+                "accounted stage durations cannot exceed total duration"
+            );
+
+            if log_profile {
+                profile.log_summary(&format!("remote_reuse_{msg_count}_msgs"));
+            }
+        }
     }
 
     #[test]
@@ -17269,6 +17822,57 @@ mod tests {
         assert_eq!(fetched.host_label, initial.host_label);
         assert_eq!(fetched.platform, initial.platform);
         assert_eq!(fetched.config_json, initial.config_json);
+    }
+
+    #[test]
+    fn ensure_source_for_conversation_recreates_remote_source_after_delete() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/ws/cache-recreate")),
+            external_id: Some("cache-recreate".into()),
+            title: Some("Cache Recreate".into()),
+            source_path: PathBuf::from("/log/cache-recreate.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: Some(16),
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("tester".into()),
+                created_at: Some(1_700_000_000_000),
+                content: "cache recreate".into(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "cache-remote-source".into(),
+            origin_host: Some("builder-cache".into()),
+        };
+
+        storage
+            .ensure_source_for_conversation(&conversation)
+            .unwrap();
+        assert!(storage.get_source("cache-remote-source").unwrap().is_some());
+
+        let deleted = storage.delete_source("cache-remote-source", false).unwrap();
+        assert!(deleted);
+        assert!(storage.get_source("cache-remote-source").unwrap().is_none());
+
+        storage
+            .ensure_source_for_conversation(&conversation)
+            .unwrap();
+        let recreated = storage.get_source("cache-remote-source").unwrap();
+        assert!(recreated.is_some());
+        assert_eq!(
+            recreated.unwrap().host_label.as_deref(),
+            Some("builder-cache")
+        );
     }
 
     #[test]
