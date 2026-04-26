@@ -220,17 +220,26 @@ fn export_markdown(hits: &[SearchHit], options: &ExportOptions) -> String {
 
 /// Export to JSON format
 fn export_json(hits: &[SearchHit], options: &ExportOptions) -> String {
-    let export_data = serde_json::json!({
+    let exported_at = Utc::now().to_rfc3339();
+    let export_data = export_json_value(hits, options, &exported_at);
+
+    serde_json::to_string_pretty(&export_data).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn export_json_value(
+    hits: &[SearchHit],
+    options: &ExportOptions,
+    exported_at: &str,
+) -> serde_json::Value {
+    serde_json::json!({
         "query": options.query,
         "count": hits.len(),
-        "exported_at": Utc::now().to_rfc3339(),
+        "exported_at": exported_at,
         "hits": hits
             .iter()
             .map(|hit| export_hit_json(hit, options))
             .collect::<Vec<_>>()
-    });
-
-    serde_json::to_string_pretty(&export_data).unwrap_or_else(|_| "{}".to_string())
+    })
 }
 
 fn export_hit_json(hit: &SearchHit, options: &ExportOptions) -> serde_json::Value {
@@ -447,6 +456,37 @@ mod tests {
 
         assert!(output.contains("\"count\": 1"));
         assert!(output.contains("\"agent\": \"claude_code\""));
+    }
+
+    #[test]
+    fn test_export_json_value_shape() {
+        let hits = vec![sample_hit()];
+        let options = ExportOptions {
+            query: Some("authentication error".to_string()),
+            ..ExportOptions::default()
+        };
+
+        let projected = export_json_value(&hits, &options, "2026-04-26T17:26:00Z");
+
+        assert_eq!(
+            projected,
+            serde_json::json!({
+                "query": "authentication error",
+                "count": 1,
+                "exported_at": "2026-04-26T17:26:00Z",
+                "hits": [{
+                    "title": "Test Result",
+                    "agent": "claude_code",
+                    "workspace": "/projects/test",
+                    "snippet": "This is a test snippet",
+                    "score": 8.5,
+                    "source_path": "/path/to/file.jsonl",
+                    "line_number": 42,
+                    "created_at": 1700000000000i64,
+                    "created_at_formatted": "2023-11-14T22:13:20+00:00"
+                }]
+            })
+        );
     }
 
     #[test]
