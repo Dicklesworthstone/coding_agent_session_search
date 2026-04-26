@@ -426,7 +426,14 @@ fn compute_no_limit_result_cap_from(
     {
         return hits.clamp(NO_LIMIT_RESULT_MIN, NO_LIMIT_RESULT_MAX);
     }
-    let budget_bytes = bytes_env
+
+    let budget_bytes = no_limit_budget_bytes(bytes_env, available_bytes);
+    let hits = (budget_bytes / AVG_HIT_BYTES) as usize;
+    hits.clamp(NO_LIMIT_RESULT_MIN, NO_LIMIT_RESULT_MAX)
+}
+
+fn no_limit_budget_bytes(bytes_env: Option<String>, available_bytes: Option<u64>) -> u64 {
+    bytes_env
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or_else(|| {
@@ -436,9 +443,7 @@ fn compute_no_limit_result_cap_from(
                         .clamp(NO_LIMIT_BYTES_FLOOR, NO_LIMIT_BYTES_CEILING)
                 })
                 .unwrap_or(NO_LIMIT_BYTES_FLOOR)
-        });
-    let hits = (budget_bytes / AVG_HIT_BYTES) as usize;
-    hits.clamp(NO_LIMIT_RESULT_MIN, NO_LIMIT_RESULT_MAX)
+        })
 }
 
 static FRANKENSEARCH_TWO_TIER_CONFIG: Lazy<FsTwoTierConfig> =
@@ -16034,6 +16039,22 @@ mod tests {
         let expected_hits = ((4u64 * 1024 * 1024 * 1024) / AVG_HIT_BYTES) as usize;
         let expected = expected_hits.clamp(NO_LIMIT_RESULT_MIN, NO_LIMIT_RESULT_MAX);
         assert_eq!(cap, expected, "bytes env must win over meminfo");
+    }
+
+    #[test]
+    fn no_limit_budget_bytes_preserves_fallback_priority() {
+        let huge_meminfo = Some(1024u64 * 1024 * 1024 * 1024);
+        let four_gib = 4u64 * 1024 * 1024 * 1024;
+
+        assert_eq!(
+            no_limit_budget_bytes(Some(four_gib.to_string()), huge_meminfo),
+            four_gib
+        );
+        assert_eq!(
+            no_limit_budget_bytes(Some("0".to_string()), huge_meminfo),
+            NO_LIMIT_BYTES_CEILING
+        );
+        assert_eq!(no_limit_budget_bytes(None, None), NO_LIMIT_BYTES_FLOOR);
     }
 
     #[test]
