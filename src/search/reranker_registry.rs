@@ -271,18 +271,19 @@ impl RerankerRegistry {
     ///
     /// Returns `Ok(())` if available, or an error with details about what's missing.
     pub fn validate(&self, name: &str) -> RerankerResult<&'static RegisteredReranker> {
-        let reranker = self.get(name).ok_or_else(|| RerankerError::RerankFailed {
-            model: name.to_string(),
-            source: format!(
-                "unknown reranker '{}'. Available: {}",
+        let reranker = self.get(name).ok_or_else(|| {
+            rerank_failed(
                 name,
-                RERANKERS
-                    .iter()
-                    .map(|r| r.name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                format!(
+                    "unknown reranker '{}'. Available: {}",
+                    name,
+                    RERANKERS
+                        .iter()
+                        .map(|r| r.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             )
-            .into(),
         })?;
 
         if !reranker.is_available(&self.data_dir) {
@@ -292,16 +293,15 @@ impl RerankerRegistry {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
 
-            return Err(RerankerError::RerankFailed {
-                model: name.to_string(),
-                source: format!(
+            return Err(rerank_failed(
+                name,
+                format!(
                     "reranker '{}' not available: missing files in {}: {}. Run 'cass models install' to download.",
                     name,
                     model_dir,
                     missing.join(", ")
-                )
-                .into(),
-            });
+                ),
+            ));
         }
 
         Ok(reranker)
@@ -325,10 +325,7 @@ pub fn get_reranker(data_dir: &Path, name: Option<&str>) -> RerankerResult<Arc<d
         Some(n) => registry.validate(n)?,
         None => registry
             .best_available()
-            .ok_or_else(|| RerankerError::RerankFailed {
-                model: "reranker".to_string(),
-                source: "no rerankers available".into(),
-            })?,
+            .ok_or_else(|| rerank_failed("reranker", "no rerankers available"))?,
     };
 
     load_reranker_by_name(data_dir, reranker_info.name)
@@ -343,17 +340,23 @@ fn load_reranker_by_name(data_dir: &Path, name: &str) -> RerankerResult<Arc<dyn 
                 .iter()
                 .find(|r| r.name == name)
                 .and_then(|r| r.model_dir(data_dir))
-                .ok_or_else(|| RerankerError::RerankFailed {
-                    model: name.to_string(),
-                    source: format!("no model dir for reranker: {}", name).into(),
+                .ok_or_else(|| {
+                    rerank_failed(name, format!("no model dir for reranker: {}", name))
                 })?;
             let reranker = FastEmbedReranker::load_from_dir(&model_dir)?;
             Ok(Arc::new(reranker))
         }
-        _ => Err(RerankerError::RerankFailed {
-            model: name.to_string(),
-            source: format!("reranker '{}' not implemented", name).into(),
-        }),
+        _ => Err(rerank_failed(
+            name,
+            format!("reranker '{}' not implemented", name),
+        )),
+    }
+}
+
+fn rerank_failed(model: &str, source: impl Into<String>) -> RerankerError {
+    RerankerError::RerankFailed {
+        model: model.to_string(),
+        source: source.into().into(),
     }
 }
 
@@ -431,6 +434,22 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.to_string().contains("unknown reranker"));
         assert!(err.to_string().contains("Available:"));
+    }
+
+    #[test]
+    fn test_rerank_failed_preserves_display_and_source() {
+        let err = rerank_failed("model-a", "underlying failure");
+
+        assert_eq!(
+            err.to_string(),
+            "Reranking failed for model-a: underlying failure. Results still valid with original RRF scores."
+        );
+        assert_eq!(
+            std::error::Error::source(&err)
+                .expect("source should be retained")
+                .to_string(),
+            "underlying failure"
+        );
     }
 
     #[test]
