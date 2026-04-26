@@ -21,31 +21,27 @@ pub enum ExportFormat {
 }
 
 impl ExportFormat {
+    fn metadata(self) -> (&'static str, &'static str, Self) {
+        match self {
+            Self::Markdown => ("Markdown", "md", Self::Json),
+            Self::Json => ("JSON", "json", Self::PlainText),
+            Self::PlainText => ("Plain Text", "txt", Self::Markdown),
+        }
+    }
+
     /// Get the display name for this format
     pub fn name(self) -> &'static str {
-        match self {
-            Self::Markdown => "Markdown",
-            Self::Json => "JSON",
-            Self::PlainText => "Plain Text",
-        }
+        self.metadata().0
     }
 
     /// Get the file extension for this format
     pub fn extension(self) -> &'static str {
-        match self {
-            Self::Markdown => "md",
-            Self::Json => "json",
-            Self::PlainText => "txt",
-        }
+        self.metadata().1
     }
 
     /// Cycle to the next export format
     pub fn next(self) -> Self {
-        match self {
-            Self::Markdown => Self::Json,
-            Self::Json => Self::PlainText,
-            Self::PlainText => Self::Markdown,
-        }
+        self.metadata().2
     }
 
     /// List all available formats
