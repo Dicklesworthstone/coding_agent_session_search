@@ -19,7 +19,7 @@
 7. `100da941` - `refactor(search): centralize policy display strings`
 8. `080448d2` - `refactor(tests): share cloudflare missing assertion`
 9. `f85fca6b` - `refactor(pages): inline github site resolver`
-10. pending final closeout commit - `refactor(pages): derive db error display`
+10. `60907f38` - `refactor(pages): derive db error display`
 
 ## Changed Surfaces
 
