@@ -85,44 +85,24 @@ impl DecryptError {
 }
 
 /// Database errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DbError {
     /// Database file is corrupted.
+    #[error("The database appears to be corrupted.")]
     CorruptDatabase(String),
     /// Required table is missing.
+    #[error("The archive is missing required data.")]
     MissingTable(String),
     /// Query syntax error.
+    #[error("Your search could not be processed.")]
     InvalidQuery(String),
     /// Database is locked by another process.
+    #[error("The database is currently in use by another process.")]
     DatabaseLocked,
     /// Query returned no results.
+    #[error("No results found.")]
     NoResults,
 }
-
-impl fmt::Display for DbError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CorruptDatabase(_) => {
-                write!(f, "The database appears to be corrupted.")
-            }
-            Self::MissingTable(_) => {
-                write!(f, "The archive is missing required data.")
-            }
-            Self::InvalidQuery(_) => {
-                // Don't expose query details to users
-                write!(f, "Your search could not be processed.")
-            }
-            Self::DatabaseLocked => {
-                write!(f, "The database is currently in use by another process.")
-            }
-            Self::NoResults => {
-                write!(f, "No results found.")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DbError {}
 
 impl DbError {
     /// Get a user-friendly recovery suggestion.
@@ -518,6 +498,34 @@ mod tests {
                 expected_substring,
                 message
             );
+        }
+    }
+
+    #[test]
+    fn test_db_error_display_and_source_are_preserved() {
+        let cases = vec![
+            (
+                DbError::CorruptDatabase("page checksum mismatch".into()),
+                "The database appears to be corrupted.",
+            ),
+            (
+                DbError::MissingTable("messages".into()),
+                "The archive is missing required data.",
+            ),
+            (
+                DbError::InvalidQuery("SELECT * FROM sqlite_master".into()),
+                "Your search could not be processed.",
+            ),
+            (
+                DbError::DatabaseLocked,
+                "The database is currently in use by another process.",
+            ),
+            (DbError::NoResults, "No results found."),
+        ];
+
+        for (error, expected_display) in cases {
+            assert_eq!(error.to_string(), expected_display);
+            assert!(std::error::Error::source(&error).is_none());
         }
     }
 
