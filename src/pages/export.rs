@@ -91,7 +91,8 @@ impl ExportEngine {
 
         // 2. Build the export into a unique temp database, then atomically
         // replace the final output only after a successful commit.
-        let temp_output_path = unique_atomic_temp_path(&self.output_path);
+        let temp_output_path =
+            unique_atomic_sidecar_path(&self.output_path, "tmp", "pages_export.db");
         let mut replace_attempted = false;
         let result = (|| -> Result<ExportStats> {
             let output_path = temp_output_path.to_string_lossy().to_string();
@@ -582,10 +583,6 @@ fn derive_attachment_refs(extra_json: Option<&str>) -> Option<String> {
             serde_json::to_string(candidate).ok()
         }
     })
-}
-
-fn unique_atomic_temp_path(path: &Path) -> PathBuf {
-    unique_atomic_sidecar_path(path, "tmp", "pages_export.db")
 }
 
 #[cfg(windows)]
