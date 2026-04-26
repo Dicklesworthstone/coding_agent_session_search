@@ -337,18 +337,30 @@ mod tests {
 
     #[test]
     fn test_strength_bar_rendering() {
-        assert_eq!(PasswordStrength::Weak.bar(), "[█░░░]");
-        assert_eq!(PasswordStrength::Fair.bar(), "[██░░]");
-        assert_eq!(PasswordStrength::Good.bar(), "[███░]");
-        assert_eq!(PasswordStrength::Strong.bar(), "[████]");
+        let cases = [
+            (PasswordStrength::Weak, "[█░░░]"),
+            (PasswordStrength::Fair, "[██░░]"),
+            (PasswordStrength::Good, "[███░]"),
+            (PasswordStrength::Strong, "[████]"),
+        ];
+
+        for (strength, expected_bar) in cases {
+            assert_eq!(strength.bar(), expected_bar, "{strength:?}");
+        }
     }
 
     #[test]
     fn test_strength_percent() {
-        assert_eq!(PasswordStrength::Weak.percent(), 25);
-        assert_eq!(PasswordStrength::Fair.percent(), 50);
-        assert_eq!(PasswordStrength::Good.percent(), 75);
-        assert_eq!(PasswordStrength::Strong.percent(), 100);
+        let cases = [
+            (PasswordStrength::Weak, 25),
+            (PasswordStrength::Fair, 50),
+            (PasswordStrength::Good, 75),
+            (PasswordStrength::Strong, 100),
+        ];
+
+        for (strength, expected_percent) in cases {
+            assert_eq!(strength.percent(), expected_percent, "{strength:?}");
+        }
     }
 
     #[test]
