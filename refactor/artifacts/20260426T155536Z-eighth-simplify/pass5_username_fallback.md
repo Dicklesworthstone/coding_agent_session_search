@@ -4,7 +4,7 @@
 - Skill: `simplify-and-refactor-code-isomorphically`
 - Mission: Option/Default Flow
 - Scope: `src/sources/sync.rs`
-- Verdict: PRODUCTIVE, with unrelated cargo-test blocker
+- Verdict: PRODUCTIVE
 
 ## Change
 
@@ -36,19 +36,11 @@ message.
 
 Yes, preservation was verified according to the skill by reading the priority
 chain directly and adding a focused helper test for priority, trimming, and
-blank skipping. The focused cargo test was attempted but blocked by unrelated
-dirty work in `src/storage/sqlite.rs`.
+blank skipping. After the unrelated dirty storage syntax error was corrected in
+the worktree, the focused cargo test passed.
 
 ## Verification
 
-Passed:
-
 - `rustfmt --edition 2024 --check src/sources/sync.rs`
 - `git diff --check -- src/sources/sync.rs`
-
-Blocked:
-
 - `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_cass_eighth_simplify cargo test --lib sources::sync::tests::test_first_nonblank_username_priority_and_trimming`
-- Blocker: pre-existing dirty `src/storage/sqlite.rs` fails to compile at line
-  4241 with `error: expected token: ','`.
-

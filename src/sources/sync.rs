@@ -116,14 +116,10 @@ fn remote_spec_for_shell_bound_copy(host: &str, remote_path: &str) -> String {
     format!("{host}:{}", quote_remote_shell_path(remote_path))
 }
 
-fn remote_spec_for_scp(host: &str, remote_path: &str) -> String {
-    format!("{host}:{remote_path}")
-}
-
 fn remote_spec_for_rsync(host: &str, remote_path: &str, protect_args_supported: bool) -> String {
     if protect_args_supported {
         // With --protect-args, rsync handles its own escaping over the wire
-        remote_spec_for_scp(host, remote_path)
+        format!("{host}:{remote_path}")
     } else {
         // Without it (e.g. openrsync), we must manually quote for the remote shell
         remote_spec_for_shell_bound_copy(host, remote_path)
@@ -1098,7 +1094,7 @@ impl SyncEngine {
                 };
             };
 
-            let remote_spec = remote_spec_for_scp(host, &remote_file);
+            let remote_spec = remote_spec_for_rsync(host, &remote_file, true);
             let mut cmd = Command::new("scp");
             cmd.args([
                 "-B",
@@ -2365,6 +2361,10 @@ Total transferred file size: 1,234 bytes
             "work-mac:/tmp/has space"
         );
         assert_eq!(
+            remote_spec_for_rsync("work-mac", "/tmp/that's all", true),
+            "work-mac:/tmp/that's all"
+        );
+        assert_eq!(
             remote_spec_for_rsync("work-mac", "/tmp/has space", false),
             "work-mac:'/tmp/has space'"
         );
@@ -2395,18 +2395,6 @@ Total transferred file size: 1,234 bytes
         assert_eq!(
             remote_spec_for_shell_bound_copy("work-mac", "/tmp/has space"),
             "work-mac:'/tmp/has space'"
-        );
-    }
-
-    #[test]
-    fn test_remote_spec_for_scp_preserves_raw_path() {
-        assert_eq!(
-            remote_spec_for_scp("work-mac", "/tmp/has space"),
-            "work-mac:/tmp/has space"
-        );
-        assert_eq!(
-            remote_spec_for_scp("work-mac", "/tmp/that's all"),
-            "work-mac:/tmp/that's all"
         );
     }
 

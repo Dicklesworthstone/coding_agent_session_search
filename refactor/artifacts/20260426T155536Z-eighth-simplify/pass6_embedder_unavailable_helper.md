@@ -4,7 +4,7 @@
 - Skill: `simplify-and-refactor-code-isomorphically`
 - Mission: Local Error Constructor
 - Scope: `src/search/embedder_registry.rs`
-- Verdict: PRODUCTIVE, with unrelated cargo-test blocker
+- Verdict: PRODUCTIVE
 
 ## Change
 
@@ -30,20 +30,12 @@ normalizes construction of the error variant; every caller still owns its
 original reason string.
 
 Yes, preservation was verified according to the skill by checking every caller
-and adding a helper-shape test for the exact `model` and `reason` fields. The
-focused cargo test was attempted but blocked by unrelated dirty work in
-`src/storage/sqlite.rs`.
+and adding a helper-shape test for the exact `model` and `reason` fields. After
+the unrelated dirty storage syntax error was corrected in the worktree, the
+focused cargo test passed.
 
 ## Verification
 
-Passed:
-
 - `rustfmt --edition 2024 --check src/search/embedder_registry.rs`
 - `git diff --check -- src/search/embedder_registry.rs`
-
-Blocked:
-
 - `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_cass_eighth_simplify cargo test --lib search::embedder_registry::tests::test_embedder_unavailable_helper_shape`
-- Blocker: pre-existing dirty `src/storage/sqlite.rs` fails to compile at line
-  4241 with `error: expected token: ','`.
-
