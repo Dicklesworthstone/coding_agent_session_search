@@ -40,18 +40,17 @@ pub enum GroupBy {
     Month,
 }
 
-impl std::fmt::Display for GroupBy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl GroupBy {
+    /// Stable lowercase string used in CLI/JSON display surfaces.
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Hour => write!(f, "hour"),
-            Self::Day => write!(f, "day"),
-            Self::Week => write!(f, "week"),
-            Self::Month => write!(f, "month"),
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
         }
     }
-}
 
-impl GroupBy {
     /// Human-readable label for display in TUI headers.
     pub fn label(self) -> &'static str {
         match self {
@@ -80,6 +79,12 @@ impl GroupBy {
             Self::Week => Self::Day,
             Self::Month => Self::Week,
         }
+    }
+}
+
+impl std::fmt::Display for GroupBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -778,6 +783,7 @@ mod tests {
     #[test]
     fn group_by_display() {
         for (group_by, expected_display, _, _, _) in GROUP_BY_CASES {
+            assert_eq!(group_by.as_str(), expected_display, "{group_by:?}");
             assert_eq!(group_by.to_string(), expected_display, "{group_by:?}");
         }
     }
