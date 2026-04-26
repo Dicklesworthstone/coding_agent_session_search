@@ -363,19 +363,23 @@ fn rerank_failed(model: &str, source: impl Into<String>) -> RerankerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
+
+    fn registry_fixture() -> (TempDir, RerankerRegistry) {
+        let tmp = tempdir().unwrap();
+        let registry = RerankerRegistry::new(tmp.path());
+        (tmp, registry)
+    }
 
     #[test]
     fn test_registry_all() {
-        let tmp = tempdir().unwrap();
-        let registry = RerankerRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
         assert!(registry.all().len() >= 4);
     }
 
     #[test]
     fn test_registry_get_by_name() {
-        let tmp = tempdir().unwrap();
-        let registry = RerankerRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         let msmarco = registry.get("ms-marco");
         assert!(msmarco.is_some());
@@ -391,8 +395,7 @@ mod tests {
 
     #[test]
     fn test_registry_get_by_id() {
-        let tmp = tempdir().unwrap();
-        let registry = RerankerRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         let msmarco = registry.get("ms-marco-minilm-l6-v2");
         assert!(msmarco.is_some());
@@ -401,8 +404,7 @@ mod tests {
 
     #[test]
     fn test_rerankers_unavailable_without_files() {
-        let tmp = tempdir().unwrap();
-        let registry = RerankerRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         // All rerankers should be unavailable without model files
         for r in registry.all() {
@@ -416,8 +418,7 @@ mod tests {
 
     #[test]
     fn test_best_available_none() {
-        let tmp = tempdir().unwrap();
-        let registry = RerankerRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         // Without model files, best_available should return None
         let best = registry.best_available();
@@ -426,8 +427,7 @@ mod tests {
 
     #[test]
     fn test_validate_unknown_reranker() {
-        let tmp = tempdir().unwrap();
-        let registry = RerankerRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         let result = registry.validate("nonexistent");
         assert!(result.is_err());
@@ -454,8 +454,7 @@ mod tests {
 
     #[test]
     fn test_registered_reranker_missing_files() {
-        let tmp = tempdir().unwrap();
-        let registry = RerankerRegistry::new(tmp.path());
+        let (tmp, registry) = registry_fixture();
 
         let msmarco = registry.get("ms-marco").unwrap();
         let missing = msmarco.missing_files(tmp.path());
@@ -467,8 +466,7 @@ mod tests {
 
     #[test]
     fn test_bakeoff_eligible_count() {
-        let tmp = tempdir().unwrap();
-        let registry = RerankerRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         let eligible = registry.bakeoff_eligible();
         // Should have at least 3 eligible models (bge-v2, jina-turbo, jina-v2)
@@ -487,8 +485,7 @@ mod tests {
 
     #[test]
     fn test_baseline_reranker() {
-        let tmp = tempdir().unwrap();
-        let registry = RerankerRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         let baseline = registry.baseline_reranker();
         assert!(baseline.is_some());
@@ -500,8 +497,7 @@ mod tests {
 
     #[test]
     fn test_bakeoff_eligibility_by_date() {
-        let tmp = tempdir().unwrap();
-        let registry = RerankerRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         // ms-marco was released before cutoff (2022-01-01)
         let msmarco = registry.get("ms-marco").unwrap();
@@ -523,8 +519,7 @@ mod tests {
 
     #[test]
     fn test_bakeoff_model_metadata_conversion() {
-        let tmp = tempdir().unwrap();
-        let registry = RerankerRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         let msmarco = registry.get("ms-marco").unwrap();
         let metadata = msmarco.to_model_metadata();
@@ -540,8 +535,7 @@ mod tests {
 
     #[test]
     fn test_eligible_reranker_metadata() {
-        let tmp = tempdir().unwrap();
-        let registry = RerankerRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         // Check BGE reranker
         let bge = registry.get("bge-reranker-v2").unwrap();
