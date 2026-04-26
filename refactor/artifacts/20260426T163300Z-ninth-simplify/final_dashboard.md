@@ -20,7 +20,7 @@
 | 7 | Wrapper Collapse | `a2086b18` | Removed a one-call pages export temp-path wrapper. |
 | 8 | Fixture Helper | `8573e928` | Shared reranker registry tempdir fixture setup. |
 | 9 | Enum/String Table | `8dcdae13` | Centralized password strength visual values. |
-| 10 | Final Rescan and Dashboard | pending | Recorded final verification and convergence. |
+| 10 | Final Rescan and Dashboard | `ed7b0584` | Recorded final verification and convergence. |
 
 ## Final Verification
 
