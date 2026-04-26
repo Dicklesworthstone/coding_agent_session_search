@@ -455,6 +455,20 @@ impl EmbeddingWorker {
 mod tests {
     use super::*;
 
+    fn build_pass_config(
+        two_tier: bool,
+        fast_model: Option<&str>,
+        quality_model: Option<&str>,
+    ) -> EmbeddingJobConfig {
+        EmbeddingJobConfig {
+            db_path: String::new(),
+            index_path: String::new(),
+            two_tier,
+            fast_model: fast_model.map(str::to_string),
+            quality_model: quality_model.map(str::to_string),
+        }
+    }
+
     #[test]
     fn test_worker_handle_clone() {
         let (_worker, handle) = EmbeddingWorker::new();
@@ -483,13 +497,7 @@ mod tests {
     #[test]
     fn test_build_passes_single() {
         let (_worker, _handle) = EmbeddingWorker::new();
-        let config = EmbeddingJobConfig {
-            db_path: String::new(),
-            index_path: String::new(),
-            two_tier: false,
-            fast_model: None,
-            quality_model: Some("minilm".to_string()),
-        };
+        let config = build_pass_config(false, None, Some("minilm"));
         let passes = _worker.build_passes(&config);
         assert_eq!(passes.len(), 1);
         assert_eq!(passes[0].0, "minilm");
@@ -499,13 +507,7 @@ mod tests {
     #[test]
     fn test_build_passes_two_tier() {
         let (_worker, _handle) = EmbeddingWorker::new();
-        let config = EmbeddingJobConfig {
-            db_path: String::new(),
-            index_path: String::new(),
-            two_tier: true,
-            fast_model: Some("hash".to_string()),
-            quality_model: Some("minilm".to_string()),
-        };
+        let config = build_pass_config(true, Some("hash"), Some("minilm"));
         let passes = _worker.build_passes(&config);
         assert_eq!(passes.len(), 2);
         assert_eq!(passes[0].0, "hash");
@@ -517,13 +519,7 @@ mod tests {
     #[test]
     fn test_build_passes_defaults() {
         let (_worker, _handle) = EmbeddingWorker::new();
-        let config = EmbeddingJobConfig {
-            db_path: String::new(),
-            index_path: String::new(),
-            two_tier: false,
-            fast_model: None,
-            quality_model: None,
-        };
+        let config = build_pass_config(false, None, None);
         let passes = _worker.build_passes(&config);
         assert_eq!(passes.len(), 1);
         assert_eq!(passes[0].0, "hash");
