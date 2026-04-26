@@ -255,9 +255,7 @@ impl StaleConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
 
-        if let Ok(val) = dotenvy::var("CASS_WATCH_STALE_THRESHOLD_HOURS")
-            && let Ok(hours) = val.parse()
-        {
+        if let Some(hours) = env_u64("CASS_WATCH_STALE_THRESHOLD_HOURS") {
             cfg.threshold_hours = hours;
         }
 
@@ -265,15 +263,11 @@ impl StaleConfig {
             cfg.action = StaleAction::from_env_str(&val);
         }
 
-        if let Ok(val) = dotenvy::var("CASS_WATCH_STALE_CHECK_INTERVAL_MINS")
-            && let Ok(mins) = val.parse()
-        {
+        if let Some(mins) = env_u64("CASS_WATCH_STALE_CHECK_INTERVAL_MINS") {
             cfg.check_interval_mins = mins;
         }
 
-        if let Ok(val) = dotenvy::var("CASS_WATCH_STALE_MIN_ZERO_SCANS")
-            && let Ok(count) = val.parse()
-        {
+        if let Some(count) = env_u64("CASS_WATCH_STALE_MIN_ZERO_SCANS") {
             cfg.min_zero_scans = count;
         }
 
@@ -284,6 +278,10 @@ impl StaleConfig {
     pub fn is_enabled(&self) -> bool {
         self.action != StaleAction::None
     }
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    dotenvy::var(key).ok()?.parse().ok()
 }
 
 /// Tracks indexing activity to detect stuck/stale states.
