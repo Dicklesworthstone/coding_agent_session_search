@@ -25,6 +25,15 @@ fn prereqs_fixture() -> Prerequisites {
     }
 }
 
+fn assert_missing_contains<T: AsRef<str> + std::fmt::Debug>(missing: &[T], needle: &str) {
+    assert!(
+        missing
+            .iter()
+            .any(|message| message.as_ref().contains(needle)),
+        "expected missing prerequisite containing `{needle}`, got {missing:?}"
+    );
+}
+
 // ============================================
 // Prerequisites Tests
 // ============================================
@@ -76,12 +85,8 @@ fn test_prerequisites_wrangler_not_installed() {
 
     assert!(!prereqs.is_ready());
     let missing = prereqs.missing();
-    assert!(
-        missing
-            .iter()
-            .any(|m| m.contains("wrangler CLI not installed"))
-    );
-    assert!(missing.iter().any(|m| m.contains("npm install")));
+    assert_missing_contains(&missing, "wrangler CLI not installed");
+    assert_missing_contains(&missing, "npm install");
 }
 
 #[test]
@@ -90,8 +95,8 @@ fn test_prerequisites_not_authenticated() {
 
     assert!(!prereqs.is_ready());
     let missing = prereqs.missing();
-    assert!(missing.iter().any(|m| m.contains("not authenticated")));
-    assert!(missing.iter().any(|m| m.contains("CLOUDFLARE_API_TOKEN")));
+    assert_missing_contains(&missing, "not authenticated");
+    assert_missing_contains(&missing, "CLOUDFLARE_API_TOKEN");
 }
 
 // ============================================
