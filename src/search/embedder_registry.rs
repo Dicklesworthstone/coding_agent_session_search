@@ -414,19 +414,23 @@ pub fn get_embedder_info(data_dir: &Path, name: Option<&str>) -> Option<Embedder
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
+
+    fn registry_fixture() -> (TempDir, EmbedderRegistry) {
+        let tmp = tempdir().unwrap();
+        let registry = EmbedderRegistry::new(tmp.path());
+        (tmp, registry)
+    }
 
     #[test]
     fn test_registry_all() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
         assert!(registry.all().len() >= 2);
     }
 
     #[test]
     fn test_registry_get_by_name() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         let minilm = registry.get("minilm");
         assert!(minilm.is_some());
@@ -442,8 +446,7 @@ mod tests {
 
     #[test]
     fn test_registry_get_by_id() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         let minilm = registry.get("minilm-384");
         assert!(minilm.is_some());
@@ -456,8 +459,7 @@ mod tests {
 
     #[test]
     fn test_hash_always_available() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         assert!(registry.is_available("hash"));
         let available = registry.available();
@@ -466,8 +468,7 @@ mod tests {
 
     #[test]
     fn test_minilm_unavailable_without_files() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         // MiniLM should not be available without model files
         assert!(!registry.is_available("minilm"));
@@ -492,8 +493,7 @@ mod tests {
 
     #[test]
     fn test_best_available_fallback() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         // Without model files, best_available should return hash
         let best = registry.best_available();
@@ -518,8 +518,7 @@ mod tests {
 
     #[test]
     fn test_validate_unknown_embedder() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         let result = registry.validate("nonexistent");
         assert!(result.is_err());
@@ -530,8 +529,7 @@ mod tests {
 
     #[test]
     fn test_registered_embedder_missing_files() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (tmp, registry) = registry_fixture();
 
         let minilm = registry.get("minilm").unwrap();
         let missing = minilm.missing_files(tmp.path());
@@ -556,8 +554,7 @@ mod tests {
 
     #[test]
     fn test_bakeoff_eligible_count() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         let eligible = registry.bakeoff_eligible();
         // Should have exactly 2 eligible models: snowflake, nomic
@@ -593,8 +590,7 @@ mod tests {
 
     #[test]
     fn test_baseline_embedder() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         let baseline = registry.baseline_embedder();
         assert!(baseline.is_some());
@@ -606,8 +602,7 @@ mod tests {
 
     #[test]
     fn test_bakeoff_eligibility_by_date() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         // MiniLM was released before cutoff (2022-08-01)
         let minilm = registry.get("minilm").unwrap();
@@ -629,8 +624,7 @@ mod tests {
 
     #[test]
     fn test_bakeoff_model_metadata_conversion() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         let minilm = registry.get("minilm").unwrap();
         let metadata = minilm.to_model_metadata();
@@ -646,8 +640,7 @@ mod tests {
 
     #[test]
     fn test_eligible_embedder_metadata() {
-        let tmp = tempdir().unwrap();
-        let registry = EmbedderRegistry::new(tmp.path());
+        let (_tmp, registry) = registry_fixture();
 
         // Check snowflake (eligible candidate, same dimension as minilm)
         let snowflake = registry.get("snowflake-arctic-s").unwrap();
