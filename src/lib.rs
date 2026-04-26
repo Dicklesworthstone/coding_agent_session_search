@@ -20754,13 +20754,24 @@ async fn run_upgrade(
             // Mirror the documented `--check` exit-code contract.
             std::process::exit(1);
         }
-        if check_only || !info.is_newer || (!yes && !io::stdin().is_terminal()) {
-            // In structured mode and not actually installing: we're done.
+        // In structured mode, only proceed to the install path when the
+        // caller explicitly passed `--yes`. Anything else (no update,
+        // `--check`, no `--yes` even on a TTY) returns now: prompting on
+        // stdin would write y/N text on top of the JSON envelope already
+        // emitted on stdout and break consumers like
+        // `cass upgrade --json | jq`. Earlier the check was
+        // `!yes && !is_terminal()`, which silently fell through to the
+        // prompt path on an attached TTY — fixed here so structured mode
+        // never prompts.
+        if check_only || !info.is_newer || !yes {
             return Ok(());
         }
-        // Fall through to the install path below — but only if we have
-        // a TTY and the caller passed --yes; otherwise structured mode
-        // can't safely prompt.
+        // Fall through to the install path: structured mode + yes +
+        // is_newer. Past this point `run_self_update` execs the
+        // installer, which writes to the same stdout — but at that
+        // point the caller has explicitly asked for the install side
+        // effect, so the installer's output replacing the JSON envelope
+        // is the documented behaviour.
     }
 
     if !info.is_newer {
@@ -21256,11 +21267,22 @@ fn copy_to_system_clipboard(text: &str) -> Result<&'static str, String> {
 
     let mut last_err: Option<String> = None;
     for (program, args) in candidates {
+        // IMPORTANT: stdout / stderr go to /dev/null rather than piped.
+        // Linux clipboard tools (wl-copy, xclip, xsel) fork a daemon
+        // that holds the X11 / Wayland selection until the clipboard
+        // is replaced or the session ends. The parent exits as soon as
+        // stdin is closed, but the daemon inherits the parent's fds.
+        // If we piped stdout/stderr, `wait_with_output` would block
+        // forever waiting for those pipes to reach EOF — which only
+        // happens when the daemon dies, possibly minutes or hours later.
+        // /dev/null avoids that without requiring a separate reader
+        // thread or a tool-specific "no fork" flag (which not all of
+        // them expose).
         let spawn_result = Command::new(program)
             .args(args.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn();
         let mut child = match spawn_result {
             Ok(c) => c,
@@ -21270,21 +21292,32 @@ fn copy_to_system_clipboard(text: &str) -> Result<&'static str, String> {
                 continue;
             }
         };
-        if let Some(mut stdin) = child.stdin.take()
-            && let Err(e) = stdin.write_all(text.as_bytes())
-        {
+        // Take stdin and drop it via a scoped block so the write end of
+        // the pipe is closed *before* we wait — otherwise the child
+        // sits in `read(stdin)` forever and so do we.
+        let write_result = {
+            let mut stdin = match child.stdin.take() {
+                Some(s) => s,
+                None => {
+                    last_err = Some(format!("{program}: stdin pipe missing"));
+                    let _ = child.wait();
+                    continue;
+                }
+            };
+            stdin.write_all(text.as_bytes())
+        };
+        if let Err(e) = write_result {
             last_err = Some(format!("{program}: write stdin: {e}"));
             let _ = child.wait();
             continue;
         }
-        match child.wait_with_output() {
-            Ok(out) if out.status.success() => return Ok(program),
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                last_err = Some(format!(
-                    "{program} exited with status {}: {}",
-                    out.status, stderr
-                ));
+        // `wait` returns as soon as the parent exits, even if a
+        // backgrounded daemon child keeps running with the inherited
+        // (now /dev/null) stdout / stderr.
+        match child.wait() {
+            Ok(status) if status.success() => return Ok(program),
+            Ok(status) => {
+                last_err = Some(format!("{program} exited with status {status}"));
             }
             Err(e) => {
                 last_err = Some(format!("{program}: wait: {e}"));
