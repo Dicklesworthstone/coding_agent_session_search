@@ -112,24 +112,21 @@ mod tests {
     // =========================
 
     #[test]
-    fn message_role_display_standard_variants() {
-        assert_eq!(MessageRole::User.to_string(), "User");
-        assert_eq!(MessageRole::Agent.to_string(), "Agent");
-        assert_eq!(MessageRole::Tool.to_string(), "Tool");
-        assert_eq!(MessageRole::System.to_string(), "System");
-    }
+    fn message_role_display() {
+        let cases = [
+            (MessageRole::User, "User"),
+            (MessageRole::Agent, "Agent"),
+            (MessageRole::Tool, "Tool"),
+            (MessageRole::System, "System"),
+            (MessageRole::Other("Custom".to_string()), "Custom"),
+            (MessageRole::Other("".to_string()), ""),
+            (MessageRole::Other("日本語".to_string()), "日本語"),
+        ];
 
-    #[test]
-    fn message_role_display_other_variant() {
-        assert_eq!(
-            MessageRole::Other("Custom".to_string()).to_string(),
-            "Custom"
-        );
-        assert_eq!(MessageRole::Other("".to_string()).to_string(), "");
-        assert_eq!(
-            MessageRole::Other("日本語".to_string()).to_string(),
-            "日本語"
-        );
+        for (role, expected_display) in cases {
+            let actual_display = role.to_string();
+            assert_eq!(actual_display, expected_display, "role: {role:?}");
+        }
     }
 
     #[test]
