@@ -68,15 +68,19 @@ pub enum SemanticMode {
 
 impl fmt::Display for SemanticMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::HybridPreferred => write!(f, "hybrid_preferred"),
-            Self::LexicalOnly => write!(f, "lexical_only"),
-            Self::StrictSemantic => write!(f, "strict_semantic"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
 impl SemanticMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HybridPreferred => "hybrid_preferred",
+            Self::LexicalOnly => "lexical_only",
+            Self::StrictSemantic => "strict_semantic",
+        }
+    }
+
     /// Parse from a user-provided string (env, CLI, config).
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
@@ -115,15 +119,19 @@ pub enum ModelDownloadPolicy {
 
 impl fmt::Display for ModelDownloadPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OptIn => write!(f, "opt_in"),
-            Self::BudgetGated => write!(f, "budget_gated"),
-            Self::Automatic => write!(f, "automatic"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
 impl ModelDownloadPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OptIn => "opt_in",
+            Self::BudgetGated => "budget_gated",
+            Self::Automatic => "automatic",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
             "opt_in" | "optin" | "manual" => Some(Self::OptIn),
@@ -472,11 +480,17 @@ pub enum SettingSource {
 
 impl fmt::Display for SettingSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl SettingSource {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::CompiledDefault => write!(f, "compiled_default"),
-            Self::Config => write!(f, "config"),
-            Self::Environment => write!(f, "environment"),
-            Self::Cli => write!(f, "cli"),
+            Self::CompiledDefault => "compiled_default",
+            Self::Config => "config",
+            Self::Environment => "environment",
+            Self::Cli => "cli",
         }
     }
 }
@@ -1081,6 +1095,40 @@ mod tests {
                 *expected,
                 "failed for input: {input:?}"
             );
+        }
+    }
+
+    #[test]
+    fn display_spellings_delegate_to_as_str() {
+        let semantic_modes = [
+            (SemanticMode::HybridPreferred, "hybrid_preferred"),
+            (SemanticMode::LexicalOnly, "lexical_only"),
+            (SemanticMode::StrictSemantic, "strict_semantic"),
+        ];
+        for (mode, expected) in semantic_modes {
+            assert_eq!(mode.as_str(), expected);
+            assert_eq!(mode.to_string(), expected);
+        }
+
+        let download_policies = [
+            (ModelDownloadPolicy::OptIn, "opt_in"),
+            (ModelDownloadPolicy::BudgetGated, "budget_gated"),
+            (ModelDownloadPolicy::Automatic, "automatic"),
+        ];
+        for (policy, expected) in download_policies {
+            assert_eq!(policy.as_str(), expected);
+            assert_eq!(policy.to_string(), expected);
+        }
+
+        let setting_sources = [
+            (SettingSource::CompiledDefault, "compiled_default"),
+            (SettingSource::Config, "config"),
+            (SettingSource::Environment, "environment"),
+            (SettingSource::Cli, "cli"),
+        ];
+        for (source, expected) in setting_sources {
+            assert_eq!(source.as_str(), expected);
+            assert_eq!(source.to_string(), expected);
         }
     }
 
