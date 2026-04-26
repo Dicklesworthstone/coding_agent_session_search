@@ -4754,12 +4754,6 @@ fn annotate_deferred_analytics_failures(
     }
 }
 
-fn analytics_track_a_rebuild_safe(conn: &frankensqlite::Connection) -> bool {
-    ["messages", "conversations", "agents"]
-        .into_iter()
-        .all(|table| analytics::query::table_exists(conn, table))
-}
-
 fn emit_analytics_validate_summary(label: &str, summary: &AnalyticsValidationSummary) {
     use colored::Colorize;
 
@@ -4834,7 +4828,10 @@ fn run_analytics_validate(
         for decision in &plan.decisions {
             match decision.kind {
                 analytics::validate::RepairKind::RebuildTrackA => {
-                    if analytics_track_a_rebuild_safe(&pre_conn) {
+                    if ["messages", "conversations", "agents"]
+                        .into_iter()
+                        .all(|table| analytics::query::table_exists(&pre_conn, table))
+                    {
                         let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
                             code: 9,
                             kind: CliErrorKind::DbError.kind_str(),
