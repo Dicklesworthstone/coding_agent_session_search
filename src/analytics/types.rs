@@ -138,14 +138,21 @@ pub enum Dim {
     Model,
 }
 
+impl Dim {
+    /// Stable lowercase string used in CLI/JSON display surfaces.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Workspace => "workspace",
+            Self::Source => "source",
+            Self::Model => "model",
+        }
+    }
+}
+
 impl std::fmt::Display for Dim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Agent => write!(f, "agent"),
-            Self::Workspace => write!(f, "workspace"),
-            Self::Source => write!(f, "source"),
-            Self::Model => write!(f, "model"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -806,6 +813,21 @@ mod tests {
     fn group_by_label() {
         for (group_by, _, expected_label, _, _) in GROUP_BY_CASES {
             assert_eq!(group_by.label(), expected_label, "{group_by:?}");
+        }
+    }
+
+    #[test]
+    fn dim_as_str_matches_display_for_all_variants() {
+        let cases = [
+            (Dim::Agent, "agent"),
+            (Dim::Workspace, "workspace"),
+            (Dim::Source, "source"),
+            (Dim::Model, "model"),
+        ];
+
+        for (dim, expected) in cases {
+            assert_eq!(dim.as_str(), expected, "{dim:?}");
+            assert_eq!(dim.to_string(), expected, "{dim:?}");
         }
     }
 
