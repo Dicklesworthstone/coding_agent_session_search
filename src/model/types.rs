@@ -107,6 +107,37 @@ mod tests {
     use super::*;
     use serde_json::{from_value, json, to_value};
 
+    fn message_fixture(content: impl Into<String>) -> Message {
+        Message {
+            id: None,
+            idx: 0,
+            role: MessageRole::User,
+            author: None,
+            created_at: None,
+            content: content.into(),
+            extra_json: json!(null),
+            snippets: vec![],
+        }
+    }
+
+    fn conversation_fixture(agent_slug: &str, source_path: &str) -> Conversation {
+        Conversation {
+            id: None,
+            agent_slug: agent_slug.to_string(),
+            workspace: None,
+            external_id: None,
+            title: None,
+            source_path: PathBuf::from(source_path),
+            started_at: None,
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: json!(null),
+            messages: vec![],
+            source_id: "local".to_string(),
+            origin_host: None,
+        }
+    }
+
     // =========================
     // MessageRole Tests
     // =========================
@@ -381,16 +412,10 @@ mod tests {
             snippet_text: Some("code".to_string()),
         };
 
-        let message = Message {
-            id: None,
-            idx: 1,
-            role: MessageRole::Agent,
-            author: None,
-            created_at: None,
-            content: "Here's some code".to_string(),
-            extra_json: json!(null),
-            snippets: vec![snippet],
-        };
+        let mut message = message_fixture("Here's some code");
+        message.idx = 1;
+        message.role = MessageRole::Agent;
+        message.snippets = vec![snippet];
 
         let json = serde_json::to_string(&message).unwrap();
         let deserialized: Message = serde_json::from_str(&json).unwrap();
@@ -401,16 +426,9 @@ mod tests {
 
     #[test]
     fn message_with_unicode_content() {
-        let message = Message {
-            id: None,
-            idx: 0,
-            role: MessageRole::User,
-            author: Some("ユーザー".to_string()),
-            created_at: None,
-            content: "こんにちは世界！🌍".to_string(),
-            extra_json: json!({"emoji": "🎉"}),
-            snippets: vec![],
-        };
+        let mut message = message_fixture("こんにちは世界！🌍");
+        message.author = Some("ユーザー".to_string());
+        message.extra_json = json!({"emoji": "🎉"});
 
         let json = serde_json::to_string(&message).unwrap();
         let deserialized: Message = serde_json::from_str(&json).unwrap();
@@ -476,21 +494,9 @@ mod tests {
 
     #[test]
     fn conversation_with_remote_source() {
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "codex".to_string(),
-            workspace: None,
-            external_id: None,
-            title: None,
-            source_path: PathBuf::from("/remote/session.jsonl"),
-            started_at: None,
-            ended_at: None,
-            approx_tokens: None,
-            metadata_json: json!(null),
-            messages: vec![],
-            source_id: "work-laptop".to_string(),
-            origin_host: Some("laptop.local".to_string()),
-        };
+        let mut conversation = conversation_fixture("codex", "/remote/session.jsonl");
+        conversation.source_id = "work-laptop".to_string();
+        conversation.origin_host = Some("laptop.local".to_string());
 
         let json = serde_json::to_string(&conversation).unwrap();
         let deserialized: Conversation = serde_json::from_str(&json).unwrap();
@@ -501,32 +507,8 @@ mod tests {
 
     #[test]
     fn conversation_with_messages() {
-        let message = Message {
-            id: None,
-            idx: 0,
-            role: MessageRole::User,
-            author: None,
-            created_at: None,
-            content: "Hello".to_string(),
-            extra_json: json!(null),
-            snippets: vec![],
-        };
-
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "test".to_string(),
-            workspace: None,
-            external_id: None,
-            title: None,
-            source_path: PathBuf::from("/test.jsonl"),
-            started_at: None,
-            ended_at: None,
-            approx_tokens: None,
-            metadata_json: json!(null),
-            messages: vec![message],
-            source_id: "local".to_string(),
-            origin_host: None,
-        };
+        let mut conversation = conversation_fixture("test", "/test.jsonl");
+        conversation.messages = vec![message_fixture("Hello")];
 
         let json = serde_json::to_string(&conversation).unwrap();
         let deserialized: Conversation = serde_json::from_str(&json).unwrap();
@@ -564,16 +546,8 @@ mod tests {
     #[test]
     fn large_content_strings() {
         let large_content = "x".repeat(100_000);
-        let message = Message {
-            id: None,
-            idx: 0,
-            role: MessageRole::Agent,
-            author: None,
-            created_at: None,
-            content: large_content.clone(),
-            extra_json: json!(null),
-            snippets: vec![],
-        };
+        let mut message = message_fixture(large_content.clone());
+        message.role = MessageRole::Agent;
 
         let json = serde_json::to_string(&message).unwrap();
         let deserialized: Message = serde_json::from_str(&json).unwrap();
@@ -584,16 +558,7 @@ mod tests {
     #[test]
     fn special_characters_in_strings() {
         let content = "Hello\nWorld\t\"quoted\"\r\nbackslash\\end";
-        let message = Message {
-            id: None,
-            idx: 0,
-            role: MessageRole::User,
-            author: None,
-            created_at: None,
-            content: content.to_string(),
-            extra_json: json!(null),
-            snippets: vec![],
-        };
+        let message = message_fixture(content);
 
         let json = serde_json::to_string(&message).unwrap();
         let deserialized: Message = serde_json::from_str(&json).unwrap();
@@ -632,21 +597,8 @@ mod tests {
             }
         });
 
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "test".to_string(),
-            workspace: None,
-            external_id: None,
-            title: None,
-            source_path: PathBuf::from("/test.jsonl"),
-            started_at: None,
-            ended_at: None,
-            approx_tokens: None,
-            metadata_json: metadata.clone(),
-            messages: vec![],
-            source_id: "local".to_string(),
-            origin_host: None,
-        };
+        let mut conversation = conversation_fixture("test", "/test.jsonl");
+        conversation.metadata_json = metadata.clone();
 
         let json = serde_json::to_string(&conversation).unwrap();
         let deserialized: Conversation = serde_json::from_str(&json).unwrap();
