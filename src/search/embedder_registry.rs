@@ -316,11 +316,10 @@ impl EmbedderRegistry {
     ///
     /// Returns `Ok(())` if available, or an error with details about what's missing.
     pub fn validate(&self, name: &str) -> EmbedderResult<&'static RegisteredEmbedder> {
-        let embedder = self
-            .get(name)
-            .ok_or_else(|| EmbedderError::EmbedderUnavailable {
-                model: name.to_string(),
-                reason: format!(
+        let embedder = self.get(name).ok_or_else(|| {
+            embedder_unavailable(
+                name,
+                format!(
                     "unknown embedder. Available: {}",
                     EMBEDDERS
                         .iter()
@@ -328,7 +327,8 @@ impl EmbedderRegistry {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
-            })?;
+            )
+        })?;
 
         if !embedder.is_available(&self.data_dir) {
             let missing = embedder.missing_files(&self.data_dir);
@@ -337,14 +337,14 @@ impl EmbedderRegistry {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
 
-            return Err(EmbedderError::EmbedderUnavailable {
-                model: name.to_string(),
-                reason: format!(
+            return Err(embedder_unavailable(
+                name,
+                format!(
                     "missing files in {}: {}. Run 'cass models install' to download.",
                     model_dir,
                     missing.join(", ")
                 ),
-            });
+            ));
         }
 
         Ok(embedder)
@@ -384,10 +384,14 @@ fn load_embedder_by_name(data_dir: &Path, name: &str) -> EmbedderResult<Arc<dyn 
             let embedder = FastEmbedder::load_by_name(data_dir, name)?;
             Ok(Arc::new(embedder))
         }
-        _ => Err(EmbedderError::EmbedderUnavailable {
-            model: name.to_string(),
-            reason: "embedder not implemented".to_string(),
-        }),
+        _ => Err(embedder_unavailable(name, "embedder not implemented")),
+    }
+}
+
+fn embedder_unavailable(model: &str, reason: impl Into<String>) -> EmbedderError {
+    EmbedderError::EmbedderUnavailable {
+        model: model.to_string(),
+        reason: reason.into(),
     }
 }
 
@@ -472,6 +476,18 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, EmbedderError::EmbedderUnavailable { .. }));
+    }
+
+    #[test]
+    fn test_embedder_unavailable_helper_shape() {
+        let err = embedder_unavailable("demo", "missing model");
+        match err {
+            EmbedderError::EmbedderUnavailable { model, reason } => {
+                assert_eq!(model, "demo");
+                assert_eq!(reason, "missing model");
+            }
+            other => panic!("unexpected error shape: {other:?}"),
+        }
     }
 
     #[test]
