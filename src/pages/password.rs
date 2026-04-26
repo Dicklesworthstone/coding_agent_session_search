@@ -24,45 +24,62 @@ pub enum PasswordStrength {
     Strong,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PasswordStrengthVisuals {
+    color: &'static str,
+    label: &'static str,
+    bar: &'static str,
+    percent: u8,
+}
+
 impl PasswordStrength {
+    fn visuals(self) -> PasswordStrengthVisuals {
+        match self {
+            Self::Weak => PasswordStrengthVisuals {
+                color: "red",
+                label: "Weak",
+                bar: "[█░░░]",
+                percent: 25,
+            },
+            Self::Fair => PasswordStrengthVisuals {
+                color: "yellow",
+                label: "Fair",
+                bar: "[██░░]",
+                percent: 50,
+            },
+            Self::Good => PasswordStrengthVisuals {
+                color: "blue",
+                label: "Good",
+                bar: "[███░]",
+                percent: 75,
+            },
+            Self::Strong => PasswordStrengthVisuals {
+                color: "green",
+                label: "Strong",
+                bar: "[████]",
+                percent: 100,
+            },
+        }
+    }
+
     /// Get the ANSI color name for this strength level.
     pub fn color(&self) -> &'static str {
-        match self {
-            Self::Weak => "red",
-            Self::Fair => "yellow",
-            Self::Good => "blue",
-            Self::Strong => "green",
-        }
+        self.visuals().color
     }
 
     /// Get a human-readable label.
     pub fn label(&self) -> &'static str {
-        match self {
-            Self::Weak => "Weak",
-            Self::Fair => "Fair",
-            Self::Good => "Good",
-            Self::Strong => "Strong",
-        }
+        self.visuals().label
     }
 
     /// Get the progress bar representation (4 segments).
     pub fn bar(&self) -> &'static str {
-        match self {
-            Self::Weak => "[█░░░]",
-            Self::Fair => "[██░░]",
-            Self::Good => "[███░]",
-            Self::Strong => "[████]",
-        }
+        self.visuals().bar
     }
 
     /// Get the percentage (0-100) for progress bar width.
     pub fn percent(&self) -> u8 {
-        match self {
-            Self::Weak => 25,
-            Self::Fair => 50,
-            Self::Good => 75,
-            Self::Strong => 100,
-        }
+        self.visuals().percent
     }
 }
 
@@ -346,6 +363,22 @@ mod tests {
 
         for (strength, expected_bar) in cases {
             assert_eq!(strength.bar(), expected_bar, "{strength:?}");
+        }
+    }
+
+    #[test]
+    fn test_strength_color_and_label() {
+        let cases = [
+            (PasswordStrength::Weak, "red", "Weak"),
+            (PasswordStrength::Fair, "yellow", "Fair"),
+            (PasswordStrength::Good, "blue", "Good"),
+            (PasswordStrength::Strong, "green", "Strong"),
+        ];
+
+        for (strength, expected_color, expected_label) in cases {
+            assert_eq!(strength.color(), expected_color, "{strength:?}");
+            assert_eq!(strength.label(), expected_label, "{strength:?}");
+            assert_eq!(strength.to_string(), expected_label, "{strength:?}");
         }
     }
 
