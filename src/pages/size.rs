@@ -235,51 +235,27 @@ impl SizeLimitResult {
 }
 
 /// Size-related errors
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SizeError {
     /// Total site size exceeds GitHub Pages limit
+    #[error(
+        "Total size ({}) exceeds GitHub Pages limit ({})\n\n\
+         Suggestions:\n\
+         • Use --since \"90 days ago\" for recent conversations only\n\
+         • Use --agents <name> to limit to specific agents\n\
+         • Use --workspaces <path> to limit projects",
+        format_bytes(*actual),
+        format_bytes(*limit)
+    )]
     TotalExceedsLimit { actual: u64, limit: u64 },
     /// Individual file exceeds limit
+    #[error("File {path} ({}) exceeds limit ({})", format_bytes(*actual), format_bytes(*limit))]
     FileExceedsLimit {
         path: String,
         actual: u64,
         limit: u64,
     },
 }
-
-impl std::fmt::Display for SizeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SizeError::TotalExceedsLimit { actual, limit } => {
-                write!(
-                    f,
-                    "Total size ({}) exceeds GitHub Pages limit ({})\n\n\
-                     Suggestions:\n\
-                     • Use --since \"90 days ago\" for recent conversations only\n\
-                     • Use --agents <name> to limit to specific agents\n\
-                     • Use --workspaces <path> to limit projects",
-                    format_bytes(*actual),
-                    format_bytes(*limit)
-                )
-            }
-            SizeError::FileExceedsLimit {
-                path,
-                actual,
-                limit,
-            } => {
-                write!(
-                    f,
-                    "File {} ({}) exceeds limit ({})",
-                    path,
-                    format_bytes(*actual),
-                    format_bytes(*limit)
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for SizeError {}
 
 /// Size-related warnings
 #[derive(Debug, Clone)]
@@ -514,6 +490,36 @@ mod tests {
         assert!(msg.contains("2.0 GB"));
         assert!(msg.contains("1.0 GB"));
         assert!(msg.contains("Suggestions"));
+    }
+
+    #[test]
+    fn test_size_error_display_and_source_are_preserved() {
+        let cases = vec![
+            (
+                SizeError::TotalExceedsLimit {
+                    actual: 2 * 1024 * 1024 * 1024,
+                    limit: 1024 * 1024 * 1024,
+                },
+                "Total size (2.0 GB) exceeds GitHub Pages limit (1.0 GB)\n\n\
+                 Suggestions:\n\
+                 • Use --since \"90 days ago\" for recent conversations only\n\
+                 • Use --agents <name> to limit to specific agents\n\
+                 • Use --workspaces <path> to limit projects",
+            ),
+            (
+                SizeError::FileExceedsLimit {
+                    path: "site/archive.bin".to_string(),
+                    actual: 150 * 1024 * 1024,
+                    limit: 100 * 1024 * 1024,
+                },
+                "File site/archive.bin (150.0 MB) exceeds limit (100.0 MB)",
+            ),
+        ];
+
+        for (error, expected_display) in cases {
+            assert_eq!(error.to_string(), expected_display);
+            assert!(std::error::Error::source(&error).is_none());
+        }
     }
 
     #[test]
