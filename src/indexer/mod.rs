@@ -750,16 +750,8 @@ impl IndexingProgress {
                 "host_loadavg_1m": rebuild_pipeline_host_loadavg_1m_milli.map(|value| {
                     f64::from(value) / 1000.0
                 }),
-                "controller_mode": if rebuild_pipeline_controller_mode.is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::json!(rebuild_pipeline_controller_mode)
-                },
-                "controller_reason": if rebuild_pipeline_controller_reason.is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::json!(rebuild_pipeline_controller_reason)
-                },
+                "controller_mode": non_empty_json_string(rebuild_pipeline_controller_mode),
+                "controller_reason": non_empty_json_string(rebuild_pipeline_controller_reason),
                 // The staged-merge / staged-shard-build controllers
                 // only run during the lexical rebuild pipeline. Outside
                 // that window (incremental scan, post-rebuild small-N
@@ -777,20 +769,12 @@ impl IndexingProgress {
                 "staged_merge_active_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_merge_active_jobs),
                 "staged_merge_ready_artifacts": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_merge_ready_artifacts),
                 "staged_merge_ready_groups": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_merge_ready_groups),
-                "staged_merge_controller_reason": if !is_rebuilding || rebuild_pipeline_staged_merge_controller_reason.is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::json!(rebuild_pipeline_staged_merge_controller_reason)
-                },
+                "staged_merge_controller_reason": active_rebuild_json_string(is_rebuilding, rebuild_pipeline_staged_merge_controller_reason),
                 "staged_shard_build_workers_max": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_workers_max),
                 "staged_shard_build_allowed_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_allowed_jobs),
                 "staged_shard_build_active_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_active_jobs),
                 "staged_shard_build_pending_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_pending_jobs),
-                "staged_shard_build_controller_reason": if !is_rebuilding || rebuild_pipeline_staged_shard_build_controller_reason.is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::json!(rebuild_pipeline_staged_shard_build_controller_reason)
-                },
+                "staged_shard_build_controller_reason": active_rebuild_json_string(is_rebuilding, rebuild_pipeline_staged_shard_build_controller_reason),
             },
         })
     }
@@ -807,6 +791,14 @@ fn staged_field_or_null(is_rebuilding: bool, value: usize) -> serde_json::Value 
     } else {
         serde_json::Value::Null
     }
+}
+
+fn non_empty_json_string(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn active_rebuild_json_string(is_rebuilding: bool, value: String) -> Option<String> {
+    (is_rebuilding && !value.is_empty()).then_some(value)
 }
 
 #[derive(Clone)]
