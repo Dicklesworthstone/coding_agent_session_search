@@ -922,14 +922,7 @@ fn create_project_api(
     api_token: &str,
 ) -> Result<()> {
     let url = format!("{}/accounts/{}/pages/projects", api_base_url(), account_id);
-    let body = json!({
-        "name": project_name,
-        "production_branch": branch,
-        "deployment_configs": {
-            "production": {},
-            "preview": {}
-        }
-    });
+    let body = project_create_body(project_name, branch);
     let response = execute_cloudflare_request(
         asupersync::http::h1::Method::Post,
         url,
@@ -939,6 +932,17 @@ fn create_project_api(
     )?;
     parse_api_response::<serde_json::Value>(response, "project create")?;
     Ok(())
+}
+
+fn project_create_body(project_name: &str, branch: &str) -> serde_json::Value {
+    json!({
+        "name": project_name,
+        "production_branch": branch,
+        "deployment_configs": {
+            "production": {},
+            "preview": {}
+        }
+    })
 }
 
 fn deploy_with_api(
@@ -1462,6 +1466,24 @@ mod tests {
         assert_eq!(config.project_name, "cass-archive");
         assert!(config.custom_domain.is_none());
         assert!(config.create_if_missing);
+    }
+
+    #[test]
+    fn test_project_create_body_shape() {
+        let body = project_create_body("archive-prod", "main");
+
+        assert_eq!(body["name"], json!("archive-prod"));
+        assert_eq!(body["production_branch"], json!("main"));
+        assert_eq!(body["deployment_configs"]["production"], json!({}));
+        assert_eq!(body["deployment_configs"]["preview"], json!({}));
+        assert_eq!(body.as_object().expect("object").len(), 3);
+        assert_eq!(
+            body["deployment_configs"]
+                .as_object()
+                .expect("configs")
+                .len(),
+            2
+        );
     }
 
     #[test]
