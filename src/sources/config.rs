@@ -321,13 +321,17 @@ pub enum SyncSchedule {
     Daily,
 }
 
+const SYNC_SCHEDULE_MANUAL: &str = "manual";
+const SYNC_SCHEDULE_HOURLY: &str = "hourly";
+const SYNC_SCHEDULE_DAILY: &str = "daily";
+
 impl std::fmt::Display for SyncSchedule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Manual => write!(f, "manual"),
-            Self::Hourly => write!(f, "hourly"),
-            Self::Daily => write!(f, "daily"),
-        }
+        f.write_str(match self {
+            Self::Manual => SYNC_SCHEDULE_MANUAL,
+            Self::Hourly => SYNC_SCHEDULE_HOURLY,
+            Self::Daily => SYNC_SCHEDULE_DAILY,
+        })
     }
 }
 
@@ -1712,9 +1716,9 @@ mod tests {
 
     #[test]
     fn test_sync_schedule_display() {
-        assert_eq!(SyncSchedule::Manual.to_string(), "manual");
-        assert_eq!(SyncSchedule::Hourly.to_string(), "hourly");
-        assert_eq!(SyncSchedule::Daily.to_string(), "daily");
+        assert_eq!(SyncSchedule::Manual.to_string(), SYNC_SCHEDULE_MANUAL);
+        assert_eq!(SyncSchedule::Hourly.to_string(), SYNC_SCHEDULE_HOURLY);
+        assert_eq!(SyncSchedule::Daily.to_string(), SYNC_SCHEDULE_DAILY);
     }
 
     #[test]
