@@ -153,6 +153,10 @@ fn resolve_embedder_kind(
     })
 }
 
+fn saturating_i64_from_usize(raw: usize) -> i64 {
+    i64::try_from(raw).unwrap_or(i64::MAX)
+}
+
 impl EmbeddingWorker {
     /// Create a new worker and its handle.
     pub fn new() -> (Self, EmbeddingWorkerHandle) {
@@ -214,7 +218,7 @@ impl EmbeddingWorker {
         // Open storage and fetch messages
         let storage = FrankenStorage::open(db_path)?;
         let messages = storage.fetch_messages_for_embedding()?;
-        let total_docs = i64::try_from(messages.len()).unwrap_or(i64::MAX);
+        let total_docs = saturating_i64_from_usize(messages.len());
 
         if total_docs == 0 {
             info!(db_path = %config.db_path, "No messages to embed");
@@ -361,7 +365,7 @@ impl EmbeddingWorker {
         }
 
         if inputs.is_empty() {
-            let final_completed = i64::try_from(messages.len()).unwrap_or(i64::MAX);
+            let final_completed = saturating_i64_from_usize(messages.len());
             let _ = storage.update_job_progress(job_id, final_completed);
             info!(
                 model = model_name,
@@ -390,7 +394,7 @@ impl EmbeddingWorker {
         let embedded = indexer.embed_messages(&inputs)?;
 
         // Update final progress
-        let final_completed = i64::try_from(messages.len()).unwrap_or(i64::MAX);
+        let final_completed = saturating_i64_from_usize(messages.len());
         let _ = storage.update_job_progress(job_id, final_completed);
 
         // Append to existing vector index, or create a new one if none exists.
@@ -560,6 +564,16 @@ mod tests {
         assert_eq!(saturating_u32_from_i64(0), 0);
         assert_eq!(saturating_u32_from_i64(7), 7);
         assert_eq!(saturating_u32_from_i64(i64::from(u32::MAX) + 123), u32::MAX);
+    }
+
+    #[test]
+    fn test_saturating_i64_from_usize_clamps_overflow() {
+        assert_eq!(saturating_i64_from_usize(0), 0);
+        assert_eq!(saturating_i64_from_usize(7), 7);
+        assert_eq!(
+            saturating_i64_from_usize(usize::MAX),
+            i64::try_from(usize::MAX).unwrap_or(i64::MAX)
+        );
     }
 
     #[test]
