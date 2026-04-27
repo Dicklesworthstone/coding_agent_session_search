@@ -286,15 +286,18 @@ mod tests {
         let tokens = HashEmbedder::tokenize("Hello, World! This is a TEST-123.");
 
         // Should be lowercase, split on non-alphanumeric, filter short tokens
-        assert!(tokens.contains(&"hello".to_string()));
-        assert!(tokens.contains(&"world".to_string()));
-        assert!(tokens.contains(&"this".to_string()));
-        assert!(tokens.contains(&"test".to_string()));
-        assert!(tokens.contains(&"123".to_string()));
-        assert!(tokens.contains(&"is".to_string())); // len == 2, included
+        for expected in ["hello", "world", "this", "test", "123", "is"] {
+            assert!(
+                tokens.iter().any(|candidate| candidate == expected),
+                "expected token {expected:?} in {tokens:?}"
+            );
+        }
 
         // Single characters should be filtered (len < 2)
-        assert!(!tokens.contains(&"a".to_string()));
+        assert!(
+            !tokens.iter().any(|candidate| candidate == "a"),
+            "single-character token should be filtered: {tokens:?}"
+        );
     }
 
     #[test]
