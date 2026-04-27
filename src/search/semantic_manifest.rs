@@ -904,6 +904,43 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum ExpectedTierReadiness {
+        Ready,
+        Stale,
+        Incompatible,
+        Building(u8),
+    }
+
+    fn no_artifact_mutation(_: &mut ArtifactRecord) {}
+
+    fn set_schema_version_to_zero(artifact: &mut ArtifactRecord) {
+        artifact.schema_version = 0;
+    }
+
+    fn assert_tier_readiness(actual: TierReadiness, expected: ExpectedTierReadiness, label: &str) {
+        match expected {
+            ExpectedTierReadiness::Ready => {
+                assert_eq!(actual, TierReadiness::Ready, "{label}");
+            }
+            ExpectedTierReadiness::Stale => {
+                assert!(
+                    matches!(actual, TierReadiness::Stale { .. }),
+                    "{label}: {actual:?}"
+                );
+            }
+            ExpectedTierReadiness::Incompatible => {
+                assert!(
+                    matches!(actual, TierReadiness::Incompatible { .. }),
+                    "{label}: {actual:?}"
+                );
+            }
+            ExpectedTierReadiness::Building(progress_pct) => {
+                assert_eq!(actual, TierReadiness::Building { progress_pct }, "{label}");
+            }
+        }
+    }
+
     // ── Manifest load/save round-trip ──────────────────────────────────
 
     #[test]
@@ -1018,42 +1055,71 @@ mod tests {
         let policy = test_policy();
         let db_fp = "fp-1234";
         let model_rev = "abc123";
+        let cases: &[(
+            &str,
+            TierKind,
+            bool,
+            &str,
+            &str,
+            fn(&mut ArtifactRecord),
+            ExpectedTierReadiness,
+        )] = &[
+            (
+                "ready artifact with matching fingerprint",
+                TierKind::Fast,
+                true,
+                db_fp,
+                model_rev,
+                no_artifact_mutation,
+                ExpectedTierReadiness::Ready,
+            ),
+            (
+                "ready artifact with changed DB fingerprint",
+                TierKind::Fast,
+                true,
+                "different-fp",
+                model_rev,
+                no_artifact_mutation,
+                ExpectedTierReadiness::Stale,
+            ),
+            (
+                "ready artifact with changed model revision",
+                TierKind::Quality,
+                true,
+                db_fp,
+                "new-revision",
+                no_artifact_mutation,
+                ExpectedTierReadiness::Stale,
+            ),
+            (
+                "schema version mismatch",
+                TierKind::Quality,
+                true,
+                db_fp,
+                model_rev,
+                set_schema_version_to_zero,
+                ExpectedTierReadiness::Incompatible,
+            ),
+            (
+                "not yet published artifact",
+                TierKind::Fast,
+                false,
+                db_fp,
+                model_rev,
+                no_artifact_mutation,
+                ExpectedTierReadiness::Building(100),
+            ),
+        ];
 
-        // Case 1: Ready artifact, matching fingerprint → Ready
-        let artifact = test_artifact(TierKind::Fast, true);
-        assert_eq!(
-            artifact.readiness(&policy, db_fp, model_rev),
-            TierReadiness::Ready,
-        );
-
-        // Case 2: Ready artifact, DB fingerprint changed → Stale
-        let artifact = test_artifact(TierKind::Fast, true);
-        assert!(matches!(
-            artifact.readiness(&policy, "different-fp", model_rev),
-            TierReadiness::Stale { .. },
-        ));
-
-        // Case 3: Ready artifact, model revision changed → Stale
-        let artifact = test_artifact(TierKind::Quality, true);
-        assert!(matches!(
-            artifact.readiness(&policy, db_fp, "new-revision"),
-            TierReadiness::Stale { .. },
-        ));
-
-        // Case 4: Schema version mismatch → Incompatible
-        let mut artifact = test_artifact(TierKind::Quality, true);
-        artifact.schema_version = 0;
-        assert!(matches!(
-            artifact.readiness(&policy, db_fp, model_rev),
-            TierReadiness::Incompatible { .. },
-        ));
-
-        // Case 5: Not yet published (ready=false) → Building
-        let artifact = test_artifact(TierKind::Fast, false);
-        assert!(matches!(
-            artifact.readiness(&policy, db_fp, model_rev),
-            TierReadiness::Building { progress_pct: 100 },
-        ));
+        for (label, tier, ready, current_db_fp, current_model_rev, mutate, expected) in cases {
+            let mut artifact = test_artifact(*tier, *ready);
+            mutate(&mut artifact);
+            assert_tier_readiness(
+                artifact.readiness(&policy, current_db_fp, current_model_rev),
+                *expected,
+                label,
+            );
+        }
     }
 
     // ── Manifest-level readiness ───────────────────────────────────────
