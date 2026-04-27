@@ -1505,7 +1505,7 @@ impl ModelDownloader {
             chrono::Utc::now().to_rfc3339(),
             source
         );
-        let temp_path = unique_model_temp_path(&marker_path);
+        let temp_path = unique_model_sidecar_path(&marker_path, "tmp", ".verified");
         let mut file = File::create(&temp_path)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
@@ -1833,10 +1833,6 @@ fn marker_field(content: &str, field: &str) -> Option<String> {
         .find_map(|line| line.strip_prefix(&prefix))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn unique_model_temp_path(path: &Path) -> PathBuf {
-    unique_model_sidecar_path(path, "tmp", ".verified")
 }
 
 fn unique_model_backup_dir(path: &Path) -> PathBuf {
