@@ -273,20 +273,32 @@ mod tests {
 
     #[test]
     fn is_searchable_distinguishes_lexical_failure_modes() {
-        assert!(!LexicalReadinessState::Missing.is_searchable());
-        assert!(!LexicalReadinessState::CorruptQuarantined.is_searchable());
-        assert!(LexicalReadinessState::Repairing.is_searchable());
-        assert!(LexicalReadinessState::StaleButSearchable.is_searchable());
-        assert!(LexicalReadinessState::Ready.is_searchable());
+        let cases = [
+            (LexicalReadinessState::Missing, false),
+            (LexicalReadinessState::CorruptQuarantined, false),
+            (LexicalReadinessState::Repairing, true),
+            (LexicalReadinessState::StaleButSearchable, true),
+            (LexicalReadinessState::Ready, true),
+        ];
+
+        for (state, expected) in cases {
+            assert_eq!(state.is_searchable(), expected, "{state:?}");
+        }
     }
 
     #[test]
     fn semantic_can_refine_only_when_at_least_fast_tier_ready() {
-        assert!(!SemanticReadinessState::Absent.can_refine());
-        assert!(!SemanticReadinessState::Backfilling.can_refine());
-        assert!(!SemanticReadinessState::PolicyDisabled.can_refine());
-        assert!(SemanticReadinessState::FastTierReady.can_refine());
-        assert!(SemanticReadinessState::HybridReady.can_refine());
+        let cases = [
+            (SemanticReadinessState::Absent, false),
+            (SemanticReadinessState::Backfilling, false),
+            (SemanticReadinessState::PolicyDisabled, false),
+            (SemanticReadinessState::FastTierReady, true),
+            (SemanticReadinessState::HybridReady, true),
+        ];
+
+        for (state, expected) in cases {
+            assert_eq!(state.can_refine(), expected, "{state:?}");
+        }
     }
 
     #[test]
