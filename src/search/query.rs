@@ -142,6 +142,11 @@ fn semantic_message_id_from_db(message_id: i64) -> std::io::Result<u64> {
     u64::try_from(message_id).map_err(|_| std::io::Error::other("negative message_id"))
 }
 
+fn semantic_doc_component_id_from_db(raw: Option<i64>) -> u32 {
+    raw.map(|value| u32::try_from(value.max(0)).unwrap_or(u32::MAX))
+        .unwrap_or(0)
+}
+
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, is_search_noise_text};
 use crate::search::embedder::Embedder;
 use crate::search::vector_index::{
@@ -4071,16 +4076,8 @@ impl SearchClient {
                     let message_id = u64::try_from(message_id_raw).map_err(|_| {
                         std::io::Error::other("message id out of range for progressive doc_id")
                     })?;
-                    let agent_id = match agent_id_raw {
-                        None => 0,
-                        Some(raw) if raw < 0 => 0,
-                        Some(raw) => u32::try_from(raw).unwrap_or(u32::MAX),
-                    };
-                    let workspace_id = if workspace_id_raw.unwrap_or(0) < 0 {
-                        0
-                    } else {
-                        u32::try_from(workspace_id_raw.unwrap_or(0)).unwrap_or(u32::MAX)
-                    };
+                    let agent_id = semantic_doc_component_id_from_db(agent_id_raw);
+                    let workspace_id = semantic_doc_component_id_from_db(workspace_id_raw);
                     let role = role_code_from_str(&role_raw).unwrap_or(ROLE_USER);
                     let doc_id = SemanticDocId {
                         message_id,
@@ -4163,16 +4160,8 @@ impl SearchClient {
                     let message_id = u64::try_from(message_id_raw).map_err(|_| {
                         std::io::Error::other("message id out of range for progressive doc_id")
                     })?;
-                    let agent_id = match agent_id_raw {
-                        None => 0,
-                        Some(raw) if raw < 0 => 0,
-                        Some(raw) => u32::try_from(raw).unwrap_or(u32::MAX),
-                    };
-                    let workspace_id = if workspace_id_raw.unwrap_or(0) < 0 {
-                        0
-                    } else {
-                        u32::try_from(workspace_id_raw.unwrap_or(0)).unwrap_or(u32::MAX)
-                    };
+                    let agent_id = semantic_doc_component_id_from_db(agent_id_raw);
+                    let workspace_id = semantic_doc_component_id_from_db(workspace_id_raw);
                     let role = role_code_from_str(&role_raw).unwrap_or(ROLE_USER);
                     let doc_id = SemanticDocId {
                         message_id,
@@ -7105,6 +7094,18 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(semantic_message_id_from_db(42).expect("positive id"), 42);
+    }
+
+    #[test]
+    fn semantic_doc_component_id_from_db_clamps_bounds() {
+        assert_eq!(semantic_doc_component_id_from_db(None), 0);
+        assert_eq!(semantic_doc_component_id_from_db(Some(-7)), 0);
+        assert_eq!(semantic_doc_component_id_from_db(Some(0)), 0);
+        assert_eq!(semantic_doc_component_id_from_db(Some(7)), 7);
+        assert_eq!(
+            semantic_doc_component_id_from_db(Some(i64::from(u32::MAX) + 123)),
+            u32::MAX
+        );
     }
 
     #[test]
