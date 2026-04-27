@@ -115,9 +115,12 @@ mod tests {
         assert!(info.is_semantic);
 
         let display = format!("{info}");
-        assert!(display.contains(FastEmbedder::embedder_id_static()));
-        assert!(display.contains("semantic"));
-        assert!(display.contains("384"));
+        for expected in [FastEmbedder::embedder_id_static(), "semantic", "384"] {
+            assert!(
+                display.contains(expected),
+                "display {display:?} should contain {expected:?}"
+            );
+        }
     }
 
     #[test]
