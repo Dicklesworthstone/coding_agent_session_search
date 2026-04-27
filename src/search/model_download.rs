@@ -2328,17 +2328,23 @@ mod tests {
 
     #[test]
     fn test_normalize_mirror_base_url_rejects_invalid_values() {
-        let err = normalize_mirror_base_url("mirror.example").unwrap_err();
-        assert!(err.to_string().contains("invalid mirror URL"));
+        let cases = [
+            ("mirror.example", "invalid mirror URL"),
+            ("file:///tmp/mirror", "unsupported URL scheme"),
+            (
+                "https://mirror.example/cache?trace=abc",
+                "must not include query or fragment",
+            ),
+        ];
 
-        let err = normalize_mirror_base_url("file:///tmp/mirror").unwrap_err();
-        assert!(err.to_string().contains("unsupported URL scheme"));
-
-        let err = normalize_mirror_base_url("https://mirror.example/cache?trace=abc").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("must not include query or fragment")
-        );
+        for (input, expected_fragment) in cases {
+            let err = normalize_mirror_base_url(input).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains(expected_fragment),
+                "expected error for {input:?} to contain {expected_fragment:?}, got {message:?}"
+            );
+        }
     }
 
     #[test]
