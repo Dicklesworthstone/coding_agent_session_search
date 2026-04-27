@@ -503,32 +503,23 @@ mod tests {
 
         let projected = export_hit_json(&hit, &options);
 
-        assert_json_field(&projected, "title", serde_json::json!("Test Result"));
-        assert_json_field(&projected, "agent", serde_json::json!("claude_code"));
-        assert_json_field(&projected, "workspace", serde_json::json!("/projects/test"));
-        assert_json_field(&projected, "snippet", serde_json::json!("This is..."));
-        assert_json_field(&projected, "score", serde_json::json!(0.0));
-        assert_json_field(
-            &projected,
-            "source_path",
-            serde_json::json!("/path/to/file.jsonl"),
-        );
-        assert_json_field(&projected, "line_number", serde_json::json!(42));
-        assert_json_field(
-            &projected,
-            "created_at",
-            serde_json::json!(1700000000000i64),
-        );
-        assert_json_field(
-            &projected,
-            "created_at_formatted",
-            serde_json::json!("2023-11-14T22:13:20+00:00"),
-        );
-        assert_json_field(
-            &projected,
-            "content",
-            serde_json::json!("Full content here"),
-        );
+        for (key, expected) in [
+            ("title", serde_json::json!("Test Result")),
+            ("agent", serde_json::json!("claude_code")),
+            ("workspace", serde_json::json!("/projects/test")),
+            ("snippet", serde_json::json!("This is...")),
+            ("score", serde_json::json!(0.0)),
+            ("source_path", serde_json::json!("/path/to/file.jsonl")),
+            ("line_number", serde_json::json!(42)),
+            ("created_at", serde_json::json!(1700000000000i64)),
+            (
+                "created_at_formatted",
+                serde_json::json!("2023-11-14T22:13:20+00:00"),
+            ),
+            ("content", serde_json::json!("Full content here")),
+        ] {
+            assert_json_field(&projected, key, expected);
+        }
         assert_eq!(projected.as_object().expect("object").len(), 10);
     }
 
