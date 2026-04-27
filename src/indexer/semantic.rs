@@ -1770,6 +1770,46 @@ mod tests {
     }
 
     #[test]
+    fn semantic_backfill_scheduler_reason_next_steps_are_stable() {
+        for (reason, expected) in [
+            (
+                SemanticBackfillSchedulerReason::IdleBudgetAvailable,
+                "background semantic backfill is within idle budgets",
+            ),
+            (
+                SemanticBackfillSchedulerReason::OperatorDisabled,
+                "background semantic backfill is disabled by CASS_SEMANTIC_BACKFILL_DISABLE",
+            ),
+            (
+                SemanticBackfillSchedulerReason::PolicyDisabled,
+                "semantic policy disables background semantic backfill",
+            ),
+            (
+                SemanticBackfillSchedulerReason::ForegroundPressure,
+                "foreground pressure is present; retry after the idle delay",
+            ),
+            (
+                SemanticBackfillSchedulerReason::LexicalRepairActive,
+                "lexical repair is active; semantic backfill is yielding",
+            ),
+            (
+                SemanticBackfillSchedulerReason::CapacityBelowFloor,
+                "machine responsiveness capacity is below the semantic backfill floor",
+            ),
+            (
+                SemanticBackfillSchedulerReason::ThreadBudgetZero,
+                "semantic backfill thread budget is zero",
+            ),
+            (
+                SemanticBackfillSchedulerReason::BatchBudgetZero,
+                "semantic backfill batch budget is zero",
+            ),
+        ] {
+            assert_eq!(reason.next_step(), expected, "{reason:?}");
+        }
+    }
+
+    #[test]
     fn semantic_backfill_scheduler_yields_to_foreground_and_lexical_pressure() {
         let policy = SemanticPolicy::compiled_defaults();
         let foreground = SemanticBackfillSchedulerSignals {
