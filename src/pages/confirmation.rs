@@ -732,11 +732,19 @@ mod tests {
 
     #[test]
     fn test_password_strength_label() {
-        assert_eq!(password_strength_label(10.0), "Very Weak");
-        assert_eq!(password_strength_label(30.0), "Weak");
-        assert_eq!(password_strength_label(50.0), "Fair");
-        assert_eq!(password_strength_label(70.0), "Strong");
-        assert_eq!(password_strength_label(90.0), "Very Strong");
+        for (entropy_bits, expected_label) in [
+            (10.0, "Very Weak"),
+            (30.0, "Weak"),
+            (50.0, "Fair"),
+            (70.0, "Strong"),
+            (90.0, "Very Strong"),
+        ] {
+            assert_eq!(
+                password_strength_label(entropy_bits),
+                expected_label,
+                "entropy_bits={entropy_bits}"
+            );
+        }
     }
 
     #[test]
