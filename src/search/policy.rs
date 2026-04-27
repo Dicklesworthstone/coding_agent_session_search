@@ -516,6 +516,15 @@ pub struct EffectiveSettings {
     pub settings: Vec<EffectiveSetting>,
 }
 
+fn compiled_default_setting(name: &str, value: impl Into<String>) -> EffectiveSetting {
+    EffectiveSetting {
+        name: name.to_owned(),
+        value: value.into(),
+        source: SettingSource::CompiledDefault,
+        env_var: None,
+    }
+}
+
 impl EffectiveSettings {
     fn resolve_with_env_lookup(
         cli: &CliSemanticOverrides,
@@ -575,18 +584,14 @@ impl EffectiveSettings {
 
         // Fields without CLI overrides — only env vs default.
         // Note: fast_tier_embedder and reranker have no env var overrides.
-        settings.push(EffectiveSetting {
-            name: "fast_tier_embedder".to_owned(),
-            value: final_policy.fast_tier_embedder.clone(),
-            source: SettingSource::CompiledDefault,
-            env_var: None,
-        });
-        settings.push(EffectiveSetting {
-            name: "reranker".to_owned(),
-            value: final_policy.reranker.clone(),
-            source: SettingSource::CompiledDefault,
-            env_var: None,
-        });
+        settings.push(compiled_default_setting(
+            "fast_tier_embedder",
+            final_policy.fast_tier_embedder.clone(),
+        ));
+        settings.push(compiled_default_setting(
+            "reranker",
+            final_policy.reranker.clone(),
+        ));
 
         type EnvOnlyFieldGetter = fn(&SemanticPolicy) -> String;
         type EnvOnlyField<'a> = (&'a str, &'a str, EnvOnlyFieldGetter);
@@ -649,18 +654,14 @@ impl EffectiveSettings {
         }
 
         // Version fields (always compiled default).
-        settings.push(EffectiveSetting {
-            name: "semantic_schema_version".to_owned(),
-            value: final_policy.semantic_schema_version.to_string(),
-            source: SettingSource::CompiledDefault,
-            env_var: None,
-        });
-        settings.push(EffectiveSetting {
-            name: "chunking_strategy_version".to_owned(),
-            value: final_policy.chunking_strategy_version.to_string(),
-            source: SettingSource::CompiledDefault,
-            env_var: None,
-        });
+        settings.push(compiled_default_setting(
+            "semantic_schema_version",
+            final_policy.semantic_schema_version.to_string(),
+        ));
+        settings.push(compiled_default_setting(
+            "chunking_strategy_version",
+            final_policy.chunking_strategy_version.to_string(),
+        ));
 
         Self { settings }
     }
