@@ -77,13 +77,7 @@ fn resolved_semantic_prep_memo_capacity() -> usize {
 ///
 /// Set `CASS_SEMANTIC_PREP_PARALLEL=1` / `true` / `yes` / `on` to opt in.
 fn parallel_prep_enabled() -> bool {
-    dotenvy::var("CASS_SEMANTIC_PREP_PARALLEL")
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
+    env_truthy("CASS_SEMANTIC_PREP_PARALLEL")
 }
 
 #[derive(Debug, Clone)]
@@ -1717,6 +1711,43 @@ mod tests {
         }
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var(key).ok();
+            // SAFETY: focused tests temporarily mutate process env and restore on drop.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, prior }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prior = std::env::var(key).ok();
+            // SAFETY: focused tests temporarily mutate process env and restore on drop.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: restores the process env value captured by this test guard.
+            unsafe {
+                match self.prior.as_deref() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[test]
     fn semantic_backfill_scheduler_runs_and_scales_batch_under_idle_budget() {
         let policy = SemanticPolicy::compiled_defaults();
@@ -2859,20 +2890,28 @@ mod tests {
     fn default_batch_size_uses_new_value() {
         // The test setup must not leak a caller-provided CASS_SEMANTIC_BATCH_SIZE
         // override, which would mask the constant bump we're asserting on.
-        let prior = std::env::var("CASS_SEMANTIC_BATCH_SIZE").ok();
-        // SAFETY: test-local env mutation.
-        unsafe {
-            std::env::remove_var("CASS_SEMANTIC_BATCH_SIZE");
-        }
+        let _guard = EnvVarGuard::remove("CASS_SEMANTIC_BATCH_SIZE");
         let indexer = SemanticIndexer::new("hash", None).unwrap();
         assert_eq!(indexer.batch_size(), DEFAULT_SEMANTIC_BATCH_SIZE);
-        // Restore whatever was there before.
-        if let Some(v) = prior {
-            // SAFETY: test-local env mutation.
-            unsafe {
-                std::env::set_var("CASS_SEMANTIC_BATCH_SIZE", v);
-            }
+    }
+
+    #[test]
+    fn parallel_prep_enabled_reuses_truthy_env_parser() {
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            (" YeS ", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("off", false),
+        ] {
+            let _guard = EnvVarGuard::set("CASS_SEMANTIC_PREP_PARALLEL", value);
+            assert_eq!(parallel_prep_enabled(), expected, "env value {value:?}");
         }
+
+        let _guard = EnvVarGuard::remove("CASS_SEMANTIC_PREP_PARALLEL");
+        assert!(!parallel_prep_enabled());
     }
 
     /// `coding_agent_session_search-ibuuh.32` (sink #3 equivalence gate):
