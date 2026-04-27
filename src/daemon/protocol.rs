@@ -286,12 +286,16 @@ mod tests {
     #[test]
     fn test_protocol_error_display_strings_are_preserved() {
         let encode = EncodeError("bad payload".to_string());
-        assert_eq!(encode.to_string(), "encode error: bad payload");
-        assert!(std::error::Error::source(&encode).is_none());
-
         let decode = DecodeError("bad frame".to_string());
-        assert_eq!(decode.to_string(), "decode error: bad frame");
-        assert!(std::error::Error::source(&decode).is_none());
+        let cases: &[(&str, &dyn std::error::Error, &str)] = &[
+            ("encode", &encode, "encode error: bad payload"),
+            ("decode", &decode, "decode error: bad frame"),
+        ];
+
+        for (label, error, expected_display) in cases {
+            assert_eq!(error.to_string(), *expected_display, "{label}");
+            assert!(error.source().is_none(), "{label}");
+        }
     }
 
     #[test]
