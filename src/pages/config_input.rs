@@ -698,6 +698,12 @@ pub fn example_config() -> &'static str {
 mod tests {
     use super::*;
 
+    fn config_with_password() -> PagesConfig {
+        let mut config = PagesConfig::default();
+        config.encryption.password = Some("test123".to_string());
+        config
+    }
+
     #[test]
     fn test_parse_minimal_config() {
         let json = r#"{"encryption": {"password": "test123"}}"#;
@@ -754,8 +760,7 @@ mod tests {
 
     #[test]
     fn test_validate_github_without_repo() {
-        let mut config = PagesConfig::default();
-        config.encryption.password = Some("test123".to_string());
+        let mut config = config_with_password();
         config.deployment.target = "github".to_string();
         let result = config.validate();
         assert!(!result.valid);
@@ -764,8 +769,7 @@ mod tests {
 
     #[test]
     fn test_validate_zero_chunk_size() {
-        let mut config = PagesConfig::default();
-        config.encryption.password = Some("test123".to_string());
+        let mut config = config_with_password();
         config.encryption.chunk_size = Some(0);
 
         let result = config.validate();
@@ -775,8 +779,7 @@ mod tests {
 
     #[test]
     fn test_validate_oversized_chunk_size() {
-        let mut config = PagesConfig::default();
-        config.encryption.password = Some("test123".to_string());
+        let mut config = config_with_password();
         config.encryption.chunk_size = Some(crate::pages::encrypt::MAX_CHUNK_SIZE as u64 + 1);
 
         let result = config.validate();
@@ -829,8 +832,7 @@ mod tests {
 
     #[test]
     fn test_invalid_path_mode() {
-        let mut config = PagesConfig::default();
-        config.encryption.password = Some("test123".to_string());
+        let mut config = config_with_password();
         config.filters.path_mode = Some("invalid".to_string());
         let result = config.validate();
         assert!(!result.valid);
@@ -839,8 +841,7 @@ mod tests {
 
     #[test]
     fn test_invalid_deploy_target() {
-        let mut config = PagesConfig::default();
-        config.encryption.password = Some("test123".to_string());
+        let mut config = config_with_password();
         config.deployment.target = "invalid".to_string();
         let result = config.validate();
         assert!(!result.valid);
@@ -849,8 +850,7 @@ mod tests {
 
     #[test]
     fn test_validate_partial_cloudflare_credentials() {
-        let mut config = PagesConfig::default();
-        config.encryption.password = Some("test123".to_string());
+        let mut config = config_with_password();
         config.deployment.target = "cloudflare".to_string();
         config.deployment.account_id = Some("acc-only".to_string());
 
@@ -893,8 +893,7 @@ mod tests {
 
     #[test]
     fn test_validate_path_mode_trims_whitespace() {
-        let mut config = PagesConfig::default();
-        config.encryption.password = Some("test123".to_string());
+        let mut config = config_with_password();
         config.filters.path_mode = Some(" FULL ".to_string());
 
         let result = config.validate();
@@ -906,8 +905,7 @@ mod tests {
 
     #[test]
     fn test_resolved_config_applies_export_defaults() {
-        let mut config = PagesConfig::default();
-        config.encryption.password = Some("test123".to_string());
+        let config = config_with_password();
 
         let result = config.validate();
         assert!(result.valid, "{:?}", result.errors);
@@ -920,8 +918,7 @@ mod tests {
 
     #[test]
     fn test_validate_target_trims_whitespace() {
-        let mut config = PagesConfig::default();
-        config.encryption.password = Some("test123".to_string());
+        let mut config = config_with_password();
         config.deployment.target = " GitHub ".to_string();
         config.deployment.repo = Some("example-repo".to_string());
 
@@ -934,8 +931,7 @@ mod tests {
 
     #[test]
     fn test_to_wizard_state_target_trims_whitespace() {
-        let mut config = PagesConfig::default();
-        config.encryption.password = Some("test123".to_string());
+        let mut config = config_with_password();
         config.deployment.target = " cloudflare ".to_string();
 
         let state = config
