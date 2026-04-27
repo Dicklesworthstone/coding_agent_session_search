@@ -423,42 +423,43 @@ pub const PLACEHOLDER_CHECKSUM: &str = "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD";
 pub fn normalize_mirror_base_url(base_url: &str) -> Result<String, DownloadError> {
     let trimmed = base_url.trim();
     if trimmed.is_empty() {
-        return Err(DownloadError::InvalidMirrorUrl {
-            url: base_url.to_string(),
-            reason: "mirror URL cannot be empty".into(),
-        });
+        return Err(invalid_mirror_url(base_url, "mirror URL cannot be empty"));
     }
 
-    let parsed = Url::parse(trimmed).map_err(|err| DownloadError::InvalidMirrorUrl {
-        url: trimmed.to_string(),
-        reason: err.to_string(),
-    })?;
+    let parsed = Url::parse(trimmed).map_err(|err| invalid_mirror_url(trimmed, err.to_string()))?;
 
     match parsed.scheme() {
         "http" | "https" => {}
         scheme => {
-            return Err(DownloadError::InvalidMirrorUrl {
-                url: trimmed.to_string(),
-                reason: format!("unsupported URL scheme '{scheme}' (expected http or https)"),
-            });
+            return Err(invalid_mirror_url(
+                trimmed,
+                format!("unsupported URL scheme '{scheme}' (expected http or https)"),
+            ));
         }
     }
 
     if parsed.host_str().is_none() {
-        return Err(DownloadError::InvalidMirrorUrl {
-            url: trimmed.to_string(),
-            reason: "mirror URL must include a host".into(),
-        });
+        return Err(invalid_mirror_url(
+            trimmed,
+            "mirror URL must include a host",
+        ));
     }
 
     if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(DownloadError::InvalidMirrorUrl {
-            url: trimmed.to_string(),
-            reason: "mirror URL must not include query or fragment components".into(),
-        });
+        return Err(invalid_mirror_url(
+            trimmed,
+            "mirror URL must not include query or fragment components",
+        ));
     }
 
     Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+fn invalid_mirror_url(url: impl Into<String>, reason: impl Into<String>) -> DownloadError {
+    DownloadError::InvalidMirrorUrl {
+        url: url.into(),
+        reason: reason.into(),
+    }
 }
 
 impl ModelManifest {
@@ -2342,6 +2343,22 @@ mod tests {
             err.to_string()
                 .contains("must not include query or fragment")
         );
+    }
+
+    #[test]
+    fn test_invalid_mirror_url_helper_shape() {
+        let err = invalid_mirror_url("ftp://mirror.example/model.onnx", "unsupported scheme");
+
+        assert!(matches!(
+            &err,
+            DownloadError::InvalidMirrorUrl { url, reason }
+                if url == "ftp://mirror.example/model.onnx" && reason == "unsupported scheme"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "invalid mirror URL 'ftp://mirror.example/model.onnx': unsupported scheme"
+        );
+        assert!(!err.is_retryable());
     }
 
     #[test]
