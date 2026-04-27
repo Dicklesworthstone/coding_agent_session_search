@@ -768,9 +768,13 @@ mod tests {
         let config = make_basic_config();
         let flow = ConfirmationFlow::new(config);
 
-        assert_eq!(flow.validate_content_review("y"), StepValidation::Passed);
-        assert_eq!(flow.validate_content_review("Y"), StepValidation::Passed);
-        assert_eq!(flow.validate_content_review("yes"), StepValidation::Passed);
+        for input in ["y", "Y", "yes"] {
+            assert_eq!(
+                flow.validate_content_review(input),
+                StepValidation::Passed,
+                "input={input}"
+            );
+        }
         assert!(matches!(
             flow.validate_content_review("n"),
             StepValidation::Failed(_)
