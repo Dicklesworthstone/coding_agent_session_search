@@ -4421,6 +4421,13 @@ struct ConversationMergeEvidence {
     start_distance_ms: i64,
 }
 
+struct ExistingConversationNewMessages<'a> {
+    messages: Vec<&'a Message>,
+    new_chars: i64,
+    idx_collision_count: usize,
+    first_collision_idx: Option<i64>,
+}
+
 fn conversation_effective_started_at(conv: &Conversation) -> Option<i64> {
     conv.started_at
         .or_else(|| conv.messages.iter().filter_map(|msg| msg.created_at).min())
@@ -4489,6 +4496,53 @@ fn replay_fingerprints_from_merge_set(
         .iter()
         .map(replay_fingerprint_from_merge)
         .collect()
+}
+
+fn collect_new_messages_for_existing_conversation<'a>(
+    conversation_id: i64,
+    conv: &'a Conversation,
+    existing_messages: &mut HashMap<i64, MessageMergeFingerprint>,
+    existing_replay_fingerprints: &mut HashSet<MessageReplayFingerprint>,
+    replay_skip_log: &'static str,
+) -> ExistingConversationNewMessages<'a> {
+    let mut idx_collision_count = 0usize;
+    let mut first_collision_idx: Option<i64> = None;
+    let mut new_chars: i64 = 0;
+    let mut messages = Vec::new();
+
+    for msg in &conv.messages {
+        let incoming_fingerprint = message_merge_fingerprint(msg);
+        if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
+            if existing_fingerprint != &incoming_fingerprint {
+                idx_collision_count = idx_collision_count.saturating_add(1);
+                first_collision_idx.get_or_insert(msg.idx);
+            }
+            continue;
+        }
+
+        let incoming_replay = replay_fingerprint_from_merge(&incoming_fingerprint);
+        if existing_replay_fingerprints.contains(&incoming_replay) {
+            tracing::debug!(
+                conversation_id,
+                idx = msg.idx,
+                source_path = %conv.source_path.display(),
+                "{replay_skip_log}"
+            );
+            continue;
+        }
+
+        existing_messages.insert(msg.idx, incoming_fingerprint);
+        existing_replay_fingerprints.insert(incoming_replay);
+        new_chars += msg.content.len() as i64;
+        messages.push(msg);
+    }
+
+    ExistingConversationNewMessages {
+        messages,
+        new_chars,
+        idx_collision_count,
+        first_collision_idx,
+    }
 }
 
 fn start_distance_ms(left: Option<i64>, right: Option<i64>) -> i64 {
@@ -6500,36 +6554,25 @@ impl FrankenStorage {
                     franken_existing_message_fingerprints_by_idx(&tx, existing_id, &conv.messages)?;
                 let mut existing_replay_fingerprints =
                     franken_existing_message_replay_fingerprints(&tx, existing_id, &conv.messages)?;
+                let ExistingConversationNewMessages {
+                    messages: new_messages,
+                    new_chars,
+                    idx_collision_count,
+                    first_collision_idx,
+                } = collect_new_messages_for_existing_conversation(
+                    existing_id,
+                    conv,
+                    &mut existing_messages,
+                    &mut existing_replay_fingerprints,
+                    "skipping replay-equivalent recovered message with shifted idx",
+                );
                 let mut inserted_indices = Vec::new();
                 let mut fts_entries = Vec::new();
                 let mut fts_pending_chars = 0usize;
                 let mut _fts_inserted_total = 0usize;
-                let mut new_chars: i64 = 0;
-                let mut idx_collision_count = 0usize;
-                let mut first_collision_idx: Option<i64> = None;
-
-                for msg in &conv.messages {
-                    if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
-                        let incoming_fingerprint = message_merge_fingerprint(msg);
-                        if existing_fingerprint != &incoming_fingerprint {
-                            idx_collision_count = idx_collision_count.saturating_add(1);
-                            first_collision_idx.get_or_insert(msg.idx);
-                        }
-                        continue;
-                    }
-                    let incoming_replay = message_replay_fingerprint(msg);
-                    if existing_replay_fingerprints.contains(&incoming_replay) {
-                        tracing::debug!(
-                            conversation_id = existing_id,
-                            idx = msg.idx,
-                            source_path = %conv.source_path.display(),
-                            "skipping replay-equivalent recovered message with shifted idx"
-                        );
-                        continue;
-                    }
-                    let Some(msg_id) = franken_insert_message(&tx, existing_id, msg)? else {
-                        continue;
-                    };
+                let inserted_message_ids =
+                    franken_batch_insert_new_messages(&tx, existing_id, &new_messages)?;
+                for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
                     franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                     if !defer_lexical_updates {
                         fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -6546,9 +6589,6 @@ impl FrankenStorage {
                         }
                     }
                     inserted_indices.push(msg.idx);
-                    new_chars += msg.content.len() as i64;
-                    existing_messages.insert(msg.idx, message_merge_fingerprint(msg));
-                    existing_replay_fingerprints.insert(incoming_replay);
                 }
 
                 if idx_collision_count > 0 {
@@ -6879,36 +6919,26 @@ impl FrankenStorage {
             franken_existing_message_fingerprints_by_idx(tx, conversation_id, &conv.messages)?;
         let mut existing_replay_fingerprints =
             franken_existing_message_replay_fingerprints(tx, conversation_id, &conv.messages)?;
+        let ExistingConversationNewMessages {
+            messages: new_messages,
+            new_chars,
+            idx_collision_count,
+            first_collision_idx,
+        } = collect_new_messages_for_existing_conversation(
+            conversation_id,
+            conv,
+            &mut existing_messages,
+            &mut existing_replay_fingerprints,
+            "skipping replay-equivalent recovered message with shifted idx",
+        );
 
         let mut inserted_indices = Vec::new();
         let mut fts_entries = Vec::new();
         let mut fts_pending_chars = 0usize;
         let mut _fts_inserted_total = 0usize;
-        let mut new_chars: i64 = 0;
-        let mut idx_collision_count = 0usize;
-        let mut first_collision_idx: Option<i64> = None;
-        for msg in &conv.messages {
-            if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
-                let incoming_fingerprint = message_merge_fingerprint(msg);
-                if existing_fingerprint != &incoming_fingerprint {
-                    idx_collision_count = idx_collision_count.saturating_add(1);
-                    first_collision_idx.get_or_insert(msg.idx);
-                }
-                continue;
-            }
-            let incoming_replay = message_replay_fingerprint(msg);
-            if existing_replay_fingerprints.contains(&incoming_replay) {
-                tracing::debug!(
-                    conversation_id,
-                    idx = msg.idx,
-                    source_path = %conv.source_path.display(),
-                    "skipping replay-equivalent recovered message with shifted idx"
-                );
-                continue;
-            }
-            let Some(msg_id) = franken_insert_message(tx, conversation_id, msg)? else {
-                continue;
-            };
+        let inserted_message_ids =
+            franken_batch_insert_new_messages(tx, conversation_id, &new_messages)?;
+        for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
             if !defer_lexical_updates {
                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -6925,9 +6955,6 @@ impl FrankenStorage {
                 }
             }
             inserted_indices.push(msg.idx);
-            new_chars += msg.content.len() as i64;
-            existing_messages.insert(msg.idx, message_merge_fingerprint(msg));
-            existing_replay_fingerprints.insert(incoming_replay);
         }
 
         if idx_collision_count > 0 {
@@ -7835,31 +7862,22 @@ impl FrankenStorage {
                     pending_message_replay_fingerprints.insert(existing_id, fingerprints.clone());
                     fingerprints
                 };
-                let mut idx_collision_count = 0usize;
-                let mut first_collision_idx: Option<i64> = None;
-
-                for msg in &conv.messages {
-                    if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
-                        let incoming_fingerprint = message_merge_fingerprint(msg);
-                        if existing_fingerprint != &incoming_fingerprint {
-                            idx_collision_count = idx_collision_count.saturating_add(1);
-                            first_collision_idx.get_or_insert(msg.idx);
-                        }
-                        continue;
-                    }
-                    let incoming_replay = message_replay_fingerprint(msg);
-                    if existing_replay_fingerprints.contains(&incoming_replay) {
-                        tracing::debug!(
-                            conversation_id = existing_id,
-                            idx = msg.idx,
-                            source_path = %conv.source_path.display(),
-                            "skipping replay-equivalent recovered message with shifted idx during batched merge"
-                        );
-                        continue;
-                    }
-                    let Some(msg_id) = franken_insert_message(&tx, existing_id, msg)? else {
-                        continue;
-                    };
+                let ExistingConversationNewMessages {
+                    messages: new_messages,
+                    new_chars,
+                    idx_collision_count,
+                    first_collision_idx,
+                } = collect_new_messages_for_existing_conversation(
+                    existing_id,
+                    conv,
+                    &mut existing_messages,
+                    &mut existing_replay_fingerprints,
+                    "skipping replay-equivalent recovered message with shifted idx during batched merge",
+                );
+                let inserted_message_ids =
+                    franken_batch_insert_new_messages(&tx, existing_id, &new_messages)?;
+                total_chars += new_chars;
+                for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
                     franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                     if !defer_lexical_updates {
                         fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -7876,11 +7894,8 @@ impl FrankenStorage {
                             )?;
                         }
                     }
-                    total_chars += msg.content.len() as i64;
                     inserted_indices.push(msg.idx);
                     inserted_messages.push((msg_id, msg));
-                    existing_messages.insert(msg.idx, message_merge_fingerprint(msg));
-                    existing_replay_fingerprints.insert(incoming_replay);
                 }
 
                 if idx_collision_count > 0 {
@@ -7987,32 +8002,22 @@ impl FrankenStorage {
                                 .insert(existing_id, fingerprints.clone());
                             fingerprints
                         };
-                        let mut idx_collision_count = 0usize;
-                        let mut first_collision_idx: Option<i64> = None;
-
-                        for msg in &conv.messages {
-                            if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
-                                let incoming_fingerprint = message_merge_fingerprint(msg);
-                                if existing_fingerprint != &incoming_fingerprint {
-                                    idx_collision_count = idx_collision_count.saturating_add(1);
-                                    first_collision_idx.get_or_insert(msg.idx);
-                                }
-                                continue;
-                            }
-                            let incoming_replay = message_replay_fingerprint(msg);
-                            if existing_replay_fingerprints.contains(&incoming_replay) {
-                                tracing::debug!(
-                                    conversation_id = existing_id,
-                                    idx = msg.idx,
-                                    source_path = %conv.source_path.display(),
-                                    "skipping replay-equivalent recovered message with shifted idx after duplicate conversation recovery"
-                                );
-                                continue;
-                            }
-                            let Some(msg_id) = franken_insert_message(&tx, existing_id, msg)?
-                            else {
-                                continue;
-                            };
+                        let ExistingConversationNewMessages {
+                            messages: new_messages,
+                            new_chars,
+                            idx_collision_count,
+                            first_collision_idx,
+                        } = collect_new_messages_for_existing_conversation(
+                            existing_id,
+                            conv,
+                            &mut existing_messages,
+                            &mut existing_replay_fingerprints,
+                            "skipping replay-equivalent recovered message with shifted idx after duplicate conversation recovery",
+                        );
+                        let inserted_message_ids =
+                            franken_batch_insert_new_messages(&tx, existing_id, &new_messages)?;
+                        total_chars += new_chars;
+                        for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
                             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                             if !defer_lexical_updates {
                                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -8030,11 +8035,8 @@ impl FrankenStorage {
                                     )?;
                                 }
                             }
-                            total_chars += msg.content.len() as i64;
                             inserted_indices.push(msg.idx);
                             inserted_messages.push((msg_id, msg));
-                            existing_messages.insert(msg.idx, message_merge_fingerprint(msg));
-                            existing_replay_fingerprints.insert(incoming_replay);
                         }
 
                         if idx_collision_count > 0 {
@@ -8855,44 +8857,6 @@ fn franken_insert_conversation(
             source_path = %conv.source_path.display(),
             "conversation INSERT OR IGNORE: duplicate row skipped"
         );
-        Ok(None)
-    } else {
-        Ok(Some(franken_last_rowid(tx)?))
-    }
-}
-
-/// Insert a message within a frankensqlite transaction.
-///
-/// Returns `Ok(Some(msg_id))` when the message was newly inserted, or
-/// `Ok(None)` when a row with the same `(conversation_id, idx)` already
-/// exists (the INSERT is silently ignored).  Callers should skip snippet
-/// and FTS insertion for `None` results to avoid duplicate data.
-fn franken_insert_message(
-    tx: &FrankenTransaction<'_>,
-    conversation_id: i64,
-    msg: &Message,
-) -> Result<Option<i64>> {
-    let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
-    let extra_bin_bytes = extra_bin.as_deref();
-
-    let rows_changed = tx.execute_compat(
-        "INSERT OR IGNORE INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        fparams![
-            conversation_id,
-            msg.idx,
-            role_str(&msg.role),
-            msg.author.as_deref(),
-            msg.created_at,
-            msg.content.as_str(),
-            extra_json_str.as_ref(),
-            extra_bin_bytes
-        ],
-    )?;
-
-    if rows_changed == 0 {
-        // Message already exists (UNIQUE constraint on conversation_id, idx).
-        // The caller should skip snippets/FTS for this message.
         Ok(None)
     } else {
         Ok(Some(franken_last_rowid(tx)?))
@@ -13515,6 +13479,91 @@ mod tests {
 
         assert_eq!(message_count, conv.messages.len() as i64);
         assert_eq!(joined_snippet_count, conv.messages.len() as i64);
+    }
+
+    #[test]
+    fn insert_conversation_tree_batched_appended_message_ids_match_snippet_rows() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("batched-append-message-ids.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_id = storage
+            .ensure_workspace(&PathBuf::from("/ws/profiled-storage-remote"), None)
+            .unwrap();
+
+        let mut initial = make_profiled_storage_remote_conversation(77, 2);
+        for (idx, msg) in initial.messages.iter_mut().enumerate() {
+            msg.snippets.push(Snippet {
+                id: None,
+                file_path: Some(PathBuf::from(format!("src/append_initial_{idx}.rs"))),
+                start_line: Some((idx + 1) as i64),
+                end_line: Some((idx + 2) as i64),
+                language: Some("rust".into()),
+                snippet_text: Some(format!("fn append_initial_{idx}() {{}}")),
+            });
+        }
+        let first = storage
+            .insert_conversation_tree(agent_id, Some(workspace_id), &initial)
+            .unwrap();
+        assert_eq!(first.inserted_indices, vec![0, 1]);
+
+        let mut appended = make_profiled_storage_remote_conversation(77, 5);
+        for (idx, msg) in appended.messages.iter_mut().enumerate() {
+            msg.snippets.push(Snippet {
+                id: None,
+                file_path: Some(PathBuf::from(format!("src/append_full_{idx}.rs"))),
+                start_line: Some((idx + 10) as i64),
+                end_line: Some((idx + 11) as i64),
+                language: Some("rust".into()),
+                snippet_text: Some(format!("fn append_full_{idx}() {{}}")),
+            });
+        }
+        let second = storage
+            .insert_conversation_tree(agent_id, Some(workspace_id), &appended)
+            .unwrap();
+        assert_eq!(second.conversation_id, first.conversation_id);
+        assert_eq!(second.inserted_indices, vec![2, 3, 4]);
+
+        let message_count: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                fparams![first.conversation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let joined_snippets: Vec<(i64, String)> = storage
+            .conn
+            .query_map_collect(
+                "SELECT m.idx, s.file_path
+                 FROM snippets s
+                 JOIN messages m ON s.message_id = m.id
+                 WHERE m.conversation_id = ?1
+                 ORDER BY m.idx, s.id",
+                fparams![first.conversation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(message_count, 5);
+        assert_eq!(
+            joined_snippets,
+            vec![
+                (0, "src/append_initial_0.rs".to_string()),
+                (1, "src/append_initial_1.rs".to_string()),
+                (2, "src/append_full_2.rs".to_string()),
+                (3, "src/append_full_3.rs".to_string()),
+                (4, "src/append_full_4.rs".to_string()),
+            ]
+        );
     }
 
     #[test]
