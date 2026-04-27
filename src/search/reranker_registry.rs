@@ -379,13 +379,18 @@ mod tests {
     fn test_registry_get_by_name() {
         let (_tmp, registry) = registry_fixture();
 
-        let msmarco = registry.get("ms-marco");
-        assert!(msmarco.is_some());
-        assert_eq!(msmarco.unwrap().id, "ms-marco-minilm-l6-v2");
+        let cases = [
+            ("ms-marco", "ms-marco-minilm-l6-v2"),
+            ("bge-reranker-v2", "bge-reranker-v2-m3"),
+        ];
 
-        let bge = registry.get("bge-reranker-v2");
-        assert!(bge.is_some());
-        assert_eq!(bge.unwrap().id, "bge-reranker-v2-m3");
+        for (name, expected_id) in cases {
+            let reranker = registry.get(name);
+            assert!(reranker.is_some(), "{name} should be registered");
+            if let Some(reranker) = reranker {
+                assert_eq!(reranker.id, expected_id, "{name}");
+            }
+        }
 
         let unknown = registry.get("unknown");
         assert!(unknown.is_none());
