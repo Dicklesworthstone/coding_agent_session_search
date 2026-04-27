@@ -311,7 +311,7 @@ pub fn key_rotate(
     rng.fill_bytes(&mut new_export_id);
     rng.fill_bytes(&mut new_base_nonce);
 
-    let staged_site_dir = unique_staged_site_dir(&archive_dir);
+    let staged_site_dir = unique_atomic_sidecar_path(&archive_dir, "rotate", "site");
     copy_site_except_runtime_state(&archive_dir, &staged_site_dir)?;
 
     // 3. Re-encrypt payload with new DEK into the staged site
@@ -978,10 +978,6 @@ fn unique_atomic_temp_path(path: &Path) -> std::path::PathBuf {
 
 fn unique_atomic_backup_path(path: &Path) -> std::path::PathBuf {
     unique_atomic_sidecar_path(path, "bak", "config.json")
-}
-
-fn unique_staged_site_dir(path: &Path) -> std::path::PathBuf {
-    unique_atomic_sidecar_path(path, "rotate", "site")
 }
 
 fn unique_atomic_sidecar_path(
