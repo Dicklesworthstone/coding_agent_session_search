@@ -914,6 +914,16 @@ mod tests {
 
     fn no_artifact_mutation(_: &mut ArtifactRecord) {}
 
+    type TierReadinessCase = (
+        &'static str,
+        TierKind,
+        bool,
+        &'static str,
+        &'static str,
+        fn(&mut ArtifactRecord),
+        ExpectedTierReadiness,
+    );
+
     fn set_schema_version_to_zero(artifact: &mut ArtifactRecord) {
         artifact.schema_version = 0;
     }
@@ -1055,15 +1065,7 @@ mod tests {
         let policy = test_policy();
         let db_fp = "fp-1234";
         let model_rev = "abc123";
-        let cases: &[(
-            &str,
-            TierKind,
-            bool,
-            &str,
-            &str,
-            fn(&mut ArtifactRecord),
-            ExpectedTierReadiness,
-        )] = &[
+        let cases: &[TierReadinessCase] = &[
             (
                 "ready artifact with matching fingerprint",
                 TierKind::Fast,

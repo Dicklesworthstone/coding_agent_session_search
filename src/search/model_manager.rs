@@ -621,6 +621,12 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    type AvailabilityTuiCase = (
+        SemanticAvailability,
+        &'static str,
+        fn(&SemanticAvailability) -> bool,
+    );
+
     #[test]
     fn test_semantic_availability_ready() {
         let ready = SemanticAvailability::Ready {
@@ -685,11 +691,7 @@ mod tests {
 
     #[test]
     fn test_semantic_availability_tui_states() {
-        let cases: &[(
-            SemanticAvailability,
-            &str,
-            fn(&SemanticAvailability) -> bool,
-        )] = &[
+        let cases: &[AvailabilityTuiCase] = &[
             (
                 SemanticAvailability::NotInstalled,
                 "LEX",

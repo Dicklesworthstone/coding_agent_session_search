@@ -1723,19 +1723,29 @@ mod tests {
     }
 
     #[test]
-    fn lexical_storage_fingerprint_matching_tolerates_small_mtime_settle_jitter() {
-        assert!(lexical_storage_fingerprints_match(
-            "323584:1776310228000:329632:1776310227824",
-            "323584:1776310227832:329632:1776310227824",
-        ));
-    }
+    fn lexical_storage_fingerprint_matching_handles_jitter_and_size_drift() {
+        let cases = [
+            (
+                "small mtime settle jitter",
+                "323584:1776310228000:329632:1776310227824",
+                "323584:1776310227832:329632:1776310227824",
+                true,
+            ),
+            (
+                "wal size drift",
+                "323584:1776310228000:329632:1776310227824",
+                "323584:1776310227832:400000:1776310227824",
+                false,
+            ),
+        ];
 
-    #[test]
-    fn lexical_storage_fingerprint_matching_rejects_real_size_drift() {
-        assert!(!lexical_storage_fingerprints_match(
-            "323584:1776310228000:329632:1776310227824",
-            "323584:1776310227832:400000:1776310227824",
-        ));
+        for (label, current, saved, expected) in cases {
+            assert_eq!(
+                lexical_storage_fingerprints_match(current, saved),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     #[test]
