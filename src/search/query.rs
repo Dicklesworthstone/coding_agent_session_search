@@ -8088,6 +8088,7 @@ mod tests {
         let mut refined_events = 0usize;
         let mut total_hits = 0usize;
         for _ in 0..iterations {
+            let mut refinement_error = None;
             runtime.block_on(async {
                 let cx = FsCx::for_request();
                 fixture
@@ -8115,12 +8116,15 @@ mod tests {
                                 }
                             }
                             ProgressiveSearchEvent::RefinementFailed { error, .. } => {
-                                panic!("progressive harness refinement failed: {error}");
+                                refinement_error = Some(error);
                             }
                         },
                     )
                     .await
             })?;
+            if let Some(error) = refinement_error {
+                bail!("progressive harness refinement failed: {error}");
+            }
         }
 
         assert_eq!(initial_events, iterations);
@@ -16412,21 +16416,17 @@ mod tests {
 
     #[test]
     fn query_token_list_parses_small_queries() {
-        // Single term
-        let tokens = parse_boolean_query("hello");
-        assert_eq!(tokens.len(), 1);
+        let cases = [
+            ("hello", 1),
+            ("hello world", 2),
+            ("hello AND world", 3),
+            ("hello world foo bar", 4),
+        ];
 
-        // Two terms
-        let tokens = parse_boolean_query("hello world");
-        assert_eq!(tokens.len(), 2);
-
-        // Three tokens with operator
-        let tokens = parse_boolean_query("hello AND world");
-        assert_eq!(tokens.len(), 3);
-
-        // Four tokens
-        let tokens = parse_boolean_query("hello world foo bar");
-        assert_eq!(tokens.len(), 4);
+        for (query, expected_len) in cases {
+            let tokens = parse_boolean_query(query);
+            assert_eq!(tokens.len(), expected_len, "{query}");
+        }
     }
 
     #[test]
@@ -18059,11 +18059,10 @@ mod tests {
             elapsed
         );
         assert_eq!(tokens.len(), 1);
-        if let QueryToken::Term(t) = &tokens[0] {
-            assert_eq!(t.len(), 10_000);
-        } else {
-            panic!("Expected Term token");
-        }
+        assert!(
+            matches!(tokens.first(), Some(QueryToken::Term(t)) if t.len() == 10_000),
+            "Expected 10K Term token, got {tokens:?}"
+        );
     }
 
     #[test]
