@@ -18,6 +18,9 @@ use std::collections::HashSet;
 /// Minimum password entropy in bits for full strength.
 pub const MIN_STRONG_PASSWORD_BITS: f64 = 60.0;
 
+const SECRET_ACK_PHRASE: &str = "I understand the risks";
+const SECRET_ACK_PHRASE_NORMALIZED: &str = "i understand the risks";
+
 /// Confirmation step identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfirmationStep {
@@ -204,10 +207,10 @@ impl ConfirmationFlow {
     /// Validate input for the secret scan acknowledgment step.
     pub fn validate_secret_ack(&self, input: &str) -> StepValidation {
         let normalized = input.trim().to_lowercase();
-        if normalized == "i understand the risks" {
+        if normalized == SECRET_ACK_PHRASE_NORMALIZED {
             StepValidation::Passed
         } else {
-            StepValidation::Failed("Please type exactly: \"I understand the risks\"".to_string())
+            StepValidation::Failed(format!("Please type exactly: \"{SECRET_ACK_PHRASE}\""))
         }
     }
 
@@ -615,10 +618,10 @@ mod tests {
         });
 
         // Wrong phrase
-        assert!(matches!(
+        assert_eq!(
             flow.validate_secret_ack("i understand"),
-            StepValidation::Failed(_)
-        ));
+            StepValidation::Failed("Please type exactly: \"I understand the risks\"".to_string())
+        );
 
         // Correct phrase (case insensitive)
         assert_eq!(
