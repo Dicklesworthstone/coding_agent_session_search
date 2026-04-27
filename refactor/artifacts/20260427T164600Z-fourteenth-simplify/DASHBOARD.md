@@ -20,7 +20,7 @@
 | 7 | Vector Role Matrix | `cfa28cc1` | `src/search/vector_index.rs` | focused role-code test, rustfmt, diff check, UBS |
 | 8 | Hash Embedder Matrix | `1e23df8b` | `src/search/hash_embedder.rs` | focused tokenizer test, rustfmt, diff check, UBS |
 | 9 | Asset Projection Helper | `8549ba08` | `src/search/asset_state.rs` | full asset-state test slice, rustfmt, diff check, UBS |
-| 10 | Final Rescan and Dashboard | pending | `src/search/asset_state.rs`, `src/search/model_manager.rs`, `src/search/semantic_manifest.rs` | full asset-state test slice, focused clippy-fix tests, rustfmt, diff check, UBS |
+| 10 | Final Rescan and Dashboard | `dc6c4177` | `src/search/asset_state.rs`, `src/search/model_manager.rs`, `src/search/semantic_manifest.rs` | full asset-state test slice, focused clippy-fix tests, rustfmt, diff check, UBS |
 
 ## Fresh-Eyes Fixes
 
