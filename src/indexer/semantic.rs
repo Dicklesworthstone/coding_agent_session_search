@@ -1658,18 +1658,9 @@ mod tests {
     }
 
     fn test_conversation(external_id: &str, body: &str) -> Conversation {
-        Conversation {
-            id: None,
-            agent_slug: "codex".to_string(),
-            workspace: None,
-            external_id: Some(external_id.to_string()),
-            title: Some(format!("semantic {external_id}")),
-            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_001_000),
-            approx_tokens: None,
-            metadata_json: json!({}),
-            messages: vec![Message {
+        test_conversation_fixture(
+            external_id,
+            vec![Message {
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -1679,12 +1670,21 @@ mod tests {
                 extra_json: json!({}),
                 snippets: Vec::new(),
             }],
-            source_id: "local".to_string(),
-            origin_host: None,
-        }
+            "local",
+            None,
+        )
     }
 
     fn test_conversation_with_messages(external_id: &str, messages: Vec<Message>) -> Conversation {
+        test_conversation_fixture(external_id, messages, "remote-laptop", Some("builder-host"))
+    }
+
+    fn test_conversation_fixture(
+        external_id: &str,
+        messages: Vec<Message>,
+        source_id: &str,
+        origin_host: Option<&str>,
+    ) -> Conversation {
         Conversation {
             id: None,
             agent_slug: "codex".to_string(),
@@ -1697,8 +1697,8 @@ mod tests {
             approx_tokens: None,
             metadata_json: json!({}),
             messages,
-            source_id: "remote-laptop".to_string(),
-            origin_host: Some("builder-host".to_string()),
+            source_id: source_id.to_string(),
+            origin_host: origin_host.map(str::to_string),
         }
     }
 
