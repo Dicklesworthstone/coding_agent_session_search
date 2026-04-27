@@ -782,18 +782,13 @@ mod tests {
         let config = make_basic_config();
         let flow = ConfirmationFlow::new(config);
 
-        assert_eq!(
-            flow.parse_password_action("s"),
-            Some(PasswordStrengthAction::SetStronger)
-        );
-        assert_eq!(
-            flow.parse_password_action("P"),
-            Some(PasswordStrengthAction::ProceedAnyway)
-        );
-        assert_eq!(
-            flow.parse_password_action("a"),
-            Some(PasswordStrengthAction::Abort)
-        );
+        for (input, expected) in [
+            ("s", Some(PasswordStrengthAction::SetStronger)),
+            ("P", Some(PasswordStrengthAction::ProceedAnyway)),
+            ("a", Some(PasswordStrengthAction::Abort)),
+        ] {
+            assert_eq!(flow.parse_password_action(input), expected, "input={input}");
+        }
         assert_eq!(flow.parse_password_action("x"), None);
     }
 
