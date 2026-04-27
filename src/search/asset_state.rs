@@ -321,6 +321,11 @@ struct SemanticRuntimeInputs<'a> {
     base_hnsw_path: Option<PathBuf>,
 }
 
+struct SemanticPreferenceSurface {
+    preferred_backend: &'static str,
+    model_dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SemanticTierAssetState {
     pub present: bool,
@@ -461,14 +466,7 @@ fn semantic_state_not_inspected(
 ) -> SemanticAssetState {
     let (fast_tier, quality_tier, backlog, checkpoint) =
         semantic_manifest_progress(data_dir, current_db_fingerprint);
-    let preferred_backend = match preference {
-        SemanticPreference::DefaultModel => "fastembed",
-        SemanticPreference::HashFallback => "hash",
-    };
-    let model_dir = match preference {
-        SemanticPreference::DefaultModel => Some(FastEmbedder::default_model_dir(data_dir)),
-        SemanticPreference::HashFallback => None,
-    };
+    let preference_surface = semantic_preference_surface(data_dir, preference);
 
     SemanticAssetState {
         status: "not_inspected",
@@ -477,10 +475,10 @@ fn semantic_state_not_inspected(
         available: false,
         can_search: false,
         fallback_mode: Some("lexical"),
-        preferred_backend,
+        preferred_backend: preference_surface.preferred_backend,
         embedder_id: None,
         vector_index_path: None,
-        model_dir,
+        model_dir: preference_surface.model_dir,
         hnsw_path: None,
         hnsw_ready: false,
         progressive_ready: semantic_progressive_assets_ready(data_dir),
@@ -521,16 +519,10 @@ pub(crate) fn semantic_state_from_availability(
 ) -> SemanticAssetState {
     let (fast_tier, quality_tier, backlog, checkpoint) =
         semantic_manifest_progress(data_dir, current_db_fingerprint);
-    let preferred_backend = match preference {
-        SemanticPreference::DefaultModel => "fastembed",
-        SemanticPreference::HashFallback => "hash",
-    };
+    let preference_surface = semantic_preference_surface(data_dir, preference);
     let base_embedder_id = semantic_embedder_id(availability, preference);
     let base_vector_index_path = semantic_vector_index_path(data_dir, availability, preference);
-    let base_model_dir = match preference {
-        SemanticPreference::DefaultModel => Some(FastEmbedder::default_model_dir(data_dir)),
-        SemanticPreference::HashFallback => None,
-    };
+    let base_model_dir = preference_surface.model_dir;
     let base_hnsw_path = base_embedder_id
         .as_deref()
         .map(|embedder_id| hnsw_index_path(data_dir, embedder_id));
@@ -574,7 +566,7 @@ pub(crate) fn semantic_state_from_availability(
         available: runtime.can_search,
         can_search: runtime.can_search,
         fallback_mode: runtime.fallback_mode,
-        preferred_backend,
+        preferred_backend: preference_surface.preferred_backend,
         embedder_id,
         vector_index_path,
         model_dir,
@@ -586,6 +578,22 @@ pub(crate) fn semantic_state_from_availability(
         quality_tier,
         backlog,
         checkpoint,
+    }
+}
+
+fn semantic_preference_surface(
+    data_dir: &Path,
+    preference: SemanticPreference,
+) -> SemanticPreferenceSurface {
+    match preference {
+        SemanticPreference::DefaultModel => SemanticPreferenceSurface {
+            preferred_backend: "fastembed",
+            model_dir: Some(FastEmbedder::default_model_dir(data_dir)),
+        },
+        SemanticPreference::HashFallback => SemanticPreferenceSurface {
+            preferred_backend: "hash",
+            model_dir: None,
+        },
     }
 }
 
@@ -2165,6 +2173,26 @@ mod tests {
     }
 
     #[test]
+    fn semantic_preference_surface_preserves_backend_and_model_dir_projection() {
+        let data_dir = Path::new("/tmp/cass");
+        let cases = [
+            (
+                SemanticPreference::DefaultModel,
+                "fastembed",
+                Some(FastEmbedder::default_model_dir(data_dir)),
+            ),
+            (SemanticPreference::HashFallback, "hash", None),
+        ];
+
+        for (preference, expected_backend, expected_model_dir) in cases {
+            let surface = semantic_preference_surface(data_dir, preference);
+
+            assert_eq!(surface.preferred_backend, expected_backend);
+            assert_eq!(surface.model_dir, expected_model_dir);
+        }
+    }
+
+    #[test]
     fn semantic_state_detects_progressive_and_hnsw_assets() {
         let temp = tempfile::tempdir().expect("tempdir");
         let vector_dir = temp.path().join(VECTOR_INDEX_DIR);
@@ -2350,14 +2378,19 @@ mod tests {
         let now_ms = 1_733_000_000_000i64;
         let snapshot = make_active_snapshot(now_ms);
         let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms);
-        match outcome {
-            MaintenanceCoordinationOutcome::Active {
-                ref job_id, phase, ..
-            } => {
-                assert_eq!(job_id, "lexical_refresh-1000-12345");
-                assert_eq!(phase.as_deref(), Some("scanning"));
-            }
-            other => panic!("expected ActiveJob, got {other:?}"),
+        if let MaintenanceCoordinationOutcome::Active {
+            ref job_id,
+            ref phase,
+            ..
+        } = outcome
+        {
+            assert_eq!(job_id, "lexical_refresh-1000-12345");
+            assert_eq!(phase.as_deref(), Some("scanning"));
+        } else {
+            assert!(
+                matches!(outcome, MaintenanceCoordinationOutcome::Active { .. }),
+                "expected ActiveJob, got {outcome:?}"
+            );
         }
     }
 
@@ -2369,15 +2402,18 @@ mod tests {
             ..make_active_snapshot(now_ms)
         };
         let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms);
-        match outcome {
-            MaintenanceCoordinationOutcome::Stale {
-                ref job_id,
-                ref reason,
-            } => {
-                assert_eq!(job_id, "lexical_refresh-1000-12345");
-                assert!(reason.contains("60000ms"), "reason={reason}");
-            }
-            other => panic!("expected StaleJob, got {other:?}"),
+        if let MaintenanceCoordinationOutcome::Stale {
+            ref job_id,
+            ref reason,
+        } = outcome
+        {
+            assert_eq!(job_id, "lexical_refresh-1000-12345");
+            assert!(reason.contains("60000ms"), "reason={reason}");
+        } else {
+            assert!(
+                matches!(outcome, MaintenanceCoordinationOutcome::Stale { .. }),
+                "expected StaleJob, got {outcome:?}"
+            );
         }
     }
 
@@ -2425,16 +2461,19 @@ mod tests {
         let now_ms = 1_733_000_000_000i64;
         let snapshot = make_active_snapshot(now_ms);
         let decision = decide_maintenance_action_from_snapshot(&snapshot, now_ms);
-        match decision {
-            MaintenanceDecision::AttachOrWait {
-                ref job_id,
-                elapsed_ms,
-                ..
-            } => {
-                assert_eq!(job_id, "lexical_refresh-1000-12345");
-                assert_eq!(elapsed_ms, 5_000);
-            }
-            other => panic!("expected AttachOrWait, got {other:?}"),
+        if let MaintenanceDecision::AttachOrWait {
+            ref job_id,
+            elapsed_ms,
+            ..
+        } = decision
+        {
+            assert_eq!(job_id, "lexical_refresh-1000-12345");
+            assert_eq!(elapsed_ms, 5_000);
+        } else {
+            assert!(
+                matches!(decision, MaintenanceDecision::AttachOrWait { .. }),
+                "expected AttachOrWait, got {decision:?}"
+            );
         }
     }
 
@@ -2568,12 +2607,14 @@ mod tests {
         .expect("write lock metadata");
 
         let decision = decide_search_failopen(temp.path(), now_ms, true);
-        match decision {
-            MaintenanceDecision::FailOpen { ref reason } => {
-                assert!(reason.contains("fo-job-1"), "reason={reason}");
-                assert!(reason.contains("failing open"), "reason={reason}");
-            }
-            other => panic!("expected FailOpen, got {other:?}"),
+        if let MaintenanceDecision::FailOpen { ref reason } = decision {
+            assert!(reason.contains("fo-job-1"), "reason={reason}");
+            assert!(reason.contains("failing open"), "reason={reason}");
+        } else {
+            assert!(
+                matches!(decision, MaintenanceDecision::FailOpen { .. }),
+                "expected FailOpen, got {decision:?}"
+            );
         }
 
         let decision_no_lexical = decide_search_failopen(temp.path(), now_ms, false);
