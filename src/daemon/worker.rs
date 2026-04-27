@@ -34,6 +34,27 @@ pub struct EmbeddingJobConfig {
     pub quality_model: Option<String>,
 }
 
+impl EmbeddingJobConfig {
+    fn fast_pass_model(&self) -> String {
+        self.fast_model
+            .clone()
+            .unwrap_or_else(|| HASH_EMBEDDER_MODEL.to_string())
+    }
+
+    fn quality_pass_model(&self) -> String {
+        self.quality_model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SEMANTIC_MODEL.to_string())
+    }
+
+    fn single_pass_model(&self) -> String {
+        self.quality_model
+            .clone()
+            .or_else(|| self.fast_model.clone())
+            .unwrap_or_else(|| HASH_EMBEDDER_MODEL.to_string())
+    }
+}
+
 /// Messages sent to the background worker.
 #[derive(Debug)]
 pub enum WorkerMessage {
@@ -248,25 +269,15 @@ impl EmbeddingWorker {
 
         if config.two_tier {
             // Fast hash pass
-            let fast = config
-                .fast_model
-                .clone()
-                .unwrap_or_else(|| HASH_EMBEDDER_MODEL.to_string());
+            let fast = config.fast_pass_model();
             passes.push((fast, false));
 
             // Quality semantic pass
-            let quality = config
-                .quality_model
-                .clone()
-                .unwrap_or_else(|| DEFAULT_SEMANTIC_MODEL.to_string());
+            let quality = config.quality_pass_model();
             passes.push((quality, true));
         } else {
             // Single pass with best available
-            let model = config
-                .quality_model
-                .clone()
-                .or_else(|| config.fast_model.clone())
-                .unwrap_or_else(|| HASH_EMBEDDER_MODEL.to_string());
+            let model = config.single_pass_model();
             let is_semantic = model != HASH_EMBEDDER_MODEL;
             passes.push((model, is_semantic));
         }
