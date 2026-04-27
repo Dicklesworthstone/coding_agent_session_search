@@ -2823,6 +2823,7 @@ pub struct FrankenStorage {
     index_writer_checkpoint_pages: AtomicI64,
     cached_ephemeral_writer: parking_lot::Mutex<CachedEphemeralWriter>,
     ensured_conversation_sources: Arc<parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>>,
+    ensured_daily_stats_keys: Arc<parking_lot::Mutex<HashSet<EnsuredDailyStatsKey>>>,
 }
 
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1000;
@@ -2847,6 +2848,23 @@ impl EnsuredConversationSourceKey {
             id: source.id.clone(),
             kind: source.kind,
             host_label: source.host_label.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EnsuredDailyStatsKey {
+    day_id: i64,
+    agent_slug: String,
+    source_id: String,
+}
+
+impl EnsuredDailyStatsKey {
+    fn new(day_id: i64, agent_slug: &str, source_id: &str) -> Self {
+        Self {
+            day_id,
+            agent_slug: agent_slug.to_owned(),
+            source_id: source_id.to_owned(),
         }
     }
 }
@@ -2890,19 +2908,21 @@ where
 
 impl FrankenStorage {
     fn new(conn: FrankenConnection, db_path: PathBuf) -> Self {
-        Self::new_with_shared_sources(
+        Self::new_with_shared_caches(
             conn,
             db_path,
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
             Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
     }
 
-    fn new_with_shared_sources(
+    fn new_with_shared_caches(
         conn: FrankenConnection,
         db_path: PathBuf,
         ensured_conversation_sources: Arc<
             parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>,
         >,
+        ensured_daily_stats_keys: Arc<parking_lot::Mutex<HashSet<EnsuredDailyStatsKey>>>,
     ) -> Self {
         Self {
             conn,
@@ -2911,6 +2931,7 @@ impl FrankenStorage {
             index_writer_checkpoint_pages: AtomicI64::new(UNSET_INDEX_WRITER_CHECKPOINT_PAGES),
             cached_ephemeral_writer: parking_lot::Mutex::new(CachedEphemeralWriter::Uninitialized),
             ensured_conversation_sources,
+            ensured_daily_stats_keys,
         }
     }
 
@@ -2951,23 +2972,29 @@ impl FrankenStorage {
     /// own connection with config applied, but migrations have already been run
     /// by the primary connection.
     pub fn open_writer(path: &Path) -> Result<Self> {
-        Self::open_writer_with_shared_sources(
+        Self::open_writer_with_shared_caches(
             path,
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
             Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
     }
 
-    fn open_writer_with_shared_sources(
+    fn open_writer_with_shared_caches(
         path: &Path,
         ensured_conversation_sources: Arc<
             parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>,
         >,
+        ensured_daily_stats_keys: Arc<parking_lot::Mutex<HashSet<EnsuredDailyStatsKey>>>,
     ) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
         let conn = FrankenConnection::open(&path_str)
             .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
-        let storage =
-            Self::new_with_shared_sources(conn, path.to_path_buf(), ensured_conversation_sources);
+        let storage = Self::new_with_shared_caches(
+            conn,
+            path.to_path_buf(),
+            ensured_conversation_sources,
+            ensured_daily_stats_keys,
+        );
         storage.apply_config()?;
         Ok(storage)
     }
@@ -2976,18 +3003,20 @@ impl FrankenStorage {
         let mut cached = self.cached_ephemeral_writer.lock();
         match std::mem::replace(&mut *cached, CachedEphemeralWriter::InUse) {
             CachedEphemeralWriter::Cached(conn) => Ok((
-                Self::new_with_shared_sources(
+                Self::new_with_shared_caches(
                     (*conn).into_inner(),
                     self.db_path.clone(),
                     Arc::clone(&self.ensured_conversation_sources),
+                    Arc::clone(&self.ensured_daily_stats_keys),
                 ),
                 true,
             )),
             CachedEphemeralWriter::Uninitialized => {
                 drop(cached);
-                match Self::open_writer_with_shared_sources(
+                match Self::open_writer_with_shared_caches(
                     &self.db_path,
                     Arc::clone(&self.ensured_conversation_sources),
+                    Arc::clone(&self.ensured_daily_stats_keys),
                 ) {
                     Ok(writer) => Ok((writer, true)),
                     Err(err) => {
@@ -3003,9 +3032,10 @@ impl FrankenStorage {
                 *cached = CachedEphemeralWriter::InUse;
                 drop(cached);
                 Ok((
-                    Self::open_writer_with_shared_sources(
+                    Self::open_writer_with_shared_caches(
                         &self.db_path,
                         Arc::clone(&self.ensured_conversation_sources),
+                        Arc::clone(&self.ensured_daily_stats_keys),
                     )?,
                     false,
                 ))
@@ -3037,6 +3067,14 @@ impl FrankenStorage {
 
     fn mark_conversation_source_ensured(&self, key: EnsuredConversationSourceKey) {
         self.ensured_conversation_sources.lock().insert(key);
+    }
+
+    fn daily_stats_key_already_ensured(&self, key: &EnsuredDailyStatsKey) -> bool {
+        self.ensured_daily_stats_keys.lock().contains(key)
+    }
+
+    fn mark_daily_stats_key_ensured(&self, key: EnsuredDailyStatsKey) {
+        self.ensured_daily_stats_keys.lock().insert(key);
     }
 
     fn invalidate_conversation_source_cache(&self, source_id: &str) {
@@ -6541,13 +6579,16 @@ impl FrankenStorage {
 
                 if !defer_analytics_updates && !inserted_indices.is_empty() {
                     franken_update_daily_stats_in_tx(
+                        self,
                         &tx,
                         &conv.agent_slug,
                         &conv.source_id,
                         conversation_effective_started_at(conv),
-                        0,
-                        inserted_indices.len() as i64,
-                        new_chars,
+                        StatsDelta {
+                            session_count_delta: 0,
+                            message_count_delta: inserted_indices.len() as i64,
+                            total_chars_delta: new_chars,
+                        },
                     )?;
                 }
 
@@ -6568,6 +6609,7 @@ impl FrankenStorage {
         let mut pending_replay_fingerprints = HashSet::new();
         let mut idx_collision_count = 0usize;
         let mut first_collision_idx: Option<i64> = None;
+        let mut new_messages = Vec::new();
         for msg in &conv.messages {
             let incoming_fingerprint = message_merge_fingerprint(msg);
             if let Some(existing_fingerprint) = pending_messages.get(&msg.idx) {
@@ -6587,9 +6629,12 @@ impl FrankenStorage {
                 );
                 continue;
             }
-            let Some(msg_id) = franken_insert_message(&tx, conv_id, msg)? else {
-                continue;
-            };
+            pending_messages.insert(msg.idx, incoming_fingerprint);
+            pending_replay_fingerprints.insert(incoming_replay);
+            new_messages.push(msg);
+        }
+        let inserted_message_ids = franken_batch_insert_new_messages(&tx, conv_id, &new_messages)?;
+        for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
             if !defer_lexical_updates {
                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -6607,8 +6652,6 @@ impl FrankenStorage {
             }
             total_chars += msg.content.len() as i64;
             inserted_indices.push(msg.idx);
-            pending_messages.insert(msg.idx, incoming_fingerprint);
-            pending_replay_fingerprints.insert(incoming_replay);
         }
         if idx_collision_count > 0 {
             tracing::warn!(
@@ -6630,13 +6673,16 @@ impl FrankenStorage {
 
         if !defer_analytics_updates {
             franken_update_daily_stats_in_tx(
+                self,
                 &tx,
                 &conv.agent_slug,
                 &conv.source_id,
                 conversation_effective_started_at(conv),
-                1,
-                inserted_indices.len() as i64,
-                total_chars,
+                StatsDelta {
+                    session_count_delta: 1,
+                    message_count_delta: inserted_indices.len() as i64,
+                    total_chars_delta: total_chars,
+                },
             )?;
         }
 
@@ -6707,6 +6753,7 @@ impl FrankenStorage {
         let mut pending_replay_fingerprints = HashSet::new();
         let mut idx_collision_count = 0usize;
         let mut first_collision_idx: Option<i64> = None;
+        let mut new_messages = Vec::new();
 
         for msg in &conv.messages {
             let incoming_fingerprint = message_merge_fingerprint(msg);
@@ -6729,12 +6776,16 @@ impl FrankenStorage {
                 continue;
             }
 
-            let message_insert_start = Instant::now();
-            let Some(msg_id) = franken_insert_message(&tx, conv_id, msg)? else {
-                continue;
-            };
-            profile.message_insert_duration += message_insert_start.elapsed();
+            pending_messages.insert(msg.idx, incoming_fingerprint);
+            pending_replay_fingerprints.insert(incoming_replay);
+            new_messages.push(msg);
+        }
 
+        let message_insert_start = Instant::now();
+        let inserted_message_ids = franken_batch_insert_new_messages(&tx, conv_id, &new_messages)?;
+        profile.message_insert_duration += message_insert_start.elapsed();
+
+        for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
             let snippet_insert_start = Instant::now();
             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
             profile.snippet_insert_duration += snippet_insert_start.elapsed();
@@ -6760,8 +6811,6 @@ impl FrankenStorage {
 
             total_chars += msg.content.len() as i64;
             inserted_indices.push(msg.idx);
-            pending_messages.insert(msg.idx, incoming_fingerprint);
-            pending_replay_fingerprints.insert(incoming_replay);
         }
 
         if idx_collision_count > 0 {
@@ -6788,13 +6837,16 @@ impl FrankenStorage {
         if !defer_analytics_updates {
             let analytics_start = Instant::now();
             franken_update_daily_stats_in_tx(
+                self,
                 &tx,
                 &conv.agent_slug,
                 &conv.source_id,
                 conversation_effective_started_at(conv),
-                1,
-                inserted_indices.len() as i64,
-                total_chars,
+                StatsDelta {
+                    session_count_delta: 1,
+                    message_count_delta: inserted_indices.len() as i64,
+                    total_chars_delta: total_chars,
+                },
             )?;
             profile.analytics_duration += analytics_start.elapsed();
         }
@@ -6907,13 +6959,16 @@ impl FrankenStorage {
         if !defer_analytics_updates && !inserted_indices.is_empty() {
             let message_count = inserted_indices.len() as i64;
             franken_update_daily_stats_in_tx(
+                self,
                 tx,
                 &conv.agent_slug,
                 &conv.source_id,
                 conversation_effective_started_at(conv),
-                0,
-                message_count,
-                new_chars,
+                StatsDelta {
+                    session_count_delta: 0,
+                    message_count_delta: message_count,
+                    total_chars_delta: new_chars,
+                },
             )?;
         }
 
@@ -7864,6 +7919,7 @@ impl FrankenStorage {
                         let pending_replay_fingerprints = pending_message_replay_fingerprints
                             .entry(new_conv_id)
                             .or_default();
+                        let mut new_messages = Vec::new();
                         for msg in &conv.messages {
                             let incoming_replay = message_replay_fingerprint(msg);
                             if pending_messages.contains_key(&msg.idx)
@@ -7871,10 +7927,13 @@ impl FrankenStorage {
                             {
                                 continue;
                             }
-                            let Some(msg_id) = franken_insert_message(&tx, new_conv_id, msg)?
-                            else {
-                                continue;
-                            };
+                            pending_messages.insert(msg.idx, message_merge_fingerprint(msg));
+                            pending_replay_fingerprints.insert(incoming_replay);
+                            new_messages.push(msg);
+                        }
+                        let inserted_message_ids =
+                            franken_batch_insert_new_messages(&tx, new_conv_id, &new_messages)?;
+                        for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
                             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                             if !defer_lexical_updates {
                                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -7895,8 +7954,6 @@ impl FrankenStorage {
                             total_chars += msg.content.len() as i64;
                             inserted_indices.push(msg.idx);
                             inserted_messages.push((msg_id, msg));
-                            pending_messages.insert(msg.idx, message_merge_fingerprint(msg));
-                            pending_replay_fingerprints.insert(incoming_replay);
                         }
                         new_conv_id
                     }
@@ -8815,15 +8872,7 @@ fn franken_insert_message(
     conversation_id: i64,
     msg: &Message,
 ) -> Result<Option<i64>> {
-    let (extra_json_str, extra_bin): (Cow<'_, str>, Option<Vec<u8>>) =
-        if let Some(raw) = historical_raw_json(&msg.extra_json) {
-            (Cow::Borrowed(raw), None)
-        } else {
-            (
-                Cow::Owned(serde_json::to_string(&msg.extra_json)?),
-                serialize_json_to_msgpack(&msg.extra_json),
-            )
-        };
+    let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
     let extra_bin_bytes = extra_bin.as_deref();
 
     let rows_changed = tx.execute_compat(
@@ -8848,6 +8897,114 @@ fn franken_insert_message(
     } else {
         Ok(Some(franken_last_rowid(tx)?))
     }
+}
+
+fn franken_insert_new_message(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    msg: &Message,
+) -> Result<i64> {
+    let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
+    let extra_bin_bytes = extra_bin.as_deref();
+
+    tx.execute_compat(
+        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        fparams![
+            conversation_id,
+            msg.idx,
+            role_str(&msg.role),
+            msg.author.as_deref(),
+            msg.created_at,
+            msg.content.as_str(),
+            extra_json_str.as_ref(),
+            extra_bin_bytes
+        ],
+    )?;
+    franken_last_rowid(tx)
+}
+
+fn franken_message_insert_payload(msg: &Message) -> Result<(Cow<'_, str>, Option<Vec<u8>>)> {
+    if let Some(raw) = historical_raw_json(&msg.extra_json) {
+        Ok((Cow::Borrowed(raw), None))
+    } else {
+        Ok((
+            Cow::Owned(serde_json::to_string(&msg.extra_json)?),
+            serialize_json_to_msgpack(&msg.extra_json),
+        ))
+    }
+}
+
+/// Batch size for proven-new message inserts.
+///
+/// Each row binds 8 values, so 100 rows stays well under SQLite's default
+/// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while still amortizing parse cost.
+const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
+
+fn franken_batch_insert_new_messages(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    messages: &[&Message],
+) -> Result<Vec<i64>> {
+    let mut inserted_ids = Vec::with_capacity(messages.len());
+    for chunk in messages.chunks(MESSAGE_INSERT_BATCH_SIZE) {
+        if chunk.len() == 1 {
+            inserted_ids.push(franken_insert_new_message(tx, conversation_id, chunk[0])?);
+            continue;
+        }
+
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                let base = idx * 8;
+                format!(
+                    "(?{},?{},?{},?{},?{},?{},?{},?{})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7,
+                    base + 8
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let sql = format!(
+            "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
+        );
+
+        let mut param_values: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 8);
+        for msg in chunk {
+            let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
+            param_values.push(ParamValue::from(conversation_id));
+            param_values.push(ParamValue::from(msg.idx));
+            param_values.push(ParamValue::from(role_str(&msg.role)));
+            param_values.push(ParamValue::from(msg.author.as_deref()));
+            param_values.push(ParamValue::from(msg.created_at));
+            param_values.push(ParamValue::from(msg.content.as_str()));
+            param_values.push(ParamValue::from(extra_json_str.as_ref()));
+            param_values.push(ParamValue::from(extra_bin.as_deref()));
+        }
+
+        tx.execute_compat(&sql, &param_values)?;
+
+        let last_id = franken_last_rowid(tx)?;
+        let first_id = last_id
+            .checked_sub((chunk.len() - 1) as i64)
+            .with_context(|| {
+                format!(
+                    "inferring rowid range for {}-row message batch ending at {last_id}",
+                    chunk.len()
+                )
+            })?;
+        inserted_ids.extend((0..chunk.len()).map(|offset| first_id + offset as i64));
+    }
+
+    Ok(inserted_ids)
 }
 
 /// Insert snippets within a frankensqlite transaction.
@@ -9089,20 +9246,104 @@ fn franken_batch_insert_fts(tx: &FrankenTransaction<'_>, entries: &[FtsEntry]) -
 
 /// Update daily stats within a frankensqlite transaction.
 fn franken_update_daily_stats_in_tx(
+    storage: &FrankenStorage,
     tx: &FrankenTransaction<'_>,
     agent_slug: &str,
     source_id: &str,
     started_at: Option<i64>,
-    session_delta: i64,
-    message_delta: i64,
-    chars_delta: i64,
+    delta: StatsDelta,
 ) -> Result<()> {
     let day_id = started_at
         .map(FrankenStorage::day_id_from_millis)
         .unwrap_or(0);
     let now = FrankenStorage::now_millis();
 
-    // Update agent-specific entry
+    franken_apply_daily_stats_delta_in_tx(
+        storage,
+        tx,
+        DailyStatsTarget {
+            day_id,
+            agent_slug,
+            source_id,
+        },
+        now,
+        delta,
+    )?;
+    franken_apply_daily_stats_delta_in_tx(
+        storage,
+        tx,
+        DailyStatsTarget {
+            day_id,
+            agent_slug: "all",
+            source_id,
+        },
+        now,
+        delta,
+    )?;
+    franken_apply_daily_stats_delta_in_tx(
+        storage,
+        tx,
+        DailyStatsTarget {
+            day_id,
+            agent_slug,
+            source_id: "all",
+        },
+        now,
+        delta,
+    )?;
+    franken_apply_daily_stats_delta_in_tx(
+        storage,
+        tx,
+        DailyStatsTarget {
+            day_id,
+            agent_slug: "all",
+            source_id: "all",
+        },
+        now,
+        delta,
+    )?;
+
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct DailyStatsTarget<'a> {
+    day_id: i64,
+    agent_slug: &'a str,
+    source_id: &'a str,
+}
+
+fn franken_apply_daily_stats_delta_in_tx(
+    storage: &FrankenStorage,
+    tx: &FrankenTransaction<'_>,
+    target: DailyStatsTarget<'_>,
+    now: i64,
+    delta: StatsDelta,
+) -> Result<()> {
+    let cache_key = EnsuredDailyStatsKey::new(target.day_id, target.agent_slug, target.source_id);
+    if storage.daily_stats_key_already_ensured(&cache_key) {
+        let rows_changed = tx.execute_compat(
+            "UPDATE daily_stats
+             SET session_count = session_count + ?4,
+                 message_count = message_count + ?5,
+                 total_chars = total_chars + ?6,
+                 last_updated = ?7
+             WHERE day_id = ?1 AND agent_slug = ?2 AND source_id = ?3",
+            fparams![
+                target.day_id,
+                target.agent_slug,
+                target.source_id,
+                delta.session_count_delta,
+                delta.message_count_delta,
+                delta.total_chars_delta,
+                now
+            ],
+        )?;
+        if rows_changed > 0 {
+            return Ok(());
+        }
+    }
+
     tx.execute_compat(
         "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
          VALUES(?1,?2,?3,?4,?5,?6,?7)
@@ -9111,45 +9352,17 @@ fn franken_update_daily_stats_in_tx(
             message_count = message_count + excluded.message_count,
             total_chars = total_chars + excluded.total_chars,
             last_updated = excluded.last_updated",
-        fparams![day_id, agent_slug, source_id, session_delta, message_delta, chars_delta, now],
+        fparams![
+            target.day_id,
+            target.agent_slug,
+            target.source_id,
+            delta.session_count_delta,
+            delta.message_count_delta,
+            delta.total_chars_delta,
+            now
+        ],
     )?;
-
-    // Update 'all' agent entry
-    tx.execute_compat(
-        "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-         VALUES(?1,'all',?2,?3,?4,?5,?6)
-         ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
-            session_count = session_count + excluded.session_count,
-            message_count = message_count + excluded.message_count,
-            total_chars = total_chars + excluded.total_chars,
-            last_updated = excluded.last_updated",
-        fparams![day_id, source_id, session_delta, message_delta, chars_delta, now],
-    )?;
-
-    // Update 'all' source entry
-    tx.execute_compat(
-        "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-         VALUES(?1,?2,'all',?3,?4,?5,?6)
-         ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
-            session_count = session_count + excluded.session_count,
-            message_count = message_count + excluded.message_count,
-            total_chars = total_chars + excluded.total_chars,
-            last_updated = excluded.last_updated",
-        fparams![day_id, agent_slug, session_delta, message_delta, chars_delta, now],
-    )?;
-
-    // Update global 'all'/'all' entry
-    tx.execute_compat(
-        "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-         VALUES(?1,'all','all',?2,?3,?4,?5)
-         ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
-            session_count = session_count + excluded.session_count,
-            message_count = message_count + excluded.message_count,
-            total_chars = total_chars + excluded.total_chars,
-            last_updated = excluded.last_updated",
-        fparams![day_id, session_delta, message_delta, chars_delta, now],
-    )?;
-
+    storage.mark_daily_stats_key_ensured(cache_key);
     Ok(())
 }
 
@@ -10352,7 +10565,7 @@ impl IndexingCache {
 // This prevents N×4 database writes (4 permutations per conversation).
 
 /// Accumulated statistics delta for a single (day_id, agent, source) combination.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct StatsDelta {
     pub session_count_delta: i64,
     pub message_count_delta: i64,
@@ -13249,6 +13462,118 @@ mod tests {
     }
 
     #[test]
+    fn insert_conversation_tree_batched_new_message_ids_match_snippet_rows() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("batched-message-ids.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_id = storage
+            .ensure_workspace(&PathBuf::from("/ws/profiled-storage-remote"), None)
+            .unwrap();
+        let mut conv = make_profiled_storage_remote_conversation(42, 5);
+        for (idx, msg) in conv.messages.iter_mut().enumerate() {
+            msg.snippets.push(Snippet {
+                id: None,
+                file_path: Some(PathBuf::from(format!("src/file_{idx}.rs"))),
+                start_line: Some((idx + 1) as i64),
+                end_line: Some((idx + 2) as i64),
+                language: Some("rust".into()),
+                snippet_text: Some(format!("fn snippet_{idx}() {{}}")),
+            });
+        }
+        let outcome = storage
+            .insert_conversation_tree(agent_id, Some(workspace_id), &conv)
+            .unwrap();
+
+        let message_count: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                fparams![outcome.conversation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let joined_snippet_count: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*)
+                 FROM snippets s
+                 JOIN messages m ON s.message_id = m.id
+                 WHERE m.conversation_id = ?1",
+                fparams![outcome.conversation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        assert_eq!(message_count, conv.messages.len() as i64);
+        assert_eq!(joined_snippet_count, conv.messages.len() as i64);
+    }
+
+    #[test]
+    fn insert_conversation_tree_recreates_daily_stats_after_manual_clear() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace = PathBuf::from("/ws/profiled-storage-remote");
+        let workspace_id = storage.ensure_workspace(&workspace, None).unwrap();
+
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                Some(workspace_id),
+                &make_profiled_storage_remote_conversation(0, 3),
+            )
+            .unwrap();
+        storage.conn.execute("DELETE FROM daily_stats").unwrap();
+
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                Some(workspace_id),
+                &make_profiled_storage_remote_conversation(1, 2),
+            )
+            .unwrap();
+
+        let row_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let (session_count, message_count): (i64, i64) = storage
+            .conn
+            .query_row_map(
+                "SELECT session_count, message_count
+                 FROM daily_stats
+                 WHERE agent_slug = 'all' AND source_id = 'all'",
+                fparams![],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(row_count, 4);
+        assert_eq!(session_count, 1);
+        assert_eq!(message_count, 2);
+    }
+
+    #[test]
     #[serial]
     fn insert_conversation_tree_stage_profile_tracks_steady_state_remote_reuse() {
         let _defer_guard = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
@@ -13576,13 +13901,16 @@ mod tests {
 
         let mut tx = storage.conn.transaction().unwrap();
         franken_update_daily_stats_in_tx(
+            &storage,
             &tx,
             "tester",
             LOCAL_SOURCE_ID,
             Some(started_at),
-            1,
-            1,
-            expected_bytes,
+            StatsDelta {
+                session_count_delta: 1,
+                message_count_delta: 1,
+                total_chars_delta: expected_bytes,
+            },
         )
         .unwrap();
         tx.commit().unwrap();
@@ -13661,13 +13989,16 @@ mod tests {
 
         let mut tx = storage.conn.transaction().unwrap();
         franken_update_daily_stats_in_tx(
+            &storage,
             &tx,
             "tester",
             LOCAL_SOURCE_ID,
             Some(started_at),
-            1,
-            1,
-            expected_bytes,
+            StatsDelta {
+                session_count_delta: 1,
+                message_count_delta: 1,
+                total_chars_delta: expected_bytes,
+            },
         )
         .unwrap();
         tx.commit().unwrap();

@@ -382,6 +382,90 @@ fn bench_insert_remote_source_reuse(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_append_remote_source_merge(c: &mut Criterion) {
+    let mut group = c.benchmark_group("append_remote_source_merge");
+    group.sample_size(20);
+
+    const WORKLOAD_CONVERSATIONS: i64 = 600;
+
+    for &msg_count in &[5i64, 20, 50] {
+        group.throughput(Throughput::Elements(msg_count as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("persist", format!("{msg_count}_msgs")),
+            &msg_count,
+            |b, &msg_count| {
+                let temp = TempDir::new().unwrap();
+                let db_path = temp.path().join("bench.db");
+                let index_path = index_dir(temp.path()).expect("index path");
+                let storage = FrankenStorage::open(&db_path).unwrap();
+                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+                for conv_id in 0..WORKLOAD_CONVERSATIONS {
+                    persist_conversation(
+                        &storage,
+                        &mut t_index,
+                        &generate_remote_conversation(conv_id, msg_count),
+                    )
+                    .unwrap();
+                }
+                t_index.commit().unwrap();
+
+                let mut conv_id = 0i64;
+                b.iter(|| {
+                    let scenario_id = conv_id % WORKLOAD_CONVERSATIONS;
+                    let conv = generate_remote_conversation(scenario_id, msg_count * 2);
+                    persist_conversation(&storage, &mut t_index, &conv).unwrap();
+                    conv_id += 1;
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("direct", format!("{msg_count}_msgs")),
+            &msg_count,
+            |b, &msg_count| {
+                let temp = TempDir::new().unwrap();
+                let db_path = temp.path().join("bench.db");
+                let fs = FrankenStorage::open(&db_path).unwrap();
+
+                let mut agent_ids = Vec::new();
+                let mut ws_ids = Vec::new();
+                for i in 0..10i64 {
+                    agent_ids.push(fs.ensure_agent(&make_agent(i)).unwrap());
+                }
+                for i in 0..20i64 {
+                    let ws_path = PathBuf::from(format!("/workspace/project-{}", i));
+                    ws_ids.push(fs.ensure_workspace(&ws_path, None).unwrap());
+                }
+
+                for conv_id in 0..WORKLOAD_CONVERSATIONS {
+                    let agent_id = agent_ids[(conv_id % 10) as usize];
+                    let ws_id = ws_ids[(conv_id % 20) as usize];
+                    let base = make_remote_conversation(conv_id, msg_count);
+                    fs.insert_conversation_tree(agent_id, Some(ws_id), &base)
+                        .unwrap();
+                }
+
+                let mut conv_id = 0i64;
+                b.iter(|| {
+                    let scenario_id = conv_id % WORKLOAD_CONVERSATIONS;
+                    let agent_id = agent_ids[(scenario_id % 10) as usize];
+                    let ws_id = ws_ids[(scenario_id % 20) as usize];
+                    let conv = make_remote_conversation(scenario_id, msg_count * 2);
+                    black_box(
+                        fs.insert_conversation_tree(agent_id, Some(ws_id), &conv)
+                            .unwrap(),
+                    );
+                    conv_id += 1;
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 // =============================================================================
 // 3. QUERY BENCHMARKS
 // =============================================================================
@@ -677,6 +761,7 @@ criterion_group! {
         bench_db_open_comparison,
         bench_insert_comparison,
         bench_insert_remote_source_reuse,
+        bench_append_remote_source_merge,
         bench_query_comparison,
         bench_concurrent_writes,
         bench_insert_scaling,
