@@ -2803,7 +2803,7 @@ BLESS=1 cargo test snapshot_baseline_ -- --nocapture
 ```
 
 The full regeneration/review protocol (required reviewer checklist, behavioral guard tests,
-and quality gates) lives in `TESTING.md` under
+and quality gates) lives in `docs/planning/TESTING.md` under
 `Snapshot Baseline Regeneration & Review (FrankenTUI)`.
 
 ### HTML Export E2E Logging
