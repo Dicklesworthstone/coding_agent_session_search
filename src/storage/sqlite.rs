@@ -21,7 +21,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
 };
 
@@ -8092,7 +8092,7 @@ impl FrankenStorage {
                 let mut has_any_tokens = false;
 
                 for &(message_id, msg) in &inserted_messages {
-                    let role_s = role_str(&msg.role);
+                    let role_s = role_str_ref(&msg.role);
                     let usage = if historical_raw_json(&msg.extra_json).is_some() {
                         crate::connectors::extract_tokens_for_agent(
                             &conv.agent_slug,
@@ -8196,7 +8196,7 @@ impl FrankenStorage {
                         thinking_tokens: usage.thinking_tokens,
                         total_tokens: usage.total_tokens(),
                         estimated_cost_usd: estimated_cost,
-                        role: role_s.clone(),
+                        role: role_s.to_string(),
                         content_chars,
                         has_tool_calls: usage.has_tool_calls,
                         tool_call_count: usage.tool_call_count,
@@ -8211,7 +8211,7 @@ impl FrankenStorage {
                         agent_slug: conv.agent_slug.clone(),
                         workspace_id: workspace_id.unwrap_or(0),
                         source_id: conv.source_id.clone(),
-                        role: role_s,
+                        role: role_s.to_string(),
                         content_chars,
                         content_tokens_est,
                         model_name: usage.model_name.clone(),
@@ -8877,7 +8877,7 @@ fn franken_insert_new_message(
         fparams![
             conversation_id,
             msg.idx,
-            role_str(&msg.role),
+            role_str_ref(&msg.role),
             msg.author.as_deref(),
             msg.created_at,
             msg.content.as_str(),
@@ -8905,6 +8905,42 @@ fn franken_message_insert_payload(msg: &Message) -> Result<(Cow<'_, str>, Option
 /// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while still amortizing parse cost.
 const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
 
+static MESSAGE_BATCH_INSERT_SQL: OnceLock<Vec<String>> = OnceLock::new();
+
+fn cached_message_batch_insert_sql(rows: usize) -> &'static str {
+    debug_assert!((2..=MESSAGE_INSERT_BATCH_SIZE).contains(&rows));
+    MESSAGE_BATCH_INSERT_SQL
+        .get_or_init(|| {
+            let mut sqls = vec![String::new(); MESSAGE_INSERT_BATCH_SIZE + 1];
+            for row_count in 2..=MESSAGE_INSERT_BATCH_SIZE {
+                let placeholders = (0..row_count)
+                    .map(|idx| {
+                        let base = idx * 8;
+                        format!(
+                            "(?{},?{},?{},?{},?{},?{},?{},?{})",
+                            base + 1,
+                            base + 2,
+                            base + 3,
+                            base + 4,
+                            base + 5,
+                            base + 6,
+                            base + 7,
+                            base + 8
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                sqls[row_count] = format!(
+                    "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
+                );
+            }
+            sqls
+        })
+        .get(rows)
+        .map(String::as_str)
+        .expect("message batch insert SQL must exist for cached row count")
+}
+
 fn franken_batch_insert_new_messages(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
@@ -8916,37 +8952,14 @@ fn franken_batch_insert_new_messages(
             inserted_ids.push(franken_insert_new_message(tx, conversation_id, chunk[0])?);
             continue;
         }
-
-        let placeholders = chunk
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                let base = idx * 8;
-                format!(
-                    "(?{},?{},?{},?{},?{},?{},?{},?{})",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6,
-                    base + 7,
-                    base + 8
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let sql = format!(
-            "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
-        );
+        let sql = cached_message_batch_insert_sql(chunk.len());
 
         let mut param_values: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 8);
         for msg in chunk {
             let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
             param_values.push(ParamValue::from(conversation_id));
             param_values.push(ParamValue::from(msg.idx));
-            param_values.push(ParamValue::from(role_str(&msg.role)));
+            param_values.push(ParamValue::from(role_str_ref(&msg.role)));
             param_values.push(ParamValue::from(msg.author.as_deref()));
             param_values.push(ParamValue::from(msg.created_at));
             param_values.push(ParamValue::from(msg.content.as_str()));
@@ -11529,12 +11542,16 @@ fn path_to_string<P: AsRef<Path>>(p: P) -> String {
 }
 
 fn role_str(role: &MessageRole) -> String {
+    role_str_ref(role).to_owned()
+}
+
+fn role_str_ref(role: &MessageRole) -> &str {
     match role {
-        MessageRole::User => "user".to_owned(),
-        MessageRole::Agent => "agent".to_owned(),
-        MessageRole::Tool => "tool".to_owned(),
-        MessageRole::System => "system".to_owned(),
-        MessageRole::Other(v) => v.clone(),
+        MessageRole::User => "user",
+        MessageRole::Agent => "agent",
+        MessageRole::Tool => "tool",
+        MessageRole::System => "system",
+        MessageRole::Other(v) => v.as_str(),
     }
 }
 
@@ -11698,7 +11715,6 @@ mod tests {
             .unwrap();
 
             for msg in &conv.messages {
-                let role = role_str(&msg.role);
                 let extra_json = msg.extra_json.to_string();
                 conn.execute_compat(
                     "INSERT INTO messages(
@@ -11708,7 +11724,7 @@ mod tests {
                         next_message_id,
                         conversation_id,
                         msg.idx,
-                        role.as_str(),
+                        role_str_ref(&msg.role),
                         msg.author.as_deref(),
                         msg.created_at,
                         msg.content.as_str(),
