@@ -239,12 +239,7 @@ fn export_json_value(
 }
 
 fn export_hit_json(hit: &SearchHit, options: &ExportOptions) -> serde_json::Value {
-    let mut obj = serde_json::json!({
-        "title": hit.title,
-        "agent": hit.agent,
-        "workspace": hit.workspace,
-        "snippet": truncate_text(&hit.snippet, options.max_snippet_len),
-    });
+    let mut obj = export_hit_base_json(hit, options);
 
     if options.include_score {
         let score = if hit.score.is_finite() {
@@ -274,6 +269,15 @@ fn export_hit_json(hit: &SearchHit, options: &ExportOptions) -> serde_json::Valu
     }
 
     obj
+}
+
+fn export_hit_base_json(hit: &SearchHit, options: &ExportOptions) -> serde_json::Value {
+    serde_json::json!({
+        "title": hit.title,
+        "agent": hit.agent,
+        "workspace": hit.workspace,
+        "snippet": truncate_text(&hit.snippet, options.max_snippet_len),
+    })
 }
 
 /// Export to plain text format
