@@ -685,29 +685,40 @@ mod tests {
 
     #[test]
     fn test_semantic_availability_tui_states() {
-        let not_installed = SemanticAvailability::NotInstalled;
-        assert!(not_installed.is_not_installed());
-        assert_eq!(not_installed.status_label(), "LEX");
+        let cases: &[(
+            SemanticAvailability,
+            &str,
+            fn(&SemanticAvailability) -> bool,
+        )] = &[
+            (
+                SemanticAvailability::NotInstalled,
+                "LEX",
+                SemanticAvailability::is_not_installed,
+            ),
+            (
+                SemanticAvailability::NeedsConsent,
+                "LEX",
+                SemanticAvailability::needs_consent,
+            ),
+            (SemanticAvailability::Verifying, "VFY...", |state| {
+                state.summary().contains("verifying")
+            }),
+            (SemanticAvailability::HashFallback, "SEM*", |state| {
+                state.is_hash_fallback() && state.can_search()
+            }),
+            (
+                SemanticAvailability::Disabled {
+                    reason: "offline mode".into(),
+                },
+                "OFF",
+                |state| state.is_disabled() && state.summary().contains("offline"),
+            ),
+        ];
 
-        let needs_consent = SemanticAvailability::NeedsConsent;
-        assert!(needs_consent.needs_consent());
-        assert_eq!(needs_consent.status_label(), "LEX");
-
-        let verifying = SemanticAvailability::Verifying;
-        assert!(verifying.summary().contains("verifying"));
-        assert_eq!(verifying.status_label(), "VFY...");
-
-        let hash_fallback = SemanticAvailability::HashFallback;
-        assert!(hash_fallback.is_hash_fallback());
-        assert!(hash_fallback.can_search());
-        assert_eq!(hash_fallback.status_label(), "SEM*");
-
-        let disabled = SemanticAvailability::Disabled {
-            reason: "offline mode".into(),
-        };
-        assert!(disabled.is_disabled());
-        assert!(disabled.summary().contains("offline"));
-        assert_eq!(disabled.status_label(), "OFF");
+        for (state, expected_label, predicate) in cases {
+            assert_eq!(state.status_label(), *expected_label, "{state:?}");
+            assert!(predicate(state), "{state:?}");
+        }
     }
 
     #[test]
