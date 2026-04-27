@@ -24,6 +24,10 @@ use super::protocol::{
 use super::worker::EmbeddingJobConfig;
 use crate::search::daemon_client::{DaemonClient, DaemonError};
 
+fn connection_not_established() -> DaemonError {
+    DaemonError::Unavailable("connection not established".to_string())
+}
+
 /// Configuration for the daemon client.
 #[derive(Debug, Clone)]
 pub struct DaemonClientConfig {
@@ -282,9 +286,7 @@ impl UdsDaemonClient {
         if conn.is_some() {
             Ok(conn)
         } else {
-            Err(DaemonError::Unavailable(
-                "connection not established".to_string(),
-            ))
+            Err(connection_not_established())
         }
     }
 
@@ -302,7 +304,7 @@ impl UdsDaemonClient {
         let mut stream_guard = self.get_connection_locked()?;
         let stream = stream_guard
             .as_mut()
-            .ok_or_else(|| DaemonError::Unavailable("connection not established".to_string()))?;
+            .ok_or_else(connection_not_established)?;
 
         // Send request
         if let Err(e) = stream.write_all(&encoded) {
@@ -704,6 +706,14 @@ mod tests {
         let first = client.request_counter.fetch_add(1, Ordering::Relaxed);
         let second = client.request_counter.fetch_add(1, Ordering::Relaxed);
         assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    fn connection_not_established_error_text_is_stable() {
+        assert_eq!(
+            connection_not_established().to_string(),
+            "daemon unavailable: connection not established"
+        );
     }
 
     #[test]
