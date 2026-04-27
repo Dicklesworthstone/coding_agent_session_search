@@ -2854,31 +2854,41 @@ mod tests {
 
     #[test]
     fn test_retryable_error_classification() {
-        assert!(DownloadError::NetworkError("boom".into()).is_retryable());
-        assert!(DownloadError::Timeout.is_retryable());
-        assert!(
-            DownloadError::HttpError {
-                status: 503,
-                message: "unavailable".into()
-            }
-            .is_retryable()
-        );
-        assert!(
-            !DownloadError::HttpError {
-                status: 404,
-                message: "missing".into()
-            }
-            .is_retryable()
-        );
-        assert!(!DownloadError::Cancelled.is_retryable());
-        assert!(
-            !DownloadError::VerificationFailed {
-                file: "model.onnx".into(),
-                expected: "a".into(),
-                actual: "b".into(),
-            }
-            .is_retryable()
-        );
+        let cases = [
+            (DownloadError::NetworkError("boom".into()), true),
+            (DownloadError::Timeout, true),
+            (
+                DownloadError::HttpError {
+                    status: 503,
+                    message: "unavailable".into(),
+                },
+                true,
+            ),
+            (
+                DownloadError::HttpError {
+                    status: 404,
+                    message: "missing".into(),
+                },
+                false,
+            ),
+            (DownloadError::Cancelled, false),
+            (
+                DownloadError::VerificationFailed {
+                    file: "model.onnx".into(),
+                    expected: "a".into(),
+                    actual: "b".into(),
+                },
+                false,
+            ),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(
+                err.is_retryable(),
+                expected,
+                "retryability mismatch for {err}"
+            );
+        }
     }
 
     #[test]
