@@ -29,6 +29,6 @@ I re-read `parallel_prep_enabled()` against `env_truthy(...)`. Both implementati
 
 ## Verification
 
-- Pending: `rustfmt --edition 2024 --check src/indexer/semantic.rs`
-- Pending: `git diff --check -- src/indexer/semantic.rs refactor/artifacts/20260427T160551Z-thirteenth-simplify/pass1_semantic_truthy_env.md`
-- Pending: `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_cass_thirteenth_simplify cargo test --lib indexer::semantic::tests::parallel_prep_enabled_reuses_truthy_env_parser -- --exact`
+- Passed: `rustfmt --edition 2024 --check src/indexer/semantic.rs`
+- Passed: `git diff --check -- src/indexer/semantic.rs refactor/artifacts/20260427T160551Z-thirteenth-simplify/pass1_semantic_truthy_env.md`
+- Passed: `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_cass_thirteenth_simplify cargo test --lib indexer::semantic::tests::parallel_prep_enabled_reuses_truthy_env_parser -- --exact`
