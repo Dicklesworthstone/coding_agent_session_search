@@ -472,6 +472,13 @@ mod tests {
         }
     }
 
+    fn fast_embed_kind(model_name: &str, embedder_id: &str) -> WorkerEmbedderKind {
+        WorkerEmbedderKind::FastEmbed {
+            model_name: model_name.to_string(),
+            embedder_id: embedder_id.to_string(),
+        }
+    }
+
     #[test]
     fn test_worker_handle_clone() {
         let (_worker, handle) = EmbeddingWorker::new();
@@ -594,24 +601,15 @@ mod tests {
     fn test_resolve_embedder_kind_semantic_aliases() {
         assert_eq!(
             resolve_embedder_kind("minilm", true).unwrap(),
-            WorkerEmbedderKind::FastEmbed {
-                model_name: "minilm".to_string(),
-                embedder_id: "minilm-384".to_string()
-            }
+            fast_embed_kind("minilm", "minilm-384")
         );
         assert_eq!(
             resolve_embedder_kind("MINILM-384", true).unwrap(),
-            WorkerEmbedderKind::FastEmbed {
-                model_name: "minilm".to_string(),
-                embedder_id: "minilm-384".to_string()
-            }
+            fast_embed_kind("minilm", "minilm-384")
         );
         assert_eq!(
             resolve_embedder_kind("fastembed", true).unwrap(),
-            WorkerEmbedderKind::FastEmbed {
-                model_name: "minilm".to_string(),
-                embedder_id: "minilm-384".to_string()
-            }
+            fast_embed_kind("minilm", "minilm-384")
         );
     }
 
@@ -619,17 +617,11 @@ mod tests {
     fn test_resolve_embedder_kind_registered_fastembed_models() {
         assert_eq!(
             resolve_embedder_kind("snowflake-arctic-s", true).unwrap(),
-            WorkerEmbedderKind::FastEmbed {
-                model_name: "snowflake-arctic-s".to_string(),
-                embedder_id: "snowflake-arctic-s-384".to_string()
-            }
+            fast_embed_kind("snowflake-arctic-s", "snowflake-arctic-s-384")
         );
         assert_eq!(
             resolve_embedder_kind("nomic-embed-text-v1.5", true).unwrap(),
-            WorkerEmbedderKind::FastEmbed {
-                model_name: "nomic-embed".to_string(),
-                embedder_id: "nomic-embed-768".to_string()
-            }
+            fast_embed_kind("nomic-embed", "nomic-embed-768")
         );
     }
 
