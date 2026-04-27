@@ -328,27 +328,25 @@ pub fn get_reranker(data_dir: &Path, name: Option<&str>) -> RerankerResult<Arc<d
             .ok_or_else(|| rerank_failed("reranker", "no rerankers available"))?,
     };
 
-    load_reranker_by_name(data_dir, reranker_info.name)
-}
-
-/// Load a reranker by registered name.
-fn load_reranker_by_name(data_dir: &Path, name: &str) -> RerankerResult<Arc<dyn Reranker>> {
-    match name {
+    match reranker_info.name {
         // All ONNX-based rerankers (baseline and bake-off candidates)
         "ms-marco" | "bge-reranker-v2" | "jina-reranker-turbo" | "jina-reranker-v2" => {
             let model_dir = RERANKERS
                 .iter()
-                .find(|r| r.name == name)
+                .find(|r| r.name == reranker_info.name)
                 .and_then(|r| r.model_dir(data_dir))
                 .ok_or_else(|| {
-                    rerank_failed(name, format!("no model dir for reranker: {}", name))
+                    rerank_failed(
+                        reranker_info.name,
+                        format!("no model dir for reranker: {}", reranker_info.name),
+                    )
                 })?;
             let reranker = FastEmbedReranker::load_from_dir(&model_dir)?;
             Ok(Arc::new(reranker))
         }
         _ => Err(rerank_failed(
-            name,
-            format!("reranker '{}' not implemented", name),
+            reranker_info.name,
+            format!("reranker '{}' not implemented", reranker_info.name),
         )),
     }
 }
