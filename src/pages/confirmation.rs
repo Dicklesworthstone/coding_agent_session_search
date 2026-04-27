@@ -490,6 +490,11 @@ pub const UNENCRYPTED_ACK_PHRASE: &str = "I UNDERSTAND AND ACCEPT THE RISKS";
 /// Exit code for unconfirmed unencrypted export.
 pub const EXIT_CODE_UNENCRYPTED_NOT_CONFIRMED: i32 = 3;
 
+const UNENCRYPTED_BLOCKED_ERROR_KIND: &str = "unencrypted_blocked";
+const UNENCRYPTED_BLOCKED_MESSAGE: &str = "Unencrypted exports are not allowed in robot mode";
+const UNENCRYPTED_BLOCKED_SUGGESTION: &str =
+    "Use --i-understand-unencrypted-risks flag if you really need this";
+
 /// Result of unencrypted export confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnencryptedConfirmResult {
@@ -534,9 +539,9 @@ pub fn check_robot_mode_unencrypted(
 /// Generate the error JSON for blocked robot mode unencrypted export.
 pub fn robot_mode_blocked_error() -> serde_json::Value {
     serde_json::json!({
-        "error": "unencrypted_blocked",
-        "message": "Unencrypted exports are not allowed in robot mode",
-        "suggestion": "Use --i-understand-unencrypted-risks flag if you really need this",
+        "error": UNENCRYPTED_BLOCKED_ERROR_KIND,
+        "message": UNENCRYPTED_BLOCKED_MESSAGE,
+        "suggestion": UNENCRYPTED_BLOCKED_SUGGESTION,
         "exit_code": EXIT_CODE_UNENCRYPTED_NOT_CONFIRMED
     })
 }
@@ -858,8 +863,15 @@ mod tests {
     #[test]
     fn test_robot_mode_blocked_error() {
         let error = robot_mode_blocked_error();
-        assert_eq!(error["error"], "unencrypted_blocked");
-        assert_eq!(error["exit_code"], EXIT_CODE_UNENCRYPTED_NOT_CONFIRMED);
+        assert_eq!(
+            error,
+            serde_json::json!({
+                "error": "unencrypted_blocked",
+                "message": "Unencrypted exports are not allowed in robot mode",
+                "suggestion": "Use --i-understand-unencrypted-risks flag if you really need this",
+                "exit_code": EXIT_CODE_UNENCRYPTED_NOT_CONFIRMED
+            })
+        );
     }
 
     #[test]
