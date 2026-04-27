@@ -464,12 +464,18 @@ mod tests {
 
     #[test]
     fn role_code_from_str_accepts_known_roles() {
-        assert_eq!(role_code_from_str("user"), Some(ROLE_USER));
-        assert_eq!(role_code_from_str("assistant"), Some(ROLE_ASSISTANT));
-        assert_eq!(role_code_from_str("agent"), Some(ROLE_ASSISTANT));
-        assert_eq!(role_code_from_str("system"), Some(ROLE_SYSTEM));
-        assert_eq!(role_code_from_str("tool"), Some(ROLE_TOOL));
-        assert_eq!(role_code_from_str("unknown"), None);
+        let cases = [
+            ("user", Some(ROLE_USER)),
+            ("assistant", Some(ROLE_ASSISTANT)),
+            ("agent", Some(ROLE_ASSISTANT)),
+            ("system", Some(ROLE_SYSTEM)),
+            ("tool", Some(ROLE_TOOL)),
+            ("unknown", None),
+        ];
+
+        for (role, expected_code) in cases {
+            assert_eq!(role_code_from_str(role), expected_code, "{role}");
+        }
     }
 
     #[test]
