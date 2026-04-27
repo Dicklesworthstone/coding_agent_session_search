@@ -4,7 +4,7 @@ use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, 
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow};
 use frankensqlite::{
-    Connection as FrankenConnection, Row as FrankenRow, SqliteValue,
+    Connection as FrankenConnection, Row as FrankenRow,
     compat::{
         ConnectionExt as FrankenConnectionExt, OpenFlags as FrankenOpenFlags,
         OptionalExtension as FrankenOptionalExtension, ParamValue, RowExt as FrankenRowExt,
@@ -3344,11 +3344,10 @@ impl FrankenStorage {
     pub(crate) fn cleanup_orphan_fk_rows(&self) -> Result<OrphanFkCleanupReport> {
         let mut report = OrphanFkCleanupReport::default();
         for entry in ORPHAN_FK_TABLES {
-            let count: i64 = match self.conn.query_row_map(
-                entry.count_sql,
-                fparams![],
-                |row| row.get_typed::<i64>(0),
-            ) {
+            let count: i64 = match self
+                .conn
+                .query_row_map(entry.count_sql, fparams![], |row| row.get_typed::<i64>(0))
+            {
                 Ok(c) => c,
                 Err(err) => {
                     // Tolerant probe: a missing child or parent table (older
@@ -3383,7 +3382,11 @@ impl FrankenStorage {
 
         let mut tx = self.conn.transaction()?;
         for entry in ORPHAN_FK_TABLES {
-            if !report.per_table.iter().any(|(t, _)| *t == entry.child_table) {
+            if !report
+                .per_table
+                .iter()
+                .any(|(t, _)| *t == entry.child_table)
+            {
                 continue;
             }
             tx.execute_compat(entry.delete_sql, fparams![])?;
@@ -9004,21 +9007,21 @@ fn franken_insert_new_message(
     msg: &Message,
 ) -> Result<i64> {
     let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
-    let params = [
-        SqliteValue::Integer(conversation_id),
-        SqliteValue::Integer(msg.idx),
-        sqlite_role_value(&msg.role),
-        sqlite_optional_text_value(msg.author.as_deref()),
-        sqlite_optional_i64_value(msg.created_at),
-        sqlite_text_value(msg.content.as_str()),
-        sqlite_cow_text_value(extra_json_str),
-        sqlite_optional_blob_value(extra_bin),
-    ];
+    let extra_bin_bytes = extra_bin.as_deref();
 
-    tx.execute_with_params(
+    tx.execute_compat(
         "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        &params,
+        fparams![
+            conversation_id,
+            msg.idx,
+            role_str(&msg.role),
+            msg.author.as_deref(),
+            msg.created_at,
+            msg.content.as_str(),
+            extra_json_str.as_ref(),
+            extra_bin_bytes
+        ],
     )?;
     franken_last_rowid(tx)
 }
@@ -9072,20 +9075,20 @@ fn franken_batch_insert_new_messages(
             "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
         );
 
-        let mut sql_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 8);
+        let mut param_values: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 8);
         for msg in chunk {
             let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
-            sql_values.push(SqliteValue::Integer(conversation_id));
-            sql_values.push(SqliteValue::Integer(msg.idx));
-            sql_values.push(sqlite_role_value(&msg.role));
-            sql_values.push(sqlite_optional_text_value(msg.author.as_deref()));
-            sql_values.push(sqlite_optional_i64_value(msg.created_at));
-            sql_values.push(sqlite_text_value(msg.content.as_str()));
-            sql_values.push(sqlite_cow_text_value(extra_json_str));
-            sql_values.push(sqlite_optional_blob_value(extra_bin));
+            param_values.push(ParamValue::from(conversation_id));
+            param_values.push(ParamValue::from(msg.idx));
+            param_values.push(ParamValue::from(role_str(&msg.role)));
+            param_values.push(ParamValue::from(msg.author.as_deref()));
+            param_values.push(ParamValue::from(msg.created_at));
+            param_values.push(ParamValue::from(msg.content.as_str()));
+            param_values.push(ParamValue::from(extra_json_str.as_ref()));
+            param_values.push(ParamValue::from(extra_bin.as_deref()));
         }
 
-        tx.execute_with_params(&sql, &sql_values)?;
+        tx.execute_compat(&sql, &param_values)?;
 
         let last_id = franken_last_rowid(tx)?;
         let first_id = last_id
@@ -11657,39 +11660,6 @@ fn flush_pending_fts_entries(
 
 fn path_to_string<P: AsRef<Path>>(p: P) -> String {
     p.as_ref().to_string_lossy().into_owned()
-}
-
-fn sqlite_text_value(value: &str) -> SqliteValue {
-    SqliteValue::Text(value.into())
-}
-
-fn sqlite_cow_text_value(value: Cow<'_, str>) -> SqliteValue {
-    match value {
-        Cow::Borrowed(text) => SqliteValue::Text(text.into()),
-        Cow::Owned(text) => SqliteValue::Text(text.into()),
-    }
-}
-
-fn sqlite_optional_text_value(value: Option<&str>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, sqlite_text_value)
-}
-
-fn sqlite_optional_i64_value(value: Option<i64>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, SqliteValue::Integer)
-}
-
-fn sqlite_optional_blob_value(value: Option<Vec<u8>>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, |bytes| SqliteValue::Blob(bytes.into()))
-}
-
-fn sqlite_role_value(role: &MessageRole) -> SqliteValue {
-    match role {
-        MessageRole::User => SqliteValue::Text("user".into()),
-        MessageRole::Agent => SqliteValue::Text("agent".into()),
-        MessageRole::Tool => SqliteValue::Text("tool".into()),
-        MessageRole::System => SqliteValue::Text("system".into()),
-        MessageRole::Other(v) => SqliteValue::Text(v.clone().into()),
-    }
 }
 
 fn role_str(role: &MessageRole) -> String {
@@ -20436,11 +20406,7 @@ mod tests {
         // Plant orphan messages referencing conversation_id=99999 (does not exist)
         // and conversation_id=0 (the specific shape reported in #202). Distinct
         // (conversation_id, idx) pairs are required by the UNIQUE constraint.
-        for (mid, cid, idx) in [
-            (101_i64, 99_999_i64, 0_i64),
-            (102, 0, 0),
-            (103, 0, 1),
-        ] {
+        for (mid, cid, idx) in [(101_i64, 99_999_i64, 0_i64), (102, 0, 0), (103, 0, 1)] {
             storage
                 .raw()
                 .execute_compat(
