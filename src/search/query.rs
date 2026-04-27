@@ -436,14 +436,14 @@ fn no_limit_budget_bytes(bytes_env: Option<String>, available_bytes: Option<u64>
     bytes_env
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or_else(|| {
-            available_bytes
-                .map(|avail| {
-                    (avail / NO_LIMIT_RAM_DIVISOR)
-                        .clamp(NO_LIMIT_BYTES_FLOOR, NO_LIMIT_BYTES_CEILING)
-                })
-                .unwrap_or(NO_LIMIT_BYTES_FLOOR)
-        })
+        .or_else(|| no_limit_available_memory_budget(available_bytes))
+        .unwrap_or(NO_LIMIT_BYTES_FLOOR)
+}
+
+fn no_limit_available_memory_budget(available_bytes: Option<u64>) -> Option<u64> {
+    available_bytes.map(|avail| {
+        (avail / NO_LIMIT_RAM_DIVISOR).clamp(NO_LIMIT_BYTES_FLOOR, NO_LIMIT_BYTES_CEILING)
+    })
 }
 
 static FRANKENSEARCH_TWO_TIER_CONFIG: Lazy<FsTwoTierConfig> =
