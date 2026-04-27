@@ -80,6 +80,10 @@ fn parallel_prep_enabled() -> bool {
     env_truthy("CASS_SEMANTIC_PREP_PARALLEL")
 }
 
+fn saturating_u64_from_usize(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 #[derive(Debug, Clone)]
 pub struct EmbeddingInput {
     pub message_id: u64,
@@ -1135,7 +1139,7 @@ fn flush_prepared_batch(
         });
     }
 
-    pb.inc(batch.len() as u64);
+    pb.inc(saturating_u64_from_usize(batch.len()));
     Ok(())
 }
 
@@ -1196,7 +1200,7 @@ impl SemanticIndexer {
         }
 
         let show_progress = std::io::stderr().is_terminal();
-        let pb = ProgressBar::new(messages.len() as u64);
+        let pb = ProgressBar::new(saturating_u64_from_usize(messages.len()));
         if show_progress {
             let style = ProgressStyle::default_bar()
                 .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} messages embedded")
@@ -1239,7 +1243,7 @@ impl SemanticIndexer {
             };
             let skipped_in_window = window_slice.len() - prepared_window.len();
             if skipped_in_window > 0 {
-                pb.inc(skipped_in_window as u64);
+                pb.inc(saturating_u64_from_usize(skipped_in_window));
             }
 
             for batch in prepared_window.chunks(self.batch_size) {
@@ -2952,6 +2956,16 @@ mod tests {
 
         let _guard = EnvVarGuard::remove("CASS_SEMANTIC_PREP_PARALLEL");
         assert!(!parallel_prep_enabled());
+    }
+
+    #[test]
+    fn saturating_u64_from_usize_covers_bounds() {
+        assert_eq!(saturating_u64_from_usize(0), 0);
+        assert_eq!(saturating_u64_from_usize(42), 42);
+        assert_eq!(
+            saturating_u64_from_usize(usize::MAX),
+            u64::try_from(usize::MAX).unwrap_or(u64::MAX)
+        );
     }
 
     /// `coding_agent_session_search-ibuuh.32` (sink #3 equivalence gate):
