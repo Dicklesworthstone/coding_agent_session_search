@@ -3322,6 +3322,77 @@ impl FrankenStorage {
         Ok(())
     }
 
+    /// Detect and remove orphan rows whose FK parent has gone missing.
+    ///
+    /// A `Connection` dropped mid-transaction (the `drop_close` warning emitted
+    /// by frankensqlite's `Drop` impl) can leave child rows persisted without a
+    /// matching parent — `messages` referencing a `conversation_id` that does
+    /// not exist, `message_metrics`/`token_usage`/`snippets` referencing a
+    /// `message_id` that does not exist, etc. With `PRAGMA foreign_keys = ON`,
+    /// every subsequent indexer pass then trips `FOREIGN KEY constraint failed`
+    /// on the next write, the session never gets marked indexed, and the
+    /// pending backlog grows without bound (issue #202).
+    ///
+    /// This pass runs at indexer startup as defense in depth: it scans each
+    /// child table for rows whose parent row has gone missing and removes them
+    /// in a single transaction, breaking the failure cycle even when the
+    /// underlying transaction-discipline bug has not been fully root-caused.
+    /// The pass is bounded (one count + one DELETE per child table), idempotent
+    /// (a clean database makes it a no-op), and emits a `WARN` with detailed
+    /// counts whenever it actually deletes anything so the upstream condition
+    /// stays visible.
+    pub(crate) fn cleanup_orphan_fk_rows(&self) -> Result<OrphanFkCleanupReport> {
+        let mut report = OrphanFkCleanupReport::default();
+        for entry in ORPHAN_FK_TABLES {
+            let count: i64 = match self.conn.query_row_map(
+                entry.count_sql,
+                fparams![],
+                |row| row.get_typed::<i64>(0),
+            ) {
+                Ok(c) => c,
+                Err(err) => {
+                    // Tolerant probe: a missing child or parent table (older
+                    // schema, freshly-rebuilt DB) just means there's nothing to
+                    // clean up. Anything else is logged at debug and skipped
+                    // rather than failing indexer startup.
+                    tracing::debug!(
+                        target: "cass::fk_repair",
+                        child_table = entry.child_table,
+                        error = %err,
+                        "skipping orphan probe (table or column unavailable)"
+                    );
+                    continue;
+                }
+            };
+            if count > 0 {
+                report.record(entry.child_table, count);
+            }
+        }
+
+        if report.total == 0 {
+            return Ok(report);
+        }
+
+        tracing::warn!(
+            target: "cass::fk_repair",
+            total_orphans = report.total,
+            per_table = ?report.per_table,
+            "removing orphan rows left behind by interrupted index transactions \
+             (cass#202 self-heal); see WARN-level drop_close events upstream"
+        );
+
+        let mut tx = self.conn.transaction()?;
+        for entry in ORPHAN_FK_TABLES {
+            if !report.per_table.iter().any(|(t, _)| *t == entry.child_table) {
+                continue;
+            }
+            tx.execute_compat(entry.delete_sql, fparams![])?;
+        }
+        tx.commit()?;
+
+        Ok(report)
+    }
+
     /// Return the current schema version from `_schema_migrations`.
     pub fn schema_version(&self) -> Result<i64> {
         let rows = self
@@ -4299,6 +4370,70 @@ fn error_indicates_missing_table(err: &impl std::fmt::Display) -> bool {
     err.to_string()
         .to_ascii_lowercase()
         .contains("no such table")
+}
+
+/// Tables whose FK parent rows can go missing when an index transaction is
+/// dropped mid-flight. The count and delete SQL strings are intentionally
+/// static (no dynamic table names) so they can be audited at a glance and so
+/// they cannot be subverted by injected identifiers. Each entry's count and
+/// delete statements share the identical predicate to guarantee they identify
+/// the same row set.
+struct OrphanFkTable {
+    child_table: &'static str,
+    count_sql: &'static str,
+    delete_sql: &'static str,
+}
+
+const ORPHAN_FK_TABLES: &[OrphanFkTable] = &[
+    OrphanFkTable {
+        child_table: "messages",
+        count_sql: "SELECT COUNT(*) FROM messages \
+                    WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE conversations.id = messages.conversation_id)",
+        delete_sql: "DELETE FROM messages \
+                     WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE conversations.id = messages.conversation_id)",
+    },
+    OrphanFkTable {
+        child_table: "message_metrics",
+        count_sql: "SELECT COUNT(*) FROM message_metrics \
+                    WHERE NOT EXISTS (SELECT 1 FROM messages WHERE messages.id = message_metrics.message_id)",
+        delete_sql: "DELETE FROM message_metrics \
+                     WHERE NOT EXISTS (SELECT 1 FROM messages WHERE messages.id = message_metrics.message_id)",
+    },
+    OrphanFkTable {
+        child_table: "token_usage",
+        count_sql: "SELECT COUNT(*) FROM token_usage \
+                    WHERE NOT EXISTS (SELECT 1 FROM messages WHERE messages.id = token_usage.message_id)",
+        delete_sql: "DELETE FROM token_usage \
+                     WHERE NOT EXISTS (SELECT 1 FROM messages WHERE messages.id = token_usage.message_id)",
+    },
+    OrphanFkTable {
+        child_table: "snippets",
+        count_sql: "SELECT COUNT(*) FROM snippets \
+                    WHERE NOT EXISTS (SELECT 1 FROM messages WHERE messages.id = snippets.message_id)",
+        delete_sql: "DELETE FROM snippets \
+                     WHERE NOT EXISTS (SELECT 1 FROM messages WHERE messages.id = snippets.message_id)",
+    },
+    OrphanFkTable {
+        child_table: "conversation_tags",
+        count_sql: "SELECT COUNT(*) FROM conversation_tags \
+                    WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE conversations.id = conversation_tags.conversation_id)",
+        delete_sql: "DELETE FROM conversation_tags \
+                     WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE conversations.id = conversation_tags.conversation_id)",
+    },
+];
+
+/// Summary of what `cleanup_orphan_fk_rows` removed (or would have removed).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct OrphanFkCleanupReport {
+    pub total: i64,
+    pub per_table: Vec<(&'static str, i64)>,
+}
+
+impl OrphanFkCleanupReport {
+    fn record(&mut self, child_table: &'static str, count: i64) {
+        self.per_table.push((child_table, count));
+        self.total = self.total.saturating_add(count);
+    }
 }
 
 pub struct InsertOutcome {
@@ -20253,5 +20388,122 @@ mod tests {
             )
             .unwrap();
         assert_eq!(openclaw_token_rows, 0);
+    }
+
+    /// Regression for cass#202: a `Connection` dropped mid-transaction can
+    /// leave child rows persisted without a matching parent. The next indexer
+    /// pass then trips `FOREIGN KEY constraint failed` on every write, the
+    /// session never gets marked indexed, and the pending backlog grows
+    /// without bound. `cleanup_orphan_fk_rows` is the indexer-startup
+    /// self-heal that breaks the cycle.
+    #[test]
+    fn cleanup_orphan_fk_rows_removes_orphans_and_is_noop_on_clean_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("orphan_fk_self_heal.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        // Plant orphan rows directly: rows whose FK parent does not exist.
+        // FK enforcement is temporarily off so the planted rows can land.
+        storage.raw().execute("PRAGMA foreign_keys = OFF").unwrap();
+
+        // Seed a real conversation so a subset of children DO have valid
+        // parents — we want the cleanup to be precise, not a table-flush.
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+                 VALUES(1, 'test-agent', 'Test Agent', 'cli', 0, 0)",
+                fparams![],
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
+                 VALUES(1, 1, 'local', '/tmp/real.jsonl', 0)",
+                fparams![],
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO messages(id, conversation_id, idx, role, content) \
+                 VALUES(1, 1, 0, 'user', 'real message')",
+                fparams![],
+            )
+            .unwrap();
+
+        // Plant orphan messages referencing conversation_id=99999 (does not exist)
+        // and conversation_id=0 (the specific shape reported in #202). Distinct
+        // (conversation_id, idx) pairs are required by the UNIQUE constraint.
+        for (mid, cid, idx) in [
+            (101_i64, 99_999_i64, 0_i64),
+            (102, 0, 0),
+            (103, 0, 1),
+        ] {
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(id, conversation_id, idx, role, content) \
+                     VALUES(?1, ?2, ?3, 'user', 'orphan message')",
+                    fparams![mid, cid, idx],
+                )
+                .unwrap();
+        }
+
+        // Plant an orphan snippet referencing a now-orphan message_id.
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO snippets(message_id, file_path, start_line, end_line, language, snippet_text) \
+                 VALUES(101, '/tmp/orphan.rs', 1, 2, 'rust', 'fn main() {}')",
+                fparams![],
+            )
+            .unwrap();
+
+        storage.raw().execute("PRAGMA foreign_keys = ON").unwrap();
+
+        // Sanity: the planted orphans are visible.
+        let messages_before: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(messages_before, 4); // 1 real + 3 orphans
+
+        // Run the self-heal.
+        let report = storage.cleanup_orphan_fk_rows().unwrap();
+
+        // The 3 orphan messages and the 1 orphan token_usage row should be gone.
+        let messages_after: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(messages_after, 1, "real message must be preserved");
+        let snippets_after: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM snippets", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(snippets_after, 0);
+
+        assert!(report.total >= 3);
+        assert!(
+            report
+                .per_table
+                .iter()
+                .any(|(table, count)| *table == "messages" && *count == 3),
+            "report must record exactly 3 orphan messages: {:?}",
+            report.per_table
+        );
+
+        // Second invocation on a now-clean DB must be a no-op.
+        let second = storage.cleanup_orphan_fk_rows().unwrap();
+        assert_eq!(second.total, 0);
+        assert!(second.per_table.is_empty());
     }
 }
