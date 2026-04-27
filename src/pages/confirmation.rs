@@ -579,6 +579,12 @@ mod tests {
         }
     }
 
+    fn basic_flow_with(configure: impl FnOnce(&mut ConfirmationConfig)) -> ConfirmationFlow {
+        let mut config = make_basic_config();
+        configure(&mut config);
+        ConfirmationFlow::new(config)
+    }
+
     #[test]
     fn test_basic_flow_no_secrets() {
         let config = make_basic_config();
@@ -604,10 +610,9 @@ mod tests {
 
     #[test]
     fn test_secret_ack_validation() {
-        let mut config = make_basic_config();
-        config.has_secrets = true;
-
-        let flow = ConfirmationFlow::new(config);
+        let flow = basic_flow_with(|config| {
+            config.has_secrets = true;
+        });
 
         // Wrong phrase
         assert!(matches!(
@@ -628,11 +633,10 @@ mod tests {
 
     #[test]
     fn test_public_warning_validation() {
-        let mut config = make_basic_config();
-        config.is_remote_publish = true;
-        config.target_domain = Some("user.github.io".to_string());
-
-        let flow = ConfirmationFlow::new(config);
+        let flow = basic_flow_with(|config| {
+            config.is_remote_publish = true;
+            config.target_domain = Some("user.github.io".to_string());
+        });
 
         // Wrong phrase
         assert!(matches!(
@@ -649,11 +653,10 @@ mod tests {
 
     #[test]
     fn test_recovery_key_validation() {
-        let mut config = make_basic_config();
-        config.has_recovery_key = true;
-        config.recovery_key_phrase = Some("forge-table-river-cloud-dance".to_string());
-
-        let flow = ConfirmationFlow::new(config);
+        let flow = basic_flow_with(|config| {
+            config.has_recovery_key = true;
+            config.recovery_key_phrase = Some("forge-table-river-cloud-dance".to_string());
+        });
 
         // Wrong word
         assert!(matches!(
