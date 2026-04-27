@@ -28,6 +28,10 @@ fn connection_not_established() -> DaemonError {
     DaemonError::Unavailable("connection not established".to_string())
 }
 
+fn unexpected_response(response: Response) -> DaemonError {
+    DaemonError::Failed(format!("unexpected response: {response:?}"))
+}
+
 /// Configuration for the daemon client.
 #[derive(Debug, Clone)]
 pub struct DaemonClientConfig {
@@ -402,10 +406,7 @@ impl UdsDaemonClient {
                 *self.last_health_check.lock() = Some(Instant::now());
                 Ok(status)
             }
-            other => Err(DaemonError::Failed(format!(
-                "unexpected response: {:?}",
-                other
-            ))),
+            other => Err(unexpected_response(other)),
         }
     }
 
@@ -417,10 +418,7 @@ impl UdsDaemonClient {
                 *self.connection.lock() = None;
                 Ok(())
             }
-            other => Err(DaemonError::Failed(format!(
-                "unexpected response: {:?}",
-                other
-            ))),
+            other => Err(unexpected_response(other)),
         }
     }
 
@@ -435,10 +433,7 @@ impl UdsDaemonClient {
         })?;
         match response {
             Response::JobSubmitted { job_id, .. } => Ok(job_id),
-            other => Err(DaemonError::Failed(format!(
-                "unexpected response: {:?}",
-                other
-            ))),
+            other => Err(unexpected_response(other)),
         }
     }
 
@@ -449,10 +444,7 @@ impl UdsDaemonClient {
         })?;
         match response {
             Response::JobStatus(info) => Ok(info),
-            other => Err(DaemonError::Failed(format!(
-                "unexpected response: {:?}",
-                other
-            ))),
+            other => Err(unexpected_response(other)),
         }
     }
 
@@ -468,10 +460,7 @@ impl UdsDaemonClient {
         })?;
         match response {
             Response::JobCancelled { cancelled, .. } => Ok(cancelled),
-            other => Err(DaemonError::Failed(format!(
-                "unexpected response: {:?}",
-                other
-            ))),
+            other => Err(unexpected_response(other)),
         }
     }
 }
@@ -535,10 +524,7 @@ impl DaemonClient for UdsDaemonClient {
                     .next()
                     .ok_or_else(|| DaemonError::Failed("embedding unexpectedly empty".to_string()))
             }
-            other => Err(DaemonError::Failed(format!(
-                "unexpected response: {:?}",
-                other
-            ))),
+            other => Err(unexpected_response(other)),
         }
     }
 
@@ -572,10 +558,7 @@ impl DaemonClient for UdsDaemonClient {
                 );
                 Ok(embed.embeddings)
             }
-            other => Err(DaemonError::Failed(format!(
-                "unexpected response: {:?}",
-                other
-            ))),
+            other => Err(unexpected_response(other)),
         }
     }
 
@@ -615,10 +598,7 @@ impl DaemonClient for UdsDaemonClient {
                 );
                 Ok(rerank.scores)
             }
-            other => Err(DaemonError::Failed(format!(
-                "unexpected response: {:?}",
-                other
-            ))),
+            other => Err(unexpected_response(other)),
         }
     }
 }
@@ -713,6 +693,17 @@ mod tests {
         assert_eq!(
             connection_not_established().to_string(),
             "daemon unavailable: connection not established"
+        );
+    }
+
+    #[test]
+    fn unexpected_response_error_text_is_stable() {
+        assert_eq!(
+            unexpected_response(Response::Shutdown {
+                message: "bye".to_string()
+            })
+            .to_string(),
+            "daemon failed: unexpected response: Shutdown { message: \"bye\" }"
         );
     }
 
