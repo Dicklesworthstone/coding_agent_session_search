@@ -70,6 +70,11 @@ use semantic::{
     packet_embedding_inputs_from_storage_since,
 };
 
+use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
+use crate::search::semantic_manifest::{
+    ArtifactRecord, SemanticManifest, TierKind as SemanticTierKind,
+};
+
 #[cfg(test)]
 use std::iter::Peekable;
 
@@ -5944,6 +5949,109 @@ fn count_total_conversations_exact(storage: &FrankenStorage) -> Result<usize> {
     Ok(usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX))
 }
 
+fn semantic_indexing_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn semantic_tier_for_embedder_id(embedder_id: &str) -> Option<SemanticTierKind> {
+    match embedder_id {
+        "minilm-384" => Some(SemanticTierKind::Quality),
+        "fnv1a-384" => Some(SemanticTierKind::Fast),
+        _ => None,
+    }
+}
+
+fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
+    if embedder_id == "fnv1a-384" {
+        "hash".to_string()
+    } else {
+        crate::search::model_download::ModelManifest::minilm_v2()
+            .revision
+            .clone()
+    }
+}
+
+/// Republish the semantic manifest after a direct `cass index --semantic`
+/// pass so `cass status` reflects the freshly-built vector index.
+///
+/// The manifest-backed `cass models backfill` path already does this via
+/// `manifest.publish_artifact(...)` inside `run_backfill_batch`. The
+/// direct path at the call-site below previously skipped the manifest
+/// update entirely, leaving status pointed at stale artifact metadata
+/// even after a successful republish — see issue #203.
+#[allow(clippy::too_many_arguments)]
+fn publish_direct_semantic_artifact(
+    storage: &FrankenStorage,
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+    embedder_id: &str,
+    embedder_dimension: usize,
+    embedded_doc_count: u64,
+    build_started_at_ms: i64,
+) -> Result<()> {
+    let Some(tier) = semantic_tier_for_embedder_id(embedder_id) else {
+        tracing::debug!(
+            embedder = embedder_id,
+            "skipping direct semantic manifest publish: unknown embedder tier"
+        );
+        return Ok(());
+    };
+
+    let db_fingerprint = lexical_storage_fingerprint_for_db(db_path)?;
+    let total_conversations =
+        u64::try_from(count_total_conversations_exact(storage)?).unwrap_or(u64::MAX);
+    let size_bytes = fs::metadata(index_path)
+        .with_context(|| {
+            format!(
+                "stat published semantic index {} for direct manifest publish",
+                index_path.display()
+            )
+        })?
+        .len();
+    let relative_index_path = index_path
+        .strip_prefix(data_dir)
+        .unwrap_or(index_path)
+        .to_string_lossy()
+        .into_owned();
+    let model_revision = semantic_model_revision_for_embedder_id(embedder_id);
+
+    let mut manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
+        anyhow::anyhow!("loading semantic manifest for direct artifact publish: {err}")
+    })?;
+    let now = semantic_indexing_now_ms();
+    manifest.publish_artifact(ArtifactRecord {
+        tier,
+        embedder_id: embedder_id.to_string(),
+        model_revision,
+        schema_version: SEMANTIC_SCHEMA_VERSION,
+        chunking_version: CHUNKING_STRATEGY_VERSION,
+        dimension: embedder_dimension,
+        doc_count: embedded_doc_count,
+        conversation_count: total_conversations,
+        db_fingerprint: db_fingerprint.clone(),
+        index_path: relative_index_path,
+        size_bytes,
+        started_at_ms: build_started_at_ms,
+        completed_at_ms: now,
+        ready: true,
+    });
+    manifest.refresh_backlog(total_conversations, &db_fingerprint);
+    manifest
+        .save(data_dir)
+        .map_err(|err| anyhow::anyhow!("saving semantic manifest after direct publish: {err}"))?;
+    tracing::info!(
+        embedder = embedder_id,
+        tier = tier.as_str(),
+        doc_count = embedded_doc_count,
+        conversation_count = total_conversations,
+        "published direct semantic artifact to manifest"
+    );
+    Ok(())
+}
+
 fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
     let total_messages: i64 = storage
         .raw()
@@ -9614,6 +9722,8 @@ pub fn run_index(
             );
 
             if !embedded_messages.is_empty() {
+                let embedded_doc_count = embedded_messages.len();
+                let build_started_at_ms = semantic_indexing_now_ms();
                 let vector_index =
                     semantic_indexer.build_and_save_index(embedded_messages, &opts.data_dir)?;
                 let index_path = crate::search::vector_index::vector_index_path(
@@ -9638,6 +9748,31 @@ pub fn run_index(
                         path = %hnsw_path.display(),
                         embedder = semantic_indexer.embedder_id(),
                         "saved HNSW index for approximate search"
+                    );
+                }
+
+                // Publish the artifact to the semantic manifest so `cass
+                // status` reflects the freshly-built index. Without this,
+                // `index --semantic` republishes the .fsvi file but leaves
+                // semantic_manifest.json pointed at stale metadata, so
+                // status reports `semantic: stale / available: false`
+                // even though semantic search works (issue #203).
+                if let Err(err) = publish_direct_semantic_artifact(
+                    &storage,
+                    &opts.data_dir,
+                    &opts.db_path,
+                    &index_path,
+                    semantic_indexer.embedder_id(),
+                    semantic_indexer.embedder_dimension(),
+                    u64::try_from(embedded_doc_count).unwrap_or(u64::MAX),
+                    build_started_at_ms,
+                ) {
+                    tracing::warn!(
+                        embedder = semantic_indexer.embedder_id(),
+                        error = %err,
+                        "direct semantic artifact published to disk but \
+                         manifest update failed; cass status may report \
+                         stale/unavailable until next backfill cycle"
                     );
                 }
             }
@@ -19023,6 +19158,37 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    /// Regression for issue #203: the direct `cass index --semantic`
+    /// path must classify embedder ids onto the right manifest tier so
+    /// the published artifact lands where `cass status` looks for it.
+    #[test]
+    fn semantic_tier_for_embedder_id_maps_known_ids() {
+        assert_eq!(
+            super::semantic_tier_for_embedder_id("minilm-384"),
+            Some(super::SemanticTierKind::Quality)
+        );
+        assert_eq!(
+            super::semantic_tier_for_embedder_id("fnv1a-384"),
+            Some(super::SemanticTierKind::Fast)
+        );
+        assert_eq!(super::semantic_tier_for_embedder_id("unknown"), None);
+    }
+
+    /// Regression for issue #203: hash embedder must report a stable
+    /// "hash" model_revision so the manifest record matches what
+    /// `run_backfill_batch` writes for the same embedder.
+    #[test]
+    fn semantic_model_revision_for_embedder_id_known_ids() {
+        assert_eq!(
+            super::semantic_model_revision_for_embedder_id("fnv1a-384"),
+            "hash"
+        );
+        assert!(
+            !super::semantic_model_revision_for_embedder_id("minilm-384").is_empty(),
+            "minilm revision should resolve to ModelManifest::minilm_v2().revision"
+        );
+    }
 
     /// Regression test for issue #201: `staged_*` progress fields must
     /// surface as JSON `null` when the lexical rebuild pipeline isn't
