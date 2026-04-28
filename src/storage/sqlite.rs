@@ -6789,6 +6789,9 @@ impl FrankenStorage {
             franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))?;
         if let Some(existing_id) = existing {
             let outcome = self.franken_append_messages_in_tx(&tx, existing_id, conv)?;
+            if outcome.inserted_indices.is_empty() {
+                return Ok(outcome);
+            }
             tx.commit()?;
             return Ok(outcome);
         }
@@ -6850,6 +6853,14 @@ impl FrankenStorage {
                         source_path = %conv.source_path.display(),
                         "message idx collisions encountered while merging recovered conversation; retaining canonical message variants"
                     );
+                }
+
+                if inserted_indices.is_empty() {
+                    return Ok(InsertOutcome {
+                        conversation_id: existing_id,
+                        conversation_inserted: false,
+                        inserted_indices,
+                    });
                 }
 
                 if !defer_lexical_updates {
@@ -7278,6 +7289,17 @@ impl FrankenStorage {
             );
         }
 
+        if inserted_indices.is_empty() {
+            profile.invocations += 1;
+            profile.messages += conv.messages.len();
+            profile.total_duration += total_start.elapsed();
+            return Ok(InsertOutcome {
+                conversation_id: existing_id,
+                conversation_inserted: false,
+                inserted_indices,
+            });
+        }
+
         if !defer_lexical_updates {
             let fts_flush_start = Instant::now();
             flush_pending_fts_entries(
@@ -7400,6 +7422,14 @@ impl FrankenStorage {
                 source_path = %conv.source_path.display(),
                 "message idx collisions encountered while appending to an existing conversation; retaining canonical message variants"
             );
+        }
+
+        if inserted_indices.is_empty() {
+            return Ok(InsertOutcome {
+                conversation_id,
+                conversation_inserted: false,
+                inserted_indices,
+            });
         }
 
         if !defer_lexical_updates {
@@ -8328,7 +8358,9 @@ impl FrankenStorage {
                     );
                 }
 
-                if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
+                if !inserted_indices.is_empty()
+                    && let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max()
+                {
                     tx.execute_compat(
                         "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
                         fparams![last_ts, existing_id],
@@ -8452,8 +8484,9 @@ impl FrankenStorage {
                             );
                         }
 
-                        if let Some(last_ts) =
-                            conv.messages.iter().filter_map(|m| m.created_at).max()
+                        if !inserted_indices.is_empty()
+                            && let Some(last_ts) =
+                                conv.messages.iter().filter_map(|m| m.created_at).max()
                         {
                             tx.execute_compat(
                                 "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
@@ -14365,6 +14398,56 @@ mod tests {
                 profile.log_summary(&format!("append_remote_merge_{msg_count}_msgs"));
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn append_existing_conversation_noop_skips_append_tail_write_work() {
+        let _defer_guard = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("append-noop-profile.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace = PathBuf::from("/ws/profiled-append-remote");
+        let workspace_id = storage.ensure_workspace(&workspace, None).unwrap();
+
+        let base = make_profiled_append_remote_merge_conversation(0, 5);
+        storage
+            .insert_conversation_tree(agent_id, Some(workspace_id), &base)
+            .unwrap();
+        let expanded = make_profiled_append_remote_merge_conversation(0, 10);
+        storage
+            .insert_conversation_tree(agent_id, Some(workspace_id), &expanded)
+            .unwrap();
+
+        let mut profile = InsertConversationTreePerfProfile::default();
+        let outcome = storage
+            .append_existing_conversation_with_profile(
+                agent_id,
+                Some(workspace_id),
+                &expanded,
+                &mut profile,
+            )
+            .unwrap();
+
+        assert!(
+            outcome.inserted_indices.is_empty(),
+            "already-merged conversations should not attempt duplicate appends"
+        );
+        assert_eq!(profile.invocations, 1);
+        assert_eq!(profile.messages, expanded.messages.len());
+        assert_eq!(profile.inserted_messages, 0);
+        assert_eq!(profile.conversation_row_duration, Duration::ZERO);
+        assert_eq!(profile.analytics_duration, Duration::ZERO);
+        assert_eq!(profile.commit_duration, Duration::ZERO);
     }
 
     #[test]
