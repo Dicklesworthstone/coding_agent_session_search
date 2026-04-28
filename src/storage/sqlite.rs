@@ -6793,11 +6793,12 @@ impl FrankenStorage {
             return Ok(outcome);
         }
 
-        let conv_id = match franken_insert_conversation_or_get_existing(
+        let conv_id = match franken_insert_conversation_or_get_existing_after_miss(
             &tx,
             agent_id,
             workspace_id,
             conv,
+            &conversation_key,
         )? {
             ConversationInsertStatus::Inserted(conv_id) => conv_id,
             ConversationInsertStatus::Existing(existing_id) => {
@@ -7020,11 +7021,12 @@ impl FrankenStorage {
         }
 
         let conversation_row_start = Instant::now();
-        let conv_id = match franken_insert_conversation_or_get_existing(
+        let conv_id = match franken_insert_conversation_or_get_existing_after_miss(
             &tx,
             agent_id,
             workspace_id,
             conv,
+            &conversation_key,
         )? {
             ConversationInsertStatus::Inserted(conv_id) => conv_id,
             ConversationInsertStatus::Existing(existing_id) => {
@@ -9172,16 +9174,33 @@ fn franken_insert_conversation_or_get_existing(
     {
         return Ok(ConversationInsertStatus::Existing(existing_id));
     }
+
+    franken_insert_conversation_or_get_existing_after_miss(
+        tx,
+        agent_id,
+        workspace_id,
+        conv,
+        &conversation_key,
+    )
+}
+
+fn franken_insert_conversation_or_get_existing_after_miss(
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    conv: &Conversation,
+    conversation_key: &PendingConversationKey,
+) -> Result<ConversationInsertStatus> {
     match franken_insert_conversation(tx, agent_id, workspace_id, conv) {
         Ok(Some(conv_id)) => Ok(ConversationInsertStatus::Inserted(conv_id)),
         Ok(None) => {
-            // INSERT OR IGNORE silently skipped a duplicate.  Look up the
-            // existing row so callers can merge messages into it (#141).
+            // A concurrent writer won the unique-provenance race. Resolve the
+            // canonical row so callers can merge messages into it.
             let existing_id =
-                franken_find_existing_conversation_by_key(tx, &conversation_key, Some(conv))?
+                franken_find_existing_conversation_by_key(tx, conversation_key, Some(conv))?
                     .with_context(|| {
                         format!(
-                            "conversation INSERT OR IGNORE produced 0 rows but existing row was not found for source_id={} agent_id={} external_id={:?} source_path={}",
+                            "conversation INSERT produced a duplicate conflict but existing row was not found for source_id={} agent_id={} external_id={:?} source_path={}",
                             conv.source_id,
                             agent_id,
                             conv.external_id,
@@ -9194,7 +9213,7 @@ fn franken_insert_conversation_or_get_existing(
                 external_id = ?conv.external_id,
                 existing_id,
                 source_path = %conv.source_path.display(),
-                "conversation INSERT OR IGNORE: duplicate gracefully skipped, reusing existing row"
+                "conversation INSERT: duplicate gracefully recovered, reusing existing row"
             );
             Ok(ConversationInsertStatus::Existing(existing_id))
         }
@@ -9214,10 +9233,9 @@ fn franken_insert_conversation_or_get_existing(
 
 /// Insert a conversation into the DB within a frankensqlite transaction.
 ///
-/// Uses `INSERT OR IGNORE` so that duplicate `(source_id, agent_id,
-/// external_id)` rows are silently skipped instead of aborting the
-/// transaction (#141).  Returns `Ok(Some(id))` on successful insert or
-/// `Ok(None)` when the row already existed and was ignored.
+/// Uses a plain `INSERT` so the common miss path stays on the slim direct
+/// insert lane. Duplicate provenance conflicts are converted into `Ok(None)`
+/// so callers can recover the canonical row and merge messages into it.
 fn franken_insert_conversation(
     tx: &FrankenTransaction<'_>,
     agent_id: i64,
@@ -9229,8 +9247,8 @@ fn franken_insert_conversation(
     let metadata_json_str = serde_json::to_string(&conv.metadata_json)?;
     let metadata_bin_bytes = metadata_bin.as_deref();
 
-    let rows_changed = tx.execute_compat(
-        "INSERT OR IGNORE INTO conversations(
+    match tx.execute_compat(
+        "INSERT INTO conversations(
             agent_id, workspace_id, source_id, external_id, title, source_path,
             started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
@@ -9248,20 +9266,19 @@ fn franken_insert_conversation(
             conv.origin_host.as_deref(),
             metadata_bin_bytes
         ],
-    )?;
-
-    if rows_changed == 0 {
-        // Duplicate row was silently ignored by INSERT OR IGNORE.
-        tracing::debug!(
-            source_id = %conv.source_id,
-            agent_id,
-            external_id = ?conv.external_id,
-            source_path = %conv.source_path.display(),
-            "conversation INSERT OR IGNORE: duplicate row skipped"
-        );
-        Ok(None)
-    } else {
-        Ok(Some(franken_last_rowid(tx)?))
+    ) {
+        Ok(_) => Ok(Some(franken_last_rowid(tx)?)),
+        Err(frankensqlite::FrankenError::UniqueViolation { .. }) => {
+            tracing::debug!(
+                source_id = %conv.source_id,
+                agent_id,
+                external_id = ?conv.external_id,
+                source_path = %conv.source_path.display(),
+                "conversation INSERT: duplicate provenance conflict"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -14986,8 +15003,15 @@ mod tests {
             .unwrap()
             .expect("first insert should succeed");
 
-        let resolved =
-            franken_insert_conversation_or_get_existing(&tx, agent_id, None, &conv).unwrap();
+        let conversation_key = conversation_merge_key(agent_id, &conv);
+        let resolved = franken_insert_conversation_or_get_existing_after_miss(
+            &tx,
+            agent_id,
+            None,
+            &conv,
+            &conversation_key,
+        )
+        .unwrap();
 
         match resolved {
             ConversationInsertStatus::Existing(existing_id) => {
