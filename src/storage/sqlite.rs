@@ -4724,6 +4724,78 @@ fn collect_new_messages_for_existing_conversation<'a>(
     }
 }
 
+fn franken_existing_conversation_append_tail_state(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<Option<(i64, i64)>> {
+    let (max_idx, max_created_at): (Option<i64>, Option<i64>) = tx.query_row_map(
+        "SELECT MAX(idx), MAX(created_at)
+         FROM messages
+         WHERE conversation_id = ?1",
+        fparams![conversation_id],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+    )?;
+    Ok(max_idx.zip(max_created_at))
+}
+
+fn collect_append_only_tail_messages<'a>(
+    conv: &'a Conversation,
+    existing_max_idx: i64,
+    existing_max_created_at: i64,
+) -> Option<ExistingConversationNewMessages<'a>> {
+    if conv.messages.is_empty() {
+        return Some(ExistingConversationNewMessages {
+            messages: Vec::new(),
+            new_chars: 0,
+            idx_collision_count: 0,
+            first_collision_idx: None,
+        });
+    }
+
+    let mut split_idx = None;
+    let mut prev_idx = None;
+    for (pos, msg) in conv.messages.iter().enumerate() {
+        if prev_idx.is_some_and(|prev| msg.idx < prev) {
+            return None;
+        }
+        prev_idx = Some(msg.idx);
+        if split_idx.is_none() && msg.idx > existing_max_idx {
+            split_idx = Some(pos);
+        }
+    }
+    let split_idx = split_idx?;
+
+    let mut seen_tail_idx = HashSet::new();
+    let mut seen_tail_replay = HashSet::new();
+    let mut new_chars = 0i64;
+    let mut messages = Vec::new();
+    for msg in &conv.messages[split_idx..] {
+        let created_at = msg.created_at?;
+        if created_at <= existing_max_created_at {
+            return None;
+        }
+
+        if !seen_tail_idx.insert(msg.idx) {
+            return None;
+        }
+
+        let replay_fingerprint = message_replay_fingerprint(msg);
+        if !seen_tail_replay.insert(replay_fingerprint) {
+            return None;
+        }
+
+        new_chars += msg.content.len() as i64;
+        messages.push(msg);
+    }
+
+    Some(ExistingConversationNewMessages {
+        messages,
+        new_chars,
+        idx_collision_count: 0,
+        first_collision_idx: None,
+    })
+}
+
 fn start_distance_ms(left: Option<i64>, right: Option<i64>) -> i64 {
     match (left, right) {
         (Some(left), Some(right)) => (i128::from(left) - i128::from(right))
@@ -6729,10 +6801,10 @@ impl FrankenStorage {
         )? {
             ConversationInsertStatus::Inserted(conv_id) => conv_id,
             ConversationInsertStatus::Existing(existing_id) => {
-                let mut existing_messages =
-                    franken_existing_message_fingerprints_by_idx(&tx, existing_id, &conv.messages)?;
-                let mut existing_replay_fingerprints =
-                    franken_existing_message_replay_fingerprints(&tx, existing_id, &conv.messages)?;
+                let ExistingMessageLookup {
+                    by_idx: mut existing_messages,
+                    replay: mut existing_replay_fingerprints,
+                } = franken_existing_message_lookup(&tx, existing_id, &conv.messages)?;
                 let ExistingConversationNewMessages {
                     messages: new_messages,
                     new_chars,
@@ -7123,14 +7195,14 @@ impl FrankenStorage {
         })?;
 
         let existing_idx_lookup_start = Instant::now();
-        let mut existing_messages =
-            franken_existing_message_fingerprints_by_idx(&tx, existing_id, &conv.messages)?;
+        let existing_plan = if let Some((existing_max_idx, existing_ended_at)) =
+            franken_existing_conversation_append_tail_state(&tx, existing_id)?
+        {
+            collect_append_only_tail_messages(conv, existing_max_idx, existing_ended_at)
+        } else {
+            None
+        };
         profile.existing_idx_lookup_duration += existing_idx_lookup_start.elapsed();
-
-        let existing_replay_lookup_start = Instant::now();
-        let mut existing_replay_fingerprints =
-            franken_existing_message_replay_fingerprints(&tx, existing_id, &conv.messages)?;
-        profile.existing_replay_lookup_duration += existing_replay_lookup_start.elapsed();
 
         let dedupe_filter_start = Instant::now();
         let ExistingConversationNewMessages {
@@ -7138,13 +7210,21 @@ impl FrankenStorage {
             new_chars,
             idx_collision_count,
             first_collision_idx,
-        } = collect_new_messages_for_existing_conversation(
-            existing_id,
-            conv,
-            &mut existing_messages,
-            &mut existing_replay_fingerprints,
-            "skipping replay-equivalent profiled append message with shifted idx",
-        );
+        } = if let Some(existing_plan) = existing_plan {
+            existing_plan
+        } else {
+            let ExistingMessageLookup {
+                by_idx: mut existing_messages,
+                replay: mut existing_replay_fingerprints,
+            } = franken_existing_message_lookup(&tx, existing_id, &conv.messages)?;
+            collect_new_messages_for_existing_conversation(
+                existing_id,
+                conv,
+                &mut existing_messages,
+                &mut existing_replay_fingerprints,
+                "skipping replay-equivalent profiled append message with shifted idx",
+            )
+        };
         profile.dedupe_filter_duration += dedupe_filter_start.elapsed();
 
         let mut inserted_indices = Vec::new();
@@ -7259,22 +7339,33 @@ impl FrankenStorage {
     ) -> Result<InsertOutcome> {
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
         let defer_analytics_updates = defer_analytics_updates_enabled();
-        let mut existing_messages =
-            franken_existing_message_fingerprints_by_idx(tx, conversation_id, &conv.messages)?;
-        let mut existing_replay_fingerprints =
-            franken_existing_message_replay_fingerprints(tx, conversation_id, &conv.messages)?;
+        let append_plan = if let Some((existing_max_idx, existing_ended_at)) =
+            franken_existing_conversation_append_tail_state(tx, conversation_id)?
+        {
+            collect_append_only_tail_messages(conv, existing_max_idx, existing_ended_at)
+        } else {
+            None
+        };
         let ExistingConversationNewMessages {
             messages: new_messages,
             new_chars,
             idx_collision_count,
             first_collision_idx,
-        } = collect_new_messages_for_existing_conversation(
-            conversation_id,
-            conv,
-            &mut existing_messages,
-            &mut existing_replay_fingerprints,
-            "skipping replay-equivalent recovered message with shifted idx",
-        );
+        } = if let Some(append_plan) = append_plan {
+            append_plan
+        } else {
+            let ExistingMessageLookup {
+                by_idx: mut existing_messages,
+                replay: mut existing_replay_fingerprints,
+            } = franken_existing_message_lookup(tx, conversation_id, &conv.messages)?;
+            collect_new_messages_for_existing_conversation(
+                conversation_id,
+                conv,
+                &mut existing_messages,
+                &mut existing_replay_fingerprints,
+                "skipping replay-equivalent recovered message with shifted idx",
+            )
+        };
 
         let mut inserted_indices = Vec::new();
         let mut fts_entries = Vec::new();
@@ -8181,31 +8272,16 @@ impl FrankenStorage {
 
             let conv_id = if let Some(existing_id) = existing_conv_id {
                 session_count_delta = 0;
-                let mut existing_messages =
-                    if let Some(fingerprints) = pending_message_fingerprints.get(&existing_id) {
-                        fingerprints.clone()
-                    } else {
-                        let fingerprints = franken_existing_message_fingerprints_by_idx(
-                            &tx,
-                            existing_id,
-                            &conv.messages,
-                        )?;
-                        pending_message_fingerprints.insert(existing_id, fingerprints.clone());
-                        fingerprints
-                    };
-                let mut existing_replay_fingerprints = if let Some(fingerprints) =
-                    pending_message_replay_fingerprints.get(&existing_id)
-                {
-                    fingerprints.clone()
-                } else {
-                    let fingerprints = franken_existing_message_replay_fingerprints(
-                        &tx,
-                        existing_id,
-                        &conv.messages,
-                    )?;
-                    pending_message_replay_fingerprints.insert(existing_id, fingerprints.clone());
-                    fingerprints
-                };
+                let ExistingMessageLookup {
+                    by_idx: mut existing_messages,
+                    replay: mut existing_replay_fingerprints,
+                } = franken_existing_message_lookup_with_pending(
+                    &tx,
+                    existing_id,
+                    &conv.messages,
+                    &mut pending_message_fingerprints,
+                    &mut pending_message_replay_fingerprints,
+                )?;
                 let ExistingConversationNewMessages {
                     messages: new_messages,
                     new_chars,
@@ -8319,33 +8395,16 @@ impl FrankenStorage {
                     ConversationInsertStatus::Existing(existing_id) => {
                         session_count_delta = 0;
                         pending_conversation_ids.insert(conversation_key.clone(), existing_id);
-                        let mut existing_messages = if let Some(fingerprints) =
-                            pending_message_fingerprints.get(&existing_id)
-                        {
-                            fingerprints.clone()
-                        } else {
-                            let fingerprints = franken_existing_message_fingerprints_by_idx(
-                                &tx,
-                                existing_id,
-                                &conv.messages,
-                            )?;
-                            pending_message_fingerprints.insert(existing_id, fingerprints.clone());
-                            fingerprints
-                        };
-                        let mut existing_replay_fingerprints = if let Some(fingerprints) =
-                            pending_message_replay_fingerprints.get(&existing_id)
-                        {
-                            fingerprints.clone()
-                        } else {
-                            let fingerprints = franken_existing_message_replay_fingerprints(
-                                &tx,
-                                existing_id,
-                                &conv.messages,
-                            )?;
-                            pending_message_replay_fingerprints
-                                .insert(existing_id, fingerprints.clone());
-                            fingerprints
-                        };
+                        let ExistingMessageLookup {
+                            by_idx: mut existing_messages,
+                            replay: mut existing_replay_fingerprints,
+                        } = franken_existing_message_lookup_with_pending(
+                            &tx,
+                            existing_id,
+                            &conv.messages,
+                            &mut pending_message_fingerprints,
+                            &mut pending_message_replay_fingerprints,
+                        )?;
                         let ExistingConversationNewMessages {
                             messages: new_messages,
                             new_chars,
@@ -9482,13 +9541,21 @@ fn franken_existing_message_fingerprints(
     Ok(fingerprints)
 }
 
-fn franken_existing_message_fingerprints_by_idx(
+struct ExistingMessageLookup {
+    by_idx: HashMap<i64, MessageMergeFingerprint>,
+    replay: HashSet<MessageReplayFingerprint>,
+}
+
+fn franken_existing_message_lookup(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
     incoming_messages: &[Message],
-) -> Result<HashMap<i64, MessageMergeFingerprint>> {
+) -> Result<ExistingMessageLookup> {
     if incoming_messages.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(ExistingMessageLookup {
+            by_idx: HashMap::new(),
+            replay: HashSet::new(),
+        });
     }
 
     let min_idx = incoming_messages
@@ -9501,47 +9568,6 @@ fn franken_existing_message_fingerprints_by_idx(
         .map(|msg| msg.idx)
         .max()
         .unwrap_or(min_idx);
-
-    // Incremental rescans can legitimately revisit an entire large session file when the file's
-    // mtime is newer than the previous scan watermark. Scope the lookup to the incoming idx range
-    // rather than clipping to an arbitrary tail window, otherwise older rescanned rows can miss
-    // dedupe and trip the UNIQUE(conversation_id, idx) constraint.
-    let rows = tx.query_params(
-        "SELECT idx, role, author, created_at, content
-         FROM messages
-         WHERE conversation_id = ?1
-           AND idx >= ?2
-           AND idx <= ?3",
-        fparams![conversation_id, min_idx, max_idx],
-    )?;
-    let mut fingerprints = HashMap::with_capacity(rows.len());
-    for row in rows {
-        let idx: i64 = row.get_typed(0)?;
-        let role: String = row.get_typed(1)?;
-        let content: String = row.get_typed(4)?;
-        fingerprints.insert(
-            idx,
-            MessageMergeFingerprint {
-                idx,
-                created_at: row.get_typed(3)?,
-                role: role_from_str(&role),
-                author: row.get_typed(2)?,
-                content_hash: *blake3::hash(content.as_bytes()).as_bytes(),
-            },
-        );
-    }
-    Ok(fingerprints)
-}
-
-fn franken_existing_message_replay_fingerprints(
-    tx: &FrankenTransaction<'_>,
-    conversation_id: i64,
-    incoming_messages: &[Message],
-) -> Result<HashSet<MessageReplayFingerprint>> {
-    if incoming_messages.is_empty() {
-        return Ok(HashSet::new());
-    }
-
     let requires_full_scan = incoming_messages.iter().any(|msg| msg.created_at.is_none());
     let created_bounds = incoming_messages
         .iter()
@@ -9556,43 +9582,117 @@ fn franken_existing_message_replay_fingerprints(
             })
         });
 
-    let rows = if requires_full_scan {
-        tx.query_params(
-            "SELECT role, author, created_at, content
-             FROM messages
-             WHERE conversation_id = ?1",
-            fparams![conversation_id],
-        )?
+    let (rows, replay_full_scan) = if requires_full_scan {
+        (
+            tx.query_params(
+                "SELECT idx, role, author, created_at, content
+                 FROM messages
+                 WHERE conversation_id = ?1",
+                fparams![conversation_id],
+            )?,
+            true,
+        )
     } else if let Some((min_created_at, max_created_at)) = created_bounds {
-        tx.query_params(
-            "SELECT role, author, created_at, content
-             FROM messages
-             WHERE conversation_id = ?1
-               AND created_at IS NOT NULL
-               AND created_at >= ?2
-               AND created_at <= ?3",
-            fparams![conversation_id, min_created_at, max_created_at],
-        )?
+        (
+            tx.query_params(
+                "SELECT idx, role, author, created_at, content
+                 FROM messages
+                 WHERE conversation_id = ?1
+                   AND (
+                        (idx >= ?2 AND idx <= ?3)
+                        OR (
+                            created_at IS NOT NULL
+                            AND created_at >= ?4
+                            AND created_at <= ?5
+                        )
+                   )",
+                fparams![
+                    conversation_id,
+                    min_idx,
+                    max_idx,
+                    min_created_at,
+                    max_created_at
+                ],
+            )?,
+            false,
+        )
     } else {
-        tx.query_params(
-            "SELECT role, author, created_at, content
-             FROM messages
-             WHERE conversation_id = ?1",
-            fparams![conversation_id],
-        )?
+        (
+            tx.query_params(
+                "SELECT idx, role, author, created_at, content
+                 FROM messages
+                 WHERE conversation_id = ?1",
+                fparams![conversation_id],
+            )?,
+            true,
+        )
     };
-    let mut fingerprints = HashSet::with_capacity(rows.len());
+
+    let mut by_idx = HashMap::with_capacity(rows.len());
+    let mut replay = HashSet::with_capacity(rows.len());
     for row in rows {
-        let role: String = row.get_typed(0)?;
-        let content: String = row.get_typed(3)?;
-        fingerprints.insert(MessageReplayFingerprint {
-            created_at: row.get_typed(2)?,
-            role: role_from_str(&role),
-            author: row.get_typed(1)?,
-            content_hash: *blake3::hash(content.as_bytes()).as_bytes(),
+        let idx: i64 = row.get_typed(0)?;
+        let role: String = row.get_typed(1)?;
+        let author: Option<String> = row.get_typed(2)?;
+        let created_at: Option<i64> = row.get_typed(3)?;
+        let content: String = row.get_typed(4)?;
+        let role = role_from_str(&role);
+        let content_hash = *blake3::hash(content.as_bytes()).as_bytes();
+
+        if idx >= min_idx && idx <= max_idx {
+            by_idx.insert(
+                idx,
+                MessageMergeFingerprint {
+                    idx,
+                    created_at,
+                    role: role.clone(),
+                    author: author.clone(),
+                    content_hash,
+                },
+            );
+        }
+
+        let replay_matches = if replay_full_scan {
+            true
+        } else if let Some((min_created_at, max_created_at)) = created_bounds {
+            created_at.is_some_and(|ts| ts >= min_created_at && ts <= max_created_at)
+        } else {
+            true
+        };
+        if replay_matches {
+            replay.insert(MessageReplayFingerprint {
+                created_at,
+                role,
+                author,
+                content_hash,
+            });
+        }
+    }
+
+    Ok(ExistingMessageLookup { by_idx, replay })
+}
+
+fn franken_existing_message_lookup_with_pending(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    incoming_messages: &[Message],
+    pending_message_fingerprints: &mut HashMap<i64, HashMap<i64, MessageMergeFingerprint>>,
+    pending_message_replay_fingerprints: &mut HashMap<i64, HashSet<MessageReplayFingerprint>>,
+) -> Result<ExistingMessageLookup> {
+    if let (Some(by_idx), Some(replay)) = (
+        pending_message_fingerprints.get(&conversation_id),
+        pending_message_replay_fingerprints.get(&conversation_id),
+    ) {
+        return Ok(ExistingMessageLookup {
+            by_idx: by_idx.clone(),
+            replay: replay.clone(),
         });
     }
-    Ok(fingerprints)
+
+    let lookup = franken_existing_message_lookup(tx, conversation_id, incoming_messages)?;
+    pending_message_fingerprints.insert(conversation_id, lookup.by_idx.clone());
+    pending_message_replay_fingerprints.insert(conversation_id, lookup.replay.clone());
+    Ok(lookup)
 }
 
 /// Batch insert FTS5 entries within a frankensqlite transaction.
