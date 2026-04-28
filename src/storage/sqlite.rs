@@ -4427,10 +4427,14 @@ const ORPHAN_FK_TABLES: &[OrphanFkTable] = &[
 ///
 /// Counts come from the count-phase `SELECT COUNT(*)` rather than from the
 /// `DELETE`'s rows-changed return, so they reflect "orphans observed before
-/// the delete transaction started." Under the function's intended use (a
-/// single indexer-startup pass holding the index run lock), no concurrent
-/// writers exist and these counts match the rows actually removed plus any
-/// `ON DELETE CASCADE` descendants the engine reaped on top.
+/// the delete transaction started." Under the function's intended use — a
+/// single indexer-startup pass holding the index run lock — no concurrent
+/// writers exist, so these counts match the rows the function's own `DELETE`
+/// statements removed. Additional rows can be removed by `ON DELETE CASCADE`
+/// triggers when an orphan message is deleted (its `message_metrics` /
+/// `token_usage` / `snippets` children cascade away with it); those cascade
+/// removals are an expected consequence of the cleanup but are *not*
+/// separately counted in `total` or `per_table`.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct OrphanFkCleanupReport {
     pub total: i64,
