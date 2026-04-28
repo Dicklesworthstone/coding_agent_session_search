@@ -4464,20 +4464,6 @@ struct MessageInsertSubstageProfile {
 }
 
 #[cfg(test)]
-impl MessageInsertSubstageProfile {
-    fn absorb(&mut self, other: &Self) {
-        self.single_row_calls += other.single_row_calls;
-        self.batch_calls += other.batch_calls;
-        self.batch_rows += other.batch_rows;
-        self.payload_duration += other.payload_duration;
-        self.sql_build_duration += other.sql_build_duration;
-        self.param_build_duration += other.param_build_duration;
-        self.execute_duration += other.execute_duration;
-        self.rowid_duration += other.rowid_duration;
-    }
-}
-
-#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct InsertConversationTreePerfProfile {
     invocations: usize,
@@ -7104,7 +7090,7 @@ impl FrankenStorage {
     fn append_existing_conversation_with_profile(
         &self,
         agent_id: i64,
-        workspace_id: Option<i64>,
+        _workspace_id: Option<i64>,
         conv: &Conversation,
         profile: &mut InsertConversationTreePerfProfile,
     ) -> Result<InsertOutcome> {
