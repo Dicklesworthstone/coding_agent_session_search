@@ -8892,26 +8892,19 @@ pub fn run_index(
     // does not exist, and the `message_metrics`/`token_usage` cascades that
     // follow. With FK enforcement on, every subsequent indexer pass would then
     // trip `FOREIGN KEY constraint failed` on the next write and the pending
-    // backlog grows without bound. We sweep before the indexer touches the DB
-    // so one bad commit cannot poison every future run. Skipped on full
-    // rebuilds because the canonical DB will be replaced anyway.
-    if !opts.full {
-        match storage.cleanup_orphan_fk_rows() {
-            Ok(report) if report.total > 0 => {
-                tracing::warn!(
-                    db_path = %opts.db_path.display(),
-                    total_orphans = report.total,
-                    per_table = ?report.per_table,
-                    "cass#202: removed orphan FK rows left behind by a prior interrupted index transaction"
-                );
-            }
-            Ok(_) => {}
-            Err(err) => tracing::warn!(
-                db_path = %opts.db_path.display(),
-                error = %err,
-                "cass#202: orphan FK self-heal failed; continuing index run (cleanup will retry next pass)"
-            ),
-        }
+    // backlog grows without bound. Sweep before the indexer touches the DB so
+    // one bad commit cannot poison every future run. Skipped on full rebuilds
+    // because the canonical DB will be replaced anyway. The function logs its
+    // own WARN on a successful cleanup; the caller only needs to surface the
+    // failure mode so the index run continues rather than aborting.
+    if !opts.full
+        && let Err(err) = storage.cleanup_orphan_fk_rows()
+    {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            error = %err,
+            "cass#202: orphan FK self-heal failed; continuing index run (cleanup will retry next pass)"
+        );
     }
 
     let index_path = index_dir(&opts.data_dir)?;

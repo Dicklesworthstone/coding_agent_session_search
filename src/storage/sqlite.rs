@@ -3338,11 +3338,11 @@ impl FrankenStorage {
     /// in a single transaction, breaking the failure cycle even when the
     /// underlying transaction-discipline bug has not been fully root-caused.
     /// The pass is bounded (one count + one DELETE per child table), idempotent
-    /// (a clean database makes it a no-op), and emits a `WARN` with detailed
-    /// counts whenever it actually deletes anything so the upstream condition
-    /// stays visible.
+    /// (a clean database is a no-op), and emits a `WARN` after a successful
+    /// commit so the upstream `drop_close` condition stays visible.
     pub(crate) fn cleanup_orphan_fk_rows(&self) -> Result<OrphanFkCleanupReport> {
         let mut report = OrphanFkCleanupReport::default();
+        let mut to_delete: SmallVec<[&'static OrphanFkTable; 8]> = SmallVec::new();
         for entry in ORPHAN_FK_TABLES {
             let count: i64 = match self
                 .conn
@@ -3365,33 +3365,31 @@ impl FrankenStorage {
             };
             if count > 0 {
                 report.record(entry.child_table, count);
+                to_delete.push(entry);
             }
         }
 
-        if report.total == 0 {
+        if to_delete.is_empty() {
             return Ok(report);
         }
 
-        tracing::warn!(
-            target: "cass::fk_repair",
-            total_orphans = report.total,
-            per_table = ?report.per_table,
-            "removing orphan rows left behind by interrupted index transactions \
-             (cass#202 self-heal); see WARN-level drop_close events upstream"
-        );
-
         let mut tx = self.conn.transaction()?;
-        for entry in ORPHAN_FK_TABLES {
-            if !report
-                .per_table
-                .iter()
-                .any(|(t, _)| *t == entry.child_table)
-            {
-                continue;
-            }
+        for entry in &to_delete {
             tx.execute_compat(entry.delete_sql, fparams![])?;
         }
         tx.commit()?;
+
+        // WARN only fires after a successful commit so the message accurately
+        // reflects what actually happened on disk. db_path is included so logs
+        // from concurrent indexers against different databases stay
+        // disambiguated.
+        tracing::warn!(
+            target: "cass::fk_repair",
+            db_path = %self.db_path.display(),
+            total_orphans = report.total,
+            per_table = ?report.per_table,
+            "cass#202: removed orphan rows left behind by interrupted index transactions"
+        );
 
         Ok(report)
     }
@@ -4447,6 +4445,33 @@ pub struct InsertOutcome {
 
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
+struct MessageInsertSubstageProfile {
+    single_row_calls: usize,
+    batch_calls: usize,
+    batch_rows: usize,
+    payload_duration: Duration,
+    sql_build_duration: Duration,
+    param_build_duration: Duration,
+    execute_duration: Duration,
+    rowid_duration: Duration,
+}
+
+#[cfg(test)]
+impl MessageInsertSubstageProfile {
+    fn absorb(&mut self, other: &Self) {
+        self.single_row_calls += other.single_row_calls;
+        self.batch_calls += other.batch_calls;
+        self.batch_rows += other.batch_rows;
+        self.payload_duration += other.payload_duration;
+        self.sql_build_duration += other.sql_build_duration;
+        self.param_build_duration += other.param_build_duration;
+        self.execute_duration += other.execute_duration;
+        self.rowid_duration += other.rowid_duration;
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
 struct InsertConversationTreePerfProfile {
     invocations: usize,
     messages: usize,
@@ -4455,8 +4480,12 @@ struct InsertConversationTreePerfProfile {
     source_duration: Duration,
     tx_open_duration: Duration,
     existing_lookup_duration: Duration,
+    existing_idx_lookup_duration: Duration,
+    existing_replay_lookup_duration: Duration,
+    dedupe_filter_duration: Duration,
     conversation_row_duration: Duration,
     message_insert_duration: Duration,
+    message_insert_breakdown: MessageInsertSubstageProfile,
     snippet_insert_duration: Duration,
     fts_entry_duration: Duration,
     fts_flush_duration: Duration,
@@ -4475,6 +4504,9 @@ impl InsertConversationTreePerfProfile {
         let accounted_duration = self.source_duration
             + self.tx_open_duration
             + self.existing_lookup_duration
+            + self.existing_idx_lookup_duration
+            + self.existing_replay_lookup_duration
+            + self.dedupe_filter_duration
             + self.conversation_row_duration
             + self.message_insert_duration
             + self.snippet_insert_duration
@@ -4488,10 +4520,12 @@ impl InsertConversationTreePerfProfile {
                 "CASS_INSERT_TREE_STAGE_PROFILE ",
                 "label={} calls={} messages={} inserted_messages={} ",
                 "total_ms={:.3} source_ms={:.3} tx_open_ms={:.3} existing_lookup_ms={:.3} ",
+                "existing_idx_lookup_ms={:.3} existing_replay_lookup_ms={:.3} dedupe_filter_ms={:.3} ",
                 "conversation_row_ms={:.3} message_insert_ms={:.3} snippet_insert_ms={:.3} ",
                 "fts_entry_ms={:.3} fts_flush_ms={:.3} analytics_ms={:.3} commit_ms={:.3} ",
+                "msg_payload_ms={:.3} msg_sql_ms={:.3} msg_param_ms={:.3} msg_execute_ms={:.3} msg_rowid_ms={:.3} ",
                 "residual_ms={:.3} avg_total_ms={:.3} avg_message_insert_ms={:.3} ",
-                "avg_snippet_insert_ms={:.3} avg_fts_entry_ms={:.3} avg_commit_ms={:.3}"
+                "avg_msg_execute_ms={:.3} avg_msg_payload_ms={:.3} avg_snippet_insert_ms={:.3} avg_fts_entry_ms={:.3} avg_commit_ms={:.3}"
             ),
             label,
             self.invocations,
@@ -4501,6 +4535,9 @@ impl InsertConversationTreePerfProfile {
             Self::millis(self.source_duration),
             Self::millis(self.tx_open_duration),
             Self::millis(self.existing_lookup_duration),
+            Self::millis(self.existing_idx_lookup_duration),
+            Self::millis(self.existing_replay_lookup_duration),
+            Self::millis(self.dedupe_filter_duration),
             Self::millis(self.conversation_row_duration),
             Self::millis(self.message_insert_duration),
             Self::millis(self.snippet_insert_duration),
@@ -4508,9 +4545,16 @@ impl InsertConversationTreePerfProfile {
             Self::millis(self.fts_flush_duration),
             Self::millis(self.analytics_duration),
             Self::millis(self.commit_duration),
+            Self::millis(self.message_insert_breakdown.payload_duration),
+            Self::millis(self.message_insert_breakdown.sql_build_duration),
+            Self::millis(self.message_insert_breakdown.param_build_duration),
+            Self::millis(self.message_insert_breakdown.execute_duration),
+            Self::millis(self.message_insert_breakdown.rowid_duration),
             Self::millis(residual_duration),
             Self::millis(self.total_duration) / calls,
             Self::millis(self.message_insert_duration) / calls,
+            Self::millis(self.message_insert_breakdown.execute_duration) / calls,
+            Self::millis(self.message_insert_breakdown.payload_duration) / calls,
             Self::millis(self.snippet_insert_duration) / calls,
             Self::millis(self.fts_entry_duration) / calls,
             Self::millis(self.commit_duration) / calls,
@@ -6960,7 +7004,12 @@ impl FrankenStorage {
         }
 
         let message_insert_start = Instant::now();
-        let inserted_message_ids = franken_batch_insert_new_messages(&tx, conv_id, &new_messages)?;
+        let inserted_message_ids = franken_batch_insert_new_messages_with_profile(
+            &tx,
+            conv_id,
+            &new_messages,
+            &mut profile.message_insert_breakdown,
+        )?;
         profile.message_insert_duration += message_insert_start.elapsed();
 
         for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
@@ -7040,6 +7089,166 @@ impl FrankenStorage {
         Ok(InsertOutcome {
             conversation_id: conv_id,
             conversation_inserted: true,
+            inserted_indices,
+        })
+    }
+
+    #[cfg(test)]
+    fn append_existing_conversation_with_profile(
+        &self,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        conv: &Conversation,
+        profile: &mut InsertConversationTreePerfProfile,
+    ) -> Result<InsertOutcome> {
+        let total_start = Instant::now();
+        let normalized_conv = normalized_conversation_for_storage(conv);
+        let conv = normalized_conv.as_ref();
+
+        let source_start = Instant::now();
+        self.ensure_source_for_conversation(conv)?;
+        profile.source_duration += source_start.elapsed();
+
+        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
+        let defer_analytics_updates = defer_analytics_updates_enabled();
+        let conversation_key = conversation_merge_key(agent_id, conv);
+
+        let tx_open_start = Instant::now();
+        let mut tx = self.conn.transaction()?;
+        profile.tx_open_duration += tx_open_start.elapsed();
+
+        let existing_lookup_start = Instant::now();
+        let existing =
+            franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))?;
+        profile.existing_lookup_duration += existing_lookup_start.elapsed();
+        let existing_id = existing.ok_or_else(|| {
+            anyhow!("append profile helper expects existing conversation for {conversation_key:?}")
+        })?;
+
+        let existing_idx_lookup_start = Instant::now();
+        let mut existing_messages =
+            franken_existing_message_fingerprints_by_idx(&tx, existing_id, &conv.messages)?;
+        profile.existing_idx_lookup_duration += existing_idx_lookup_start.elapsed();
+
+        let existing_replay_lookup_start = Instant::now();
+        let mut existing_replay_fingerprints =
+            franken_existing_message_replay_fingerprints(&tx, existing_id, &conv.messages)?;
+        profile.existing_replay_lookup_duration += existing_replay_lookup_start.elapsed();
+
+        let dedupe_filter_start = Instant::now();
+        let ExistingConversationNewMessages {
+            messages: new_messages,
+            new_chars,
+            idx_collision_count,
+            first_collision_idx,
+        } = collect_new_messages_for_existing_conversation(
+            existing_id,
+            conv,
+            &mut existing_messages,
+            &mut existing_replay_fingerprints,
+            "skipping replay-equivalent profiled append message with shifted idx",
+        );
+        profile.dedupe_filter_duration += dedupe_filter_start.elapsed();
+
+        let mut inserted_indices = Vec::new();
+        let mut fts_entries = Vec::new();
+        let mut fts_pending_chars = 0usize;
+        let mut fts_inserted_total = 0usize;
+
+        let message_insert_start = Instant::now();
+        let inserted_message_ids = franken_batch_insert_new_messages_with_profile(
+            &tx,
+            existing_id,
+            &new_messages,
+            &mut profile.message_insert_breakdown,
+        )?;
+        profile.message_insert_duration += message_insert_start.elapsed();
+
+        for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
+            let snippet_insert_start = Instant::now();
+            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+            profile.snippet_insert_duration += snippet_insert_start.elapsed();
+
+            if !defer_lexical_updates {
+                let fts_entry_start = Instant::now();
+                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+                profile.fts_entry_duration += fts_entry_start.elapsed();
+                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                {
+                    let fts_flush_start = Instant::now();
+                    flush_pending_fts_entries(
+                        &tx,
+                        &mut fts_entries,
+                        &mut fts_pending_chars,
+                        &mut fts_inserted_total,
+                    )?;
+                    profile.fts_flush_duration += fts_flush_start.elapsed();
+                }
+            }
+
+            inserted_indices.push(msg.idx);
+        }
+
+        if idx_collision_count > 0 {
+            tracing::warn!(
+                conversation_id = existing_id,
+                collision_count = idx_collision_count,
+                first_idx = first_collision_idx,
+                source_path = %conv.source_path.display(),
+                "message idx collisions encountered while profiling append merge; retaining canonical message variants"
+            );
+        }
+
+        if !defer_lexical_updates {
+            let fts_flush_start = Instant::now();
+            flush_pending_fts_entries(
+                &tx,
+                &mut fts_entries,
+                &mut fts_pending_chars,
+                &mut fts_inserted_total,
+            )?;
+            profile.fts_flush_duration += fts_flush_start.elapsed();
+        }
+
+        if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
+            let conversation_row_start = Instant::now();
+            tx.execute_compat(
+                "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
+                fparams![last_ts, existing_id],
+            )?;
+            profile.conversation_row_duration += conversation_row_start.elapsed();
+        }
+
+        if !defer_analytics_updates && !inserted_indices.is_empty() {
+            let analytics_start = Instant::now();
+            franken_update_daily_stats_in_tx(
+                self,
+                &tx,
+                &conv.agent_slug,
+                &conv.source_id,
+                conversation_effective_started_at(conv),
+                StatsDelta {
+                    session_count_delta: 0,
+                    message_count_delta: inserted_indices.len() as i64,
+                    total_chars_delta: new_chars,
+                },
+            )?;
+            profile.analytics_duration += analytics_start.elapsed();
+        }
+
+        let commit_start = Instant::now();
+        tx.commit()?;
+        profile.commit_duration += commit_start.elapsed();
+        profile.invocations += 1;
+        profile.messages += conv.messages.len();
+        profile.inserted_messages += inserted_indices.len();
+        profile.total_duration += total_start.elapsed();
+
+        Ok(InsertOutcome {
+            conversation_id: existing_id,
+            conversation_inserted: false,
             inserted_indices,
         })
     }
@@ -9039,9 +9248,10 @@ fn franken_message_insert_payload(msg: &Message) -> Result<(Cow<'_, str>, Option
 
 /// Batch size for proven-new message inserts.
 ///
-/// Each row binds 8 values, so 100 rows stays well under SQLite's default
-/// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while still amortizing parse cost.
-const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
+/// Each row binds 8 values, so 20 rows stays well under SQLite's default
+/// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while keeping VALUE lists shorter
+/// on frankensqlite's current execute path.
+const MESSAGE_INSERT_BATCH_SIZE: usize = 20;
 
 fn franken_batch_insert_new_messages(
     tx: &FrankenTransaction<'_>,
@@ -9100,6 +9310,128 @@ fn franken_batch_insert_new_messages(
                 )
             })?;
         inserted_ids.extend((0..chunk.len()).map(|offset| first_id + offset as i64));
+    }
+
+    Ok(inserted_ids)
+}
+
+#[cfg(test)]
+fn franken_insert_new_message_with_profile(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    msg: &Message,
+    profile: &mut MessageInsertSubstageProfile,
+) -> Result<i64> {
+    profile.single_row_calls += 1;
+    profile.batch_rows += 1;
+
+    let payload_start = Instant::now();
+    let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
+    profile.payload_duration += payload_start.elapsed();
+    let extra_bin_bytes = extra_bin.as_deref();
+
+    let execute_start = Instant::now();
+    tx.execute_compat(
+        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        fparams![
+            conversation_id,
+            msg.idx,
+            role_str(&msg.role),
+            msg.author.as_deref(),
+            msg.created_at,
+            msg.content.as_str(),
+            extra_json_str.as_ref(),
+            extra_bin_bytes
+        ],
+    )?;
+    profile.execute_duration += execute_start.elapsed();
+
+    let rowid_start = Instant::now();
+    let rowid = franken_last_rowid(tx)?;
+    profile.rowid_duration += rowid_start.elapsed();
+    Ok(rowid)
+}
+
+#[cfg(test)]
+fn franken_batch_insert_new_messages_with_profile(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    messages: &[&Message],
+    profile: &mut MessageInsertSubstageProfile,
+) -> Result<Vec<i64>> {
+    let mut inserted_ids = Vec::with_capacity(messages.len());
+    for chunk in messages.chunks(MESSAGE_INSERT_BATCH_SIZE) {
+        if chunk.len() == 1 {
+            inserted_ids.push(franken_insert_new_message_with_profile(
+                tx,
+                conversation_id,
+                chunk[0],
+                profile,
+            )?);
+            continue;
+        }
+
+        profile.batch_calls += 1;
+        profile.batch_rows += chunk.len();
+
+        let sql_build_start = Instant::now();
+        let placeholders = (0..chunk.len())
+            .map(|idx| {
+                let base = idx * 8;
+                format!(
+                    "(?{},?{},?{},?{},?{},?{},?{},?{})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7,
+                    base + 8
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
+        );
+        profile.sql_build_duration += sql_build_start.elapsed();
+
+        let mut param_values: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 8);
+        for msg in chunk {
+            let payload_start = Instant::now();
+            let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
+            profile.payload_duration += payload_start.elapsed();
+
+            let param_build_start = Instant::now();
+            param_values.push(ParamValue::from(conversation_id));
+            param_values.push(ParamValue::from(msg.idx));
+            param_values.push(ParamValue::from(role_str(&msg.role)));
+            param_values.push(ParamValue::from(msg.author.as_deref()));
+            param_values.push(ParamValue::from(msg.created_at));
+            param_values.push(ParamValue::from(msg.content.as_str()));
+            param_values.push(ParamValue::from(extra_json_str.as_ref()));
+            param_values.push(ParamValue::from(extra_bin.as_deref()));
+            profile.param_build_duration += param_build_start.elapsed();
+        }
+
+        let execute_start = Instant::now();
+        tx.execute_compat(&sql, &param_values)?;
+        profile.execute_duration += execute_start.elapsed();
+
+        let rowid_start = Instant::now();
+        let last_id = franken_last_rowid(tx)?;
+        let first_id = last_id
+            .checked_sub((chunk.len() - 1) as i64)
+            .with_context(|| {
+                format!(
+                    "inferring rowid range for {}-row message batch ending at {last_id}",
+                    chunk.len()
+                )
+            })?;
+        inserted_ids.extend((0..chunk.len()).map(|offset| first_id + offset as i64));
+        profile.rowid_duration += rowid_start.elapsed();
     }
 
     Ok(inserted_ids)
@@ -13559,6 +13891,46 @@ mod tests {
         }
     }
 
+    fn make_profiled_append_remote_merge_conversation(
+        external_id: i64,
+        msg_count: usize,
+    ) -> Conversation {
+        let base_ts = 100_000 + external_id * 1_000;
+        Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/ws/profiled-append-remote")),
+            external_id: Some(format!("profiled-append-remote-{external_id}")),
+            title: Some(format!("Profiled append remote conversation {external_id}")),
+            source_path: PathBuf::from(format!("/log/profiled-append-remote-{external_id}.jsonl")),
+            started_at: Some(base_ts),
+            ended_at: Some(base_ts + msg_count as i64),
+            approx_tokens: Some(msg_count as i64 * 50),
+            metadata_json: serde_json::json!({ "bench": true }),
+            messages: (0..msg_count)
+                .map(|idx| Message {
+                    id: None,
+                    idx: idx as i64,
+                    role: if idx % 2 == 0 {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Agent
+                    },
+                    author: Some(format!("model-{}", external_id % 5)),
+                    created_at: Some(base_ts + idx as i64),
+                    content: format!(
+                        "Profiled append remote conversation {} message {}: Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
+                        external_id, idx
+                    ),
+                    extra_json: serde_json::json!({ "bench": true }),
+                    snippets: Vec::new(),
+                })
+                .collect(),
+            source_id: "profiled-append-remote-source".into(),
+            origin_host: Some("builder-profile".into()),
+        }
+    }
+
     #[test]
     fn insert_conversation_tree_batched_new_message_ids_match_snippet_rows() {
         let dir = TempDir::new().unwrap();
@@ -13818,6 +14190,83 @@ mod tests {
 
             if log_profile {
                 profile.log_summary(&format!("remote_reuse_{msg_count}_msgs"));
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn insert_conversation_tree_stage_profile_tracks_append_remote_source_merge() {
+        let _defer_guard = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let log_profile = dotenvy::var("CASS_INSERT_TREE_STAGE_PROFILE").is_ok();
+
+        for &(msg_count, iterations) in &[(5usize, 80usize), (20, 50), (50, 24)] {
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join(format!("append-profile-{msg_count}.db"));
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "codex".into(),
+                    name: "Codex".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let workspace = PathBuf::from("/ws/profiled-append-remote");
+            let workspace_id = storage.ensure_workspace(&workspace, None).unwrap();
+
+            for external_id in 0..iterations {
+                storage
+                    .insert_conversation_tree(
+                        agent_id,
+                        Some(workspace_id),
+                        &make_profiled_append_remote_merge_conversation(
+                            external_id as i64,
+                            msg_count,
+                        ),
+                    )
+                    .unwrap();
+            }
+
+            let mut profile = InsertConversationTreePerfProfile::default();
+            for external_id in 0..iterations {
+                storage
+                    .append_existing_conversation_with_profile(
+                        agent_id,
+                        Some(workspace_id),
+                        &make_profiled_append_remote_merge_conversation(
+                            external_id as i64,
+                            msg_count * 2,
+                        ),
+                        &mut profile,
+                    )
+                    .unwrap();
+            }
+
+            let accounted_duration = profile.source_duration
+                + profile.tx_open_duration
+                + profile.existing_lookup_duration
+                + profile.existing_idx_lookup_duration
+                + profile.existing_replay_lookup_duration
+                + profile.dedupe_filter_duration
+                + profile.conversation_row_duration
+                + profile.message_insert_duration
+                + profile.snippet_insert_duration
+                + profile.fts_entry_duration
+                + profile.fts_flush_duration
+                + profile.analytics_duration
+                + profile.commit_duration;
+            assert_eq!(profile.invocations, iterations);
+            assert_eq!(profile.messages, iterations * msg_count * 2);
+            assert_eq!(profile.inserted_messages, iterations * msg_count);
+            assert!(
+                profile.total_duration >= accounted_duration,
+                "accounted append stage durations cannot exceed total duration"
+            );
+
+            if log_profile {
+                profile.log_summary(&format!("append_remote_merge_{msg_count}_msgs"));
             }
         }
     }
@@ -20417,12 +20866,14 @@ mod tests {
                 .unwrap();
         }
 
-        // Plant an orphan snippet referencing a now-orphan message_id.
+        // Plant a directly-orphan snippet — message_id=99999 does not exist
+        // anywhere, so this exercises the snippets DELETE path rather than
+        // riding on the cascade from the orphan-message DELETE.
         storage
             .raw()
             .execute_compat(
                 "INSERT INTO snippets(message_id, file_path, start_line, end_line, language, snippet_text) \
-                 VALUES(101, '/tmp/orphan.rs', 1, 2, 'rust', 'fn main() {}')",
+                 VALUES(99999, '/tmp/orphan-snippet.rs', 1, 2, 'rust', 'fn main() {}')",
                 fparams![],
             )
             .unwrap();
@@ -20437,11 +20888,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!(messages_before, 4); // 1 real + 3 orphans
+        let snippets_before: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM snippets", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(snippets_before, 1);
 
         // Run the self-heal.
         let report = storage.cleanup_orphan_fk_rows().unwrap();
 
-        // The 3 orphan messages and the 1 orphan token_usage row should be gone.
+        // 3 orphan messages + 1 directly-orphan snippet = 4 deletions reported.
+        // The real message (id=1) must still be present afterwards.
         let messages_after: i64 = storage
             .raw()
             .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
@@ -20457,15 +20916,19 @@ mod tests {
             .unwrap();
         assert_eq!(snippets_after, 0);
 
-        assert!(report.total >= 3);
-        assert!(
-            report
-                .per_table
-                .iter()
-                .any(|(table, count)| *table == "messages" && *count == 3),
-            "report must record exactly 3 orphan messages: {:?}",
-            report.per_table
-        );
+        assert_eq!(report.total, 4, "report total: {:?}", report);
+        let messages_count = report
+            .per_table
+            .iter()
+            .find(|(t, _)| *t == "messages")
+            .map(|(_, c)| *c);
+        assert_eq!(messages_count, Some(3));
+        let snippets_count = report
+            .per_table
+            .iter()
+            .find(|(t, _)| *t == "snippets")
+            .map(|(_, c)| *c);
+        assert_eq!(snippets_count, Some(1));
 
         // Second invocation on a now-clean DB must be a no-op.
         let second = storage.cleanup_orphan_fk_rows().unwrap();
