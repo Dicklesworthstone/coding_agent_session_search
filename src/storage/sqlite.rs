@@ -2225,7 +2225,7 @@ fn is_backup_root_name(name: &str, prefix: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 15;
+pub const CURRENT_SCHEMA_VERSION: i64 = 14;
 const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
@@ -2431,6 +2431,9 @@ CREATE TABLE IF NOT EXISTS conversation_tags (
 
 CREATE INDEX IF NOT EXISTS idx_conversations_agent_started
     ON conversations(agent_id, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_messages_conv_idx
+    ON messages(conversation_id, idx);
 
 CREATE INDEX IF NOT EXISTS idx_messages_created
     ON messages(created_at);
@@ -2738,13 +2741,6 @@ const MIGRATION_V14: &str = r"
 -- The current contentless table is recreated lazily after open() only when the
 -- frankensqlite FTS consistency check finds it missing or malformed.
 DROP TABLE IF EXISTS fts_messages;
-";
-
-const MIGRATION_V15: &str = r"
--- `messages` already has UNIQUE(conversation_id, idx), which creates the
--- canonical lookup/order autoindex. Dropping the duplicate named index avoids
--- maintaining the same key twice on every message insert.
-DROP INDEX IF EXISTS idx_messages_conv_idx;
 ";
 
 /// Row from the embedding_jobs table.
@@ -3525,7 +3521,6 @@ fn build_cass_migrations() -> MigrationRunner {
     MigrationRunner::new()
         .add(13, "full_schema_v13", MIGRATION_FRESH_SCHEMA)
         .add(14, "fts_contentless", MIGRATION_V14)
-        .add(15, "drop_redundant_messages_conv_idx", MIGRATION_V15)
 }
 
 /// Combined V13 schema for fresh databases.
@@ -3875,6 +3870,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
 CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
+CREATE INDEX IF NOT EXISTS idx_messages_conv_idx ON messages(conversation_id, idx);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_id);
 CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
@@ -4239,7 +4235,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 15] = [
+const MIGRATION_NAMES: [(i64, &str); 14] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -4254,7 +4250,6 @@ const MIGRATION_NAMES: [(i64, &str); 15] = [
     (12, "model_dimensions"),
     (13, "plan_token_rollups"),
     (14, "fts_contentless"),
-    (15, "drop_redundant_messages_conv_idx"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -9177,7 +9172,6 @@ fn franken_insert_conversation_or_get_existing(
     {
         return Ok(ConversationInsertStatus::Existing(existing_id));
     }
-
     match franken_insert_conversation(tx, agent_id, workspace_id, conv) {
         Ok(Some(conv_id)) => Ok(ConversationInsertStatus::Inserted(conv_id)),
         Ok(None) => {

@@ -77,54 +77,6 @@ fn schema_version_uses_schema_migrations_after_open() {
 }
 
 #[test]
-fn open_applies_v15_drop_redundant_messages_idx_migration() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("drop_redundant_messages_idx.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
-
-    storage
-        .raw()
-        .execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_conv_idx ON messages(conversation_id, idx)",
-        )
-        .unwrap();
-    storage
-        .raw()
-        .execute_compat(
-            "DELETE FROM _schema_migrations WHERE version = ?1",
-            &[ParamValue::from(15_i64)],
-        )
-        .unwrap();
-    storage
-        .raw()
-        .execute_compat(
-            "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-            &[ParamValue::from("14")],
-        )
-        .unwrap();
-    drop(storage);
-
-    let reopened = SqliteStorage::open(&db_path).expect("reopen");
-    let message_indexes: Vec<String> = reopened
-        .raw()
-        .query_map_collect("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
-        .unwrap();
-
-    assert!(
-        !message_indexes.contains(&"idx_messages_conv_idx".to_string()),
-        "v15 migration should drop the redundant named message index, found: {message_indexes:?}"
-    );
-    assert!(
-        message_indexes.contains(&"sqlite_autoindex_messages_1".to_string()),
-        "messages UNIQUE(conversation_id, idx) autoindex should remain, found: {message_indexes:?}"
-    );
-    assert_eq!(
-        reopened.schema_version().unwrap(),
-        coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION
-    );
-}
-
-#[test]
 fn rebuild_fts_repopulates_rows() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("fts.db");
@@ -526,8 +478,8 @@ fn fresh_db_creates_all_indexes() {
         "messages UNIQUE(conversation_id, idx) autoindex should exist, found: {message_indexes:?}"
     );
     assert!(
-        !message_indexes.contains(&"idx_messages_conv_idx".to_string()),
-        "fresh schema should not create the redundant named message index, found: {message_indexes:?}"
+        message_indexes.contains(&"idx_messages_conv_idx".to_string()),
+        "fresh schema should create the named message index, found: {message_indexes:?}"
     );
 }
 
