@@ -2225,7 +2225,7 @@ fn is_backup_root_name(name: &str, prefix: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 14;
+pub const CURRENT_SCHEMA_VERSION: i64 = 15;
 const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
@@ -2431,9 +2431,6 @@ CREATE TABLE IF NOT EXISTS conversation_tags (
 
 CREATE INDEX IF NOT EXISTS idx_conversations_agent_started
     ON conversations(agent_id, started_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_messages_conv_idx
-    ON messages(conversation_id, idx);
 
 CREATE INDEX IF NOT EXISTS idx_messages_created
     ON messages(created_at);
@@ -2741,6 +2738,13 @@ const MIGRATION_V14: &str = r"
 -- The current contentless table is recreated lazily after open() only when the
 -- frankensqlite FTS consistency check finds it missing or malformed.
 DROP TABLE IF EXISTS fts_messages;
+";
+
+const MIGRATION_V15: &str = r"
+-- `messages` already has UNIQUE(conversation_id, idx), which creates the
+-- canonical lookup/order autoindex. Dropping the duplicate named index avoids
+-- maintaining the same key twice on every message insert.
+DROP INDEX IF EXISTS idx_messages_conv_idx;
 ";
 
 /// Row from the embedding_jobs table.
@@ -3521,6 +3525,7 @@ fn build_cass_migrations() -> MigrationRunner {
     MigrationRunner::new()
         .add(13, "full_schema_v13", MIGRATION_FRESH_SCHEMA)
         .add(14, "fts_contentless", MIGRATION_V14)
+        .add(15, "drop_redundant_messages_conv_idx", MIGRATION_V15)
 }
 
 /// Combined V13 schema for fresh databases.
@@ -3870,7 +3875,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
 CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
-CREATE INDEX IF NOT EXISTS idx_messages_conv_idx ON messages(conversation_id, idx);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_id);
 CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
@@ -4235,7 +4239,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 14] = [
+const MIGRATION_NAMES: [(i64, &str); 15] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -4250,6 +4254,7 @@ const MIGRATION_NAMES: [(i64, &str); 14] = [
     (12, "model_dimensions"),
     (13, "plan_token_rollups"),
     (14, "fts_contentless"),
+    (15, "drop_redundant_messages_conv_idx"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -6789,9 +6794,6 @@ impl FrankenStorage {
             franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))?;
         if let Some(existing_id) = existing {
             let outcome = self.franken_append_messages_in_tx(&tx, existing_id, conv)?;
-            if outcome.inserted_indices.is_empty() {
-                return Ok(outcome);
-            }
             tx.commit()?;
             return Ok(outcome);
         }
@@ -6853,14 +6855,6 @@ impl FrankenStorage {
                         source_path = %conv.source_path.display(),
                         "message idx collisions encountered while merging recovered conversation; retaining canonical message variants"
                     );
-                }
-
-                if inserted_indices.is_empty() {
-                    return Ok(InsertOutcome {
-                        conversation_id: existing_id,
-                        conversation_inserted: false,
-                        inserted_indices,
-                    });
                 }
 
                 if !defer_lexical_updates {
@@ -7289,17 +7283,6 @@ impl FrankenStorage {
             );
         }
 
-        if inserted_indices.is_empty() {
-            profile.invocations += 1;
-            profile.messages += conv.messages.len();
-            profile.total_duration += total_start.elapsed();
-            return Ok(InsertOutcome {
-                conversation_id: existing_id,
-                conversation_inserted: false,
-                inserted_indices,
-            });
-        }
-
         if !defer_lexical_updates {
             let fts_flush_start = Instant::now();
             flush_pending_fts_entries(
@@ -7422,14 +7405,6 @@ impl FrankenStorage {
                 source_path = %conv.source_path.display(),
                 "message idx collisions encountered while appending to an existing conversation; retaining canonical message variants"
             );
-        }
-
-        if inserted_indices.is_empty() {
-            return Ok(InsertOutcome {
-                conversation_id,
-                conversation_inserted: false,
-                inserted_indices,
-            });
         }
 
         if !defer_lexical_updates {
@@ -8358,9 +8333,7 @@ impl FrankenStorage {
                     );
                 }
 
-                if !inserted_indices.is_empty()
-                    && let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max()
-                {
+                if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
                     tx.execute_compat(
                         "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
                         fparams![last_ts, existing_id],
@@ -8484,9 +8457,8 @@ impl FrankenStorage {
                             );
                         }
 
-                        if !inserted_indices.is_empty()
-                            && let Some(last_ts) =
-                                conv.messages.iter().filter_map(|m| m.created_at).max()
+                        if let Some(last_ts) =
+                            conv.messages.iter().filter_map(|m| m.created_at).max()
                         {
                             tx.execute_compat(
                                 "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
@@ -14398,56 +14370,6 @@ mod tests {
                 profile.log_summary(&format!("append_remote_merge_{msg_count}_msgs"));
             }
         }
-    }
-
-    #[test]
-    #[serial]
-    fn append_existing_conversation_noop_skips_append_tail_write_work() {
-        let _defer_guard = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("append-noop-profile.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        let agent_id = storage
-            .ensure_agent(&Agent {
-                id: None,
-                slug: "codex".into(),
-                name: "Codex".into(),
-                version: None,
-                kind: AgentKind::Cli,
-            })
-            .unwrap();
-        let workspace = PathBuf::from("/ws/profiled-append-remote");
-        let workspace_id = storage.ensure_workspace(&workspace, None).unwrap();
-
-        let base = make_profiled_append_remote_merge_conversation(0, 5);
-        storage
-            .insert_conversation_tree(agent_id, Some(workspace_id), &base)
-            .unwrap();
-        let expanded = make_profiled_append_remote_merge_conversation(0, 10);
-        storage
-            .insert_conversation_tree(agent_id, Some(workspace_id), &expanded)
-            .unwrap();
-
-        let mut profile = InsertConversationTreePerfProfile::default();
-        let outcome = storage
-            .append_existing_conversation_with_profile(
-                agent_id,
-                Some(workspace_id),
-                &expanded,
-                &mut profile,
-            )
-            .unwrap();
-
-        assert!(
-            outcome.inserted_indices.is_empty(),
-            "already-merged conversations should not attempt duplicate appends"
-        );
-        assert_eq!(profile.invocations, 1);
-        assert_eq!(profile.messages, expanded.messages.len());
-        assert_eq!(profile.inserted_messages, 0);
-        assert_eq!(profile.conversation_row_duration, Duration::ZERO);
-        assert_eq!(profile.analytics_duration, Duration::ZERO);
-        assert_eq!(profile.commit_duration, Duration::ZERO);
     }
 
     #[test]
