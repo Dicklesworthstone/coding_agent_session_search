@@ -8901,6 +8901,7 @@ pub fn run_index(
         && let Err(err) = storage.cleanup_orphan_fk_rows()
     {
         tracing::warn!(
+            target: "cass::fk_repair",
             db_path = %opts.db_path.display(),
             error = %err,
             "cass#202: orphan FK self-heal failed; continuing index run (cleanup will retry next pass)"

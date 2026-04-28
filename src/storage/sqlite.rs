@@ -4423,7 +4423,14 @@ const ORPHAN_FK_TABLES: &[OrphanFkTable] = &[
     },
 ];
 
-/// Summary of what `cleanup_orphan_fk_rows` removed (or would have removed).
+/// Summary of orphan rows detected and removed by `cleanup_orphan_fk_rows`.
+///
+/// Counts come from the count-phase `SELECT COUNT(*)` rather than from the
+/// `DELETE`'s rows-changed return, so they reflect "orphans observed before
+/// the delete transaction started." Under the function's intended use (a
+/// single indexer-startup pass holding the index run lock), no concurrent
+/// writers exist and these counts match the rows actually removed plus any
+/// `ON DELETE CASCADE` descendants the engine reaped on top.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct OrphanFkCleanupReport {
     pub total: i64,
