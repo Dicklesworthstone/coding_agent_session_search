@@ -9255,10 +9255,9 @@ fn franken_message_insert_payload(msg: &Message) -> Result<(Cow<'_, str>, Option
 
 /// Batch size for proven-new message inserts.
 ///
-/// Each row binds 8 values, so 20 rows stays well under SQLite's default
-/// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while keeping VALUE lists shorter
-/// on frankensqlite's current execute path.
-const MESSAGE_INSERT_BATCH_SIZE: usize = 20;
+/// Each row binds 8 values, so 100 rows stays well under SQLite's default
+/// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while still amortizing parse cost.
+const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
 
 fn franken_batch_insert_new_messages(
     tx: &FrankenTransaction<'_>,
