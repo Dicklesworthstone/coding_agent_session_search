@@ -17268,7 +17268,7 @@ pub mod persist {
             let db_path = dir.path().join("checkpoint-policy.db");
             let storage = create_franken_db(&db_path);
 
-            assert_eq!(storage.index_writer_checkpoint_pages(), Some(1000));
+            assert_eq!(storage.index_writer_checkpoint_pages(), Some(4096));
 
             apply_index_writer_checkpoint_policy(&storage, true);
             let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();

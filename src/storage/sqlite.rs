@@ -2848,7 +2848,10 @@ pub struct FrankenStorage {
     fts_messages_present_cache: AtomicI8,
 }
 
-const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1000;
+/// Keep ordinary storage commits from tripping over frequent auto-checkpoints
+/// while still bounding WAL growth. Bulk index paths may override this through
+/// their explicit checkpoint policy.
+const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 4096;
 const UNSET_INDEX_WRITER_CHECKPOINT_PAGES: i64 = i64::MIN;
 const FTS_MESSAGES_PRESENT_UNKNOWN: i8 = 0;
 const FTS_MESSAGES_PRESENT_ABSENT: i8 = 1;
@@ -3261,9 +3264,11 @@ impl FrankenStorage {
         // backend), temp_store is always memory-resident and mmap_size does not
         // apply. Skipped intentionally — these are no-ops or errors.
 
-        // wal_autocheckpoint: frankensqlite manages WAL internally, but the
-        // PRAGMA is accepted for compatibility.
-        let _ = self.conn.execute("PRAGMA wal_autocheckpoint = 1000;");
+        // wal_autocheckpoint: use a bounded cadence that avoids checkpointing
+        // inside common append batches without deferring checkpoints forever.
+        let checkpoint_pragma =
+            format!("PRAGMA wal_autocheckpoint = {DEFAULT_WAL_AUTOCHECKPOINT_PAGES};");
+        let _ = self.conn.execute(&checkpoint_pragma);
         self.index_writer_checkpoint_pages
             .store(DEFAULT_WAL_AUTOCHECKPOINT_PAGES, Ordering::Relaxed);
         // Explicitly enable concurrent writer mode for BEGIN/transaction paths.
