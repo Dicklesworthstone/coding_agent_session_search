@@ -22400,23 +22400,45 @@ pub fn run_tui_ftui(
         model.macro_playback = Some(MacroPlayback::new(macro_data));
     }
 
-    // All paths use the native ftui backend (no crossterm compat).
-    let mut program = ftui::Program::with_native_backend(model, config)
-        .map_err(|e| anyhow::anyhow!("ftui program creation error: {e}"))?;
-
-    if macro_config.record_path.is_some() {
-        program.start_recording("cass-session");
-    }
-
-    let result = program.run();
-
-    // Save recorded macro on exit (only if recording was active).
-    if let Some(ref record_path) = macro_config.record_path
-        && let Some(recorded) = program.stop_recording()
-    {
-        macro_file::save_macro(record_path, &recorded, false)?;
-        eprintln!("Macro saved to: {}", record_path.display());
-    }
+    // Unix: native ftui-tty backend. Non-Unix (Windows): crossterm-compat —
+    // ftui_tty::TtyBackend is "Unix-first; Windows deferred", and on non-Unix
+    // `Program::with_native_backend` resolves to a headless 0x0 backend that
+    // produces no frames (frankentui#49 / cass#204). Mirrors the
+    // ftui-demo-showcase split.
+    let result = {
+        #[cfg(unix)]
+        {
+            let mut program = ftui::Program::with_native_backend(model, config)
+                .map_err(|e| anyhow::anyhow!("ftui program creation error: {e}"))?;
+            if macro_config.record_path.is_some() {
+                program.start_recording("cass-session");
+            }
+            let run_result = program.run();
+            if let Some(ref record_path) = macro_config.record_path
+                && let Some(recorded) = program.stop_recording()
+            {
+                macro_file::save_macro(record_path, &recorded, false)?;
+                eprintln!("Macro saved to: {}", record_path.display());
+            }
+            run_result
+        }
+        #[cfg(not(unix))]
+        {
+            let mut program = ftui::Program::with_config(model, config)
+                .map_err(|e| anyhow::anyhow!("ftui program creation error: {e}"))?;
+            if macro_config.record_path.is_some() {
+                program.start_recording("cass-session");
+            }
+            let run_result = program.run();
+            if let Some(ref record_path) = macro_config.record_path
+                && let Some(recorded) = program.stop_recording()
+            {
+                macro_file::save_macro(record_path, &recorded, false)?;
+                eprintln!("Macro saved to: {}", record_path.display());
+            }
+            run_result
+        }
+    };
 
     if let Some(recorder) = latency_trace {
         let mut trace = recorder
