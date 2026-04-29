@@ -3138,14 +3138,6 @@ impl FrankenStorage {
         self.ensured_daily_stats_keys.lock().contains(key)
     }
 
-    fn daily_stats_keys_already_ensured<const N: usize>(
-        &self,
-        keys: &[EnsuredDailyStatsKey; N],
-    ) -> bool {
-        let ensured_keys = self.ensured_daily_stats_keys.lock();
-        keys.iter().all(|key| ensured_keys.contains(key))
-    }
-
     fn mark_daily_stats_key_ensured(&self, key: EnsuredDailyStatsKey) {
         self.ensured_daily_stats_keys.lock().insert(key);
     }
@@ -10388,7 +10380,10 @@ fn franken_update_ensured_daily_stats_targets_in_tx(
     let cache_keys = targets.map(|target| {
         EnsuredDailyStatsKey::new(target.day_id, target.agent_slug, target.source_id)
     });
-    if !storage.daily_stats_keys_already_ensured(&cache_keys) {
+    if !cache_keys
+        .iter()
+        .all(|key| storage.daily_stats_key_already_ensured(key))
+    {
         return Ok(false);
     }
 
