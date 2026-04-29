@@ -4,7 +4,7 @@ use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, 
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow};
 use frankensqlite::{
-    Connection as FrankenConnection, Row as FrankenRow,
+    Connection as FrankenConnection, Row as FrankenRow, SqliteValue,
     compat::{
         ConnectionExt as FrankenConnectionExt, OpenFlags as FrankenOpenFlags,
         OptionalExtension as FrankenOptionalExtension, ParamValue, RowExt as FrankenRowExt,
@@ -9511,20 +9511,20 @@ fn franken_batch_insert_new_messages_with_batch_size(
             "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
         );
 
-        let mut param_values: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 8);
+        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 8);
         for msg in chunk {
             let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
-            param_values.push(ParamValue::from(conversation_id));
-            param_values.push(ParamValue::from(msg.idx));
-            param_values.push(ParamValue::from(role_str(&msg.role)));
-            param_values.push(ParamValue::from(msg.author.as_deref()));
-            param_values.push(ParamValue::from(msg.created_at));
-            param_values.push(ParamValue::from(msg.content.as_str()));
-            param_values.push(ParamValue::from(extra_json_str.as_ref()));
-            param_values.push(ParamValue::from(extra_bin.as_deref()));
+            param_values.push(SqliteValue::from(conversation_id));
+            param_values.push(SqliteValue::from(msg.idx));
+            param_values.push(SqliteValue::from(role_str(&msg.role)));
+            param_values.push(SqliteValue::from(msg.author.as_deref()));
+            param_values.push(SqliteValue::from(msg.created_at));
+            param_values.push(SqliteValue::from(msg.content.as_str()));
+            param_values.push(SqliteValue::from(extra_json_str.as_ref()));
+            param_values.push(SqliteValue::from(extra_bin.as_deref()));
         }
 
-        tx.execute_compat(&sql, &param_values)?;
+        tx.execute_with_params(&sql, &param_values)?;
 
         let last_id = franken_last_rowid(tx)?;
         let first_id = last_id
@@ -9658,26 +9658,26 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
         );
         profile.sql_build_duration += sql_build_start.elapsed();
 
-        let mut param_values: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 8);
+        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 8);
         for msg in chunk {
             let payload_start = Instant::now();
             let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
             profile.payload_duration += payload_start.elapsed();
 
             let param_build_start = Instant::now();
-            param_values.push(ParamValue::from(conversation_id));
-            param_values.push(ParamValue::from(msg.idx));
-            param_values.push(ParamValue::from(role_str(&msg.role)));
-            param_values.push(ParamValue::from(msg.author.as_deref()));
-            param_values.push(ParamValue::from(msg.created_at));
-            param_values.push(ParamValue::from(msg.content.as_str()));
-            param_values.push(ParamValue::from(extra_json_str.as_ref()));
-            param_values.push(ParamValue::from(extra_bin.as_deref()));
+            param_values.push(SqliteValue::from(conversation_id));
+            param_values.push(SqliteValue::from(msg.idx));
+            param_values.push(SqliteValue::from(role_str(&msg.role)));
+            param_values.push(SqliteValue::from(msg.author.as_deref()));
+            param_values.push(SqliteValue::from(msg.created_at));
+            param_values.push(SqliteValue::from(msg.content.as_str()));
+            param_values.push(SqliteValue::from(extra_json_str.as_ref()));
+            param_values.push(SqliteValue::from(extra_bin.as_deref()));
             profile.param_build_duration += param_build_start.elapsed();
         }
 
         let execute_start = Instant::now();
-        tx.execute_compat(&sql, &param_values)?;
+        tx.execute_with_params(&sql, &param_values)?;
         profile.execute_duration += execute_start.elapsed();
 
         let rowid_start = Instant::now();
@@ -9946,18 +9946,18 @@ fn franken_batch_insert_fts(tx: &FrankenTransaction<'_>, entries: &[FtsEntry]) -
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
         );
 
-        let mut param_values: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 7);
+        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 7);
         for entry in chunk {
-            param_values.push(ParamValue::from(entry.message_id));
-            param_values.push(ParamValue::from(entry.content.as_str()));
-            param_values.push(ParamValue::from(entry.title.as_str()));
-            param_values.push(ParamValue::from(entry.agent.as_str()));
-            param_values.push(ParamValue::from(entry.workspace.as_str()));
-            param_values.push(ParamValue::from(entry.source_path.as_str()));
-            param_values.push(ParamValue::from(entry.created_at));
+            param_values.push(SqliteValue::from(entry.message_id));
+            param_values.push(SqliteValue::from(entry.content.as_str()));
+            param_values.push(SqliteValue::from(entry.title.as_str()));
+            param_values.push(SqliteValue::from(entry.agent.as_str()));
+            param_values.push(SqliteValue::from(entry.workspace.as_str()));
+            param_values.push(SqliteValue::from(entry.source_path.as_str()));
+            param_values.push(SqliteValue::from(entry.created_at));
         }
 
-        match tx.execute_compat(&sql, &param_values) {
+        match tx.execute_with_params(&sql, &param_values) {
             Ok(_) => {
                 inserted += chunk.len();
             }
