@@ -10048,50 +10048,39 @@ fn franken_update_daily_stats_in_tx(
         .unwrap_or(0);
     let now = FrankenStorage::now_millis();
 
-    franken_apply_daily_stats_delta_in_tx(
-        storage,
-        tx,
+    let targets = [
         DailyStatsTarget {
             day_id,
             agent_slug,
             source_id,
         },
-        now,
-        delta,
-    )?;
-    franken_apply_daily_stats_delta_in_tx(
-        storage,
-        tx,
         DailyStatsTarget {
             day_id,
             agent_slug: "all",
             source_id,
         },
-        now,
-        delta,
-    )?;
-    franken_apply_daily_stats_delta_in_tx(
-        storage,
-        tx,
         DailyStatsTarget {
             day_id,
             agent_slug,
             source_id: "all",
         },
-        now,
-        delta,
-    )?;
-    franken_apply_daily_stats_delta_in_tx(
-        storage,
-        tx,
         DailyStatsTarget {
             day_id,
             agent_slug: "all",
             source_id: "all",
         },
-        now,
-        delta,
-    )?;
+    ];
+
+    if agent_slug != "all"
+        && source_id != "all"
+        && franken_update_ensured_daily_stats_targets_in_tx(storage, tx, &targets, now, delta)?
+    {
+        return Ok(());
+    }
+
+    for target in targets {
+        franken_apply_daily_stats_delta_in_tx(storage, tx, target, now, delta)?;
+    }
 
     Ok(())
 }
@@ -10101,6 +10090,85 @@ struct DailyStatsTarget<'a> {
     day_id: i64,
     agent_slug: &'a str,
     source_id: &'a str,
+}
+
+fn franken_update_ensured_daily_stats_targets_in_tx(
+    storage: &FrankenStorage,
+    tx: &FrankenTransaction<'_>,
+    targets: &[DailyStatsTarget<'_>; 4],
+    now: i64,
+    delta: StatsDelta,
+) -> Result<bool> {
+    let cache_keys = targets.map(|target| {
+        EnsuredDailyStatsKey::new(target.day_id, target.agent_slug, target.source_id)
+    });
+    if !cache_keys
+        .iter()
+        .all(|key| storage.daily_stats_key_already_ensured(key))
+    {
+        return Ok(false);
+    }
+
+    let primary = targets[0];
+    let rows_changed = tx.execute_compat(
+        "UPDATE daily_stats
+         SET session_count = session_count + ?4,
+             message_count = message_count + ?5,
+             total_chars = total_chars + ?6,
+             last_updated = ?7
+         WHERE day_id = ?1
+           AND (
+               (agent_slug = ?2 AND source_id = ?3)
+               OR (agent_slug = 'all' AND source_id = ?3)
+               OR (agent_slug = ?2 AND source_id = 'all')
+               OR (agent_slug = 'all' AND source_id = 'all')
+           )",
+        fparams![
+            primary.day_id,
+            primary.agent_slug,
+            primary.source_id,
+            delta.session_count_delta,
+            delta.message_count_delta,
+            delta.total_chars_delta,
+            now
+        ],
+    )?;
+    if rows_changed == targets.len() {
+        return Ok(true);
+    }
+
+    for (target, cache_key) in targets.iter().copied().zip(cache_keys) {
+        let exists = tx
+            .query_row_map(
+                "SELECT 1 FROM daily_stats
+                 WHERE day_id = ?1 AND agent_slug = ?2 AND source_id = ?3
+                 LIMIT 1",
+                fparams![target.day_id, target.agent_slug, target.source_id],
+                |row| row.get_typed::<i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if exists {
+            continue;
+        }
+
+        tx.execute_compat(
+            "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            fparams![
+                target.day_id,
+                target.agent_slug,
+                target.source_id,
+                delta.session_count_delta,
+                delta.message_count_delta,
+                delta.total_chars_delta,
+                now
+            ],
+        )?;
+        storage.mark_daily_stats_key_ensured(cache_key);
+    }
+
+    Ok(true)
 }
 
 fn franken_apply_daily_stats_delta_in_tx(
