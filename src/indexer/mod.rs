@@ -5985,7 +5985,6 @@ fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
 fn publish_direct_semantic_artifact(
     storage: &FrankenStorage,
     data_dir: &Path,
-    db_path: &Path,
     index_path: &Path,
     embedder_id: &str,
     embedder_dimension: usize,
@@ -6000,9 +5999,16 @@ fn publish_direct_semantic_artifact(
         return Ok(());
     };
 
-    let db_fingerprint = lexical_storage_fingerprint_for_db(db_path)?;
-    let total_conversations =
-        u64::try_from(count_total_conversations_exact(storage)?).unwrap_or(u64::MAX);
+    // Compute conversation count and fingerprint from the SAME storage
+    // handle so the manifest's `conversation_count` and the count
+    // embedded in `db_fingerprint` (the `content-v1:N:M:K` string) can
+    // never disagree by one. Also avoids re-opening the DB in
+    // `lexical_storage_fingerprint_for_db`, which is a no-op cost on
+    // SQLite but still pointless work.
+    let total_conversations_raw = count_total_conversations_exact(storage)?;
+    let db_fingerprint =
+        lexical_rebuild_content_fingerprint(storage, total_conversations_raw)?;
+    let total_conversations = u64::try_from(total_conversations_raw).unwrap_or(u64::MAX);
     let size_bytes = fs::metadata(index_path)
         .with_context(|| {
             format!(
@@ -9760,7 +9766,6 @@ pub fn run_index(
                 if let Err(err) = publish_direct_semantic_artifact(
                     &storage,
                     &opts.data_dir,
-                    &opts.db_path,
                     &index_path,
                     semantic_indexer.embedder_id(),
                     semantic_indexer.embedder_dimension(),
