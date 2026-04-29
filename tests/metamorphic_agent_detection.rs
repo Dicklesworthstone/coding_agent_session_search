@@ -106,7 +106,10 @@ fn mr_codex_scan_invariant_under_root_permutation() {
         &data_dir,
     );
     let order_ba = scan_codex_collected(
-        vec![ScanRoot::local(root_b.clone()), ScanRoot::local(root_a.clone())],
+        vec![
+            ScanRoot::local(root_b.clone()),
+            ScanRoot::local(root_a.clone()),
+        ],
         &data_dir,
     );
 
@@ -121,14 +124,20 @@ fn mr_codex_scan_invariant_under_root_permutation() {
         "expected to detect at least 4 codex sessions across both roots in order [A,B]; \
          got {} sessions: {:?}",
         order_ab.len(),
-        order_ab.iter().map(|c| c.source_path.display().to_string()).collect::<Vec<_>>()
+        order_ab
+            .iter()
+            .map(|c| c.source_path.display().to_string())
+            .collect::<Vec<_>>()
     );
     assert!(
         order_ba.len() >= 4,
         "expected to detect at least 4 codex sessions across both roots in order [B,A]; \
          got {} sessions: {:?}",
         order_ba.len(),
-        order_ba.iter().map(|c| c.source_path.display().to_string()).collect::<Vec<_>>()
+        order_ba
+            .iter()
+            .map(|c| c.source_path.display().to_string())
+            .collect::<Vec<_>>()
     );
 
     // The metamorphic relation: SET equality of stable identity
@@ -138,7 +147,8 @@ fn mr_codex_scan_invariant_under_root_permutation() {
     let set_ab: HashSet<ConversationKey> = order_ab.iter().map(key).collect();
     let set_ba: HashSet<ConversationKey> = order_ba.iter().map(key).collect();
     assert_eq!(
-        set_ab, set_ba,
+        set_ab,
+        set_ba,
         "metamorphic invariant violated: codex scan(roots=[A,B]) detected a different \
          SET of sessions than scan(roots=[B,A]).\n\
          only in [A,B]: {:?}\nonly in [B,A]: {:?}",

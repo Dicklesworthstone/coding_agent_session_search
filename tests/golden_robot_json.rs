@@ -860,8 +860,8 @@ fn stats_json_missing_db_error_envelope_shape_matches_golden() {
         ])
         .output()
         .expect("run cass stats --json");
-    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("stats error envelope is JSON on stdout");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stats error envelope is JSON on stdout");
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
     assert_golden("robot/stats_missing_db_shape.json.golden", &canonical);
@@ -1068,16 +1068,22 @@ fn export_html_shape_matches_golden() {
 #[test]
 fn doctor_json_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let scrubbed =
-        capture_robot_json(test_home.path(), &["doctor", "--json"], ExpectStatus::ExitOk);
+    let scrubbed = capture_robot_json(
+        test_home.path(),
+        &["doctor", "--json"],
+        ExpectStatus::ExitOk,
+    );
     assert_golden("robot/doctor.json.golden", &scrubbed);
 }
 
 #[test]
 fn status_shape_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let status =
-        capture_robot_json_value(test_home.path(), &["status", "--json"], ExpectStatus::ExitOk);
+    let status = capture_robot_json_value(
+        test_home.path(),
+        &["status", "--json"],
+        ExpectStatus::ExitOk,
+    );
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&status)).expect("pretty-print JSON");
     assert_golden("robot/status_shape.json.golden", &canonical);
@@ -1086,8 +1092,11 @@ fn status_shape_matches_golden() {
 #[test]
 fn doctor_shape_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let doctor =
-        capture_robot_json_value(test_home.path(), &["doctor", "--json"], ExpectStatus::ExitOk);
+    let doctor = capture_robot_json_value(
+        test_home.path(),
+        &["doctor", "--json"],
+        ExpectStatus::ExitOk,
+    );
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&doctor)).expect("pretty-print JSON");
     assert_golden("robot/doctor_shape.json.golden", &canonical);
@@ -1112,14 +1121,11 @@ fn sessions_json_missing_db_error_envelope_shape_matches_golden() {
         ])
         .output()
         .expect("run cass sessions --current --json");
-    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("sessions error envelope is JSON on stdout");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("sessions error envelope is JSON on stdout");
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
-    assert_golden(
-        "robot/sessions_missing_db_shape.json.golden",
-        &canonical,
-    );
+    assert_golden("robot/sessions_missing_db_shape.json.golden", &canonical);
 }
 
 #[test]

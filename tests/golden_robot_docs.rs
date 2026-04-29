@@ -128,10 +128,7 @@ fn robot_docs_schemas_matches_golden() {
 
 #[test]
 fn robot_docs_commands_matches_golden() {
-    assert_golden(
-        "robot_docs/commands.txt.golden",
-        &capture_docs("commands"),
-    );
+    assert_golden("robot_docs/commands.txt.golden", &capture_docs("commands"));
 }
 
 #[test]
@@ -141,10 +138,7 @@ fn robot_docs_guide_matches_golden() {
 
 #[test]
 fn robot_docs_examples_matches_golden() {
-    assert_golden(
-        "robot_docs/examples.txt.golden",
-        &capture_docs("examples"),
-    );
+    assert_golden("robot_docs/examples.txt.golden", &capture_docs("examples"));
 }
 
 #[test]

@@ -6006,8 +6006,7 @@ fn publish_direct_semantic_artifact(
     // `lexical_storage_fingerprint_for_db`, which is a no-op cost on
     // SQLite but still pointless work.
     let total_conversations_raw = count_total_conversations_exact(storage)?;
-    let db_fingerprint =
-        lexical_rebuild_content_fingerprint(storage, total_conversations_raw)?;
+    let db_fingerprint = lexical_rebuild_content_fingerprint(storage, total_conversations_raw)?;
     let total_conversations = u64::try_from(total_conversations_raw).unwrap_or(u64::MAX);
     let size_bytes = fs::metadata(index_path)
         .with_context(|| {
