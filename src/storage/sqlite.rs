@@ -4682,6 +4682,13 @@ struct ExistingConversationNewMessages<'a> {
     first_collision_idx: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExistingConversationTailState {
+    last_message_idx: i64,
+    last_message_created_at: i64,
+    ended_at: Option<i64>,
+}
+
 fn conversation_effective_started_at(conv: &Conversation) -> Option<i64> {
     conv.started_at
         .or_else(|| conv.messages.iter().filter_map(|msg| msg.created_at).min())
@@ -4816,16 +4823,21 @@ fn collect_new_messages_for_existing_conversation<'a>(
 fn franken_existing_conversation_append_tail_state(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
-) -> Result<Option<(i64, i64)>> {
-    let cached: (Option<i64>, Option<i64>) = tx.query_row_map(
-        "SELECT last_message_idx, last_message_created_at
+) -> Result<Option<ExistingConversationTailState>> {
+    let cached: (Option<i64>, Option<i64>, Option<i64>) = tx.query_row_map(
+        "SELECT last_message_idx, last_message_created_at, ended_at
          FROM conversations
          WHERE id = ?1",
         fparams![conversation_id],
-        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
     )?;
-    if let Some(state) = cached.0.zip(cached.1) {
-        return Ok(Some(state));
+    let (_, _, cached_ended_at) = cached;
+    if let Some((last_message_idx, last_message_created_at)) = cached.0.zip(cached.1) {
+        return Ok(Some(ExistingConversationTailState {
+            last_message_idx,
+            last_message_created_at,
+            ended_at: cached_ended_at,
+        }));
     }
 
     let (max_idx, max_created_at): (Option<i64>, Option<i64>) = tx.query_row_map(
@@ -4843,7 +4855,11 @@ fn franken_existing_conversation_append_tail_state(
             Some(last_message_idx),
             Some(last_message_created_at),
         )?;
-        return Ok(Some((last_message_idx, last_message_created_at)));
+        return Ok(Some(ExistingConversationTailState {
+            last_message_idx,
+            last_message_created_at,
+            ended_at: cached_ended_at,
+        }));
     }
     Ok(None)
 }
@@ -4883,6 +4899,29 @@ fn franken_update_conversation_tail_state(
             ended_at_candidate,
             last_message_idx_candidate,
             last_message_created_at_candidate,
+            conversation_id
+        ],
+    )?;
+    Ok(())
+}
+
+fn franken_set_conversation_tail_state_after_append(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    ended_at: i64,
+    last_message_idx: i64,
+    last_message_created_at: i64,
+) -> Result<()> {
+    tx.execute_compat(
+        "UPDATE conversations
+         SET ended_at = ?1,
+             last_message_idx = ?2,
+             last_message_created_at = ?3
+         WHERE id = ?4",
+        fparams![
+            ended_at,
+            last_message_idx,
+            last_message_created_at,
             conversation_id
         ],
     )?;
@@ -7358,13 +7397,16 @@ impl FrankenStorage {
         })?;
 
         let existing_idx_lookup_start = Instant::now();
-        let existing_plan = if let Some((existing_max_idx, existing_ended_at)) =
-            franken_existing_conversation_append_tail_state(&tx, existing_id)?
-        {
-            collect_append_only_tail_messages(conv, existing_max_idx, existing_ended_at)
-        } else {
-            None
-        };
+        let append_tail_state = franken_existing_conversation_append_tail_state(&tx, existing_id)?;
+        let append_tail_ended_at = append_tail_state.and_then(|state| state.ended_at);
+        let existing_plan = append_tail_state.as_ref().and_then(|state| {
+            collect_append_only_tail_messages(
+                conv,
+                state.last_message_idx,
+                state.last_message_created_at,
+            )
+        });
+        let used_append_tail_plan = existing_plan.is_some();
         profile.existing_idx_lookup_duration += existing_idx_lookup_start.elapsed();
 
         let dedupe_filter_start = Instant::now();
@@ -7457,14 +7499,38 @@ impl FrankenStorage {
         }
 
         let conversation_row_start = Instant::now();
-        let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
-        franken_update_conversation_tail_state(
-            &tx,
-            existing_id,
-            conv_last_ts,
-            inserted_last_idx,
-            inserted_last_created_at,
-        )?;
+        if used_append_tail_plan {
+            if let (Some(last_message_idx), Some(last_message_created_at)) =
+                (inserted_last_idx, inserted_last_created_at)
+            {
+                if append_tail_ended_at.is_none_or(|ended_at| ended_at <= last_message_created_at) {
+                    franken_set_conversation_tail_state_after_append(
+                        &tx,
+                        existing_id,
+                        last_message_created_at,
+                        last_message_idx,
+                        last_message_created_at,
+                    )?;
+                } else {
+                    franken_update_conversation_tail_state(
+                        &tx,
+                        existing_id,
+                        Some(last_message_created_at),
+                        inserted_last_idx,
+                        inserted_last_created_at,
+                    )?;
+                }
+            }
+        } else {
+            let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
+            franken_update_conversation_tail_state(
+                &tx,
+                existing_id,
+                conv_last_ts,
+                inserted_last_idx,
+                inserted_last_created_at,
+            )?;
+        }
         profile.conversation_row_duration += conversation_row_start.elapsed();
 
         if !defer_analytics_updates && !inserted_indices.is_empty() {
@@ -7508,13 +7574,17 @@ impl FrankenStorage {
     ) -> Result<InsertOutcome> {
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
         let defer_analytics_updates = defer_analytics_updates_enabled();
-        let append_plan = if let Some((existing_max_idx, existing_ended_at)) =
-            franken_existing_conversation_append_tail_state(tx, conversation_id)?
-        {
-            collect_append_only_tail_messages(conv, existing_max_idx, existing_ended_at)
-        } else {
-            None
-        };
+        let append_tail_state =
+            franken_existing_conversation_append_tail_state(tx, conversation_id)?;
+        let append_tail_ended_at = append_tail_state.and_then(|state| state.ended_at);
+        let append_plan = append_tail_state.as_ref().and_then(|state| {
+            collect_append_only_tail_messages(
+                conv,
+                state.last_message_idx,
+                state.last_message_created_at,
+            )
+        });
+        let used_append_tail_plan = append_plan.is_some();
         let ExistingConversationNewMessages {
             messages: new_messages,
             new_chars,
@@ -7584,14 +7654,38 @@ impl FrankenStorage {
             )?;
         }
 
-        let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
-        franken_update_conversation_tail_state(
-            tx,
-            conversation_id,
-            conv_last_ts,
-            inserted_last_idx,
-            inserted_last_created_at,
-        )?;
+        if used_append_tail_plan {
+            if let (Some(last_message_idx), Some(last_message_created_at)) =
+                (inserted_last_idx, inserted_last_created_at)
+            {
+                if append_tail_ended_at.is_none_or(|ended_at| ended_at <= last_message_created_at) {
+                    franken_set_conversation_tail_state_after_append(
+                        tx,
+                        conversation_id,
+                        last_message_created_at,
+                        last_message_idx,
+                        last_message_created_at,
+                    )?;
+                } else {
+                    franken_update_conversation_tail_state(
+                        tx,
+                        conversation_id,
+                        Some(last_message_created_at),
+                        inserted_last_idx,
+                        inserted_last_created_at,
+                    )?;
+                }
+            }
+        } else {
+            let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
+            franken_update_conversation_tail_state(
+                tx,
+                conversation_id,
+                conv_last_ts,
+                inserted_last_idx,
+                inserted_last_created_at,
+            )?;
+        }
 
         if !defer_analytics_updates && !inserted_indices.is_empty() {
             let message_count = inserted_indices.len() as i64;
@@ -19775,23 +19869,27 @@ mod tests {
             .unwrap();
         let conversation_id = insert_outcome.conversation_id;
 
-        let initial_tail: (Option<i64>, Option<i64>) = storage
+        let initial_tail: (Option<i64>, Option<i64>, Option<i64>) = storage
             .raw()
             .query_row_map(
-                "SELECT last_message_idx, last_message_created_at FROM conversations WHERE id = ?1",
+                "SELECT ended_at, last_message_idx, last_message_created_at
+                 FROM conversations
+                 WHERE id = ?1",
                 fparams![conversation_id],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
             )
             .unwrap();
-        assert_eq!(initial_tail, (Some(4), Some(111_004)));
+        assert_eq!(initial_tail, (Some(111_005), Some(4), Some(111_004)));
 
         storage
             .raw()
             .execute_compat(
                 "UPDATE conversations
-                 SET last_message_idx = NULL, last_message_created_at = NULL
-                 WHERE id = ?1",
-                fparams![conversation_id],
+                 SET ended_at = ?1,
+                     last_message_idx = NULL,
+                     last_message_created_at = NULL
+                 WHERE id = ?2",
+                fparams![111_999_i64, conversation_id],
             )
             .unwrap();
 
@@ -19801,15 +19899,17 @@ mod tests {
             .unwrap();
         assert_eq!(append_outcome.inserted_indices, vec![5, 6, 7, 8, 9]);
 
-        let final_tail: (Option<i64>, Option<i64>) = storage
+        let final_tail: (Option<i64>, Option<i64>, Option<i64>) = storage
             .raw()
             .query_row_map(
-                "SELECT last_message_idx, last_message_created_at FROM conversations WHERE id = ?1",
+                "SELECT ended_at, last_message_idx, last_message_created_at
+                 FROM conversations
+                 WHERE id = ?1",
                 fparams![conversation_id],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
             )
             .unwrap();
-        assert_eq!(final_tail, (Some(9), Some(111_009)));
+        assert_eq!(final_tail, (Some(111_999), Some(9), Some(111_009)));
     }
 
     #[test]
