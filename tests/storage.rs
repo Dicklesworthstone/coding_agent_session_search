@@ -478,8 +478,45 @@ fn fresh_db_creates_all_indexes() {
         "messages UNIQUE(conversation_id, idx) autoindex should exist, found: {message_indexes:?}"
     );
     assert!(
-        message_indexes.contains(&"idx_messages_conv_idx".to_string()),
-        "fresh schema should create the named message index, found: {message_indexes:?}"
+        !message_indexes.contains(&"idx_messages_conv_idx".to_string()),
+        "fresh schema should not retain redundant idx_messages_conv_idx, found: {message_indexes:?}"
+    );
+}
+
+#[test]
+fn migration_v16_drops_redundant_message_conv_idx() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("v16_drop_redundant_idx.db");
+    {
+        let storage = SqliteStorage::open(&db_path).expect("open");
+        storage
+            .raw()
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_conv_idx ON messages(conversation_id, idx)",
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute("DELETE FROM _schema_migrations WHERE version = 16")
+            .unwrap();
+        storage
+            .raw()
+            .execute("UPDATE meta SET value = '15' WHERE key = 'schema_version'")
+            .unwrap();
+    }
+
+    let storage = SqliteStorage::open(&db_path).expect("reopen migrated db");
+    let message_indexes: Vec<String> = storage
+        .raw()
+        .query_map_collect("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
+        .unwrap();
+    assert!(
+        message_indexes.contains(&"sqlite_autoindex_messages_1".to_string()),
+        "v16 must retain the UNIQUE(conversation_id, idx) autoindex, found: {message_indexes:?}"
+    );
+    assert!(
+        !message_indexes.contains(&"idx_messages_conv_idx".to_string()),
+        "v16 should drop the redundant named message index, found: {message_indexes:?}"
     );
 }
 

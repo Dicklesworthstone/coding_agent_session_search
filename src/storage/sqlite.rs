@@ -2227,7 +2227,7 @@ fn is_backup_root_name(name: &str, prefix: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 15;
+pub const CURRENT_SCHEMA_VERSION: i64 = 16;
 const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
@@ -2762,6 +2762,13 @@ SET last_message_idx = (
         FROM messages m
         WHERE m.conversation_id = conversations.id
     );
+";
+
+const MIGRATION_V16: &str = r"
+-- UNIQUE(conversation_id, idx) already creates sqlite_autoindex_messages_1,
+-- which covers the same lookup/order key as idx_messages_conv_idx. Keeping both
+-- doubles message insert index maintenance on the hot indexing path.
+DROP INDEX IF EXISTS idx_messages_conv_idx;
 ";
 
 /// Row from the embedding_jobs table.
@@ -3596,6 +3603,7 @@ fn build_cass_migrations() -> MigrationRunner {
         .add(13, "full_schema_v13", MIGRATION_FRESH_SCHEMA)
         .add(14, "fts_contentless", MIGRATION_V14)
         .add(15, "conversation_tail_state_cache", MIGRATION_V15)
+        .add(16, "drop_redundant_message_conv_idx", MIGRATION_V16)
 }
 
 /// Combined V13 schema for fresh databases.
@@ -3945,7 +3953,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
 CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
-CREATE INDEX IF NOT EXISTS idx_messages_conv_idx ON messages(conversation_id, idx);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_id);
 CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
