@@ -2930,6 +2930,8 @@ pub struct FrankenStorage {
     ephemeral_writer_preflight_verified: AtomicBool,
     index_writer_checkpoint_pages: AtomicI64,
     cached_ephemeral_writer: parking_lot::Mutex<CachedEphemeralWriter>,
+    ensured_agents: Arc<parking_lot::Mutex<HashMap<EnsuredAgentKey, i64>>>,
+    ensured_workspaces: Arc<parking_lot::Mutex<HashMap<EnsuredWorkspaceKey, i64>>>,
     ensured_conversation_sources: Arc<parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>>,
     ensured_daily_stats_keys: Arc<parking_lot::Mutex<HashSet<EnsuredDailyStatsKey>>>,
     fts_messages_present_cache: AtomicI8,
@@ -2948,6 +2950,40 @@ enum CachedEphemeralWriter {
     Uninitialized,
     Cached(Box<SendFrankenConnection>),
     InUse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EnsuredAgentKey {
+    slug: String,
+    name: String,
+    version: Option<String>,
+    kind: String,
+}
+
+impl EnsuredAgentKey {
+    fn from_agent(agent: &Agent) -> Self {
+        Self {
+            slug: agent.slug.clone(),
+            name: agent.name.clone(),
+            version: agent.version.clone(),
+            kind: agent_kind_str(agent.kind.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EnsuredWorkspaceKey {
+    path: String,
+    display_name: Option<String>,
+}
+
+impl EnsuredWorkspaceKey {
+    fn new(path: String, display_name: Option<&str>) -> Self {
+        Self {
+            path,
+            display_name: display_name.map(str::to_owned),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3026,6 +3062,8 @@ impl FrankenStorage {
         Self::new_with_shared_caches(
             conn,
             db_path,
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
             Arc::new(parking_lot::Mutex::new(HashSet::new())),
             Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
@@ -3034,6 +3072,8 @@ impl FrankenStorage {
     fn new_with_shared_caches(
         conn: FrankenConnection,
         db_path: PathBuf,
+        ensured_agents: Arc<parking_lot::Mutex<HashMap<EnsuredAgentKey, i64>>>,
+        ensured_workspaces: Arc<parking_lot::Mutex<HashMap<EnsuredWorkspaceKey, i64>>>,
         ensured_conversation_sources: Arc<
             parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>,
         >,
@@ -3045,6 +3085,8 @@ impl FrankenStorage {
             ephemeral_writer_preflight_verified: AtomicBool::new(false),
             index_writer_checkpoint_pages: AtomicI64::new(UNSET_INDEX_WRITER_CHECKPOINT_PAGES),
             cached_ephemeral_writer: parking_lot::Mutex::new(CachedEphemeralWriter::Uninitialized),
+            ensured_agents,
+            ensured_workspaces,
             ensured_conversation_sources,
             ensured_daily_stats_keys,
             fts_messages_present_cache: AtomicI8::new(FTS_MESSAGES_PRESENT_UNKNOWN),
@@ -3090,6 +3132,8 @@ impl FrankenStorage {
     pub fn open_writer(path: &Path) -> Result<Self> {
         Self::open_writer_with_shared_caches(
             path,
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
             Arc::new(parking_lot::Mutex::new(HashSet::new())),
             Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
@@ -3097,6 +3141,8 @@ impl FrankenStorage {
 
     fn open_writer_with_shared_caches(
         path: &Path,
+        ensured_agents: Arc<parking_lot::Mutex<HashMap<EnsuredAgentKey, i64>>>,
+        ensured_workspaces: Arc<parking_lot::Mutex<HashMap<EnsuredWorkspaceKey, i64>>>,
         ensured_conversation_sources: Arc<
             parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>,
         >,
@@ -3108,6 +3154,8 @@ impl FrankenStorage {
         let storage = Self::new_with_shared_caches(
             conn,
             path.to_path_buf(),
+            ensured_agents,
+            ensured_workspaces,
             ensured_conversation_sources,
             ensured_daily_stats_keys,
         );
@@ -3122,6 +3170,8 @@ impl FrankenStorage {
                 Self::new_with_shared_caches(
                     (*conn).into_inner(),
                     self.db_path.clone(),
+                    Arc::clone(&self.ensured_agents),
+                    Arc::clone(&self.ensured_workspaces),
                     Arc::clone(&self.ensured_conversation_sources),
                     Arc::clone(&self.ensured_daily_stats_keys),
                 ),
@@ -3131,6 +3181,8 @@ impl FrankenStorage {
                 drop(cached);
                 match Self::open_writer_with_shared_caches(
                     &self.db_path,
+                    Arc::clone(&self.ensured_agents),
+                    Arc::clone(&self.ensured_workspaces),
                     Arc::clone(&self.ensured_conversation_sources),
                     Arc::clone(&self.ensured_daily_stats_keys),
                 ) {
@@ -3150,6 +3202,8 @@ impl FrankenStorage {
                 Ok((
                     Self::open_writer_with_shared_caches(
                         &self.db_path,
+                        Arc::clone(&self.ensured_agents),
+                        Arc::clone(&self.ensured_workspaces),
                         Arc::clone(&self.ensured_conversation_sources),
                         Arc::clone(&self.ensured_daily_stats_keys),
                     )?,
@@ -3175,6 +3229,22 @@ impl FrankenStorage {
         if matches!(&*cached, CachedEphemeralWriter::InUse) {
             *cached = CachedEphemeralWriter::Uninitialized;
         }
+    }
+
+    fn cached_agent_id(&self, key: &EnsuredAgentKey) -> Option<i64> {
+        self.ensured_agents.lock().get(key).copied()
+    }
+
+    fn mark_agent_ensured(&self, key: EnsuredAgentKey, id: i64) {
+        self.ensured_agents.lock().insert(key, id);
+    }
+
+    fn cached_workspace_id(&self, key: &EnsuredWorkspaceKey) -> Option<i64> {
+        self.ensured_workspaces.lock().get(key).copied()
+    }
+
+    fn mark_workspace_ensured(&self, key: EnsuredWorkspaceKey, id: i64) {
+        self.ensured_workspaces.lock().insert(key, id);
     }
 
     fn conversation_source_already_ensured(&self, key: &EnsuredConversationSourceKey) -> bool {
@@ -5355,8 +5425,12 @@ pub struct MessageForEmbedding {
 impl FrankenStorage {
     /// Ensure an agent exists in the database, returning its ID.
     pub fn ensure_agent(&self, agent: &Agent) -> Result<i64> {
+        let cache_key = EnsuredAgentKey::from_agent(agent);
+        if let Some(id) = self.cached_agent_id(&cache_key) {
+            return Ok(id);
+        }
+
         let now = Self::now_millis();
-        let kind = agent_kind_str(agent.kind.clone());
         self.conn.execute_compat(
             "INSERT INTO agents(slug, name, version, kind, created_at, updated_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6)
@@ -5374,24 +5448,32 @@ impl FrankenStorage {
                 agent.slug.as_str(),
                 agent.name.as_str(),
                 agent.version.as_deref(),
-                kind.as_str(),
+                cache_key.kind.as_str(),
                 now,
                 now
             ],
         )?;
 
-        self.conn
+        let id = self
+            .conn
             .query_row_map(
                 "SELECT id FROM agents WHERE slug = ?1 LIMIT 1",
                 fparams![agent.slug.as_str()],
                 |row| row.get_typed(0),
             )
-            .with_context(|| format!("fetching agent id for {}", agent.slug))
+            .with_context(|| format!("fetching agent id for {}", agent.slug))?;
+        self.mark_agent_ensured(cache_key, id);
+        Ok(id)
     }
 
     /// Ensure a workspace exists in the database, returning its ID.
     pub fn ensure_workspace(&self, path: &Path, display_name: Option<&str>) -> Result<i64> {
         let path_str = path.to_string_lossy().to_string();
+        let cache_key = EnsuredWorkspaceKey::new(path_str.clone(), display_name);
+        if let Some(id) = self.cached_workspace_id(&cache_key) {
+            return Ok(id);
+        }
+
         if let Some(display_name) = display_name {
             self.conn.execute_compat(
                 "INSERT INTO workspaces(path, display_name)
@@ -5408,13 +5490,16 @@ impl FrankenStorage {
             )?;
         }
 
-        self.conn
+        let id = self
+            .conn
             .query_row_map(
                 "SELECT id FROM workspaces WHERE path = ?1 LIMIT 1",
                 fparams![path_str.as_str()],
                 |row| row.get_typed(0),
             )
-            .with_context(|| format!("fetching workspace id for {path_str}"))
+            .with_context(|| format!("fetching workspace id for {path_str}"))?;
+        self.mark_workspace_ensured(cache_key, id);
+        Ok(id)
     }
 
     /// Get current time as milliseconds since epoch.
@@ -19845,6 +19930,38 @@ mod tests {
     }
 
     #[test]
+    fn ensure_agent_changed_metadata_updates_cached_slug() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let mut agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("1.0".into()),
+            kind: AgentKind::Cli,
+        };
+
+        let id1 = storage.ensure_agent(&agent).unwrap();
+        agent.name = "Codex CLI".into();
+        agent.version = Some("1.1".into());
+        let id2 = storage.ensure_agent(&agent).unwrap();
+
+        let fetched: (String, Option<String>) = storage
+            .conn
+            .query_row_map(
+                "SELECT name, version FROM agents WHERE slug = ?1",
+                fparams![agent.slug.as_str()],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(id1, id2);
+        assert_eq!(fetched, ("Codex CLI".into(), Some("1.1".into())));
+    }
+
+    #[test]
     fn list_agents_returns_inserted() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
@@ -19889,6 +20006,29 @@ mod tests {
         let id1 = storage.ensure_workspace(path, None).unwrap();
         let id2 = storage.ensure_workspace(path, None).unwrap();
         assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn ensure_workspace_changed_display_name_updates_cached_path() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let path = Path::new("/home/user/myproject");
+        let id1 = storage.ensure_workspace(path, Some("Before")).unwrap();
+        let id2 = storage.ensure_workspace(path, Some("After")).unwrap();
+
+        let display_name: Option<String> = storage
+            .conn
+            .query_row_map(
+                "SELECT display_name FROM workspaces WHERE path = ?1",
+                fparams![path.to_string_lossy().as_ref()],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        assert_eq!(id1, id2);
+        assert_eq!(display_name.as_deref(), Some("After"));
     }
 
     #[test]
