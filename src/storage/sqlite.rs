@@ -2227,7 +2227,7 @@ fn is_backup_root_name(name: &str, prefix: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 16;
+pub const CURRENT_SCHEMA_VERSION: i64 = 17;
 const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
@@ -2437,8 +2437,6 @@ CREATE INDEX IF NOT EXISTS idx_conversations_agent_started
 CREATE INDEX IF NOT EXISTS idx_messages_conv_idx
     ON messages(conversation_id, idx);
 
-CREATE INDEX IF NOT EXISTS idx_messages_created
-    ON messages(created_at);
 ";
 
 #[cfg(test)]
@@ -2769,6 +2767,14 @@ const MIGRATION_V16: &str = r"
 -- which covers the same lookup/order key as idx_messages_conv_idx. Keeping both
 -- doubles message insert index maintenance on the hot indexing path.
 DROP INDEX IF EXISTS idx_messages_conv_idx;
+";
+
+const MIGRATION_V17: &str = r"
+-- Drop the global messages(created_at) secondary index from the ingest hot
+-- path. Search/time filters are served by the derived search layer and
+-- conversation/analytics indexes, while this index is maintained on every
+-- message insert.
+DROP INDEX IF EXISTS idx_messages_created;
 ";
 
 /// Row from the embedding_jobs table.
@@ -3333,9 +3339,8 @@ impl FrankenStorage {
     /// V5 migration which uses `DROP TABLE` — an operation that triggers a known
     /// frankensqlite autoindex limitation.
     ///
-    /// Existing databases (transitioned from SqliteStorage) are typically at V13
-    /// already, so no further migrations are needed. For databases at V5-V12,
-    /// the additive V6-V13 migrations are applied normally.
+    /// Existing databases (transitioned from SqliteStorage) are typically at
+    /// V13 or newer already; additive post-V13 migrations are applied normally.
     pub fn run_migrations(&self) -> Result<()> {
         transition_from_meta_version(&self.conn)?;
 
@@ -3595,15 +3600,16 @@ impl FrankenStorage {
 /// in sqlite_master are not properly cleaned up during DROP TABLE, causing
 /// "sqlite_master entry not found" errors.
 ///
-/// For existing databases transitioned from SqliteStorage (typically at V13),
-/// the transition function backfills `_schema_migrations` and no further
-/// migrations are needed.
+/// For existing databases transitioned from SqliteStorage, the transition
+/// function backfills `_schema_migrations`; post-V13 additive migrations then
+/// run normally.
 fn build_cass_migrations() -> MigrationRunner {
     MigrationRunner::new()
         .add(13, "full_schema_v13", MIGRATION_FRESH_SCHEMA)
         .add(14, "fts_contentless", MIGRATION_V14)
         .add(15, "conversation_tail_state_cache", MIGRATION_V15)
         .add(16, "drop_redundant_message_conv_idx", MIGRATION_V16)
+        .add(17, "drop_message_created_idx", MIGRATION_V17)
 }
 
 /// Combined V13 schema for fresh databases.
@@ -3953,7 +3959,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
 CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
-CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_id);
 CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
 CREATE INDEX IF NOT EXISTS idx_token_usage_day ON token_usage(day_id, agent_id);
@@ -20565,16 +20570,17 @@ mod tests {
             );
         }
 
-        // Fresh frankensqlite databases should record both applied migrations:
-        // the combined V13 base schema and the V14 contentless FTS upgrade.
+        // Fresh frankensqlite databases should record the combined V13 base
+        // schema plus every additive post-V13 migration.
         let rows = storage
             .raw()
             .query("SELECT COUNT(*) FROM _schema_migrations;")
             .unwrap();
         let count: i64 = rows.first().unwrap().get_typed(0).unwrap();
         assert_eq!(
-            count, 2,
-            "_schema_migrations should record the V13 base schema and V14 FTS migration"
+            count,
+            (13..=CURRENT_SCHEMA_VERSION).count() as i64,
+            "_schema_migrations should record the V13 base schema and post-V13 migrations"
         );
 
         // The latest applied migration should be the current schema version.
@@ -20589,8 +20595,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             versions,
-            vec![13, 14],
-            "_schema_migrations should contain v13 and v14"
+            (13..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),
+            "_schema_migrations should contain v13 through current"
         );
     }
 
@@ -21083,10 +21089,10 @@ mod tests {
         assert!(result.was_fresh);
         assert_eq!(
             result.applied,
-            vec![13, 14],
-            "should apply combined V13 + FTS contentless V14"
+            (13..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),
+            "should apply combined V13 plus additive post-V13 migrations"
         );
-        assert_eq!(result.current, 14);
+        assert_eq!(result.current, CURRENT_SCHEMA_VERSION);
     }
 
     #[test]

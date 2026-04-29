@@ -465,8 +465,8 @@ fn fresh_db_creates_all_indexes() {
         "idx_conversations_agent_started index exists"
     );
     assert!(
-        indexes.contains(&"idx_messages_created".to_string()),
-        "idx_messages_created index exists"
+        !indexes.contains(&"idx_messages_created".to_string()),
+        "fresh schema should not create write-heavy idx_messages_created, found: {indexes:?}"
     );
 
     let message_indexes: Vec<String> = storage
@@ -517,6 +517,37 @@ fn migration_v16_drops_redundant_message_conv_idx() {
     assert!(
         !message_indexes.contains(&"idx_messages_conv_idx".to_string()),
         "v16 should drop the redundant named message index, found: {message_indexes:?}"
+    );
+}
+
+#[test]
+fn migration_v17_drops_message_created_idx() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("v17_drop_message_created_idx.db");
+    {
+        let storage = SqliteStorage::open(&db_path).expect("open");
+        storage
+            .raw()
+            .execute("CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)")
+            .unwrap();
+        storage
+            .raw()
+            .execute("DELETE FROM _schema_migrations WHERE version = 17")
+            .unwrap();
+        storage
+            .raw()
+            .execute("UPDATE meta SET value = '16' WHERE key = 'schema_version'")
+            .unwrap();
+    }
+
+    let storage = SqliteStorage::open(&db_path).expect("reopen migrated db");
+    let message_indexes: Vec<String> = storage
+        .raw()
+        .query_map_collect("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
+        .unwrap();
+    assert!(
+        !message_indexes.contains(&"idx_messages_created".to_string()),
+        "v17 should drop the write-heavy created_at index, found: {message_indexes:?}"
     );
 }
 
