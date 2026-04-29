@@ -2227,7 +2227,7 @@ fn is_backup_root_name(name: &str, prefix: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 17;
+pub const CURRENT_SCHEMA_VERSION: i64 = 18;
 const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
@@ -2775,6 +2775,29 @@ const MIGRATION_V17: &str = r"
 -- conversation/analytics indexes, while this index is maintained on every
 -- message insert.
 DROP INDEX IF EXISTS idx_messages_created;
+";
+
+const MIGRATION_V18: &str = r"
+-- Move append-tail state out of the wide, indexed conversations row. The hot
+-- append path updates this cache for every appended conversation; keeping it in
+-- a tiny rowid table avoids rewriting the large conversation record.
+CREATE TABLE IF NOT EXISTS conversation_tail_state (
+    -- Deliberately no FOREIGN KEY: this hot row is maintained by insert/append
+    -- paths, and FK metadata keeps frankensqlite off the direct rowid update path.
+    conversation_id INTEGER PRIMARY KEY,
+    ended_at INTEGER,
+    last_message_idx INTEGER,
+    last_message_created_at INTEGER
+);
+
+INSERT OR REPLACE INTO conversation_tail_state (
+    conversation_id, ended_at, last_message_idx, last_message_created_at
+)
+SELECT id, ended_at, last_message_idx, last_message_created_at
+FROM conversations
+WHERE ended_at IS NOT NULL
+   OR last_message_idx IS NOT NULL
+   OR last_message_created_at IS NOT NULL;
 ";
 
 /// Row from the embedding_jobs table.
@@ -3610,6 +3633,7 @@ fn build_cass_migrations() -> MigrationRunner {
         .add(15, "conversation_tail_state_cache", MIGRATION_V15)
         .add(16, "drop_redundant_message_conv_idx", MIGRATION_V16)
         .add(17, "drop_message_created_idx", MIGRATION_V17)
+        .add(18, "conversation_tail_state_hot_table", MIGRATION_V18)
 }
 
 /// Combined V13 schema for fresh databases.
@@ -4707,8 +4731,6 @@ struct ExistingConversationWithTail {
     tail_state: Option<ExistingConversationTailState>,
 }
 
-type ExistingConversationTailRow = (i64, Option<i64>, Option<i64>, Option<i64>);
-
 fn conversation_effective_started_at(conv: &Conversation) -> Option<i64> {
     conv.started_at
         .or_else(|| conv.messages.iter().filter_map(|msg| msg.created_at).min())
@@ -4844,17 +4866,44 @@ fn franken_existing_conversation_append_tail_state(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
 ) -> Result<Option<ExistingConversationTailState>> {
-    let cached: (Option<i64>, Option<i64>, Option<i64>) = tx.query_row_map(
+    let cached: Option<(Option<i64>, Option<i64>, Option<i64>)> = tx
+        .query_row_map(
+            "SELECT last_message_idx, last_message_created_at, ended_at
+             FROM conversation_tail_state
+             WHERE conversation_id = ?1",
+            fparams![conversation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )
+        .optional()?;
+    if let Some(cached) = cached {
+        let (_, _, cached_ended_at) = cached;
+        if let Some(tail_state) =
+            existing_conversation_tail_state_from_cached(cached.0, cached.1, cached_ended_at)
+        {
+            return Ok(Some(tail_state));
+        }
+    }
+
+    let legacy_cached: (Option<i64>, Option<i64>, Option<i64>) = tx.query_row_map(
         "SELECT last_message_idx, last_message_created_at, ended_at
          FROM conversations
          WHERE id = ?1",
         fparams![conversation_id],
         |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
     )?;
-    let (_, _, cached_ended_at) = cached;
-    if let Some(tail_state) =
-        existing_conversation_tail_state_from_cached(cached.0, cached.1, cached_ended_at)
-    {
+    let (_, _, cached_ended_at) = legacy_cached;
+    if let Some(tail_state) = existing_conversation_tail_state_from_cached(
+        legacy_cached.0,
+        legacy_cached.1,
+        cached_ended_at,
+    ) {
+        franken_insert_conversation_tail_state(
+            tx,
+            conversation_id,
+            cached_ended_at,
+            Some(tail_state.last_message_idx),
+            Some(tail_state.last_message_created_at),
+        )?;
         return Ok(Some(tail_state));
     }
 
@@ -4901,50 +4950,35 @@ fn franken_find_existing_conversation_with_tail_by_key(
     key: &PendingConversationKey,
     conv: Option<&Conversation>,
 ) -> Result<Option<ExistingConversationWithTail>> {
-    match key {
-        PendingConversationKey::External {
-            source_id,
-            agent_id,
-            external_id,
-        } => {
-            let row: Option<ExistingConversationTailRow> = tx
-                .query_row_map(
-                    "SELECT id, last_message_idx, last_message_created_at, ended_at
-                     FROM conversations
-                     WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
-                    fparams![source_id.as_str(), *agent_id, external_id.as_str()],
-                    |row| {
-                        Ok((
-                            row.get_typed(0)?,
-                            row.get_typed(1)?,
-                            row.get_typed(2)?,
-                            row.get_typed(3)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((id, last_message_idx, last_message_created_at, ended_at)) = row else {
-                return Ok(None);
-            };
-            let tail_state = if let Some(tail_state) = existing_conversation_tail_state_from_cached(
-                last_message_idx,
-                last_message_created_at,
-                ended_at,
-            ) {
-                Some(tail_state)
-            } else {
-                franken_existing_conversation_append_tail_state(tx, id)?
-            };
-            Ok(Some(ExistingConversationWithTail { id, tail_state }))
-        }
-        PendingConversationKey::SourcePath { .. } => {
-            let Some(id) = franken_find_existing_conversation_by_key(tx, key, conv)? else {
-                return Ok(None);
-            };
-            let tail_state = franken_existing_conversation_append_tail_state(tx, id)?;
-            Ok(Some(ExistingConversationWithTail { id, tail_state }))
-        }
+    let Some(id) = franken_find_existing_conversation_by_key(tx, key, conv)? else {
+        return Ok(None);
+    };
+    let tail_state = franken_existing_conversation_append_tail_state(tx, id)?;
+    Ok(Some(ExistingConversationWithTail { id, tail_state }))
+}
+
+fn franken_insert_conversation_tail_state(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    ended_at: Option<i64>,
+    last_message_idx: Option<i64>,
+    last_message_created_at: Option<i64>,
+) -> Result<()> {
+    if ended_at.is_none() && last_message_idx.is_none() && last_message_created_at.is_none() {
+        return Ok(());
     }
+    tx.execute_compat(
+        "INSERT OR REPLACE INTO conversation_tail_state (
+             conversation_id, ended_at, last_message_idx, last_message_created_at
+         ) VALUES (?1, ?2, ?3, ?4)",
+        fparams![
+            conversation_id,
+            ended_at,
+            last_message_idx,
+            last_message_created_at
+        ],
+    )?;
+    Ok(())
 }
 
 fn franken_update_conversation_tail_state(
@@ -4961,8 +4995,8 @@ fn franken_update_conversation_tail_state(
         return Ok(());
     }
 
-    tx.execute_compat(
-        "UPDATE conversations
+    let changed = tx.execute_compat(
+        "UPDATE conversation_tail_state
          SET ended_at = CASE
                  WHEN ?1 IS NULL THEN ended_at
                  ELSE MAX(IFNULL(ended_at, 0), ?1)
@@ -4977,7 +5011,7 @@ fn franken_update_conversation_tail_state(
                  WHEN last_message_created_at IS NULL OR last_message_created_at < ?3 THEN ?3
                  ELSE last_message_created_at
              END
-         WHERE id = ?4",
+         WHERE conversation_id = ?4",
         fparams![
             ended_at_candidate,
             last_message_idx_candidate,
@@ -4985,6 +5019,15 @@ fn franken_update_conversation_tail_state(
             conversation_id
         ],
     )?;
+    if changed == 0 {
+        franken_insert_conversation_tail_state(
+            tx,
+            conversation_id,
+            ended_at_candidate,
+            last_message_idx_candidate,
+            last_message_created_at_candidate,
+        )?;
+    }
     Ok(())
 }
 
@@ -4995,12 +5038,12 @@ fn franken_set_conversation_tail_state_after_append(
     last_message_idx: i64,
     last_message_created_at: i64,
 ) -> Result<()> {
-    tx.execute_compat(
-        "UPDATE conversations
+    let changed = tx.execute_compat(
+        "UPDATE conversation_tail_state
          SET ended_at = ?1,
              last_message_idx = ?2,
              last_message_created_at = ?3
-         WHERE id = ?4",
+         WHERE conversation_id = ?4",
         fparams![
             ended_at,
             last_message_idx,
@@ -5008,6 +5051,15 @@ fn franken_set_conversation_tail_state_after_append(
             conversation_id
         ],
     )?;
+    if changed == 0 {
+        franken_insert_conversation_tail_state(
+            tx,
+            conversation_id,
+            Some(ended_at),
+            Some(last_message_idx),
+            Some(last_message_created_at),
+        )?;
+    }
     Ok(())
 }
 
@@ -5440,7 +5492,14 @@ impl FrankenStorage {
                          COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
                          (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
                          c.external_id, c.title, c.source_path,
-                         c.started_at, c.ended_at, c.approx_tokens, c.metadata_json,
+                         c.started_at,
+                         COALESCE(
+                             (SELECT ts.ended_at
+                              FROM conversation_tail_state ts
+                              WHERE ts.conversation_id = c.id),
+                             c.ended_at
+                         ),
+                         c.approx_tokens, c.metadata_json,
                          c.source_id, c.origin_host, c.metadata_bin
                 FROM conversations c
                 ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC
@@ -5584,7 +5643,14 @@ impl FrankenStorage {
         self.conn
             .query_map_collect(
                 r"SELECT id, agent_id, workspace_id, external_id, title, source_path,
-                       started_at, ended_at, source_id, origin_host
+                       started_at,
+                       COALESCE(
+                           (SELECT ts.ended_at
+                            FROM conversation_tail_state ts
+                            WHERE ts.conversation_id = conversations.id),
+                           ended_at
+                       ),
+                       source_id, origin_host
                 FROM conversations
                 ORDER BY id ASC
                 LIMIT ?1 OFFSET ?2",
@@ -5633,7 +5699,14 @@ impl FrankenStorage {
         self.conn
             .query_map_collect(
                 r"SELECT id, agent_id, workspace_id, external_id, title, source_path,
-                       started_at, ended_at, source_id, origin_host
+                       started_at,
+                       COALESCE(
+                           (SELECT ts.ended_at
+                            FROM conversation_tail_state ts
+                            WHERE ts.conversation_id = conversations.id),
+                           ended_at
+                       ),
+                       source_id, origin_host
                 FROM conversations
                 WHERE id > ?2
                 ORDER BY id ASC
@@ -5692,7 +5765,14 @@ impl FrankenStorage {
         self.conn
             .query_map_collect(
                 r"SELECT id, agent_id, workspace_id, external_id, title, source_path,
-                       started_at, ended_at, source_id, origin_host
+                       started_at,
+                       COALESCE(
+                           (SELECT ts.ended_at
+                            FROM conversation_tail_state ts
+                            WHERE ts.conversation_id = conversations.id),
+                           ended_at
+                       ),
+                       source_id, origin_host
                 FROM conversations
                 WHERE id > ?2 AND id <= ?3
                 ORDER BY id ASC
@@ -9648,7 +9728,17 @@ fn franken_insert_conversation(
             last_message_created_at
         ],
     ) {
-        Ok(_) => Ok(Some(franken_last_rowid(tx)?)),
+        Ok(_) => {
+            let conv_id = franken_last_rowid(tx)?;
+            franken_insert_conversation_tail_state(
+                tx,
+                conv_id,
+                conv.ended_at,
+                last_message_idx,
+                last_message_created_at,
+            )?;
+            Ok(Some(conv_id))
+        }
         Err(frankensqlite::FrankenError::UniqueViolation { .. }) => {
             tracing::debug!(
                 source_id = %conv.source_id,
@@ -19967,8 +20057,8 @@ mod tests {
             .raw()
             .query_row_map(
                 "SELECT ended_at, last_message_idx, last_message_created_at
-                 FROM conversations
-                 WHERE id = ?1",
+                 FROM conversation_tail_state
+                 WHERE conversation_id = ?1",
                 fparams![conversation_id],
                 |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
             )
@@ -19978,12 +20068,15 @@ mod tests {
         storage
             .raw()
             .execute_compat(
-                "UPDATE conversations
-                 SET ended_at = ?1,
-                     last_message_idx = NULL,
-                     last_message_created_at = NULL
-                 WHERE id = ?2",
+                "UPDATE conversations SET ended_at = ?1 WHERE id = ?2",
                 fparams![111_999_i64, conversation_id],
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+                fparams![conversation_id],
             )
             .unwrap();
 
@@ -19997,8 +20090,8 @@ mod tests {
             .raw()
             .query_row_map(
                 "SELECT ended_at, last_message_idx, last_message_created_at
-                 FROM conversations
-                 WHERE id = ?1",
+                 FROM conversation_tail_state
+                 WHERE conversation_id = ?1",
                 fparams![conversation_id],
                 |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
             )
@@ -20569,6 +20662,10 @@ mod tests {
                 "missing table: {analytics_table}"
             );
         }
+        assert!(
+            table_names.contains(&"conversation_tail_state".to_string()),
+            "missing conversation_tail_state table"
+        );
 
         // Fresh frankensqlite databases should record the combined V13 base
         // schema plus every additive post-V13 migration.
@@ -20760,7 +20857,8 @@ mod tests {
                  agent_id INTEGER NOT NULL,
                  workspace_id INTEGER,
                  title TEXT,
-                 source_path TEXT NOT NULL
+                 source_path TEXT NOT NULL,
+                 ended_at INTEGER
              );
              CREATE TABLE messages (
                  id INTEGER PRIMARY KEY,
