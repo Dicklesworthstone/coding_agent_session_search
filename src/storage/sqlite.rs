@@ -9413,15 +9413,15 @@ fn franken_insert_new_message(
     tx.execute_compat(
         "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        fparams![
-            conversation_id,
-            msg.idx,
-            role_str(&msg.role),
-            msg.author.as_deref(),
-            msg.created_at,
-            msg.content.as_str(),
-            extra_json_str.as_ref(),
-            extra_bin_bytes
+            fparams![
+                conversation_id,
+                msg.idx,
+                role_as_str(&msg.role),
+                msg.author.as_deref(),
+                msg.created_at,
+                msg.content.as_str(),
+                extra_json_str.as_ref(),
+                extra_bin_bytes
         ],
     )?;
     franken_last_rowid(tx)
@@ -9516,7 +9516,7 @@ fn franken_batch_insert_new_messages_with_batch_size(
             let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
             param_values.push(SqliteValue::from(conversation_id));
             param_values.push(SqliteValue::from(msg.idx));
-            param_values.push(SqliteValue::from(role_str(&msg.role)));
+            param_values.push(SqliteValue::from(role_as_str(&msg.role)));
             param_values.push(SqliteValue::from(msg.author.as_deref()));
             param_values.push(SqliteValue::from(msg.created_at));
             param_values.push(SqliteValue::from(msg.content.as_str()));
@@ -9560,15 +9560,15 @@ fn franken_insert_new_message_with_profile(
     tx.execute_compat(
         "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        fparams![
-            conversation_id,
-            msg.idx,
-            role_str(&msg.role),
-            msg.author.as_deref(),
-            msg.created_at,
-            msg.content.as_str(),
-            extra_json_str.as_ref(),
-            extra_bin_bytes
+            fparams![
+                conversation_id,
+                msg.idx,
+                role_as_str(&msg.role),
+                msg.author.as_deref(),
+                msg.created_at,
+                msg.content.as_str(),
+                extra_json_str.as_ref(),
+                extra_bin_bytes
         ],
     )?;
     profile.execute_duration += execute_start.elapsed();
@@ -9667,7 +9667,7 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
             let param_build_start = Instant::now();
             param_values.push(SqliteValue::from(conversation_id));
             param_values.push(SqliteValue::from(msg.idx));
-            param_values.push(SqliteValue::from(role_str(&msg.role)));
+            param_values.push(SqliteValue::from(role_as_str(&msg.role)));
             param_values.push(SqliteValue::from(msg.author.as_deref()));
             param_values.push(SqliteValue::from(msg.created_at));
             param_values.push(SqliteValue::from(msg.content.as_str()));
@@ -12296,12 +12296,16 @@ fn path_to_string<P: AsRef<Path>>(p: P) -> String {
 }
 
 fn role_str(role: &MessageRole) -> String {
+    role_as_str(role).to_owned()
+}
+
+fn role_as_str(role: &MessageRole) -> &str {
     match role {
-        MessageRole::User => "user".into(),
-        MessageRole::Agent => "agent".into(),
-        MessageRole::Tool => "tool".into(),
-        MessageRole::System => "system".into(),
-        MessageRole::Other(v) => v.clone(),
+        MessageRole::User => "user",
+        MessageRole::Agent => "agent",
+        MessageRole::Tool => "tool",
+        MessageRole::System => "system",
+        MessageRole::Other(v) => v.as_str(),
     }
 }
 
