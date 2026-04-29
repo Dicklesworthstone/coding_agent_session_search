@@ -10388,45 +10388,25 @@ fn franken_update_ensured_daily_stats_targets_in_tx(
     }
 
     let primary = targets[0];
-    let rows_changed = if delta.session_count_delta == 0 {
-        tx.execute_compat(
-            "UPDATE daily_stats
-             SET message_count = message_count + ?4,
-                 total_chars = total_chars + ?5,
-                 last_updated = ?6
-             WHERE day_id = ?1
-               AND agent_slug IN (?2, 'all')
-               AND source_id IN (?3, 'all')",
-            fparams![
-                primary.day_id,
-                primary.agent_slug,
-                primary.source_id,
-                delta.message_count_delta,
-                delta.total_chars_delta,
-                now
-            ],
-        )?
-    } else {
-        tx.execute_compat(
-            "UPDATE daily_stats
-             SET session_count = session_count + ?4,
-                 message_count = message_count + ?5,
-                 total_chars = total_chars + ?6,
-                 last_updated = ?7
-             WHERE day_id = ?1
-               AND agent_slug IN (?2, 'all')
-               AND source_id IN (?3, 'all')",
-            fparams![
-                primary.day_id,
-                primary.agent_slug,
-                primary.source_id,
-                delta.session_count_delta,
-                delta.message_count_delta,
-                delta.total_chars_delta,
-                now
-            ],
-        )?
-    };
+    let rows_changed = tx.execute_compat(
+        "UPDATE daily_stats
+         SET session_count = session_count + ?4,
+             message_count = message_count + ?5,
+             total_chars = total_chars + ?6,
+             last_updated = ?7
+         WHERE day_id = ?1
+           AND agent_slug IN (?2, 'all')
+           AND source_id IN (?3, 'all')",
+        fparams![
+            primary.day_id,
+            primary.agent_slug,
+            primary.source_id,
+            delta.session_count_delta,
+            delta.message_count_delta,
+            delta.total_chars_delta,
+            now
+        ],
+    )?;
     if rows_changed == targets.len() {
         return Ok(true);
     }
