@@ -9795,12 +9795,12 @@ fn franken_message_insert_payload(msg: &Message) -> Result<(Cow<'_, str>, Option
 /// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while still amortizing parse cost.
 const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
 
-/// Append workloads commit fastest with medium chunks on current frankensqlite.
+/// Append workloads profile fastest with larger chunks on current frankensqlite.
 ///
-/// After frankensqlite's child-FK insert fast path, 20-row chunks beat both the
-/// old 10-row setting and row-wise direct inserts on the append-merge profile,
-/// while 50-row chunks bring back commit-time pressure.
-const APPEND_MESSAGE_INSERT_BATCH_SIZE: usize = 20;
+/// After the tail-state hot table removed conversation-row rewrites from the
+/// append path, 50-row chunks beat the old 20-row setting on the append-merge
+/// profile. 100-row chunks slightly regress the 20-message workload.
+const APPEND_MESSAGE_INSERT_BATCH_SIZE: usize = 50;
 
 fn franken_batch_insert_new_messages(
     tx: &FrankenTransaction<'_>,
