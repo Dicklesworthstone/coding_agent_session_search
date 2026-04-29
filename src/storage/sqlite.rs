@@ -14364,7 +14364,6 @@ mod tests {
     #[serial]
     fn insert_conversation_tree_stage_profile_tracks_steady_state_remote_reuse() {
         let _defer_guard = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
-        let log_profile = dotenvy::var("CASS_INSERT_TREE_STAGE_PROFILE").is_ok();
 
         for &(msg_count, iterations) in &[(5usize, 80usize), (20, 50), (50, 24)] {
             let dir = TempDir::new().unwrap();
@@ -14420,9 +14419,7 @@ mod tests {
                 "accounted stage durations cannot exceed total duration"
             );
 
-            if log_profile {
-                profile.log_summary(&format!("remote_reuse_{msg_count}_msgs"));
-            }
+            profile.log_summary(&format!("remote_reuse_{msg_count}_msgs"));
         }
     }
 
@@ -14430,7 +14427,6 @@ mod tests {
     #[serial]
     fn insert_conversation_tree_stage_profile_tracks_append_remote_source_merge() {
         let _defer_guard = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
-        let log_profile = dotenvy::var("CASS_INSERT_TREE_STAGE_PROFILE").is_ok();
 
         for &(msg_count, iterations) in &[(5usize, 80usize), (20, 50), (50, 24)] {
             let dir = TempDir::new().unwrap();
@@ -14497,9 +14493,7 @@ mod tests {
                 "accounted append stage durations cannot exceed total duration"
             );
 
-            if log_profile {
-                profile.log_summary(&format!("append_remote_merge_{msg_count}_msgs"));
-            }
+            profile.log_summary(&format!("append_remote_merge_{msg_count}_msgs"));
         }
     }
 
