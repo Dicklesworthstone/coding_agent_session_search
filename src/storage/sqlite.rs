@@ -6923,7 +6923,7 @@ impl FrankenStorage {
                 let mut fts_pending_chars = 0usize;
                 let mut _fts_inserted_total = 0usize;
                 let inserted_message_ids =
-                    franken_batch_insert_new_messages(&tx, existing_id, &new_messages)?;
+                    franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
                 for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
                     franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                     if !defer_lexical_updates {
@@ -7339,7 +7339,7 @@ impl FrankenStorage {
             borrowed_messages_tail_state(&new_messages);
 
         let message_insert_start = Instant::now();
-        let inserted_message_ids = franken_batch_insert_new_messages_with_profile(
+        let inserted_message_ids = franken_append_insert_new_messages_with_profile(
             &tx,
             existing_id,
             &new_messages,
@@ -7482,7 +7482,7 @@ impl FrankenStorage {
         let (inserted_last_idx, inserted_last_created_at) =
             borrowed_messages_tail_state(&new_messages);
         let inserted_message_ids =
-            franken_batch_insert_new_messages(tx, conversation_id, &new_messages)?;
+            franken_append_insert_new_messages(tx, conversation_id, &new_messages)?;
         for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
             if !defer_lexical_updates {
@@ -8409,7 +8409,7 @@ impl FrankenStorage {
                 let (inserted_last_idx, inserted_last_created_at) =
                     borrowed_messages_tail_state(&new_messages);
                 let inserted_message_ids =
-                    franken_batch_insert_new_messages(&tx, existing_id, &new_messages)?;
+                    franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
                 total_chars += new_chars;
                 for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
                     franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
@@ -8536,7 +8536,7 @@ impl FrankenStorage {
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let inserted_message_ids =
-                            franken_batch_insert_new_messages(&tx, existing_id, &new_messages)?;
+                            franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
                         total_chars += new_chars;
                         for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
                             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
@@ -9444,13 +9444,48 @@ fn franken_message_insert_payload(msg: &Message) -> Result<(Cow<'_, str>, Option
 /// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while still amortizing parse cost.
 const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
 
+/// Append workloads commit faster with smaller chunks on current frankensqlite.
+///
+/// The remaining execution cost is inside frankensqlite's INSERT path, but
+/// keeping append chunks modest avoids the large commit-time spike seen with a
+/// single 20-50 row VALUES statement while preserving fresh-insert throughput.
+const APPEND_MESSAGE_INSERT_BATCH_SIZE: usize = 10;
+
 fn franken_batch_insert_new_messages(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
     messages: &[&Message],
 ) -> Result<Vec<i64>> {
+    franken_batch_insert_new_messages_with_batch_size(
+        tx,
+        conversation_id,
+        messages,
+        MESSAGE_INSERT_BATCH_SIZE,
+    )
+}
+
+fn franken_append_insert_new_messages(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    messages: &[&Message],
+) -> Result<Vec<i64>> {
+    franken_batch_insert_new_messages_with_batch_size(
+        tx,
+        conversation_id,
+        messages,
+        APPEND_MESSAGE_INSERT_BATCH_SIZE,
+    )
+}
+
+fn franken_batch_insert_new_messages_with_batch_size(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    messages: &[&Message],
+    batch_size: usize,
+) -> Result<Vec<i64>> {
+    let batch_size = batch_size.max(1);
     let mut inserted_ids = Vec::with_capacity(messages.len());
-    for chunk in messages.chunks(MESSAGE_INSERT_BATCH_SIZE) {
+    for chunk in messages.chunks(batch_size) {
         if chunk.len() == 1 {
             inserted_ids.push(franken_insert_new_message(tx, conversation_id, chunk[0])?);
             continue;
@@ -9551,8 +9586,42 @@ fn franken_batch_insert_new_messages_with_profile(
     messages: &[&Message],
     profile: &mut MessageInsertSubstageProfile,
 ) -> Result<Vec<i64>> {
+    franken_batch_insert_new_messages_with_profile_batch_size(
+        tx,
+        conversation_id,
+        messages,
+        profile,
+        MESSAGE_INSERT_BATCH_SIZE,
+    )
+}
+
+#[cfg(test)]
+fn franken_append_insert_new_messages_with_profile(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    messages: &[&Message],
+    profile: &mut MessageInsertSubstageProfile,
+) -> Result<Vec<i64>> {
+    franken_batch_insert_new_messages_with_profile_batch_size(
+        tx,
+        conversation_id,
+        messages,
+        profile,
+        APPEND_MESSAGE_INSERT_BATCH_SIZE,
+    )
+}
+
+#[cfg(test)]
+fn franken_batch_insert_new_messages_with_profile_batch_size(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    messages: &[&Message],
+    profile: &mut MessageInsertSubstageProfile,
+    batch_size: usize,
+) -> Result<Vec<i64>> {
+    let batch_size = batch_size.max(1);
     let mut inserted_ids = Vec::with_capacity(messages.len());
-    for chunk in messages.chunks(MESSAGE_INSERT_BATCH_SIZE) {
+    for chunk in messages.chunks(batch_size) {
         if chunk.len() == 1 {
             inserted_ids.push(franken_insert_new_message_with_profile(
                 tx,
