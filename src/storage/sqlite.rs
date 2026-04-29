@@ -9224,7 +9224,7 @@ fn franken_find_existing_conversation_by_key(
         } => tx
             .query_row_map(
                 "SELECT id
-                 FROM conversations NOT INDEXED
+                 FROM conversations
                  WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
                 fparams![source_id.as_str(), *agent_id, external_id.as_str()],
                 |row| row.get_typed(0),
@@ -9240,7 +9240,7 @@ fn franken_find_existing_conversation_by_key(
             let exact_match = tx
                 .query_row_map(
                     "SELECT c.id
-                     FROM conversations c NOT INDEXED
+                     FROM conversations c
                      WHERE c.source_id = ?1
                        AND c.agent_id = ?2
                        AND c.source_path = ?3
@@ -9294,7 +9294,7 @@ fn franken_find_existing_conversation_by_key(
                           WHERE conversation_id = c.id
                             AND created_at IS NOT NULL)
                      ) AS effective_started_at
-                 FROM conversations c NOT INDEXED
+                 FROM conversations c
                  WHERE c.source_id = ?1
                    AND c.agent_id = ?2
                    AND c.source_path = ?3
