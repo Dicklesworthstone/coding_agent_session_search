@@ -4696,6 +4696,14 @@ struct ExistingConversationTailState {
     ended_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExistingConversationWithTail {
+    id: i64,
+    tail_state: Option<ExistingConversationTailState>,
+}
+
+type ExistingConversationTailRow = (i64, Option<i64>, Option<i64>, Option<i64>);
+
 fn conversation_effective_started_at(conv: &Conversation) -> Option<i64> {
     conv.started_at
         .or_else(|| conv.messages.iter().filter_map(|msg| msg.created_at).min())
@@ -4839,12 +4847,10 @@ fn franken_existing_conversation_append_tail_state(
         |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
     )?;
     let (_, _, cached_ended_at) = cached;
-    if let Some((last_message_idx, last_message_created_at)) = cached.0.zip(cached.1) {
-        return Ok(Some(ExistingConversationTailState {
-            last_message_idx,
-            last_message_created_at,
-            ended_at: cached_ended_at,
-        }));
+    if let Some(tail_state) =
+        existing_conversation_tail_state_from_cached(cached.0, cached.1, cached_ended_at)
+    {
+        return Ok(Some(tail_state));
     }
 
     let (max_idx, max_created_at): (Option<i64>, Option<i64>) = tx.query_row_map(
@@ -4869,6 +4875,71 @@ fn franken_existing_conversation_append_tail_state(
         }));
     }
     Ok(None)
+}
+
+fn existing_conversation_tail_state_from_cached(
+    last_message_idx: Option<i64>,
+    last_message_created_at: Option<i64>,
+    ended_at: Option<i64>,
+) -> Option<ExistingConversationTailState> {
+    let (last_message_idx, last_message_created_at) =
+        last_message_idx.zip(last_message_created_at)?;
+    Some(ExistingConversationTailState {
+        last_message_idx,
+        last_message_created_at,
+        ended_at,
+    })
+}
+
+fn franken_find_existing_conversation_with_tail_by_key(
+    tx: &FrankenTransaction<'_>,
+    key: &PendingConversationKey,
+    conv: Option<&Conversation>,
+) -> Result<Option<ExistingConversationWithTail>> {
+    match key {
+        PendingConversationKey::External {
+            source_id,
+            agent_id,
+            external_id,
+        } => {
+            let row: Option<ExistingConversationTailRow> = tx
+                .query_row_map(
+                    "SELECT id, last_message_idx, last_message_created_at, ended_at
+                     FROM conversations
+                     WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
+                    fparams![source_id.as_str(), *agent_id, external_id.as_str()],
+                    |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((id, last_message_idx, last_message_created_at, ended_at)) = row else {
+                return Ok(None);
+            };
+            let tail_state = if let Some(tail_state) = existing_conversation_tail_state_from_cached(
+                last_message_idx,
+                last_message_created_at,
+                ended_at,
+            ) {
+                Some(tail_state)
+            } else {
+                franken_existing_conversation_append_tail_state(tx, id)?
+            };
+            Ok(Some(ExistingConversationWithTail { id, tail_state }))
+        }
+        PendingConversationKey::SourcePath { .. } => {
+            let Some(id) = franken_find_existing_conversation_by_key(tx, key, conv)? else {
+                return Ok(None);
+            };
+            let tail_state = franken_existing_conversation_append_tail_state(tx, id)?;
+            Ok(Some(ExistingConversationWithTail { id, tail_state }))
+        }
+    }
 }
 
 fn franken_update_conversation_tail_state(
@@ -6982,10 +7053,18 @@ impl FrankenStorage {
         let defer_analytics_updates = defer_analytics_updates_enabled();
         let conversation_key = conversation_merge_key(agent_id, conv);
         let mut tx = self.conn.transaction()?;
-        let existing =
-            franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))?;
-        if let Some(existing_id) = existing {
-            let outcome = self.franken_append_messages_in_tx(&tx, existing_id, conv)?;
+        let existing = franken_find_existing_conversation_with_tail_by_key(
+            &tx,
+            &conversation_key,
+            Some(conv),
+        )?;
+        if let Some(existing) = existing {
+            let outcome = self.franken_append_messages_with_tail_in_tx(
+                &tx,
+                existing.id,
+                conv,
+                existing.tail_state,
+            )?;
             tx.commit()?;
             return Ok(outcome);
         }
@@ -7396,15 +7475,19 @@ impl FrankenStorage {
         profile.tx_open_duration += tx_open_start.elapsed();
 
         let existing_lookup_start = Instant::now();
-        let existing =
-            franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))?;
+        let existing = franken_find_existing_conversation_with_tail_by_key(
+            &tx,
+            &conversation_key,
+            Some(conv),
+        )?;
         profile.existing_lookup_duration += existing_lookup_start.elapsed();
-        let existing_id = existing.ok_or_else(|| {
+        let existing = existing.ok_or_else(|| {
             anyhow!("append profile helper expects existing conversation for {conversation_key:?}")
         })?;
+        let existing_id = existing.id;
 
         let existing_idx_lookup_start = Instant::now();
-        let append_tail_state = franken_existing_conversation_append_tail_state(&tx, existing_id)?;
+        let append_tail_state = existing.tail_state;
         let append_tail_ended_at = append_tail_state.and_then(|state| state.ended_at);
         let existing_plan = append_tail_state.as_ref().and_then(|state| {
             collect_append_only_tail_messages(
@@ -7573,16 +7656,15 @@ impl FrankenStorage {
     }
 
     /// Append new messages to an existing conversation within an active transaction.
-    fn franken_append_messages_in_tx(
+    fn franken_append_messages_with_tail_in_tx(
         &self,
         tx: &FrankenTransaction<'_>,
         conversation_id: i64,
         conv: &Conversation,
+        append_tail_state: Option<ExistingConversationTailState>,
     ) -> Result<InsertOutcome> {
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
         let defer_analytics_updates = defer_analytics_updates_enabled();
-        let append_tail_state =
-            franken_existing_conversation_append_tail_state(tx, conversation_id)?;
         let append_tail_ended_at = append_tail_state.and_then(|state| state.ended_at);
         let append_plan = append_tail_state.as_ref().and_then(|state| {
             collect_append_only_tail_messages(
