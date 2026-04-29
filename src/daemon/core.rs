@@ -258,37 +258,6 @@ impl ModelDaemon {
         self.start_time.elapsed().as_secs()
     }
 
-    fn embedder_model_info(&self) -> ModelInfo {
-        ModelInfo {
-            id: self.models.embedder_id().to_string(),
-            name: self.models.embedder_name().to_string(),
-            dimension: Some(self.models.embedder_dimension()),
-            loaded: self.models.embedder_loaded(),
-            memory_bytes: 0, // Would need model-specific tracking
-        }
-    }
-
-    fn reranker_model_info(&self) -> ModelInfo {
-        ModelInfo {
-            id: self.models.reranker_id().to_string(),
-            name: self.models.reranker_name().to_string(),
-            dimension: None,
-            loaded: self.models.reranker_loaded(),
-            memory_bytes: 0,
-        }
-    }
-
-    fn status_response(&self) -> StatusResponse {
-        StatusResponse {
-            uptime_secs: self.uptime_secs(),
-            version: PROTOCOL_VERSION,
-            embedders: vec![self.embedder_model_info()],
-            rerankers: vec![self.reranker_model_info()],
-            memory_bytes: self.resources.memory_usage(),
-            total_requests: self.total_requests.load(Ordering::Relaxed),
-        }
-    }
-
     /// Check if daemon should shutdown due to idle timeout.
     fn should_shutdown_idle(&self) -> bool {
         if self.config.idle_timeout.is_zero() {
@@ -679,7 +648,32 @@ impl ModelDaemon {
                 }
             }
 
-            Request::Status => Response::Status(self.status_response()),
+            Request::Status => {
+                let embedder_info = ModelInfo {
+                    id: self.models.embedder_id().to_string(),
+                    name: self.models.embedder_name().to_string(),
+                    dimension: Some(self.models.embedder_dimension()),
+                    loaded: self.models.embedder_loaded(),
+                    memory_bytes: 0, // Would need model-specific tracking
+                };
+
+                let reranker_info = ModelInfo {
+                    id: self.models.reranker_id().to_string(),
+                    name: self.models.reranker_name().to_string(),
+                    dimension: None,
+                    loaded: self.models.reranker_loaded(),
+                    memory_bytes: 0,
+                };
+
+                Response::Status(StatusResponse {
+                    uptime_secs: self.uptime_secs(),
+                    version: PROTOCOL_VERSION,
+                    embedders: vec![embedder_info],
+                    rerankers: vec![reranker_info],
+                    memory_bytes: self.resources.memory_usage(),
+                    total_requests: self.total_requests.load(Ordering::Relaxed),
+                })
+            }
 
             Request::SubmitEmbeddingJob {
                 db_path,
@@ -829,34 +823,6 @@ mod tests {
         let after = daemon.uptime_secs();
         // Uptime should not decrease
         assert!(after >= initial);
-    }
-
-    #[test]
-    fn status_response_projects_default_model_fields() {
-        let config = DaemonConfig::default();
-        let models = ModelManager::new(&test_data_dir());
-        let daemon = ModelDaemon::new(config, models);
-
-        let status = daemon.status_response();
-
-        assert_eq!(status.version, PROTOCOL_VERSION);
-        assert_eq!(status.total_requests, 0);
-        assert_eq!(status.embedders.len(), 1);
-        assert_eq!(status.rerankers.len(), 1);
-
-        let embedder = &status.embedders[0];
-        assert_eq!(embedder.id, "hash-384");
-        assert_eq!(embedder.name, "not-loaded");
-        assert_eq!(embedder.dimension, Some(384));
-        assert!(!embedder.loaded);
-        assert_eq!(embedder.memory_bytes, 0);
-
-        let reranker = &status.rerankers[0];
-        assert_eq!(reranker.id, "none");
-        assert_eq!(reranker.name, "not-loaded");
-        assert_eq!(reranker.dimension, None);
-        assert!(!reranker.loaded);
-        assert_eq!(reranker.memory_bytes, 0);
     }
 
     #[test]

@@ -2227,7 +2227,7 @@ fn is_backup_root_name(name: &str, prefix: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 19;
+pub const CURRENT_SCHEMA_VERSION: i64 = 20;
 const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
@@ -2817,6 +2817,38 @@ SELECT
     id
 FROM conversations
 WHERE external_id IS NOT NULL;
+";
+
+const MIGRATION_V20: &str = r"
+-- Fuse external conversation lookup with append-tail state. Append-heavy
+-- workloads can resolve both the conversation id and tail plan from one
+-- primary-key probe.
+CREATE TABLE IF NOT EXISTS conversation_external_tail_lookup (
+    lookup_key TEXT PRIMARY KEY,
+    conversation_id INTEGER NOT NULL,
+    ended_at INTEGER,
+    last_message_idx INTEGER,
+    last_message_created_at INTEGER
+);
+
+INSERT OR REPLACE INTO conversation_external_tail_lookup (
+    lookup_key,
+    conversation_id,
+    ended_at,
+    last_message_idx,
+    last_message_created_at
+)
+SELECT
+    CAST(length(c.source_id) AS TEXT) || ':' || c.source_id || ':' ||
+    CAST(c.agent_id AS TEXT) || ':' ||
+    CAST(length(c.external_id) AS TEXT) || ':' || c.external_id,
+    c.id,
+    ts.ended_at,
+    ts.last_message_idx,
+    ts.last_message_created_at
+FROM conversations c
+LEFT JOIN conversation_tail_state ts ON ts.conversation_id = c.id
+WHERE c.external_id IS NOT NULL;
 ";
 
 /// Row from the embedding_jobs table.
@@ -3654,6 +3686,7 @@ fn build_cass_migrations() -> MigrationRunner {
         .add(17, "drop_message_created_idx", MIGRATION_V17)
         .add(18, "conversation_tail_state_hot_table", MIGRATION_V18)
         .add(19, "conversation_external_lookup", MIGRATION_V19)
+        .add(20, "conversation_external_tail_lookup", MIGRATION_V20)
 }
 
 /// Combined V13 schema for fresh databases.
@@ -4087,6 +4120,35 @@ FROM conversations
 WHERE external_id IS NOT NULL;
 ";
 
+const CURRENT_SCHEMA_REPAIR_CONVERSATION_EXTERNAL_TAIL_LOOKUP_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS conversation_external_tail_lookup (
+    lookup_key TEXT PRIMARY KEY,
+    conversation_id INTEGER NOT NULL,
+    ended_at INTEGER,
+    last_message_idx INTEGER,
+    last_message_created_at INTEGER
+);
+
+INSERT OR REPLACE INTO conversation_external_tail_lookup (
+    lookup_key,
+    conversation_id,
+    ended_at,
+    last_message_idx,
+    last_message_created_at
+)
+SELECT
+    CAST(length(c.source_id) AS TEXT) || ':' || c.source_id || ':' ||
+    CAST(c.agent_id AS TEXT) || ':' ||
+    CAST(length(c.external_id) AS TEXT) || ':' || c.external_id,
+    c.id,
+    ts.ended_at,
+    ts.last_message_idx,
+    ts.last_message_created_at
+FROM conversations c
+LEFT JOIN conversation_tail_state ts ON ts.conversation_id = c.id
+WHERE c.external_id IS NOT NULL;
+";
+
 const CURRENT_SCHEMA_REPAIR_EMBEDDING_JOBS_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS embedding_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4335,6 +4397,11 @@ const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
         sql: CURRENT_SCHEMA_REPAIR_CONVERSATION_EXTERNAL_LOOKUP_SQL,
     },
     SchemaRepairBatch {
+        name: "conversation_external_tail_lookup",
+        tables: &["conversation_external_tail_lookup"],
+        sql: CURRENT_SCHEMA_REPAIR_CONVERSATION_EXTERNAL_TAIL_LOOKUP_SQL,
+    },
+    SchemaRepairBatch {
         name: "embedding_jobs",
         tables: &["embedding_jobs"],
         sql: CURRENT_SCHEMA_REPAIR_EMBEDDING_JOBS_SQL,
@@ -4500,6 +4567,10 @@ const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
     (
         "conversation_external_lookup",
         "SELECT lookup_key FROM conversation_external_lookup LIMIT 1;",
+    ),
+    (
+        "conversation_external_tail_lookup",
+        "SELECT lookup_key, last_message_idx FROM conversation_external_tail_lookup LIMIT 1;",
     ),
     ("embedding_jobs", "SELECT id FROM embedding_jobs LIMIT 1;"),
     ("token_usage", "SELECT id FROM token_usage LIMIT 1;"),
@@ -4736,6 +4807,12 @@ fn conversation_external_lookup_key(source_id: &str, agent_id: i64, external_id:
         source_id.chars().count(),
         external_id.chars().count()
     )
+}
+
+fn conversation_external_lookup_key_for_conv(agent_id: i64, conv: &Conversation) -> Option<String> {
+    conv.external_id
+        .as_deref()
+        .map(|external_id| conversation_external_lookup_key(&conv.source_id, agent_id, external_id))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -5003,6 +5080,19 @@ fn franken_find_existing_conversation_with_tail_by_key(
     key: &PendingConversationKey,
     conv: Option<&Conversation>,
 ) -> Result<Option<ExistingConversationWithTail>> {
+    if let PendingConversationKey::External {
+        source_id,
+        agent_id,
+        external_id,
+    } = key
+    {
+        let lookup_key = conversation_external_lookup_key(source_id, *agent_id, external_id);
+        if let Some(existing) = franken_find_external_conversation_tail_lookup(tx, &lookup_key)? {
+            return Ok(Some(existing));
+        }
+        return Ok(None);
+    }
+
     let Some(id) = franken_find_existing_conversation_by_key(tx, key, conv)? else {
         return Ok(None);
     };
@@ -5495,6 +5585,13 @@ impl FrankenStorage {
         let mut tx = self.conn.transaction()?;
         tx.execute_compat(
             "DELETE FROM conversation_external_lookup
+             WHERE conversation_id IN (
+                 SELECT id FROM conversations WHERE agent_id = ?1
+             )",
+            fparams![agent_id],
+        )?;
+        tx.execute_compat(
+            "DELETE FROM conversation_external_tail_lookup
              WHERE conversation_id IN (
                  SELECT id FROM conversations WHERE agent_id = ?1
              )",
@@ -7206,6 +7303,7 @@ impl FrankenStorage {
         if let Some(existing) = existing {
             let outcome = self.franken_append_messages_with_tail_in_tx(
                 &tx,
+                agent_id,
                 existing.id,
                 conv,
                 existing.tail_state,
@@ -7295,6 +7393,16 @@ impl FrankenStorage {
                     inserted_last_idx,
                     inserted_last_created_at,
                 )?;
+                if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv)
+                {
+                    franken_update_external_conversation_tail_lookup_key(
+                        &tx,
+                        &lookup_key,
+                        conv_last_ts,
+                        inserted_last_idx,
+                        inserted_last_created_at,
+                    )?;
+                }
 
                 if !defer_analytics_updates && !inserted_indices.is_empty() {
                     franken_update_daily_stats_in_tx(
@@ -7766,6 +7874,20 @@ impl FrankenStorage {
                 inserted_last_created_at,
             )?;
         }
+        if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv) {
+            let ended_at_candidate = if used_append_tail_plan {
+                inserted_last_created_at
+            } else {
+                conv.messages.iter().filter_map(|m| m.created_at).max()
+            };
+            franken_update_external_conversation_tail_lookup_key(
+                &tx,
+                &lookup_key,
+                ended_at_candidate,
+                inserted_last_idx,
+                inserted_last_created_at,
+            )?;
+        }
         profile.conversation_row_duration += conversation_row_start.elapsed();
 
         if !defer_analytics_updates && !inserted_indices.is_empty() {
@@ -7804,6 +7926,7 @@ impl FrankenStorage {
     fn franken_append_messages_with_tail_in_tx(
         &self,
         tx: &FrankenTransaction<'_>,
+        agent_id: i64,
         conversation_id: i64,
         conv: &Conversation,
         append_tail_state: Option<ExistingConversationTailState>,
@@ -7916,6 +8039,20 @@ impl FrankenStorage {
                 tx,
                 conversation_id,
                 conv_last_ts,
+                inserted_last_idx,
+                inserted_last_created_at,
+            )?;
+        }
+        if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv) {
+            let ended_at_candidate = if used_append_tail_plan {
+                inserted_last_created_at
+            } else {
+                conv.messages.iter().filter_map(|m| m.created_at).max()
+            };
+            franken_update_external_conversation_tail_lookup_key(
+                tx,
+                &lookup_key,
+                ended_at_candidate,
                 inserted_last_idx,
                 inserted_last_created_at,
             )?;
@@ -8848,6 +8985,16 @@ impl FrankenStorage {
                     inserted_last_idx,
                     inserted_last_created_at,
                 )?;
+                if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv)
+                {
+                    franken_update_external_conversation_tail_lookup_key(
+                        &tx,
+                        &lookup_key,
+                        conv_last_ts,
+                        inserted_last_idx,
+                        inserted_last_created_at,
+                    )?;
+                }
 
                 pending_message_fingerprints.insert(existing_id, existing_messages);
                 pending_message_replay_fingerprints
@@ -8978,6 +9125,17 @@ impl FrankenStorage {
                             inserted_last_idx,
                             inserted_last_created_at,
                         )?;
+                        if let Some(lookup_key) =
+                            conversation_external_lookup_key_for_conv(agent_id, conv)
+                        {
+                            franken_update_external_conversation_tail_lookup_key(
+                                &tx,
+                                &lookup_key,
+                                conv_last_ts,
+                                inserted_last_idx,
+                                inserted_last_created_at,
+                            )?;
+                        }
 
                         pending_message_fingerprints.insert(existing_id, existing_messages);
                         pending_message_replay_fingerprints
@@ -9539,50 +9697,126 @@ enum ConversationInsertStatus {
     Existing(i64),
 }
 
-fn franken_find_external_conversation_lookup(
+fn franken_find_external_conversation_tail_lookup(
     tx: &FrankenTransaction<'_>,
     lookup_key: &str,
-) -> Result<Option<i64>> {
+) -> Result<Option<ExistingConversationWithTail>> {
     let params = [SqliteValue::from(lookup_key)];
     let row = tx
         .query_row_with_params(
-            "SELECT conversation_id
-             FROM conversation_external_lookup
+            "SELECT conversation_id, ended_at, last_message_idx, last_message_created_at
+             FROM conversation_external_tail_lookup
              WHERE lookup_key = ?1",
             &params,
         )
         .optional()?;
-    row.map(|row| row.get_typed(0))
-        .transpose()
-        .map_err(Into::into)
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let id = row.get_typed(0)?;
+    let ended_at = row.get_typed(1)?;
+    let last_message_idx = row.get_typed(2)?;
+    let last_message_created_at = row.get_typed(3)?;
+    Ok(Some(ExistingConversationWithTail {
+        id,
+        tail_state: existing_conversation_tail_state_from_cached(
+            last_message_idx,
+            last_message_created_at,
+            ended_at,
+        ),
+    }))
 }
 
-fn franken_insert_external_conversation_lookup_key(
+fn franken_find_external_conversation_lookup(
+    tx: &FrankenTransaction<'_>,
+    lookup_key: &str,
+) -> Result<Option<i64>> {
+    Ok(franken_find_external_conversation_tail_lookup(tx, lookup_key)?.map(|existing| existing.id))
+}
+
+fn franken_insert_external_conversation_tail_lookup_key(
     tx: &FrankenTransaction<'_>,
     lookup_key: &str,
     conversation_id: i64,
+    ended_at: Option<i64>,
+    last_message_idx: Option<i64>,
+    last_message_created_at: Option<i64>,
 ) -> Result<()> {
     let params = [
         SqliteValue::from(lookup_key),
         SqliteValue::from(conversation_id),
+        SqliteValue::from(ended_at),
+        SqliteValue::from(last_message_idx),
+        SqliteValue::from(last_message_created_at),
     ];
     tx.execute_with_params(
-        "INSERT OR REPLACE INTO conversation_external_lookup(lookup_key, conversation_id)
-         VALUES(?1, ?2)",
+        "INSERT OR REPLACE INTO conversation_external_tail_lookup(
+             lookup_key, conversation_id, ended_at, last_message_idx, last_message_created_at
+         ) VALUES(?1, ?2, ?3, ?4, ?5)",
         &params,
     )?;
     Ok(())
 }
 
-fn franken_insert_external_conversation_lookup(
+fn franken_insert_external_conversation_tail_lookup(
     tx: &FrankenTransaction<'_>,
     source_id: &str,
     agent_id: i64,
     external_id: &str,
     conversation_id: i64,
+    ended_at: Option<i64>,
+    last_message_idx: Option<i64>,
+    last_message_created_at: Option<i64>,
 ) -> Result<()> {
     let lookup_key = conversation_external_lookup_key(source_id, agent_id, external_id);
-    franken_insert_external_conversation_lookup_key(tx, &lookup_key, conversation_id)
+    franken_insert_external_conversation_tail_lookup_key(
+        tx,
+        &lookup_key,
+        conversation_id,
+        ended_at,
+        last_message_idx,
+        last_message_created_at,
+    )
+}
+
+fn franken_update_external_conversation_tail_lookup_key(
+    tx: &FrankenTransaction<'_>,
+    lookup_key: &str,
+    ended_at_candidate: Option<i64>,
+    last_message_idx_candidate: Option<i64>,
+    last_message_created_at_candidate: Option<i64>,
+) -> Result<()> {
+    if ended_at_candidate.is_none()
+        && last_message_idx_candidate.is_none()
+        && last_message_created_at_candidate.is_none()
+    {
+        return Ok(());
+    }
+    tx.execute_compat(
+        "UPDATE conversation_external_tail_lookup
+         SET ended_at = CASE
+                 WHEN ?1 IS NULL THEN ended_at
+                 ELSE MAX(IFNULL(ended_at, 0), ?1)
+             END,
+             last_message_idx = CASE
+                 WHEN ?2 IS NULL THEN last_message_idx
+                 WHEN last_message_idx IS NULL OR last_message_idx < ?2 THEN ?2
+                 ELSE last_message_idx
+             END,
+             last_message_created_at = CASE
+                 WHEN ?3 IS NULL THEN last_message_created_at
+                 WHEN last_message_created_at IS NULL OR last_message_created_at < ?3 THEN ?3
+                 ELSE last_message_created_at
+             END
+         WHERE lookup_key = ?4",
+        fparams![
+            ended_at_candidate,
+            last_message_idx_candidate,
+            last_message_created_at_candidate,
+            lookup_key
+        ],
+    )?;
+    Ok(())
 }
 
 fn franken_find_existing_conversation_by_key(
@@ -9631,7 +9865,15 @@ fn franken_find_existing_conversation_by_key_impl(
                 )
                 .optional()?;
             if let Some(existing_id) = existing_id {
-                franken_insert_external_conversation_lookup_key(tx, &lookup_key, existing_id)?;
+                let tail_state = franken_existing_conversation_append_tail_state(tx, existing_id)?;
+                franken_insert_external_conversation_tail_lookup_key(
+                    tx,
+                    &lookup_key,
+                    existing_id,
+                    tail_state.and_then(|state| state.ended_at),
+                    tail_state.map(|state| state.last_message_idx),
+                    tail_state.map(|state| state.last_message_created_at),
+                )?;
                 Ok(Some(existing_id))
             } else {
                 Ok(None)
@@ -9880,12 +10122,15 @@ fn franken_insert_conversation(
                 last_message_created_at,
             )?;
             if let Some(external_id) = conv.external_id.as_deref() {
-                franken_insert_external_conversation_lookup(
+                franken_insert_external_conversation_tail_lookup(
                     tx,
                     conv.source_id.as_str(),
                     agent_id,
                     external_id,
                     conv_id,
+                    conv.ended_at,
+                    last_message_idx,
+                    last_message_created_at,
                 )?;
             }
             Ok(Some(conv_id))
@@ -14961,7 +15206,7 @@ mod tests {
             .conn
             .query_row_map(
                 "SELECT conversation_id
-                 FROM conversation_external_lookup
+                 FROM conversation_external_tail_lookup
                  WHERE lookup_key = ?1",
                 fparams![lookup_key.as_str()],
                 |row| row.get_typed(0),
@@ -14972,7 +15217,7 @@ mod tests {
         storage
             .conn
             .execute_compat(
-                "DELETE FROM conversation_external_lookup WHERE lookup_key = ?1",
+                "DELETE FROM conversation_external_tail_lookup WHERE lookup_key = ?1",
                 fparams![lookup_key.as_str()],
             )
             .unwrap();
@@ -14994,18 +15239,51 @@ mod tests {
                 |row| row.get_typed(0),
             )
             .unwrap();
-        let restored_lookup_id: i64 = storage
+        let restored_lookup: (i64, Option<i64>, Option<i64>, Option<i64>) = storage
             .conn
             .query_row_map(
-                "SELECT conversation_id
-                 FROM conversation_external_lookup
+                "SELECT conversation_id, ended_at, last_message_idx, last_message_created_at
+                 FROM conversation_external_tail_lookup
                  WHERE lookup_key = ?1",
                 fparams![lookup_key.as_str()],
-                |row| row.get_typed(0),
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let tail_state: (Option<i64>, Option<i64>, Option<i64>) = storage
+            .conn
+            .query_row_map(
+                "SELECT ended_at, last_message_idx, last_message_created_at
+                 FROM conversation_tail_state
+                 WHERE conversation_id = ?1",
+                fparams![first.conversation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
             )
             .unwrap();
         assert_eq!(conversation_count, 1);
-        assert_eq!(restored_lookup_id, first.conversation_id);
+        assert_eq!(
+            restored_lookup,
+            (
+                first.conversation_id,
+                tail_state.0,
+                tail_state.1,
+                tail_state.2
+            )
+        );
+        assert_eq!(
+            tail_state,
+            (
+                appended.messages[3].created_at,
+                Some(3),
+                appended.messages[3].created_at
+            )
+        );
     }
 
     #[test]
@@ -20893,6 +21171,10 @@ mod tests {
             table_names.contains(&"conversation_external_lookup".to_string()),
             "missing conversation_external_lookup table"
         );
+        assert!(
+            table_names.contains(&"conversation_external_tail_lookup".to_string()),
+            "missing conversation_external_tail_lookup table"
+        );
 
         // Fresh frankensqlite databases should record the combined V13 base
         // schema plus every additive post-V13 migration.
@@ -20935,7 +21217,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v19_backfills_conversation_external_lookup() {
+    fn migration_v20_backfills_conversation_external_tail_lookup() {
         let storage = franken_storage_in_memory();
         let agent_id = storage
             .ensure_agent(&Agent {
@@ -20960,33 +21242,48 @@ mod tests {
 
         storage
             .raw()
-            .execute("DELETE FROM conversation_external_lookup")
+            .execute("DELETE FROM conversation_external_tail_lookup")
             .unwrap();
         storage
             .raw()
-            .execute("DELETE FROM _schema_migrations WHERE version = 19")
+            .execute("DELETE FROM _schema_migrations WHERE version = 20")
             .unwrap();
         storage
             .raw()
             .execute_compat(
                 "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-                fparams!["18"],
+                fparams!["19"],
             )
             .unwrap();
 
         storage.run_migrations().unwrap();
 
-        let backfilled_id: i64 = storage
+        let backfilled: (i64, Option<i64>, Option<i64>, Option<i64>) = storage
             .raw()
             .query_row_map(
-                "SELECT conversation_id
-                 FROM conversation_external_lookup
+                "SELECT conversation_id, ended_at, last_message_idx, last_message_created_at
+                 FROM conversation_external_tail_lookup
                  WHERE lookup_key = ?1",
                 fparams![lookup_key.as_str()],
-                |row| row.get_typed(0),
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                    ))
+                },
             )
             .unwrap();
-        assert_eq!(backfilled_id, outcome.conversation_id);
+        assert_eq!(
+            backfilled,
+            (
+                outcome.conversation_id,
+                conv.ended_at,
+                Some(1),
+                conv.messages[1].created_at
+            )
+        );
         assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
