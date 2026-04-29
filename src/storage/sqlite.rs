@@ -22,7 +22,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI8, AtomicI64, AtomicU64, Ordering},
 };
 
 /// Frankensqlite parameter list builder.
@@ -2845,10 +2845,14 @@ pub struct FrankenStorage {
     cached_ephemeral_writer: parking_lot::Mutex<CachedEphemeralWriter>,
     ensured_conversation_sources: Arc<parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>>,
     ensured_daily_stats_keys: Arc<parking_lot::Mutex<HashSet<EnsuredDailyStatsKey>>>,
+    fts_messages_present_cache: AtomicI8,
 }
 
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1000;
 const UNSET_INDEX_WRITER_CHECKPOINT_PAGES: i64 = i64::MIN;
+const FTS_MESSAGES_PRESENT_UNKNOWN: i8 = 0;
+const FTS_MESSAGES_PRESENT_ABSENT: i8 = 1;
+const FTS_MESSAGES_PRESENT_PRESENT: i8 = 2;
 
 enum CachedEphemeralWriter {
     Uninitialized,
@@ -2953,6 +2957,7 @@ impl FrankenStorage {
             cached_ephemeral_writer: parking_lot::Mutex::new(CachedEphemeralWriter::Uninitialized),
             ensured_conversation_sources,
             ensured_daily_stats_keys,
+            fts_messages_present_cache: AtomicI8::new(FTS_MESSAGES_PRESENT_UNKNOWN),
         }
     }
 
@@ -3096,6 +3101,49 @@ impl FrankenStorage {
 
     fn mark_daily_stats_key_ensured(&self, key: EnsuredDailyStatsKey) {
         self.ensured_daily_stats_keys.lock().insert(key);
+    }
+
+    fn fts_messages_present_cached(&self, tx: &FrankenTransaction<'_>) -> bool {
+        match self.fts_messages_present_cache.load(Ordering::Acquire) {
+            FTS_MESSAGES_PRESENT_PRESENT => return true,
+            FTS_MESSAGES_PRESENT_ABSENT => return false,
+            _ => {}
+        }
+
+        let present = tx
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name = 'fts_messages'
+                   AND rootpage > 0",
+                fparams![],
+                |row| row.get_typed::<i64>(0),
+            )
+            .map(|count| count > 0)
+            .unwrap_or_else(|err| {
+                tracing::debug!(
+                    error = %err,
+                    "failed to probe fts_messages presence; skipping db-resident FTS maintenance"
+                );
+                false
+            });
+        self.set_fts_messages_present_cache(present);
+        present
+    }
+
+    fn set_fts_messages_present_cache(&self, present: bool) {
+        self.fts_messages_present_cache.store(
+            if present {
+                FTS_MESSAGES_PRESENT_PRESENT
+            } else {
+                FTS_MESSAGES_PRESENT_ABSENT
+            },
+            Ordering::Release,
+        );
+    }
+
+    fn invalidate_fts_messages_present_cache(&self) {
+        self.fts_messages_present_cache
+            .store(FTS_MESSAGES_PRESENT_UNKNOWN, Ordering::Release);
     }
 
     fn invalidate_conversation_source_cache(&self, source_id: &str) {
@@ -6933,6 +6981,7 @@ impl FrankenStorage {
                             || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
                         {
                             flush_pending_fts_entries(
+                                self,
                                 &tx,
                                 &mut fts_entries,
                                 &mut fts_pending_chars,
@@ -6955,6 +7004,7 @@ impl FrankenStorage {
 
                 if !defer_lexical_updates {
                     flush_pending_fts_entries(
+                        self,
                         &tx,
                         &mut fts_entries,
                         &mut fts_pending_chars,
@@ -7037,6 +7087,7 @@ impl FrankenStorage {
                     || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
                 {
                     flush_pending_fts_entries(
+                        self,
                         &tx,
                         &mut fts_entries,
                         &mut fts_pending_chars,
@@ -7058,6 +7109,7 @@ impl FrankenStorage {
         }
         if !defer_lexical_updates {
             flush_pending_fts_entries(
+                self,
                 &tx,
                 &mut fts_entries,
                 &mut fts_pending_chars,
@@ -7200,6 +7252,7 @@ impl FrankenStorage {
                 {
                     let fts_flush_start = Instant::now();
                     flush_pending_fts_entries(
+                        self,
                         &tx,
                         &mut fts_entries,
                         &mut fts_pending_chars,
@@ -7226,6 +7279,7 @@ impl FrankenStorage {
         if !defer_lexical_updates {
             let fts_flush_start = Instant::now();
             flush_pending_fts_entries(
+                self,
                 &tx,
                 &mut fts_entries,
                 &mut fts_pending_chars,
@@ -7362,6 +7416,7 @@ impl FrankenStorage {
                 {
                     let fts_flush_start = Instant::now();
                     flush_pending_fts_entries(
+                        self,
                         &tx,
                         &mut fts_entries,
                         &mut fts_pending_chars,
@@ -7387,6 +7442,7 @@ impl FrankenStorage {
         if !defer_lexical_updates {
             let fts_flush_start = Instant::now();
             flush_pending_fts_entries(
+                self,
                 &tx,
                 &mut fts_entries,
                 &mut fts_pending_chars,
@@ -7492,6 +7548,7 @@ impl FrankenStorage {
                     || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
                 {
                     flush_pending_fts_entries(
+                        self,
                         tx,
                         &mut fts_entries,
                         &mut fts_pending_chars,
@@ -7514,6 +7571,7 @@ impl FrankenStorage {
 
         if !defer_lexical_updates {
             flush_pending_fts_entries(
+                self,
                 tx,
                 &mut fts_entries,
                 &mut fts_pending_chars,
@@ -7726,6 +7784,7 @@ impl FrankenStorage {
                     "FTS already populated and consistent; setting generation marker without rebuild"
                 );
                 self.record_fts_franken_rebuild_generation()?;
+                self.set_fts_messages_present_cache(true);
             } else {
                 let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
                 self.record_fts_franken_rebuild_generation()?;
@@ -7778,6 +7837,7 @@ impl FrankenStorage {
                 })?;
 
         if indexed_messages == total_messages {
+            self.set_fts_messages_present_cache(true);
             return Ok(FtsConsistencyRepair::AlreadyHealthy {
                 rows: usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX),
             });
@@ -7810,6 +7870,7 @@ impl FrankenStorage {
                     row.get_typed::<i64>(0)
                 })?;
         if repaired_rows == total_messages {
+            self.set_fts_messages_present_cache(true);
             return Ok(FtsConsistencyRepair::IncrementalCatchUp {
                 inserted_rows,
                 total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
@@ -7831,6 +7892,7 @@ impl FrankenStorage {
                 un_indexable_gap = total_messages.saturating_sub(repaired_rows),
                 "FTS catch-up inserted 0 rows; remaining gap is un-indexable (likely orphaned messages with dangling conversation_id)"
             );
+            self.set_fts_messages_present_cache(true);
             return Ok(FtsConsistencyRepair::IncrementalCatchUp {
                 inserted_rows: 0,
                 total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
@@ -7845,12 +7907,14 @@ impl FrankenStorage {
     }
 
     pub(crate) fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
+        self.invalidate_fts_messages_present_cache();
         self.conn
             .execute("DROP TABLE IF EXISTS fts_messages;")
             .with_context(|| "dropping derived fts_messages before frankensqlite rebuild")?;
         self.conn
             .execute_compat(FTS5_REGISTER_SQL, fparams![])
             .with_context(|| "creating derived fts_messages via frankensqlite rebuild")?;
+        self.set_fts_messages_present_cache(true);
 
         // Bug #168: Batch the FTS rebuild INSERT to avoid OOM when messages
         // table is large (e.g. 179K+ rows).  We paginate through messages by
@@ -8421,6 +8485,7 @@ impl FrankenStorage {
                             || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
                         {
                             flush_pending_fts_entries(
+                                self,
                                 &tx,
                                 &mut fts_entries,
                                 &mut fts_pending_chars,
@@ -8495,6 +8560,7 @@ impl FrankenStorage {
                                     || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
                                 {
                                     flush_pending_fts_entries(
+                                        self,
                                         &tx,
                                         &mut fts_entries,
                                         &mut fts_pending_chars,
@@ -8549,6 +8615,7 @@ impl FrankenStorage {
                                     || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
                                 {
                                     flush_pending_fts_entries(
+                                        self,
                                         &tx,
                                         &mut fts_entries,
                                         &mut fts_pending_chars,
@@ -8778,6 +8845,7 @@ impl FrankenStorage {
         // Batch insert all FTS entries at once
         if !defer_lexical_updates {
             flush_pending_fts_entries(
+                self,
                 &tx,
                 &mut fts_entries,
                 &mut fts_pending_chars,
@@ -9903,20 +9971,6 @@ fn franken_existing_message_lookup_with_pending(
 /// Batch insert FTS5 entries within a frankensqlite transaction.
 fn franken_batch_insert_fts(tx: &FrankenTransaction<'_>, entries: &[FtsEntry]) -> Result<usize> {
     if entries.is_empty() {
-        return Ok(0);
-    }
-
-    let fts_table_present = tx
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE name = 'fts_messages'
-               AND rootpage > 0",
-            fparams![],
-            |row| row.get_typed::<i64>(0),
-        )
-        .map(|count| count > 0)
-        .unwrap_or(false);
-    if !fts_table_present {
         return Ok(0);
     }
 
@@ -12276,6 +12330,7 @@ fn fts_rebuild_batch_size() -> usize {
 }
 
 fn flush_pending_fts_entries(
+    storage: &FrankenStorage,
     tx: &FrankenTransaction<'_>,
     entries: &mut Vec<FtsEntry>,
     pending_chars: &mut usize,
@@ -12285,7 +12340,9 @@ fn flush_pending_fts_entries(
         return Ok(());
     }
 
-    *inserted_total += franken_batch_insert_fts(tx, entries)?;
+    if storage.fts_messages_present_cached(tx) {
+        *inserted_total += franken_batch_insert_fts(tx, entries)?;
+    }
     entries.clear();
     *pending_chars = 0;
     Ok(())
