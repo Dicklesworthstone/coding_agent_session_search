@@ -541,6 +541,8 @@ fn conversations_table_has_correct_columns() {
         "ended_at",
         "approx_tokens",
         "metadata_json",
+        "last_message_idx",
+        "last_message_created_at",
     ];
     let missing: Vec<&str> = expected
         .iter()

@@ -1266,7 +1266,9 @@ CREATE TABLE conversations (
     api_call_count INTEGER,
     tool_call_count INTEGER,
     user_message_count INTEGER,
-    assistant_message_count INTEGER
+    assistant_message_count INTEGER,
+    last_message_idx INTEGER,
+    last_message_created_at INTEGER
 );
 CREATE TABLE messages (
     id INTEGER PRIMARY KEY,
@@ -2225,7 +2227,7 @@ fn is_backup_root_name(name: &str, prefix: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 14;
+pub const CURRENT_SCHEMA_VERSION: i64 = 15;
 const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
@@ -2741,6 +2743,25 @@ const MIGRATION_V14: &str = r"
 -- The current contentless table is recreated lazily after open() only when the
 -- frankensqlite FTS consistency check finds it missing or malformed.
 DROP TABLE IF EXISTS fts_messages;
+";
+
+const MIGRATION_V15: &str = r"
+-- Cache append-tail state on the conversation row so append-only merges do not
+-- have to rescan messages for MAX(idx)/MAX(created_at) on every call.
+ALTER TABLE conversations ADD COLUMN last_message_idx INTEGER;
+ALTER TABLE conversations ADD COLUMN last_message_created_at INTEGER;
+
+UPDATE conversations
+SET last_message_idx = (
+        SELECT MAX(m.idx)
+        FROM messages m
+        WHERE m.conversation_id = conversations.id
+    ),
+    last_message_created_at = (
+        SELECT MAX(m.created_at)
+        FROM messages m
+        WHERE m.conversation_id = conversations.id
+    );
 ";
 
 /// Row from the embedding_jobs table.
@@ -3521,6 +3542,7 @@ fn build_cass_migrations() -> MigrationRunner {
     MigrationRunner::new()
         .add(13, "full_schema_v13", MIGRATION_FRESH_SCHEMA)
         .add(14, "fts_contentless", MIGRATION_V14)
+        .add(15, "conversation_tail_state_cache", MIGRATION_V15)
 }
 
 /// Combined V13 schema for fresh databases.
@@ -4612,6 +4634,20 @@ fn conversation_effective_started_at(conv: &Conversation) -> Option<i64> {
         .or_else(|| conv.messages.iter().filter_map(|msg| msg.created_at).min())
 }
 
+fn conversation_tail_state(conv: &Conversation) -> (Option<i64>, Option<i64>) {
+    (
+        conv.messages.iter().map(|msg| msg.idx).max(),
+        conv.messages.iter().filter_map(|msg| msg.created_at).max(),
+    )
+}
+
+fn borrowed_messages_tail_state(messages: &[&Message]) -> (Option<i64>, Option<i64>) {
+    (
+        messages.iter().map(|msg| msg.idx).max(),
+        messages.iter().filter_map(|msg| msg.created_at).max(),
+    )
+}
+
 fn role_from_str(role: &str) -> MessageRole {
     match role {
         "user" => MessageRole::User,
@@ -4728,6 +4764,17 @@ fn franken_existing_conversation_append_tail_state(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
 ) -> Result<Option<(i64, i64)>> {
+    let cached: (Option<i64>, Option<i64>) = tx.query_row_map(
+        "SELECT last_message_idx, last_message_created_at
+         FROM conversations
+         WHERE id = ?1",
+        fparams![conversation_id],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+    )?;
+    if let Some(state) = cached.0.zip(cached.1) {
+        return Ok(Some(state));
+    }
+
     let (max_idx, max_created_at): (Option<i64>, Option<i64>) = tx.query_row_map(
         "SELECT MAX(idx), MAX(created_at)
          FROM messages
@@ -4735,7 +4782,58 @@ fn franken_existing_conversation_append_tail_state(
         fparams![conversation_id],
         |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
     )?;
-    Ok(max_idx.zip(max_created_at))
+    if let Some((last_message_idx, last_message_created_at)) = max_idx.zip(max_created_at) {
+        franken_update_conversation_tail_state(
+            tx,
+            conversation_id,
+            None,
+            Some(last_message_idx),
+            Some(last_message_created_at),
+        )?;
+        return Ok(Some((last_message_idx, last_message_created_at)));
+    }
+    Ok(None)
+}
+
+fn franken_update_conversation_tail_state(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    ended_at_candidate: Option<i64>,
+    last_message_idx_candidate: Option<i64>,
+    last_message_created_at_candidate: Option<i64>,
+) -> Result<()> {
+    if ended_at_candidate.is_none()
+        && last_message_idx_candidate.is_none()
+        && last_message_created_at_candidate.is_none()
+    {
+        return Ok(());
+    }
+
+    tx.execute_compat(
+        "UPDATE conversations
+         SET ended_at = CASE
+                 WHEN ?1 IS NULL THEN ended_at
+                 ELSE MAX(IFNULL(ended_at, 0), ?1)
+             END,
+             last_message_idx = CASE
+                 WHEN ?2 IS NULL THEN last_message_idx
+                 WHEN last_message_idx IS NULL OR last_message_idx < ?2 THEN ?2
+                 ELSE last_message_idx
+             END,
+             last_message_created_at = CASE
+                 WHEN ?3 IS NULL THEN last_message_created_at
+                 WHEN last_message_created_at IS NULL OR last_message_created_at < ?3 THEN ?3
+                 ELSE last_message_created_at
+             END
+         WHERE id = ?4",
+        fparams![
+            ended_at_candidate,
+            last_message_idx_candidate,
+            last_message_created_at_candidate,
+            conversation_id
+        ],
+    )?;
+    Ok(())
 }
 
 fn collect_append_only_tail_messages<'a>(
@@ -6818,6 +6916,8 @@ impl FrankenStorage {
                     &mut existing_replay_fingerprints,
                     "skipping replay-equivalent recovered message with shifted idx",
                 );
+                let (inserted_last_idx, inserted_last_created_at) =
+                    borrowed_messages_tail_state(&new_messages);
                 let mut inserted_indices = Vec::new();
                 let mut fts_entries = Vec::new();
                 let mut fts_pending_chars = 0usize;
@@ -6862,12 +6962,14 @@ impl FrankenStorage {
                     )?;
                 }
 
-                if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
-                    tx.execute_compat(
-                        "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
-                        fparams![last_ts, existing_id],
-                    )?;
-                }
+                let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
+                franken_update_conversation_tail_state(
+                    &tx,
+                    existing_id,
+                    conv_last_ts,
+                    inserted_last_idx,
+                    inserted_last_created_at,
+                )?;
 
                 if !defer_analytics_updates && !inserted_indices.is_empty() {
                     franken_update_daily_stats_in_tx(
@@ -7233,6 +7335,8 @@ impl FrankenStorage {
         let mut fts_entries = Vec::new();
         let mut fts_pending_chars = 0usize;
         let mut fts_inserted_total = 0usize;
+        let (inserted_last_idx, inserted_last_created_at) =
+            borrowed_messages_tail_state(&new_messages);
 
         let message_insert_start = Instant::now();
         let inserted_message_ids = franken_batch_insert_new_messages_with_profile(
@@ -7291,14 +7395,16 @@ impl FrankenStorage {
             profile.fts_flush_duration += fts_flush_start.elapsed();
         }
 
-        if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
-            let conversation_row_start = Instant::now();
-            tx.execute_compat(
-                "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
-                fparams![last_ts, existing_id],
-            )?;
-            profile.conversation_row_duration += conversation_row_start.elapsed();
-        }
+        let conversation_row_start = Instant::now();
+        let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
+        franken_update_conversation_tail_state(
+            &tx,
+            existing_id,
+            conv_last_ts,
+            inserted_last_idx,
+            inserted_last_created_at,
+        )?;
+        profile.conversation_row_duration += conversation_row_start.elapsed();
 
         if !defer_analytics_updates && !inserted_indices.is_empty() {
             let analytics_start = Instant::now();
@@ -7373,6 +7479,8 @@ impl FrankenStorage {
         let mut fts_entries = Vec::new();
         let mut fts_pending_chars = 0usize;
         let mut _fts_inserted_total = 0usize;
+        let (inserted_last_idx, inserted_last_created_at) =
+            borrowed_messages_tail_state(&new_messages);
         let inserted_message_ids =
             franken_batch_insert_new_messages(tx, conversation_id, &new_messages)?;
         for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
@@ -7413,12 +7521,14 @@ impl FrankenStorage {
             )?;
         }
 
-        if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
-            tx.execute_compat(
-                "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
-                fparams![last_ts, conversation_id],
-            )?;
-        }
+        let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
+        franken_update_conversation_tail_state(
+            tx,
+            conversation_id,
+            conv_last_ts,
+            inserted_last_idx,
+            inserted_last_created_at,
+        )?;
 
         if !defer_analytics_updates && !inserted_indices.is_empty() {
             let message_count = inserted_indices.len() as i64;
@@ -8296,6 +8406,8 @@ impl FrankenStorage {
                     &mut existing_replay_fingerprints,
                     "skipping replay-equivalent recovered message with shifted idx during batched merge",
                 );
+                let (inserted_last_idx, inserted_last_created_at) =
+                    borrowed_messages_tail_state(&new_messages);
                 let inserted_message_ids =
                     franken_batch_insert_new_messages(&tx, existing_id, &new_messages)?;
                 total_chars += new_chars;
@@ -8330,12 +8442,14 @@ impl FrankenStorage {
                     );
                 }
 
-                if let Some(last_ts) = conv.messages.iter().filter_map(|m| m.created_at).max() {
-                    tx.execute_compat(
-                        "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
-                        fparams![last_ts, existing_id],
-                    )?;
-                }
+                let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
+                franken_update_conversation_tail_state(
+                    &tx,
+                    existing_id,
+                    conv_last_ts,
+                    inserted_last_idx,
+                    inserted_last_created_at,
+                )?;
 
                 pending_message_fingerprints.insert(existing_id, existing_messages);
                 pending_message_replay_fingerprints
@@ -8419,6 +8533,8 @@ impl FrankenStorage {
                             &mut existing_replay_fingerprints,
                             "skipping replay-equivalent recovered message with shifted idx after duplicate conversation recovery",
                         );
+                        let (inserted_last_idx, inserted_last_created_at) =
+                            borrowed_messages_tail_state(&new_messages);
                         let inserted_message_ids =
                             franken_batch_insert_new_messages(&tx, existing_id, &new_messages)?;
                         total_chars += new_chars;
@@ -8454,14 +8570,14 @@ impl FrankenStorage {
                             );
                         }
 
-                        if let Some(last_ts) =
-                            conv.messages.iter().filter_map(|m| m.created_at).max()
-                        {
-                            tx.execute_compat(
-                                "UPDATE conversations SET ended_at = MAX(IFNULL(ended_at, 0), ?1) WHERE id = ?2",
-                                fparams![last_ts, existing_id],
-                            )?;
-                        }
+                        let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
+                        franken_update_conversation_tail_state(
+                            &tx,
+                            existing_id,
+                            conv_last_ts,
+                            inserted_last_idx,
+                            inserted_last_created_at,
+                        )?;
 
                         pending_message_fingerprints.insert(existing_id, existing_messages);
                         pending_message_replay_fingerprints
@@ -9243,6 +9359,7 @@ fn franken_insert_conversation(
     conv: &Conversation,
 ) -> Result<Option<i64>> {
     let metadata_bin = serialize_json_to_msgpack(&conv.metadata_json);
+    let (last_message_idx, last_message_created_at) = conversation_tail_state(conv);
 
     let metadata_json_str = serde_json::to_string(&conv.metadata_json)?;
     let metadata_bin_bytes = metadata_bin.as_deref();
@@ -9250,8 +9367,9 @@ fn franken_insert_conversation(
     match tx.execute_compat(
         "INSERT INTO conversations(
             agent_id, workspace_id, source_id, external_id, title, source_path,
-            started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
-        ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin,
+            last_message_idx, last_message_created_at
+        ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         fparams![
             agent_id,
             workspace_id,
@@ -9264,7 +9382,9 @@ fn franken_insert_conversation(
             conv.approx_tokens,
             metadata_json_str.as_str(),
             conv.origin_host.as_deref(),
-            metadata_bin_bytes
+            metadata_bin_bytes,
+            last_message_idx,
+            last_message_created_at
         ],
     ) {
         Ok(_) => Ok(Some(franken_last_rowid(tx)?)),
@@ -19433,6 +19553,66 @@ mod tests {
             .iter()
             .any(|row| row.get_typed::<String>(1).unwrap() == "extra_bin");
         assert!(has_extra_bin, "messages should have extra_bin column");
+    }
+
+    #[test]
+    fn insert_conversation_tree_rehydrates_append_tail_state_cache_after_manual_clear() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("append-tail-state-cache.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace = PathBuf::from("/ws/profiled-append-remote");
+        let workspace_id = storage.ensure_workspace(&workspace, None).unwrap();
+
+        let initial = make_profiled_append_remote_merge_conversation(11, 5);
+        let insert_outcome = storage
+            .insert_conversation_tree(agent_id, Some(workspace_id), &initial)
+            .unwrap();
+        let conversation_id = insert_outcome.conversation_id;
+
+        let initial_tail: (Option<i64>, Option<i64>) = storage
+            .raw()
+            .query_row_map(
+                "SELECT last_message_idx, last_message_created_at FROM conversations WHERE id = ?1",
+                fparams![conversation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(initial_tail, (Some(4), Some(111_004)));
+
+        storage
+            .raw()
+            .execute_compat(
+                "UPDATE conversations
+                 SET last_message_idx = NULL, last_message_created_at = NULL
+                 WHERE id = ?1",
+                fparams![conversation_id],
+            )
+            .unwrap();
+
+        let appended = make_profiled_append_remote_merge_conversation(11, 10);
+        let append_outcome = storage
+            .insert_conversation_tree(agent_id, Some(workspace_id), &appended)
+            .unwrap();
+        assert_eq!(append_outcome.inserted_indices, vec![5, 6, 7, 8, 9]);
+
+        let final_tail: (Option<i64>, Option<i64>) = storage
+            .raw()
+            .query_row_map(
+                "SELECT last_message_idx, last_message_created_at FROM conversations WHERE id = ?1",
+                fparams![conversation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(final_tail, (Some(9), Some(111_009)));
     }
 
     #[test]
