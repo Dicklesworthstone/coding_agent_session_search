@@ -9848,16 +9848,18 @@ fn franken_insert_external_conversation_tail_lookup(
     source_id: &str,
     agent_id: i64,
     external_id: &str,
-    conversation_id: i64,
-    ended_at: Option<i64>,
-    last_message_idx: Option<i64>,
-    last_message_created_at: Option<i64>,
+    existing: ExistingConversationWithTail,
 ) -> Result<()> {
     let lookup_key = conversation_external_lookup_key(source_id, agent_id, external_id);
+    let ended_at = existing.tail_state.and_then(|state| state.ended_at);
+    let last_message_idx = existing.tail_state.map(|state| state.last_message_idx);
+    let last_message_created_at = existing
+        .tail_state
+        .map(|state| state.last_message_created_at);
     franken_insert_external_conversation_tail_lookup_key(
         tx,
         &lookup_key,
-        conversation_id,
+        existing.id,
         ended_at,
         last_message_idx,
         last_message_created_at,
@@ -10212,10 +10214,14 @@ fn franken_insert_conversation(
                     conv.source_id.as_str(),
                     agent_id,
                     external_id,
-                    conv_id,
-                    conv.ended_at,
-                    last_message_idx,
-                    last_message_created_at,
+                    ExistingConversationWithTail {
+                        id: conv_id,
+                        tail_state: existing_conversation_tail_state_from_cached(
+                            last_message_idx,
+                            last_message_created_at,
+                            conv.ended_at,
+                        ),
+                    },
                 )?;
             }
             Ok(Some(conv_id))
