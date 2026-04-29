@@ -2724,8 +2724,8 @@ Update check state is stored in the data directory:
 
 | Dependency | Pinned revision |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `18a512b6` |
-| `franken-agent-detection` | `9ead6659` |
+| `frankensqlite` / `fsqlite-types` | `038f0f46` |
+| `franken-agent-detection` | `babea936` |
 | `asupersync` | `0.3.1` |
 | `frankensearch` | `3dbab624` |
 | `frankentui` | `5f78cfa0` |
