@@ -10313,10 +10313,8 @@ fn franken_insert_conversation(
     workspace_id: Option<i64>,
     conv: &Conversation,
 ) -> Result<Option<i64>> {
-    let metadata_bin = serialize_json_to_msgpack(&conv.metadata_json);
+    let (metadata_json_str, metadata_bin) = franken_metadata_insert_payload(&conv.metadata_json)?;
     let (last_message_idx, last_message_created_at) = conversation_tail_state(conv);
-
-    let metadata_json_str = serde_json::to_string(&conv.metadata_json)?;
     let metadata_bin_bytes = metadata_bin.as_deref();
 
     match tx.execute_compat(
@@ -10335,7 +10333,7 @@ fn franken_insert_conversation(
             conv.started_at,
             conv.ended_at,
             conv.approx_tokens,
-            metadata_json_str.as_str(),
+            metadata_json_str.as_deref(),
             conv.origin_host.as_deref(),
             metadata_bin_bytes,
             last_message_idx,
@@ -10380,6 +10378,22 @@ fn franken_insert_conversation(
             Ok(None)
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+type MetadataInsertPayload<'a> = (Option<Cow<'a, str>>, Option<Vec<u8>>);
+
+fn franken_metadata_insert_payload(value: &serde_json::Value) -> Result<MetadataInsertPayload<'_>> {
+    if let Some(raw) = historical_raw_json(value) {
+        Ok((Some(Cow::Borrowed(raw)), None))
+    } else if value.is_null() {
+        Ok((Some(Cow::Borrowed("null")), None))
+    } else if value.as_object().is_some_and(|object| object.is_empty()) {
+        Ok((None, None))
+    } else if let Some(metadata_bin) = serialize_json_to_msgpack(value) {
+        Ok((None, Some(metadata_bin)))
+    } else {
+        Ok((Some(Cow::Owned(serde_json::to_string(value)?)), None))
     }
 }
 
@@ -20863,6 +20877,123 @@ mod tests {
 
         let stored = storage.fetch_messages(conversation_id).unwrap();
         assert_eq!(stored[0].extra_json, extra_json);
+    }
+
+    #[test]
+    fn conversation_insert_preserves_null_metadata_json_as_json_null() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("null-conversation-metadata".into()),
+            title: Some("Null conversation metadata".into()),
+            source_path: PathBuf::from("/tmp/null-conversation-metadata.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "null conversation metadata message".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+
+        let (metadata_json, metadata_bin): (Option<String>, Option<Vec<u8>>) = storage
+            .conn
+            .query_row_map(
+                "SELECT metadata_json, metadata_bin FROM conversations WHERE external_id = ?1",
+                fparams!["null-conversation-metadata"],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(metadata_json.as_deref(), Some("null"));
+        assert!(metadata_bin.is_none());
+
+        let listed = storage.list_conversations(10, 0).unwrap();
+        assert!(listed[0].metadata_json.is_null());
+    }
+
+    #[test]
+    fn conversation_insert_stores_nonempty_metadata_as_msgpack_only() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let metadata_json = serde_json::json!({ "bench": true, "source": "profile" });
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("msgpack-conversation-metadata".into()),
+            title: Some("MessagePack conversation metadata".into()),
+            source_path: PathBuf::from("/tmp/msgpack-conversation-metadata.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: metadata_json.clone(),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "msgpack conversation metadata message".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+
+        let (metadata_text, metadata_bin): (Option<String>, Option<Vec<u8>>) = storage
+            .conn
+            .query_row_map(
+                "SELECT metadata_json, metadata_bin FROM conversations WHERE external_id = ?1",
+                fparams!["msgpack-conversation-metadata"],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert!(metadata_text.is_none());
+        assert!(metadata_bin.is_some());
+
+        let listed = storage.list_conversations(10, 0).unwrap();
+        assert_eq!(listed[0].metadata_json, metadata_json);
     }
 
     #[test]
