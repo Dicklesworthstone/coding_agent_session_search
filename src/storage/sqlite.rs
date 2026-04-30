@@ -7417,6 +7417,8 @@ impl FrankenStorage {
                 existing.id,
                 conv,
                 existing.tail_state,
+                defer_lexical_updates,
+                defer_analytics_updates,
             )?;
             tx.commit()?;
             return Ok(outcome);
@@ -8037,9 +8039,9 @@ impl FrankenStorage {
         conversation_id: i64,
         conv: &Conversation,
         append_tail_state: Option<ExistingConversationTailState>,
+        defer_lexical_updates: bool,
+        defer_analytics_updates: bool,
     ) -> Result<InsertOutcome> {
-        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
-        let defer_analytics_updates = defer_analytics_updates_enabled();
         let append_tail_ended_at = append_tail_state.and_then(|state| state.ended_at);
         let append_plan = append_tail_state.as_ref().and_then(|state| {
             collect_append_only_tail_messages(
