@@ -10959,8 +10959,10 @@ fn franken_update_ensured_daily_stats_targets_in_tx(
              total_chars = total_chars + ?6,
              last_updated = ?7
          WHERE day_id = ?1
-           AND agent_slug IN (?2, 'all')
-           AND source_id IN (?3, 'all')",
+           AND ((agent_slug = ?2 AND source_id = ?3)
+                OR (agent_slug = 'all' AND source_id = ?3)
+                OR (agent_slug = ?2 AND source_id = 'all')
+                OR (agent_slug = 'all' AND source_id = 'all'))",
         fparams![
             primary.day_id,
             primary.agent_slug,
