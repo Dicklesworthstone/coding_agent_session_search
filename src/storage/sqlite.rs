@@ -5194,6 +5194,22 @@ fn franken_insert_conversation_tail_state(
     Ok(())
 }
 
+fn franken_tail_state_insert_ended_at(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    candidate: Option<i64>,
+) -> Result<Option<i64>> {
+    let canonical: Option<i64> = tx
+        .query_row_map(
+            "SELECT ended_at FROM conversations WHERE id = ?1",
+            fparams![conversation_id],
+            |row| row.get_typed(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(canonical.max(candidate))
+}
+
 fn franken_update_conversation_tail_state(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
@@ -5233,10 +5249,12 @@ fn franken_update_conversation_tail_state(
         ],
     )?;
     if changed == 0 {
+        let insert_ended_at =
+            franken_tail_state_insert_ended_at(tx, conversation_id, ended_at_candidate)?;
         franken_insert_conversation_tail_state(
             tx,
             conversation_id,
-            ended_at_candidate,
+            insert_ended_at,
             last_message_idx_candidate,
             last_message_created_at_candidate,
         )?;
@@ -5265,10 +5283,12 @@ fn franken_set_conversation_tail_state_after_append(
         ],
     )?;
     if changed == 0 {
+        let insert_ended_at =
+            franken_tail_state_insert_ended_at(tx, conversation_id, Some(ended_at))?;
         franken_insert_conversation_tail_state(
             tx,
             conversation_id,
-            Some(ended_at),
+            insert_ended_at,
             Some(last_message_idx),
             Some(last_message_created_at),
         )?;
@@ -7927,6 +7947,7 @@ impl FrankenStorage {
         }
 
         let conversation_row_start = Instant::now();
+        let mut exact_append_tail_set = false;
         if used_append_tail_plan {
             if let (Some(last_message_idx), Some(last_message_created_at)) =
                 (inserted_last_idx, inserted_last_created_at)
@@ -7939,6 +7960,7 @@ impl FrankenStorage {
                         last_message_idx,
                         last_message_created_at,
                     )?;
+                    exact_append_tail_set = true;
                 } else {
                     franken_update_conversation_tail_state(
                         &tx,
@@ -7959,20 +7981,15 @@ impl FrankenStorage {
                 inserted_last_created_at,
             )?;
         }
-        if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv) {
-            let ended_at_candidate = if used_append_tail_plan {
-                inserted_last_created_at
-            } else {
-                conv.messages.iter().filter_map(|m| m.created_at).max()
-            };
-            franken_update_external_conversation_tail_lookup_key(
-                &tx,
-                &lookup_key,
-                ended_at_candidate,
-                inserted_last_idx,
-                inserted_last_created_at,
-            )?;
-        }
+        franken_update_external_conversation_tail_after_append(
+            &tx,
+            agent_id,
+            conv,
+            used_append_tail_plan,
+            exact_append_tail_set,
+            inserted_last_idx,
+            inserted_last_created_at,
+        )?;
         profile.conversation_row_duration += conversation_row_start.elapsed();
 
         if !defer_analytics_updates && !inserted_indices.is_empty() {
@@ -8096,6 +8113,7 @@ impl FrankenStorage {
             )?;
         }
 
+        let mut exact_append_tail_set = false;
         if used_append_tail_plan {
             if let (Some(last_message_idx), Some(last_message_created_at)) =
                 (inserted_last_idx, inserted_last_created_at)
@@ -8108,6 +8126,7 @@ impl FrankenStorage {
                         last_message_idx,
                         last_message_created_at,
                     )?;
+                    exact_append_tail_set = true;
                 } else {
                     franken_update_conversation_tail_state(
                         tx,
@@ -8128,20 +8147,15 @@ impl FrankenStorage {
                 inserted_last_created_at,
             )?;
         }
-        if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv) {
-            let ended_at_candidate = if used_append_tail_plan {
-                inserted_last_created_at
-            } else {
-                conv.messages.iter().filter_map(|m| m.created_at).max()
-            };
-            franken_update_external_conversation_tail_lookup_key(
-                tx,
-                &lookup_key,
-                ended_at_candidate,
-                inserted_last_idx,
-                inserted_last_created_at,
-            )?;
-        }
+        franken_update_external_conversation_tail_after_append(
+            tx,
+            agent_id,
+            conv,
+            used_append_tail_plan,
+            exact_append_tail_set,
+            inserted_last_idx,
+            inserted_last_created_at,
+        )?;
 
         if !defer_analytics_updates && !inserted_indices.is_empty() {
             let message_count = inserted_indices.len() as i64;
@@ -9904,6 +9918,69 @@ fn franken_update_external_conversation_tail_lookup_key(
         ],
     )?;
     Ok(())
+}
+
+fn franken_set_external_conversation_tail_lookup_after_append(
+    tx: &FrankenTransaction<'_>,
+    lookup_key: &str,
+    ended_at: i64,
+    last_message_idx: i64,
+    last_message_created_at: i64,
+) -> Result<()> {
+    tx.execute_compat(
+        "UPDATE conversation_external_tail_lookup
+         SET ended_at = ?1,
+             last_message_idx = ?2,
+             last_message_created_at = ?3
+         WHERE lookup_key = ?4",
+        fparams![
+            ended_at,
+            last_message_idx,
+            last_message_created_at,
+            lookup_key
+        ],
+    )?;
+    Ok(())
+}
+
+fn franken_update_external_conversation_tail_after_append(
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    conv: &Conversation,
+    used_append_tail_plan: bool,
+    exact_append_set: bool,
+    inserted_last_idx: Option<i64>,
+    inserted_last_created_at: Option<i64>,
+) -> Result<()> {
+    let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv) else {
+        return Ok(());
+    };
+
+    if exact_append_set
+        && let (Some(last_message_idx), Some(last_message_created_at)) =
+            (inserted_last_idx, inserted_last_created_at)
+    {
+        return franken_set_external_conversation_tail_lookup_after_append(
+            tx,
+            &lookup_key,
+            last_message_created_at,
+            last_message_idx,
+            last_message_created_at,
+        );
+    }
+
+    let ended_at_candidate = if used_append_tail_plan {
+        inserted_last_created_at
+    } else {
+        conv.messages.iter().filter_map(|m| m.created_at).max()
+    };
+    franken_update_external_conversation_tail_lookup_key(
+        tx,
+        &lookup_key,
+        ended_at_candidate,
+        inserted_last_idx,
+        inserted_last_created_at,
+    )
 }
 
 fn franken_find_existing_conversation_by_key(
