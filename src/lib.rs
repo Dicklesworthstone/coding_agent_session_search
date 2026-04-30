@@ -27822,9 +27822,13 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
             .collect();
 
         // Top-level fields describe the *active* model — preserves the
-        // original single-model JSON shape for any consumer that reads it.
-        // Falls back to MiniLM-shaped placeholder fields when the policy
-        // selects "hash" (no model active).
+        // original single-model JSON shape for any consumer that reads
+        // `model_id` etc. directly. When the policy selects "hash" (or
+        // an unrecognized name) there is no active model, so these
+        // fields are omitted from the top level — consumers should
+        // treat their absence as "no embedder model in use" and fall
+        // back to `policy_quality_tier_embedder` + `models[*]` to see
+        // the full picture.
         let active_json = active_status.map(|s| {
             serde_json::json!({
                 "model_id": s.manifest.id,
