@@ -27694,7 +27694,13 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
     }
 }
 
-/// Show semantic model installation status
+/// Show semantic model installation status.
+///
+/// Reports on every embedder cass knows about (currently `minilm`,
+/// `snowflake-arctic-s`, `nomic-embed`), not just the compiled-in default.
+/// The "active" model is the one resolved from policy
+/// (`quality_tier_embedder`) — that is what `cass index` and `cass search`
+/// will actually use.
 fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     use crate::search::fastembed_embedder::FastEmbedder;
     use crate::search::model_download::{
@@ -27703,38 +27709,78 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
 
     let data_dir = default_data_dir();
-    let model_dir = FastEmbedder::default_model_dir(&data_dir);
-    let manifest = ModelManifest::minilm_v2();
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
-    let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
 
-    let total_size = manifest.total_size();
-    let total_size_mb = total_size as f64 / 1_048_576.0;
-
-    // Check for file sizes on disk
-    let mut installed_size: u64 = 0;
-    let mut file_info: Vec<serde_json::Value> = Vec::new();
-    for mfile in &manifest.files {
-        let file_path = model_file_path(&model_dir, mfile);
-        let exists = file_path.is_some();
-        let size = if let Some(path) = file_path.as_ref() {
-            path.metadata().map(|m| m.len()).unwrap_or(0)
-        } else {
-            0
-        };
-        if exists {
-            installed_size += size;
+    // Canonicalize the policy's quality_tier_embedder to a registry name.
+    // The policy stores short aliases (e.g. "snowflake", "minilm") while
+    // ModelManifest::for_embedder expects registry names — match both.
+    let policy_embedder = policy.quality_tier_embedder.as_str();
+    let active_registry_name = match policy_embedder {
+        "minilm" | "all-minilm-l6-v2" | "fastembed" | "minilm-384" => Some("minilm"),
+        "snowflake" | "snowflake-arctic-s" | "snowflake-arctic-embed-s"
+        | "snowflake-arctic-s-384" => Some("snowflake-arctic-s"),
+        "nomic" | "nomic-embed" | "nomic-embed-text-v1.5" | "nomic-embed-768" => {
+            Some("nomic-embed")
         }
-        file_info.push(serde_json::json!({
-            "name": mfile.name,
-            "local_name": mfile.local_name(),
-            "actual_path": file_path.as_ref().map(|path| path.display().to_string()),
-            "expected_size": mfile.size,
-            "actual_size": size,
-            "exists": exists,
-            "size_match": exists && size == mfile.size,
-        }));
+        "hash" => None, // hash fallback — no model files
+        _ => None,
+    };
+
+    // Per-model status snapshot.
+    struct ModelStatus {
+        registry_name: &'static str,
+        manifest: ModelManifest,
+        model_dir: PathBuf,
+        cache_report: crate::search::model_download::ModelCacheReport,
+        total_size: u64,
+        installed_size: u64,
+        files: Vec<serde_json::Value>,
+    }
+
+    let known: &[&str] = &["minilm", "snowflake-arctic-s", "nomic-embed"];
+    let mut statuses: Vec<ModelStatus> = Vec::with_capacity(known.len());
+    for name in known {
+        let Some(manifest) = ModelManifest::for_embedder(name) else {
+            continue;
+        };
+        let Some(model_dir) = FastEmbedder::model_dir_for(&data_dir, name) else {
+            continue;
+        };
+        let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
+        let total_size = manifest.total_size();
+        let mut installed_size: u64 = 0;
+        let mut file_info: Vec<serde_json::Value> = Vec::with_capacity(manifest.files.len());
+        for mfile in &manifest.files {
+            let file_path = model_file_path(&model_dir, mfile);
+            let exists = file_path.is_some();
+            let size = if let Some(path) = file_path.as_ref() {
+                path.metadata().map(|m| m.len()).unwrap_or(0)
+            } else {
+                0
+            };
+            if exists {
+                installed_size += size;
+            }
+            file_info.push(serde_json::json!({
+                "name": mfile.name,
+                "local_name": mfile.local_name(),
+                "actual_path": file_path.as_ref().map(|path| path.display().to_string()),
+                "expected_size": mfile.size,
+                "actual_size": size,
+                "exists": exists,
+                "size_match": exists && size == mfile.size,
+            }));
+        }
+        statuses.push(ModelStatus {
+            registry_name: name,
+            manifest,
+            model_dir,
+            cache_report,
+            total_size,
+            installed_size,
+            files: file_info,
+        });
     }
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -27745,24 +27791,70 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         }
     });
 
+    let active_status = active_registry_name
+        .and_then(|name| statuses.iter().find(|s| s.registry_name == name));
+
     if let Some(_fmt) = structured_format {
-        let output = serde_json::json!({
-            "model_id": manifest.id,
-            "model_dir": model_dir.display().to_string(),
-            "installed": cache_report.is_usable(),
-            "state": cache_report.state_code(),
-            "state_detail": cache_report.state.summary(),
-            "next_step": cache_report.state.next_step(),
-            "lexical_fail_open": true,
-            "revision": manifest.revision,
-            "license": manifest.license,
-            "total_size_bytes": total_size,
-            "installed_size_bytes": cache_report.installed_size_bytes,
-            "observed_file_bytes": installed_size,
-            "policy_source": cache_report.policy_source.as_str(),
-            "cache_lifecycle": &cache_report,
-            "files": file_info,
+        let models_json: Vec<serde_json::Value> = statuses
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "registry_name": s.registry_name,
+                    "model_id": s.manifest.id,
+                    "model_dir": s.model_dir.display().to_string(),
+                    "active": active_registry_name == Some(s.registry_name),
+                    "installed": s.cache_report.is_usable(),
+                    "state": s.cache_report.state_code(),
+                    "state_detail": s.cache_report.state.summary(),
+                    "next_step": s.cache_report.state.next_step(),
+                    "revision": s.manifest.revision,
+                    "license": s.manifest.license,
+                    "total_size_bytes": s.total_size,
+                    "installed_size_bytes": s.cache_report.installed_size_bytes,
+                    "observed_file_bytes": s.installed_size,
+                    "policy_source": s.cache_report.policy_source.as_str(),
+                    "cache_lifecycle": &s.cache_report,
+                    "files": s.files,
+                })
+            })
+            .collect();
+
+        // Top-level fields describe the *active* model — preserves the
+        // original single-model JSON shape for any consumer that reads it.
+        // Falls back to MiniLM-shaped placeholder fields when the policy
+        // selects "hash" (no model active).
+        let active_json = active_status.map(|s| {
+            serde_json::json!({
+                "model_id": s.manifest.id,
+                "model_dir": s.model_dir.display().to_string(),
+                "installed": s.cache_report.is_usable(),
+                "state": s.cache_report.state_code(),
+                "state_detail": s.cache_report.state.summary(),
+                "next_step": s.cache_report.state.next_step(),
+                "revision": s.manifest.revision,
+                "license": s.manifest.license,
+                "total_size_bytes": s.total_size,
+                "installed_size_bytes": s.cache_report.installed_size_bytes,
+                "observed_file_bytes": s.installed_size,
+                "policy_source": s.cache_report.policy_source.as_str(),
+                "cache_lifecycle": &s.cache_report,
+                "files": &s.files,
+            })
         });
+
+        let mut output = serde_json::json!({
+            "policy_quality_tier_embedder": policy_embedder,
+            "active_registry_name": active_registry_name,
+            "lexical_fail_open": true,
+            "models": models_json,
+        });
+        if let (Some(active), Some(obj)) = (active_json, output.as_object_mut()) {
+            if let Some(active_obj) = active.as_object() {
+                for (k, v) in active_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&output).unwrap_or_default()
@@ -27773,56 +27865,89 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         println!("Semantic Search Model Status");
         println!("============================");
         println!();
-        println!("Model:    {} ({})", manifest.id, manifest.license);
+        println!("Active embedder (quality tier): {}", policy_embedder);
+        if active_registry_name.is_none() && policy_embedder != "hash" {
+            println!(
+                "  {} unrecognized embedder name; cass will fall back to hash-only.",
+                "⚠".yellow()
+            );
+        }
+        if policy_embedder == "hash" {
+            println!("  No ONNX model is in use; semantic search runs in hash-fallback mode.");
+        }
         println!(
-            "Revision: {}",
-            manifest.revision.get(..12).unwrap_or(&manifest.revision)
+            "Override with: CASS_SEMANTIC_EMBEDDER={{minilm|snowflake-arctic-s|nomic-embed|hash}}"
         );
-        println!("Location: {}", model_dir.display());
-        println!("Size:     {:.1} MB", total_size_mb);
-        println!();
-
-        let status_str = match cache_report.state_code() {
-            "acquired" | "preseeded_local" | "mirror_sourced" => {
-                cache_report.state.summary().green().to_string()
-            }
-            "acquiring" => cache_report.state.summary().cyan().to_string(),
-            "not_acquired" | "offline_blocked" | "budget_blocked" | "disabled_by_policy" => {
-                cache_report.state.summary().yellow().to_string()
-            }
-            _ => cache_report.state.summary().red().to_string(),
-        };
-        println!("Status: {}", status_str);
         println!("Fail-open: lexical search remains available.");
         println!();
 
-        // Show files
-        println!("Files:");
-        for mfile in &manifest.files {
-            let file_path = model_file_path(&model_dir, mfile);
-            let exists = file_path.is_some();
-            let size = if let Some(path) = file_path.as_ref() {
-                path.metadata().map(|m| m.len()).unwrap_or(0)
-            } else {
-                0
+        for s in &statuses {
+            let is_active = active_registry_name == Some(s.registry_name);
+            let header = format!(
+                "{} {} ({})",
+                if is_active { "▶" } else { " " },
+                s.manifest.id,
+                s.manifest.license
+            );
+            println!(
+                "{}",
+                if is_active {
+                    header.bold().to_string()
+                } else {
+                    header
+                }
+            );
+            println!(
+                "  Revision: {}",
+                s.manifest.revision.get(..12).unwrap_or(&s.manifest.revision)
+            );
+            println!("  Location: {}", s.model_dir.display());
+            let total_size_mb = s.total_size as f64 / 1_048_576.0;
+            println!("  Size:     {:.1} MB", total_size_mb);
+            let status_str = match s.cache_report.state_code() {
+                "acquired" | "preseeded_local" | "mirror_sourced" => {
+                    s.cache_report.state.summary().green().to_string()
+                }
+                "acquiring" => s.cache_report.state.summary().cyan().to_string(),
+                "not_acquired" | "offline_blocked" | "budget_blocked" | "disabled_by_policy" => {
+                    s.cache_report.state.summary().yellow().to_string()
+                }
+                _ => s.cache_report.state.summary().red().to_string(),
             };
-            let size_mb = mfile.size as f64 / 1_048_576.0;
+            println!("  Status:   {}", status_str);
 
-            let status = if exists && size == mfile.size {
-                "✓".green().to_string()
-            } else if exists {
-                "⚠".yellow().to_string()
-            } else {
-                "✗".red().to_string()
-            };
-            println!("  {} {} ({:.1} MB)", status, mfile.name, size_mb);
+            print!("  Files:    ");
+            let installed = s
+                .files
+                .iter()
+                .filter(|f| f["size_match"].as_bool().unwrap_or(false))
+                .count();
+            let partial = s
+                .files
+                .iter()
+                .filter(|f| {
+                    f["exists"].as_bool().unwrap_or(false)
+                        && !f["size_match"].as_bool().unwrap_or(false)
+                })
+                .count();
+            let missing = s.files.len() - installed - partial;
+            println!(
+                "{} ok / {} partial / {} missing",
+                installed, partial, missing
+            );
+            if let Some(next_step) = s.cache_report.state.next_step() {
+                println!("  Next:     {}", next_step);
+            }
+            println!();
         }
-        println!();
 
-        if let Some(next_step) = cache_report.state.next_step() {
-            println!("{}", next_step);
-        } else {
-            println!("Model is ready for semantic search.");
+        if active_status.is_none() && policy_embedder != "hash" {
+            println!(
+                "{}: active embedder '{}' has no manifest registered. \
+                 Use 'cass models install --model <name>' to install one of the supported embedders.",
+                "⚠".yellow(),
+                policy_embedder
+            );
         }
     }
 
