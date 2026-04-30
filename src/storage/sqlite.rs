@@ -777,6 +777,24 @@ fn franken_read_metadata_compat(
     serde_json::Value::Object(serde_json::Map::new())
 }
 
+fn franken_read_message_extra_compat(
+    row: &FrankenRow,
+    json_idx: usize,
+    bin_idx: usize,
+) -> serde_json::Value {
+    if let Ok(Some(bytes)) = row.get_typed::<Option<Vec<u8>>>(bin_idx)
+        && !bytes.is_empty()
+    {
+        return deserialize_msgpack_to_json(&bytes);
+    }
+
+    if let Ok(Some(json_str)) = row.get_typed::<Option<String>>(json_idx) {
+        return serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
+    }
+
+    serde_json::Value::Null
+}
+
 // -------------------------------------------------------------------------
 // Migration Error Types (P1.5)
 // -------------------------------------------------------------------------
@@ -6144,7 +6162,7 @@ impl FrankenStorage {
                     author: row.get_typed(3)?,
                     created_at: row.get_typed(4)?,
                     content: row.get_typed(5)?,
-                    extra_json: franken_read_metadata_compat(row, 6, 7),
+                    extra_json: franken_read_message_extra_compat(row, 6, 7),
                     snippets: Vec::new(),
                 })
             })
@@ -6171,7 +6189,7 @@ impl FrankenStorage {
                                 author: row.get_typed(3)?,
                                 created_at: row.get_typed(4)?,
                                 content: row.get_typed(5)?,
-                                extra_json: franken_read_metadata_compat(row, 6, 7),
+                                extra_json: franken_read_message_extra_compat(row, 6, 7),
                                 snippets: Vec::new(),
                             })
                         },
@@ -8072,6 +8090,7 @@ impl FrankenStorage {
     }
 
     /// Append new messages to an existing conversation within an active transaction.
+    #[allow(clippy::too_many_arguments)]
     fn franken_append_messages_with_tail_in_tx(
         &self,
         tx: &FrankenTransaction<'_>,
@@ -10382,21 +10401,30 @@ fn franken_insert_new_message(
                 msg.author.as_deref(),
                 msg.created_at,
                 msg.content.as_str(),
-                extra_json_str.as_ref(),
+                extra_json_str.as_deref(),
                 extra_bin_bytes
         ],
     )?;
     franken_last_rowid(tx)
 }
 
-fn franken_message_insert_payload(msg: &Message) -> Result<(Cow<'_, str>, Option<Vec<u8>>)> {
+type MessageInsertPayload<'a> = (Option<Cow<'a, str>>, Option<Vec<u8>>);
+
+fn franken_message_insert_payload(msg: &Message) -> Result<MessageInsertPayload<'_>> {
     if let Some(raw) = historical_raw_json(&msg.extra_json) {
-        Ok((Cow::Borrowed(raw), None))
+        Ok((Some(Cow::Borrowed(raw)), None))
+    } else if msg.extra_json.is_null() {
+        Ok((None, None))
     } else {
-        Ok((
-            Cow::Owned(serde_json::to_string(&msg.extra_json)?),
-            serialize_json_to_msgpack(&msg.extra_json),
-        ))
+        let extra_bin = serialize_json_to_msgpack(&msg.extra_json);
+        if extra_bin.is_some() {
+            Ok((None, extra_bin))
+        } else {
+            Ok((
+                Some(Cow::Owned(serde_json::to_string(&msg.extra_json)?)),
+                None,
+            ))
+        }
     }
 }
 
@@ -10412,6 +10440,44 @@ const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
 /// append path, 50-row chunks beat the old 20-row setting on the append-merge
 /// profile. 100-row chunks slightly regress the 20-message workload.
 const APPEND_MESSAGE_INSERT_BATCH_SIZE: usize = 50;
+
+fn message_insert_batch_sql(row_count: usize) -> &'static str {
+    static MESSAGE_INSERT_BATCH_SQL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+    let max_batch_size = MESSAGE_INSERT_BATCH_SIZE.max(APPEND_MESSAGE_INSERT_BATCH_SIZE);
+    let cached_sql = MESSAGE_INSERT_BATCH_SQL.get_or_init(|| {
+        let mut sql_by_row_count = Vec::with_capacity(max_batch_size + 1);
+        sql_by_row_count.push(String::new());
+        for row_count in 1..=max_batch_size {
+            let placeholders = (0..row_count)
+                .map(|idx| {
+                    let base = idx * 8;
+                    format!(
+                        "(?{},?{},?{},?{},?{},?{},?{},?{})",
+                        base + 1,
+                        base + 2,
+                        base + 3,
+                        base + 4,
+                        base + 5,
+                        base + 6,
+                        base + 7,
+                        base + 8
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            sql_by_row_count.push(format!(
+                "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
+            ));
+        }
+        sql_by_row_count
+    });
+
+    cached_sql
+        .get(row_count)
+        .map(String::as_str)
+        .expect("message insert batch size must be covered by the cached SQL table")
+}
 
 fn franken_batch_insert_new_messages(
     tx: &FrankenTransaction<'_>,
@@ -10452,26 +10518,7 @@ fn franken_batch_insert_new_messages_with_batch_size(
             inserted_ids.push(franken_insert_new_message(tx, conversation_id, chunk[0])?);
             continue;
         }
-        let placeholders = (0..chunk.len())
-            .map(|idx| {
-                let base = idx * 8;
-                format!(
-                    "(?{},?{},?{},?{},?{},?{},?{},?{})",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6,
-                    base + 7,
-                    base + 8
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
-        );
+        let sql = message_insert_batch_sql(chunk.len());
 
         let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 8);
         for msg in chunk {
@@ -10482,11 +10529,11 @@ fn franken_batch_insert_new_messages_with_batch_size(
             param_values.push(SqliteValue::from(msg.author.as_deref()));
             param_values.push(SqliteValue::from(msg.created_at));
             param_values.push(SqliteValue::from(msg.content.as_str()));
-            param_values.push(SqliteValue::from(extra_json_str.as_ref()));
+            param_values.push(SqliteValue::from(extra_json_str.as_deref()));
             param_values.push(SqliteValue::from(extra_bin.as_deref()));
         }
 
-        tx.execute_with_params(&sql, &param_values)?;
+        tx.execute_with_params(sql, &param_values)?;
 
         let last_id = franken_last_rowid(tx)?;
         let first_id = last_id
@@ -10529,7 +10576,7 @@ fn franken_insert_new_message_with_profile(
                 msg.author.as_deref(),
                 msg.created_at,
                 msg.content.as_str(),
-                extra_json_str.as_ref(),
+                extra_json_str.as_deref(),
                 extra_bin_bytes
         ],
     )?;
@@ -10598,26 +10645,7 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
         profile.batch_rows += chunk.len();
 
         let sql_build_start = Instant::now();
-        let placeholders = (0..chunk.len())
-            .map(|idx| {
-                let base = idx * 8;
-                format!(
-                    "(?{},?{},?{},?{},?{},?{},?{},?{})",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6,
-                    base + 7,
-                    base + 8
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
-        );
+        let sql = message_insert_batch_sql(chunk.len());
         profile.sql_build_duration += sql_build_start.elapsed();
 
         let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 8);
@@ -10633,13 +10661,13 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
             param_values.push(SqliteValue::from(msg.author.as_deref()));
             param_values.push(SqliteValue::from(msg.created_at));
             param_values.push(SqliteValue::from(msg.content.as_str()));
-            param_values.push(SqliteValue::from(extra_json_str.as_ref()));
+            param_values.push(SqliteValue::from(extra_json_str.as_deref()));
             param_values.push(SqliteValue::from(extra_bin.as_deref()));
             profile.param_build_duration += param_build_start.elapsed();
         }
 
         let execute_start = Instant::now();
-        tx.execute_with_params(&sql, &param_values)?;
+        tx.execute_with_params(sql, &param_values)?;
         profile.execute_duration += execute_start.elapsed();
 
         let rowid_start = Instant::now();
@@ -20716,6 +20744,125 @@ mod tests {
     fn msgpack_returns_none_for_null() {
         let value = serde_json::Value::Null;
         assert!(serialize_json_to_msgpack(&value).is_none());
+    }
+
+    #[test]
+    fn message_insert_stores_null_extra_json_as_sql_null() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("null-extra-json".into()),
+            title: Some("Null extra_json".into()),
+            source_path: PathBuf::from("/tmp/null-extra-json.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "null metadata message".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let conversation_id = storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap()
+            .conversation_id;
+
+        let (extra_json, extra_bin): (Option<String>, Option<Vec<u8>>) = storage
+            .conn
+            .query_row_map(
+                "SELECT extra_json, extra_bin FROM messages WHERE conversation_id = ?1",
+                fparams![conversation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert!(extra_json.is_none());
+        assert!(extra_bin.is_none());
+
+        let stored = storage.fetch_messages(conversation_id).unwrap();
+        assert!(stored[0].extra_json.is_null());
+    }
+
+    #[test]
+    fn message_insert_stores_nonempty_extra_json_as_msgpack_only() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let extra_json = serde_json::json!({ "idx": 7, "kind": "profile" });
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("msgpack-extra-json".into()),
+            title: Some("MessagePack extra_json".into()),
+            source_path: PathBuf::from("/tmp/msgpack-extra-json.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "msgpack metadata message".into(),
+                extra_json: extra_json.clone(),
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let conversation_id = storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap()
+            .conversation_id;
+
+        let (extra_json_text, extra_bin): (Option<String>, Option<Vec<u8>>) = storage
+            .conn
+            .query_row_map(
+                "SELECT extra_json, extra_bin FROM messages WHERE conversation_id = ?1",
+                fparams![conversation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert!(extra_json_text.is_none());
+        assert!(extra_bin.is_some());
+
+        let stored = storage.fetch_messages(conversation_id).unwrap();
+        assert_eq!(stored[0].extra_json, extra_json);
     }
 
     #[test]
