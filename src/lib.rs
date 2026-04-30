@@ -27718,7 +27718,9 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     let policy_embedder = policy.quality_tier_embedder.as_str();
     let active_registry_name = match policy_embedder {
         "minilm" | "all-minilm-l6-v2" | "fastembed" | "minilm-384" => Some("minilm"),
-        "snowflake" | "snowflake-arctic-s" | "snowflake-arctic-embed-s"
+        "snowflake"
+        | "snowflake-arctic-s"
+        | "snowflake-arctic-embed-s"
         | "snowflake-arctic-s-384" => Some("snowflake-arctic-s"),
         "nomic" | "nomic-embed" | "nomic-embed-text-v1.5" | "nomic-embed-768" => {
             Some("nomic-embed")
@@ -27791,8 +27793,8 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         }
     });
 
-    let active_status = active_registry_name
-        .and_then(|name| statuses.iter().find(|s| s.registry_name == name));
+    let active_status =
+        active_registry_name.and_then(|name| statuses.iter().find(|s| s.registry_name == name));
 
     if let Some(_fmt) = structured_format {
         let models_json: Vec<serde_json::Value> = statuses
@@ -27848,11 +27850,11 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
             "lexical_fail_open": true,
             "models": models_json,
         });
-        if let (Some(active), Some(obj)) = (active_json, output.as_object_mut()) {
-            if let Some(active_obj) = active.as_object() {
-                for (k, v) in active_obj {
-                    obj.insert(k.clone(), v.clone());
-                }
+        if let (Some(active), Some(obj)) = (active_json, output.as_object_mut())
+            && let Some(active_obj) = active.as_object()
+        {
+            for (k, v) in active_obj {
+                obj.insert(k.clone(), v.clone());
             }
         }
         println!(
@@ -27899,7 +27901,10 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
             );
             println!(
                 "  Revision: {}",
-                s.manifest.revision.get(..12).unwrap_or(&s.manifest.revision)
+                s.manifest
+                    .revision
+                    .get(..12)
+                    .unwrap_or(&s.manifest.revision)
             );
             println!("  Location: {}", s.model_dir.display());
             let total_size_mb = s.total_size as f64 / 1_048_576.0;
