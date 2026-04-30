@@ -15937,6 +15937,9 @@ pub mod persist {
 
     pub(super) fn apply_index_writer_busy_timeout(storage: &FrankenStorage) {
         let busy_timeout_ms = index_writer_busy_timeout_ms();
+        if storage.index_writer_busy_timeout_ms() == Some(busy_timeout_ms) {
+            return;
+        }
         let pragma = format!("PRAGMA busy_timeout = {busy_timeout_ms};");
         if let Err(err) = storage.raw().execute(&pragma) {
             tracing::debug!(
@@ -15944,6 +15947,8 @@ pub mod persist {
                 error = %err,
                 "failed_to_apply_index_writer_busy_timeout"
             );
+        } else {
+            storage.mark_index_writer_busy_timeout_ms(busy_timeout_ms);
         }
     }
 

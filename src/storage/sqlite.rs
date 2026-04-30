@@ -68,7 +68,7 @@ pub enum LazyDbError {
 /// However, the `Rc` values are entirely self-contained within the Connection
 /// and are not shared externally.  When wrapped in a `Mutex`,
 /// exclusive access is guaranteed, making cross-thread transfer safe.
-pub struct SendFrankenConnection(FrankenConnection);
+pub struct SendFrankenConnection(FrankenConnection, i64, u64);
 
 // Safety: Rc fields inside FrankenConnection are not cloned or shared externally.
 // The Mutex<Option<SendFrankenConnection>> ensures exclusive access.
@@ -76,11 +76,23 @@ unsafe impl Send for SendFrankenConnection {}
 
 impl SendFrankenConnection {
     pub(crate) fn new(conn: FrankenConnection) -> Self {
-        Self(conn)
+        Self(
+            conn,
+            UNSET_INDEX_WRITER_CHECKPOINT_PAGES,
+            UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS,
+        )
     }
 
-    pub(crate) fn into_inner(self) -> FrankenConnection {
-        self.0
+    pub(crate) fn new_with_index_writer_state(
+        conn: FrankenConnection,
+        checkpoint_pages: i64,
+        busy_timeout_ms: u64,
+    ) -> Self {
+        Self(conn, checkpoint_pages, busy_timeout_ms)
+    }
+
+    pub(crate) fn into_parts(self) -> (FrankenConnection, i64, u64) {
+        (self.0, self.1, self.2)
     }
 }
 
@@ -164,7 +176,7 @@ impl LazyFrankenDb {
                 reason = reason,
                 "lazily opened FrankenSQLite database"
             );
-            *guard = Some(SendFrankenConnection(conn));
+            *guard = Some(SendFrankenConnection::new(conn));
         }
         Ok(LazyFrankenDbGuard(guard))
     }
@@ -547,7 +559,7 @@ impl FrankenConnectionManager {
             // Apply read-tuned config (no migration, no write PRAGMAs)
             let _ = conn.execute("PRAGMA busy_timeout = 5000;"); // match writer config
             let _ = conn.execute("PRAGMA cache_size = -16384;"); // 16MB reader cache
-            readers.push(parking_lot::Mutex::new(SendFrankenConnection(conn)));
+            readers.push(parking_lot::Mutex::new(SendFrankenConnection::new(conn)));
         }
 
         let max_writers = config.max_writers.max(1);
@@ -2929,6 +2941,7 @@ pub struct FrankenStorage {
     db_path: PathBuf,
     ephemeral_writer_preflight_verified: AtomicBool,
     index_writer_checkpoint_pages: AtomicI64,
+    index_writer_busy_timeout_ms: AtomicU64,
     cached_ephemeral_writer: parking_lot::Mutex<CachedEphemeralWriter>,
     ensured_agents: Arc<parking_lot::Mutex<HashMap<EnsuredAgentKey, i64>>>,
     ensured_workspaces: Arc<parking_lot::Mutex<HashMap<EnsuredWorkspaceKey, i64>>>,
@@ -2942,6 +2955,7 @@ pub struct FrankenStorage {
 /// their explicit checkpoint policy.
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 4096;
 const UNSET_INDEX_WRITER_CHECKPOINT_PAGES: i64 = i64::MIN;
+const UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS: u64 = 0;
 const FTS_MESSAGES_PRESENT_UNKNOWN: i8 = 0;
 const FTS_MESSAGES_PRESENT_ABSENT: i8 = 1;
 const FTS_MESSAGES_PRESENT_PRESENT: i8 = 2;
@@ -3084,6 +3098,7 @@ impl FrankenStorage {
             db_path,
             ephemeral_writer_preflight_verified: AtomicBool::new(false),
             index_writer_checkpoint_pages: AtomicI64::new(UNSET_INDEX_WRITER_CHECKPOINT_PAGES),
+            index_writer_busy_timeout_ms: AtomicU64::new(UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS),
             cached_ephemeral_writer: parking_lot::Mutex::new(CachedEphemeralWriter::Uninitialized),
             ensured_agents,
             ensured_workspaces,
@@ -3166,17 +3181,24 @@ impl FrankenStorage {
     pub(crate) fn acquire_cached_ephemeral_writer(&self) -> Result<(Self, bool)> {
         let mut cached = self.cached_ephemeral_writer.lock();
         match std::mem::replace(&mut *cached, CachedEphemeralWriter::InUse) {
-            CachedEphemeralWriter::Cached(conn) => Ok((
-                Self::new_with_shared_caches(
-                    (*conn).into_inner(),
+            CachedEphemeralWriter::Cached(conn) => {
+                let (conn, checkpoint_pages, busy_timeout_ms) = (*conn).into_parts();
+                let writer = Self::new_with_shared_caches(
+                    conn,
                     self.db_path.clone(),
                     Arc::clone(&self.ensured_agents),
                     Arc::clone(&self.ensured_workspaces),
                     Arc::clone(&self.ensured_conversation_sources),
                     Arc::clone(&self.ensured_daily_stats_keys),
-                ),
-                true,
-            )),
+                );
+                writer
+                    .index_writer_checkpoint_pages
+                    .store(checkpoint_pages, Ordering::Relaxed);
+                writer
+                    .index_writer_busy_timeout_ms
+                    .store(busy_timeout_ms, Ordering::Relaxed);
+                Ok((writer, true))
+            }
             CachedEphemeralWriter::Uninitialized => {
                 drop(cached);
                 match Self::open_writer_with_shared_caches(
@@ -3214,13 +3236,21 @@ impl FrankenStorage {
     }
 
     pub(crate) fn release_cached_ephemeral_writer(&self, writer: Self) {
+        let checkpoint_pages = writer.index_writer_checkpoint_pages.load(Ordering::Relaxed);
+        let busy_timeout_ms = writer.index_writer_busy_timeout_ms.load(Ordering::Relaxed);
         let conn = writer.into_raw();
         let mut cached = self.cached_ephemeral_writer.lock();
         debug_assert!(
             matches!(&*cached, CachedEphemeralWriter::InUse),
             "cached ephemeral writer state should be in-use when releasing"
         );
-        *cached = CachedEphemeralWriter::Cached(Box::new(SendFrankenConnection::new(conn)));
+        *cached = CachedEphemeralWriter::Cached(Box::new(
+            SendFrankenConnection::new_with_index_writer_state(
+                conn,
+                checkpoint_pages,
+                busy_timeout_ms,
+            ),
+        ));
     }
 
     pub(crate) fn discard_cached_ephemeral_writer(&self, mut writer: Self) {
@@ -3696,6 +3726,16 @@ impl FrankenStorage {
     pub(crate) fn mark_index_writer_checkpoint_pages(&self, pages: i64) {
         self.index_writer_checkpoint_pages
             .store(pages, Ordering::Relaxed);
+    }
+
+    pub(crate) fn index_writer_busy_timeout_ms(&self) -> Option<u64> {
+        let timeout_ms = self.index_writer_busy_timeout_ms.load(Ordering::Relaxed);
+        (timeout_ms != UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS).then_some(timeout_ms)
+    }
+
+    pub(crate) fn mark_index_writer_busy_timeout_ms(&self, timeout_ms: u64) {
+        self.index_writer_busy_timeout_ms
+            .store(timeout_ms, Ordering::Relaxed);
     }
 
     /// Open database with migration, backing up if schema is incompatible.
