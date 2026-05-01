@@ -11,6 +11,26 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Codebuff (formerly Manicode) connector.** New agent under `src/connectors/codebuff.rs`
+  re-exporting `franken_agent_detection::CodebuffConnector`. Indexes chat history stored at
+  `~/.config/manicode/projects/<project>/chats/<chatId>/chat-messages.json` (and the
+  rebranded `~/.config/codebuff/...` layout). Walks `manicode-dev` and `manicode-staging`
+  channels when present. Honors `CODEBUFF_DATA_DIR` / legacy `MANICODE_DATA_DIR` env
+  overrides, and recovers the originating cwd from the sibling `run-state.json` so sessions
+  group by real project path rather than the on-disk sanitized basename. Brings the
+  supported-agent count to 20. Storage layout reverse-engineered from
+  [getagentseal/codeburn#124](https://github.com/getagentseal/codeburn/pull/124).
+
+### Changed
+
+- Bumped `franken-agent-detection` git pin to include the new Codebuff connector.
+
+---
+
 ## [v0.3.7] -- 2026-04-23
 
 **Indexer stall observability + zero-writer deadlock fix.**

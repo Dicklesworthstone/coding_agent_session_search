@@ -44,6 +44,7 @@ pub mod chatgpt;
 pub mod claude_code;
 pub mod clawdbot;
 pub mod cline;
+pub mod codebuff;
 pub mod codex;
 pub mod copilot;
 pub mod copilot_cli;

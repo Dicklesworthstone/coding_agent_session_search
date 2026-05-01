@@ -72,7 +72,14 @@ memmap2 = "*"
 bytemuck = "*"
 fastembed = { version = "*", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
 frankensearch = { version = "*", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3dbab624", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
-franken-agent-detection = { version = "*", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "03fa0a3bdff9f0e618471873fb71658b7af386ab", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
+## NOTE (Codebuff connector): pinned temporarily at @anandghegde's fork rev
+## carrying the new `CodebuffConnector`. The companion FAD PR adds it to
+## `connectors::codebuff` upstream; once that PR merges into
+## `Dicklesworthstone/franken_agent_detection`, the URL should be flipped
+## back and the rev bumped to the merge commit. The build.rs URL contract
+## was widened to accept the fork URL only for as long as this fork pin is
+## in effect — see the matching note in build.rs.
+franken-agent-detection = { version = "*", git = "https://github.com/anandghegde/franken_agent_detection", rev = "ca827f2e9d8c5185bb5a6e58410245d8a2c7024f", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
 wide = "*"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "*"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "*"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache

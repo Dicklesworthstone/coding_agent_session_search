@@ -80,14 +80,19 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "franken-agent-detection",
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
-        expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "03fa0a3bdff9f0e618471873fb71658b7af386ab",
+        // Temporarily pointing at @anandghegde's fork that carries the new
+        // Codebuff connector. Flip back to
+        // `https://github.com/Dicklesworthstone/franken_agent_detection`
+        // once the upstream FAD PR adding `connectors::codebuff` merges,
+        // and bump `expected_rev` to the merge commit.
+        expected_git: "https://github.com/anandghegde/franken_agent_detection",
+        expected_rev: "ca827f2e9d8c5185bb5a6e58410245d8a2c7024f",
         expected_version: "0.1.3",
         expected_features: &["chatgpt", "connectors", "crush", "cursor", "opencode"],
         expected_default_features: None,
         repo_rel: "../franken_agent_detection",
         manifest_rel: "Cargo.toml",
-        patch_url: Some("https://github.com/Dicklesworthstone/franken_agent_detection"),
+        patch_url: Some("https://github.com/anandghegde/franken_agent_detection"),
         patch_key: Some("franken-agent-detection"),
         mode: ValidationMode::StrictOptIn,
     },

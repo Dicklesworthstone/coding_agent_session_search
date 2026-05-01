@@ -11,7 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Kimi Code, Qwen Code, and Factory (Droid) into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Kimi Code, Qwen Code, Codebuff (Manicode), and Factory (Droid) into a single, searchable timeline.
 
 <div align="center">
 
@@ -368,6 +368,7 @@ Ingests history from 19 local agents, normalizing them into a unified `Conversat
 - **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
 - **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
+- **Codebuff** (formerly Manicode): `~/.config/manicode/projects/<project>/chats/<chatId>/chat-messages.json` (and the rebranded `~/.config/codebuff/...` layout). Honors `CODEBUFF_DATA_DIR` / legacy `MANICODE_DATA_DIR` overrides; recovers the originating cwd from the sibling `run-state.json` so sessions group by real project path.
 - **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content)
 - **GitHub Copilot Chat**: VS Code global storage under `github.copilot-chat` (JSON)
 - **Copilot CLI**: `~/.copilot/session-state`, legacy `~/.copilot/history-session-state`, and `gh copilot` config paths (JSONL/JSON)
