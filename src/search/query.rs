@@ -5309,6 +5309,7 @@ impl SearchClient {
                     "SELECT m.conversation_id, m.idx, m.content
                      FROM messages m INDEXED BY sqlite_autoindex_messages_1
                      WHERE m.conversation_id = {conversation_id} AND m.idx = {line_idx}
+                     ORDER BY m.idx
                      LIMIT 1"
                 );
                 let params: [ParamValue; 0] = [];
@@ -5412,6 +5413,7 @@ impl SearchClient {
                     "SELECT m.conversation_id, m.idx, m.content
                      FROM messages m INDEXED BY sqlite_autoindex_messages_1
                      WHERE m.conversation_id = {conversation_id} AND m.idx = {line_idx}
+                     ORDER BY m.idx
                      LIMIT 1"
                 );
                 let params: [ParamValue; 0] = [];
