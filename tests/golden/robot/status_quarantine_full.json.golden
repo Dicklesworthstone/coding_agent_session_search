@@ -38,7 +38,8 @@
     "path": "[TEST_HOME]/cass-data/agent_search.db",
     "open_error": null,
     "open_retryable": false,
-    "counts_skipped": false
+    "counts_skipped": false,
+    "open_skipped": false
   },
   "pending": {
     "sessions": 0,

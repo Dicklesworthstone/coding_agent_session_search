@@ -1079,11 +1079,20 @@ fn doctor_json_matches_golden() {
 #[test]
 fn status_shape_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let status = capture_robot_json_value(
+    let mut status = capture_robot_json_value(
         test_home.path(),
         &["status", "--json"],
         ExpectStatus::ExitOk,
     );
+    // Keep the warnings array item schema pinned even when this fixture has no
+    // warning instances.
+    if let Some(warnings) = status
+        .pointer_mut("/quarantine/warnings")
+        .and_then(Value::as_array_mut)
+        && warnings.is_empty()
+    {
+        warnings.push(Value::String("[SHAPE_STRING]".to_string()));
+    }
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&status)).expect("pretty-print JSON");
     assert_golden("robot/status_shape.json.golden", &canonical);

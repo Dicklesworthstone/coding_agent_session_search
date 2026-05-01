@@ -1563,10 +1563,39 @@ pub fn classify_model_cache(
     manifest: &ModelManifest,
     policy: &ModelAcquisitionPolicy,
 ) -> ModelCacheReport {
+    classify_model_cache_with_integrity(model_dir, manifest, policy, ModelCacheIntegrity::Full)
+}
+
+/// Classify the local semantic model cache using metadata only.
+///
+/// This is for hot status/health probes. It preserves the same policy,
+/// missing-file, staging, quarantine, and revision-marker decisions as
+/// `classify_model_cache`, but it does not hash model payloads. Actual model
+/// loading and `cass models verify` still use full SHA256 validation.
+pub(crate) fn classify_model_cache_metadata(
+    model_dir: &Path,
+    manifest: &ModelManifest,
+    policy: &ModelAcquisitionPolicy,
+) -> ModelCacheReport {
+    classify_model_cache_with_integrity(model_dir, manifest, policy, ModelCacheIntegrity::Metadata)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelCacheIntegrity {
+    Full,
+    Metadata,
+}
+
+fn classify_model_cache_with_integrity(
+    model_dir: &Path,
+    manifest: &ModelManifest,
+    policy: &ModelAcquisitionPolicy,
+    integrity: ModelCacheIntegrity,
+) -> ModelCacheReport {
     let required_size_bytes = manifest.total_size();
     let installed_size_bytes = installed_manifest_size(model_dir, manifest);
     let missing_files = missing_manifest_files(model_dir, manifest);
-    let state = classify_model_cache_state(model_dir, manifest, policy, &missing_files);
+    let state = classify_model_cache_state(model_dir, manifest, policy, &missing_files, integrity);
 
     ModelCacheReport {
         model_id: manifest.id.clone(),
@@ -1583,6 +1612,7 @@ fn classify_model_cache_state(
     manifest: &ModelManifest,
     policy: &ModelAcquisitionPolicy,
     missing_files: &[String],
+    integrity: ModelCacheIntegrity,
 ) -> ModelCacheState {
     if !policy.downloads_enabled {
         return ModelCacheState::DisabledByPolicy {
@@ -1640,24 +1670,26 @@ fn classify_model_cache_state(
         };
     }
 
-    for file in &manifest.files {
-        let Some(path) = model_file_path(model_dir, file) else {
-            continue;
-        };
-        match compute_sha256(&path) {
-            Ok(actual) if actual == file.sha256 => {}
-            Ok(actual) => {
-                return ModelCacheState::ChecksumMismatch {
-                    file: file.local_name().to_string(),
-                    expected: file.sha256.clone(),
-                    actual,
-                };
-            }
-            Err(err) => {
-                return ModelCacheState::QuarantinedCorrupt {
-                    marker_path: path,
-                    reason: format!("unable to hash model file {}: {err}", file.local_name()),
-                };
+    if integrity == ModelCacheIntegrity::Full {
+        for file in &manifest.files {
+            let Some(path) = model_file_path(model_dir, file) else {
+                continue;
+            };
+            match compute_sha256(&path) {
+                Ok(actual) if actual == file.sha256 => {}
+                Ok(actual) => {
+                    return ModelCacheState::ChecksumMismatch {
+                        file: file.local_name().to_string(),
+                        expected: file.sha256.clone(),
+                        actual,
+                    };
+                }
+                Err(err) => {
+                    return ModelCacheState::QuarantinedCorrupt {
+                        marker_path: path,
+                        reason: format!("unable to hash model file {}: {err}", file.local_name()),
+                    };
+                }
             }
         }
     }
@@ -2495,6 +2527,32 @@ mod tests {
             report.state,
             ModelCacheState::ChecksumMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn classify_cache_metadata_trusts_verified_marker_without_hashing_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.onnx"), b"m0del").unwrap();
+        fs::write(
+            model_dir.join(".verified"),
+            "revision=rev1\nsource=registry\n",
+        )
+        .unwrap();
+        let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
+
+        let metadata_report = classify_model_cache_metadata(
+            &model_dir,
+            &manifest,
+            &ModelAcquisitionPolicy::default(),
+        );
+        assert_eq!(metadata_report.state_code(), "acquired");
+        assert!(metadata_report.is_usable());
+
+        let full_report =
+            classify_model_cache(&model_dir, &manifest, &ModelAcquisitionPolicy::default());
+        assert_eq!(full_report.state_code(), "checksum_mismatch");
     }
 
     #[test]

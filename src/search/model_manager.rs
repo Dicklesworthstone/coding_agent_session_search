@@ -18,6 +18,7 @@ use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_download::{
     ModelAcquisitionPolicy, ModelCacheState, ModelManifest, classify_model_cache,
+    classify_model_cache_metadata,
 };
 use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
 use crate::search::vector_index::{
@@ -286,6 +287,43 @@ pub fn load_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
     load_semantic_context_inner(data_dir, db_path, true)
 }
 
+/// Probe semantic availability without loading the embedder, vector index, or
+/// DB-backed filter maps. Status/health surfaces use this to report readiness
+/// cheaply; actual semantic search still calls `load_semantic_context`.
+pub(crate) fn probe_semantic_availability(data_dir: &Path) -> SemanticAvailability {
+    let model_dir = FastEmbedder::default_model_dir(data_dir);
+    let manifest = ModelManifest::minilm_v2();
+    let semantic_policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+    let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&semantic_policy);
+    let cache_report = classify_model_cache_metadata(&model_dir, &manifest, &acquisition_policy);
+
+    if let Some(availability) =
+        semantic_availability_from_cache_state(&model_dir, &cache_report.state, true)
+    {
+        return availability;
+    }
+
+    let index_path = vector_index_path(data_dir, FastEmbedder::embedder_id_static());
+    if !index_path.is_file() {
+        return SemanticAvailability::IndexMissing { index_path };
+    }
+
+    SemanticAvailability::Ready {
+        embedder_id: FastEmbedder::embedder_id_static().to_string(),
+    }
+}
+
+/// Probe hash semantic availability without opening the DB or vector index.
+pub(crate) fn probe_hash_semantic_availability(data_dir: &Path) -> SemanticAvailability {
+    let embedder = HashEmbedder::default();
+    let index_path = vector_index_path(data_dir, embedder.id());
+    if !index_path.is_file() {
+        SemanticAvailability::IndexMissing { index_path }
+    } else {
+        SemanticAvailability::HashFallback
+    }
+}
+
 /// Load hash-based semantic context (no model download required).
 pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
     let embedder = HashEmbedder::default();
@@ -367,120 +405,13 @@ fn load_semantic_context_inner(
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&semantic_policy);
     let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
 
-    match &cache_report.state {
-        ModelCacheState::Acquired { .. }
-        | ModelCacheState::PreseededLocal { .. }
-        | ModelCacheState::MirrorSourced { .. } => {}
-        ModelCacheState::IncompatibleVersion {
-            current_revision,
-            expected_revision,
-        } if check_for_updates => {
-            return SemanticSetup {
-                availability: SemanticAvailability::UpdateAvailable {
-                    embedder_id: FastEmbedder::embedder_id_static().to_string(),
-                    current_revision: current_revision.clone(),
-                    latest_revision: expected_revision.clone(),
-                },
-                context: None,
-            };
-        }
-        ModelCacheState::IncompatibleVersion { .. } => {}
-        ModelCacheState::NotAcquired {
-            missing_files,
-            needs_consent,
-        } => {
-            let availability = if *needs_consent {
-                SemanticAvailability::NeedsConsent
-            } else {
-                SemanticAvailability::ModelMissing {
-                    model_dir: model_dir.clone(),
-                    missing_files: missing_files.clone(),
-                }
-            };
-            return SemanticSetup {
-                availability,
-                context: None,
-            };
-        }
-        ModelCacheState::Acquiring {
-            bytes_present,
-            total_bytes,
-            ..
-        } => {
-            let progress_pct = if *total_bytes == 0 {
-                0
-            } else {
-                ((*bytes_present as f64 / *total_bytes as f64) * 100.0).min(100.0) as u8
-            };
-            return SemanticSetup {
-                availability: SemanticAvailability::Downloading {
-                    progress_pct,
-                    bytes_downloaded: *bytes_present,
-                    total_bytes: *total_bytes,
-                },
-                context: None,
-            };
-        }
-        ModelCacheState::ChecksumMismatch {
-            file,
-            expected,
-            actual,
-        } => {
-            return SemanticSetup {
-                availability: SemanticAvailability::LoadFailed {
-                    context: format!(
-                        "model checksum mismatch for {file}: expected {expected}, got {actual}"
-                    ),
-                },
-                context: None,
-            };
-        }
-        ModelCacheState::DisabledByPolicy { reason } => {
-            return SemanticSetup {
-                availability: SemanticAvailability::Disabled {
-                    reason: reason.clone(),
-                },
-                context: None,
-            };
-        }
-        ModelCacheState::BudgetBlocked {
-            required_bytes,
-            max_bytes,
-        } => {
-            return SemanticSetup {
-                availability: SemanticAvailability::Disabled {
-                    reason: format!(
-                        "semantic model requires {required_bytes} bytes but policy allows {max_bytes}"
-                    ),
-                },
-                context: None,
-            };
-        }
-        ModelCacheState::QuarantinedCorrupt {
-            marker_path,
-            reason,
-        } => {
-            return SemanticSetup {
-                availability: SemanticAvailability::LoadFailed {
-                    context: format!(
-                        "model cache quarantined at {}: {reason}",
-                        marker_path.display()
-                    ),
-                },
-                context: None,
-            };
-        }
-        ModelCacheState::OfflineBlocked { missing_files } => {
-            return SemanticSetup {
-                availability: SemanticAvailability::Disabled {
-                    reason: format!(
-                        "offline and semantic model is not acquired: missing {}",
-                        missing_files.join(", ")
-                    ),
-                },
-                context: None,
-            };
-        }
+    if let Some(availability) =
+        semantic_availability_from_cache_state(&model_dir, &cache_report.state, check_for_updates)
+    {
+        return SemanticSetup {
+            availability,
+            context: None,
+        };
     }
 
     let index_path = vector_index_path(data_dir, FastEmbedder::embedder_id_static());
@@ -551,6 +482,91 @@ fn load_semantic_context_inner(
             index,
             filter_maps,
             roles,
+        }),
+    }
+}
+
+fn semantic_availability_from_cache_state(
+    model_dir: &Path,
+    state: &ModelCacheState,
+    check_for_updates: bool,
+) -> Option<SemanticAvailability> {
+    match state {
+        ModelCacheState::Acquired { .. }
+        | ModelCacheState::PreseededLocal { .. }
+        | ModelCacheState::MirrorSourced { .. } => None,
+        ModelCacheState::IncompatibleVersion {
+            current_revision,
+            expected_revision,
+        } if check_for_updates => Some(SemanticAvailability::UpdateAvailable {
+            embedder_id: FastEmbedder::embedder_id_static().to_string(),
+            current_revision: current_revision.clone(),
+            latest_revision: expected_revision.clone(),
+        }),
+        ModelCacheState::IncompatibleVersion { .. } => None,
+        ModelCacheState::NotAcquired {
+            missing_files,
+            needs_consent,
+        } => {
+            if *needs_consent {
+                Some(SemanticAvailability::NeedsConsent)
+            } else {
+                Some(SemanticAvailability::ModelMissing {
+                    model_dir: model_dir.to_path_buf(),
+                    missing_files: missing_files.clone(),
+                })
+            }
+        }
+        ModelCacheState::Acquiring {
+            bytes_present,
+            total_bytes,
+            ..
+        } => {
+            let progress_pct = if *total_bytes == 0 {
+                0
+            } else {
+                ((*bytes_present as f64 / *total_bytes as f64) * 100.0).min(100.0) as u8
+            };
+            Some(SemanticAvailability::Downloading {
+                progress_pct,
+                bytes_downloaded: *bytes_present,
+                total_bytes: *total_bytes,
+            })
+        }
+        ModelCacheState::ChecksumMismatch {
+            file,
+            expected,
+            actual,
+        } => Some(SemanticAvailability::LoadFailed {
+            context: format!(
+                "model checksum mismatch for {file}: expected {expected}, got {actual}"
+            ),
+        }),
+        ModelCacheState::DisabledByPolicy { reason } => Some(SemanticAvailability::Disabled {
+            reason: reason.clone(),
+        }),
+        ModelCacheState::BudgetBlocked {
+            required_bytes,
+            max_bytes,
+        } => Some(SemanticAvailability::Disabled {
+            reason: format!(
+                "semantic model requires {required_bytes} bytes but policy allows {max_bytes}"
+            ),
+        }),
+        ModelCacheState::QuarantinedCorrupt {
+            marker_path,
+            reason,
+        } => Some(SemanticAvailability::LoadFailed {
+            context: format!(
+                "model cache quarantined at {}: {reason}",
+                marker_path.display()
+            ),
+        }),
+        ModelCacheState::OfflineBlocked { missing_files } => Some(SemanticAvailability::Disabled {
+            reason: format!(
+                "offline and semantic model is not acquired: missing {}",
+                missing_files.join(", ")
+            ),
         }),
     }
 }

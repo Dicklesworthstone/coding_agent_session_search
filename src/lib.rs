@@ -5251,10 +5251,9 @@ struct StateDbSnapshot {
     open_retryable: bool,
     counts_skipped: bool,
     /// `coding_agent_session_search-gi4oy`: true when state_meta_json
-    /// elided the FrankenStorage open (health fast path). `opened`
-    /// is set to true based on `db_path.exists()` alone in that case;
-    /// callers needing the actual open-success signal use
-    /// `cass status` / `cass diag` which always perform the open.
+    /// elided the FrankenStorage open. `opened` is set to true based on
+    /// regular-file metadata alone in that case; callers needing the actual
+    /// open-success signal use `cass diag` / `cass doctor`.
     open_skipped: bool,
 }
 
@@ -5636,6 +5635,7 @@ fn state_meta_json_full(
         allow_db_open,
         include_counts_override,
         skip_db_open,
+        allow_db_open && !skip_db_open,
     )
 }
 
@@ -5648,6 +5648,29 @@ fn state_meta_json_for_health(
     stale_threshold: u64,
 ) -> serde_json::Value {
     state_meta_json_full(data_dir, db_path, stale_threshold, true, Some(false), true)
+}
+
+fn status_should_skip_db_open(db_path: &Path) -> bool {
+    std::fs::metadata(db_path).ok().is_some_and(|metadata| {
+        metadata.is_file() && metadata.len() > STATUS_COUNT_SCAN_MAX_DB_BYTES
+    })
+}
+
+fn state_meta_json_for_status(
+    data_dir: &Path,
+    db_path: &Path,
+    stale_threshold: u64,
+) -> serde_json::Value {
+    let skip_db_open = status_should_skip_db_open(db_path);
+    state_meta_json_inner(
+        data_dir,
+        db_path,
+        stale_threshold,
+        true,
+        None,
+        skip_db_open,
+        true,
+    )
 }
 
 /// `coding_agent_session_search-d0rmo`: variant of `state_meta_json`
@@ -5673,6 +5696,7 @@ fn state_meta_json_inner(
     allow_db_open: bool,
     include_counts_override: Option<bool>,
     skip_db_open: bool,
+    inspect_semantic: bool,
 ) -> serde_json::Value {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5760,7 +5784,7 @@ fn state_meta_json_inner(
             semantic_preference: crate::search::asset_state::SemanticPreference::DefaultModel,
             db_available: db_opened,
             compute_lexical_fingerprint: include_counts,
-            inspect_semantic: allow_db_open && !skip_db_open,
+            inspect_semantic,
         },
     )
     .unwrap_or_else(|err| {
@@ -12413,7 +12437,7 @@ fn run_status(
 ) -> CliResult<()> {
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let mut state = state_meta_json(&data_dir, &db_path, stale_threshold, true);
+    let mut state = state_meta_json_for_status(&data_dir, &db_path, stale_threshold);
     refresh_state_database_counts_if_needed(&mut state, &db_path, "status");
 
     let index_exists = state
@@ -12474,6 +12498,11 @@ fn run_status(
         .and_then(|d| d.get("counts_skipped"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let open_skipped = state
+        .get("database")
+        .and_then(|d| d.get("open_skipped"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let pending_sessions = state
         .get("pending")
         .and_then(|p| p.get("sessions"))
@@ -12579,6 +12608,7 @@ fn run_status(
                 "open_error": db_open_error,
                 "open_retryable": db_open_retryable,
                 "counts_skipped": counts_skipped,
+                "open_skipped": open_skipped,
             }),
             "pending": state.get("pending").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
@@ -12652,7 +12682,9 @@ fn run_status(
     println!("Database:");
     if db_exists {
         if db_opened {
-            if counts_skipped {
+            if open_skipped {
+                println!("  Open skipped for fast status on large database");
+            } else if counts_skipped {
                 println!("  Counts skipped for fast status on large database");
             } else {
                 if let Some(conversations) = state
@@ -13369,6 +13401,67 @@ mod cli_read_db_tests {
             snapshot.open_error.is_none(),
             "state probe should not report an error: {:?}",
             snapshot.open_error
+        );
+    }
+
+    #[test]
+    fn status_state_skips_open_for_large_regular_db_probe() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        let file = std::fs::File::create(&db_path).expect("create sparse db placeholder");
+        file.set_len(STATUS_COUNT_SCAN_MAX_DB_BYTES + 4096)
+            .expect("grow sparse placeholder");
+        drop(file);
+
+        let state = state_meta_json_for_status(temp.path(), &db_path, 60);
+        let database = state
+            .get("database")
+            .and_then(serde_json::Value::as_object)
+            .expect("database state");
+
+        assert_eq!(database.get("exists").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(database.get("opened").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            database.get("open_skipped").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            database.get("counts_skipped").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            database
+                .get("open_error")
+                .is_some_and(serde_json::Value::is_null)
+        );
+    }
+
+    #[test]
+    fn status_state_still_probes_malformed_non_file_db_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::create_dir_all(&db_path).expect("create directory at db path");
+
+        let state = state_meta_json_for_status(temp.path(), &db_path, 60);
+        let database = state
+            .get("database")
+            .and_then(serde_json::Value::as_object)
+            .expect("database state");
+
+        assert_eq!(database.get("exists").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            database.get("open_skipped").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            database.get("opened").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(
+            database
+                .get("open_error")
+                .and_then(|v| v.as_str())
+                .is_some_and(|err| !err.is_empty())
         );
     }
 

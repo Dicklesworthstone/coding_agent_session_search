@@ -27,7 +27,7 @@ use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_manager::{
-    SemanticAvailability, load_hash_semantic_context, load_semantic_context,
+    SemanticAvailability, probe_hash_semantic_availability, probe_semantic_availability,
 };
 use crate::search::semantic_manifest::{ArtifactRecord, BuildCheckpoint, SemanticManifest};
 use crate::search::tantivy::SCHEMA_HASH;
@@ -448,9 +448,9 @@ pub(crate) fn inspect_search_assets(
     let semantic = if inspect_semantic {
         inspect_semantic_assets(
             data_dir,
-            db_path,
             semantic_preference,
             current_db_fingerprint,
+            db_available,
         )
     } else {
         semantic_state_not_inspected(data_dir, semantic_preference, current_db_fingerprint)
@@ -495,20 +495,19 @@ fn semantic_state_not_inspected(
 
 pub(crate) fn inspect_semantic_assets(
     data_dir: &Path,
-    db_path: &Path,
     preference: SemanticPreference,
     current_db_fingerprint: Option<&str>,
+    db_available: bool,
 ) -> SemanticAssetState {
-    let setup = match preference {
-        SemanticPreference::DefaultModel => load_semantic_context(data_dir, db_path),
-        SemanticPreference::HashFallback => load_hash_semantic_context(data_dir, db_path),
+    if !db_available {
+        return semantic_state_not_inspected(data_dir, preference, current_db_fingerprint);
+    }
+
+    let availability = match preference {
+        SemanticPreference::DefaultModel => probe_semantic_availability(data_dir),
+        SemanticPreference::HashFallback => probe_hash_semantic_availability(data_dir),
     };
-    semantic_state_from_availability(
-        data_dir,
-        &setup.availability,
-        preference,
-        current_db_fingerprint,
-    )
+    semantic_state_from_availability(data_dir, &availability, preference, current_db_fingerprint)
 }
 
 pub(crate) fn semantic_state_from_availability(
@@ -2164,6 +2163,40 @@ mod tests {
         assert_eq!(snapshot.semantic.status, "not_inspected");
         assert_eq!(snapshot.semantic.availability, "not_inspected");
         assert_eq!(snapshot.semantic.fallback_mode, Some("lexical"));
+    }
+
+    #[test]
+    fn inspect_search_assets_trusts_db_probe_for_semantic_metadata_probe() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::create_dir_all(&db_path).expect("create unopenable db path");
+
+        let vector_path = vector_index_path(temp.path(), HashEmbedder::default().id());
+        std::fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector dir");
+        std::fs::write(&vector_path, b"index").expect("write vector index");
+
+        let snapshot = inspect_search_assets(InspectSearchAssetsInput {
+            data_dir: temp.path(),
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_secs: 1_733_000_001,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            semantic_preference: SemanticPreference::HashFallback,
+            db_available: true,
+            compute_lexical_fingerprint: false,
+            inspect_semantic: true,
+        })
+        .expect("semantic metadata probe should trust the existing DB availability signal");
+
+        assert_eq!(snapshot.semantic.status, "hash_fallback");
+        assert_eq!(snapshot.semantic.availability, "hash_fallback");
+        assert!(snapshot.semantic.can_search);
     }
 
     #[test]
