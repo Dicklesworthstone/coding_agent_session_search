@@ -16683,6 +16683,7 @@ pub mod persist {
             inserted_indices,
         } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let internal_conv = map_to_internal(conv);
+
             let agent = Agent {
                 id: None,
                 slug: conv.agent_slug.clone(),
