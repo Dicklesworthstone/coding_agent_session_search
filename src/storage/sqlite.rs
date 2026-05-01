@@ -5217,10 +5217,7 @@ fn franken_find_existing_conversation_with_tail_by_key(
     key: &PendingConversationKey,
     conv: Option<&Conversation>,
 ) -> Result<Option<ExistingConversationWithTail>> {
-    if let PendingConversationKey::External {
-        lookup_key, ..
-    } = key
-    {
+    if let PendingConversationKey::External { lookup_key, .. } = key {
         if let Some(existing) = franken_find_external_conversation_tail_lookup(tx, lookup_key)? {
             return Ok(Some(existing));
         }
