@@ -5949,15 +5949,19 @@ fn state_meta_json_inner(
         pipeline.insert("runtime".to_string(), runtime_value);
     }
 
-    // Probe Tantivy index document count when the DB has messages.
-    // This is cheap (one reader open) and only runs when it matters.
+    // Probe the live lexical document count when the DB has messages. Prefer
+    // the published generation manifest: status only needs the durable count
+    // for stale/empty diagnostics, while opening a large Tantivy reader here
+    // fans out across every segment file on the hot robot path.
     let index_doc_count: Option<u64> = if db_opened && message_count > 0 && lexical.exists {
-        frankensearch::lexical::cass_open_search_reader(
-            &index_path,
-            frankensearch::lexical::ReloadPolicy::Manual,
-        )
-        .ok()
-        .map(|(reader, _fields)| reader.searcher().num_docs())
+        lexical_manifest_indexed_doc_count(&index_path).or_else(|| {
+            frankensearch::lexical::cass_open_search_reader(
+                &index_path,
+                frankensearch::lexical::ReloadPolicy::Manual,
+            )
+            .ok()
+            .map(|(reader, _fields)| reader.searcher().num_docs())
+        })
     } else {
         None
     };
@@ -6121,6 +6125,22 @@ fn state_meta_json_inner(
             "db_path": db_path.display().to_string()
         }
     })
+}
+
+fn lexical_manifest_indexed_doc_count(index_path: &Path) -> Option<u64> {
+    use crate::indexer::lexical_generation::{LexicalGenerationPublishState, load_manifest};
+
+    match load_manifest(index_path) {
+        Ok(Some(manifest))
+            if matches!(
+                manifest.publish_state,
+                LexicalGenerationPublishState::Published
+            ) =>
+        {
+            Some(manifest.indexed_doc_count)
+        }
+        _ => None,
+    }
 }
 
 fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value> {
@@ -11017,7 +11037,7 @@ struct DiagPathObservation {
 struct DiagLexicalManifestEntry {
     path: PathBuf,
     manifest: crate::indexer::lexical_generation::LexicalGenerationManifest,
-    observation: DiagPathObservation,
+    observation: Option<DiagPathObservation>,
     quarantined_shards: usize,
 }
 
@@ -11173,6 +11193,10 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
         {
             continue;
         }
+        let observation = match entry.observation {
+            Some(observation) => observation,
+            None => observe_diag_path(&entry.path, now, &mut report.warnings),
+        };
         let inventory = lexical_inventory_by_generation.get(&entry.manifest.generation_id);
         let reclaimable_bytes = inventory
             .map(|inventory| inventory.reclaimable_bytes)
@@ -11196,7 +11220,7 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
         } else {
             format!(
                 "cleanup dry-run only marks {} of {} bytes reclaimable",
-                reclaimable_bytes, entry.observation.size_bytes
+                reclaimable_bytes, observation.size_bytes
             )
         };
         if matches!(
@@ -11212,9 +11236,9 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
                     shard_id: None,
                     publish_state: Some(lexical_publish_state_label(entry.manifest.publish_state)),
                     shard_state: None,
-                    size_bytes: entry.observation.size_bytes,
-                    age_seconds: entry.observation.age_seconds,
-                    last_read_at_ms: entry.observation.last_read_at_ms,
+                    size_bytes: observation.size_bytes,
+                    age_seconds: observation.age_seconds,
+                    last_read_at_ms: observation.last_read_at_ms,
                     safe_to_gc,
                     gc_reason: gc_reason.clone(),
                 });
@@ -11235,8 +11259,8 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
                     publish_state: Some(lexical_publish_state_label(entry.manifest.publish_state)),
                     shard_state: Some(lexical_shard_state_label(shard.state)),
                     size_bytes: shard.artifact_bytes,
-                    age_seconds: entry.observation.age_seconds,
-                    last_read_at_ms: entry.observation.last_read_at_ms,
+                    age_seconds: observation.age_seconds,
+                    last_read_at_ms: observation.last_read_at_ms,
                     safe_to_gc: false,
                     gc_reason: shard.quarantine_reason.clone().unwrap_or_else(|| {
                         "quarantined lexical shard requires operator inspection".to_string()
@@ -11249,10 +11273,10 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
             publish_state: lexical_publish_state_label(entry.manifest.publish_state),
             quarantined_shards: entry.quarantined_shards,
             total_shards: entry.manifest.shards.len(),
-            artifact_bytes: entry.observation.size_bytes,
+            artifact_bytes: observation.size_bytes,
             updated_at_ms: entry.manifest.updated_at_ms,
-            age_seconds: entry.observation.age_seconds,
-            last_read_at_ms: entry.observation.last_read_at_ms,
+            age_seconds: observation.age_seconds,
+            last_read_at_ms: observation.last_read_at_ms,
             reclaimable_bytes,
             inspection_required,
             safe_to_gc,
@@ -11375,7 +11399,8 @@ fn collect_diag_lexical_manifest_entries(
     summary: &mut DiagQuarantineSummary,
 ) -> Vec<DiagLexicalManifestEntry> {
     use crate::indexer::lexical_generation::{
-        LEXICAL_GENERATION_MANIFEST_FILE, LexicalShardLifecycleState, load_manifest,
+        LEXICAL_GENERATION_MANIFEST_FILE, LexicalGenerationPublishState,
+        LexicalShardLifecycleState, load_manifest,
     };
 
     let mut lexical_manifest_entries = Vec::new();
@@ -11428,9 +11453,15 @@ fn collect_diag_lexical_manifest_entries(
                     .lexical_generation_publish_state_counts
                     .entry(lexical_publish_state_label(manifest.publish_state).to_string())
                     .or_insert(0) += 1;
+                let needs_observation = matches!(
+                    manifest.publish_state,
+                    LexicalGenerationPublishState::Quarantined
+                ) || quarantined_shards > 0;
+                let observation =
+                    needs_observation.then(|| observe_diag_path(generation_dir, now, warnings));
                 lexical_manifest_entries.push(DiagLexicalManifestEntry {
                     path: generation_dir.to_path_buf(),
-                    observation: observe_diag_path(generation_dir, now, warnings),
+                    observation,
                     manifest,
                     quarantined_shards,
                 });
