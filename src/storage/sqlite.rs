@@ -6297,75 +6297,55 @@ impl FrankenStorage {
             return Ok(HashMap::new());
         }
 
-        let mut sql = String::from(
-            "SELECT conversation_id, id, idx, role, author, created_at, content \
-             FROM messages \
-             WHERE conversation_id IN (",
-        );
-        let mut params: Vec<ParamValue> = Vec::with_capacity(conversation_ids.len());
-        for (idx, conversation_id) in conversation_ids.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("?{}", idx + 1));
-            params.push(ParamValue::from(*conversation_id));
-        }
-        sql.push_str(") ORDER BY conversation_id ASC, idx ASC");
-
         let mut grouped: HashMap<i64, Vec<Message>> =
             HashMap::with_capacity(conversation_ids.len());
+        let mut fetched_conversation_ids = HashSet::with_capacity(conversation_ids.len());
         let mut total_messages = 0usize;
         let mut total_content_bytes = 0usize;
-        let _: Vec<()> = self
-            .conn
-            .query_map_collect(&sql, &params, |row| {
-                let role: String = row.get_typed(3)?;
-                let conversation_id: i64 = row.get_typed(0)?;
-                let content: String = row.get_typed(6)?;
-                total_messages = total_messages.saturating_add(1);
-                total_content_bytes = total_content_bytes.saturating_add(content.len());
-                if let Some(limit) = max_messages
-                    && total_messages > limit
-                {
-                    return Err(frankensqlite::FrankenError::Internal(format!(
-                        "lexical rebuild batch fetch exceeded message guardrail: messages={total_messages} limit={limit} conversations={}",
-                        conversation_ids.len()
-                    )));
-                }
-                if let Some(limit) = max_content_bytes
-                    && total_content_bytes > limit
-                {
-                    return Err(frankensqlite::FrankenError::Internal(format!(
-                        "lexical rebuild batch fetch exceeded content-byte guardrail: bytes={total_content_bytes} limit={limit} conversations={}",
-                        conversation_ids.len()
-                    )));
-                }
 
-                let message = Message {
-                    id: Some(row.get_typed(1)?),
-                    idx: row.get_typed(2)?,
-                    role: match role.as_str() {
-                        "user" => MessageRole::User,
-                        "agent" | "assistant" => MessageRole::Agent,
-                        "tool" => MessageRole::Tool,
-                        "system" => MessageRole::System,
-                        other => MessageRole::Other(other.to_string()),
-                    },
-                    author: row.get_typed(4)?,
-                    created_at: row.get_typed(5)?,
-                    content,
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                };
-                grouped.entry(conversation_id).or_default().push(message);
-                Ok(())
-            })
-            .with_context(|| {
-                format!(
-                    "fetching lexical rebuild messages for {} conversations",
+        // The apparent single-query shape (`WHERE conversation_id IN (...) ORDER BY ...`)
+        // is a bad frankensqlite plan for large live databases: it can
+        // materialize far more of `messages` than the requested conversations.
+        // Reuse the hinted per-conversation primary-key lookup instead.
+        for conversation_id in conversation_ids {
+            if !fetched_conversation_ids.insert(*conversation_id) {
+                continue;
+            }
+
+            let messages = self
+                .fetch_messages_for_lexical_rebuild(*conversation_id)
+                .with_context(|| {
+                    format!("fetching lexical rebuild messages for conversation {conversation_id}")
+                })?;
+            total_messages = total_messages.saturating_add(messages.len());
+            if let Some(limit) = max_messages
+                && total_messages > limit
+            {
+                return Err(anyhow!(
+                    "lexical rebuild batch fetch exceeded message guardrail: messages={total_messages} limit={limit} conversations={}",
                     conversation_ids.len()
-                )
-            })?;
+                ));
+            }
+
+            let message_bytes = messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>();
+            total_content_bytes = total_content_bytes.saturating_add(message_bytes);
+            if let Some(limit) = max_content_bytes
+                && total_content_bytes > limit
+            {
+                return Err(anyhow!(
+                    "lexical rebuild batch fetch exceeded content-byte guardrail: bytes={total_content_bytes} limit={limit} conversations={}",
+                    conversation_ids.len()
+                ));
+            }
+
+            if !messages.is_empty() {
+                grouped.insert(*conversation_id, messages);
+            }
+        }
+
         Ok(grouped)
     }
 
@@ -18842,6 +18822,22 @@ mod tests {
             source_id: LOCAL_SOURCE_ID.into(),
             origin_host: None,
         };
+        let third = Conversation {
+            external_id: Some("lexical-batch-3".into()),
+            title: Some("Lexical batch 3".into()),
+            source_path: PathBuf::from("/tmp/lexical-batch-3.jsonl"),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::System,
+                author: Some("system".into()),
+                created_at: Some(1_700_000_000_410),
+                content: "third-a".into(),
+                extra_json: serde_json::json!({"opaque": true}),
+                snippets: Vec::new(),
+            }],
+            ..second.clone()
+        };
 
         let first_id = storage
             .insert_conversation_tree(agent_id, None, &first)
@@ -18851,9 +18847,13 @@ mod tests {
             .insert_conversation_tree(agent_id, None, &second)
             .unwrap()
             .conversation_id;
+        let third_id = storage
+            .insert_conversation_tree(agent_id, None, &third)
+            .unwrap()
+            .conversation_id;
 
         let lexical = storage
-            .fetch_messages_for_lexical_rebuild_batch(&[second_id, first_id], None, None)
+            .fetch_messages_for_lexical_rebuild_batch(&[third_id, first_id], None, None)
             .unwrap();
 
         let first_messages = lexical.get(&first_id).expect("first conversation");
@@ -18866,10 +18866,15 @@ mod tests {
                 .all(|message| message.extra_json.is_null())
         );
 
-        let second_messages = lexical.get(&second_id).expect("second conversation");
-        assert_eq!(second_messages.len(), 1);
-        assert_eq!(second_messages[0].content, "second-a");
-        assert!(second_messages[0].extra_json.is_null());
+        assert!(
+            !lexical.contains_key(&second_id),
+            "batch fetch must exclude conversations not requested by the caller"
+        );
+
+        let third_messages = lexical.get(&third_id).expect("third conversation");
+        assert_eq!(third_messages.len(), 1);
+        assert_eq!(third_messages[0].content, "third-a");
+        assert!(third_messages[0].extra_json.is_null());
     }
 
     #[test]
