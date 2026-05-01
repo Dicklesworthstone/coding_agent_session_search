@@ -10455,37 +10455,68 @@ const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
 /// profile. 100-row chunks slightly regress the 20-message workload.
 const APPEND_MESSAGE_INSERT_BATCH_SIZE: usize = 50;
 
-fn message_insert_batch_sql(row_count: usize) -> &'static str {
+fn message_insert_batch_sql(row_count: usize, include_extra_json: bool) -> &'static str {
     static MESSAGE_INSERT_BATCH_SQL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    static MESSAGE_INSERT_BATCH_SQL_WITHOUT_EXTRA_JSON: std::sync::OnceLock<Vec<String>> =
+        std::sync::OnceLock::new();
 
     let max_batch_size = MESSAGE_INSERT_BATCH_SIZE.max(APPEND_MESSAGE_INSERT_BATCH_SIZE);
-    let cached_sql = MESSAGE_INSERT_BATCH_SQL.get_or_init(|| {
-        let mut sql_by_row_count = Vec::with_capacity(max_batch_size + 1);
-        sql_by_row_count.push(String::new());
-        for row_count in 1..=max_batch_size {
-            let placeholders = (0..row_count)
-                .map(|idx| {
-                    let base = idx * 8;
-                    format!(
-                        "(?{},?{},?{},?{},?{},?{},?{},?{})",
-                        base + 1,
-                        base + 2,
-                        base + 3,
-                        base + 4,
-                        base + 5,
-                        base + 6,
-                        base + 7,
-                        base + 8
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            sql_by_row_count.push(format!(
-                "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
-            ));
-        }
-        sql_by_row_count
-    });
+    let cached_sql = if include_extra_json {
+        MESSAGE_INSERT_BATCH_SQL.get_or_init(|| {
+            let mut sql_by_row_count = Vec::with_capacity(max_batch_size + 1);
+            sql_by_row_count.push(String::new());
+            for row_count in 1..=max_batch_size {
+                let placeholders = (0..row_count)
+                    .map(|idx| {
+                        let base = idx * 8;
+                        format!(
+                            "(?{},?{},?{},?{},?{},?{},?{},?{})",
+                            base + 1,
+                            base + 2,
+                            base + 3,
+                            base + 4,
+                            base + 5,
+                            base + 6,
+                            base + 7,
+                            base + 8
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                sql_by_row_count.push(format!(
+                    "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
+                ));
+            }
+            sql_by_row_count
+        })
+    } else {
+        MESSAGE_INSERT_BATCH_SQL_WITHOUT_EXTRA_JSON.get_or_init(|| {
+            let mut sql_by_row_count = Vec::with_capacity(max_batch_size + 1);
+            sql_by_row_count.push(String::new());
+            for row_count in 1..=max_batch_size {
+                let placeholders = (0..row_count)
+                    .map(|idx| {
+                        let base = idx * 7;
+                        format!(
+                            "(?{},?{},?{},?{},?{},?{},?{})",
+                            base + 1,
+                            base + 2,
+                            base + 3,
+                            base + 4,
+                            base + 5,
+                            base + 6,
+                            base + 7
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                sql_by_row_count.push(format!(
+                    "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_bin) VALUES {placeholders}"
+                ));
+            }
+            sql_by_row_count
+        })
+    };
 
     cached_sql
         .get(row_count)
@@ -10532,18 +10563,27 @@ fn franken_batch_insert_new_messages_with_batch_size(
             inserted_ids.push(franken_insert_new_message(tx, conversation_id, chunk[0])?);
             continue;
         }
-        let sql = message_insert_batch_sql(chunk.len());
+        let payloads: Vec<_> = chunk
+            .iter()
+            .map(|msg| franken_message_insert_payload(msg))
+            .collect::<Result<_>>()?;
+        let include_extra_json = payloads
+            .iter()
+            .any(|(extra_json_str, _)| extra_json_str.is_some());
+        let sql = message_insert_batch_sql(chunk.len(), include_extra_json);
 
-        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 8);
-        for msg in chunk {
-            let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
+        let value_count = if include_extra_json { 8 } else { 7 };
+        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * value_count);
+        for (msg, (extra_json_str, extra_bin)) in chunk.iter().zip(payloads.iter()) {
             param_values.push(SqliteValue::from(conversation_id));
             param_values.push(SqliteValue::from(msg.idx));
             param_values.push(SqliteValue::from(role_as_str(&msg.role)));
             param_values.push(SqliteValue::from(msg.author.as_deref()));
             param_values.push(SqliteValue::from(msg.created_at));
             param_values.push(SqliteValue::from(msg.content.as_str()));
-            param_values.push(SqliteValue::from(extra_json_str.as_deref()));
+            if include_extra_json {
+                param_values.push(SqliteValue::from(extra_json_str.as_deref()));
+            }
             param_values.push(SqliteValue::from(extra_bin.as_deref()));
         }
 
@@ -10659,15 +10699,22 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
         profile.batch_rows += chunk.len();
 
         let sql_build_start = Instant::now();
-        let sql = message_insert_batch_sql(chunk.len());
+        let payload_start = Instant::now();
+        let payloads: Vec<_> = chunk
+            .iter()
+            .map(|msg| franken_message_insert_payload(msg))
+            .collect::<Result<_>>()?;
+        profile.payload_duration += payload_start.elapsed();
+
+        let include_extra_json = payloads
+            .iter()
+            .any(|(extra_json_str, _)| extra_json_str.is_some());
+        let sql = message_insert_batch_sql(chunk.len(), include_extra_json);
         profile.sql_build_duration += sql_build_start.elapsed();
 
-        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 8);
-        for msg in chunk {
-            let payload_start = Instant::now();
-            let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
-            profile.payload_duration += payload_start.elapsed();
-
+        let value_count = if include_extra_json { 8 } else { 7 };
+        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * value_count);
+        for (msg, (extra_json_str, extra_bin)) in chunk.iter().zip(payloads.iter()) {
             let param_build_start = Instant::now();
             param_values.push(SqliteValue::from(conversation_id));
             param_values.push(SqliteValue::from(msg.idx));
@@ -10675,7 +10722,9 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
             param_values.push(SqliteValue::from(msg.author.as_deref()));
             param_values.push(SqliteValue::from(msg.created_at));
             param_values.push(SqliteValue::from(msg.content.as_str()));
-            param_values.push(SqliteValue::from(extra_json_str.as_deref()));
+            if include_extra_json {
+                param_values.push(SqliteValue::from(extra_json_str.as_deref()));
+            }
             param_values.push(SqliteValue::from(extra_bin.as_deref()));
             profile.param_build_duration += param_build_start.elapsed();
         }
