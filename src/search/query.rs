@@ -3,15 +3,15 @@ use crossbeam_channel as mpsc;
 use frankensearch::lexical::{
     BooleanQuery, CASS_SCHEMA_HASH as FS_CASS_SCHEMA_HASH, CassFields as FsCassFields,
     CassQueryFilters as FsCassQueryFilters, CassQueryToken as FsCassQueryToken,
-    CassSourceFilter as FsCassSourceFilter, CassWildcardPattern as FsCassWildcardPattern,
-    IndexReader, IndexRecordOption, Occur, Query, ReloadPolicy, Searcher,
+    CassSourceFilter as FsCassSourceFilter, CassWildcardPattern as FsCassWildcardPattern, Count,
+    IndexReader, IndexRecordOption, LexicalDocHit as FsLexicalDocHit,
+    LexicalSearchResult as FsLexicalSearchResult, Occur, Query, ReloadPolicy, Searcher,
     SnippetConfig as FsSnippetConfig, TantivyDocument, Term, TermQuery, TopDocs, Value,
     cass_build_tantivy_query as fs_cass_build_tantivy_query,
     cass_has_boolean_operators as fs_cass_has_boolean_operators,
     cass_open_search_reader as fs_cass_open_search_reader,
     cass_parse_boolean_query as fs_cass_parse_boolean_query,
-    cass_sanitize_query as fs_cass_sanitize_query,
-    execute_query_with_offset as fs_execute_query_with_offset, load_doc as fs_load_doc,
+    cass_sanitize_query as fs_cass_sanitize_query, load_doc as fs_load_doc,
     render_snippet_html as fs_render_snippet_html,
     try_build_snippet_generator as fs_try_build_snippet_generator,
 };
@@ -1262,6 +1262,32 @@ fn effective_field_mask(field_mask: FieldMask) -> FieldMask {
     } else {
         FieldMask::FULL
     }
+}
+
+fn execute_query_with_lazy_exact_count(
+    searcher: &Searcher,
+    query: &dyn Query,
+    limit: usize,
+    offset: usize,
+) -> Result<FsLexicalSearchResult> {
+    let top_docs = searcher.search(query, &TopDocs::with_limit(limit).and_offset(offset))?;
+    let page_saturated = top_docs.len() == limit;
+    let total_count = if page_saturated {
+        searcher.search(query, &Count)?
+    } else {
+        offset.saturating_add(top_docs.len())
+    };
+    let hits = top_docs
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (bm25_score, doc_address))| FsLexicalDocHit {
+            bm25_score,
+            rank,
+            doc_address,
+        })
+        .collect();
+
+    Ok(FsLexicalSearchResult { hits, total_count })
 }
 
 /// Result of a search operation with metadata about how matches were found
@@ -5549,7 +5575,7 @@ impl SearchClient {
         let q: Box<dyn Query> = fs_cass_build_tantivy_query(raw_query, &fs_filters, fields);
 
         let prefix_only = is_prefix_only(sanitized_query);
-        let top_docs = fs_execute_query_with_offset(&searcher, &*q, limit, offset)?;
+        let top_docs = execute_query_with_lazy_exact_count(&searcher, &*q, limit, offset)?;
         let tantivy_total_count = top_docs.total_count;
         let query_match_type = dominant_match_type(sanitized_query);
         let mut pending_hits = Vec::with_capacity(top_docs.hits.len());
