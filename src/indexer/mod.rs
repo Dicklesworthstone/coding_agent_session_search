@@ -55,7 +55,9 @@ use crate::model::conversation_packet::{
 };
 use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode};
 use crate::search::canonicalize::is_hard_message_noise;
-use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
+use crate::search::tantivy::{
+    SearchableIndexSummary, TantivyIndex, index_dir, schema_hash_matches,
+};
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
 
 use crate::sources::config::{Platform, SourcesConfig};
@@ -2637,20 +2639,23 @@ fn build_lexical_rebuild_shard_index(
     batch: &[LexicalRebuildConversationPacket],
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
 ) -> Result<usize> {
-    build_lexical_rebuild_shard_index_with_writer_parallelism(
-        shard_index_path,
-        batch,
-        lexical_rebuild_worker_pool,
-        None,
+    Ok(
+        build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
+            shard_index_path,
+            batch,
+            lexical_rebuild_worker_pool,
+            None,
+        )?
+        .docs,
     )
 }
 
-fn build_lexical_rebuild_shard_index_with_writer_parallelism(
+fn build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
     shard_index_path: &Path,
     batch: &[LexicalRebuildConversationPacket],
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
     writer_parallelism: Option<usize>,
-) -> Result<usize> {
+) -> Result<SearchableIndexSummary> {
     let mut shard_index = if let Some(writer_parallelism) = writer_parallelism {
         TantivyIndex::open_or_create_with_writer_parallelism(shard_index_path, writer_parallelism)
     } else {
@@ -2679,7 +2684,10 @@ fn build_lexical_rebuild_shard_index_with_writer_parallelism(
             shard_index_path.display()
         )
     })?;
-    Ok(indexed_docs)
+    Ok(SearchableIndexSummary {
+        docs: indexed_docs,
+        segments: shard_index.segment_count(),
+    })
 }
 
 #[derive(Debug)]
@@ -2694,6 +2702,7 @@ struct LexicalRebuildShardBuildWork {
 struct LexicalRebuildShardBuildResult {
     shard: LexicalShardPlanShard,
     indexed_docs: usize,
+    segments: usize,
     shard_index_path: PathBuf,
 }
 
@@ -2709,6 +2718,8 @@ struct LexicalRebuildShardMergeArtifact {
     first_shard_index: usize,
     last_shard_index: usize,
     index_path: PathBuf,
+    docs: usize,
+    segments: usize,
 }
 
 #[derive(Debug)]
@@ -2764,20 +2775,21 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                             .iter()
                             .map(|packet| packet.flow_reservation_bytes)
                             .sum::<usize>();
-                        let result = build_lexical_rebuild_shard_index_with_writer_parallelism(
-                            &work.shard_index_path,
-                            &work.packets,
-                            lexical_rebuild_worker_pool.as_deref(),
-                            Some(work.writer_parallelism),
-                        );
+                        let result =
+                            build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
+                                &work.shard_index_path,
+                                &work.packets,
+                                lexical_rebuild_worker_pool.as_deref(),
+                                Some(work.writer_parallelism),
+                            );
                         flow_limiter.release(flow_reservation_bytes);
                         match result {
-                            Ok(indexed_docs) => {
+                            Ok(summary) => {
                                 tracing::info!(
                                     worker_idx,
                                     shard_index = work.shard.shard_index,
                                     writer_parallelism = work.writer_parallelism,
-                                    indexed_docs,
+                                    indexed_docs = summary.docs,
                                     shard_conversations = work.shard.conversation_count,
                                     "built lexical rebuild shard index"
                                 );
@@ -2785,7 +2797,8 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                                     .send(LexicalRebuildShardBuildMessage::Built(
                                         LexicalRebuildShardBuildResult {
                                             shard: work.shard,
-                                            indexed_docs,
+                                            indexed_docs: summary.docs,
+                                            segments: summary.segments,
                                             shard_index_path: work.shard_index_path,
                                         },
                                     ))
@@ -2845,6 +2858,12 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                             );
                         match result {
                             Ok(merged_index) => {
+                                let docs = work
+                                    .input_artifacts
+                                    .iter()
+                                    .map(|artifact| artifact.docs)
+                                    .sum();
+                                let segments = merged_index.segment_count();
                                 drop(merged_index);
                                 tracing::info!(
                                     worker_idx,
@@ -2862,6 +2881,8 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                                                 first_shard_index,
                                                 last_shard_index,
                                                 index_path: work.output_path,
+                                                docs,
+                                                segments,
                                             },
                                         },
                                     ))
@@ -5614,6 +5635,8 @@ fn validate_lexical_rebuild_shard_build_result(
         first_shard_index: result.shard.shard_index,
         last_shard_index: result.shard.shard_index,
         index_path: result.shard_index_path.clone(),
+        docs: observed_docs,
+        segments: result.segments,
     })
 }
 
@@ -5640,13 +5663,10 @@ fn validate_complete_lexical_rebuild_shard_artifacts(
                 artifact.last_shard_index
             ));
         }
-        let observed_docs = live_tantivy_doc_count(&artifact.index_path)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "validated lexical rebuild shard {} at {} is no longer searchable before publish",
-                expected.shard_index,
-                artifact.index_path.display()
-            )
-        })?;
+        // These counts were already checked against a fresh reader when each
+        // shard build completed; reusing them avoids a redundant end-of-run
+        // open of every staged shard.
+        let observed_docs = artifact.docs;
         // [coding_agent_session_search-rx1ex] Mirrors the relaxation in
         // validate_lexical_rebuild_shard_build_result: tolerate
         // filter-induced doc < message gaps; only fail on the
@@ -6980,7 +7000,7 @@ fn lexical_rebuild_staged_shard_builder_parallelism() -> usize {
 fn lexical_rebuild_default_staged_merge_worker_parallelism_for_workers(workers: usize) -> usize {
     workers
         .saturating_sub(workers.saturating_mul(3).div_ceil(4))
-        .clamp(1, 4)
+        .clamp(1, 8)
 }
 
 fn lexical_rebuild_staged_merge_worker_parallelism() -> usize {
@@ -12499,49 +12519,94 @@ struct LexicalRebuildFinalMergeArtifact {
     segments: usize,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn finalize_staged_lexical_rebuild_publish_artifact(
     output_path: &Path,
     input_paths: &[PathBuf],
     stage_root: &Path,
     max_parallel_jobs: usize,
 ) -> Result<LexicalRebuildFinalMergeArtifact> {
-    if input_paths.is_empty() {
+    let mut input_artifacts = Vec::with_capacity(input_paths.len());
+    for (idx, input_path) in input_paths.iter().enumerate() {
+        let summary =
+            crate::search::tantivy::searchable_index_summary(input_path)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "staged lexical rebuild artifact is not searchable: {}",
+                    input_path.display()
+                )
+            })?;
+        input_artifacts.push(LexicalRebuildShardMergeArtifact {
+            first_shard_index: idx,
+            last_shard_index: idx,
+            index_path: input_path.clone(),
+            docs: summary.docs,
+            segments: summary.segments,
+        });
+    }
+    finalize_staged_lexical_rebuild_publish_artifact_from_artifacts(
+        output_path,
+        &input_artifacts,
+        stage_root,
+        max_parallel_jobs,
+    )
+}
+
+fn finalize_staged_lexical_rebuild_publish_artifact_from_artifacts(
+    output_path: &Path,
+    input_artifacts: &[LexicalRebuildShardMergeArtifact],
+    stage_root: &Path,
+    max_parallel_jobs: usize,
+) -> Result<LexicalRebuildFinalMergeArtifact> {
+    if input_artifacts.is_empty() {
         return Err(anyhow::anyhow!(
             "cannot finalize staged lexical rebuild without at least one merged artifact"
         ));
     }
 
-    if input_paths.len() == 1 {
-        let publish_path = input_paths[0].clone();
+    if input_artifacts.len() == 1 {
+        let artifact = &input_artifacts[0];
+        let publish_path = artifact.index_path.clone();
         tracing::info!(
             publish_path = %publish_path.display(),
             "reusing already-final staged lexical rebuild artifact without redundant final merge"
         );
-        let summary =
-            crate::search::tantivy::searchable_index_summary(&publish_path)?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "single-input staged lexical rebuild artifact is not searchable: {}",
-                    publish_path.display()
-                )
-            })?;
+        if !crate::search::tantivy::searchable_index_exists(&publish_path) {
+            return Err(anyhow::anyhow!(
+                "single-input staged lexical rebuild artifact is not searchable: {}",
+                publish_path.display()
+            ));
+        }
         return Ok(LexicalRebuildFinalMergeArtifact {
             publish_path,
-            docs: summary.docs,
-            segments: summary.segments,
+            docs: artifact.docs,
+            segments: artifact.segments,
         });
     }
 
     tracing::info!(
         publish_path = %output_path.display(),
-        staged_artifacts = input_paths.len(),
+        staged_artifacts = input_artifacts.len(),
         "publishing staged lexical rebuild as federated lexical shard set without final assembly collapse"
     );
     let _ = stage_root;
     let _ = max_parallel_jobs;
-    let summary = crate::search::tantivy::publish_federated_searchable_index_directories(
-        output_path,
-        input_paths,
-    )?;
+    let publish_inputs = input_artifacts
+        .iter()
+        .map(|artifact| {
+            (
+                artifact.index_path.clone(),
+                SearchableIndexSummary {
+                    docs: artifact.docs,
+                    segments: artifact.segments,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let summary =
+        crate::search::tantivy::publish_federated_searchable_index_directories_with_summaries(
+            output_path,
+            &publish_inputs,
+        )?;
     Ok(LexicalRebuildFinalMergeArtifact {
         publish_path: output_path.to_path_buf(),
         docs: summary.docs,
@@ -13530,14 +13595,11 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         perf_profile.as_mut(),
     )?;
 
-    let final_merge_input_paths = final_merge_input_artifacts
-        .unwrap_or_else(|| merge_coordinator.final_merge_input_artifacts())
-        .into_iter()
-        .map(|artifact| artifact.index_path)
-        .collect::<Vec<_>>();
-    let final_merge_artifact = finalize_staged_lexical_rebuild_publish_artifact(
+    let final_merge_inputs = final_merge_input_artifacts
+        .unwrap_or_else(|| merge_coordinator.final_merge_input_artifacts());
+    let final_merge_artifact = finalize_staged_lexical_rebuild_publish_artifact_from_artifacts(
         &staged_merged_index_path,
-        &final_merge_input_paths,
+        &final_merge_inputs,
         &final_merge_stage_root,
         shard_merge_settings.workers,
     )?;
@@ -20948,6 +21010,7 @@ mod tests {
         let result = LexicalRebuildShardBuildResult {
             shard: shard.clone(),
             indexed_docs,
+            segments: 1,
             shard_index_path: shard_path.clone(),
         };
 
@@ -21028,6 +21091,7 @@ mod tests {
                 oversized_single_conversation: false,
             },
             indexed_docs: 1,
+            segments: 1,
             shard_index_path: shard_path,
         };
 
@@ -21114,6 +21178,7 @@ mod tests {
         let result = LexicalRebuildShardBuildResult {
             shard: shard.clone(),
             indexed_docs,
+            segments: 1,
             shard_index_path: shard_path.clone(),
         };
 
@@ -21208,6 +21273,7 @@ mod tests {
         let result = LexicalRebuildShardBuildResult {
             shard: shard.clone(),
             indexed_docs,
+            segments: 1,
             shard_index_path: shard_path.clone(),
         };
 
@@ -21601,6 +21667,8 @@ mod tests {
                     first_shard_index: *first_shard_index,
                     last_shard_index: *last_shard_index,
                     index_path: shard_path,
+                    docs: 2,
+                    segments: 1,
                 }
             })
             .collect::<Vec<_>>();
@@ -21711,6 +21779,8 @@ mod tests {
                         first_shard_index: idx,
                         last_shard_index: idx,
                         index_path: shard_path.clone(),
+                        docs: 2,
+                        segments: 1,
                     },
                     &merge_work_tx,
                 )
@@ -21779,21 +21849,29 @@ mod tests {
                     first_shard_index: 0,
                     last_shard_index: 0,
                     index_path: PathBuf::from("/tmp/shard-0"),
+                    docs: 0,
+                    segments: 0,
                 },
                 LexicalRebuildShardMergeArtifact {
                     first_shard_index: 1,
                     last_shard_index: 1,
                     index_path: PathBuf::from("/tmp/shard-1"),
+                    docs: 0,
+                    segments: 0,
                 },
                 LexicalRebuildShardMergeArtifact {
                     first_shard_index: 2,
                     last_shard_index: 2,
                     index_path: PathBuf::from("/tmp/shard-2"),
+                    docs: 0,
+                    segments: 0,
                 },
                 LexicalRebuildShardMergeArtifact {
                     first_shard_index: 3,
                     last_shard_index: 3,
                     index_path: PathBuf::from("/tmp/shard-3"),
+                    docs: 0,
+                    segments: 0,
                 },
             ])],
             next_output_seq_by_level: vec![0, 0],
@@ -21834,6 +21912,8 @@ mod tests {
                         first_shard_index: idx,
                         last_shard_index: idx,
                         index_path: PathBuf::from(format!("/tmp/shard-{idx}")),
+                        docs: 0,
+                        segments: 0,
                     })
                     .collect(),
             ],
@@ -21870,6 +21950,8 @@ mod tests {
                         first_shard_index: idx,
                         last_shard_index: idx,
                         index_path: PathBuf::from(format!("/tmp/shard-{idx}")),
+                        docs: 0,
+                        segments: 0,
                     })
                     .collect(),
             ],
@@ -21905,41 +21987,57 @@ mod tests {
                     first_shard_index: 0,
                     last_shard_index: 0,
                     index_path: PathBuf::from("/tmp/shard-0"),
+                    docs: 0,
+                    segments: 0,
                 },
                 LexicalRebuildShardMergeArtifact {
                     first_shard_index: 1,
                     last_shard_index: 1,
                     index_path: PathBuf::from("/tmp/shard-1"),
+                    docs: 0,
+                    segments: 0,
                 },
                 LexicalRebuildShardMergeArtifact {
                     first_shard_index: 2,
                     last_shard_index: 2,
                     index_path: PathBuf::from("/tmp/shard-2"),
+                    docs: 0,
+                    segments: 0,
                 },
                 LexicalRebuildShardMergeArtifact {
                     first_shard_index: 3,
                     last_shard_index: 3,
                     index_path: PathBuf::from("/tmp/shard-3"),
+                    docs: 0,
+                    segments: 0,
                 },
                 LexicalRebuildShardMergeArtifact {
                     first_shard_index: 4,
                     last_shard_index: 4,
                     index_path: PathBuf::from("/tmp/shard-4"),
+                    docs: 0,
+                    segments: 0,
                 },
                 LexicalRebuildShardMergeArtifact {
                     first_shard_index: 5,
                     last_shard_index: 5,
                     index_path: PathBuf::from("/tmp/shard-5"),
+                    docs: 0,
+                    segments: 0,
                 },
                 LexicalRebuildShardMergeArtifact {
                     first_shard_index: 6,
                     last_shard_index: 6,
                     index_path: PathBuf::from("/tmp/shard-6"),
+                    docs: 0,
+                    segments: 0,
                 },
                 LexicalRebuildShardMergeArtifact {
                     first_shard_index: 7,
                     last_shard_index: 7,
                     index_path: PathBuf::from("/tmp/shard-7"),
+                    docs: 0,
+                    segments: 0,
                 },
             ])],
             next_output_seq_by_level: vec![0, 0],
@@ -22174,7 +22272,11 @@ mod tests {
         );
         assert_eq!(
             lexical_rebuild_default_staged_merge_worker_parallelism_for_workers(32),
-            4
+            8
+        );
+        assert_eq!(
+            lexical_rebuild_default_staged_merge_worker_parallelism_for_workers(64),
+            8
         );
     }
 

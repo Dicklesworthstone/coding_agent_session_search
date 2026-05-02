@@ -538,6 +538,29 @@ pub fn publish_federated_searchable_index_directories<P: AsRef<Path>>(
             "cannot publish federated lexical bundle without at least one input shard"
         ));
     }
+    let mut input_summaries = Vec::with_capacity(input_paths.len());
+    for input_path in input_paths {
+        let input_path = input_path.as_ref();
+        let summary = searchable_index_summary(input_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "federated lexical publish input is not a searchable index: {}",
+                input_path.display()
+            )
+        })?;
+        input_summaries.push((input_path.to_path_buf(), summary));
+    }
+    publish_federated_searchable_index_directories_with_summaries(output_path, &input_summaries)
+}
+
+pub fn publish_federated_searchable_index_directories_with_summaries(
+    output_path: &Path,
+    input_shards: &[(PathBuf, SearchableIndexSummary)],
+) -> Result<SearchableIndexSummary> {
+    if input_shards.is_empty() {
+        return Err(anyhow::anyhow!(
+            "cannot publish federated lexical bundle without at least one input shard"
+        ));
+    }
     ensure_empty_merge_output_directory(output_path)?;
 
     let shard_root = output_path.join("shards");
@@ -552,19 +575,18 @@ pub fn publish_federated_searchable_index_directories<P: AsRef<Path>>(
         version: 1,
         kind: "cass-federated-lexical-index".to_string(),
         schema_hash: CASS_SCHEMA_HASH.to_string(),
-        shards: Vec::with_capacity(input_paths.len()),
+        shards: Vec::with_capacity(input_shards.len()),
     };
     let mut total_docs = 0usize;
     let mut total_segments = 0usize;
 
-    for (shard_idx, input_path) in input_paths.iter().enumerate() {
-        let input_path = input_path.as_ref();
-        let summary = searchable_index_summary(input_path)?.ok_or_else(|| {
-            anyhow::anyhow!(
+    for (shard_idx, (input_path, summary)) in input_shards.iter().enumerate() {
+        if !searchable_index_exists(input_path) {
+            return Err(anyhow::anyhow!(
                 "federated lexical publish input is not a searchable index: {}",
                 input_path.display()
-            )
-        })?;
+            ));
+        }
         let meta_fingerprint = meta_fingerprint_for_existing_index_dir(input_path)?;
         let relative_path = manifest_relative_shard_path(shard_idx);
         let destination_path = output_path.join(&relative_path);
