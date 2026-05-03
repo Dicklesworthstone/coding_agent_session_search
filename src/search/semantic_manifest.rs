@@ -443,6 +443,7 @@ impl SemanticShardManifest {
         let mut ready_indices = std::collections::BTreeSet::new();
         let mut ann_ready_indices = std::collections::BTreeSet::new();
         let mut seen_indices = std::collections::BTreeSet::new();
+        let mut seen_index_paths = std::collections::BTreeSet::new();
         let mut expected_shard_count = None;
         let mut expected_generation_metadata: Option<(&str, u32, u32, usize, u64, &str)> = None;
         let mut generation_consistent = true;
@@ -455,6 +456,9 @@ impl SemanticShardManifest {
                 generation_consistent = false;
             }
             if !seen_indices.insert(shard.shard_index) {
+                generation_consistent = false;
+            }
+            if shard.index_path.trim().is_empty() || !seen_index_paths.insert(&shard.index_path) {
                 generation_consistent = false;
             }
             match expected_shard_count {
@@ -1878,6 +1882,38 @@ mod tests {
         assert!(
             !duplicate_summary.complete,
             "duplicate shard indexes must not summarize as a complete generation"
+        );
+
+        let mut duplicate_path = test_shard(1, 2, true);
+        duplicate_path.index_path = test_shard(0, 2, true).index_path;
+        shards.replace_shards_for_generation(
+            TierKind::Fast,
+            "fnv1a-384",
+            "fp-sharded",
+            vec![test_shard(0, 2, true), duplicate_path],
+        );
+        let duplicate_path_summary = shards.summary(TierKind::Fast, "fnv1a-384", "fp-sharded");
+        assert_eq!(duplicate_path_summary.shard_count, 2);
+        assert_eq!(duplicate_path_summary.ready_shards, 2);
+        assert!(
+            !duplicate_path_summary.complete,
+            "duplicate shard index paths must not summarize as a complete generation"
+        );
+
+        let mut blank_path = test_shard(0, 1, true);
+        blank_path.index_path.clear();
+        shards.replace_shards_for_generation(
+            TierKind::Fast,
+            "fnv1a-384",
+            "fp-sharded",
+            vec![blank_path],
+        );
+        let blank_path_summary = shards.summary(TierKind::Fast, "fnv1a-384", "fp-sharded");
+        assert_eq!(blank_path_summary.shard_count, 1);
+        assert_eq!(blank_path_summary.ready_shards, 1);
+        assert!(
+            !blank_path_summary.complete,
+            "blank shard index paths must not summarize as complete"
         );
 
         shards.replace_shards_for_generation(
