@@ -1995,6 +1995,7 @@ struct SemanticSearchState {
     context_token: Arc<()>,
     embedder: Arc<dyn Embedder>,
     fs_semantic_index: Arc<FsVectorIndex>,
+    fs_semantic_indexes: Arc<Vec<Arc<FsVectorIndex>>>,
     fs_ann_index: Option<Arc<FsHnswIndex>>,
     ann_path: Option<PathBuf>,
     fs_in_memory_two_tier_index: Option<Arc<FsInMemoryTwoTierIndex>>,
@@ -2044,6 +2045,7 @@ struct ProgressiveTwoTierContext {
 #[derive(Clone)]
 struct SemanticCandidateContext {
     fs_semantic_index: Arc<FsVectorIndex>,
+    fs_semantic_indexes: Arc<Vec<Arc<FsVectorIndex>>>,
     filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
 }
@@ -3677,22 +3679,55 @@ impl SearchClient {
         roles: Option<HashSet<u8>>,
         ann_path: Option<PathBuf>,
     ) -> Result<()> {
+        self.set_semantic_indexes_context(
+            embedder,
+            vec![fs_semantic_index],
+            filter_maps,
+            roles,
+            ann_path,
+        )
+    }
+
+    pub fn set_semantic_indexes_context(
+        &self,
+        embedder: Arc<dyn Embedder>,
+        fs_semantic_indexes: Vec<VectorIndex>,
+        filter_maps: SemanticFilterMaps,
+        roles: Option<HashSet<u8>>,
+        ann_path: Option<PathBuf>,
+    ) -> Result<()> {
+        if fs_semantic_indexes.is_empty() {
+            bail!("semantic context requires at least one vector index");
+        }
+
+        let fs_semantic_indexes = fs_semantic_indexes
+            .into_iter()
+            .map(|index| {
+                let embedder_id = index.embedder_id().to_string();
+                let dimension = index.dimension();
+                if embedder_id != embedder.id() {
+                    bail!(
+                        "embedder mismatch: index uses {}, embedder is {}",
+                        embedder_id,
+                        embedder.id()
+                    );
+                }
+                if dimension != embedder.dimension() {
+                    bail!(
+                        "embedder dimension mismatch: index uses {}, embedder is {}",
+                        dimension,
+                        embedder.dimension()
+                    );
+                }
+                Ok(Arc::new(index))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let fs_semantic_index = Arc::clone(&fs_semantic_indexes[0]);
+        let shard_count = fs_semantic_indexes.len();
+        let ann_path = if shard_count == 1 { ann_path } else { None };
         let embedder_id = fs_semantic_index.embedder_id().to_string();
         let dimension = fs_semantic_index.dimension();
-        if embedder_id != embedder.id() {
-            bail!(
-                "embedder mismatch: index uses {}, embedder is {}",
-                embedder_id,
-                embedder.id()
-            );
-        }
-        if dimension != embedder.dimension() {
-            bail!(
-                "embedder dimension mismatch: index uses {}, embedder is {}",
-                dimension,
-                embedder.dimension()
-            );
-        }
+        let fs_semantic_indexes = Arc::new(fs_semantic_indexes);
 
         let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
         let context_token = Arc::new(());
@@ -3703,7 +3738,8 @@ impl SearchClient {
         *state_guard = Some(SemanticSearchState {
             context_token,
             embedder,
-            fs_semantic_index: Arc::new(fs_semantic_index),
+            fs_semantic_index,
+            fs_semantic_indexes,
             fs_ann_index: None,
             ann_path,
             fs_in_memory_two_tier_index: None,
@@ -3714,6 +3750,14 @@ impl SearchClient {
             roles,
             query_cache: QueryCache::new(embedder_id.as_str(), capacity),
         });
+        if shard_count > 1 {
+            tracing::info!(
+                shard_count,
+                dimension,
+                embedder = embedder_id,
+                "semantic search context loaded sharded vector generation"
+            );
+        }
         Ok(())
     }
 
@@ -3926,6 +3970,75 @@ impl SearchClient {
         collapsed
     }
 
+    fn record_fs_semantic_hit(
+        best_by_message: &mut HashMap<u64, VectorSearchResult>,
+        hit: &FsVectorHit,
+    ) {
+        let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+            return;
+        };
+        best_by_message
+            .entry(parsed.message_id)
+            .and_modify(|entry| {
+                if hit.score > entry.score {
+                    entry.score = hit.score;
+                    entry.chunk_idx = parsed.chunk_idx;
+                }
+            })
+            .or_insert(VectorSearchResult {
+                message_id: parsed.message_id,
+                chunk_idx: parsed.chunk_idx,
+                score: hit.score,
+            });
+    }
+
+    fn search_exact_semantic_indexes(
+        context: &SemanticCandidateContext,
+        embedding: &[f32],
+        fetch_limit: usize,
+        fs_filter: Option<&dyn FsSearchFilter>,
+    ) -> Result<(Vec<VectorSearchResult>, bool)> {
+        if context.fs_semantic_indexes.len() == 1 {
+            let fs_hits = context
+                .fs_semantic_index
+                .search_top_k(embedding, fetch_limit, fs_filter)
+                .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
+            let mut best_by_message = HashMap::with_capacity(fs_hits.len());
+            for hit in &fs_hits {
+                Self::record_fs_semantic_hit(&mut best_by_message, hit);
+            }
+            return Ok((
+                Self::collapse_semantic_results(best_by_message, fetch_limit),
+                fs_hits.len() >= fetch_limit,
+            ));
+        }
+
+        let mut best_by_message = HashMap::new();
+        let mut raw_hits = 0usize;
+        for index in context.fs_semantic_indexes.iter() {
+            let shard_limit = index.record_count();
+            if shard_limit == 0 {
+                continue;
+            }
+            let fs_hits = index
+                .search_top_k(embedding, shard_limit, fs_filter)
+                .map_err(|err| anyhow!("frankensearch sharded semantic search failed: {err}"))?;
+            raw_hits = raw_hits.saturating_add(fs_hits.len());
+            best_by_message.reserve(fs_hits.len());
+            for hit in &fs_hits {
+                Self::record_fs_semantic_hit(&mut best_by_message, hit);
+            }
+        }
+        let collapsed = Self::collapse_semantic_results(best_by_message, fetch_limit);
+        tracing::debug!(
+            shard_count = context.fs_semantic_indexes.len(),
+            raw_hits,
+            returned = collapsed.len(),
+            "semantic sharded exact merge complete"
+        );
+        Ok((collapsed, false))
+    }
+
     fn search_semantic_candidates(
         &self,
         context: &SemanticCandidateContext,
@@ -3997,37 +4110,13 @@ impl SearchClient {
             );
 
             let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-            let fs_hits = context
-                .fs_semantic_index
-                .search_top_k(embedding, request.fetch_limit, fs_filter)
-                .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
-
-            let mut best_by_message: HashMap<u64, VectorSearchResult> =
-                HashMap::with_capacity(fs_hits.len());
-            for hit in fs_hits.iter() {
-                let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                    continue;
-                };
-                best_by_message
-                    .entry(parsed.message_id)
-                    .and_modify(|entry| {
-                        if hit.score > entry.score {
-                            entry.score = hit.score;
-                            entry.chunk_idx = parsed.chunk_idx;
-                        }
-                    })
-                    .or_insert(VectorSearchResult {
-                        message_id: parsed.message_id,
-                        chunk_idx: parsed.chunk_idx,
-                        score: hit.score,
-                    });
-            }
-
-            return Ok((
-                Self::collapse_semantic_results(best_by_message, request.fetch_limit),
-                fs_hits.len() >= request.fetch_limit,
-                None,
-            ));
+            let (results, truncated) = Self::search_exact_semantic_indexes(
+                context,
+                embedding,
+                request.fetch_limit,
+                fs_filter,
+            )?;
+            return Ok((results, truncated, None));
         }
 
         if request.approximate {
@@ -4096,37 +4185,13 @@ impl SearchClient {
         }
 
         let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-        let fs_hits = context
-            .fs_semantic_index
-            .search_top_k(embedding, request.fetch_limit, fs_filter)
-            .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
-
-        let mut best_by_message: HashMap<u64, VectorSearchResult> =
-            HashMap::with_capacity(fs_hits.len());
-        for hit in fs_hits.iter() {
-            let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                continue;
-            };
-            best_by_message
-                .entry(parsed.message_id)
-                .and_modify(|entry| {
-                    if hit.score > entry.score {
-                        entry.score = hit.score;
-                        entry.chunk_idx = parsed.chunk_idx;
-                    }
-                })
-                .or_insert(VectorSearchResult {
-                    message_id: parsed.message_id,
-                    chunk_idx: parsed.chunk_idx,
-                    score: hit.score,
-                });
-        }
-
-        Ok((
-            Self::collapse_semantic_results(best_by_message, request.fetch_limit),
-            fs_hits.len() >= request.fetch_limit,
-            None,
-        ))
+        let (results, truncated) = Self::search_exact_semantic_indexes(
+            context,
+            embedding,
+            request.fetch_limit,
+            fs_filter,
+        )?;
+        Ok((results, truncated, None))
     }
 
     pub fn can_progressively_refine(&self) -> bool {
@@ -5110,6 +5175,7 @@ impl SearchClient {
                     (
                         SemanticCandidateContext {
                             fs_semantic_index: Arc::clone(&state.fs_semantic_index),
+                            fs_semantic_indexes: Arc::clone(&state.fs_semantic_indexes),
                             filter_maps: state.filter_maps.clone(),
                             roles: state.roles.clone(),
                         },
@@ -8240,6 +8306,14 @@ mod tests {
     }
 
     fn build_semantic_test_fixture() -> Result<SemanticTestFixture> {
+        build_semantic_test_fixture_with_shards(false)
+    }
+
+    fn build_sharded_semantic_test_fixture() -> Result<SemanticTestFixture> {
+        build_semantic_test_fixture_with_shards(true)
+    }
+
+    fn build_semantic_test_fixture_with_shards(sharded: bool) -> Result<SemanticTestFixture> {
         let dir = TempDir::new()?;
         let db_path = dir.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path)?;
@@ -8322,18 +8396,9 @@ mod tests {
         let filter_maps = SemanticFilterMaps::from_storage(&storage)?;
         let embedder = Arc::new(FixedTestEmbedder::new("test-fixed-2d", &[1.0, 0.0]));
         let source_hash = crc32fast::hash(crate::sources::provenance::LOCAL_SOURCE_ID.as_bytes());
-        let vector_path = dir
-            .path()
-            .join("vector_index")
-            .join("index-test-fixed-2d.fsvi");
-        std::fs::create_dir_all(vector_path.parent().expect("vector directory"))?;
-        let mut writer = VectorIndex::create_with_revision(
-            &vector_path,
-            embedder.id(),
-            "rev-1",
-            embedder.dimension(),
-            frankensearch::index::Quantization::F16,
-        )?;
+        let vector_dir = dir.path().join("vector_index");
+        std::fs::create_dir_all(&vector_dir)?;
+        let mut vector_records = Vec::with_capacity(documents.len());
 
         for ((message_id, created_at_ms), (_, _, vector)) in message_rows.iter().zip(documents) {
             let doc_id = SemanticDocId {
@@ -8348,14 +8413,45 @@ mod tests {
             }
             .to_doc_id_string();
             doc_ids.push(doc_id.clone());
-            writer.write_record(&doc_id, &vector)?;
+            vector_records.push((doc_id, vector));
         }
-        writer.finish()?;
-        let vector_index = VectorIndex::open(&vector_path)?;
+
+        let mut vector_indexes = Vec::new();
+        if sharded {
+            for (shard_index, chunk) in vector_records.chunks(2).enumerate() {
+                let vector_path = vector_dir.join(format!("shard-{shard_index}.fsvi"));
+                let mut writer = VectorIndex::create_with_revision(
+                    &vector_path,
+                    embedder.id(),
+                    "rev-1",
+                    embedder.dimension(),
+                    frankensearch::index::Quantization::F16,
+                )?;
+                for (doc_id, vector) in chunk {
+                    writer.write_record(doc_id, vector)?;
+                }
+                writer.finish()?;
+                vector_indexes.push(VectorIndex::open(&vector_path)?);
+            }
+        } else {
+            let vector_path = vector_dir.join("index-test-fixed-2d.fsvi");
+            let mut writer = VectorIndex::create_with_revision(
+                &vector_path,
+                embedder.id(),
+                "rev-1",
+                embedder.dimension(),
+                frankensearch::index::Quantization::F16,
+            )?;
+            for (doc_id, vector) in &vector_records {
+                writer.write_record(doc_id, vector)?;
+            }
+            writer.finish()?;
+            vector_indexes.push(VectorIndex::open(&vector_path)?);
+        }
         drop(storage);
 
         let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("db-backed client");
-        client.set_semantic_context(embedder, vector_index, filter_maps, None, None)?;
+        client.set_semantic_indexes_context(embedder, vector_indexes, filter_maps, None, None)?;
 
         Ok(SemanticTestFixture {
             _dir: dir,
@@ -17097,6 +17193,30 @@ mod tests {
             hits[0].source_path, fixture.source_paths[2],
             "offset must apply after semantic deduplication and session path filtering"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_search_merges_sharded_vector_indexes() -> Result<()> {
+        let fixture = build_sharded_semantic_test_fixture()?;
+        let (hits, ann_stats) = fixture.client.search_semantic(
+            "semantic fixture query",
+            SearchFilters::default(),
+            3,
+            0,
+            FieldMask::FULL,
+            false,
+        )?;
+
+        assert!(
+            ann_stats.is_none(),
+            "sharded exact search should not emit ANN stats"
+        );
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].source_path, fixture.source_paths[0]);
+        assert_eq!(hits[1].source_path, fixture.source_paths[1]);
+        assert_eq!(hits[2].source_path, fixture.source_paths[2]);
 
         Ok(())
     }

@@ -22328,9 +22328,13 @@ pub fn run_tui_ftui(
                             .join(crate::search::vector_index::VECTOR_INDEX_DIR)
                             .join(format!("hnsw-{}.chsw", context.embedder.id())),
                     );
-                    if let Err(err) = client.set_semantic_context(
+                    let mut indexes =
+                        Vec::with_capacity(context.additional_indexes.len().saturating_add(1));
+                    indexes.push(context.index);
+                    indexes.extend(context.additional_indexes);
+                    if let Err(err) = client.set_semantic_indexes_context(
                         context.embedder,
-                        context.index,
+                        indexes,
                         context.filter_maps,
                         context.roles,
                         ann_path,

@@ -8164,6 +8164,7 @@ fn run_cli_search(
         if let Some(context) = setup.context {
             let embedder = context.embedder;
             let index = context.index;
+            let additional_indexes = context.additional_indexes;
             let filter_maps = context.filter_maps;
             let roles = context.roles;
 
@@ -8199,8 +8200,11 @@ fn run_cli_search(
                     .join(crate::search::vector_index::VECTOR_INDEX_DIR)
                     .join(format!("hnsw-{}.chsw", embedder.id())),
             );
+            let mut indexes = Vec::with_capacity(additional_indexes.len().saturating_add(1));
+            indexes.push(index);
+            indexes.extend(additional_indexes);
             if let Err(err) =
-                client.set_semantic_context(embedder, index, filter_maps, roles, ann_path)
+                client.set_semantic_indexes_context(embedder, indexes, filter_maps, roles, ann_path)
             {
                 let hint = if prefer_hash {
                     "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or use --mode lexical"

@@ -21,6 +21,7 @@ use crate::search::model_download::{
     classify_model_cache_metadata,
 };
 use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
+use crate::search::semantic_manifest::{SemanticShardManifest, SemanticShardRecord, TierKind};
 use crate::search::vector_index::{
     ROLE_ASSISTANT, ROLE_USER, SemanticFilterMaps, VectorIndex, vector_index_path,
 };
@@ -270,6 +271,7 @@ impl SemanticAvailability {
 pub struct SemanticContext {
     pub embedder: Arc<dyn Embedder>,
     pub index: VectorIndex,
+    pub additional_indexes: Vec<VectorIndex>,
     pub filter_maps: SemanticFilterMaps,
     pub roles: Option<HashSet<u8>>,
 }
@@ -277,6 +279,105 @@ pub struct SemanticContext {
 pub struct SemanticSetup {
     pub availability: SemanticAvailability,
     pub context: Option<SemanticContext>,
+}
+
+fn semantic_sidecar_path(data_dir: &Path, recorded_path: &str) -> PathBuf {
+    let path = PathBuf::from(recorded_path);
+    if path.is_absolute() {
+        path
+    } else {
+        data_dir.join(path)
+    }
+}
+
+fn matching_complete_shard_records(
+    data_dir: &Path,
+    tier: TierKind,
+    embedder_id: &str,
+    db_fingerprint: &str,
+) -> Result<Option<Vec<SemanticShardRecord>>, String> {
+    let manifest = match SemanticShardManifest::load(data_dir) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return Ok(None),
+        Err(err) => return Err(format!("semantic shard manifest: {err}")),
+    };
+    let summary = manifest.summary(tier, embedder_id, db_fingerprint);
+    if !summary.complete {
+        return Ok(None);
+    }
+
+    let mut records = manifest
+        .shards
+        .into_iter()
+        .filter(|shard| shard.matches_generation(tier, embedder_id, db_fingerprint))
+        .collect::<Vec<_>>();
+    records.sort_by_key(|shard| shard.shard_index);
+    if records.len() != usize::try_from(summary.shard_count).unwrap_or(usize::MAX) {
+        return Ok(None);
+    }
+
+    let Some(first) = records.first() else {
+        return Ok(None);
+    };
+    for (expected_index, shard) in records.iter().enumerate() {
+        if shard.shard_index != u32::try_from(expected_index).unwrap_or(u32::MAX)
+            || !shard.ready
+            || !shard.mmap_ready
+            || shard.model_revision != first.model_revision
+            || shard.schema_version != crate::search::policy::SEMANTIC_SCHEMA_VERSION
+            || shard.chunking_version != crate::search::policy::CHUNKING_STRATEGY_VERSION
+            || shard.dimension == 0
+            || shard.dimension != first.dimension
+            || shard.total_conversations != first.total_conversations
+        {
+            return Ok(None);
+        }
+        let path = semantic_sidecar_path(data_dir, &shard.index_path);
+        if !path.is_file() {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(records))
+}
+
+fn load_complete_shard_indexes(
+    data_dir: &Path,
+    embedder_id: &str,
+    db_fingerprint: &str,
+) -> Result<Option<Vec<VectorIndex>>, String> {
+    for tier in [TierKind::Quality, TierKind::Fast] {
+        let Some(records) =
+            matching_complete_shard_records(data_dir, tier, embedder_id, db_fingerprint)?
+        else {
+            continue;
+        };
+
+        let mut indexes = Vec::with_capacity(records.len());
+        for shard in records {
+            let path = semantic_sidecar_path(data_dir, &shard.index_path);
+            let index = VectorIndex::open(&path)
+                .map_err(|err| format!("semantic shard vector index {}: {err}", path.display()))?;
+            if index.embedder_id() != embedder_id || index.dimension() != shard.dimension {
+                return Err(format!(
+                    "semantic shard vector index {} metadata mismatch",
+                    path.display()
+                ));
+            }
+            indexes.push(index);
+        }
+        if !indexes.is_empty() {
+            tracing::info!(
+                tier = tier.as_str(),
+                embedder = embedder_id,
+                shard_count = indexes.len(),
+                "loaded complete semantic shard generation"
+            );
+            return Ok(Some(indexes));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Load semantic context with optional version mismatch checking.
@@ -328,7 +429,23 @@ pub(crate) fn probe_hash_semantic_availability(data_dir: &Path) -> SemanticAvail
 pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
     let embedder = HashEmbedder::default();
     let index_path = vector_index_path(data_dir, embedder.id());
-    if !index_path.is_file() {
+    let monolithic_present = index_path.is_file();
+    let shard_indexes = if monolithic_present {
+        None
+    } else {
+        crate::indexer::lexical_storage_fingerprint_for_db(db_path)
+            .ok()
+            .and_then(|db_fingerprint| {
+                load_complete_shard_indexes(data_dir, embedder.id(), &db_fingerprint)
+                    .map_err(|err| {
+                        tracing::debug!(error = %err, "hash semantic shard context unavailable");
+                        err
+                    })
+                    .ok()
+                    .flatten()
+            })
+    };
+    if !monolithic_present && shard_indexes.is_none() {
         return SemanticSetup {
             availability: SemanticAvailability::IndexMissing { index_path },
             context: None,
@@ -360,15 +477,20 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
         }
     };
 
-    let index = match VectorIndex::open(&index_path) {
-        Ok(index) => index,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::LoadFailed {
-                    context: format!("vector index: {err}"),
-                },
-                context: None,
-            };
+    let (index, additional_indexes) = if let Some(mut indexes) = shard_indexes {
+        let index = indexes.remove(0);
+        (index, indexes)
+    } else {
+        match VectorIndex::open(&index_path) {
+            Ok(index) => (index, Vec::new()),
+            Err(err) => {
+                return SemanticSetup {
+                    availability: SemanticAvailability::LoadFailed {
+                        context: format!("vector index: {err}"),
+                    },
+                    context: None,
+                };
+            }
         }
     };
 
@@ -380,6 +502,7 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
         context: Some(SemanticContext {
             embedder,
             index,
+            additional_indexes,
             filter_maps,
             roles,
         }),
@@ -415,7 +538,27 @@ fn load_semantic_context_inner(
     }
 
     let index_path = vector_index_path(data_dir, FastEmbedder::embedder_id_static());
-    if !index_path.is_file() {
+    let monolithic_present = index_path.is_file();
+    let shard_indexes = if monolithic_present {
+        None
+    } else {
+        crate::indexer::lexical_storage_fingerprint_for_db(db_path)
+            .ok()
+            .and_then(|db_fingerprint| {
+                load_complete_shard_indexes(
+                    data_dir,
+                    FastEmbedder::embedder_id_static(),
+                    &db_fingerprint,
+                )
+                .map_err(|err| {
+                    tracing::debug!(error = %err, "semantic shard context unavailable");
+                    err
+                })
+                .ok()
+                .flatten()
+            })
+    };
+    if !monolithic_present && shard_indexes.is_none() {
         return SemanticSetup {
             availability: SemanticAvailability::IndexMissing { index_path },
             context: None,
@@ -447,15 +590,20 @@ fn load_semantic_context_inner(
         }
     };
 
-    let index = match VectorIndex::open(&index_path) {
-        Ok(index) => index,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::LoadFailed {
-                    context: format!("vector index: {err}"),
-                },
-                context: None,
-            };
+    let (index, additional_indexes) = if let Some(mut indexes) = shard_indexes {
+        let index = indexes.remove(0);
+        (index, indexes)
+    } else {
+        match VectorIndex::open(&index_path) {
+            Ok(index) => (index, Vec::new()),
+            Err(err) => {
+                return SemanticSetup {
+                    availability: SemanticAvailability::LoadFailed {
+                        context: format!("vector index: {err}"),
+                    },
+                    context: None,
+                };
+            }
         }
     };
 
@@ -480,6 +628,7 @@ fn load_semantic_context_inner(
         context: Some(SemanticContext {
             embedder,
             index,
+            additional_indexes,
             filter_maps,
             roles,
         }),

@@ -29,7 +29,11 @@ use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_manager::{
     SemanticAvailability, probe_hash_semantic_availability, probe_semantic_availability,
 };
-use crate::search::semantic_manifest::{ArtifactRecord, BuildCheckpoint, SemanticManifest};
+use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
+use crate::search::semantic_manifest::{
+    ArtifactRecord, BuildCheckpoint, SemanticManifest, SemanticShardManifest, SemanticShardRecord,
+    TierKind,
+};
 use crate::search::tantivy::SCHEMA_HASH;
 use crate::search::vector_index::{VECTOR_INDEX_DIR, vector_index_path};
 
@@ -337,6 +341,7 @@ pub(crate) struct SemanticTierAssetState {
     pub model_revision: Option<String>,
     pub completed_at_ms: Option<i64>,
     pub size_bytes: Option<u64>,
+    pub index_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -516,10 +521,28 @@ pub(crate) fn semantic_state_from_availability(
     preference: SemanticPreference,
     current_db_fingerprint: Option<&str>,
 ) -> SemanticAssetState {
-    let (fast_tier, quality_tier, backlog, checkpoint) =
+    let (mut fast_tier, mut quality_tier, backlog, checkpoint) =
         semantic_manifest_progress(data_dir, current_db_fingerprint);
     let preference_surface = semantic_preference_surface(data_dir, preference);
     let base_embedder_id = semantic_embedder_id(availability, preference);
+    if let (Some(db_fingerprint), Some(embedder_id)) =
+        (current_db_fingerprint, base_embedder_id.as_deref())
+    {
+        promote_complete_shard_generation_state(
+            data_dir,
+            TierKind::Fast,
+            embedder_id,
+            db_fingerprint,
+            &mut fast_tier,
+        );
+        promote_complete_shard_generation_state(
+            data_dir,
+            TierKind::Quality,
+            embedder_id,
+            db_fingerprint,
+            &mut quality_tier,
+        );
+    }
     let base_vector_index_path = semantic_vector_index_path(data_dir, availability, preference);
     let base_model_dir = preference_surface.model_dir;
     let base_hnsw_path = base_embedder_id
@@ -650,9 +673,18 @@ fn semantic_runtime_surface(inputs: SemanticRuntimeInputs<'_>) -> SemanticRuntim
     } else {
         None
     };
-    let effective_vector_index_path = effective_embedder_id
-        .as_deref()
-        .map(|embedder_id| vector_index_path(data_dir, embedder_id));
+    let effective_vector_index_path = if quality_queryable {
+        quality_tier.index_path.clone()
+    } else if fast_queryable {
+        fast_tier.index_path.clone()
+    } else {
+        None
+    }
+    .or_else(|| {
+        effective_embedder_id
+            .as_deref()
+            .map(|embedder_id| vector_index_path(data_dir, embedder_id))
+    });
     let effective_model_dir = effective_embedder_id.as_deref().and_then(|embedder_id| {
         (!semantic_embedder_is_hash(embedder_id)).then(|| FastEmbedder::default_model_dir(data_dir))
     });
@@ -818,7 +850,99 @@ fn semantic_tier_asset_state(
         model_revision: Some(artifact.model_revision.clone()),
         completed_at_ms: Some(artifact.completed_at_ms),
         size_bytes: Some(artifact.size_bytes),
+        index_path: None,
     }
+}
+
+fn resolve_semantic_artifact_path(data_dir: &Path, recorded_path: &str) -> PathBuf {
+    let path = PathBuf::from(recorded_path);
+    if path.is_absolute() {
+        path
+    } else {
+        data_dir.join(path)
+    }
+}
+
+fn complete_shard_records_for_state(
+    data_dir: &Path,
+    tier: TierKind,
+    embedder_id: &str,
+    db_fingerprint: &str,
+) -> Option<Vec<SemanticShardRecord>> {
+    let manifest = SemanticShardManifest::load(data_dir).ok().flatten()?;
+    let summary = manifest.summary(tier, embedder_id, db_fingerprint);
+    if !summary.complete {
+        return None;
+    }
+    let mut records = manifest
+        .shards
+        .into_iter()
+        .filter(|shard| shard.matches_generation(tier, embedder_id, db_fingerprint))
+        .collect::<Vec<_>>();
+    records.sort_by_key(|shard| shard.shard_index);
+    if records.len() != usize::try_from(summary.shard_count).unwrap_or(usize::MAX) {
+        return None;
+    }
+    let first = records.first()?;
+    for (expected_index, shard) in records.iter().enumerate() {
+        if shard.shard_index != u32::try_from(expected_index).unwrap_or(u32::MAX)
+            || !shard.ready
+            || !shard.mmap_ready
+            || shard.model_revision != first.model_revision
+            || shard.schema_version != SEMANTIC_SCHEMA_VERSION
+            || shard.chunking_version != CHUNKING_STRATEGY_VERSION
+            || shard.dimension == 0
+            || shard.dimension != first.dimension
+            || shard.total_conversations != first.total_conversations
+            || !resolve_semantic_artifact_path(data_dir, &shard.index_path).is_file()
+        {
+            return None;
+        }
+    }
+    Some(records)
+}
+
+fn promote_complete_shard_generation_state(
+    data_dir: &Path,
+    tier: TierKind,
+    embedder_id: &str,
+    db_fingerprint: &str,
+    state: &mut SemanticTierAssetState,
+) {
+    if state.ready && state.current_db_matches == Some(true) {
+        return;
+    }
+    let Some(records) =
+        complete_shard_records_for_state(data_dir, tier, embedder_id, db_fingerprint)
+    else {
+        return;
+    };
+    let doc_count = records
+        .iter()
+        .map(|shard| shard.doc_count)
+        .fold(0, u64::saturating_add);
+    let size_bytes = records
+        .iter()
+        .map(|shard| shard.size_bytes)
+        .fold(0, u64::saturating_add);
+    let completed_at_ms = records
+        .iter()
+        .map(|shard| shard.completed_at_ms)
+        .max()
+        .unwrap_or(0);
+    let first = &records[0];
+    *state = SemanticTierAssetState {
+        present: true,
+        ready: true,
+        current_db_matches: Some(true),
+        conversation_count: Some(first.total_conversations),
+        doc_count: Some(doc_count),
+        embedder_id: Some(first.embedder_id.clone()),
+        model_revision: Some(first.model_revision.clone()),
+        completed_at_ms: Some(completed_at_ms),
+        size_bytes: Some(size_bytes),
+        index_path: Some(resolve_semantic_artifact_path(data_dir, &first.index_path)),
+    };
 }
 
 fn semantic_backlog_progress_state(
@@ -2376,6 +2500,70 @@ mod tests {
             Some(vector_path.as_path())
         );
         assert_eq!(state.hint, None);
+    }
+
+    #[test]
+    fn semantic_state_promotes_complete_current_shard_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let embedder_id = HashEmbedder::default().id().to_string();
+        let mut records = Vec::new();
+        for shard_index in 0..2_u32 {
+            let relative_path = format!("vector_index/shards/fast-hash/shard-{shard_index}.fsvi");
+            let path = temp.path().join(&relative_path);
+            std::fs::create_dir_all(path.parent().expect("shard parent"))
+                .expect("create shard parent");
+            std::fs::write(&path, b"fsvi").expect("write shard placeholder");
+            records.push(SemanticShardRecord {
+                tier: TierKind::Fast,
+                embedder_id: embedder_id.clone(),
+                model_revision: "hash".to_string(),
+                schema_version: SEMANTIC_SCHEMA_VERSION,
+                chunking_version: CHUNKING_STRATEGY_VERSION,
+                dimension: HashEmbedder::default().dimension(),
+                shard_index,
+                shard_count: 2,
+                doc_count: 10 + u64::from(shard_index),
+                total_conversations: 7,
+                db_fingerprint: "current-db".to_string(),
+                index_path: relative_path,
+                quantization: "f16".to_string(),
+                mmap_ready: true,
+                ann_index_path: None,
+                ann_size_bytes: 0,
+                ann_ready: false,
+                size_bytes: 100 + u64::from(shard_index),
+                started_at_ms: 1_733_100_000_000,
+                completed_at_ms: 1_733_100_000_000 + i64::from(shard_index),
+                ready: true,
+            });
+        }
+        let mut shards = SemanticShardManifest {
+            shards: records,
+            ..Default::default()
+        };
+        shards.save(temp.path()).expect("save shard manifest");
+
+        let state = semantic_state_from_availability(
+            temp.path(),
+            &SemanticAvailability::IndexMissing {
+                index_path: vector_index_path(temp.path(), &embedder_id),
+            },
+            SemanticPreference::HashFallback,
+            Some("current-db"),
+        );
+
+        assert_eq!(state.status, "ready");
+        assert_eq!(state.availability, "ready");
+        assert!(state.can_search);
+        assert_eq!(state.fallback_mode, None);
+        assert_eq!(state.fast_tier.doc_count, Some(21));
+        let expected_path = temp
+            .path()
+            .join("vector_index/shards/fast-hash/shard-0.fsvi");
+        assert_eq!(
+            state.vector_index_path.as_deref(),
+            Some(expected_path.as_path())
+        );
     }
 
     // -----------------------------------------------------------------------
