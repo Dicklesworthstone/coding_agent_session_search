@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::{borrow::Cow, ops::Range, path::Path};
 
 use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
 use crate::model::types::{Conversation, Message, MessageRole, Snippet};
@@ -175,6 +175,156 @@ pub struct ConversationPacket {
     pub projections: ConversationPacketSinkProjections,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConversationPacketTextSink {
+    Lexical,
+    Semantic,
+    Fingerprint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationPacketTextBatchMode {
+    Slab,
+    OwnedFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationPacketProjectionError {
+    pub sink: ConversationPacketTextSink,
+    pub message_index: usize,
+    pub message_count: usize,
+}
+
+impl std::fmt::Display for ConversationPacketProjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{:?} packet projection references message index {} but packet has {} messages",
+            self.sink, self.message_index, self.message_count
+        )
+    }
+}
+
+impl std::error::Error for ConversationPacketProjectionError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationPacketTextMessage<'a> {
+    pub message_index: usize,
+    pub message_id: Option<i64>,
+    pub idx: i64,
+    pub role: Cow<'a, str>,
+    pub author: Option<Cow<'a, str>>,
+    pub created_at: Option<i64>,
+    pub content: Cow<'a, str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationPacketTextBatch<'a> {
+    pub sink: ConversationPacketTextSink,
+    pub mode: ConversationPacketTextBatchMode,
+    pub total_content_bytes: usize,
+    messages: Vec<ConversationPacketTextMessage<'a>>,
+}
+
+impl<'a> ConversationPacketTextBatch<'a> {
+    pub fn messages(&self) -> &[ConversationPacketTextMessage<'a>] {
+        &self.messages
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationPacketTextSlab {
+    text: String,
+    message_ranges: Vec<Range<usize>>,
+}
+
+impl ConversationPacketTextSlab {
+    pub fn from_packet(packet: &ConversationPacket) -> Self {
+        let mut text = String::with_capacity(packet_total_content_bytes(&packet.payload.messages));
+        let mut message_ranges = Vec::with_capacity(packet.payload.messages.len());
+        for message in &packet.payload.messages {
+            let start = text.len();
+            text.push_str(&message.content);
+            let end = text.len();
+            message_ranges.push(start..end);
+        }
+        Self {
+            text,
+            message_ranges,
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn message_count(&self) -> usize {
+        self.message_ranges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn message_content(&self, message_index: usize) -> Option<&str> {
+        self.message_ranges
+            .get(message_index)
+            .and_then(|range| self.text.get(range.clone()))
+    }
+
+    pub fn message_range(&self, message_index: usize) -> Option<Range<usize>> {
+        self.message_ranges.get(message_index).cloned()
+    }
+
+    pub fn sink_batch<'a>(
+        &'a self,
+        packet: &'a ConversationPacket,
+        sink: ConversationPacketTextSink,
+    ) -> Result<ConversationPacketTextBatch<'a>, ConversationPacketProjectionError> {
+        let indices = packet.sink_message_indices(sink);
+        let mut messages = Vec::with_capacity(indices.len());
+        for &message_index in indices.iter() {
+            let Some(message) = packet.payload.messages.get(message_index) else {
+                return Err(ConversationPacketProjectionError {
+                    sink,
+                    message_index,
+                    message_count: packet.payload.messages.len(),
+                });
+            };
+            let Some(content) = self.message_content(message_index) else {
+                return Err(ConversationPacketProjectionError {
+                    sink,
+                    message_index,
+                    message_count: self.message_count(),
+                });
+            };
+            messages.push(ConversationPacketTextMessage {
+                message_index,
+                message_id: message.message_id,
+                idx: message.idx,
+                role: Cow::Borrowed(message.role.as_str()),
+                author: message.author.as_deref().map(Cow::Borrowed),
+                created_at: message.created_at,
+                content: Cow::Borrowed(content),
+            });
+        }
+        Ok(ConversationPacketTextBatch {
+            sink,
+            mode: ConversationPacketTextBatchMode::Slab,
+            total_content_bytes: packet.sink_total_content_bytes(sink),
+            messages,
+        })
+    }
+}
+
 impl ConversationPacket {
     pub fn from_normalized_conversation(
         conversation: &NormalizedConversation,
@@ -242,6 +392,38 @@ impl ConversationPacket {
             && self.projections == other.projections
     }
 
+    pub fn text_slab(&self) -> ConversationPacketTextSlab {
+        ConversationPacketTextSlab::from_packet(self)
+    }
+
+    pub fn owned_text_batch_fallback(
+        &self,
+        sink: ConversationPacketTextSink,
+    ) -> ConversationPacketTextBatch<'static> {
+        let indices = fallback_sink_message_indices(sink, &self.payload.messages);
+        let messages = indices
+            .into_iter()
+            .filter_map(|message_index| {
+                let message = self.payload.messages.get(message_index)?;
+                Some(ConversationPacketTextMessage {
+                    message_index,
+                    message_id: message.message_id,
+                    idx: message.idx,
+                    role: Cow::Owned(message.role.clone()),
+                    author: message.author.clone().map(Cow::Owned),
+                    created_at: message.created_at,
+                    content: Cow::Owned(message.content.clone()),
+                })
+            })
+            .collect();
+        ConversationPacketTextBatch {
+            sink,
+            mode: ConversationPacketTextBatchMode::OwnedFallback,
+            total_content_bytes: packet_total_content_bytes(&self.payload.messages),
+            messages,
+        }
+    }
+
     fn from_payload(
         payload: ConversationPacketPayload,
         builder: ConversationPacketBuilder,
@@ -256,6 +438,52 @@ impl ConversationPacket {
             projections,
         }
     }
+
+    fn sink_message_indices(&self, sink: ConversationPacketTextSink) -> Cow<'_, [usize]> {
+        match sink {
+            ConversationPacketTextSink::Lexical => {
+                Cow::Borrowed(&self.projections.lexical.message_indices)
+            }
+            ConversationPacketTextSink::Semantic => {
+                Cow::Borrowed(&self.projections.semantic.message_indices)
+            }
+            ConversationPacketTextSink::Fingerprint => {
+                Cow::Owned((0..self.payload.messages.len()).collect())
+            }
+        }
+    }
+
+    fn sink_total_content_bytes(&self, sink: ConversationPacketTextSink) -> usize {
+        match sink {
+            ConversationPacketTextSink::Lexical => self.projections.lexical.total_content_bytes,
+            ConversationPacketTextSink::Semantic => self.projections.semantic.total_content_bytes,
+            ConversationPacketTextSink::Fingerprint => {
+                packet_total_content_bytes(&self.payload.messages)
+            }
+        }
+    }
+}
+
+fn fallback_sink_message_indices(
+    sink: ConversationPacketTextSink,
+    messages: &[ConversationPacketMessage],
+) -> Vec<usize> {
+    match sink {
+        ConversationPacketTextSink::Lexical | ConversationPacketTextSink::Semantic => messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| !message.content.is_empty())
+            .map(|(idx, _)| idx)
+            .collect(),
+        ConversationPacketTextSink::Fingerprint => (0..messages.len()).collect(),
+    }
+}
+
+fn packet_total_content_bytes(messages: &[ConversationPacketMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| message.content.len())
+        .sum::<usize>()
 }
 
 fn path_to_packet_string(path: &Path) -> String {
@@ -647,6 +875,99 @@ mod tests {
 
         assert_ne!(original.hashes.semantic_hash, changed.hashes.semantic_hash);
         assert_ne!(original.hashes.message_hash, changed.hashes.message_hash);
+    }
+
+    #[test]
+    fn text_slab_reuses_one_utf8_arena_for_packet_sinks() {
+        let mut canonical = canonical_conversation();
+        canonical.messages[0].content = format!("build {} packet", "\u{2603}");
+        canonical.messages.push(Message {
+            id: Some(102),
+            idx: 2,
+            role: MessageRole::System,
+            author: None,
+            created_at: Some(1_700_000_002_000),
+            content: String::new(),
+            extra_json: json!({}),
+            snippets: Vec::new(),
+        });
+        let packet = ConversationPacket::from_canonical_replay(
+            &canonical,
+            ConversationPacketProvenance::local(),
+        );
+        let slab = packet.text_slab();
+
+        assert_eq!(slab.message_count(), 3);
+        let range = slab
+            .message_range(0)
+            .expect("first message should have a slab range");
+        assert!(slab.text().is_char_boundary(range.start));
+        assert!(slab.text().is_char_boundary(range.end));
+        assert_eq!(
+            slab.message_content(0),
+            Some(packet.payload.messages[0].content.as_str())
+        );
+
+        let lexical = slab
+            .sink_batch(&packet, ConversationPacketTextSink::Lexical)
+            .expect("lexical projection should borrow from the slab");
+        let semantic = slab
+            .sink_batch(&packet, ConversationPacketTextSink::Semantic)
+            .expect("semantic projection should borrow from the slab");
+        let fingerprint = slab
+            .sink_batch(&packet, ConversationPacketTextSink::Fingerprint)
+            .expect("fingerprint projection should cover all messages");
+
+        assert_eq!(lexical.mode, ConversationPacketTextBatchMode::Slab);
+        assert_eq!(lexical.len(), 2, "empty content stays out of lexical");
+        assert_eq!(semantic.len(), 2, "empty content stays out of semantic");
+        assert_eq!(fingerprint.len(), 3, "fingerprint sees every message");
+        assert!(fingerprint.messages()[2].content.is_empty());
+
+        let slab_content = slab
+            .message_content(0)
+            .expect("first message should be readable from the slab");
+        assert!(std::ptr::eq(
+            lexical.messages()[0].content.as_ref().as_ptr(),
+            slab_content.as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            semantic.messages()[0].content.as_ref().as_ptr(),
+            slab_content.as_ptr()
+        ));
+        assert_eq!(
+            lexical.messages()[0].content.as_ref(),
+            "build \u{2603} packet"
+        );
+    }
+
+    #[test]
+    fn owned_text_batch_fallback_recovers_from_bad_projection() {
+        let mut packet = ConversationPacket::from_canonical_replay(
+            &canonical_conversation(),
+            ConversationPacketProvenance::local(),
+        );
+        packet.projections.semantic.message_indices = vec![0, 99];
+        let slab = packet.text_slab();
+        let err = slab
+            .sink_batch(&packet, ConversationPacketTextSink::Semantic)
+            .expect_err("bad projection should not build a slab view");
+
+        assert_eq!(err.sink, ConversationPacketTextSink::Semantic);
+        assert_eq!(err.message_index, 99);
+        assert_eq!(err.message_count, packet.payload.messages.len());
+
+        let fallback = packet.owned_text_batch_fallback(ConversationPacketTextSink::Semantic);
+        assert_eq!(
+            fallback.mode,
+            ConversationPacketTextBatchMode::OwnedFallback
+        );
+        assert_eq!(fallback.len(), 2);
+        assert!(
+            matches!(fallback.messages()[0].content, Cow::Owned(_)),
+            "fallback should own content instead of borrowing from the slab"
+        );
+        assert_eq!(fallback.messages()[0].content.as_ref(), "build the packet");
     }
 
     #[test]
