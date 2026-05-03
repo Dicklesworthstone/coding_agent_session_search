@@ -273,6 +273,7 @@ schemas: (auto-generated from contract)
         - token_budget: object
         - total_matches: integer
       - elapsed_ms: integer
+      - explanation_cards: array
       - fallback_reason: ?
       - fallback_tier: ?
       - hits_clamped: boolean

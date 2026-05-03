@@ -9,6 +9,7 @@ pub mod crash_replay;
 pub mod daemon;
 pub mod encryption;
 pub mod evidence_bundle;
+pub mod explainability;
 pub mod export;
 pub mod ftui_harness;
 pub mod html_export;
@@ -10225,6 +10226,36 @@ fn output_robot_results(
         cache_stats: &result.cache_stats,
         index_freshness: index_freshness.as_ref(),
     });
+    let index_rebuilding = index_freshness
+        .as_ref()
+        .and_then(|freshness| freshness.get("rebuilding"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let pending_sessions = index_freshness
+        .as_ref()
+        .and_then(|freshness| freshness.get("pending_sessions"))
+        .and_then(serde_json::Value::as_u64);
+    let explanation_cards = crate::explainability::search_robot_explanation_cards(
+        crate::explainability::SearchRobotExplanationInput {
+            requested_mode: search_mode_label(search_mode_meta.requested).to_string(),
+            realized_mode: search_mode_label(search_mode_meta.realized).to_string(),
+            fallback_tier: search_mode_meta.fallback_tier.map(str::to_string),
+            fallback_reason: search_mode_meta.fallback_reason.clone(),
+            semantic_refinement: search_mode_meta.semantic_refinement(),
+            wildcard_fallback: result.wildcard_fallback,
+            cache_policy: result.cache_stats.eviction_policy.to_string(),
+            cache_hits: result.cache_stats.cache_hits,
+            cache_misses: result.cache_stats.cache_miss,
+            cache_shortfall: result.cache_stats.cache_shortfall,
+            cache_evictions: result.cache_stats.eviction_count,
+            cache_admission_rejects: result.cache_stats.admission_rejects,
+            cache_ghost_entries: result.cache_stats.ghost_entries,
+            index_rebuilding,
+            pending_sessions,
+        },
+    );
+    let explanation_cards_json =
+        serde_json::to_value(&explanation_cards).unwrap_or_else(|_| serde_json::json!([]));
 
     // Serialize aggregations if present
     let agg_json = if aggregations.is_empty() {
@@ -10300,6 +10331,7 @@ fn output_robot_results(
                     "hits_clamped": hits_clamped,
                     "query_plan": query_plan_json.clone(),
                     "cursor_manifest": cursor_manifest_json.clone(),
+                    "explanation_cards": explanation_cards_json.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -10414,6 +10446,7 @@ fn output_robot_results(
                         "hits_clamped": hits_clamped,
                         "query_plan": query_plan_json.clone(),
                         "cursor_manifest": cursor_manifest_json.clone(),
+                        "explanation_cards": explanation_cards_json.clone(),
                     }
                 });
                 if let Some(state) = state_meta
@@ -10574,6 +10607,7 @@ fn output_robot_results(
                     "hits_clamped": hits_clamped,
                     "query_plan": query_plan_json.clone(),
                     "cursor_manifest": cursor_manifest_json.clone(),
+                    "explanation_cards": explanation_cards_json.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -10691,6 +10725,7 @@ fn output_robot_results(
                     "hits_clamped": hits_clamped,
                     "query_plan": query_plan_json.clone(),
                     "cursor_manifest": cursor_manifest_json.clone(),
+                    "explanation_cards": explanation_cards_json.clone(),
                 });
                 if let Some(state) = state_meta
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -18430,6 +18465,46 @@ fn response_schema_cursor_manifest() -> serde_json::Value {
     })
 }
 
+fn response_schema_explanation_cards() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "description": "Compact robot-visible decision cards explaining search, fallback, cache, rebuild, and source-sync controller behavior.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "schema_version": { "type": "integer" },
+                "card_id": { "type": "string" },
+                "surface": { "type": "string" },
+                "decision": { "type": "string" },
+                "level": { "type": "integer" },
+                "summary": { "type": "string" },
+                "inputs": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "evidence": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "fallback_contract": {
+                    "type": ["object", "null"],
+                    "additionalProperties": true
+                }
+            },
+            "required": [
+                "schema_version",
+                "card_id",
+                "surface",
+                "decision",
+                "level",
+                "summary",
+                "inputs",
+                "evidence"
+            ]
+        }
+    })
+}
+
 fn response_schema_search_meta() -> serde_json::Value {
     response_schema_object([
         ("elapsed_ms", serde_json::json!({ "type": "integer" })),
@@ -18464,6 +18539,7 @@ fn response_schema_search_meta() -> serde_json::Value {
         ("cache_stats", response_schema_search_cache_stats()),
         ("query_plan", response_schema_query_plan()),
         ("cursor_manifest", response_schema_cursor_manifest()),
+        ("explanation_cards", response_schema_explanation_cards()),
         ("timing", response_schema_search_timing()),
         (
             "tokens_estimated",
@@ -19230,6 +19306,7 @@ mod response_schema_tests {
             "timing",
             "state",
             "cursor_manifest",
+            "explanation_cards",
         ] {
             assert!(meta.get(key).is_some(), "search _meta schema missing {key}");
         }
@@ -19238,6 +19315,10 @@ mod response_schema_tests {
                 .get("continuation_safe")
                 .is_some(),
             "cursor manifest schema should explain continuation safety"
+        );
+        assert_eq!(
+            meta["explanation_cards"]["items"]["properties"]["fallback_contract"]["type"],
+            serde_json::json!(["object", "null"])
         );
     }
 }

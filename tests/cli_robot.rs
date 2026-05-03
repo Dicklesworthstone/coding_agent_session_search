@@ -1503,6 +1503,23 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
         Some("lexical"),
         "cursor manifest should mirror semantic fallback state"
     );
+
+    let explanation_cards = meta
+        .get("explanation_cards")
+        .and_then(Value::as_array)
+        .expect("_meta.explanation_cards should be present");
+    assert!(
+        explanation_cards
+            .iter()
+            .any(|card| card.get("decision").and_then(Value::as_str) == Some("search_fallback")),
+        "explanation cards should include the search fallback decision"
+    );
+    assert!(
+        explanation_cards.iter().any(
+            |card| card.get("decision").and_then(Value::as_str) == Some("semantic_unavailable")
+        ),
+        "explanation cards should include semantic unavailability when hybrid fails open"
+    );
 }
 
 #[test]
@@ -1554,6 +1571,17 @@ fn search_cursor_manifest_marks_rebuilding_generation_best_effort() {
             "continuation reason should explain the rebuild state"
         );
     }
+
+    let explanation_cards = json["_meta"]
+        .get("explanation_cards")
+        .and_then(Value::as_array)
+        .expect("_meta.explanation_cards should be present");
+    assert!(
+        explanation_cards
+            .iter()
+            .any(|card| card.get("decision").and_then(Value::as_str) == Some("rebuild_throttle")),
+        "explanation cards should include rebuild throttle while rebuild is active"
+    );
 }
 
 #[test]

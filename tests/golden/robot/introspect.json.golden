@@ -4398,6 +4398,58 @@
                 "semantic_fallback"
               ]
             },
+            "explanation_cards": {
+              "type": "array",
+              "description": "Compact robot-visible decision cards explaining search, fallback, cache, rebuild, and source-sync controller behavior.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "schema_version": {
+                    "type": "integer"
+                  },
+                  "card_id": {
+                    "type": "string"
+                  },
+                  "surface": {
+                    "type": "string"
+                  },
+                  "decision": {
+                    "type": "string"
+                  },
+                  "level": {
+                    "type": "integer"
+                  },
+                  "summary": {
+                    "type": "string"
+                  },
+                  "inputs": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "evidence": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "fallback_contract": {
+                    "type": [
+                      "object",
+                      "null"
+                    ],
+                    "additionalProperties": true
+                  }
+                },
+                "required": [
+                  "schema_version",
+                  "card_id",
+                  "surface",
+                  "decision",
+                  "level",
+                  "summary",
+                  "inputs",
+                  "evidence"
+                ]
+              }
+            },
             "timing": {
               "type": "object",
               "properties": {
