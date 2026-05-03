@@ -13,6 +13,7 @@ pub mod html_export;
 pub mod indexer;
 pub mod model;
 pub mod pages;
+pub mod perf_evidence;
 pub mod search;
 pub mod sources;
 pub mod storage;
