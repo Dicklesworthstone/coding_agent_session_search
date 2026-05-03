@@ -7041,7 +7041,6 @@ fn lexical_rebuild_default_shard_planner_budgets_for_totals(
     }
 }
 
-#[cfg(test)]
 fn lexical_rebuild_shard_planner_conversations_from_storage(
     storage: &FrankenStorage,
 ) -> Result<Vec<LexicalShardPlannerConversation>> {
@@ -7057,27 +7056,34 @@ fn lexical_rebuild_shard_planner_conversations_from_storage(
         .collect())
 }
 
-fn plan_lexical_rebuild_shards_from_conversation_ids(
-    conversation_ids: &[i64],
-    budgets: LexicalShardPlannerBudgets,
-) -> LexicalShardPlan {
-    let conversations: Vec<LexicalShardPlannerConversation> = conversation_ids
+fn plan_lexical_rebuild_shards_from_storage_with_settings(
+    storage: &FrankenStorage,
+    settings: &LexicalRebuildPipelineSettingsSnapshot,
+) -> Result<LexicalShardPlan> {
+    let conversations = lexical_rebuild_shard_planner_conversations_from_storage(storage)?;
+    let total_conversations = conversations.len();
+    let total_messages = conversations
         .iter()
-        .map(|conversation_id| LexicalShardPlannerConversation {
-            conversation_id: *conversation_id,
-            message_count: 0,
-            message_bytes: 0,
-        })
-        .collect();
+        .map(|conversation| conversation.message_count)
+        .sum();
+    let total_message_bytes = conversations
+        .iter()
+        .map(|conversation| conversation.message_bytes)
+        .sum();
+    let budgets = lexical_rebuild_default_shard_planner_budgets_for_totals(
+        settings,
+        total_conversations,
+        total_messages,
+        total_message_bytes,
+    );
     let mut plan = plan_lexical_rebuild_shards(&conversations, budgets);
-    let mut next_conversation = 0usize;
     for shard in &mut plan.shards {
-        let start = next_conversation;
-        let end = start.saturating_add(shard.conversation_count);
-        next_conversation = end;
+        // Footprints are sizing estimates, not validation contracts: the
+        // lexical sink can legitimately emit more than one Tantivy document
+        // for a source message on snippet-heavy sessions. Keep the byte-aware
+        // boundaries, but leave exact doc-count validation to the completed
+        // rebuild accounting.
         shard.message_count = LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT;
-        shard.conversation_id_fingerprint =
-            lexical_shard_conversation_ids_fingerprint(&conversation_ids[start..end]);
     }
     plan.plan_id = lexical_shard_plan_id(
         plan.budgets,
@@ -7087,27 +7093,7 @@ fn plan_lexical_rebuild_shards_from_conversation_ids(
         plan.total_message_bytes,
         &plan.oversized_conversation_ids,
     );
-    plan
-}
-
-fn plan_lexical_rebuild_shards_from_storage_with_settings(
-    storage: &FrankenStorage,
-    settings: &LexicalRebuildPipelineSettingsSnapshot,
-) -> Result<LexicalShardPlan> {
-    let conversation_ids = storage
-        .list_conversation_ids_for_lexical_rebuild()
-        .with_context(|| "listing canonical lexical rebuild conversation ids")?;
-    let total_conversations = conversation_ids.len();
-    let budgets = lexical_rebuild_default_shard_planner_budgets_for_totals(
-        settings,
-        total_conversations,
-        0,
-        0,
-    );
-    Ok(plan_lexical_rebuild_shards_from_conversation_ids(
-        &conversation_ids,
-        budgets,
-    ))
+    Ok(plan)
 }
 
 #[derive(Debug, Clone)]
@@ -23183,6 +23169,111 @@ mod tests {
                         crate::storage::sqlite::LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_shard_plan_from_storage_uses_message_footprints() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        for conversation_idx in 0..3 {
+            let external_id = format!("footprint-plan-{conversation_idx}");
+            let messages = (0..4)
+                .map(|message_idx| Message {
+                    id: None,
+                    idx: message_idx,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + message_idx),
+                    content: format!("{external_id}-{message_idx}"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "codex".into(),
+                        workspace: Some(PathBuf::from("/tmp/workspace")),
+                        external_id: Some(external_id.clone()),
+                        title: Some(external_id.clone()),
+                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                        started_at: Some(1_700_000_000_000),
+                        ended_at: Some(1_700_000_000_100),
+                        approx_tokens: Some(64),
+                        metadata_json: serde_json::Value::Null,
+                        messages,
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        let settings = LexicalRebuildPipelineSettingsSnapshot {
+            workers: 1,
+            available_parallelism: 1,
+            reserved_cores: 0,
+            tantivy_writer_threads: 1,
+            staged_shard_builders: 1,
+            staged_merge_workers: 1,
+            controller_mode: "steady".into(),
+            controller_restore_clear_samples: 1,
+            controller_restore_hold_ms: 0,
+            controller_loadavg_high_watermark_1m_milli: None,
+            controller_loadavg_low_watermark_1m_milli: None,
+            page_size: LEXICAL_REBUILD_PAGE_SIZE,
+            steady_batch_fetch_conversations: 10,
+            startup_batch_fetch_conversations: 10,
+            steady_commit_every_conversations: 10,
+            startup_commit_every_conversations: 10,
+            steady_commit_every_messages: 5,
+            startup_commit_every_messages: 5,
+            steady_commit_every_message_bytes: 1024 * 1024,
+            startup_commit_every_message_bytes: 1024 * 1024,
+            pipeline_channel_size: 2,
+            page_prep_workers: 1,
+            pipeline_max_message_bytes_in_flight: 2 * 1024 * 1024,
+        };
+
+        let plan =
+            plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &settings).unwrap();
+
+        assert_eq!(plan.total_conversations, 3);
+        assert_eq!(plan.total_messages, 12);
+        assert_eq!(plan.shards.len(), 3);
+        assert_eq!(
+            plan.shards
+                .iter()
+                .map(|shard| shard.message_count)
+                .collect::<Vec<_>>(),
+            vec![
+                LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT,
+                LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT,
+                LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT
+            ]
+        );
+        assert_eq!(
+            plan.shards
+                .iter()
+                .map(|shard| shard.conversation_count)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
         );
     }
 
