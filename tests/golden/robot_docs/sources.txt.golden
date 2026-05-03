@@ -85,9 +85,9 @@ The wizard generates sources.toml entries like:
 
 ## Artifact Proofs
   cass sources artifact-manifest --write --json
-  cass sources artifact-manifest --verify-existing --index-path /copy --json
+  cass sources artifact-manifest --verify-existing --index-path /copy --expected-manifest /producer/evidence-bundle-manifest.json --json
 Writes evidence-bundle-manifest.json for the current lexical artifact.
-Use --index-path to verify a copied artifact before exchange.
+Use --index-path and --expected-manifest to verify a copied artifact before exchange.
 
 ## Related Commands
   cass sources list         List configured sources

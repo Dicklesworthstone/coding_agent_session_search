@@ -1142,6 +1142,9 @@ pub enum SourcesCommand {
         /// Verify the existing evidence-bundle-manifest.json without regenerating it
         #[arg(long, conflicts_with = "write")]
         verify_existing: bool,
+        /// Producer manifest to compare against when verifying a copied artifact
+        #[arg(long, value_hint = ValueHint::FilePath, requires = "verify_existing")]
+        expected_manifest: Option<PathBuf>,
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -7518,10 +7521,10 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             String::new(),
             "## Artifact Proofs".to_string(),
             "  cass sources artifact-manifest --write --json".to_string(),
-            "  cass sources artifact-manifest --verify-existing --index-path /copy --json"
-                .to_string(),
+            "  cass sources artifact-manifest --verify-existing --index-path /copy --expected-manifest /producer/evidence-bundle-manifest.json --json".to_string(),
             "Writes evidence-bundle-manifest.json for the current lexical artifact.".to_string(),
-            "Use --index-path to verify a copied artifact before exchange.".to_string(),
+            "Use --index-path and --expected-manifest to verify a copied artifact before exchange."
+                .to_string(),
             String::new(),
             "## Related Commands".to_string(),
             "  cass sources list         List configured sources".to_string(),
@@ -27352,6 +27355,7 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             data_dir,
             write,
             verify_existing,
+            expected_manifest,
             json,
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
@@ -27360,6 +27364,7 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
                 data_dir,
                 write,
                 verify_existing,
+                expected_manifest,
                 structured_format,
             )
         }
@@ -27436,12 +27441,55 @@ fn normalized_sources_artifact_manifest_format(fmt: RobotFormat) -> RobotFormat 
 
 fn run_sources_verify_existing_artifact_manifest(
     index_path: PathBuf,
+    expected_manifest: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     let manifest_path = crate::evidence_bundle::EvidenceBundleManifest::path(&index_path);
     let report =
         crate::evidence_bundle::verify_evidence_bundle_manifest_file(&index_path, &manifest_path);
-    let complete = report.is_complete();
+    let expected_manifest_path = expected_manifest
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let mut manifest_matches_expected = None;
+    let mut manifest_compare_error = None;
+    let mut actual_bundle_id = report.bundle_id.clone();
+    let mut expected_bundle_id = None;
+
+    if let Some(expected_manifest) = expected_manifest.as_ref() {
+        match (
+            crate::evidence_bundle::EvidenceBundleManifest::load(&manifest_path),
+            crate::evidence_bundle::EvidenceBundleManifest::load(expected_manifest),
+        ) {
+            (Ok(actual), Ok(expected)) => {
+                actual_bundle_id = Some(actual.bundle_id.clone());
+                expected_bundle_id = Some(expected.bundle_id.clone());
+                manifest_matches_expected = Some(actual == expected);
+            }
+            (actual, expected) => {
+                manifest_matches_expected = Some(false);
+                manifest_compare_error = Some(format!(
+                    "actual_manifest_load={}; expected_manifest_load={}",
+                    actual
+                        .as_ref()
+                        .map(|_| "ok".to_string())
+                        .unwrap_or_else(|err| format!("{err:#}")),
+                    expected
+                        .as_ref()
+                        .map(|_| "ok".to_string())
+                        .unwrap_or_else(|err| format!("{err:#}"))
+                ));
+                if let Ok(actual) = actual {
+                    actual_bundle_id = Some(actual.bundle_id);
+                }
+                if let Ok(expected) = expected {
+                    expected_bundle_id = Some(expected.bundle_id);
+                }
+            }
+        }
+    }
+
+    let expected_manifest_matches = manifest_matches_expected.unwrap_or(true);
+    let complete = report.is_complete() && expected_manifest_matches;
     let status = if complete { "ok" } else { "error" };
     let report_status = report.status;
     let issue_count = report.issues.len();
@@ -27451,6 +27499,11 @@ fn run_sources_verify_existing_artifact_manifest(
         "status": status,
         "index_path": index_path.display().to_string(),
         "manifest_path": manifest_path.display().to_string(),
+        "expected_manifest_path": expected_manifest_path,
+        "manifest_matches_expected": manifest_matches_expected,
+        "manifest_compare_error": manifest_compare_error,
+        "actual_bundle_id": actual_bundle_id,
+        "expected_bundle_id": expected_bundle_id,
         "verification": report,
     });
 
@@ -27467,16 +27520,28 @@ fn run_sources_verify_existing_artifact_manifest(
         println!("Lexical artifact evidence manifest verification");
         println!("  index: {}", index_path.display());
         println!("  manifest: {}", manifest_path.display());
+        if let Some(expected_manifest) = expected_manifest_path.as_deref() {
+            println!("  expected_manifest: {expected_manifest}");
+            println!(
+                "  manifest_matches_expected: {}",
+                manifest_matches_expected.unwrap_or(false)
+            );
+        }
         println!("  status: {:?}", report_status);
         println!("  issues: {issue_count} ({unsafe_issue_count} unsafe)");
         if !complete {
             return Err(CliError {
                 code: 5,
                 kind: CliErrorKind::LexicalGeneration.kind_str(),
-                message: format!(
-                    "Lexical artifact evidence manifest verification failed: {:?}",
-                    report_status
-                ),
+                message: if !expected_manifest_matches {
+                    "Lexical artifact evidence manifest does not match the expected producer manifest"
+                        .to_string()
+                } else {
+                    format!(
+                        "Lexical artifact evidence manifest verification failed: {:?}",
+                        report_status
+                    )
+                },
                 hint: Some(
                     "Reject this copied artifact and rebuild or copy it again from the source."
                         .to_string(),
@@ -27494,11 +27559,16 @@ fn run_sources_artifact_manifest(
     data_dir: Option<PathBuf>,
     write: bool,
     verify_existing: bool,
+    expected_manifest: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     let index_path = resolved_sources_artifact_manifest_index_path(index_path, data_dir);
     if verify_existing {
-        return run_sources_verify_existing_artifact_manifest(index_path, output_format);
+        return run_sources_verify_existing_artifact_manifest(
+            index_path,
+            expected_manifest,
+            output_format,
+        );
     }
 
     let manifest = search::tantivy::lexical_search_evidence_bundle_manifest(&index_path)
