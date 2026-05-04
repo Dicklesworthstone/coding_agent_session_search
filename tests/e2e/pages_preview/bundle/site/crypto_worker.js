@@ -298,14 +298,13 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled) {
     // Concatenate chunks
     const compressed = concatenateChunks(decryptedChunks);
 
-    // Decompress
-    let decompressed;
-    if (config.compression === 'deflate') {
-        decompressed = await decompressDeflate(compressed);
-    } else {
-        // No compression
-        decompressed = compressed;
+    // Decompress. The current archive format stores every encrypted payload
+    // chunk as deflate; fail closed instead of handing compressed bytes to
+    // sqlite-wasm and surfacing a misleading database initialization error.
+    if (config.compression !== 'deflate') {
+        throw new Error(`Unsupported archive compression: ${config.compression ?? 'missing'}`);
     }
+    const decompressed = await decompressDeflate(compressed);
 
     self.postMessage({ type: 'PROGRESS', phase: 'Loading database...', percent: 95 });
 
