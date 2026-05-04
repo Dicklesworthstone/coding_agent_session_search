@@ -2967,6 +2967,25 @@ pub struct LexicalRebuildConversationFootprintRow {
 }
 
 pub(crate) const LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE: usize = 4 * 1024;
+const LEXICAL_REBUILD_FOOTPRINT_POINT_TAIL_FALLBACK_LIMIT: usize = 64;
+
+fn lexical_rebuild_message_count_from_tail_idx(last_message_idx: Option<i64>) -> Option<usize> {
+    let last_message_idx = u64::try_from(last_message_idx?).ok()?;
+    let high_water = last_message_idx.checked_add(1)?;
+    usize::try_from(high_water).ok()
+}
+
+fn lexical_rebuild_conversation_footprint_from_count(
+    conversation_id: i64,
+    message_count: usize,
+) -> LexicalRebuildConversationFootprintRow {
+    LexicalRebuildConversationFootprintRow {
+        conversation_id,
+        message_count,
+        message_bytes: message_count
+            .saturating_mul(LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE),
+    }
+}
 
 /// Lightweight message projection used by the streaming lexical rebuild path.
 #[derive(Debug, Clone)]
@@ -6198,29 +6217,114 @@ impl FrankenStorage {
     pub fn list_conversation_footprints_for_lexical_rebuild(
         &self,
     ) -> Result<Vec<LexicalRebuildConversationFootprintRow>> {
-        self.conn
+        let rows = self
+            .conn
             .query_map_collect(
                 "SELECT c.id, COALESCE(ts.last_message_idx, c.last_message_idx)
                  FROM conversations c
                  LEFT JOIN conversation_tail_state ts ON ts.conversation_id = c.id
                  ORDER BY c.id ASC",
                 fparams![],
+                |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<Option<i64>>(1)?)),
+            )
+            .with_context(|| "listing lexical rebuild conversation footprint estimates")?;
+
+        let mut footprints = Vec::with_capacity(rows.len());
+        let mut missing_tail_positions = HashMap::new();
+        for (conversation_id, last_message_idx) in rows {
+            let Some(message_count) = lexical_rebuild_message_count_from_tail_idx(last_message_idx)
+            else {
+                missing_tail_positions.insert(conversation_id, footprints.len());
+                footprints.push(LexicalRebuildConversationFootprintRow {
+                    conversation_id,
+                    message_count: 0,
+                    message_bytes: 0,
+                });
+                continue;
+            };
+            footprints.push(lexical_rebuild_conversation_footprint_from_count(
+                conversation_id,
+                message_count,
+            ));
+        }
+
+        if !missing_tail_positions.is_empty() {
+            self.fill_missing_lexical_rebuild_footprint_tails(
+                &mut footprints,
+                &missing_tail_positions,
+            )?;
+        }
+
+        Ok(footprints)
+    }
+
+    fn fill_missing_lexical_rebuild_footprint_tails(
+        &self,
+        footprints: &mut [LexicalRebuildConversationFootprintRow],
+        missing_tail_positions: &HashMap<i64, usize>,
+    ) -> Result<()> {
+        if missing_tail_positions.len() <= LEXICAL_REBUILD_FOOTPRINT_POINT_TAIL_FALLBACK_LIMIT {
+            for (conversation_id, position) in missing_tail_positions {
+                let last_message_idx: Option<i64> = self
+                    .conn
+                    .query_row_map(
+                        "SELECT MAX(idx) FROM messages WHERE conversation_id = ?1",
+                        fparams![*conversation_id],
+                        |row| row.get_typed(0),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "looking up missing lexical rebuild tail estimate for conversation {conversation_id}"
+                        )
+                    })?;
+                if let Some(message_count) =
+                    lexical_rebuild_message_count_from_tail_idx(last_message_idx)
+                {
+                    footprints[*position] = lexical_rebuild_conversation_footprint_from_count(
+                        *conversation_id,
+                        message_count,
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        let mut missing_counts: HashMap<i64, usize> = missing_tail_positions
+            .keys()
+            .map(|conversation_id| (*conversation_id, 0usize))
+            .collect();
+        self.conn
+            .query_with_params_for_each(
+                "SELECT conversation_id, MAX(idx)
+                 FROM messages
+                 GROUP BY conversation_id
+                 ORDER BY conversation_id ASC",
+                &[] as &[SqliteValue],
                 |row| {
                     let conversation_id: i64 = row.get_typed(0)?;
-                    let last_message_idx: Option<i64> = row.get_typed(1)?;
-                    let message_count = last_message_idx
-                        .and_then(|idx| idx.checked_add(1))
-                        .and_then(|count| usize::try_from(count).ok())
-                        .unwrap_or(0);
-                    Ok(LexicalRebuildConversationFootprintRow {
-                        conversation_id,
-                        message_count,
-                        message_bytes: message_count
-                            .saturating_mul(LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE),
-                    })
+                    if let Some(count) = missing_counts.get_mut(&conversation_id) {
+                        let last_message_idx: Option<i64> = row.get_typed(1)?;
+                        if let Some(message_count) =
+                            lexical_rebuild_message_count_from_tail_idx(last_message_idx)
+                        {
+                            *count = message_count;
+                        }
+                    }
+                    Ok(())
                 },
             )
-            .with_context(|| "listing lexical rebuild conversation footprint estimates")
+            .with_context(|| "streaming missing lexical rebuild tail estimates from messages")?;
+
+        for (conversation_id, message_count) in missing_counts {
+            if let Some(position) = missing_tail_positions.get(&conversation_id) {
+                footprints[*position] = lexical_rebuild_conversation_footprint_from_count(
+                    conversation_id,
+                    message_count,
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// List conversation ids in the stable order used by lexical rebuilds.
@@ -18655,6 +18759,86 @@ mod tests {
                     message_bytes: 11 * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn list_conversation_footprints_for_lexical_rebuild_falls_back_for_missing_tail_cache() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation_id = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: Some(PathBuf::from("/tmp/workspace")),
+                    external_id: Some("footprint-missing-tail".to_string()),
+                    title: Some("footprint-missing-tail".to_string()),
+                    source_path: PathBuf::from("/tmp/footprint-missing-tail.jsonl"),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: Some(1_700_000_000_100),
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![Message {
+                        id: None,
+                        idx: 10,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_010),
+                        content: "legacy sparse tail".into(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .unwrap()
+            .conversation_id;
+
+        storage
+            .conn
+            .execute_compat(
+                "UPDATE conversations
+                 SET last_message_idx = NULL, last_message_created_at = NULL
+                 WHERE id = ?1",
+                fparams![conversation_id],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+                fparams![conversation_id],
+            )
+            .unwrap();
+
+        let footprints = storage
+            .list_conversation_footprints_for_lexical_rebuild()
+            .unwrap();
+
+        assert_eq!(
+            footprints,
+            vec![LexicalRebuildConversationFootprintRow {
+                conversation_id,
+                message_count: 11,
+                message_bytes: 11 * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
+            }],
+            "missing tail-cache metadata should fall back to messages MAX(idx) instead of treating legacy conversations as empty"
         );
     }
 
