@@ -204,7 +204,7 @@ impl ToastManager {
         if self.coalesce
             && let Some(existing) = self.toasts.iter_mut().find(|t| t.id == toast.id)
         {
-            existing.count += 1;
+            existing.count = existing.count.saturating_add(1);
             existing.created_at = Instant::now(); // Reset timer
             return;
         }
@@ -213,7 +213,8 @@ impl ToastManager {
         self.toasts.push_front(toast);
 
         // Trim excess
-        while self.toasts.len() > self.max_visible * 2 {
+        let retention_limit = self.max_visible.saturating_mul(2);
+        while self.toasts.len() > retention_limit {
             self.toasts.pop_back();
         }
     }
@@ -260,25 +261,44 @@ impl ToastManager {
 
     /// Calculate the render area for toasts given the full terminal area
     pub fn render_area(&self, full_area: Rect) -> Rect {
+        const HORIZONTAL_MARGIN: u16 = 2;
+        const TOAST_ROW_HEIGHT: usize = 3;
+        const VERTICAL_MARGIN: u16 = 1;
+
         let toast_width = 40.min(full_area.width.saturating_sub(4));
         let visible_count = self.visible().count();
-        let toast_height = (visible_count as u16 * 3).min(full_area.height.saturating_sub(2));
+        let max_height = full_area.height.saturating_sub(VERTICAL_MARGIN * 2);
+        let toast_height = visible_count
+            .saturating_mul(TOAST_ROW_HEIGHT)
+            .min(usize::from(max_height))
+            .try_into()
+            .unwrap_or(max_height);
+
+        if toast_width == 0 || toast_height == 0 {
+            return Rect::new(full_area.x, full_area.y, 0, 0);
+        }
 
         let x = match self.position {
-            ToastPosition::TopLeft | ToastPosition::BottomLeft => 2,
-            ToastPosition::TopRight | ToastPosition::BottomRight => {
-                full_area.width.saturating_sub(toast_width + 2)
+            ToastPosition::TopLeft | ToastPosition::BottomLeft => {
+                full_area.x.saturating_add(HORIZONTAL_MARGIN)
             }
-            ToastPosition::TopCenter | ToastPosition::BottomCenter => {
-                (full_area.width.saturating_sub(toast_width)) / 2
-            }
+            ToastPosition::TopRight | ToastPosition::BottomRight => full_area
+                .right()
+                .saturating_sub(toast_width.saturating_add(HORIZONTAL_MARGIN)),
+            ToastPosition::TopCenter | ToastPosition::BottomCenter => full_area
+                .x
+                .saturating_add(full_area.width.saturating_sub(toast_width) / 2),
         };
 
         let y = match self.position {
-            ToastPosition::TopLeft | ToastPosition::TopRight | ToastPosition::TopCenter => 1,
+            ToastPosition::TopLeft | ToastPosition::TopRight | ToastPosition::TopCenter => {
+                full_area.y.saturating_add(VERTICAL_MARGIN)
+            }
             ToastPosition::BottomLeft
             | ToastPosition::BottomRight
-            | ToastPosition::BottomCenter => full_area.height.saturating_sub(toast_height + 1),
+            | ToastPosition::BottomCenter => full_area
+                .bottom()
+                .saturating_sub(toast_height.saturating_add(VERTICAL_MARGIN)),
         };
 
         Rect::new(x, y, toast_width, toast_height)
@@ -287,7 +307,10 @@ impl ToastManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Toast, ToastManager, ToastPosition, ToastType};
+    use ftui::core::geometry::Rect;
+    use std::collections::VecDeque;
+    use std::time::Duration;
 
     #[test]
     fn test_toast_creation() {
@@ -323,6 +346,18 @@ mod tests {
     }
 
     #[test]
+    fn test_toast_coalesced_count_saturates() {
+        let mut manager = ToastManager::new().with_coalesce(true);
+        manager.push(Toast::info("Same message"));
+        manager.toasts.front_mut().unwrap().count = usize::MAX;
+
+        manager.push(Toast::info("Same message"));
+
+        assert_eq!(manager.len(), 1);
+        assert_eq!(manager.visible().next().unwrap().count, usize::MAX);
+    }
+
+    #[test]
     fn test_toast_coalescing_disabled() {
         let mut manager = ToastManager::new().with_coalesce(false);
         manager.push(Toast::info("Same message"));
@@ -335,6 +370,47 @@ mod tests {
     fn test_toast_position() {
         let manager = ToastManager::new().with_position(ToastPosition::BottomLeft);
         assert_eq!(manager.position(), ToastPosition::BottomLeft);
+    }
+
+    #[test]
+    fn test_toast_retention_limit_saturates() {
+        let mut manager = ToastManager::new()
+            .with_max_visible(usize::MAX)
+            .with_coalesce(false);
+
+        manager.push(Toast::info("First"));
+        manager.push(Toast::info("Second"));
+
+        assert_eq!(manager.len(), 2);
+    }
+
+    #[test]
+    fn test_render_area_respects_full_area_origin() {
+        let mut manager = ToastManager::new().with_position(ToastPosition::TopLeft);
+        manager.push(Toast::info("Origin-aware"));
+
+        let area = manager.render_area(Rect::new(10, 5, 80, 20));
+
+        assert_eq!(area.x, 12);
+        assert_eq!(area.y, 6);
+        assert_eq!(area.width, 40);
+        assert_eq!(area.height, 3);
+    }
+
+    #[test]
+    fn test_render_area_caps_large_visible_count_without_truncation() {
+        let manager = ToastManager {
+            toasts: (0..21_846)
+                .map(|idx| Toast::info(format!("Toast {idx}")))
+                .collect::<VecDeque<_>>(),
+            max_visible: usize::MAX,
+            position: ToastPosition::TopRight,
+            coalesce: false,
+        };
+
+        let area = manager.render_area(Rect::new(0, 0, 80, u16::MAX));
+
+        assert_eq!(area.height, u16::MAX - 2);
     }
 
     #[test]
