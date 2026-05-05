@@ -1565,6 +1565,297 @@
       "A verified mirror blob remains useful when the upstream provider file has been pruned."
     ]
   },
+  "source_authority": {
+    "schema_version": 1,
+    "decision": "refused",
+    "selected_authority": null,
+    "selected_authorities": [],
+    "rejected_authorities": [
+      {
+        "authority": "verified_raw_mirror",
+        "decision": "refused",
+        "reason": "raw mirror is not trusted for archive repair: status=absent, checksum_status=not_recorded",
+        "repairs": [
+          "canonical_archive_db",
+          "source_coverage_ledger"
+        ],
+        "coverage_delta": 0,
+        "freshness_delta_ms": null,
+        "checksum_status": "not_recorded",
+        "evidence": [
+          "manifest-count=0",
+          "missing-blob-count=0",
+          "checksum-mismatch-count=0"
+        ]
+      },
+      {
+        "authority": "verified_backup_bundle",
+        "decision": "refused",
+        "reason": "backup-unverified; backup-stale; backup-coverage-unknown; restore-rehearsal-missing",
+        "repairs": [
+          "canonical_archive_db",
+          "archive_db_sidecar",
+          "source_coverage_ledger"
+        ],
+        "coverage_delta": 0,
+        "freshness_delta_ms": null,
+        "checksum_status": "not_recorded",
+        "evidence": [
+          "backup-unverified",
+          "backup-stale",
+          "backup-coverage-unknown",
+          "restore-rehearsal-missing"
+        ]
+      },
+      {
+        "authority": "verified_candidate_archive",
+        "decision": "refused",
+        "reason": "candidate-incomplete; candidate-checksum-mismatch; candidate-coverage-lower-than-current-archive",
+        "repairs": [
+          "canonical_archive_db",
+          "archive_db_sidecar",
+          "derived_lexical_index",
+          "derived_semantic_index"
+        ],
+        "coverage_delta": 0,
+        "freshness_delta_ms": null,
+        "checksum_status": "not_recorded",
+        "evidence": [
+          "candidate-incomplete",
+          "candidate-checksum-mismatch",
+          "candidate-coverage-lower-than-current-archive"
+        ]
+      },
+      {
+        "authority": "derived_lexical_index",
+        "decision": "refused",
+        "reason": "derived-index-is-not-archive-authority",
+        "repairs": [],
+        "coverage_delta": 0,
+        "freshness_delta_ms": null,
+        "checksum_status": "not_recorded",
+        "evidence": [
+          "derived-index-is-not-archive-authority"
+        ]
+      },
+      {
+        "authority": "derived_semantic_index",
+        "decision": "refused",
+        "reason": "derived-index-is-not-archive-authority",
+        "repairs": [],
+        "coverage_delta": 0,
+        "freshness_delta_ms": null,
+        "checksum_status": "not_recorded",
+        "evidence": [
+          "derived-index-is-not-archive-authority"
+        ]
+      },
+      {
+        "authority": "support_bundle",
+        "decision": "refused",
+        "reason": "support-bundle-is-redacted-diagnostic-evidence",
+        "repairs": [],
+        "coverage_delta": 0,
+        "freshness_delta_ms": null,
+        "checksum_status": "not_recorded",
+        "evidence": [
+          "support-bundle-is-redacted-diagnostic-evidence"
+        ]
+      }
+    ],
+    "coverage_delta": {
+      "archive_conversation_count": 0,
+      "visible_local_source_conversation_count": 0,
+      "missing_current_source_count": 0,
+      "remote_source_count": 0,
+      "unknown_mapping_count": 0,
+      "raw_mirror_db_link_count": 0,
+      "visible_local_source_minus_archive": 0,
+      "raw_mirror_links_minus_archive": 0
+    },
+    "freshness_delta": {
+      "archive_db_modified_at_ms": null,
+      "newest_raw_mirror_capture_at_ms": null,
+      "newest_raw_mirror_source_mtime_ms": null,
+      "raw_mirror_capture_minus_archive_db_ms": null,
+      "freshness_state": "archive-db-missing"
+    },
+    "checksum_evidence": {
+      "raw_mirror_status": "absent",
+      "raw_mirror_manifest_count": 0,
+      "raw_mirror_verified_blob_count": 0,
+      "raw_mirror_missing_blob_count": 0,
+      "raw_mirror_checksum_mismatch_count": 0,
+      "raw_mirror_manifest_checksum_mismatch_count": 0,
+      "raw_mirror_manifest_checksum_not_recorded_count": 0,
+      "raw_mirror_invalid_manifest_count": 0,
+      "summary_status": "not_recorded"
+    },
+    "matrix": [
+      {
+        "authority": "canonical_archive_db",
+        "repairs": [
+          "derived_lexical_index",
+          "derived_semantic_index",
+          "source_coverage_ledger"
+        ],
+        "required_evidence": [
+          "archive-db-opens",
+          "conversation-count-known",
+          "repair-target-is-derived-or-ledger"
+        ],
+        "refuses_when": [
+          "archive-db-corrupt",
+          "archive-db-missing",
+          "candidate-would-reduce-coverage"
+        ],
+        "decision_when_valid": "read_only",
+        "notes": "The existing cass archive is the source of truth for derived asset rebuilds and must not be replaced by smaller live source coverage."
+      },
+      {
+        "authority": "verified_raw_mirror",
+        "repairs": [
+          "canonical_archive_db",
+          "source_coverage_ledger"
+        ],
+        "required_evidence": [
+          "manifest-checksum-matched",
+          "blob-checksum-matched",
+          "source-identity-recorded",
+          "candidate-coverage-nondecreasing-before-promotion"
+        ],
+        "refuses_when": [
+          "mirror-absent",
+          "blob-missing",
+          "checksum-mismatch",
+          "manifest-invalid",
+          "candidate-coverage-shrinks"
+        ],
+        "decision_when_valid": "candidate_only",
+        "notes": "A verified raw mirror can seed a staged reconstruction candidate; promotion still needs coverage and checksum verification."
+      },
+      {
+        "authority": "verified_backup_bundle",
+        "repairs": [
+          "canonical_archive_db",
+          "archive_db_sidecar",
+          "source_coverage_ledger"
+        ],
+        "required_evidence": [
+          "backup-manifest-present",
+          "backup-checksums-matched",
+          "restore-rehearsal-receipt"
+        ],
+        "refuses_when": [
+          "backup-unverified",
+          "backup-stale",
+          "backup-coverage-unknown",
+          "restore-rehearsal-missing"
+        ],
+        "decision_when_valid": "candidate_only",
+        "notes": "Backups are evidence until verified; restore apply should consume a rehearsal receipt, not a filename guess."
+      },
+      {
+        "authority": "verified_candidate_archive",
+        "repairs": [
+          "canonical_archive_db",
+          "archive_db_sidecar",
+          "derived_lexical_index",
+          "derived_semantic_index"
+        ],
+        "required_evidence": [
+          "candidate-db-opens",
+          "candidate-checksums-matched",
+          "coverage-nondecreasing",
+          "promotion-plan-fingerprint-approved"
+        ],
+        "refuses_when": [
+          "candidate-incomplete",
+          "candidate-checksum-mismatch",
+          "candidate-coverage-lower-than-current-archive"
+        ],
+        "decision_when_valid": "promotable",
+        "notes": "Only an isolated candidate with non-decreasing coverage may become promotable."
+      },
+      {
+        "authority": "live_upstream_source",
+        "repairs": [
+          "raw_mirror_blob",
+          "source_coverage_ledger"
+        ],
+        "required_evidence": [
+          "source-path-visible",
+          "provider-identity-known",
+          "coverage-continuity-proven"
+        ],
+        "refuses_when": [
+          "source-path-missing",
+          "provider-mapping-unknown",
+          "provider-pruning-risk",
+          "coverage-shrinks-relative-to-archive"
+        ],
+        "decision_when_valid": "candidate_only",
+        "notes": "Live provider logs are useful capture inputs, but they do not outrank the archive when pruning risk is present."
+      },
+      {
+        "authority": "remote_sync_copy",
+        "repairs": [
+          "canonical_archive_db",
+          "source_coverage_ledger"
+        ],
+        "required_evidence": [
+          "source-id-matched",
+          "origin-host-matched",
+          "generation-or-checksum-matched",
+          "coverage-nondecreasing"
+        ],
+        "refuses_when": [
+          "remote-identity-ambiguous",
+          "remote-generation-unverified",
+          "remote-copy-coverage-unknown"
+        ],
+        "decision_when_valid": "candidate_only",
+        "notes": "Remote copies need identity, generation, and checksum evidence before they can seed repair."
+      },
+      {
+        "authority": "derived_lexical_index",
+        "repairs": [],
+        "required_evidence": [],
+        "refuses_when": [
+          "derived-index-is-not-archive-authority"
+        ],
+        "decision_when_valid": "refused",
+        "notes": "Lexical indexes are rebuildable outputs, never archive reconstruction authorities."
+      },
+      {
+        "authority": "derived_semantic_index",
+        "repairs": [],
+        "required_evidence": [],
+        "refuses_when": [
+          "derived-index-is-not-archive-authority"
+        ],
+        "decision_when_valid": "refused",
+        "notes": "Semantic/vector indexes are rebuildable outputs, never archive reconstruction authorities."
+      },
+      {
+        "authority": "support_bundle",
+        "repairs": [],
+        "required_evidence": [
+          "manifest-only-diagnostic-artifact"
+        ],
+        "refuses_when": [
+          "support-bundle-is-redacted-diagnostic-evidence"
+        ],
+        "decision_when_valid": "refused",
+        "notes": "Support bundles are for diagnostics and sharing; they must not become repair authorities."
+      }
+    ],
+    "notes": [
+      "Doctor chooses the most conservative authority first; live sources never outrank an existing archive when coverage shrinks.",
+      "Candidate-only means evidence may seed an isolated rebuild candidate, not direct promotion.",
+      "Promotion requires a later non-decreasing coverage check plus checksum-verified receipt."
+    ]
+  },
   "checks": [
     {
       "name": "data_directory",

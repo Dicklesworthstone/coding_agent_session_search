@@ -16318,8 +16318,7 @@ fn build_doctor_source_authority_report(
     let checksum_evidence = doctor_source_authority_checksum_evidence(raw_mirror);
     let raw_mirror_trusted = raw_mirror.status == "verified"
         && checksum_evidence.summary_status == DoctorArtifactChecksumStatus::Matched;
-    let archive_available =
-        source_inventory.db_available && source_inventory.total_indexed_conversations > 0;
+    let archive_available = source_inventory.db_available;
     let mut selected_authorities = Vec::new();
     let mut rejected_authorities = Vec::new();
 

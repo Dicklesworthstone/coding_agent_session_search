@@ -183,6 +183,39 @@ schemas: (auto-generated from contract)
       - warnings: array
     - recommended_action: ?
     - repair_contract: object
+    - source_authority: object
+      - checksum_evidence: object
+        - raw_mirror_checksum_mismatch_count: integer
+        - raw_mirror_invalid_manifest_count: integer
+        - raw_mirror_manifest_checksum_mismatch_count: integer
+        - raw_mirror_manifest_checksum_not_recorded_count: integer
+        - raw_mirror_manifest_count: integer
+        - raw_mirror_missing_blob_count: integer
+        - raw_mirror_status: string
+        - raw_mirror_verified_blob_count: integer
+        - summary_status: string
+      - coverage_delta: object
+        - archive_conversation_count: integer
+        - missing_current_source_count: integer
+        - raw_mirror_db_link_count: integer
+        - raw_mirror_links_minus_archive: integer
+        - remote_source_count: integer
+        - unknown_mapping_count: integer
+        - visible_local_source_conversation_count: integer
+        - visible_local_source_minus_archive: integer
+      - decision: string
+      - freshness_delta: object
+        - archive_db_modified_at_ms: ?
+        - freshness_state: string
+        - newest_raw_mirror_capture_at_ms: ?
+        - newest_raw_mirror_source_mtime_ms: ?
+        - raw_mirror_capture_minus_archive_db_ms: ?
+      - matrix: array
+      - notes: array
+      - rejected_authorities: array
+      - schema_version: integer
+      - selected_authorities: array
+      - selected_authority: ?
     - source_inventory: object
       - db_available: boolean
       - db_query_error: string

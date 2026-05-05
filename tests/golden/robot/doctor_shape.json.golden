@@ -650,6 +650,186 @@
         }
       }
     },
+    "source_authority": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "selected_authority": {
+          "type": "null"
+        },
+        "selected_authorities": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "rejected_authorities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "authority": {
+                "type": "string"
+              },
+              "decision": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "repairs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "coverage_delta": {
+                "type": "integer"
+              },
+              "freshness_delta_ms": {
+                "type": "null"
+              },
+              "checksum_status": {
+                "type": "string"
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "coverage_delta": {
+          "type": "object",
+          "properties": {
+            "archive_conversation_count": {
+              "type": "integer"
+            },
+            "visible_local_source_conversation_count": {
+              "type": "integer"
+            },
+            "missing_current_source_count": {
+              "type": "integer"
+            },
+            "remote_source_count": {
+              "type": "integer"
+            },
+            "unknown_mapping_count": {
+              "type": "integer"
+            },
+            "raw_mirror_db_link_count": {
+              "type": "integer"
+            },
+            "visible_local_source_minus_archive": {
+              "type": "integer"
+            },
+            "raw_mirror_links_minus_archive": {
+              "type": "integer"
+            }
+          }
+        },
+        "freshness_delta": {
+          "type": "object",
+          "properties": {
+            "archive_db_modified_at_ms": {
+              "type": "null"
+            },
+            "newest_raw_mirror_capture_at_ms": {
+              "type": "null"
+            },
+            "newest_raw_mirror_source_mtime_ms": {
+              "type": "null"
+            },
+            "raw_mirror_capture_minus_archive_db_ms": {
+              "type": "null"
+            },
+            "freshness_state": {
+              "type": "string"
+            }
+          }
+        },
+        "checksum_evidence": {
+          "type": "object",
+          "properties": {
+            "raw_mirror_status": {
+              "type": "string"
+            },
+            "raw_mirror_manifest_count": {
+              "type": "integer"
+            },
+            "raw_mirror_verified_blob_count": {
+              "type": "integer"
+            },
+            "raw_mirror_missing_blob_count": {
+              "type": "integer"
+            },
+            "raw_mirror_checksum_mismatch_count": {
+              "type": "integer"
+            },
+            "raw_mirror_manifest_checksum_mismatch_count": {
+              "type": "integer"
+            },
+            "raw_mirror_manifest_checksum_not_recorded_count": {
+              "type": "integer"
+            },
+            "raw_mirror_invalid_manifest_count": {
+              "type": "integer"
+            },
+            "summary_status": {
+              "type": "string"
+            }
+          }
+        },
+        "matrix": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "authority": {
+                "type": "string"
+              },
+              "repairs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "required_evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "refuses_when": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "decision_when_valid": {
+                "type": "string"
+              },
+              "notes": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "checks": {
       "type": "array",
       "items": {
