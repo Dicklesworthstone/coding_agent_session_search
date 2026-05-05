@@ -12426,7 +12426,7 @@ const DOCTOR_ANOMALY_POLICY_TABLE: &[DoctorAnomalyPolicy] = &[
         health_class: DoctorHealth::RepairBlocked,
         severity: DoctorSeverity::Warn,
         affected_asset_class: DoctorAssetClass::OperationReceipt,
-        data_loss_risk: DoctorDataLossRisk::Low,
+        data_loss_risk: DoctorDataLossRisk::Unknown,
         default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
         safe_for_auto_repair: false,
         recommended_action: "inspect-blocker-before-retrying",
@@ -12694,15 +12694,15 @@ fn doctor_health_class_for_checks(checks: &[DoctorCheckReport]) -> DoctorHealth 
     }
     if checks
         .iter()
-        .any(|check| check.health_class == DoctorHealth::SourceAuthorityUnsafe)
-    {
-        return DoctorHealth::SourceAuthorityUnsafe;
-    }
-    if checks
-        .iter()
         .any(|check| check.health_class == DoctorHealth::DegradedArchiveRisk)
     {
         return DoctorHealth::DegradedArchiveRisk;
+    }
+    if checks
+        .iter()
+        .any(|check| check.health_class == DoctorHealth::SourceAuthorityUnsafe)
+    {
+        return DoctorHealth::SourceAuthorityUnsafe;
     }
     if checks
         .iter()
@@ -16997,6 +16997,38 @@ mod doctor_asset_taxonomy_tests {
         DoctorAssetClass::Unknown,
     ];
 
+    const ALL_DOCTOR_HEALTH_CLASSES: &[DoctorHealth] = &[
+        DoctorHealth::Healthy,
+        DoctorHealth::DegradedDerivedAssets,
+        DoctorHealth::DegradedArchiveRisk,
+        DoctorHealth::RepairBlocked,
+        DoctorHealth::RepairPreviouslyFailed,
+        DoctorHealth::SourceAuthorityUnsafe,
+    ];
+
+    const ALL_DOCTOR_ANOMALIES: &[DoctorAnomaly] = &[
+        DoctorAnomaly::Healthy,
+        DoctorAnomaly::DegradedDerivedAssets,
+        DoctorAnomaly::DegradedArchiveRisk,
+        DoctorAnomaly::RepairBlocked,
+        DoctorAnomaly::RepairPreviouslyFailed,
+        DoctorAnomaly::SourceAuthorityUnsafe,
+        DoctorAnomaly::ArchiveDbCorrupt,
+        DoctorAnomaly::ArchiveDbUnreadable,
+        DoctorAnomaly::RawMirrorMissing,
+        DoctorAnomaly::RawMirrorBehindSource,
+        DoctorAnomaly::UpstreamSourcePruned,
+        DoctorAnomaly::DerivedLexicalStale,
+        DoctorAnomaly::DerivedSemanticStale,
+        DoctorAnomaly::InterruptedRepair,
+        DoctorAnomaly::LockContention,
+        DoctorAnomaly::StoragePressure,
+        DoctorAnomaly::ConfigExclusionRisk,
+        DoctorAnomaly::BackupUnverified,
+        DoctorAnomaly::BackupStale,
+        DoctorAnomaly::PrivacyRedactionRequired,
+    ];
+
     #[test]
     fn doctor_asset_taxonomy_explicitly_covers_every_class_and_operation() {
         let policy_classes: HashSet<_> = DOCTOR_ASSET_POLICY_TABLE
@@ -17163,6 +17195,210 @@ mod doctor_asset_taxonomy_tests {
                 operation
             ));
         }
+    }
+
+    #[test]
+    fn doctor_anomaly_taxonomy_explicitly_covers_every_class() {
+        let policy_anomalies: HashSet<_> = DOCTOR_ANOMALY_POLICY_TABLE
+            .iter()
+            .map(|policy| policy.anomaly_class)
+            .collect();
+        let expected_anomalies: HashSet<_> = ALL_DOCTOR_ANOMALIES.iter().copied().collect();
+        assert_eq!(
+            policy_anomalies, expected_anomalies,
+            "every DoctorAnomaly variant needs a central policy row"
+        );
+        assert_eq!(
+            DOCTOR_ANOMALY_POLICY_TABLE.len(),
+            expected_anomalies.len(),
+            "DoctorAnomaly policy table must not contain duplicate rows"
+        );
+
+        let policy_health_classes: HashSet<_> = DOCTOR_ANOMALY_POLICY_TABLE
+            .iter()
+            .map(|policy| policy.health_class)
+            .collect();
+        let expected_health_classes: HashSet<_> =
+            ALL_DOCTOR_HEALTH_CLASSES.iter().copied().collect();
+        assert_eq!(
+            policy_health_classes, expected_health_classes,
+            "every DoctorHealth class should be reachable from at least one anomaly"
+        );
+
+        for &anomaly in ALL_DOCTOR_ANOMALIES {
+            let value = serde_json::to_value(anomaly).expect("serialize DoctorAnomaly");
+            let serialized = value
+                .as_str()
+                .expect("DoctorAnomaly serializes as a string");
+            assert!(
+                serialized
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch == '-'),
+                "{anomaly:?} must serialize as stable kebab-case, got {serialized:?}"
+            );
+            assert!(
+                !serialized.contains('_'),
+                "{anomaly:?} must not use snake_case in robot contracts"
+            );
+        }
+
+        for &health_class in ALL_DOCTOR_HEALTH_CLASSES {
+            let value = serde_json::to_value(health_class).expect("serialize DoctorHealth");
+            let serialized = value.as_str().expect("DoctorHealth serializes as a string");
+            assert!(
+                serialized
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch == '-'),
+                "{health_class:?} must serialize as stable kebab-case, got {serialized:?}"
+            );
+            assert!(
+                !serialized.contains('_'),
+                "{health_class:?} must not use snake_case in robot contracts"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_anomaly_policy_fails_closed_for_precious_assets() {
+        for policy in DOCTOR_ANOMALY_POLICY_TABLE {
+            let asset_policy = doctor_asset_policy(policy.affected_asset_class);
+            if policy.safe_for_auto_repair {
+                assert_eq!(
+                    policy.health_class,
+                    DoctorHealth::DegradedDerivedAssets,
+                    "{:?} must not be auto-repair-safe unless it is derived-only",
+                    policy.anomaly_class
+                );
+                assert_eq!(
+                    policy.data_loss_risk,
+                    DoctorDataLossRisk::None,
+                    "{:?} must not be auto-repair-safe while carrying data-loss risk",
+                    policy.anomaly_class
+                );
+                assert!(
+                    !asset_policy.precious,
+                    "{:?} must not be auto-repair-safe for precious {:?}",
+                    policy.anomaly_class, policy.affected_asset_class
+                );
+            }
+
+            if asset_policy.precious
+                || matches!(
+                    policy.health_class,
+                    DoctorHealth::DegradedArchiveRisk | DoctorHealth::SourceAuthorityUnsafe
+                )
+            {
+                assert!(
+                    !policy.safe_for_auto_repair,
+                    "{:?} must fail closed by default",
+                    policy.anomaly_class
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_check_report_serializes_stable_robot_fields() {
+        let stale_index =
+            doctor_check_report("index", "fail", "Search index not found", true, false);
+        let value = serde_json::to_value(&stale_index).expect("serialize check report");
+        assert_eq!(value["anomaly_class"], "derived-lexical-stale");
+        assert_eq!(value["health_class"], "degraded-derived-assets");
+        assert_eq!(value["severity"], "warn");
+        assert_eq!(value["affected_asset_class"], "derived_lexical_index");
+        assert_eq!(value["data_loss_risk"], "none");
+        assert_eq!(value["recommended_action"], "rebuild-derived-lexical-index");
+        assert_eq!(value["safe_for_auto_repair"], true);
+        assert_eq!(value["default_outcome_kind"], "planned");
+        assert_eq!(value["fix_available"], true);
+        assert_eq!(value["fix_applied"], false);
+
+        let source_pruned = doctor_check_report(
+            "source_inventory",
+            "warn",
+            "Source coverage risk: 1 indexed local conversation(s) no longer have a visible upstream file; 0 indexed conversation(s) have incomplete source mapping",
+            false,
+            false,
+        );
+        let value = serde_json::to_value(&source_pruned).expect("serialize source report");
+        assert_eq!(value["anomaly_class"], "upstream-source-pruned");
+        assert_eq!(value["health_class"], "degraded-archive-risk");
+        assert_eq!(value["severity"], "warn");
+        assert_eq!(value["affected_asset_class"], "external_upstream_source");
+        assert_eq!(value["data_loss_risk"], "high");
+        assert_eq!(value["safe_for_auto_repair"], false);
+
+        let pass = doctor_check_report("database", "pass", "Database OK", true, true);
+        let value = serde_json::to_value(&pass).expect("serialize pass report");
+        assert_eq!(value["anomaly_class"], "healthy");
+        assert_eq!(value["health_class"], "healthy");
+        assert_eq!(value["severity"], "info");
+        assert_eq!(value["safe_for_auto_repair"], false);
+    }
+
+    #[test]
+    fn doctor_check_report_auto_repair_is_gated_by_issue_and_fix_plan() {
+        let planned = doctor_check_report("index", "warn", "Index may be stale", true, false);
+        assert!(planned.safe_for_auto_repair);
+
+        let no_plan = doctor_check_report("index", "warn", "Index may be stale", false, false);
+        assert!(!no_plan.safe_for_auto_repair);
+
+        let passing = doctor_check_report("index", "pass", "Index OK", true, false);
+        assert!(!passing.safe_for_auto_repair);
+
+        let precious = doctor_check_report(
+            "database",
+            "fail",
+            "Cannot open database: simulated archive issue",
+            true,
+            false,
+        );
+        assert_eq!(
+            precious.affected_asset_class,
+            DoctorAssetClass::CanonicalArchiveDb
+        );
+        assert!(!precious.safe_for_auto_repair);
+    }
+
+    #[test]
+    fn doctor_health_class_uses_highest_risk_report() {
+        let derived = doctor_check_report("index", "fail", "Search index not found", true, false);
+        let source_unsafe = doctor_check_report(
+            "sessions",
+            "warn",
+            "No agent sessions found in configured search paths",
+            false,
+            false,
+        );
+        let archive_risk = doctor_check_report(
+            "database",
+            "fail",
+            "Cannot open database: simulated archive issue",
+            false,
+            false,
+        );
+        let repair_failed =
+            doctor_check_report("rebuild", "fail", "Index rebuild failed: boom", true, false);
+
+        assert_eq!(
+            doctor_health_class_for_checks(std::slice::from_ref(&derived)),
+            DoctorHealth::DegradedDerivedAssets
+        );
+        assert_eq!(
+            doctor_health_class_for_checks(&[derived.clone(), source_unsafe]),
+            DoctorHealth::SourceAuthorityUnsafe
+        );
+        assert_eq!(
+            doctor_health_class_for_checks(&[derived.clone(), archive_risk.clone()]),
+            DoctorHealth::DegradedArchiveRisk,
+            "archive-risk checks must not be masked by derived-asset failures"
+        );
+        assert_eq!(
+            doctor_health_class_for_checks(&[archive_risk, repair_failed]),
+            DoctorHealth::RepairPreviouslyFailed,
+            "a previous failed repair should be the top-level state until inspected"
+        );
     }
 
     #[test]

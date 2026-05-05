@@ -34,6 +34,7 @@ schemas: (auto-generated from contract)
     - version: string
   doctor:
     - _meta: object
+    - anomaly_taxonomy: array
     - asset_taxonomy: array
     - auto_fix_actions: array
     - auto_fix_applied: boolean
@@ -103,6 +104,7 @@ schemas: (auto-generated from contract)
       - retry_safety: string
     - explanation: ?
     - failures: integer
+    - health_class: string
     - healthy: boolean
     - initialized: boolean
     - issues_fixed: integer

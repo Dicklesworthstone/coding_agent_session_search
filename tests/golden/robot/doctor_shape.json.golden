@@ -4,6 +4,9 @@
     "status": {
       "type": "string"
     },
+    "health_class": {
+      "type": "string"
+    },
     "healthy": {
       "type": "boolean"
     },
@@ -70,6 +73,38 @@
             }
           },
           "notes": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "anomaly_taxonomy": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "anomaly_class": {
+            "type": "string"
+          },
+          "health_class": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string"
+          },
+          "affected_asset_class": {
+            "type": "string"
+          },
+          "data_loss_risk": {
+            "type": "string"
+          },
+          "default_outcome_kind": {
+            "type": "string"
+          },
+          "safe_for_auto_repair": {
+            "type": "boolean"
+          },
+          "recommended_action": {
             "type": "string"
           }
         }
@@ -548,6 +583,30 @@
             "type": "string"
           },
           "message": {
+            "type": "string"
+          },
+          "anomaly_class": {
+            "type": "string"
+          },
+          "health_class": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string"
+          },
+          "affected_asset_class": {
+            "type": "string"
+          },
+          "data_loss_risk": {
+            "type": "string"
+          },
+          "recommended_action": {
+            "type": "string"
+          },
+          "safe_for_auto_repair": {
+            "type": "boolean"
+          },
+          "default_outcome_kind": {
             "type": "string"
           },
           "fix_available": {

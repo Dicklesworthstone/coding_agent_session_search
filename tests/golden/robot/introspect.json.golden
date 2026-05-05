@@ -2342,6 +2342,10 @@
         "status": {
           "type": "string"
         },
+        "health_class": {
+          "type": "string",
+          "description": "Stable kebab-case DoctorHealth value such as healthy, degraded-derived-assets, degraded-archive-risk, repair-blocked, repair-previously-failed, or source-authority-unsafe."
+        },
         "healthy": {
           "type": "boolean"
         },
@@ -2385,6 +2389,13 @@
           }
         },
         "asset_taxonomy": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "anomaly_taxonomy": {
           "type": "array",
           "items": {
             "type": "object",
@@ -3821,6 +3832,35 @@
               "message": {
                 "type": "string"
               },
+              "anomaly_class": {
+                "type": "string",
+                "description": "Stable kebab-case DoctorAnomaly value; robots should branch on this instead of message text."
+              },
+              "health_class": {
+                "type": "string",
+                "description": "Stable kebab-case DoctorHealth value derived from anomaly_class."
+              },
+              "severity": {
+                "type": "string",
+                "description": "info | warn | error"
+              },
+              "affected_asset_class": {
+                "type": "string",
+                "description": "Stable DoctorAssetClass value naming the asset class at risk."
+              },
+              "data_loss_risk": {
+                "type": "string",
+                "description": "none | low | medium | high | unknown"
+              },
+              "recommended_action": {
+                "type": "string"
+              },
+              "safe_for_auto_repair": {
+                "type": "boolean"
+              },
+              "default_outcome_kind": {
+                "type": "string"
+              },
               "fix_available": {
                 "type": "boolean"
               },
@@ -3832,6 +3872,14 @@
               "name",
               "status",
               "message",
+              "anomaly_class",
+              "health_class",
+              "severity",
+              "affected_asset_class",
+              "data_loss_risk",
+              "recommended_action",
+              "safe_for_auto_repair",
+              "default_outcome_kind",
               "fix_available",
               "fix_applied"
             ]
@@ -3840,6 +3888,7 @@
       },
       "required": [
         "status",
+        "health_class",
         "healthy",
         "initialized",
         "checks"
