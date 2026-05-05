@@ -19,6 +19,7 @@ const RAW_MIRROR_BLOB_EXTENSION: &str = "raw";
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 static BLOB_CAPTURE_CACHE: OnceLock<Mutex<HashMap<RawMirrorBlobCacheKey, RawMirrorBlobRecord>>> =
     OnceLock::new();
+static MANIFEST_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub(crate) struct RawMirrorCaptureInput<'a> {
@@ -226,6 +227,12 @@ pub(crate) fn capture_source_file(
         publish_manifest_bytes_create_new(&root, &manifest_path, &manifest_bytes, &blob_blake3)?;
     let (record_blob_size_bytes, record_captured_at_ms, record_source_mtime_ms) =
         if manifest_already_present {
+            merge_raw_mirror_manifest_db_links(
+                &root,
+                &manifest_path,
+                input.db_links,
+                &blob_blake3,
+            )?;
             let published = read_raw_mirror_manifest(&manifest_path)?;
             (
                 published.blob_size_bytes,
@@ -443,6 +450,82 @@ fn publish_manifest_bytes_create_new(
             temp_path.display()
         )),
     }
+}
+
+fn merge_raw_mirror_manifest_db_links(
+    root: &Path,
+    manifest_path: &Path,
+    links: &[RawMirrorDbLink],
+    expected_blob_blake3: &str,
+) -> Result<()> {
+    if links.is_empty() {
+        return Ok(());
+    }
+
+    let lock = MANIFEST_UPDATE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| anyhow!("raw mirror manifest update lock poisoned"))?;
+
+    let mut manifest = read_raw_mirror_manifest(manifest_path)?;
+    if manifest.blob_blake3 != expected_blob_blake3 {
+        return Err(anyhow!(
+            "existing raw mirror manifest {} points at blob {}, expected {}",
+            manifest_path.display(),
+            manifest.blob_blake3,
+            expected_blob_blake3
+        ));
+    }
+
+    let mut merged_links = manifest.db_links.clone();
+    merged_links.extend_from_slice(links);
+    let merged_links = unique_db_links(&merged_links);
+    if merged_links == manifest.db_links {
+        return Ok(());
+    }
+
+    manifest.db_links = merged_links;
+    manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    replace_manifest_bytes(root, manifest_path, &manifest_bytes)
+}
+
+fn replace_manifest_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()> {
+    ensure_private_dir(
+        manifest_path
+            .parent()
+            .ok_or_else(|| anyhow!("raw mirror manifest path has no parent"))?,
+    )?;
+    let temp_dir = unique_capture_temp_dir(root);
+    ensure_private_dir(&temp_dir)?;
+    let temp_path = unique_temp_path(&temp_dir, "manifest-update");
+    let mut temp = private_create_new_file(&temp_path)?;
+    temp.write_all(manifest_bytes).with_context(|| {
+        format!(
+            "write raw mirror manifest update temp {}",
+            temp_path.display()
+        )
+    })?;
+    temp.sync_all().with_context(|| {
+        format!(
+            "sync raw mirror manifest update temp {}",
+            temp_path.display()
+        )
+    })?;
+    drop(temp);
+
+    fs::rename(&temp_path, manifest_path).with_context(|| {
+        format!(
+            "replace raw mirror manifest {} from {}",
+            manifest_path.display(),
+            temp_path.display()
+        )
+    })?;
+    set_private_file_permissions(manifest_path)?;
+    sync_file(manifest_path)?;
+    sync_parent(manifest_path)?;
+    remove_empty_temp_dir_best_effort(&temp_dir);
+    Ok(())
 }
 
 fn verify_existing_file(path: &Path, expected_blake3: &str) -> Result<()> {
@@ -917,6 +1000,65 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn capture_source_file_merges_db_links_into_existing_manifest() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("preparse-then-parsed.jsonl");
+        let source_bytes = b"{\"type\":\"message\",\"text\":\"hello\"}\n";
+        fs::write(&source_path, source_bytes).expect("write source");
+
+        let preparse = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("preparse capture");
+
+        let parsed_link = RawMirrorDbLink {
+            conversation_id: None,
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let parsed = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: std::slice::from_ref(&parsed_link),
+        })
+        .expect("parsed capture");
+
+        assert_eq!(preparse.manifest_id, parsed.manifest_id);
+        assert_eq!(preparse.blob_blake3, parsed.blob_blake3);
+        assert!(parsed.already_present);
+
+        let manifest_path = data_dir
+            .join(RAW_MIRROR_ROOT_DIR)
+            .join(RAW_MIRROR_VERSION_DIR)
+            .join(&parsed.manifest_relative_path);
+        let manifest = read_raw_mirror_manifest(&manifest_path).expect("merged manifest");
+        assert_eq!(
+            manifest.db_links,
+            vec![parsed_link],
+            "second capture must enrich the pre-parse manifest with DB-link evidence"
+        );
+        let expected_manifest_blake3 = raw_mirror_manifest_blake3(&manifest);
+        assert_eq!(
+            manifest.manifest_blake3.as_deref(),
+            Some(expected_manifest_blake3.as_str()),
+            "manifest checksum must be recomputed after DB-link merge"
+        );
+        assert_eq!(fs::read(&source_path).expect("source bytes"), source_bytes);
     }
 
     #[test]

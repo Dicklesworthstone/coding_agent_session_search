@@ -20627,6 +20627,61 @@ mod tests {
     }
 
     #[test]
+    fn raw_mirror_capture_enriches_preparse_manifest_after_successful_parse() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("preparse-then-parsed.jsonl");
+        let source_bytes = b"{\"type\":\"message\",\"role\":\"user\",\"content\":\"hello\"}\n";
+        std::fs::write(&source_path, source_bytes).expect("write source");
+        let root = ScanRoot::local(source_path.clone());
+
+        capture_scan_root_file_before_parse(&data_dir, "codex", &root);
+
+        let mut conv = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some("raw-mirror-preparse-enrichment".to_string()),
+            title: Some("Raw mirror preparse enrichment".to_string()),
+            workspace: None,
+            source_path: source_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_000_100),
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".to_string(),
+                author: None,
+                created_at: Some(1_733_000_000_000),
+                content: "hello".to_string(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+        inject_provenance(&mut conv, &Origin::local());
+        attach_raw_mirror_capture(&data_dir, &mut conv);
+
+        let manifest_root = data_dir.join("raw-mirror/v1/manifests");
+        let manifests = std::fs::read_dir(&manifest_root)
+            .expect("manifest dir")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("manifest entries");
+        assert_eq!(manifests.len(), 1);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(manifests[0].path()).expect("manifest bytes"))
+                .expect("manifest json");
+        assert_eq!(manifest["db_links"].as_array().map(Vec::len), Some(1));
+        assert_eq!(manifest["db_links"][0]["message_count"].as_u64(), Some(1));
+        assert_eq!(
+            manifest["db_links"][0]["started_at_ms"].as_i64(),
+            Some(1_733_000_000_000)
+        );
+        assert_eq!(
+            std::fs::read(&source_path).expect("source bytes"),
+            source_bytes
+        );
+    }
+
+    #[test]
     #[serial]
     fn batch_index_captures_explicit_file_root_before_failed_scan() {
         let temp = TempDir::new().expect("tempdir");
