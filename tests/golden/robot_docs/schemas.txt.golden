@@ -38,6 +38,69 @@ schemas: (auto-generated from contract)
     - auto_fix_actions: array
     - auto_fix_applied: boolean
     - checks: array
+    - cleanup_apply: object
+      - actions: array
+      - approval_fingerprint: string
+      - approval_requirement: string
+      - mode: string
+      - operation_finished_at_ms: ?
+      - operation_started_at_ms: ?
+      - outcome_kind: string
+      - plan: object
+        - actions: array
+        - approval_fingerprint: string
+        - approval_requirement: string
+        - artifact_manifest: object
+        - blocked_reasons: array
+        - coverage_before: object
+        - event_log: object
+        - fingerprint_algorithm: string
+        - forensic_bundle: object
+        - mode: string
+        - outcome_contract: string
+        - plan_fingerprint: string
+        - plan_kind: string
+        - rejected_authorities: array
+        - remaining_risk: array
+        - safety_gates: array
+        - schema_version: integer
+        - selected_authorities: array
+      - planned_actions: array
+      - receipt: object
+        - action_status_counts: object
+        - actions: array
+        - applied_action_count: integer
+        - approval_fingerprint: string
+        - artifact_checksums: array
+        - artifact_manifest: object
+        - backup_paths: array
+        - blocked_reasons: array
+        - bytes_copied: integer
+        - bytes_moved: integer
+        - bytes_planned: integer
+        - bytes_pruned: integer
+        - coverage_after: object
+        - coverage_before: object
+        - drift_detection_status: string
+        - duration_ms: ?
+        - event_log: object
+        - failed_action_count: integer
+        - finished_at_ms: ?
+        - forensic_bundle: object
+        - mode: string
+        - outcome_kind: string
+        - plan_fingerprint: string
+        - planned_action_count: integer
+        - receipt_kind: string
+        - reclaimed_bytes: integer
+        - rejected_authorities: array
+        - remaining_risk: array
+        - schema_version: integer
+        - selected_authorities: array
+        - skipped_action_count: integer
+        - started_at_ms: ?
+        - verification_outcomes: array
+      - retry_safety: string
     - explanation: ?
     - failures: integer
     - healthy: boolean

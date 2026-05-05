@@ -410,6 +410,68 @@
     "default_mode": "check",
     "default_non_destructive": true,
     "fail_closed": true,
+    "plan_receipt_schema": {
+      "plan_schema_version": 1,
+      "receipt_schema_version": 1,
+      "action_schema_version": 1,
+      "artifact_schema_version": 1,
+      "fingerprint_algorithm": "blake3-canonical-json-v1",
+      "plan_fingerprint_includes": [
+        "plan_kind",
+        "schema_version",
+        "mode",
+        "approval_requirement",
+        "approval_fingerprint",
+        "outcome_contract",
+        "coverage_before",
+        "safety_gates",
+        "actions",
+        "artifact_manifest",
+        "selected_authorities",
+        "rejected_authorities",
+        "blocked_reasons",
+        "remaining_risk"
+      ],
+      "receipt_required_fields": [
+        "receipt_kind",
+        "schema_version",
+        "mode",
+        "outcome_kind",
+        "approval_fingerprint",
+        "plan_fingerprint",
+        "started_at_ms",
+        "finished_at_ms",
+        "actions",
+        "action_status_counts",
+        "artifact_manifest",
+        "drift_detection_status",
+        "coverage_before",
+        "coverage_after"
+      ],
+      "action_statuses": [
+        "planned",
+        "applied",
+        "skipped",
+        "blocked",
+        "failed",
+        "refused"
+      ],
+      "artifact_checksum_statuses": [
+        "not_recorded",
+        "matched",
+        "mismatched",
+        "missing"
+      ],
+      "drift_detection_statuses": [
+        "not_checked",
+        "verified",
+        "checksum_mismatch",
+        "missing_artifact",
+        "manifest_mismatch"
+      ],
+      "redaction_contract": "robot receipts may expose existing doctor paths; support bundles must redact before export",
+      "tamper_evidence_scope": "plan fingerprints, artifact manifests, event logs, and forensic bundles"
+    },
     "approval_requirements": [
       "none",
       "approval_fingerprint",

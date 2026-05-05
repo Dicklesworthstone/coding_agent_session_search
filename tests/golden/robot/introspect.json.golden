@@ -2399,6 +2399,987 @@
           "type": "object",
           "additionalProperties": true
         },
+        "cleanup_apply": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string"
+            },
+            "approval_requirement": {
+              "type": "string"
+            },
+            "outcome_kind": {
+              "type": "string"
+            },
+            "retry_safety": {
+              "type": "string"
+            },
+            "approval_fingerprint": {
+              "type": "string"
+            },
+            "operation_started_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "operation_finished_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "planned_actions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "actions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "plan": {
+              "type": "object",
+              "properties": {
+                "plan_kind": {
+                  "type": "string"
+                },
+                "schema_version": {
+                  "type": "integer"
+                },
+                "mode": {
+                  "type": "string"
+                },
+                "approval_requirement": {
+                  "type": "string"
+                },
+                "approval_fingerprint": {
+                  "type": "string"
+                },
+                "plan_fingerprint": {
+                  "type": "string"
+                },
+                "fingerprint_algorithm": {
+                  "type": "string"
+                },
+                "outcome_contract": {
+                  "type": "string"
+                },
+                "coverage_before": {
+                  "type": "object",
+                  "properties": {
+                    "generation_count": {
+                      "type": "integer"
+                    },
+                    "reclaim_candidate_count": {
+                      "type": "integer"
+                    },
+                    "reclaimable_bytes": {
+                      "type": "integer"
+                    },
+                    "retained_bytes": {
+                      "type": "integer"
+                    },
+                    "artifact_count": {
+                      "type": "integer"
+                    },
+                    "covered_asset_classes": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "safety_gates": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "mode": {
+                        "type": "string"
+                      },
+                      "asset_class": {
+                        "type": "string"
+                      },
+                      "allowed_by_mode": {
+                        "type": "boolean"
+                      },
+                      "allowed_by_taxonomy": {
+                        "type": "boolean"
+                      },
+                      "path_safe": {
+                        "type": "boolean"
+                      },
+                      "approval_requirement": {
+                        "type": "string"
+                      },
+                      "approval_fingerprint": {
+                        "type": "string"
+                      },
+                      "passed": {
+                        "type": "boolean"
+                      },
+                      "blocked_reasons": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                },
+                "actions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "action_id": {
+                        "type": "string"
+                      },
+                      "action_kind": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "type": "string",
+                        "description": "planned | applied | skipped | blocked | failed | refused"
+                      },
+                      "mode": {
+                        "type": "string"
+                      },
+                      "asset_class": {
+                        "type": "string"
+                      },
+                      "target_path": {
+                        "type": "string"
+                      },
+                      "redacted_target_path": {
+                        "type": "string"
+                      },
+                      "reason": {
+                        "type": "string"
+                      },
+                      "authority_decision": {
+                        "type": "string"
+                      },
+                      "selected_authorities": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "rejected_authorities": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "safety_gate": {
+                        "type": "object",
+                        "properties": {
+                          "mode": {
+                            "type": "string"
+                          },
+                          "asset_class": {
+                            "type": "string"
+                          },
+                          "allowed_by_mode": {
+                            "type": "boolean"
+                          },
+                          "allowed_by_taxonomy": {
+                            "type": "boolean"
+                          },
+                          "path_safe": {
+                            "type": "boolean"
+                          },
+                          "approval_requirement": {
+                            "type": "string"
+                          },
+                          "approval_fingerprint": {
+                            "type": "string"
+                          },
+                          "passed": {
+                            "type": "boolean"
+                          },
+                          "blocked_reasons": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      },
+                      "planned_bytes": {
+                        "type": "integer"
+                      },
+                      "bytes_copied": {
+                        "type": "integer"
+                      },
+                      "bytes_moved": {
+                        "type": "integer"
+                      },
+                      "bytes_pruned": {
+                        "type": "integer"
+                      },
+                      "backup_paths": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "verification_outcome": {
+                        "type": "string"
+                      },
+                      "remaining_risk": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "artifacts": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "artifact_id": {
+                              "type": "string"
+                            },
+                            "artifact_kind": {
+                              "type": "string"
+                            },
+                            "asset_class": {
+                              "type": "string"
+                            },
+                            "path": {
+                              "type": "string"
+                            },
+                            "redacted_path": {
+                              "type": "string"
+                            },
+                            "exists": {
+                              "type": "boolean"
+                            },
+                            "size_bytes": {
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "descriptor_blake3": {
+                              "type": "string"
+                            },
+                            "expected_content_blake3": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "actual_content_blake3": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "checksum_status": {
+                              "type": "string",
+                              "description": "not_recorded | matched | mismatched | missing"
+                            }
+                          },
+                          "required": [
+                            "artifact_id",
+                            "artifact_kind",
+                            "asset_class",
+                            "path",
+                            "redacted_path",
+                            "exists",
+                            "descriptor_blake3",
+                            "checksum_status"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                },
+                "artifact_manifest": {
+                  "type": "object",
+                  "properties": {
+                    "schema_version": {
+                      "type": "integer"
+                    },
+                    "artifact_count": {
+                      "type": "integer"
+                    },
+                    "manifest_blake3": {
+                      "type": "string"
+                    },
+                    "drift_detection_status": {
+                      "type": "string",
+                      "description": "not_checked | verified | checksum_mismatch | missing_artifact | manifest_mismatch"
+                    },
+                    "artifacts": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "artifact_id": {
+                            "type": "string"
+                          },
+                          "artifact_kind": {
+                            "type": "string"
+                          },
+                          "asset_class": {
+                            "type": "string"
+                          },
+                          "path": {
+                            "type": "string"
+                          },
+                          "redacted_path": {
+                            "type": "string"
+                          },
+                          "exists": {
+                            "type": "boolean"
+                          },
+                          "size_bytes": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "descriptor_blake3": {
+                            "type": "string"
+                          },
+                          "expected_content_blake3": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "actual_content_blake3": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "checksum_status": {
+                            "type": "string",
+                            "description": "not_recorded | matched | mismatched | missing"
+                          }
+                        },
+                        "required": [
+                          "artifact_id",
+                          "artifact_kind",
+                          "asset_class",
+                          "path",
+                          "redacted_path",
+                          "exists",
+                          "descriptor_blake3",
+                          "checksum_status"
+                        ]
+                      }
+                    }
+                  }
+                },
+                "event_log": {
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "checksum_blake3": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "hash_chain_tip": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "forensic_bundle": {
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "checksum_blake3": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "selected_authorities": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "rejected_authorities": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "blocked_reasons": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "remaining_risk": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "receipt": {
+              "type": "object",
+              "properties": {
+                "receipt_kind": {
+                  "type": "string"
+                },
+                "schema_version": {
+                  "type": "integer"
+                },
+                "mode": {
+                  "type": "string"
+                },
+                "outcome_kind": {
+                  "type": "string"
+                },
+                "approval_fingerprint": {
+                  "type": "string"
+                },
+                "plan_fingerprint": {
+                  "type": "string"
+                },
+                "started_at_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "finished_at_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "duration_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "planned_action_count": {
+                  "type": "integer"
+                },
+                "applied_action_count": {
+                  "type": "integer"
+                },
+                "skipped_action_count": {
+                  "type": "integer"
+                },
+                "failed_action_count": {
+                  "type": "integer"
+                },
+                "bytes_planned": {
+                  "type": "integer"
+                },
+                "bytes_copied": {
+                  "type": "integer"
+                },
+                "bytes_moved": {
+                  "type": "integer"
+                },
+                "bytes_pruned": {
+                  "type": "integer"
+                },
+                "reclaimed_bytes": {
+                  "type": "integer"
+                },
+                "backup_paths": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "selected_authorities": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "rejected_authorities": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "verification_outcomes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "remaining_risk": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "event_log": {
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "checksum_blake3": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "hash_chain_tip": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "forensic_bundle": {
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "checksum_blake3": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "status": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "artifact_manifest": {
+                  "type": "object",
+                  "properties": {
+                    "schema_version": {
+                      "type": "integer"
+                    },
+                    "artifact_count": {
+                      "type": "integer"
+                    },
+                    "manifest_blake3": {
+                      "type": "string"
+                    },
+                    "drift_detection_status": {
+                      "type": "string",
+                      "description": "not_checked | verified | checksum_mismatch | missing_artifact | manifest_mismatch"
+                    },
+                    "artifacts": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "artifact_id": {
+                            "type": "string"
+                          },
+                          "artifact_kind": {
+                            "type": "string"
+                          },
+                          "asset_class": {
+                            "type": "string"
+                          },
+                          "path": {
+                            "type": "string"
+                          },
+                          "redacted_path": {
+                            "type": "string"
+                          },
+                          "exists": {
+                            "type": "boolean"
+                          },
+                          "size_bytes": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "descriptor_blake3": {
+                            "type": "string"
+                          },
+                          "expected_content_blake3": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "actual_content_blake3": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "checksum_status": {
+                            "type": "string",
+                            "description": "not_recorded | matched | mismatched | missing"
+                          }
+                        },
+                        "required": [
+                          "artifact_id",
+                          "artifact_kind",
+                          "asset_class",
+                          "path",
+                          "redacted_path",
+                          "exists",
+                          "descriptor_blake3",
+                          "checksum_status"
+                        ]
+                      }
+                    }
+                  }
+                },
+                "artifact_checksums": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "artifact_id": {
+                        "type": "string"
+                      },
+                      "artifact_kind": {
+                        "type": "string"
+                      },
+                      "asset_class": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "string"
+                      },
+                      "redacted_path": {
+                        "type": "string"
+                      },
+                      "exists": {
+                        "type": "boolean"
+                      },
+                      "size_bytes": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "descriptor_blake3": {
+                        "type": "string"
+                      },
+                      "expected_content_blake3": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "actual_content_blake3": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "checksum_status": {
+                        "type": "string",
+                        "description": "not_recorded | matched | mismatched | missing"
+                      }
+                    },
+                    "required": [
+                      "artifact_id",
+                      "artifact_kind",
+                      "asset_class",
+                      "path",
+                      "redacted_path",
+                      "exists",
+                      "descriptor_blake3",
+                      "checksum_status"
+                    ]
+                  }
+                },
+                "drift_detection_status": {
+                  "type": "string"
+                },
+                "coverage_before": {
+                  "type": "object",
+                  "properties": {
+                    "generation_count": {
+                      "type": "integer"
+                    },
+                    "reclaim_candidate_count": {
+                      "type": "integer"
+                    },
+                    "reclaimable_bytes": {
+                      "type": "integer"
+                    },
+                    "retained_bytes": {
+                      "type": "integer"
+                    },
+                    "artifact_count": {
+                      "type": "integer"
+                    },
+                    "covered_asset_classes": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "coverage_after": {
+                  "type": "object",
+                  "properties": {
+                    "generation_count": {
+                      "type": "integer"
+                    },
+                    "reclaim_candidate_count": {
+                      "type": "integer"
+                    },
+                    "reclaimable_bytes": {
+                      "type": "integer"
+                    },
+                    "retained_bytes": {
+                      "type": "integer"
+                    },
+                    "artifact_count": {
+                      "type": "integer"
+                    },
+                    "covered_asset_classes": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "actions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "action_id": {
+                        "type": "string"
+                      },
+                      "action_kind": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "type": "string",
+                        "description": "planned | applied | skipped | blocked | failed | refused"
+                      },
+                      "mode": {
+                        "type": "string"
+                      },
+                      "asset_class": {
+                        "type": "string"
+                      },
+                      "target_path": {
+                        "type": "string"
+                      },
+                      "redacted_target_path": {
+                        "type": "string"
+                      },
+                      "reason": {
+                        "type": "string"
+                      },
+                      "authority_decision": {
+                        "type": "string"
+                      },
+                      "selected_authorities": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "rejected_authorities": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "safety_gate": {
+                        "type": "object",
+                        "properties": {
+                          "mode": {
+                            "type": "string"
+                          },
+                          "asset_class": {
+                            "type": "string"
+                          },
+                          "allowed_by_mode": {
+                            "type": "boolean"
+                          },
+                          "allowed_by_taxonomy": {
+                            "type": "boolean"
+                          },
+                          "path_safe": {
+                            "type": "boolean"
+                          },
+                          "approval_requirement": {
+                            "type": "string"
+                          },
+                          "approval_fingerprint": {
+                            "type": "string"
+                          },
+                          "passed": {
+                            "type": "boolean"
+                          },
+                          "blocked_reasons": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      },
+                      "planned_bytes": {
+                        "type": "integer"
+                      },
+                      "bytes_copied": {
+                        "type": "integer"
+                      },
+                      "bytes_moved": {
+                        "type": "integer"
+                      },
+                      "bytes_pruned": {
+                        "type": "integer"
+                      },
+                      "backup_paths": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "verification_outcome": {
+                        "type": "string"
+                      },
+                      "remaining_risk": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "artifacts": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "artifact_id": {
+                              "type": "string"
+                            },
+                            "artifact_kind": {
+                              "type": "string"
+                            },
+                            "asset_class": {
+                              "type": "string"
+                            },
+                            "path": {
+                              "type": "string"
+                            },
+                            "redacted_path": {
+                              "type": "string"
+                            },
+                            "exists": {
+                              "type": "boolean"
+                            },
+                            "size_bytes": {
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "descriptor_blake3": {
+                              "type": "string"
+                            },
+                            "expected_content_blake3": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "actual_content_blake3": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "checksum_status": {
+                              "type": "string",
+                              "description": "not_recorded | matched | mismatched | missing"
+                            }
+                          },
+                          "required": [
+                            "artifact_id",
+                            "artifact_kind",
+                            "asset_class",
+                            "path",
+                            "redacted_path",
+                            "exists",
+                            "descriptor_blake3",
+                            "checksum_status"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                },
+                "action_status_counts": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "integer"
+                  }
+                },
+                "blocked_reasons": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
         "_meta": {
           "type": "object",
           "additionalProperties": true

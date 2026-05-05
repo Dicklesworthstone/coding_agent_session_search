@@ -87,6 +87,62 @@
         "fail_closed": {
           "type": "boolean"
         },
+        "plan_receipt_schema": {
+          "type": "object",
+          "properties": {
+            "plan_schema_version": {
+              "type": "integer"
+            },
+            "receipt_schema_version": {
+              "type": "integer"
+            },
+            "action_schema_version": {
+              "type": "integer"
+            },
+            "artifact_schema_version": {
+              "type": "integer"
+            },
+            "fingerprint_algorithm": {
+              "type": "string"
+            },
+            "plan_fingerprint_includes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "receipt_required_fields": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "action_statuses": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "artifact_checksum_statuses": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "drift_detection_statuses": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "redaction_contract": {
+              "type": "string"
+            },
+            "tamper_evidence_scope": {
+              "type": "string"
+            }
+          }
+        },
         "approval_requirements": {
           "type": "array",
           "items": {
