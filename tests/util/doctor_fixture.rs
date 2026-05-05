@@ -1051,6 +1051,9 @@ pub fn default_expected_artifact_keys() -> Vec<String> {
     vec![
         "scenario_json".to_string(),
         "fixture_inventory".to_string(),
+        "source_inventory_before".to_string(),
+        "source_inventory_after".to_string(),
+        "execution_flow".to_string(),
         "commands_jsonl".to_string(),
         "stdout_doctor_json".to_string(),
         "stderr_doctor_json".to_string(),

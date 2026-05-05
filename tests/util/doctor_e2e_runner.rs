@@ -99,6 +99,7 @@ pub struct DoctorE2eFileEntry {
 pub struct DoctorE2eCommandRecord {
     pub command_id: String,
     pub argv: Vec<String>,
+    pub env: BTreeMap<String, String>,
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
     pub stdout_path: String,
@@ -279,27 +280,33 @@ impl DoctorE2eRunner {
             &fixture_inventory,
             &mut artifacts,
         )?;
+        let source_inventory_before =
+            build_source_inventory_snapshot(spec, &fixture, &redactor, &before, "before");
+        write_json_artifact(
+            &scenario_artifact_dir,
+            "source-inventory-before.json",
+            &source_inventory_before,
+            &mut artifacts,
+        )?;
 
+        let command_env = doctor_command_env(&fixture);
         let command_start = Instant::now();
-        let output = Command::new(&self.cass_bin)
-            .args([
-                "doctor",
-                "--json",
-                "--data-dir",
-                fixture.data_dir().to_str().ok_or_else(|| {
-                    format!(
-                        "fixture data dir is not utf8: {}",
-                        fixture.data_dir().display()
-                    )
-                })?,
-            ])
-            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-            .env("NO_COLOR", "1")
-            .env("CASS_NO_COLOR", "1")
-            .env("XDG_DATA_HOME", fixture.home_dir())
-            .env("XDG_CONFIG_HOME", fixture.home_dir())
-            .env("HOME", fixture.home_dir())
+        let mut command = Command::new(&self.cass_bin);
+        command.args([
+            "doctor",
+            "--json",
+            "--data-dir",
+            fixture.data_dir().to_str().ok_or_else(|| {
+                format!(
+                    "fixture data dir is not utf8: {}",
+                    fixture.data_dir().display()
+                )
+            })?,
+        ]);
+        for (key, value) in &command_env {
+            command.env(key, value);
+        }
+        let output = command
             .output()
             .map_err(|err| format!("failed to run cass doctor --json: {err}"))?;
         let duration_ms = elapsed_ms(command_start);
@@ -372,6 +379,14 @@ impl DoctorE2eRunner {
             &scenario_artifact_dir,
             "file-tree-after.json",
             &after,
+            &mut artifacts,
+        )?;
+        let source_inventory_after =
+            build_source_inventory_snapshot(spec, &fixture, &redactor, &after, "after");
+        write_json_artifact(
+            &scenario_artifact_dir,
+            "source-inventory-after.json",
+            &source_inventory_after,
             &mut artifacts,
         )?;
 
@@ -458,6 +473,10 @@ impl DoctorE2eRunner {
                 "--data-dir".to_string(),
                 redactor.redact(&fixture.data_dir().display().to_string()),
             ],
+            env: command_env
+                .iter()
+                .map(|(key, value)| (key.clone(), redactor.redact(value)))
+                .collect(),
             exit_code,
             duration_ms,
             stdout_path,
@@ -470,6 +489,21 @@ impl DoctorE2eRunner {
             &scenario_artifact_dir,
             "commands.jsonl",
             &[serde_json::to_value(&command_record).expect("command record json")],
+            &mut artifacts,
+        )?;
+        let execution_flow = build_execution_flow_log(
+            spec,
+            &fixture_inventory,
+            &source_inventory_before,
+            &source_inventory_after,
+            parsed_json.as_ref().map(|(value, _)| value),
+            &command_record,
+            &mutation_diffs,
+        );
+        write_jsonl_artifact(
+            &scenario_artifact_dir,
+            "execution-flow.jsonl",
+            &execution_flow,
             &mut artifacts,
         )?;
 
@@ -740,6 +774,223 @@ fn build_fixture_inventory(
             "entries": data_dir_entries,
         },
     })
+}
+
+fn build_source_inventory_snapshot(
+    spec: &DoctorE2eScenarioSpec,
+    fixture: &DoctorFixtureFactory,
+    redactor: &DoctorE2eRedactor,
+    snapshot: &DoctorE2eFileTreeSnapshot,
+    phase: &str,
+) -> Value {
+    let manifest = fixture.manifest();
+    let source_artifacts: Vec<_> = manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_kind == "provider_source_log")
+        .map(|artifact| {
+            json!({
+                "artifact_kind": artifact.artifact_kind,
+                "relative_path": artifact.relative_path,
+                "size_bytes": artifact.size_bytes,
+                "blake3": artifact.blake3,
+            })
+        })
+        .collect();
+    let raw_mirror_artifacts: Vec<_> = manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_kind.starts_with("raw_mirror_"))
+        .map(|artifact| {
+            json!({
+                "artifact_kind": artifact.artifact_kind,
+                "relative_path": artifact.relative_path,
+                "size_bytes": artifact.size_bytes,
+                "blake3": artifact.blake3,
+            })
+        })
+        .collect();
+    let source_tree_entries = file_tree_entries_matching(snapshot, |root_id, relative_path| {
+        root_id == "home" && looks_like_agent_source_path(relative_path)
+    });
+    let raw_mirror_tree_entries = file_tree_entries_matching(snapshot, |root_id, relative_path| {
+        root_id == "data" && relative_path.starts_with("raw-mirror/v1/")
+    });
+
+    json!({
+        "schema_version": DOCTOR_E2E_SCHEMA_VERSION,
+        "scenario_id": spec.scenario_id,
+        "phase": phase,
+        "fixture_root": redactor.redact(&fixture.root().display().to_string()),
+        "source_discovery": {
+            "provider_set": &manifest.provider_set,
+            "expected_provider_counts": &manifest.expected_source_inventory.provider_counts,
+            "expected_total_conversations": manifest.expected_source_inventory.total_conversations,
+            "expected_missing_current_source_count": manifest.expected_source_inventory.missing_current_source_count,
+            "structured_fixture_log": &manifest.structured_log,
+        },
+        "upstream_source_files": {
+            "artifact_count": source_artifacts.len(),
+            "tree_entry_count": source_tree_entries.len(),
+            "artifacts": source_artifacts,
+            "tree_entries": source_tree_entries,
+        },
+        "raw_mirror_files": {
+            "artifact_count": raw_mirror_artifacts.len(),
+            "tree_entry_count": raw_mirror_tree_entries.len(),
+            "artifacts": raw_mirror_artifacts,
+            "tree_entries": raw_mirror_tree_entries,
+        },
+    })
+}
+
+fn build_execution_flow_log(
+    spec: &DoctorE2eScenarioSpec,
+    fixture_inventory: &Value,
+    source_inventory_before: &Value,
+    source_inventory_after: &Value,
+    parsed_json: Option<&Value>,
+    command_record: &DoctorE2eCommandRecord,
+    mutation_diffs: &[String],
+) -> Vec<Value> {
+    let parse_status = if command_record.parsed_json_ok {
+        "parsed"
+    } else {
+        "failed"
+    };
+    let doctor_checks = parsed_json
+        .and_then(|value| value.pointer("/checks"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let source_authority = parsed_json
+        .and_then(|value| value.pointer("/source_authority"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let raw_mirror = parsed_json
+        .and_then(|value| value.pointer("/raw_mirror"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    vec![
+        json!({
+            "phase": "source_discovery",
+            "scenario_id": spec.scenario_id,
+            "status": "recorded",
+            "details": source_inventory_before["source_discovery"].clone(),
+        }),
+        json!({
+            "phase": "raw_mirror_hash",
+            "scenario_id": spec.scenario_id,
+            "status": "recorded",
+            "details": {
+                "fixture_mirror_hash_inventory": fixture_inventory["mirror_hash_inventory"].clone(),
+                "before_raw_mirror_files": source_inventory_before["raw_mirror_files"].clone(),
+                "doctor_raw_mirror_status": raw_mirror.get("status").cloned().unwrap_or(Value::Null),
+                "doctor_raw_mirror_summary": raw_mirror.get("summary").cloned().unwrap_or(Value::Null),
+            },
+        }),
+        json!({
+            "phase": "parse_outcome",
+            "scenario_id": spec.scenario_id,
+            "status": parse_status,
+            "details": {
+                "command_id": command_record.command_id,
+                "argv": command_record.argv,
+                "env": command_record.env,
+                "exit_code": command_record.exit_code,
+                "parsed_json_ok": command_record.parsed_json_ok,
+                "doctor_checks": doctor_checks,
+            },
+        }),
+        json!({
+            "phase": "db_projection_outcome",
+            "scenario_id": spec.scenario_id,
+            "status": fixture_inventory["db_row_counts"]["status"].clone(),
+            "details": {
+                "fixture_db_row_counts": fixture_inventory["db_row_counts"].clone(),
+                "doctor_source_authority": source_authority,
+            },
+        }),
+        json!({
+            "phase": "source_inventory_before",
+            "scenario_id": spec.scenario_id,
+            "status": "recorded",
+            "details": source_inventory_before,
+        }),
+        json!({
+            "phase": "source_inventory_after",
+            "scenario_id": spec.scenario_id,
+            "status": "recorded",
+            "details": source_inventory_after,
+        }),
+        json!({
+            "phase": "mutation_audit",
+            "scenario_id": spec.scenario_id,
+            "status": if mutation_diffs.is_empty() { "unchanged" } else { "changed" },
+            "details": {
+                "mutation_diff_count": mutation_diffs.len(),
+                "mutation_diffs": mutation_diffs,
+            },
+        }),
+    ]
+}
+
+fn file_tree_entries_matching(
+    snapshot: &DoctorE2eFileTreeSnapshot,
+    predicate: impl Fn(&str, &str) -> bool,
+) -> Vec<Value> {
+    let mut entries = Vec::new();
+    for root in &snapshot.roots {
+        for entry in &root.entries {
+            if predicate(&root.root_id, &entry.relative_path) {
+                entries.push(json!({
+                    "root_id": root.root_id,
+                    "relative_path": entry.relative_path,
+                    "entry_kind": entry.entry_kind,
+                    "size_bytes": entry.size_bytes,
+                    "blake3": entry.blake3,
+                }));
+            }
+        }
+    }
+    entries
+}
+
+fn looks_like_agent_source_path(relative_path: &str) -> bool {
+    [
+        ".claude/",
+        ".codex/",
+        ".cursor/",
+        ".gemini/",
+        ".aider/",
+        ".amp/",
+        ".cline/",
+        ".opencode/",
+        ".pi-agent/",
+        ".copilot/",
+        ".openclaw/",
+        ".clawdbot/",
+        ".vibe/",
+        ".chatgpt/",
+        ".fad/",
+    ]
+    .iter()
+    .any(|prefix| relative_path.starts_with(prefix))
+}
+
+fn doctor_command_env(fixture: &DoctorFixtureFactory) -> BTreeMap<String, String> {
+    [
+        ("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1".to_string()),
+        ("CASS_IGNORE_SOURCES_CONFIG", "1".to_string()),
+        ("NO_COLOR", "1".to_string()),
+        ("CASS_NO_COLOR", "1".to_string()),
+        ("XDG_DATA_HOME", fixture.home_dir().display().to_string()),
+        ("XDG_CONFIG_HOME", fixture.home_dir().display().to_string()),
+        ("HOME", fixture.home_dir().display().to_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect()
 }
 
 fn read_fixture_db_row_counts(data_dir: &Path, redactor: &DoctorE2eRedactor) -> Value {
@@ -1044,6 +1295,9 @@ fn artifact_key(relative: &str) -> String {
     match relative {
         "scenario.json" => "scenario_json",
         "fixture-inventory.json" => "fixture_inventory",
+        "source-inventory-before.json" => "source_inventory_before",
+        "source-inventory-after.json" => "source_inventory_after",
+        "execution-flow.jsonl" => "execution_flow",
         "commands.jsonl" => "commands_jsonl",
         "stdout/doctor-json.out" => "stdout_doctor_json",
         "stderr/doctor-json.err" => "stderr_doctor_json",

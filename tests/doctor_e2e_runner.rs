@@ -140,6 +140,9 @@ fn doctor_e2e_runner_records_artifacts_and_no_mutation_for_pruned_source() {
         "manifest.json",
         "scenario.json",
         "fixture-inventory.json",
+        "source-inventory-before.json",
+        "source-inventory-after.json",
+        "execution-flow.jsonl",
         "commands.jsonl",
         "stdout/doctor-json.out",
         "stderr/doctor-json.err",
@@ -220,6 +223,45 @@ fn doctor_e2e_runner_records_artifacts_and_no_mutation_for_pruned_source() {
         !inventory_text.contains("CASS_DOCTOR_PRIVACY_SENTINEL"),
         "fixture inventory should not leak privacy sentinels"
     );
+
+    let source_before: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("source-inventory-before.json")).unwrap(),
+    )
+    .expect("source inventory before json");
+    let source_after: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("source-inventory-after.json")).unwrap(),
+    )
+    .expect("source inventory after json");
+    assert_eq!(source_before["phase"].as_str(), Some("before"));
+    assert_eq!(source_after["phase"].as_str(), Some("after"));
+    assert!(
+        source_before["raw_mirror_files"]["tree_entry_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "before source inventory should include raw mirror file evidence"
+    );
+    assert_eq!(
+        source_before["raw_mirror_files"]["tree_entry_count"],
+        source_after["raw_mirror_files"]["tree_entry_count"],
+        "read-only doctor run should not change raw mirror inventory"
+    );
+
+    let execution_flow =
+        std::fs::read_to_string(result.artifact_dir.join("execution-flow.jsonl")).unwrap();
+    for phase in [
+        "source_discovery",
+        "raw_mirror_hash",
+        "parse_outcome",
+        "db_projection_outcome",
+        "source_inventory_before",
+        "source_inventory_after",
+        "mutation_audit",
+    ] {
+        assert!(
+            execution_flow.contains(&format!("\"phase\":\"{phase}\"")),
+            "execution flow should include phase {phase}: {execution_flow}"
+        );
+    }
 }
 
 #[test]
