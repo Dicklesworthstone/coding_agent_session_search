@@ -4910,6 +4910,12 @@ fn error_indicates_missing_table(err: &impl std::fmt::Display) -> bool {
         .contains("no such table")
 }
 
+fn error_indicates_missing_column(err: &impl std::fmt::Display) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("no such column")
+}
+
 const ORPHAN_FK_ID_CHUNK_SIZE: usize = 256;
 
 fn collect_orphan_message_ids(conn: &FrankenConnection) -> Result<Vec<i64>> {
@@ -6233,16 +6239,31 @@ impl FrankenStorage {
         let tail_state_by_conversation: HashMap<i64, Option<i64>> =
             tail_state_rows.into_iter().collect();
 
-        let rows = self
-            .conn
-            .query_map_collect(
-                "SELECT id, last_message_idx
-                 FROM conversations
-                 ORDER BY id ASC",
-                fparams![],
-                |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<Option<i64>>(1)?)),
-            )
-            .with_context(|| "listing lexical rebuild conversation footprint estimates")?;
+        let rows: Vec<(i64, Option<i64>)> = match self.conn.query_map_collect(
+            "SELECT id, last_message_idx
+             FROM conversations
+             ORDER BY id ASC",
+            fparams![],
+            |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<Option<i64>>(1)?)),
+        ) {
+            Ok(rows) => rows,
+            Err(err) if error_indicates_missing_column(&err) => self
+                .conn
+                .query_map_collect(
+                    "SELECT id
+                     FROM conversations
+                     ORDER BY id ASC",
+                    fparams![],
+                    |row| Ok((row.get_typed::<i64>(0)?, None)),
+                )
+                .with_context(|| {
+                    "listing lexical rebuild conversation ids after missing tail column fallback"
+                })?,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| "listing lexical rebuild conversation footprint estimates");
+            }
+        };
 
         let mut footprints = Vec::with_capacity(rows.len());
         let mut missing_tail_positions = HashMap::new();
@@ -18961,6 +18982,31 @@ mod tests {
                 message_bytes: 11 * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
             }],
             "read-only lexical self-heal must tolerate pre-tail-cache databases and use messages MAX(idx)"
+        );
+    }
+
+    #[test]
+    fn list_conversation_footprints_for_lexical_rebuild_tolerates_legacy_search_demo_fixture() {
+        let fixture_db = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("search_demo_data")
+            .join("agent_search.db");
+        let storage = FrankenStorage::open_readonly(&fixture_db).unwrap();
+
+        let footprints = storage
+            .list_conversation_footprints_for_lexical_rebuild()
+            .unwrap();
+
+        assert!(
+            !footprints.is_empty(),
+            "search self-heal should be able to plan a lexical rebuild from the legacy search demo fixture"
+        );
+        assert!(
+            footprints
+                .iter()
+                .all(|footprint| footprint.message_count > 0),
+            "legacy fixture conversations should derive message counts from messages when tail caches are absent"
         );
     }
 
