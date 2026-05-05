@@ -17476,6 +17476,22 @@ fn doctor_safety_gate_for_cleanup_action(
     }
 }
 
+fn doctor_cleanup_action_id(action: &DiagCleanupApplyAction) -> String {
+    doctor_canonical_blake3(
+        "doctor-action-v1",
+        serde_json::json!({
+            "action_kind": action.artifact_kind,
+            "mode": DoctorRepairMode::CleanupApply,
+            "asset_class": action.asset_safety.asset_class,
+            "target_path": action.path,
+            "generation_id": action.generation_id,
+            "shard_id": action.shard_id,
+            "planned_bytes": action.planned_reclaimable_bytes,
+            "reason": action.reason,
+        }),
+    )
+}
+
 fn doctor_action_from_cleanup_action(
     action: &DiagCleanupApplyAction,
     status: DoctorActionStatus,
@@ -17533,19 +17549,7 @@ fn doctor_action_from_cleanup_action(
     } else {
         0
     };
-    let action_id = doctor_canonical_blake3(
-        "doctor-action-v1",
-        serde_json::json!({
-            "action_kind": action.artifact_kind,
-            "mode": DoctorRepairMode::CleanupApply,
-            "asset_class": action.asset_safety.asset_class,
-            "target_path": action.path,
-            "generation_id": action.generation_id,
-            "shard_id": action.shard_id,
-            "planned_bytes": action.planned_reclaimable_bytes,
-            "reason": action.reason,
-        }),
-    );
+    let action_id = doctor_cleanup_action_id(action);
     DoctorAction {
         action_id,
         action_kind: action.artifact_kind.clone(),
@@ -18385,6 +18389,46 @@ struct DiagCleanupApplyAction {
     applied: bool,
     skipped: bool,
     skip_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mutation_receipt: Option<DoctorFsMutationReceipt>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DoctorFsMutationKind {
+    #[default]
+    PruneCleanupTarget,
+}
+
+#[derive(Debug, Clone)]
+struct DoctorFsMutationRequest<'a> {
+    operation_id: &'a str,
+    action_id: &'a str,
+    mutation_kind: DoctorFsMutationKind,
+    mode: DoctorRepairMode,
+    asset_class: DoctorAssetClass,
+    target_path: &'a Path,
+    data_dir: &'a Path,
+    db_path: &'a Path,
+    index_path: &'a Path,
+    planned_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorFsMutationReceipt {
+    schema_version: u32,
+    operation_id: String,
+    action_id: String,
+    mutation_kind: DoctorFsMutationKind,
+    mode: DoctorRepairMode,
+    asset_class: DoctorAssetClass,
+    target_path: String,
+    redacted_target_path: String,
+    planned_bytes: u64,
+    affected_bytes: u64,
+    status: DoctorActionStatus,
+    blocked_reasons: Vec<String>,
+    precondition_checks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -18944,10 +18988,25 @@ fn apply_diag_quarantine_cleanup(
             applied: false,
             skipped: false,
             skip_reason: None,
+            mutation_receipt: None,
         };
 
-        match prune_cleanup_target(&path, data_dir, db_path, index_path, asset_class) {
-            Ok(reclaimed_bytes) => {
+        let action_id = doctor_cleanup_action_id(&action);
+        let mutation_receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: &result.approval_fingerprint,
+            action_id: &action_id,
+            mutation_kind: DoctorFsMutationKind::PruneCleanupTarget,
+            mode: DoctorRepairMode::CleanupApply,
+            asset_class,
+            target_path: &path,
+            data_dir,
+            db_path,
+            index_path,
+            planned_bytes: action.planned_reclaimable_bytes,
+        });
+        match mutation_receipt.status {
+            DoctorActionStatus::Applied => {
+                let reclaimed_bytes = mutation_receipt.affected_bytes;
                 action.reclaimed_bytes = reclaimed_bytes;
                 action.applied = true;
                 result.pruned_asset_count = result.pruned_asset_count.saturating_add(1);
@@ -18960,13 +19019,15 @@ fn apply_diag_quarantine_cleanup(
                     "pruned retained lexical publish backup outside retention cap"
                 );
             }
-            Err(err) => {
+            _ => {
+                let err = mutation_receipt.blocked_reasons.join("; ");
                 action.skipped = true;
                 action.skip_reason = Some(err.clone());
                 result.skipped_asset_count = result.skipped_asset_count.saturating_add(1);
                 result.warnings.push(err);
             }
         }
+        action.mutation_receipt = Some(mutation_receipt);
 
         result.actions.push(action);
     }
@@ -19016,6 +19077,7 @@ fn apply_diag_quarantine_cleanup(
                 applied: false,
                 skipped: false,
                 skip_reason: None,
+                mutation_receipt: None,
             };
 
             let generation_fully_reclaimable = inventory.retained_bytes == 0
@@ -19040,8 +19102,22 @@ fn apply_diag_quarantine_cleanup(
                 continue;
             }
 
-            match prune_cleanup_target(&entry.path, data_dir, db_path, index_path, asset_class) {
-                Ok(reclaimed_bytes) => {
+            let action_id = doctor_cleanup_action_id(&action);
+            let mutation_receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+                operation_id: &result.approval_fingerprint,
+                action_id: &action_id,
+                mutation_kind: DoctorFsMutationKind::PruneCleanupTarget,
+                mode: DoctorRepairMode::CleanupApply,
+                asset_class,
+                target_path: &entry.path,
+                data_dir,
+                db_path,
+                index_path,
+                planned_bytes: action.planned_reclaimable_bytes,
+            });
+            match mutation_receipt.status {
+                DoctorActionStatus::Applied => {
+                    let reclaimed_bytes = mutation_receipt.affected_bytes;
                     action.reclaimed_bytes = reclaimed_bytes;
                     action.applied = true;
                     result.pruned_asset_count = result.pruned_asset_count.saturating_add(1);
@@ -19057,13 +19133,15 @@ fn apply_diag_quarantine_cleanup(
                         "pruned reclaimable lexical generation"
                     );
                 }
-                Err(err) => {
+                _ => {
+                    let err = mutation_receipt.blocked_reasons.join("; ");
                     action.skipped = true;
                     action.skip_reason = Some(err.clone());
                     result.skipped_asset_count = result.skipped_asset_count.saturating_add(1);
                     result.warnings.push(err);
                 }
             }
+            action.mutation_receipt = Some(mutation_receipt);
 
             result.actions.push(action);
         }
@@ -19108,39 +19186,98 @@ fn cleanup_apply_inventory_from_report(report: &DiagQuarantineReport) -> DiagCle
     }
 }
 
-fn prune_cleanup_target(
-    path: &Path,
-    data_dir: &Path,
-    db_path: &Path,
-    index_path: &Path,
-    asset_class: DoctorAssetClass,
-) -> Result<u64, String> {
-    if !doctor_repair_mode_allows_asset_mutation(DoctorRepairMode::CleanupApply, asset_class) {
-        return Err(format!(
+fn execute_doctor_fs_mutation(request: DoctorFsMutationRequest<'_>) -> DoctorFsMutationReceipt {
+    let mut receipt = DoctorFsMutationReceipt {
+        schema_version: 1,
+        operation_id: request.operation_id.to_string(),
+        action_id: request.action_id.to_string(),
+        mutation_kind: request.mutation_kind,
+        mode: request.mode,
+        asset_class: request.asset_class,
+        target_path: request.target_path.display().to_string(),
+        redacted_target_path: doctor_redacted_path(
+            &request.target_path.display().to_string(),
+            request.data_dir,
+        ),
+        planned_bytes: request.planned_bytes,
+        affected_bytes: 0,
+        status: DoctorActionStatus::Blocked,
+        blocked_reasons: Vec::new(),
+        precondition_checks: Vec::new(),
+    };
+
+    if request.mutation_kind != DoctorFsMutationKind::PruneCleanupTarget {
+        receipt.blocked_reasons.push(format!(
+            "unsupported doctor filesystem mutation kind {:?}",
+            request.mutation_kind
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("mutation_kind_prune_cleanup_target".to_string());
+
+    if !doctor_repair_mode_allows_asset_mutation(request.mode, request.asset_class) {
+        receipt.blocked_reasons.push(format!(
             "refusing to prune asset class {:?}: cleanup_apply mode does not allow this mutation",
-            asset_class
+            request.asset_class
         ));
+        return receipt;
     }
-    if !doctor_asset_safe_to_gc(asset_class, true) {
-        return Err(format!(
+    receipt
+        .precondition_checks
+        .push("mode_allows_asset_class".to_string());
+
+    if !doctor_asset_safe_to_gc(request.asset_class, true) {
+        receipt.blocked_reasons.push(format!(
             "refusing to prune asset class {:?}: taxonomy does not allow automatic reclaim",
-            asset_class
+            request.asset_class
         ));
+        return receipt;
     }
-    if !cleanup_target_path_is_safe(path, data_dir, db_path, index_path) {
-        return Err(format!(
+    receipt
+        .precondition_checks
+        .push("taxonomy_allows_automatic_reclaim".to_string());
+
+    if !cleanup_target_path_is_safe(
+        request.target_path,
+        request.data_dir,
+        request.db_path,
+        request.index_path,
+    ) {
+        receipt.blocked_reasons.push(format!(
             "refusing to prune unsafe cleanup target {}",
-            path.display()
+            request.target_path.display()
         ));
+        return receipt;
     }
-    let reclaimed_bytes = fs_dir_size(path);
-    if path.is_dir() {
-        std::fs::remove_dir_all(path)
+    receipt
+        .precondition_checks
+        .push("path_confined_to_reclaimable_cleanup_target".to_string());
+
+    let reclaimed_bytes = fs_dir_size(request.target_path);
+    let remove_result = if request.target_path.is_dir() {
+        std::fs::remove_dir_all(request.target_path)
     } else {
-        std::fs::remove_file(path)
+        std::fs::remove_file(request.target_path)
+    };
+    match remove_result {
+        Ok(()) => {
+            receipt.affected_bytes = reclaimed_bytes;
+            receipt.status = DoctorActionStatus::Applied;
+            receipt
+                .precondition_checks
+                .push("filesystem_remove_completed".to_string());
+        }
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(format!(
+                "failed to prune cleanup target {}: {err}",
+                request.target_path.display()
+            ));
+        }
     }
-    .map_err(|err| format!("failed to prune cleanup target {}: {err}", path.display()))?;
-    Ok(reclaimed_bytes)
+    receipt
 }
 
 fn cleanup_target_path_is_safe(
@@ -20185,6 +20322,7 @@ mod doctor_asset_taxonomy_tests {
                 applied: true,
                 skipped: false,
                 skip_reason: None,
+                mutation_receipt: None,
             }],
             ..DiagCleanupApplyResult::default()
         };
@@ -20263,6 +20401,7 @@ mod doctor_asset_taxonomy_tests {
             applied: false,
             skipped: false,
             skip_reason: None,
+            mutation_receipt: None,
         }
     }
 
@@ -20445,6 +20584,208 @@ mod doctor_asset_taxonomy_tests {
     }
 
     #[test]
+    fn doctor_fs_mutation_executor_prunes_allowed_cleanup_target_with_receipt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let backup_parent = index_path
+            .parent()
+            .expect("index parent")
+            .join(".lexical-publish-backups");
+        std::fs::create_dir_all(&backup_parent).expect("create publish backup parent");
+        let candidate = backup_parent.join("2026-05-05-prior-live");
+        std::fs::create_dir_all(&candidate).expect("create cleanup candidate");
+        std::fs::write(candidate.join("segment.idx"), b"reclaim me")
+            .expect("write cleanup candidate payload");
+
+        let planned_bytes = fs_dir_size(&candidate);
+        let action = test_cleanup_action(&candidate.display().to_string(), planned_bytes);
+        let action_id = doctor_cleanup_action_id(&action);
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "cleanup-v1-test-operation",
+            action_id: &action_id,
+            mutation_kind: DoctorFsMutationKind::PruneCleanupTarget,
+            mode: DoctorRepairMode::CleanupApply,
+            asset_class: DoctorAssetClass::RetainedPublishBackup,
+            target_path: &candidate,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            planned_bytes,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Applied);
+        assert_eq!(receipt.operation_id, "cleanup-v1-test-operation");
+        assert_eq!(receipt.action_id, action_id);
+        assert_eq!(
+            receipt.mutation_kind,
+            DoctorFsMutationKind::PruneCleanupTarget
+        );
+        assert_eq!(receipt.asset_class, DoctorAssetClass::RetainedPublishBackup);
+        assert_eq!(receipt.planned_bytes, planned_bytes);
+        assert_eq!(receipt.affected_bytes, planned_bytes);
+        assert!(
+            receipt
+                .redacted_target_path
+                .starts_with("[cass-data]/index/.lexical-publish-backups/"),
+            "receipt should carry redacted path for operator diagnostics without leaking the full path: {:?}",
+            receipt.redacted_target_path
+        );
+        for expected in [
+            "mutation_kind_prune_cleanup_target",
+            "mode_allows_asset_class",
+            "taxonomy_allows_automatic_reclaim",
+            "path_confined_to_reclaimable_cleanup_target",
+            "filesystem_remove_completed",
+        ] {
+            assert!(
+                receipt
+                    .precondition_checks
+                    .iter()
+                    .any(|observed| observed == expected),
+                "missing executor receipt precondition {expected}: {:?}",
+                receipt.precondition_checks
+            );
+        }
+        assert!(
+            !candidate.exists(),
+            "allowed derived cleanup target should be removed by the audited executor"
+        );
+        assert!(
+            db_path.exists(),
+            "canonical archive DB must remain untouched"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_refuses_precious_archive_unlink() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write db placeholder");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "cleanup-v1-precious-refusal",
+            action_id: "canonical-db-delete-attempt",
+            mutation_kind: DoctorFsMutationKind::PruneCleanupTarget,
+            mode: DoctorRepairMode::CleanupApply,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            target_path: &db_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            planned_bytes: fs_dir_size(&db_path),
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert_eq!(receipt.affected_bytes, 0);
+        assert!(
+            receipt.blocked_reasons.iter().any(|reason| {
+                reason.contains("cleanup_apply mode does not allow this mutation")
+                    || reason.contains("taxonomy does not allow automatic reclaim")
+            }),
+            "precious archive refusal should name the policy blocker: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "filesystem_remove_completed"),
+            "blocked precious evidence must not reach the unlink/remove step"
+        );
+        assert!(db_path.exists(), "canonical archive DB must not be removed");
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_blocks_missing_cleanup_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+        let missing_candidate = index_path
+            .parent()
+            .expect("index parent")
+            .join(".lexical-publish-backups")
+            .join("missing-prior-live");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "cleanup-v1-missing-target",
+            action_id: "missing-target",
+            mutation_kind: DoctorFsMutationKind::PruneCleanupTarget,
+            mode: DoctorRepairMode::CleanupApply,
+            asset_class: DoctorAssetClass::RetainedPublishBackup,
+            target_path: &missing_candidate,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            planned_bytes: 1,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe cleanup target")),
+            "missing targets must fail as an unsafe precondition, not as a best-effort deletion: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "filesystem_remove_completed"),
+            "missing target must not record a completed filesystem mutation"
+        );
+    }
+
+    #[test]
+    fn doctor_cleanup_apply_cannot_bypass_fs_mutation_executor_for_pruning() {
+        let source = include_str!("lib.rs");
+        let cleanup_start = source
+            .find("fn apply_diag_quarantine_cleanup(")
+            .expect("cleanup apply function");
+        let cleanup_end = source
+            .find("fn fill_cleanup_after_summary(")
+            .expect("cleanup apply end marker");
+        let cleanup_source = &source[cleanup_start..cleanup_end];
+
+        assert!(
+            cleanup_source.matches("execute_doctor_fs_mutation").count() >= 2,
+            "cleanup apply should route both retained publish backup and lexical generation pruning through the audited executor"
+        );
+        for forbidden in ["remove_dir_all", "remove_file"] {
+            assert!(
+                !cleanup_source.contains(forbidden),
+                "cleanup apply must not call {forbidden} directly; all filesystem pruning goes through execute_doctor_fs_mutation"
+            );
+        }
+
+        let executor_start = source
+            .find("fn execute_doctor_fs_mutation(")
+            .expect("filesystem mutation executor");
+        let executor_end = source
+            .find("fn cleanup_target_path_is_safe(")
+            .expect("executor end marker");
+        let executor_source = &source[executor_start..executor_end];
+        assert!(
+            executor_source.contains("remove_dir_all")
+                && executor_source.contains("remove_file")
+                && executor_source.contains("cleanup_target_path_is_safe"),
+            "the only cleanup unlink/remove implementation should live inside the executor next to its path guard"
+        );
+    }
+
+    #[test]
     fn doctor_cleanup_event_log_orders_hash_chain_and_correlates_receipts() {
         let data_dir = Path::new("/tmp/cass");
         let db_path = data_dir.join("agent_search.db");
@@ -20471,6 +20812,7 @@ mod doctor_asset_taxonomy_tests {
                 applied: true,
                 skipped: false,
                 skip_reason: None,
+                mutation_receipt: None,
             }],
             ..DiagCleanupApplyResult::default()
         };
@@ -21493,6 +21835,61 @@ mod cleanup_target_safety_tests {
                 &normal_index_path,
             ),
             "normal retained publish backups under data_dir must remain eligible for policy pruning"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_rejects_symlinked_publish_backup_parent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        let index_parent = index_path.parent().expect("index parent");
+        std::fs::create_dir_all(index_parent).expect("create index parent");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let external_backup_root = temp.path().join("outside-backups");
+        std::fs::create_dir_all(&external_backup_root).expect("create external backup root");
+
+        let publish_backup_parent = index_parent.join(".lexical-publish-backups");
+        std::os::unix::fs::symlink(&external_backup_root, &publish_backup_parent)
+            .expect("create symlinked retained publish backup parent");
+        let symlinked_candidate = publish_backup_parent.join("prior-live-older");
+        std::fs::create_dir_all(&symlinked_candidate).expect("create candidate via symlink parent");
+        std::fs::write(symlinked_candidate.join("payload.idx"), b"outside data")
+            .expect("write candidate payload");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "cleanup-v1-symlink-refusal",
+            action_id: "symlinked-retained-backup",
+            mutation_kind: DoctorFsMutationKind::PruneCleanupTarget,
+            mode: DoctorRepairMode::CleanupApply,
+            asset_class: DoctorAssetClass::RetainedPublishBackup,
+            target_path: &symlinked_candidate,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            planned_bytes: fs_dir_size(&symlinked_candidate),
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe cleanup target")),
+            "executor must report the symlink escape as a blocked unsafe target: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            symlinked_candidate.exists(),
+            "executor must not delete through symlinked backup roots"
+        );
+        assert!(
+            external_backup_root.join("prior-live-older").exists(),
+            "outside target reached through the symlink must remain intact"
         );
     }
 
