@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
 use super::cass_bin;
-use super::doctor_fixture::{DoctorFixtureFactory, DoctorFixtureScenario};
+use super::doctor_fixture::{
+    DoctorFixtureFactory, DoctorFixtureScenario, default_expected_artifact_keys,
+};
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -267,6 +270,13 @@ impl DoctorE2eRunner {
             &scenario_artifact_dir,
             "file-tree-before.json",
             &before,
+            &mut artifacts,
+        )?;
+        let fixture_inventory = build_fixture_inventory(spec, &fixture, &redactor, &before);
+        write_json_artifact(
+            &scenario_artifact_dir,
+            "fixture-inventory.json",
+            &fixture_inventory,
             &mut artifacts,
         )?;
 
@@ -664,6 +674,141 @@ impl DoctorE2eRedactor {
     }
 }
 
+fn build_fixture_inventory(
+    spec: &DoctorE2eScenarioSpec,
+    fixture: &DoctorFixtureFactory,
+    redactor: &DoctorE2eRedactor,
+    before: &DoctorE2eFileTreeSnapshot,
+) -> Value {
+    let manifest = fixture.manifest();
+    let expected_source_inventory = &manifest.expected_source_inventory;
+    let db_row_counts = read_fixture_db_row_counts(fixture.data_dir(), redactor);
+    let data_dir_entries: Vec<_> = before
+        .roots
+        .iter()
+        .find(|root| root.root_id == "data")
+        .map(|root| {
+            root.entries
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "relative_path": entry.relative_path,
+                        "entry_kind": entry.entry_kind,
+                        "size_bytes": entry.size_bytes,
+                        "blake3": entry.blake3,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mirror_hash_inventory: Vec<_> = manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_kind.starts_with("raw_mirror_"))
+        .map(|artifact| {
+            json!({
+                "artifact_kind": artifact.artifact_kind,
+                "relative_path": artifact.relative_path,
+                "size_bytes": artifact.size_bytes,
+                "blake3": artifact.blake3,
+            })
+        })
+        .collect();
+
+    json!({
+        "schema_version": DOCTOR_E2E_SCHEMA_VERSION,
+        "scenario_id": spec.scenario_id,
+        "fixture_id": manifest.fixture_id,
+        "labels": spec.labels.iter().cloned().collect::<Vec<_>>(),
+        "fixture_root": redactor.redact(&fixture.root().display().to_string()),
+        "home_dir": redactor.redact(&fixture.home_dir().display().to_string()),
+        "data_dir": redactor.redact(&fixture.data_dir().display().to_string()),
+        "risk_class": &manifest.risk_class,
+        "expected_mutation_class": &manifest.expected_mutation_class,
+        "repair_eligibility": &manifest.repair_eligibility,
+        "allowed_commands": &manifest.allowed_commands,
+        "forbidden_live_path_patterns": &manifest.forbidden_live_path_patterns,
+        "expected_artifact_keys": &manifest.expected_artifact_keys,
+        "redaction_policy": &manifest.redaction_policy,
+        "expected_anomalies": &manifest.expected_anomalies,
+        "expected_coverage_state": &manifest.expected_coverage_state,
+        "db_row_counts": db_row_counts,
+        "source_inventory": expected_source_inventory,
+        "mirror_hash_inventory": mirror_hash_inventory,
+        "data_dir_inventory": {
+            "entry_count": data_dir_entries.len(),
+            "entries": data_dir_entries,
+        },
+    })
+}
+
+fn read_fixture_db_row_counts(data_dir: &Path, redactor: &DoctorE2eRedactor) -> Value {
+    let db_path = data_dir.join("agent_search.db");
+    if !db_path.exists() {
+        return json!({
+            "status": "missing",
+            "agents": Value::Null,
+            "conversations": Value::Null,
+            "messages": Value::Null,
+            "errors": {},
+        });
+    }
+
+    let storage = match SqliteStorage::open_readonly(&db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            return json!({
+                "status": "unreadable",
+                "agents": Value::Null,
+                "conversations": Value::Null,
+                "messages": Value::Null,
+                "errors": {
+                    "open_readonly": redactor.redact(&err.to_string()),
+                },
+            });
+        }
+    };
+
+    let mut errors = BTreeMap::new();
+    let agents = match storage.list_agents() {
+        Ok(agents) => json!(agents.len()),
+        Err(err) => {
+            errors.insert("agents".to_string(), redactor.redact(&err.to_string()));
+            Value::Null
+        }
+    };
+    let conversations = match storage.total_conversation_count() {
+        Ok(count) => json!(count),
+        Err(err) => {
+            errors.insert(
+                "conversations".to_string(),
+                redactor.redact(&err.to_string()),
+            );
+            Value::Null
+        }
+    };
+    let messages = match storage.total_message_count() {
+        Ok(count) => json!(count),
+        Err(err) => {
+            errors.insert("messages".to_string(), redactor.redact(&err.to_string()));
+            Value::Null
+        }
+    };
+    let status = if errors.is_empty() {
+        "ok"
+    } else {
+        "partial-error"
+    };
+
+    json!({
+        "status": status,
+        "agents": agents,
+        "conversations": conversations,
+        "messages": messages,
+        "errors": errors,
+    })
+}
+
 pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
     vec![
         DoctorE2eScenarioSpec::new(
@@ -751,19 +896,8 @@ pub fn validate_artifact_manifest_value(
     if manifest.command_count == 0 {
         return Err("command_count must be greater than zero".to_string());
     }
-    for required in [
-        "scenario_json",
-        "commands_jsonl",
-        "stdout_doctor_json",
-        "stderr_doctor_json",
-        "file_tree_before",
-        "file_tree_after",
-        "checksums",
-        "timing",
-        "receipts",
-        "doctor_logs",
-    ] {
-        let Some(relative) = manifest.artifacts.get(required) else {
+    for required in default_expected_artifact_keys() {
+        let Some(relative) = manifest.artifacts.get(&required) else {
             return Err(format!(
                 "manifest is missing required artifact key {required}"
             ));
@@ -909,6 +1043,7 @@ fn artifact_path(artifact_dir: &Path, relative: &str) -> Result<PathBuf, String>
 fn artifact_key(relative: &str) -> String {
     match relative {
         "scenario.json" => "scenario_json",
+        "fixture-inventory.json" => "fixture_inventory",
         "commands.jsonl" => "commands_jsonl",
         "stdout/doctor-json.out" => "stdout_doctor_json",
         "stderr/doctor-json.err" => "stderr_doctor_json",

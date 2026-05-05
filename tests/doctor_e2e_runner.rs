@@ -7,7 +7,7 @@ use util::doctor_e2e_runner::{
     parse_doctor_json_stdout, select_scenarios, validate_artifact_manifest,
     validate_artifact_manifest_value,
 };
-use util::doctor_fixture::DoctorFixtureScenario;
+use util::doctor_fixture::{DoctorFixtureScenario, default_expected_artifact_keys};
 
 #[test]
 fn doctor_e2e_cli_args_parse_labels_scenarios_and_flags() {
@@ -92,18 +92,7 @@ fn doctor_e2e_json_parse_failures_are_diagnostic() {
 fn doctor_e2e_manifest_validation_rejects_missing_artifacts() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let mut artifacts = BTreeMap::new();
-    for key in [
-        "scenario_json",
-        "commands_jsonl",
-        "stdout_doctor_json",
-        "stderr_doctor_json",
-        "file_tree_before",
-        "file_tree_after",
-        "checksums",
-        "timing",
-        "receipts",
-        "doctor_logs",
-    ] {
+    for key in default_expected_artifact_keys() {
         artifacts.insert(key.to_string(), format!("{key}.missing"));
     }
     let manifest = DoctorE2eArtifactManifest {
@@ -150,6 +139,7 @@ fn doctor_e2e_runner_records_artifacts_and_no_mutation_for_pruned_source() {
     for relative in [
         "manifest.json",
         "scenario.json",
+        "fixture-inventory.json",
         "commands.jsonl",
         "stdout/doctor-json.out",
         "stderr/doctor-json.err",
@@ -188,6 +178,47 @@ fn doctor_e2e_runner_records_artifacts_and_no_mutation_for_pruned_source() {
         doctor_events.contains("\"hash_chain_tip\"")
             || doctor_events.contains("\"previous_event_hash\""),
         "doctor event artifact should include hash-chain evidence for debugging"
+    );
+
+    let fixture_inventory: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("fixture-inventory.json")).unwrap(),
+    )
+    .expect("fixture inventory json");
+    assert_eq!(
+        fixture_inventory["scenario_id"].as_str(),
+        Some("artifact-pruned-source")
+    );
+    assert_eq!(
+        fixture_inventory["db_row_counts"]["status"].as_str(),
+        Some("ok")
+    );
+    assert_eq!(
+        fixture_inventory["db_row_counts"]["agents"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        fixture_inventory["db_row_counts"]["conversations"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        fixture_inventory["db_row_counts"]["messages"].as_u64(),
+        Some(2)
+    );
+    assert!(
+        fixture_inventory["mirror_hash_inventory"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "fixture inventory should include raw mirror hash evidence"
+    );
+    let inventory_text =
+        serde_json::to_string(&fixture_inventory).expect("serialize fixture inventory");
+    assert!(
+        !inventory_text.contains(temp.path().to_string_lossy().as_ref()),
+        "fixture inventory should redact temp paths"
+    );
+    assert!(
+        !inventory_text.contains("CASS_DOCTOR_PRIVACY_SENTINEL"),
+        "fixture inventory should not leak privacy sentinels"
     );
 }
 

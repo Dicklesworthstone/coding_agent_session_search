@@ -3,6 +3,7 @@ mod util;
 use serde_json::Value;
 use util::doctor_fixture::{
     DoctorFixtureArtifact, DoctorFixtureFactory, DoctorFixtureScenario, DoctorProviderSpec,
+    default_expected_artifact_keys,
 };
 
 #[test]
@@ -99,12 +100,14 @@ fn doctor_fixture_factory_can_materialize_all_named_scenarios() {
         DoctorFixtureScenario::DbCorrupt,
         DoctorFixtureScenario::IndexCorrupt,
         DoctorFixtureScenario::StaleLock,
+        DoctorFixtureScenario::ActiveLock,
         DoctorFixtureScenario::InterruptedRepair,
         DoctorFixtureScenario::BackupAvailable,
         DoctorFixtureScenario::LowDisk,
         DoctorFixtureScenario::BackupExclusion,
         DoctorFixtureScenario::SupportBundle,
         DoctorFixtureScenario::MultiSource,
+        DoctorFixtureScenario::PathEdgeCases,
     ] {
         let mut factory = DoctorFixtureFactory::new(format!("scenario-{scenario:?}"));
         factory.apply_scenario(scenario);
@@ -112,10 +115,77 @@ fn doctor_fixture_factory_can_materialize_all_named_scenarios() {
             .validate_manifest()
             .unwrap_or_else(|err| panic!("scenario {scenario:?} manifest invalid: {err}"));
         assert!(
+            !factory.manifest().risk_class.trim().is_empty(),
+            "scenario {scenario:?} should declare a risk class"
+        );
+        assert!(
+            !factory.manifest().expected_mutation_class.trim().is_empty(),
+            "scenario {scenario:?} should declare a mutation class"
+        );
+        assert!(
+            !factory.manifest().repair_eligibility.trim().is_empty(),
+            "scenario {scenario:?} should declare repair eligibility"
+        );
+        assert!(
             !factory.manifest().structured_log.is_empty(),
             "scenario {scenario:?} should emit structured setup log entries"
         );
     }
+}
+
+#[test]
+fn doctor_fixture_manifest_declares_safety_and_artifact_contracts() {
+    let mut factory = DoctorFixtureFactory::new("contract-fields");
+    factory.apply_scenario(DoctorFixtureScenario::SourcePruned);
+    factory.validate_manifest().expect("manifest valid");
+    let manifest = factory.manifest();
+
+    assert_eq!(manifest.risk_class, "archive-sole-copy-risk");
+    assert_eq!(manifest.expected_mutation_class, "read-only");
+    assert_eq!(manifest.repair_eligibility, "reconstruct-plan-required");
+    assert!(
+        manifest
+            .allowed_commands
+            .iter()
+            .all(|command| command.contains("--json") || command.contains("--robot")),
+        "allowed commands must be machine-readable: {:?}",
+        manifest.allowed_commands
+    );
+    assert!(
+        manifest
+            .forbidden_live_path_patterns
+            .iter()
+            .any(|pattern| pattern == "real-home/.codex"),
+        "manifest should document live agent harness paths that fixtures must not target"
+    );
+    for required in default_expected_artifact_keys() {
+        assert!(
+            manifest.expected_artifact_keys.contains(&required),
+            "manifest should require e2e artifact key {required}"
+        );
+    }
+    assert!(!manifest.redaction_policy.raw_session_text_in_default_output);
+    assert!(
+        !manifest
+            .redaction_policy
+            .full_source_paths_in_default_output
+    );
+    assert!(!manifest.redaction_policy.privacy_sentinel_in_default_output);
+}
+
+#[test]
+fn doctor_fixture_manifest_validation_rejects_sensitive_default_output_policy() {
+    let factory = DoctorFixtureFactory::new("bad-redaction-policy");
+    let mut manifest = factory.manifest().clone();
+    manifest.redaction_policy.raw_session_text_in_default_output = true;
+
+    let err = manifest
+        .validate_against_root(factory.root())
+        .expect_err("sensitive default output policy must be rejected");
+    assert!(
+        err.contains("default redaction policy"),
+        "validation error should explain redaction policy failure, got: {err}"
+    );
 }
 
 #[test]

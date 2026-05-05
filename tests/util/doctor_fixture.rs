@@ -39,6 +39,13 @@ enum DoctorFixtureRoot {
 pub struct DoctorFixtureScenarioManifest {
     pub schema_version: u32,
     pub fixture_id: String,
+    pub risk_class: String,
+    pub expected_mutation_class: String,
+    pub allowed_commands: Vec<String>,
+    pub forbidden_live_path_patterns: Vec<String>,
+    pub expected_artifact_keys: Vec<String>,
+    pub redaction_policy: DoctorFixtureRedactionExpectation,
+    pub repair_eligibility: String,
     pub provider_set: Vec<String>,
     pub expected_source_inventory: DoctorFixtureSourceInventoryExpectation,
     pub expected_coverage_state: String,
@@ -63,6 +70,14 @@ pub struct DoctorFixtureMutabilityExpectation {
     pub doctor_check_may_mutate: bool,
     pub doctor_fix_may_mutate: bool,
     pub protected_path_classes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorFixtureRedactionExpectation {
+    pub raw_session_text_in_default_output: bool,
+    pub full_source_paths_in_default_output: bool,
+    pub privacy_sentinel_in_default_output: bool,
+    pub sensitive_attachments_require_opt_in: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -103,12 +118,14 @@ pub enum DoctorFixtureScenario {
     DbCorrupt,
     IndexCorrupt,
     StaleLock,
+    ActiveLock,
     InterruptedRepair,
     BackupAvailable,
     LowDisk,
     BackupExclusion,
     SupportBundle,
     MultiSource,
+    PathEdgeCases,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -143,6 +160,17 @@ impl Default for DoctorFixtureMutabilityExpectation {
                 "archive_database".to_string(),
                 "privacy_sentinel".to_string(),
             ],
+        }
+    }
+}
+
+impl Default for DoctorFixtureRedactionExpectation {
+    fn default() -> Self {
+        Self {
+            raw_session_text_in_default_output: false,
+            full_source_paths_in_default_output: false,
+            privacy_sentinel_in_default_output: false,
+            sensitive_attachments_require_opt_in: true,
         }
     }
 }
@@ -200,6 +228,13 @@ impl DoctorFixtureFactory {
         let manifest = DoctorFixtureScenarioManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             fixture_id,
+            risk_class: "healthy".to_string(),
+            expected_mutation_class: "read-only".to_string(),
+            allowed_commands: default_allowed_commands(),
+            forbidden_live_path_patterns: default_forbidden_live_path_patterns(),
+            expected_artifact_keys: default_expected_artifact_keys(),
+            redaction_policy: DoctorFixtureRedactionExpectation::default(),
+            repair_eligibility: "no-op".to_string(),
             provider_set: Vec::new(),
             expected_source_inventory: DoctorFixtureSourceInventoryExpectation::default(),
             expected_coverage_state: "healthy".to_string(),
@@ -376,6 +411,7 @@ impl DoctorFixtureFactory {
     pub fn apply_scenario(&mut self, scenario: DoctorFixtureScenario) -> &mut Self {
         match scenario {
             DoctorFixtureScenario::Healthy => {
+                self.set_contract("healthy", "read-only", "no-op");
                 let _ = self.add_provider_source(
                     DoctorProviderSpec::codex(),
                     "local",
@@ -386,6 +422,11 @@ impl DoctorFixtureFactory {
                 self.manifest.expected_coverage_state = "healthy".to_string();
             }
             DoctorFixtureScenario::PartiallyIndexed => {
+                self.set_contract(
+                    "derived-asset-risk",
+                    "derived-only",
+                    "safe-derived-repair-eligible",
+                );
                 let _ = self.add_provider_source(
                     DoctorProviderSpec::codex(),
                     "local",
@@ -399,6 +440,11 @@ impl DoctorFixtureFactory {
                     .push_unique("partially-indexed");
             }
             DoctorFixtureScenario::SourcePruned => {
+                self.set_contract(
+                    "archive-sole-copy-risk",
+                    "read-only",
+                    "reconstruct-plan-required",
+                );
                 let _ = self.add_provider_source(
                     DoctorProviderSpec::codex(),
                     "local",
@@ -408,6 +454,11 @@ impl DoctorFixtureFactory {
                 );
             }
             DoctorFixtureScenario::MirrorMissing => {
+                self.set_contract(
+                    "archive-authority-risk",
+                    "blocked",
+                    "no-safe-repair-authority",
+                );
                 let _ = self.add_provider_source(
                     DoctorProviderSpec::codex(),
                     "local",
@@ -420,6 +471,11 @@ impl DoctorFixtureFactory {
                     .push_unique("raw-mirror-missing");
             }
             DoctorFixtureScenario::DbCorrupt => {
+                self.set_contract(
+                    "archive-corruption-risk",
+                    "blocked",
+                    "reconstruct-candidate-required",
+                );
                 let db_path = self.data_dir.join("agent_search.db");
                 self.write_confined_file(&db_path, b"not a sqlite database", "archive_database");
                 self.manifest
@@ -427,18 +483,35 @@ impl DoctorFixtureFactory {
                     .push_unique("archive-db-corrupt");
             }
             DoctorFixtureScenario::IndexCorrupt => {
+                self.set_contract(
+                    "derived-asset-risk",
+                    "derived-only",
+                    "safe-derived-repair-eligible",
+                );
                 self.write_marker("index/corrupt-derived-segment.fixture", b"corrupt-index");
                 self.manifest
                     .expected_anomalies
                     .push_unique("derived-lexical-stale");
             }
             DoctorFixtureScenario::StaleLock => {
+                self.set_contract("concurrency-risk", "read-only", "stale-lock-diagnosis");
                 self.write_marker("locks/doctor.stale.lock", b"pid=999999\nheartbeat=0\n");
                 self.manifest
                     .expected_anomalies
                     .push_unique("lock-contention");
             }
+            DoctorFixtureScenario::ActiveLock => {
+                self.set_contract("concurrency-risk", "read-only", "wait-required");
+                self.write_marker(
+                    "locks/doctor.active.lock",
+                    b"pid=1\nheartbeat=1733000000000\nstate=active\n",
+                );
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("active-lock-contention");
+            }
             DoctorFixtureScenario::InterruptedRepair => {
+                self.set_contract("repair-state-risk", "blocked", "resume-or-inspect-required");
                 self.write_marker(
                     "doctor/tmp/interrupted-repair/plan.json",
                     br#"{"state":"interrupted"}"#,
@@ -448,6 +521,11 @@ impl DoctorFixtureFactory {
                     .push_unique("interrupted-repair");
             }
             DoctorFixtureScenario::BackupAvailable => {
+                self.set_contract(
+                    "backup-inspection",
+                    "read-only",
+                    "restore-rehearsal-eligible",
+                );
                 self.write_marker("backups/agent_search.db.fixture.bak", b"backup");
                 self.manifest
                     .cleanup_expectations
@@ -458,12 +536,14 @@ impl DoctorFixtureFactory {
                     });
             }
             DoctorFixtureScenario::LowDisk => {
+                self.set_contract("storage-pressure", "read-only", "cleanup-dry-run-only");
                 self.write_marker("diagnostics/low-disk.fixture", b"free_bytes=1024\n");
                 self.manifest
                     .expected_anomalies
                     .push_unique("storage-pressure");
             }
             DoctorFixtureScenario::BackupExclusion => {
+                self.set_contract("archive-preservation-risk", "read-only", "warn-only");
                 self.write_marker(
                     "backup-policy/exclusion-risk.fixture",
                     b"raw-mirror excluded by test policy\n",
@@ -473,9 +553,11 @@ impl DoctorFixtureFactory {
                     .push_unique("config-exclusion-risk");
             }
             DoctorFixtureScenario::SupportBundle => {
+                self.set_contract("privacy-risk", "read-only", "support-bundle-eligible");
                 self.add_privacy_sentinel();
             }
             DoctorFixtureScenario::MultiSource => {
+                self.set_contract("source-sync-risk", "read-only", "sync-gap-analysis");
                 let _ = self.add_provider_source(
                     DoctorProviderSpec::codex(),
                     "local",
@@ -492,8 +574,26 @@ impl DoctorFixtureFactory {
                 );
                 self.manifest.expected_coverage_state = "multi-source".to_string();
             }
+            DoctorFixtureScenario::PathEdgeCases => {
+                self.set_contract("path-safety-risk", "read-only", "fixture-validation-only");
+                self.write_marker("diagnostics/path-edge-case.fixture", b"path-edge-case\n");
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("path-edge-case");
+            }
         }
         self
+    }
+
+    fn set_contract(
+        &mut self,
+        risk_class: &str,
+        expected_mutation_class: &str,
+        repair_eligibility: &str,
+    ) {
+        self.manifest.risk_class = risk_class.to_string();
+        self.manifest.expected_mutation_class = expected_mutation_class.to_string();
+        self.manifest.repair_eligibility = repair_eligibility.to_string();
     }
 
     pub fn add_privacy_sentinel(&mut self) -> &mut Self {
@@ -837,6 +937,42 @@ impl DoctorFixtureScenarioManifest {
         if self.fixture_id.trim().is_empty() {
             return Err("fixture_id must not be empty".to_string());
         }
+        validate_non_empty_field("risk_class", &self.risk_class)?;
+        validate_non_empty_field("expected_mutation_class", &self.expected_mutation_class)?;
+        validate_non_empty_field("repair_eligibility", &self.repair_eligibility)?;
+        validate_non_empty_list("allowed_commands", &self.allowed_commands)?;
+        validate_non_empty_list(
+            "forbidden_live_path_patterns",
+            &self.forbidden_live_path_patterns,
+        )?;
+        validate_non_empty_list("expected_artifact_keys", &self.expected_artifact_keys)?;
+        for command in &self.allowed_commands {
+            if command == "cass" || (!command.contains("--json") && !command.contains("--robot")) {
+                return Err(format!(
+                    "allowed command must be non-interactive and machine-readable: {command}"
+                ));
+            }
+        }
+        for pattern in &self.forbidden_live_path_patterns {
+            validate_manifest_relative_path(pattern)?;
+        }
+        for required in default_expected_artifact_keys() {
+            if !self
+                .expected_artifact_keys
+                .iter()
+                .any(|key| key == &required)
+            {
+                return Err(format!(
+                    "expected_artifact_keys is missing required key {required}"
+                ));
+            }
+        }
+        if self.redaction_policy.raw_session_text_in_default_output
+            || self.redaction_policy.full_source_paths_in_default_output
+            || self.redaction_policy.privacy_sentinel_in_default_output
+        {
+            return Err("default redaction policy allows sensitive output".to_string());
+        }
         let mut seen = BTreeSet::new();
         for provider in &self.provider_set {
             if provider.trim().is_empty() {
@@ -895,6 +1031,55 @@ impl DoctorFixtureScenarioManifest {
         }
         Ok(())
     }
+}
+
+fn default_allowed_commands() -> Vec<String> {
+    vec!["cass doctor --json".to_string()]
+}
+
+fn default_forbidden_live_path_patterns() -> Vec<String> {
+    vec![
+        "real-home/.codex".to_string(),
+        "real-home/.claude".to_string(),
+        "real-home/.config/cass".to_string(),
+        "real-home/.local/share/cass".to_string(),
+        "current-repo/.beads".to_string(),
+    ]
+}
+
+pub fn default_expected_artifact_keys() -> Vec<String> {
+    vec![
+        "scenario_json".to_string(),
+        "fixture_inventory".to_string(),
+        "commands_jsonl".to_string(),
+        "stdout_doctor_json".to_string(),
+        "stderr_doctor_json".to_string(),
+        "parsed_json_doctor_json".to_string(),
+        "file_tree_before".to_string(),
+        "file_tree_after".to_string(),
+        "checksums".to_string(),
+        "timing".to_string(),
+        "receipts".to_string(),
+        "doctor_logs".to_string(),
+    ]
+}
+
+fn validate_non_empty_field(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err(format!("{field} must not be empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_non_empty_list(field: &str, values: &[String]) -> Result<(), String> {
+    if values.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    for value in values {
+        validate_non_empty_field(field, value)?;
+    }
+    Ok(())
 }
 
 impl DoctorProviderSpec {
