@@ -8420,7 +8420,7 @@ fn spawn_connector_producer(
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
             for root_path in &detect.root_paths {
                 let root = ScanRoot::local(root_path.clone());
-                capture_scan_root_file_before_parse(&config.data_dir, name, &root);
+                capture_scan_sources_before_parse(&config.data_dir, name, &root, config.since_ts);
             }
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 inject_provenance(&mut conversation, &local_origin);
@@ -8476,7 +8476,7 @@ fn spawn_connector_producer(
             );
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
-            capture_scan_root_file_before_parse(&config.data_dir, name, root);
+            capture_scan_sources_before_parse(&config.data_dir, name, root, config.since_ts);
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 inject_provenance(&mut conversation, &root.origin);
                 apply_workspace_rewrite(&mut conversation, root);
@@ -9257,7 +9257,7 @@ fn run_batch_index_with_connector_factories(
                         crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
                     for root_path in &detect.root_paths {
                         let root = ScanRoot::local(root_path.clone());
-                        capture_scan_root_file_before_parse(&data_dir, name, &root);
+                        capture_scan_sources_before_parse(&data_dir, name, &root, since_ts);
                     }
                     match conn.scan(&ctx) {
                         Ok(mut local_convs) => {
@@ -9283,7 +9283,7 @@ fn run_batch_index_with_connector_factories(
                             vec![root.clone()],
                             since_ts,
                         );
-                        capture_scan_root_file_before_parse(&data_dir, name, root);
+                        capture_scan_sources_before_parse(&data_dir, name, root, since_ts);
                         match conn.scan(&ctx) {
                             Ok(mut remote_convs) => {
                                 for conv in &mut remote_convs {
@@ -15746,7 +15746,7 @@ fn reindex_paths_with_semantic_delta(
             since_ts,
         );
 
-        capture_scan_root_file_before_parse(&opts.data_dir, kind.slug(), &root);
+        capture_scan_sources_before_parse(&opts.data_dir, kind.slug(), &root, since_ts);
 
         // SCAN PHASE: IO-heavy, no locks held
         let scan_start = Instant::now();
@@ -16634,6 +16634,47 @@ fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
             );
         }
     }
+}
+
+fn capture_scan_sources_before_parse(
+    data_dir: &Path,
+    provider: &str,
+    root: &ScanRoot,
+    since_ts: Option<i64>,
+) {
+    for capture_root in preparse_capture_roots(provider, root, since_ts) {
+        capture_scan_root_file_before_parse(data_dir, provider, &capture_root);
+    }
+}
+
+fn preparse_capture_roots(provider: &str, root: &ScanRoot, since_ts: Option<i64>) -> Vec<ScanRoot> {
+    if root.path.is_file() {
+        return vec![root.clone()];
+    }
+
+    if provider == "codex" {
+        let preflight = crate::connectors::preflight_codex_explicit_file_roots(
+            std::slice::from_ref(root),
+            since_ts,
+        );
+        let capture_roots: Vec<ScanRoot> = preflight
+            .scan_roots
+            .into_iter()
+            .filter(|scan_root| scan_root.path.is_file())
+            .collect();
+        if !capture_roots.is_empty() {
+            tracing::debug!(
+                provider,
+                scan_root = %root.path.display(),
+                capture_files = capture_roots.len(),
+                fallback_roots = preflight.fallback_roots,
+                "expanded codex directory root into explicit raw-mirror preparse capture files"
+            );
+        }
+        return capture_roots;
+    }
+
+    Vec::new()
 }
 
 fn capture_scan_root_file_before_parse(data_dir: &Path, provider: &str, root: &ScanRoot) {
@@ -20732,6 +20773,76 @@ mod tests {
         assert_eq!(
             std::fs::read(&source_path).expect("source remains untouched"),
             b"{not valid connector json\n"
+        );
+    }
+
+    #[test]
+    fn raw_mirror_capture_expands_codex_directory_root_before_parse() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let codex_root = temp.path().join(".codex");
+        let sessions = codex_root.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions dir");
+        let first_path = sessions.join("rollout-first.jsonl");
+        let second_path = sessions.join("rollout-second.json");
+        let ignored_path = sessions.join("notes.jsonl");
+        let first_bytes = b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"first\"}}\n";
+        let second_bytes =
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"second\"}}\n";
+        std::fs::write(&first_path, first_bytes).expect("first source");
+        std::fs::write(&second_path, second_bytes).expect("second source");
+        std::fs::write(&ignored_path, b"{\"not\":\"a rollout file\"}\n").expect("ignored source");
+        let root = ScanRoot::local(codex_root);
+
+        capture_scan_sources_before_parse(&data_dir, "codex", &root, None);
+
+        let manifest_root = data_dir.join("raw-mirror/v1/manifests");
+        let manifests = std::fs::read_dir(&manifest_root)
+            .expect("manifest dir")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("manifest entries");
+        assert_eq!(
+            manifests.len(),
+            2,
+            "codex directory preparse capture should mirror rollout files only"
+        );
+        let mut manifest_sources = manifests
+            .iter()
+            .map(|entry| {
+                let manifest: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(entry.path()).expect("manifest bytes"))
+                        .expect("manifest json");
+                assert_eq!(manifest["provider"].as_str(), Some("codex"));
+                assert_eq!(manifest["source_id"].as_str(), Some("local"));
+                assert_eq!(
+                    manifest["verification"]["status"].as_str(),
+                    Some("captured")
+                );
+                manifest["original_path"]
+                    .as_str()
+                    .expect("original path")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        manifest_sources.sort();
+        assert_eq!(
+            manifest_sources,
+            vec![
+                first_path.display().to_string(),
+                second_path.display().to_string()
+            ]
+        );
+        assert_eq!(
+            std::fs::read(&first_path).expect("first bytes"),
+            first_bytes
+        );
+        assert_eq!(
+            std::fs::read(&second_path).expect("second bytes"),
+            second_bytes
+        );
+        assert_eq!(
+            std::fs::read(&ignored_path).expect("ignored bytes"),
+            b"{\"not\":\"a rollout file\"}\n"
         );
     }
 
