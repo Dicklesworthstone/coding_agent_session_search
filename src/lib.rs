@@ -18427,6 +18427,8 @@ enum DoctorFsMutationKind {
     CopyFileToStaging,
     #[allow(dead_code)]
     PromoteStagedFile,
+    #[allow(dead_code)]
+    MoveFileToQuarantine,
 }
 
 impl DoctorFsMutationKind {
@@ -18438,6 +18440,7 @@ impl DoctorFsMutationKind {
             }
             DoctorFsMutationKind::CopyFileToStaging => DoctorAssetOperation::Copy,
             DoctorFsMutationKind::PromoteStagedFile => DoctorAssetOperation::Promote,
+            DoctorFsMutationKind::MoveFileToQuarantine => DoctorAssetOperation::MoveQuarantine,
         }
     }
 }
@@ -19300,6 +19303,9 @@ fn execute_doctor_fs_mutation(request: DoctorFsMutationRequest<'_>) -> DoctorFsM
         DoctorFsMutationKind::PromoteStagedFile => {
             execute_doctor_promote_staged_file(request, receipt)
         }
+        DoctorFsMutationKind::MoveFileToQuarantine => {
+            execute_doctor_move_file_to_quarantine(request, receipt)
+        }
     }
 }
 
@@ -19845,6 +19851,219 @@ fn execute_doctor_promote_staged_file(
     receipt
 }
 
+fn execute_doctor_move_file_to_quarantine(
+    request: DoctorFsMutationRequest<'_>,
+    mut receipt: DoctorFsMutationReceipt,
+) -> DoctorFsMutationReceipt {
+    receipt
+        .precondition_checks
+        .push("mutation_kind_move_file_to_quarantine".to_string());
+
+    if !doctor_repair_mode_allows_asset_operation_mutation(
+        request.mode,
+        request.asset_class,
+        request.mutation_kind.asset_operation(),
+    ) {
+        receipt.blocked_reasons.push(format!(
+            "refusing to quarantine asset class {:?}: mode {:?} does not allow quarantine mutation",
+            request.asset_class, request.mode
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("mode_allows_asset_operation".to_string());
+
+    let Some(source_path) = request.source_path else {
+        receipt
+            .blocked_reasons
+            .push("refusing to quarantine without a source path".to_string());
+        return receipt;
+    };
+    let Some(quarantine_root) = request.staging_root else {
+        receipt
+            .blocked_reasons
+            .push("refusing to quarantine without an approved quarantine root".to_string());
+        return receipt;
+    };
+    let Some(expected_source_blake3) = request.expected_source_blake3 else {
+        receipt
+            .blocked_reasons
+            .push("refusing to quarantine without expected source blake3".to_string());
+        return receipt;
+    };
+
+    if !doctor_quarantine_source_path_is_safe(
+        source_path,
+        request.data_dir,
+        request.db_path,
+        request.index_path,
+        request.asset_class,
+    ) {
+        receipt.blocked_reasons.push(format!(
+            "refusing to quarantine unsafe source path {}",
+            source_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("source_path_confined_to_derived_asset".to_string());
+
+    let Some(source_parent) = source_path.parent() else {
+        receipt.blocked_reasons.push(format!(
+            "refusing to quarantine source without parent {}",
+            source_path.display()
+        ));
+        return receipt;
+    };
+    let Some(target_parent) = request.target_path.parent() else {
+        receipt.blocked_reasons.push(format!(
+            "refusing to quarantine target without parent {}",
+            request.target_path.display()
+        ));
+        return receipt;
+    };
+    if !target_parent.is_dir() {
+        receipt.blocked_reasons.push(format!(
+            "refusing to quarantine target with missing parent {}",
+            target_parent.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("target_parent_exists".to_string());
+
+    if !doctor_staging_target_path_is_safe(request.target_path, quarantine_root, request.data_dir) {
+        receipt.blocked_reasons.push(format!(
+            "refusing to quarantine to unsafe target {}",
+            request.target_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("target_path_confined_to_quarantine_root".to_string());
+
+    match std::fs::symlink_metadata(request.target_path) {
+        Ok(_) => {
+            receipt.blocked_reasons.push(format!(
+                "refusing to quarantine over existing target {}",
+                request.target_path.display()
+            ));
+            return receipt;
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            receipt.blocked_reasons.push(format!(
+                "refusing to quarantine target {}: could not verify target absence: {err}",
+                request.target_path.display()
+            ));
+            return receipt;
+        }
+    }
+    receipt
+        .precondition_checks
+        .push("target_does_not_exist".to_string());
+
+    let source_blake3 = match file_blake3_hex(source_path) {
+        Ok(hash) => hash,
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(err);
+            return receipt;
+        }
+    };
+    receipt.actual_source_blake3 = Some(source_blake3.clone());
+    receipt
+        .precondition_checks
+        .push("source_blake3_recorded".to_string());
+
+    if expected_source_blake3 != source_blake3 {
+        receipt.blocked_reasons.push(format!(
+            "refusing to quarantine source {}: expected blake3 {expected_source_blake3}, observed {source_blake3}",
+            source_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("expected_source_blake3_matched".to_string());
+
+    let source_bytes = std::fs::metadata(source_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(request.planned_bytes);
+    match std::fs::rename(source_path, request.target_path) {
+        Ok(()) => {
+            receipt.affected_bytes = source_bytes;
+            receipt
+                .precondition_checks
+                .push("filesystem_rename_completed".to_string());
+        }
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(format!(
+                "failed to atomically quarantine {} to {}: {err}",
+                source_path.display(),
+                request.target_path.display()
+            ));
+            return receipt;
+        }
+    }
+
+    let target_blake3 = match file_blake3_hex(request.target_path) {
+        Ok(hash) => hash,
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(err);
+            return receipt;
+        }
+    };
+    receipt.actual_target_blake3 = Some(target_blake3.clone());
+    if target_blake3 != source_blake3 {
+        receipt.status = DoctorActionStatus::Failed;
+        receipt.blocked_reasons.push(format!(
+            "quarantined target {} hash mismatch: expected source blake3 {source_blake3}, observed target blake3 {target_blake3}",
+            request.target_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("target_blake3_matched_source".to_string());
+
+    match std::fs::File::open(request.target_path).and_then(|file| file.sync_all()) {
+        Ok(()) => {
+            receipt
+                .precondition_checks
+                .push("target_file_sync_completed".to_string());
+        }
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(format!(
+                "failed to sync quarantined target {}: {err}",
+                request.target_path.display()
+            ));
+            return receipt;
+        }
+    }
+
+    match sync_directory(source_parent).and_then(|()| sync_directory(target_parent)) {
+        Ok(()) => {
+            receipt.status = DoctorActionStatus::Applied;
+            receipt
+                .precondition_checks
+                .push("source_and_target_parent_sync_completed".to_string());
+        }
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(err);
+        }
+    }
+    receipt
+}
+
 fn doctor_fs_mutation_action_id(
     mutation_kind: DoctorFsMutationKind,
     mode: DoctorRepairMode,
@@ -20100,6 +20319,65 @@ fn doctor_promote_target_path_is_safe(path: &Path, staging_root: &Path, data_dir
         return false;
     }
     true
+}
+
+fn doctor_quarantine_source_path_is_safe(
+    path: &Path,
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+    asset_class: DoctorAssetClass,
+) -> bool {
+    if path == data_dir || path == db_path || path == index_path || !path.starts_with(data_dir) {
+        return false;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    if path_has_symlink_below_root(path, data_dir) {
+        return false;
+    }
+    let Ok(canonical_path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(canonical_data_dir) = std::fs::canonicalize(data_dir) else {
+        return false;
+    };
+    if !canonical_path.starts_with(&canonical_data_dir) {
+        return false;
+    }
+    if std::fs::canonicalize(db_path)
+        .ok()
+        .is_some_and(|canonical_db_path| canonical_path == canonical_db_path)
+    {
+        return false;
+    }
+    if let Ok(canonical_index_path) = std::fs::canonicalize(index_path)
+        && canonical_path == canonical_index_path
+    {
+        return false;
+    }
+    let index_root = index_path.parent().unwrap_or(index_path);
+    match asset_class {
+        DoctorAssetClass::DerivedLexicalIndex => path.starts_with(index_path),
+        DoctorAssetClass::RetainedPublishBackup => {
+            path.starts_with(index_root.join(".lexical-publish-backups"))
+        }
+        DoctorAssetClass::DerivedSemanticIndex => path.starts_with(data_dir.join("semantic")),
+        DoctorAssetClass::MemoCache | DoctorAssetClass::ReclaimableDerivedCache => {
+            path.starts_with(data_dir.join("cache"))
+        }
+        _ => false,
+    }
 }
 
 fn path_age_seconds(path: &Path) -> Option<u64> {
@@ -20994,6 +21272,14 @@ mod doctor_asset_taxonomy_tests {
                 DoctorAssetOperation::PruneReclaim,
             ),
             "repair_apply must not become a hidden prune path for live derived lexical indexes"
+        );
+        assert!(
+            doctor_repair_mode_allows_asset_operation_mutation(
+                DoctorRepairMode::RepairApply,
+                DoctorAssetClass::DerivedLexicalIndex,
+                DoctorAssetOperation::MoveQuarantine,
+            ),
+            "repair_apply should be able to move verified bad derived index files into quarantine without deleting them"
         );
 
         assert!(
@@ -22407,6 +22693,324 @@ mod doctor_asset_taxonomy_tests {
         assert!(
             !unsafe_target.exists(),
             "blocked promote must not create a target inside staging"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_quarantines_verified_derived_file_with_receipt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write archive placeholder");
+
+        let source_path = index_path.join("segment-0001.idx");
+        let source_bytes = b"bad derived lexical bytes";
+        std::fs::write(&source_path, source_bytes).expect("write derived source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let quarantine_root = data_dir.join("doctor-quarantine").join("repair-op-1");
+        let target_path = quarantine_root.join("index").join("segment-0001.idx");
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create quarantine target parent");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "repair-apply-quarantine-derived-index",
+            action_id: "quarantine-derived-segment",
+            mutation_kind: DoctorFsMutationKind::MoveFileToQuarantine,
+            mode: DoctorRepairMode::RepairApply,
+            asset_class: DoctorAssetClass::DerivedLexicalIndex,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&quarantine_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Applied);
+        assert_eq!(
+            receipt.mutation_kind,
+            DoctorFsMutationKind::MoveFileToQuarantine
+        );
+        assert_eq!(receipt.asset_class, DoctorAssetClass::DerivedLexicalIndex);
+        assert_eq!(receipt.affected_bytes, source_bytes.len() as u64);
+        assert_eq!(
+            receipt.actual_source_blake3.as_deref(),
+            Some(expected_source_blake3.as_str())
+        );
+        assert_eq!(
+            receipt.actual_target_blake3.as_deref(),
+            Some(expected_source_blake3.as_str())
+        );
+        assert_eq!(
+            receipt.redacted_source_path.as_deref(),
+            Some("[cass-data]/index/live-generation/segment-0001.idx")
+        );
+        assert_eq!(
+            receipt.redacted_target_path,
+            "[cass-data]/doctor-quarantine/repair-op-1/index/segment-0001.idx"
+        );
+        for expected in [
+            "mutation_kind_move_file_to_quarantine",
+            "mode_allows_asset_operation",
+            "source_path_confined_to_derived_asset",
+            "target_parent_exists",
+            "target_path_confined_to_quarantine_root",
+            "target_does_not_exist",
+            "source_blake3_recorded",
+            "expected_source_blake3_matched",
+            "filesystem_rename_completed",
+            "target_blake3_matched_source",
+            "target_file_sync_completed",
+            "source_and_target_parent_sync_completed",
+        ] {
+            assert!(
+                receipt
+                    .precondition_checks
+                    .iter()
+                    .any(|observed| observed == expected),
+                "missing quarantine receipt precondition {expected}: {:?}",
+                receipt.precondition_checks
+            );
+        }
+        assert!(
+            !source_path.exists(),
+            "successful quarantine should move the suspect derived file out of live index path"
+        );
+        assert_eq!(
+            std::fs::read(&target_path).expect("read quarantined target"),
+            source_bytes
+        );
+        assert!(
+            db_path.exists(),
+            "quarantining derived files must not touch the canonical archive DB"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_refuses_to_quarantine_precious_archive_db() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        let archive_bytes = b"precious archive bytes";
+        std::fs::write(&db_path, archive_bytes).expect("write archive placeholder");
+        let expected_source_blake3 = blake3::hash(archive_bytes).to_hex().to_string();
+
+        let quarantine_root = data_dir.join("doctor-quarantine").join("archive-refusal");
+        let target_path = quarantine_root.join("agent_search.db");
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create quarantine target parent");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "repair-apply-quarantine-derived-index",
+            action_id: "quarantine-archive-db-refused",
+            mutation_kind: DoctorFsMutationKind::MoveFileToQuarantine,
+            mode: DoctorRepairMode::RepairApply,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&db_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&quarantine_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: archive_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("does not allow quarantine mutation")),
+            "precious archive quarantine refusal should name the mode/policy blocker: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "filesystem_rename_completed"),
+            "archive DB refusal must stop before rename"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read archive source"),
+            archive_bytes
+        );
+        assert!(
+            !target_path.exists(),
+            "blocked archive quarantine must not create a target"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_blocks_quarantine_without_verified_source_hash() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write archive placeholder");
+
+        let source_path = index_path.join("segment-0002.idx");
+        std::fs::write(&source_path, b"bad derived lexical bytes").expect("write derived source");
+        let quarantine_root = data_dir.join("doctor-quarantine").join("missing-hash");
+        let target_path = quarantine_root.join("segment-0002.idx");
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create quarantine target parent");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "repair-apply-quarantine-derived-index",
+            action_id: "quarantine-without-hash",
+            mutation_kind: DoctorFsMutationKind::MoveFileToQuarantine,
+            mode: DoctorRepairMode::RepairApply,
+            asset_class: DoctorAssetClass::DerivedLexicalIndex,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&quarantine_root),
+            expected_source_blake3: None,
+            planned_bytes: fs_dir_size(&source_path),
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("expected source blake3")),
+            "quarantine must require a verified source hash: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            source_path.exists(),
+            "blocked quarantine must keep suspect source in place"
+        );
+        assert!(
+            !target_path.exists(),
+            "blocked quarantine must not create target"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_refuses_quarantine_over_existing_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write archive placeholder");
+
+        let source_path = index_path.join("segment-0003.idx");
+        let source_bytes = b"bad derived lexical bytes";
+        std::fs::write(&source_path, source_bytes).expect("write derived source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+        let quarantine_root = data_dir.join("doctor-quarantine").join("existing-target");
+        let target_path = quarantine_root.join("segment-0003.idx");
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create quarantine target parent");
+        std::fs::write(&target_path, b"existing quarantine bytes").expect("write existing target");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "repair-apply-quarantine-derived-index",
+            action_id: "quarantine-existing-target",
+            mutation_kind: DoctorFsMutationKind::MoveFileToQuarantine,
+            mode: DoctorRepairMode::RepairApply,
+            asset_class: DoctorAssetClass::DerivedLexicalIndex,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&quarantine_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("existing target")),
+            "existing quarantine targets must not be overwritten: {:?}",
+            receipt.blocked_reasons
+        );
+        assert_eq!(
+            std::fs::read(&target_path).expect("read existing target"),
+            b"existing quarantine bytes"
+        );
+        assert!(source_path.exists(), "blocked quarantine must keep source");
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_refuses_quarantine_asset_path_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write archive placeholder");
+
+        let cache_root = data_dir.join("cache");
+        std::fs::create_dir_all(&cache_root).expect("create cache root");
+        let source_path = cache_root.join("memo-cache-entry.bin");
+        let source_bytes = b"derived cache bytes";
+        std::fs::write(&source_path, source_bytes).expect("write cache source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let quarantine_root = data_dir
+            .join("doctor-quarantine")
+            .join("asset-path-mismatch");
+        let target_path = quarantine_root.join("memo-cache-entry.bin");
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create quarantine target parent");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "repair-apply-quarantine-derived-index",
+            action_id: "quarantine-mislabeled-cache-as-lexical",
+            mutation_kind: DoctorFsMutationKind::MoveFileToQuarantine,
+            mode: DoctorRepairMode::RepairApply,
+            asset_class: DoctorAssetClass::DerivedLexicalIndex,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&quarantine_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe source path")),
+            "quarantine must reject a source path that does not match the declared asset class: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            source_path.exists(),
+            "blocked quarantine must keep the mismatched source in place"
+        );
+        assert!(
+            !target_path.exists(),
+            "blocked quarantine must not create target"
         );
     }
 
@@ -24001,6 +24605,197 @@ mod cleanup_target_safety_tests {
         assert!(
             !outside_target.exists(),
             "promote must not create the broken symlink target outside data dir"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_rejects_symlinked_quarantine_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let outside_source = temp.path().join("outside-derived.idx");
+        let source_bytes = b"external derived bytes";
+        std::fs::write(&outside_source, source_bytes).expect("write outside source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+        let source_path = index_path.join("segment-symlink.idx");
+        std::os::unix::fs::symlink(&outside_source, &source_path)
+            .expect("create symlinked quarantine source");
+
+        let quarantine_root = data_dir.join("doctor-quarantine").join("source-symlink");
+        let target_path = quarantine_root.join("segment-symlink.idx");
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create quarantine target parent");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "repair-apply-quarantine-derived-index",
+            action_id: "quarantine-symlinked-source",
+            mutation_kind: DoctorFsMutationKind::MoveFileToQuarantine,
+            mode: DoctorRepairMode::RepairApply,
+            asset_class: DoctorAssetClass::DerivedLexicalIndex,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&quarantine_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe source path")),
+            "executor must reject symlinked quarantine sources: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            source_path.exists(),
+            "source symlink must remain for inspection"
+        );
+        assert!(
+            outside_source.exists(),
+            "outside source must remain untouched"
+        );
+        assert!(
+            !target_path.exists(),
+            "blocked quarantine must not create target"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_rejects_symlinked_quarantine_target_even_when_broken() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let source_path = index_path.join("segment-target-symlink.idx");
+        let source_bytes = b"bad derived bytes";
+        std::fs::write(&source_path, source_bytes).expect("write derived source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let quarantine_root = data_dir.join("doctor-quarantine").join("target-symlink");
+        std::fs::create_dir_all(&quarantine_root).expect("create quarantine root");
+        let outside_target = temp.path().join("outside-quarantine-through-symlink.idx");
+        let target_path = quarantine_root.join("segment-target-symlink.idx");
+        std::os::unix::fs::symlink(&outside_target, &target_path)
+            .expect("create broken symlink as quarantine target");
+        assert!(
+            !target_path.exists(),
+            "regression setup expects Path::exists to miss the broken symlink"
+        );
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "repair-apply-quarantine-derived-index",
+            action_id: "quarantine-symlinked-target",
+            mutation_kind: DoctorFsMutationKind::MoveFileToQuarantine,
+            mode: DoctorRepairMode::RepairApply,
+            asset_class: DoctorAssetClass::DerivedLexicalIndex,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&quarantine_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("existing target")),
+            "executor must treat broken symlink quarantine targets as existing targets: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(source_path.exists(), "blocked quarantine must keep source");
+        assert!(
+            std::fs::symlink_metadata(&target_path)
+                .expect("target symlink still exists")
+                .file_type()
+                .is_symlink(),
+            "blocked quarantine must leave target symlink untouched"
+        );
+        assert!(
+            !outside_target.exists(),
+            "quarantine must not create the broken symlink target outside data dir"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_rejects_symlinked_quarantine_parent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let source_path = index_path.join("segment-parent-symlink.idx");
+        let source_bytes = b"bad derived bytes";
+        std::fs::write(&source_path, source_bytes).expect("write derived source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let quarantine_root = data_dir.join("doctor-quarantine").join("parent-symlink");
+        std::fs::create_dir_all(&quarantine_root).expect("create quarantine root");
+        let outside_parent = temp.path().join("outside-quarantine-parent");
+        std::fs::create_dir_all(&outside_parent).expect("create outside parent");
+        let symlinked_parent = quarantine_root.join("redirected");
+        std::os::unix::fs::symlink(&outside_parent, &symlinked_parent)
+            .expect("create symlinked quarantine parent");
+        let target_path = symlinked_parent.join("segment-parent-symlink.idx");
+        let outside_target = outside_parent.join("segment-parent-symlink.idx");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "repair-apply-quarantine-derived-index",
+            action_id: "quarantine-symlinked-parent",
+            mutation_kind: DoctorFsMutationKind::MoveFileToQuarantine,
+            mode: DoctorRepairMode::RepairApply,
+            asset_class: DoctorAssetClass::DerivedLexicalIndex,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&quarantine_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe target")),
+            "executor must reject quarantine targets below symlinked parents: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(source_path.exists(), "blocked quarantine must keep source");
+        assert!(
+            std::fs::symlink_metadata(&symlinked_parent)
+                .expect("target parent symlink still exists")
+                .file_type()
+                .is_symlink(),
+            "blocked quarantine must leave parent symlink untouched"
+        );
+        assert!(
+            !outside_target.exists(),
+            "quarantine must not create a target through the symlinked parent"
         );
     }
 
