@@ -19937,6 +19937,13 @@ fn execute_doctor_promote_staged_file(
         .precondition_checks
         .push("source_path_confined_to_staging_root".to_string());
 
+    let Some(source_parent) = source_path.parent() else {
+        receipt.blocked_reasons.push(format!(
+            "refusing to promote source without parent {}",
+            source_path.display()
+        ));
+        return receipt;
+    };
     let Some(target_parent) = request.target_path.parent() else {
         receipt.blocked_reasons.push(format!(
             "refusing to promote target without parent {}",
@@ -20018,20 +20025,29 @@ fn execute_doctor_promote_staged_file(
     let source_bytes = std::fs::metadata(source_path)
         .map(|metadata| metadata.len())
         .unwrap_or(request.planned_bytes);
-    match std::fs::rename(source_path, request.target_path) {
-        Ok(()) => {
+    match doctor_move_file_with_cross_device_fallback(
+        source_path,
+        request.target_path,
+        &source_blake3,
+        source_bytes,
+        "promote",
+        "promoted target",
+    ) {
+        Ok(move_method) => {
             receipt.affected_bytes = source_bytes;
-            receipt
-                .precondition_checks
-                .push("filesystem_rename_completed".to_string());
+            receipt.precondition_checks.push(
+                match move_method {
+                    DoctorFsMoveMethod::AtomicRename => "filesystem_rename_completed",
+                    DoctorFsMoveMethod::CrossDeviceCopyRemoveSource => {
+                        "filesystem_cross_device_copy_remove_completed"
+                    }
+                }
+                .to_string(),
+            );
         }
         Err(err) => {
             receipt.status = DoctorActionStatus::Failed;
-            receipt.blocked_reasons.push(format!(
-                "failed to atomically promote {} to {}: {err}",
-                source_path.display(),
-                request.target_path.display()
-            ));
+            receipt.blocked_reasons.push(err);
             return receipt;
         }
     }
@@ -20070,12 +20086,12 @@ fn execute_doctor_promote_staged_file(
         }
     }
 
-    match sync_directory(target_parent) {
+    match sync_directory(source_parent).and_then(|()| sync_directory(target_parent)) {
         Ok(()) => {
             receipt.status = DoctorActionStatus::Applied;
             receipt
                 .precondition_checks
-                .push("target_parent_sync_completed".to_string());
+                .push("source_and_target_parent_sync_completed".to_string());
         }
         Err(err) => {
             receipt.status = DoctorActionStatus::Failed;
@@ -20138,6 +20154,13 @@ fn execute_doctor_restore_staged_file(
         .precondition_checks
         .push("source_path_confined_to_staging_root".to_string());
 
+    let Some(source_parent) = source_path.parent() else {
+        receipt.blocked_reasons.push(format!(
+            "refusing to restore source without parent {}",
+            source_path.display()
+        ));
+        return receipt;
+    };
     let Some(target_parent) = request.target_path.parent() else {
         receipt.blocked_reasons.push(format!(
             "refusing to restore target without parent {}",
@@ -20219,20 +20242,29 @@ fn execute_doctor_restore_staged_file(
     let source_bytes = std::fs::metadata(source_path)
         .map(|metadata| metadata.len())
         .unwrap_or(request.planned_bytes);
-    match std::fs::rename(source_path, request.target_path) {
-        Ok(()) => {
+    match doctor_move_file_with_cross_device_fallback(
+        source_path,
+        request.target_path,
+        &source_blake3,
+        source_bytes,
+        "restore",
+        "restored target",
+    ) {
+        Ok(move_method) => {
             receipt.affected_bytes = source_bytes;
-            receipt
-                .precondition_checks
-                .push("filesystem_rename_completed".to_string());
+            receipt.precondition_checks.push(
+                match move_method {
+                    DoctorFsMoveMethod::AtomicRename => "filesystem_rename_completed",
+                    DoctorFsMoveMethod::CrossDeviceCopyRemoveSource => {
+                        "filesystem_cross_device_copy_remove_completed"
+                    }
+                }
+                .to_string(),
+            );
         }
         Err(err) => {
             receipt.status = DoctorActionStatus::Failed;
-            receipt.blocked_reasons.push(format!(
-                "failed to atomically restore {} to {}: {err}",
-                source_path.display(),
-                request.target_path.display()
-            ));
+            receipt.blocked_reasons.push(err);
             return receipt;
         }
     }
@@ -20271,12 +20303,12 @@ fn execute_doctor_restore_staged_file(
         }
     }
 
-    match sync_directory(target_parent) {
+    match sync_directory(source_parent).and_then(|()| sync_directory(target_parent)) {
         Ok(()) => {
             receipt.status = DoctorActionStatus::Applied;
             receipt
                 .precondition_checks
-                .push("target_parent_sync_completed".to_string());
+                .push("source_and_target_parent_sync_completed".to_string());
         }
         Err(err) => {
             receipt.status = DoctorActionStatus::Failed;
@@ -20429,20 +20461,29 @@ fn execute_doctor_move_file_to_quarantine(
     let source_bytes = std::fs::metadata(source_path)
         .map(|metadata| metadata.len())
         .unwrap_or(request.planned_bytes);
-    match std::fs::rename(source_path, request.target_path) {
-        Ok(()) => {
+    match doctor_move_file_with_cross_device_fallback(
+        source_path,
+        request.target_path,
+        &source_blake3,
+        source_bytes,
+        "quarantine",
+        "quarantined target",
+    ) {
+        Ok(move_method) => {
             receipt.affected_bytes = source_bytes;
-            receipt
-                .precondition_checks
-                .push("filesystem_rename_completed".to_string());
+            receipt.precondition_checks.push(
+                match move_method {
+                    DoctorFsMoveMethod::AtomicRename => "filesystem_rename_completed",
+                    DoctorFsMoveMethod::CrossDeviceCopyRemoveSource => {
+                        "filesystem_cross_device_copy_remove_completed"
+                    }
+                }
+                .to_string(),
+            );
         }
         Err(err) => {
             receipt.status = DoctorActionStatus::Failed;
-            receipt.blocked_reasons.push(format!(
-                "failed to atomically quarantine {} to {}: {err}",
-                source_path.display(),
-                request.target_path.display()
-            ));
+            receipt.blocked_reasons.push(err);
             return receipt;
         }
     }
@@ -20538,6 +20579,14 @@ fn file_blake3_hex(path: &Path) -> Result<String, String> {
 thread_local! {
     static DOCTOR_TEST_FAIL_NEXT_FILE_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DOCTOR_TEST_FAIL_NEXT_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DOCTOR_TEST_FAIL_NEXT_RENAME: std::cell::Cell<Option<DoctorTestRenameFailure>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum DoctorTestRenameFailure {
+    CrossDevice,
+    PermissionDenied,
 }
 
 #[cfg(test)]
@@ -20548,6 +20597,20 @@ fn doctor_test_inject_next_file_sync_failure() {
 #[cfg(test)]
 fn doctor_test_inject_next_directory_sync_failure() {
     DOCTOR_TEST_FAIL_NEXT_DIRECTORY_SYNC.with(|fail_next| fail_next.set(true));
+}
+
+#[cfg(test)]
+fn doctor_test_inject_next_cross_device_rename_failure() {
+    DOCTOR_TEST_FAIL_NEXT_RENAME.with(|fail_next| {
+        fail_next.set(Some(DoctorTestRenameFailure::CrossDevice));
+    });
+}
+
+#[cfg(test)]
+fn doctor_test_inject_next_permission_denied_rename_failure() {
+    DOCTOR_TEST_FAIL_NEXT_RENAME.with(|fail_next| {
+        fail_next.set(Some(DoctorTestRenameFailure::PermissionDenied));
+    });
 }
 
 #[cfg(test)]
@@ -20565,9 +20628,19 @@ fn doctor_test_take_next_directory_sync_failure() -> bool {
     DOCTOR_TEST_FAIL_NEXT_DIRECTORY_SYNC.with(|fail_next| fail_next.replace(false))
 }
 
+#[cfg(test)]
+fn doctor_test_take_next_rename_failure() -> Option<DoctorTestRenameFailure> {
+    DOCTOR_TEST_FAIL_NEXT_RENAME.with(|fail_next| fail_next.replace(None))
+}
+
 #[cfg(not(test))]
 fn doctor_test_take_next_directory_sync_failure() -> bool {
     false
+}
+
+#[cfg(not(test))]
+fn doctor_test_take_next_rename_failure() -> Option<()> {
+    None
 }
 
 fn sync_file(path: &Path, label: &str) -> Result<(), String> {
@@ -20592,6 +20665,170 @@ fn sync_directory(path: &Path) -> Result<(), String> {
     std::fs::File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|err| format!("failed to sync directory {}: {err}", path.display()))
+}
+
+fn doctor_rename_file(source_path: &Path, target_path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(failure) = doctor_test_take_next_rename_failure() {
+        return match failure {
+            DoctorTestRenameFailure::CrossDevice => Err(io::Error::new(
+                io::ErrorKind::CrossesDevices,
+                "injected test cross-device rename failure",
+            )),
+            DoctorTestRenameFailure::PermissionDenied => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected test permission denied rename failure",
+            )),
+        };
+    }
+
+    #[cfg(not(test))]
+    let _ = doctor_test_take_next_rename_failure();
+
+    std::fs::rename(source_path, target_path)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorFsMoveMethod {
+    AtomicRename,
+    CrossDeviceCopyRemoveSource,
+}
+
+fn doctor_is_cross_device_rename_error(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::CrossesDevices
+}
+
+fn doctor_remove_partial_fallback_target(target_path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(target_path) {
+        Ok(()) => {
+            if let Some(parent) = target_path.parent() {
+                sync_directory(parent).map_err(|err| {
+                    format!(
+                        "removed partial cross-device fallback target {} but failed to sync rollback parent: {err}",
+                        target_path.display()
+                    )
+                })?;
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "failed to roll back partial cross-device fallback target {}: {err}",
+            target_path.display()
+        )),
+    }
+}
+
+fn doctor_rollback_fallback_target_error(target_path: &Path, failure: String) -> String {
+    match doctor_remove_partial_fallback_target(target_path) {
+        Ok(()) => format!(
+            "{failure}; rolled back copied target {}",
+            target_path.display()
+        ),
+        Err(rollback_err) => format!("{failure}; {rollback_err}"),
+    }
+}
+
+fn doctor_move_file_with_cross_device_fallback(
+    source_path: &Path,
+    target_path: &Path,
+    expected_blake3: &str,
+    expected_bytes: u64,
+    operation_label: &str,
+    target_sync_label: &str,
+) -> Result<DoctorFsMoveMethod, String> {
+    match doctor_rename_file(source_path, target_path) {
+        Ok(()) => return Ok(DoctorFsMoveMethod::AtomicRename),
+        Err(err) if !doctor_is_cross_device_rename_error(&err) => {
+            return Err(format!(
+                "failed to atomically {operation_label} {} to {}: {err}",
+                source_path.display(),
+                target_path.display()
+            ));
+        }
+        Err(_) => {}
+    }
+
+    match std::fs::symlink_metadata(target_path) {
+        Ok(_) => {
+            return Err(format!(
+                "refusing cross-device {operation_label} fallback over existing target {}",
+                target_path.display()
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "refusing cross-device {operation_label} fallback to {}: could not verify target absence: {err}",
+                target_path.display()
+            ));
+        }
+    }
+
+    let copied_bytes = (|| -> io::Result<u64> {
+        let mut source = std::fs::File::open(source_path)?;
+        let mut target = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target_path)?;
+        let copied = io::copy(&mut source, &mut target)?;
+        use std::io::Write as _;
+        target.flush()?;
+        Ok(copied)
+    })()
+    .map_err(|err| {
+        doctor_rollback_fallback_target_error(
+            target_path,
+            format!(
+                "failed cross-device {operation_label} fallback copy {} to {}: {err}",
+                source_path.display(),
+                target_path.display()
+            ),
+        )
+    })?;
+
+    if copied_bytes != expected_bytes {
+        return Err(doctor_rollback_fallback_target_error(
+            target_path,
+            format!(
+                "cross-device {operation_label} fallback copied {copied_bytes} byte(s), expected {expected_bytes}"
+            ),
+        ));
+    }
+
+    let target_blake3 = file_blake3_hex(target_path).map_err(|err| {
+        doctor_rollback_fallback_target_error(
+            target_path,
+            format!("failed to verify cross-device {operation_label} fallback target: {err}"),
+        )
+    })?;
+    if target_blake3 != expected_blake3 {
+        return Err(doctor_rollback_fallback_target_error(
+            target_path,
+            format!(
+                "cross-device {operation_label} fallback target {} hash mismatch: expected source blake3 {expected_blake3}, observed target blake3 {target_blake3}",
+                target_path.display()
+            ),
+        ));
+    }
+
+    sync_file(target_path, target_sync_label).map_err(|err| {
+        doctor_rollback_fallback_target_error(
+            target_path,
+            format!("failed cross-device {operation_label} fallback target sync: {err}"),
+        )
+    })?;
+
+    match std::fs::remove_file(source_path) {
+        Ok(()) => Ok(DoctorFsMoveMethod::CrossDeviceCopyRemoveSource),
+        Err(err) => Err(doctor_rollback_fallback_target_error(
+            target_path,
+            format!(
+                "failed to remove cross-device {operation_label} fallback source {} after verified copy: {err}",
+                source_path.display()
+            ),
+        )),
+    }
 }
 
 fn cleanup_target_path_is_safe(
@@ -23335,7 +23572,7 @@ mod doctor_asset_taxonomy_tests {
             "filesystem_rename_completed",
             "target_blake3_matched_source",
             "target_file_sync_completed",
-            "target_parent_sync_completed",
+            "source_and_target_parent_sync_completed",
         ] {
             assert!(
                 receipt
@@ -23353,6 +23590,136 @@ mod doctor_asset_taxonomy_tests {
         assert_eq!(
             std::fs::read(&db_path).expect("read promoted target"),
             source_bytes
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_promote_cross_device_fallback_verifies_and_consumes_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        let staging_root = data_dir.join("doctor-staging").join("promote-cross-device");
+        let source_path = staging_root.join("candidate").join("agent_search.db");
+        let source_bytes = b"verified candidate archive bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create staged source parent");
+        std::fs::write(&source_path, source_bytes).expect("write staged source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        doctor_test_inject_next_cross_device_rename_failure();
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-archive",
+            action_id: "promote-cross-device-fallback",
+            mutation_kind: DoctorFsMutationKind::PromoteStagedFile,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&source_path),
+            target_path: &db_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Applied);
+        assert_eq!(receipt.affected_bytes, source_bytes.len() as u64);
+        assert!(
+            receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "filesystem_cross_device_copy_remove_completed"),
+            "cross-device fallback should record copy+verified source removal: {:?}",
+            receipt.precondition_checks
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "filesystem_rename_completed"),
+            "cross-device fallback must not claim an atomic rename completed"
+        );
+        assert!(
+            receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "source_and_target_parent_sync_completed"),
+            "cross-device fallback should still sync both changed directories"
+        );
+        assert!(
+            !source_path.exists(),
+            "verified cross-device promote fallback should consume the staged source"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read promoted target"),
+            source_bytes
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_promote_non_cross_device_rename_failure_does_not_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        let staging_root = data_dir
+            .join("doctor-staging")
+            .join("promote-permission-fail");
+        let source_path = staging_root.join("candidate.db");
+        let source_bytes = b"candidate bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create staged source parent");
+        std::fs::write(&source_path, source_bytes).expect("write staged source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        doctor_test_inject_next_permission_denied_rename_failure();
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-archive",
+            action_id: "promote-permission-denied",
+            mutation_kind: DoctorFsMutationKind::PromoteStagedFile,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&source_path),
+            target_path: &db_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Failed);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("failed to atomically promote")),
+            "non-cross-device rename failures must not take the copy fallback path: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "filesystem_cross_device_copy_remove_completed"),
+            "permission-denied rename must not be treated as cross-device fallback"
+        );
+        assert!(
+            source_path.exists(),
+            "failed non-cross-device promote must keep staged source"
+        );
+        assert!(
+            !db_path.exists(),
+            "failed non-cross-device promote must not create live target"
         );
     }
 
@@ -23587,7 +23954,7 @@ mod doctor_asset_taxonomy_tests {
             "filesystem_rename_completed",
             "target_blake3_matched_source",
             "target_file_sync_completed",
-            "target_parent_sync_completed",
+            "source_and_target_parent_sync_completed",
         ] {
             assert!(
                 receipt
@@ -23853,8 +24220,8 @@ mod doctor_asset_taxonomy_tests {
             !receipt
                 .precondition_checks
                 .iter()
-                .any(|check| check == "target_parent_sync_completed"),
-            "parent-sync failure must not claim directory sync completed"
+                .any(|check| check == "source_and_target_parent_sync_completed"),
+            "parent-sync failure must not claim source+target directory sync completed"
         );
         assert!(
             !source_path.exists(),
@@ -23864,6 +24231,70 @@ mod doctor_asset_taxonomy_tests {
             std::fs::read(&db_path).expect("read restored target after parent sync failure"),
             source_bytes,
             "failed receipt must leave a recoverable restored target for inspection"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_restore_cross_device_fallback_rolls_back_target_on_sync_failure()
+    {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        let staging_root = data_dir
+            .join("doctor-restore")
+            .join("restore-cross-device-sync-fail");
+        let source_path = staging_root.join("candidate.db");
+        let source_bytes = b"restore candidate bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create staged restore parent");
+        std::fs::write(&source_path, source_bytes).expect("write staged restore source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        doctor_test_inject_next_cross_device_rename_failure();
+        doctor_test_inject_next_file_sync_failure();
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "restore-apply-archive",
+            action_id: "restore-cross-device-sync-fail",
+            mutation_kind: DoctorFsMutationKind::RestoreStagedFile,
+            mode: DoctorRepairMode::RestoreApply,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&source_path),
+            target_path: &db_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Failed);
+        assert!(
+            receipt.blocked_reasons.iter().any(|reason| {
+                reason.contains("failed cross-device restore fallback target sync")
+                    && reason.contains("rolled back copied target")
+            }),
+            "cross-device sync failure should report rollback of the copied target: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "filesystem_cross_device_copy_remove_completed"),
+            "failed fallback must not claim source removal completed"
+        );
+        assert!(
+            source_path.exists(),
+            "failed cross-device restore fallback must keep the verified staged source"
+        );
+        assert!(
+            !db_path.exists(),
+            "failed cross-device restore fallback must roll back the copied live target"
         );
     }
 
