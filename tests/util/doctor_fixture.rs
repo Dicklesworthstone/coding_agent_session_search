@@ -211,7 +211,35 @@ impl DoctorFixtureFactory {
         fs::create_dir_all(&self.data_dir).expect("create fixture data dir");
         let db_path = self.data_dir.join("agent_search.db");
         SqliteStorage::open(&db_path).expect("create fixture archive db");
-        self.log("seed_empty_archive_db", "created frankensqlite archive schema");
+        self.log(
+            "seed_empty_archive_db",
+            "created frankensqlite archive schema",
+        );
+        self
+    }
+
+    pub fn seed_empty_search_index(&mut self) -> &mut Self {
+        let out = self
+            .cass_cmd()
+            .args([
+                "index",
+                "--force-rebuild",
+                "--json",
+                "--data-dir",
+                self.data_dir.to_str().expect("utf8 fixture data dir"),
+            ])
+            .output()
+            .expect("run fixture cass index --json");
+        assert!(
+            out.status.success(),
+            "fixture cass index --json failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        self.log(
+            "seed_empty_search_index",
+            "created empty derived search index through cass CLI",
+        );
         self
     }
 
@@ -256,7 +284,9 @@ impl DoctorFixtureFactory {
             .or_default() += 1;
 
         let manifest_id = if mirror_raw {
-            self.manifest.expected_source_inventory.mirrored_source_count += 1;
+            self.manifest
+                .expected_source_inventory
+                .mirrored_source_count += 1;
             let manifest = self.write_raw_mirror(provider, source_id, &source_path, source_bytes);
             manifest["manifest_id"].as_str().map(ToOwned::to_owned)
         } else {
@@ -271,7 +301,9 @@ impl DoctorFixtureFactory {
             self.manifest
                 .expected_anomalies
                 .push_unique("upstream-source-pruned");
-            self.manifest.expected_source_inventory.missing_current_source_count += 1;
+            self.manifest
+                .expected_source_inventory
+                .missing_current_source_count += 1;
             self.manifest.expected_coverage_state = if mirror_raw {
                 "source-pruned-mirror-verified".to_string()
             } else {
@@ -294,21 +326,45 @@ impl DoctorFixtureFactory {
     pub fn apply_scenario(&mut self, scenario: DoctorFixtureScenario) -> &mut Self {
         match scenario {
             DoctorFixtureScenario::Healthy => {
-                let _ = self.add_provider_source(DoctorProviderSpec::codex(), "local", true, false, false);
+                let _ = self.add_provider_source(
+                    DoctorProviderSpec::codex(),
+                    "local",
+                    true,
+                    false,
+                    false,
+                );
                 self.manifest.expected_coverage_state = "healthy".to_string();
             }
             DoctorFixtureScenario::PartiallyIndexed => {
-                let _ = self.add_provider_source(DoctorProviderSpec::codex(), "local", true, false, false);
+                let _ = self.add_provider_source(
+                    DoctorProviderSpec::codex(),
+                    "local",
+                    true,
+                    false,
+                    false,
+                );
                 self.write_marker("diagnostics/partial-index.fixture", b"partial-index");
                 self.manifest
                     .expected_anomalies
                     .push_unique("partially-indexed");
             }
             DoctorFixtureScenario::SourcePruned => {
-                let _ = self.add_provider_source(DoctorProviderSpec::codex(), "local", true, true, true);
+                let _ = self.add_provider_source(
+                    DoctorProviderSpec::codex(),
+                    "local",
+                    true,
+                    true,
+                    true,
+                );
             }
             DoctorFixtureScenario::MirrorMissing => {
-                let _ = self.add_provider_source(DoctorProviderSpec::codex(), "local", false, false, false);
+                let _ = self.add_provider_source(
+                    DoctorProviderSpec::codex(),
+                    "local",
+                    false,
+                    false,
+                    false,
+                );
                 self.manifest
                     .expected_anomalies
                     .push_unique("raw-mirror-missing");
@@ -316,7 +372,9 @@ impl DoctorFixtureFactory {
             DoctorFixtureScenario::DbCorrupt => {
                 let db_path = self.data_dir.join("agent_search.db");
                 self.write_confined_file(&db_path, b"not a sqlite database", "archive_database");
-                self.manifest.expected_anomalies.push_unique("archive-db-corrupt");
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("archive-db-corrupt");
             }
             DoctorFixtureScenario::IndexCorrupt => {
                 self.write_marker("index/corrupt-derived-segment.fixture", b"corrupt-index");
@@ -326,7 +384,9 @@ impl DoctorFixtureFactory {
             }
             DoctorFixtureScenario::StaleLock => {
                 self.write_marker("locks/doctor.stale.lock", b"pid=999999\nheartbeat=0\n");
-                self.manifest.expected_anomalies.push_unique("lock-contention");
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("lock-contention");
             }
             DoctorFixtureScenario::InterruptedRepair => {
                 self.write_marker(
@@ -339,15 +399,19 @@ impl DoctorFixtureFactory {
             }
             DoctorFixtureScenario::BackupAvailable => {
                 self.write_marker("backups/agent_search.db.fixture.bak", b"backup");
-                self.manifest.cleanup_expectations.push(DoctorFixtureCleanupExpectation {
-                    path_class: "backup".to_string(),
-                    may_be_reclaimed_by_fix: false,
-                    reason: "backup evidence is retained for operator inspection".to_string(),
-                });
+                self.manifest
+                    .cleanup_expectations
+                    .push(DoctorFixtureCleanupExpectation {
+                        path_class: "backup".to_string(),
+                        may_be_reclaimed_by_fix: false,
+                        reason: "backup evidence is retained for operator inspection".to_string(),
+                    });
             }
             DoctorFixtureScenario::LowDisk => {
                 self.write_marker("diagnostics/low-disk.fixture", b"free_bytes=1024\n");
-                self.manifest.expected_anomalies.push_unique("storage-pressure");
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("storage-pressure");
             }
             DoctorFixtureScenario::BackupExclusion => {
                 self.write_marker(
@@ -362,8 +426,13 @@ impl DoctorFixtureFactory {
                 self.add_privacy_sentinel();
             }
             DoctorFixtureScenario::MultiSource => {
-                let _ =
-                    self.add_provider_source(DoctorProviderSpec::codex(), "local", true, false, false);
+                let _ = self.add_provider_source(
+                    DoctorProviderSpec::codex(),
+                    "local",
+                    true,
+                    false,
+                    false,
+                );
                 let _ = self.add_provider_source(
                     DoctorProviderSpec::claude_code(),
                     "work-laptop",
@@ -386,12 +455,14 @@ impl DoctorFixtureFactory {
             PRIVACY_SENTINEL_VALUE.as_bytes(),
             "privacy_sentinel",
         );
-        self.manifest.privacy_sentinels.push(DoctorFixturePrivacySentinel {
-            sentinel_id: PRIVACY_SENTINEL_ID.to_string(),
-            value_blake3: blake3_hex(PRIVACY_SENTINEL_VALUE.as_bytes()),
-            relative_path: self.relative_to_root(&sentinel_path),
-            must_be_absent_from_default_output: true,
-        });
+        self.manifest
+            .privacy_sentinels
+            .push(DoctorFixturePrivacySentinel {
+                sentinel_id: PRIVACY_SENTINEL_ID.to_string(),
+                value_blake3: blake3_hex(PRIVACY_SENTINEL_VALUE.as_bytes()),
+                relative_path: self.relative_to_root(&sentinel_path),
+                must_be_absent_from_default_output: true,
+            });
         self.manifest
             .expected_anomalies
             .push_unique("privacy-redaction-required");
@@ -470,10 +541,7 @@ impl DoctorFixtureFactory {
             .messages(message_count)
             .with_content(
                 0,
-                format!(
-                    "{} fixture source for {}",
-                    provider.slug, self.fixture_id
-                ),
+                format!("{} fixture source for {}", provider.slug, self.fixture_id),
             )
             .build_conversation();
         conv.source_id = source_id.to_string();
@@ -583,7 +651,10 @@ impl DoctorFixtureFactory {
         }
         fs::write(path, bytes).expect("write doctor fixture file");
         self.record_file(kind, path);
-        self.log("write_file", &format!("{kind}:{}", self.relative_to_root(path)));
+        self.log(
+            "write_file",
+            &format!("{kind}:{}", self.relative_to_root(path)),
+        );
     }
 
     fn record_file(&mut self, kind: &str, path: &Path) {
@@ -592,12 +663,9 @@ impl DoctorFixtureFactory {
         }
         let bytes = fs::read(path).expect("read fixture file for hash");
         let relative_path = self.relative_to_root(path);
-        if self
-            .manifest
-            .artifacts
-            .iter()
-            .any(|artifact| artifact.relative_path == relative_path && artifact.artifact_kind == kind)
-        {
+        if self.manifest.artifacts.iter().any(|artifact| {
+            artifact.relative_path == relative_path && artifact.artifact_kind == kind
+        }) {
             return;
         }
         self.manifest.artifacts.push(DoctorFixtureArtifact {
@@ -668,7 +736,10 @@ impl DoctorFixtureFactory {
 impl DoctorFixtureScenarioManifest {
     pub fn validate_against_root(&self, root: &Path) -> Result<(), String> {
         if self.schema_version != MANIFEST_SCHEMA_VERSION {
-            return Err(format!("unsupported schema_version {}", self.schema_version));
+            return Err(format!(
+                "unsupported schema_version {}",
+                self.schema_version
+            ));
         }
         if self.fixture_id.trim().is_empty() {
             return Err("fixture_id must not be empty".to_string());
@@ -679,7 +750,9 @@ impl DoctorFixtureScenarioManifest {
                 return Err("provider_set contains an empty provider".to_string());
             }
             if !seen.insert(provider) {
-                return Err(format!("provider_set contains duplicate provider {provider}"));
+                return Err(format!(
+                    "provider_set contains duplicate provider {provider}"
+                ));
             }
         }
         for artifact in &self.artifacts {
@@ -761,11 +834,19 @@ impl DoctorProviderSpec {
     }
 
     pub fn codex() -> Self {
-        Self::new("codex", "Codex", ".codex/sessions/2026/05/05/rollout-fixture.jsonl")
+        Self::new(
+            "codex",
+            "Codex",
+            ".codex/sessions/2026/05/05/rollout-fixture.jsonl",
+        )
     }
 
     pub fn cursor() -> Self {
-        Self::new("cursor", "Cursor", ".config/Cursor/User/globalStorage/state.vscdb")
+        Self::new(
+            "cursor",
+            "Cursor",
+            ".config/Cursor/User/globalStorage/state.vscdb",
+        )
     }
 
     pub fn gemini() -> Self {
@@ -777,7 +858,11 @@ impl DoctorProviderSpec {
     }
 
     pub fn amp() -> Self {
-        Self::new("amp", "Amp", ".config/sourcegraph/amp/sessions/session.json")
+        Self::new(
+            "amp",
+            "Amp",
+            ".config/sourcegraph/amp/sessions/session.json",
+        )
     }
 
     pub fn cline() -> Self {
@@ -813,7 +898,11 @@ impl DoctorProviderSpec {
     }
 
     pub fn chatgpt() -> Self {
-        Self::new("chatgpt", "ChatGPT", ".config/cass/chatgpt/conversations.json")
+        Self::new(
+            "chatgpt",
+            "ChatGPT",
+            ".config/cass/chatgpt/conversations.json",
+        )
     }
 
     pub fn fad_backed() -> Self {
