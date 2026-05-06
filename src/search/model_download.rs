@@ -1222,7 +1222,7 @@ impl ModelDownloader {
     }
 
     fn prepare_temp_dir(&self, manifest: &ModelManifest) -> Result<(), DownloadError> {
-        fs::create_dir_all(&self.temp_dir)?;
+        ensure_model_download_temp_dir(&self.temp_dir)?;
 
         let expected_files: HashSet<String> = manifest
             .files
@@ -1516,7 +1516,9 @@ impl ModelDownloader {
 
     /// Clean up temporary download directory.
     fn cleanup_temp(&self) {
-        let _ = fs::remove_dir_all(&self.temp_dir);
+        if model_dir_is_real_directory(&self.temp_dir).unwrap_or(false) {
+            let _ = fs::remove_dir_all(&self.temp_dir);
+        }
     }
 
     fn cleanup_temp_for_error(&self, err: &DownloadError) {
@@ -1792,21 +1794,12 @@ pub fn check_version_mismatch(model_dir: &Path, manifest: &ModelManifest) -> Opt
 fn ensure_replaceable_model_dir(path: &Path) -> Result<bool, DownloadError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() {
-                return Err(std::io::Error::other(format!(
-                    "refusing to install model through symlink: {}",
-                    path.display()
-                ))
-                .into());
-            }
-            if !file_type.is_dir() {
-                return Err(std::io::Error::other(format!(
-                    "refusing to replace model target because it is not a directory: {}",
-                    path.display()
-                ))
-                .into());
-            }
+            ensure_real_model_directory_metadata(
+                path,
+                &metadata,
+                "refusing to install model through symlink",
+                "refusing to replace model target because it is not a directory",
+            )?;
             Ok(true)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1819,6 +1812,83 @@ fn ensure_replaceable_model_dir(path: &Path) -> Result<bool, DownloadError> {
         )
         .into()),
     }
+}
+
+fn ensure_model_download_temp_dir(path: &Path) -> Result<(), DownloadError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure_real_model_directory_metadata(
+                path,
+                &metadata,
+                "refusing to prepare model download temp dir through symlink",
+                "refusing to prepare model download temp dir because it is not a directory",
+            )?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)?;
+            let metadata = fs::symlink_metadata(path).map_err(|err| {
+                std::io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed inspecting model download temp dir after create {}: {err}",
+                        path.display()
+                    ),
+                )
+            })?;
+            ensure_real_model_directory_metadata(
+                path,
+                &metadata,
+                "refusing to prepare model download temp dir through symlink",
+                "refusing to prepare model download temp dir because it is not a directory",
+            )?;
+        }
+        Err(err) => {
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "failed inspecting model download temp dir before prepare {}: {err}",
+                    path.display()
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn model_dir_is_real_directory(path: &Path) -> Result<bool, DownloadError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            Ok(file_type.is_dir() && !file_type.is_symlink())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn ensure_real_model_directory_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    symlink_message: &str,
+    non_dir_message: &str,
+) -> Result<(), DownloadError> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "{symlink_message}: {}",
+            path.display()
+        ))
+        .into());
+    }
+    if !file_type.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{non_dir_message}: {}",
+            path.display()
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 fn model_download_temp_dir(target_dir: &Path) -> PathBuf {
@@ -2987,6 +3057,64 @@ mod tests {
         assert!(
             outside.exists(),
             "cleanup must not touch the symlink target"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_prepare_temp_dir_rejects_symlinked_temp_dir_without_pruning_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        let outside = tmp.path().join("outside-download-cache");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("stale.bin"), b"must remain").unwrap();
+        symlink(&outside, &downloader.temp_dir).unwrap();
+
+        let err = downloader
+            .prepare_temp_dir(&ModelManifest::minilm_v2())
+            .expect_err("symlinked temp dir must be rejected before pruning");
+
+        assert!(
+            err.to_string().contains("temp dir through symlink"),
+            "unexpected symlink-temp-dir error: {err}"
+        );
+        assert_eq!(
+            fs::read(outside.join("stale.bin")).unwrap(),
+            b"must remain"
+        );
+        assert!(
+            fs::symlink_metadata(&downloader.temp_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cleanup_temp_skips_symlinked_temp_dir() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        let outside = tmp.path().join("outside-download-cache");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("sentinel.bin"), b"must remain").unwrap();
+        symlink(&outside, &downloader.temp_dir).unwrap();
+
+        downloader.cleanup_temp();
+
+        assert_eq!(
+            fs::read(outside.join("sentinel.bin")).unwrap(),
+            b"must remain"
+        );
+        assert!(
+            fs::symlink_metadata(&downloader.temp_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 
