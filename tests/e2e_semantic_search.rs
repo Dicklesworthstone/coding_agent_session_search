@@ -10,6 +10,7 @@
 //! Part of bead: coding_agent_session_search-2vvg
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use chrono::{SecondsFormat, Utc};
 use std::fs;
 use std::path::Path;
 
@@ -23,6 +24,12 @@ use util::e2e_log::PhaseTracker;
 
 fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_semantic_search", test_name)
+}
+
+fn codex_iso_timestamp(ts_millis: u64) -> String {
+    chrono::DateTime::<Utc>::from_timestamp_millis(ts_millis as i64)
+        .expect("valid millis timestamp for codex fixture")
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 /// Helper to create Claude Code session fixture.
@@ -43,12 +50,41 @@ fn make_codex_session(root: &Path, date_path: &str, filename: &str, content: &st
     let sessions = root.join(format!("sessions/{date_path}"));
     fs::create_dir_all(&sessions).unwrap();
     let file = sessions.join(filename);
-    let sample = format!(
-        r#"{{"type": "event_msg", "timestamp": {ts}, "payload": {{"type": "user_message", "message": "{content}"}}}}
-{{"type": "response_item", "timestamp": {}, "payload": {{"role": "assistant", "content": "{content}_response"}}}}
-"#,
-        ts + 1000
-    );
+    let workspace = root.to_string_lossy();
+    let lines = [
+        serde_json::json!({
+            "timestamp": codex_iso_timestamp(ts),
+            "type": "session_meta",
+            "payload": {
+                "id": filename,
+                "cwd": workspace,
+                "cli_version": "0.42.0"
+            }
+        }),
+        serde_json::json!({
+            "timestamp": codex_iso_timestamp(ts + 1_000),
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": content }]
+            }
+        }),
+        serde_json::json!({
+            "timestamp": codex_iso_timestamp(ts + 2_000),
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": format!("{content}_response") }]
+            }
+        }),
+    ];
+    let mut sample = String::new();
+    for line in lines {
+        sample.push_str(&serde_json::to_string(&line).unwrap());
+        sample.push('\n');
+    }
     fs::write(file, sample).unwrap();
 }
 

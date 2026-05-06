@@ -210,8 +210,8 @@
     "measured_operation_count": 14,
     "slow_operation_count": 0,
     "default_threshold_ms": 500,
-    "slowest_operation": "semantic_probe",
-    "slowest_elapsed_ms": 1,
+    "slowest_operation": "[LIVE_OPERATION]",
+    "slowest_elapsed_ms": "[ELAPSED_MS]",
     "notes": [
       "Timing spans are advisory wall-clock measurements for the current doctor process.",
       "Health/status should consume cached summaries rather than rerunning expensive doctor collectors."
@@ -703,14 +703,79 @@
     }
   },
   "storage_pressure": {
-    "schema_version": 1,
+    "schema_version": 2,
     "status": "ok",
     "data_dir_exists": true,
     "probe_path": "[TEST_HOME]/cass-data",
     "available_bytes": "[LIVE_BYTES]",
     "min_recommended_free_bytes": 1073741824,
+    "low_disk_risk": "none",
+    "total_accounted_bytes": 1138,
+    "reclaimable_derived_bytes": 50,
+    "precious_evidence_bytes": 19,
+    "protected_non_reclaimable_bytes": 1088,
+    "unknown_bytes": 0,
+    "reclaimable_bytes_by_class": {
+      "retained_publish_backup": 50
+    },
+    "precious_bytes_by_class": {
+      "backup_bundle": 19
+    },
+    "protected_bytes_by_class": {
+      "backup_bundle": 19,
+      "quarantined_lexical_generation": 1069
+    },
+    "bytes_by_class": {
+      "backup_bundle": {
+        "bytes": 19,
+        "file_count": 2,
+        "safety_classification": "backup_evidence",
+        "derived": false,
+        "precious": true,
+        "reclaimable": false,
+        "example_paths": [
+          "backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak",
+          "backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak-wal"
+        ]
+      },
+      "quarantined_lexical_generation": {
+        "bytes": 1069,
+        "file_count": 2,
+        "safety_classification": "diagnostic_evidence",
+        "derived": true,
+        "precious": false,
+        "reclaimable": false,
+        "example_paths": [
+          "index/generation-quarantined/lexical-generation-manifest.json",
+          "index/generation-quarantined/segment-a"
+        ]
+      },
+      "retained_publish_backup": {
+        "bytes": 50,
+        "file_count": 2,
+        "safety_classification": "derived_reclaimable",
+        "derived": true,
+        "precious": false,
+        "reclaimable": true,
+        "example_paths": [
+          "index/.lexical-publish-backups/prior-live-newer/segment-b",
+          "index/.lexical-publish-backups/prior-live-older/segment-a"
+        ]
+      }
+    },
+    "safe_cleanup_scope": [
+      "retained_publish_backup"
+    ],
+    "precious_evidence_classes": [
+      "backup_bundle"
+    ],
+    "classification_warnings": [],
+    "recommended_action": "No immediate low-disk risk: derived reclaimable bytes exist, but cleanup still requires an explicit dry-run fingerprint.",
     "notes": [
-      "Available space is above the doctor safety floor."
+      "Available space is above the doctor safety floor.",
+      "Storage inventory accounted for 1138 bytes: 50 derived-reclaimable bytes and 19 precious evidence bytes.",
+      "Precious evidence bytes are not cleanup candidates; use verified export, backup, or relocation workflows instead.",
+      "Reclaimable derived bytes still require cleanup dry-run approval and a matching fingerprint before apply."
     ]
   },
   "asset_taxonomy": [

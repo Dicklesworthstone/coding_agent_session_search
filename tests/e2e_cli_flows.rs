@@ -11,7 +11,7 @@
 //! # E2E Logging
 //!
 //! Tests emit structured JSONL logs via E2eLogger when `E2E_LOG=1` is set.
-//! See `test-results/e2e/SCHEMA.md` for log format.
+//! See `docs/reference/E2E_LOGGING_SCHEMA.md` for log format.
 
 use assert_cmd::Command;
 use serde_json::Value;

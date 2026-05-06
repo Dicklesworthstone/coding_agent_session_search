@@ -33,7 +33,10 @@ use anyhow::Result;
 use base64::prelude::*;
 use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use frankensqlite::compat::{
+    ConnectionExt, OpenFlags as FrankenOpenFlags, RowExt,
+    open_with_flags as open_franken_with_flags,
+};
 use indexer::IndexOptions;
 use model::cli_error_kind::ErrorKind as CliErrorKind;
 use serde::{Deserialize, Serialize};
@@ -646,6 +649,18 @@ pub enum Commands {
         /// Hidden normalized form for `cass doctor cleanup ...`.
         #[arg(long, hide = true, default_value_t = false, conflicts_with_all = ["check", "repair", "fix"])]
         cleanup: bool,
+        /// Hidden normalized form for `cass doctor backups list ...`.
+        #[arg(long, hide = true, default_value_t = false, conflicts_with_all = ["check", "repair", "cleanup", "fix", "backups_verify", "backups_restore"])]
+        backups_list: bool,
+        /// Hidden normalized form for `cass doctor backups verify ...`.
+        #[arg(long, hide = true, default_value_t = false, conflicts_with_all = ["check", "repair", "cleanup", "fix", "backups_list", "backups_restore"])]
+        backups_verify: bool,
+        /// Hidden normalized form for `cass doctor backups restore ...`.
+        #[arg(long, hide = true, default_value_t = false, conflicts_with_all = ["check", "repair", "cleanup", "fix", "backups_list", "backups_verify"])]
+        backups_restore: bool,
+        /// Backup id from `cass doctor backups list --json`.
+        #[arg(long, hide = true)]
+        backup_id: Option<String>,
         /// Preview a fingerprinted repair plan without mutating any cass files.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -2242,6 +2257,48 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
         && rest
             .get(1)
+            .is_some_and(|arg| arg.eq_ignore_ascii_case("backups"))
+        && let Some(action) = rest.get(2).map(|arg| arg.to_ascii_lowercase())
+    {
+        match action.as_str() {
+            "list" => {
+                rest.remove(2);
+                rest.remove(1);
+                rest.insert(1, "--backups-list".to_string());
+                corrections.push(
+                    "'doctor backups list' → 'doctor --backups-list' (backup inventory surface)"
+                        .into(),
+                );
+            }
+            "verify" | "restore" => {
+                let flag = if action == "verify" {
+                    "--backups-verify"
+                } else {
+                    "--backups-restore"
+                };
+                let backup_id = rest.get(3).filter(|arg| !arg.starts_with('-')).cloned();
+                if backup_id.is_some() {
+                    rest.remove(3);
+                }
+                rest.remove(2);
+                rest.remove(1);
+                rest.insert(1, flag.to_string());
+                if let Some(backup_id) = backup_id {
+                    rest.insert(2, backup_id);
+                    rest.insert(2, "--backup-id".to_string());
+                }
+                corrections.push(format!(
+                    "'doctor backups {action}' → 'doctor {flag}' (backup {action} surface)"
+                ));
+            }
+            _ => {}
+        }
+    }
+    if rest
+        .first()
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
+        && rest
+            .get(1)
             .is_some_and(|arg| arg.eq_ignore_ascii_case("check"))
     {
         rest.remove(1);
@@ -3737,6 +3794,13 @@ async fn execute_cli(
 
                         // Exit with non-zero if invalid
                         if result.status != "valid" {
+                            if structured_format.is_some() {
+                                return Err(CliError::already_reported(
+                                    1,
+                                    CliErrorKind::Pages.kind_str(),
+                                    false,
+                                ));
+                            }
                             return Err(CliError {
                                 code: 1,
                                 kind: CliErrorKind::Pages.kind_str(),
@@ -4053,6 +4117,10 @@ async fn execute_cli(
                     fix,
                     repair,
                     cleanup,
+                    backups_list,
+                    backups_verify,
+                    backups_restore,
+                    backup_id,
                     dry_run,
                     yes,
                     plan_fingerprint,
@@ -4061,7 +4129,7 @@ async fn execute_cli(
                     allow_repeated_repair,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
-                    let request = doctor::DoctorCommandRequest::from_cli_flags(
+                    let request = doctor::DoctorCommandRequest::from_cli_flags_with_backups(
                         data_dir,
                         cli.db.clone(),
                         structured_format,
@@ -4069,6 +4137,10 @@ async fn execute_cli(
                         fix,
                         repair,
                         cleanup,
+                        backups_list,
+                        backups_verify,
+                        backups_restore,
+                        backup_id,
                         dry_run,
                         yes,
                         plan_fingerprint,
@@ -5789,6 +5861,7 @@ fn state_meta_json_with_counts(
         allow_db_open,
         include_counts_override,
         false,
+        allow_db_open,
     )
 }
 
@@ -5804,6 +5877,7 @@ fn state_meta_json_full(
     allow_db_open: bool,
     include_counts_override: Option<bool>,
     skip_db_open: bool,
+    inspect_semantic: bool,
 ) -> serde_json::Value {
     state_meta_json_inner(
         data_dir,
@@ -5812,19 +5886,28 @@ fn state_meta_json_full(
         allow_db_open,
         include_counts_override,
         skip_db_open,
-        allow_db_open && !skip_db_open,
+        inspect_semantic,
     )
 }
 
 /// Convenience wrapper for run_health: skip COUNT(*) AND skip the
-/// DB open. The two together drop p50 from 296ms (pre-d0rmo)
-/// through ~132ms (post-d0rmo) toward the <50ms budget.
+/// DB open. Keep semantic asset probing enabled: it is filesystem-only
+/// on this path, and health/status JSON must agree on realized fallback
+/// state instead of reporting an unhelpful `not_inspected` placeholder.
 fn state_meta_json_for_health(
     data_dir: &Path,
     db_path: &Path,
     stale_threshold: u64,
 ) -> serde_json::Value {
-    state_meta_json_full(data_dir, db_path, stale_threshold, true, Some(false), true)
+    state_meta_json_full(
+        data_dir,
+        db_path,
+        stale_threshold,
+        true,
+        Some(false),
+        true,
+        true,
+    )
 }
 
 fn status_should_skip_db_open(db_path: &Path) -> bool {
@@ -7471,6 +7554,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Doctor outcomes: branch on doctor.operation_outcome.kind (kebab-case) before prose; exit_code_kind says whether the outcome is success, health-failure, usage-error, lock-busy, or repair-failure.".to_string(),
             "  Doctor v2 schemas: use introspect.response_schemas doctor-* keys. First branch on err.kind/status/operation_outcome.kind/outcome_kind/asset_class/risk_level/fallback_mode; never scrape diagnostic prose.".to_string(),
             "  Doctor repairs: start with `cass doctor check --json`; use repair dry-run fingerprints for apply; support bundles and failure contexts report artifact_manifest_path/event_log_path instead of putting logs in stdout.".to_string(),
+            "  Doctor validation: use `scripts/e2e/doctor_v2.sh list|describe|run --json`; `--artifact-dir` creates a fresh run child, and run-summary.json lists scenario ids, labels, mutation class, log paths, failure_context path, and rerun command.".to_string(),
+            "  Doctor failure reports: attach the redacted failure_context.json plus manifest/commands/events artifacts; do not attach raw session logs, exact source paths, or live archive copies by default.".to_string(),
             "  Args: accepts --robot-docs=topic and misplaced globals; detailed errors with examples on parse failure".to_string(),
             "  Source control: use `cass robot-docs sources` for remote sync/setup plus persistent agent-harness exclusions".to_string(),
             "  TUI drill-in contract: Enter on selected hit opens detail modal (Messages tab); Enter with no selected hit falls back to query submit behavior".to_string(),
@@ -8434,6 +8519,13 @@ fn ensure_lexical_assets_for_search(
                     &reason,
                     anyhow::anyhow!(rendered),
                 ));
+            }
+            if initial_index_exists {
+                return Ok(SearchLexicalSelfHeal {
+                    action: "concurrent-repair-searching-existing-index",
+                    reason: Some(reason),
+                    indexed_docs: None,
+                });
             }
 
             let waited = wait_for_searchable_index_after_active_rebuild(
@@ -12902,7 +12994,9 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
         "repair_failure_marker" => DoctorAnomaly::RepairPreviouslyFailed,
         "post_repair_probes" => DoctorAnomaly::RepairPreviouslyFailed,
         "derivative_cleanup" => DoctorAnomaly::DegradedDerivedAssets,
-        "config" | "sources_config" => DoctorAnomaly::ConfigExclusionRisk,
+        "config" | "sources_config" | "config_exclusion_risks" => {
+            DoctorAnomaly::ConfigExclusionRisk
+        }
         "sessions" => DoctorAnomaly::SourceAuthorityUnsafe,
         "source_inventory" => {
             if message.contains("no longer have a visible upstream file")
@@ -15623,6 +15717,11 @@ fn doctor_redacted_path(path: &str, data_dir: &Path) -> String {
         .unwrap_or_else(|| "[external]".to_string())
 }
 
+fn doctor_redacted_text(text: &str, data_dir: &Path) -> String {
+    let data_dir_text = data_dir.display().to_string();
+    text.replace(&data_dir_text, "[cass-data]")
+}
+
 fn doctor_forensic_bundle_uncaptured(status: &str) -> DoctorForensicBundleMetadata {
     DoctorForensicBundleMetadata {
         status: status.to_string(),
@@ -16799,6 +16898,13 @@ struct DoctorCandidatePromotionReport {
     derived_assets_consistency_status: String,
     derived_lexical_rebuild_required: bool,
     derived_semantic_rebuild_required: bool,
+    derived_lexical_followup_status: String,
+    derived_semantic_followup_status: String,
+    derived_vector_followup_status: String,
+    derived_memo_followup_status: String,
+    derived_followup_artifact_path: Option<String>,
+    redacted_derived_followup_artifact_path: Option<String>,
+    derived_followup_artifact_blake3: Option<String>,
     candidate_lexical_metadata_path: Option<String>,
     redacted_candidate_lexical_metadata_path: Option<String>,
     candidate_lexical_metadata_blake3: Option<String>,
@@ -17270,6 +17376,8 @@ impl DoctorMutationLockObservation {
 
 const DOCTOR_STORAGE_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 const CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES: &str = "CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES";
+const CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT: &str =
+    "CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT";
 const DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS: u64 = 500;
 const DOCTOR_LOCK_HEARTBEAT_STALE_AFTER_MS: u64 = 60 * 60 * 1000;
 
@@ -17281,7 +17389,59 @@ struct DoctorStoragePressureReport {
     probe_path: String,
     available_bytes: Option<u64>,
     min_recommended_free_bytes: u64,
+    low_disk_risk: String,
+    total_accounted_bytes: u64,
+    reclaimable_derived_bytes: u64,
+    precious_evidence_bytes: u64,
+    protected_non_reclaimable_bytes: u64,
+    unknown_bytes: u64,
+    reclaimable_bytes_by_class: BTreeMap<String, u64>,
+    precious_bytes_by_class: BTreeMap<String, u64>,
+    protected_bytes_by_class: BTreeMap<String, u64>,
+    bytes_by_class: BTreeMap<String, DoctorStorageAssetClassBreakdown>,
+    safe_cleanup_scope: Vec<String>,
+    precious_evidence_classes: Vec<String>,
+    classification_warnings: Vec<String>,
+    recommended_action: String,
     notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorStorageAssetClassBreakdown {
+    bytes: u64,
+    file_count: usize,
+    safety_classification: DoctorAssetSafetyClassification,
+    derived: bool,
+    precious: bool,
+    reclaimable: bool,
+    example_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DoctorConfigExclusionRiskReport {
+    schema_version: u32,
+    path: String,
+    risk_kind: String,
+    evidence: Vec<String>,
+    confidence: String,
+    recommended_action: String,
+    auto_fix_available: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DoctorConfigExclusionTarget {
+    path: PathBuf,
+    asset_class: DoctorAssetClass,
+    label: &'static str,
+    tokens: &'static [&'static str],
+}
+
+#[derive(Debug, Clone)]
+struct DoctorConfigPatternMatch {
+    config_path: PathBuf,
+    line_number: usize,
+    pattern: String,
+    include: bool,
 }
 
 fn doctor_storage_probe_path(data_dir: &Path) -> PathBuf {
@@ -17305,16 +17465,263 @@ fn doctor_available_space(probe_path: &Path) -> io::Result<u64> {
     fs2::available_space(probe_path)
 }
 
-fn collect_doctor_storage_pressure(data_dir: &Path) -> DoctorStoragePressureReport {
-    let probe_path = doctor_storage_probe_path(data_dir);
-    match doctor_available_space(&probe_path) {
+fn doctor_asset_class_name(asset_class: DoctorAssetClass) -> String {
+    serde_json::to_value(asset_class)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("{asset_class:?}"))
+}
+
+fn doctor_storage_relative_components(relative_path: &Path) -> Vec<String> {
+    relative_path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn doctor_classify_storage_relative_path(relative_path: &Path) -> DoctorAssetClass {
+    let components = doctor_storage_relative_components(relative_path);
+    let Some(first) = components.first().map(String::as_str) else {
+        return DoctorAssetClass::Unknown;
+    };
+    let file_name = relative_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if first == "agent_search.db" {
+        return DoctorAssetClass::CanonicalArchiveDb;
+    }
+    if file_name == "agent_search.db-wal"
+        || file_name == "agent_search.db-shm"
+        || file_name.starts_with("agent_search.db-")
+    {
+        return DoctorAssetClass::ArchiveDbSidecar;
+    }
+    if first == "raw-mirror" || first == "raw_mirror" {
+        return DoctorAssetClass::RawMirrorBlob;
+    }
+    if first == "backups" || first == "backup" || file_name.ends_with(".bak") {
+        return DoctorAssetClass::BackupBundle;
+    }
+    if first == "sources.toml" || first == "config" || first == "configs" {
+        return DoctorAssetClass::UserConfig;
+    }
+    if first == "bookmarks.json" || first == "bookmarks" {
+        return DoctorAssetClass::BookmarkStore;
+    }
+    if first == "models" || first == "model-cache" || first == "model_cache" {
+        return DoctorAssetClass::ModelCache;
+    }
+    if first == "memo" || first == "memo-cache" || first == "memo_cache" {
+        return DoctorAssetClass::MemoCache;
+    }
+    if first == "semantic" || first == "vectors" || first == "vector" {
+        return DoctorAssetClass::DerivedSemanticIndex;
+    }
+    if first == "doctor" {
+        return match components.get(1).map(String::as_str) {
+            Some("receipts") => DoctorAssetClass::OperationReceipt,
+            Some("support-bundles") | Some("support_bundles") => DoctorAssetClass::SupportBundle,
+            Some("forensic-bundles") | Some("forensic_bundles") => DoctorAssetClass::ForensicBundle,
+            Some("events") | Some("event-log") | Some("event_log") | Some("logs") => {
+                DoctorAssetClass::EventLog
+            }
+            _ => DoctorAssetClass::ForensicBundle,
+        };
+    }
+    if first == "index" {
+        if components
+            .iter()
+            .any(|part| part == ".lexical-publish-backups")
+        {
+            return DoctorAssetClass::RetainedPublishBackup;
+        }
+        if components
+            .iter()
+            .any(|part| part.contains("quarantined") || part.contains("quarantine"))
+        {
+            return DoctorAssetClass::QuarantinedLexicalGeneration;
+        }
+        if components
+            .iter()
+            .any(|part| part.contains("failed-reclaimable") || part.contains("reclaimable"))
+        {
+            return DoctorAssetClass::ReclaimableDerivedCache;
+        }
+        return DoctorAssetClass::DerivedLexicalIndex;
+    }
+
+    DoctorAssetClass::Unknown
+}
+
+fn doctor_storage_breakdown_for_class(
+    asset_class: DoctorAssetClass,
+) -> DoctorStorageAssetClassBreakdown {
+    let safety = doctor_asset_safety(asset_class);
+    DoctorStorageAssetClassBreakdown {
+        bytes: 0,
+        file_count: 0,
+        safety_classification: safety.safety_classification,
+        derived: safety.derived,
+        precious: safety.precious,
+        reclaimable: safety.safe_to_gc_allowed,
+        example_paths: Vec::new(),
+    }
+}
+
+fn doctor_record_storage_bytes(
+    bytes_by_class: &mut BTreeMap<String, DoctorStorageAssetClassBreakdown>,
+    asset_class: DoctorAssetClass,
+    relative_path: &Path,
+    bytes: u64,
+) {
+    let class_name = doctor_asset_class_name(asset_class);
+    let entry = bytes_by_class
+        .entry(class_name)
+        .or_insert_with(|| doctor_storage_breakdown_for_class(asset_class));
+    entry.bytes = entry.bytes.saturating_add(bytes);
+    entry.file_count += 1;
+    if entry.example_paths.len() < 3 {
+        entry
+            .example_paths
+            .push(relative_path.display().to_string());
+    }
+}
+
+fn doctor_collect_storage_bytes_by_class(
+    data_dir: &Path,
+) -> (
+    BTreeMap<String, DoctorStorageAssetClassBreakdown>,
+    Vec<String>,
+) {
+    let mut bytes_by_class = BTreeMap::new();
+    let mut warnings = Vec::new();
+    if !data_dir.exists() {
+        return (bytes_by_class, warnings);
+    }
+
+    let scan_root = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    for entry in walkdir::WalkDir::new(&scan_root)
+        .follow_links(false)
+        .into_iter()
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                warnings.push(format!("storage inventory skipped an entry: {err}"));
+                continue;
+            }
+        };
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            warnings.push(format!(
+                "storage inventory could not stat {}",
+                entry.path().display()
+            ));
+            continue;
+        };
+        if !(metadata.is_file() || metadata.file_type().is_symlink()) {
+            continue;
+        }
+        let relative_path = entry
+            .path()
+            .strip_prefix(&scan_root)
+            .unwrap_or(entry.path());
+        let asset_class = doctor_classify_storage_relative_path(relative_path);
+        if asset_class == DoctorAssetClass::Unknown {
+            warnings.push(format!(
+                "storage inventory classified {} as unknown and protected it from cleanup",
+                relative_path.display()
+            ));
+        }
+        doctor_record_storage_bytes(
+            &mut bytes_by_class,
+            asset_class,
+            relative_path,
+            metadata.len(),
+        );
+    }
+    (bytes_by_class, warnings)
+}
+
+fn doctor_storage_pressure_action(
+    low_disk_risk: &str,
+    reclaimable_derived_bytes: u64,
+    precious_evidence_bytes: u64,
+) -> String {
+    if low_disk_risk == "low_free_space" && reclaimable_derived_bytes > 0 {
+        "Low free space: inspect the cleanup dry-run and apply only fingerprint-approved derived cleanup; preserve raw mirrors, archive DBs, backups, receipts, configs, bookmarks, and source evidence.".to_string()
+    } else if low_disk_risk == "low_free_space" && precious_evidence_bytes > 0 {
+        "Low free space: use verified export or archive relocation for precious evidence before reclaiming space; do not delete cass archive evidence manually.".to_string()
+    } else if low_disk_risk == "low_free_space" {
+        "Low free space: free non-cass space or run doctor cleanup dry-run before any mutation."
+            .to_string()
+    } else if reclaimable_derived_bytes > 0 {
+        "No immediate low-disk risk: derived reclaimable bytes exist, but cleanup still requires an explicit dry-run fingerprint.".to_string()
+    } else if precious_evidence_bytes > 0 {
+        "No immediate low-disk risk: monitor precious archive growth and use verified export or relocation if it outgrows this disk.".to_string()
+    } else {
+        "No immediate storage-pressure action is needed.".to_string()
+    }
+}
+
+fn build_doctor_storage_pressure_report(
+    data_dir: &Path,
+    probe_path: PathBuf,
+    available_space: io::Result<u64>,
+    used_test_override: bool,
+) -> DoctorStoragePressureReport {
+    let (bytes_by_class, classification_warnings) = doctor_collect_storage_bytes_by_class(data_dir);
+    let mut total_accounted_bytes = 0_u64;
+    let mut reclaimable_derived_bytes = 0_u64;
+    let mut precious_evidence_bytes = 0_u64;
+    let mut protected_non_reclaimable_bytes = 0_u64;
+    let mut unknown_bytes = 0_u64;
+    let mut reclaimable_bytes_by_class = BTreeMap::new();
+    let mut precious_bytes_by_class = BTreeMap::new();
+    let mut protected_bytes_by_class = BTreeMap::new();
+    let mut safe_cleanup_scope = Vec::new();
+    let mut precious_evidence_classes = Vec::new();
+
+    for (class_name, breakdown) in &bytes_by_class {
+        total_accounted_bytes = total_accounted_bytes.saturating_add(breakdown.bytes);
+        if breakdown.reclaimable {
+            reclaimable_derived_bytes = reclaimable_derived_bytes.saturating_add(breakdown.bytes);
+            reclaimable_bytes_by_class.insert(class_name.clone(), breakdown.bytes);
+            safe_cleanup_scope.push(class_name.clone());
+        } else {
+            protected_non_reclaimable_bytes =
+                protected_non_reclaimable_bytes.saturating_add(breakdown.bytes);
+            protected_bytes_by_class.insert(class_name.clone(), breakdown.bytes);
+        }
+        if breakdown.precious {
+            precious_evidence_bytes = precious_evidence_bytes.saturating_add(breakdown.bytes);
+            precious_bytes_by_class.insert(class_name.clone(), breakdown.bytes);
+            precious_evidence_classes.push(class_name.clone());
+        }
+        if class_name == "unknown" {
+            unknown_bytes = unknown_bytes.saturating_add(breakdown.bytes);
+        }
+    }
+
+    safe_cleanup_scope.sort();
+    precious_evidence_classes.sort();
+    let (status, available_bytes, low_disk_risk, mut notes) = match available_space {
         Ok(available_bytes) => {
             let status = if available_bytes < DOCTOR_STORAGE_MIN_FREE_BYTES {
                 "warn"
             } else {
                 "ok"
             };
-            let mut notes = vec![if status == "warn" {
+            let low_disk_risk = if status == "warn" {
+                "low_free_space"
+            } else {
+                "none"
+            };
+            let notes = vec![if status == "warn" {
                 format!(
                     "Available space is below the doctor safety floor of {} bytes; free space without deleting cass archive evidence.",
                     DOCTOR_STORAGE_MIN_FREE_BYTES
@@ -17322,33 +17729,494 @@ fn collect_doctor_storage_pressure(data_dir: &Path) -> DoctorStoragePressureRepo
             } else {
                 "Available space is above the doctor safety floor.".to_string()
             }];
-            if dotenvy::var(CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES).is_ok() {
-                notes.push(
-                    "Storage pressure used the deterministic doctor E2E test override.".to_string(),
-                );
-            }
-            DoctorStoragePressureReport {
-                schema_version: 1,
-                status: status.to_string(),
-                data_dir_exists: data_dir.exists(),
-                probe_path: probe_path.display().to_string(),
-                available_bytes: Some(available_bytes),
-                min_recommended_free_bytes: DOCTOR_STORAGE_MIN_FREE_BYTES,
+            (
+                status.to_string(),
+                Some(available_bytes),
+                low_disk_risk.to_string(),
                 notes,
-            }
+            )
         }
-        Err(err) => DoctorStoragePressureReport {
-            schema_version: 1,
-            status: "unknown".to_string(),
-            data_dir_exists: data_dir.exists(),
-            probe_path: probe_path.display().to_string(),
-            available_bytes: None,
-            min_recommended_free_bytes: DOCTOR_STORAGE_MIN_FREE_BYTES,
-            notes: vec![format!(
+        Err(err) => (
+            "unknown".to_string(),
+            None,
+            "unknown".to_string(),
+            vec![format!(
                 "Storage pressure was not checked because free-space probing failed: {err}"
             )],
-        },
+        ),
+    };
+
+    if used_test_override {
+        notes.push("Storage pressure used the deterministic doctor E2E test override.".to_string());
     }
+    notes.push(format!(
+        "Storage inventory accounted for {total_accounted_bytes} bytes: {reclaimable_derived_bytes} derived-reclaimable bytes and {precious_evidence_bytes} precious evidence bytes."
+    ));
+    if precious_evidence_bytes > 0 {
+        notes.push(
+            "Precious evidence bytes are not cleanup candidates; use verified export, backup, or relocation workflows instead."
+                .to_string(),
+        );
+    }
+    if reclaimable_derived_bytes > 0 {
+        notes.push(
+            "Reclaimable derived bytes still require cleanup dry-run approval and a matching fingerprint before apply."
+                .to_string(),
+        );
+    }
+
+    let recommended_action = doctor_storage_pressure_action(
+        &low_disk_risk,
+        reclaimable_derived_bytes,
+        precious_evidence_bytes,
+    );
+
+    DoctorStoragePressureReport {
+        schema_version: 2,
+        status,
+        data_dir_exists: data_dir.exists(),
+        probe_path: probe_path.display().to_string(),
+        available_bytes,
+        min_recommended_free_bytes: DOCTOR_STORAGE_MIN_FREE_BYTES,
+        low_disk_risk,
+        total_accounted_bytes,
+        reclaimable_derived_bytes,
+        precious_evidence_bytes,
+        protected_non_reclaimable_bytes,
+        unknown_bytes,
+        reclaimable_bytes_by_class,
+        precious_bytes_by_class,
+        protected_bytes_by_class,
+        bytes_by_class,
+        safe_cleanup_scope,
+        precious_evidence_classes,
+        classification_warnings,
+        recommended_action,
+        notes,
+    }
+}
+
+fn collect_doctor_storage_pressure(data_dir: &Path) -> DoctorStoragePressureReport {
+    let probe_path = doctor_storage_probe_path(data_dir);
+    let used_test_override = dotenvy::var(CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES).is_ok();
+    let available_space = doctor_available_space(&probe_path);
+    build_doctor_storage_pressure_report(data_dir, probe_path, available_space, used_test_override)
+}
+
+fn doctor_config_exclusion_targets(
+    data_dir: &Path,
+    db_path: &Path,
+) -> Vec<DoctorConfigExclusionTarget> {
+    vec![
+        DoctorConfigExclusionTarget {
+            path: data_dir.to_path_buf(),
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            label: "cass data directory",
+            tokens: &["cass", "cass-data", "data_dir", "data-dir"],
+        },
+        DoctorConfigExclusionTarget {
+            path: db_path.to_path_buf(),
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            label: "canonical archive database",
+            tokens: &["agent_search.db", "archive", "database"],
+        },
+        DoctorConfigExclusionTarget {
+            path: doctor_raw_mirror_root(data_dir),
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            label: "raw mirror evidence",
+            tokens: &["raw-mirror", "raw_mirror", "raw mirror"],
+        },
+        DoctorConfigExclusionTarget {
+            path: data_dir.join("backups"),
+            asset_class: DoctorAssetClass::BackupBundle,
+            label: "doctor backups",
+            tokens: &["backup", "backups"],
+        },
+        DoctorConfigExclusionTarget {
+            path: data_dir.join("doctor").join("receipts"),
+            asset_class: DoctorAssetClass::OperationReceipt,
+            label: "doctor receipts",
+            tokens: &["receipt", "receipts"],
+        },
+        DoctorConfigExclusionTarget {
+            path: data_dir.join("doctor").join("forensic-bundles"),
+            asset_class: DoctorAssetClass::ForensicBundle,
+            label: "forensic bundles",
+            tokens: &["forensic-bundle", "forensic_bundles", "forensic"],
+        },
+        DoctorConfigExclusionTarget {
+            path: data_dir.join("doctor").join("support-bundles"),
+            asset_class: DoctorAssetClass::SupportBundle,
+            label: "support bundles",
+            tokens: &["support-bundle", "support_bundles", "support"],
+        },
+    ]
+}
+
+fn doctor_path_to_slash_string(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
+            std::path::Component::RootDir => Some("/".into()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+        .replace("//", "/")
+}
+
+fn doctor_pattern_matches_relative_path(raw_pattern: &str, relative_path: &Path) -> bool {
+    let mut pattern = raw_pattern.trim();
+    if pattern.is_empty() || pattern.starts_with('#') {
+        return false;
+    }
+    if let Some(stripped) = pattern.strip_prefix('!') {
+        pattern = stripped.trim();
+    }
+    if let Some(stripped) = pattern.strip_prefix("- ") {
+        pattern = stripped.trim();
+    }
+    if let Some(stripped) = pattern.strip_prefix("+ ") {
+        pattern = stripped.trim();
+    }
+    if let Some(stripped) = pattern.strip_prefix("exclude ") {
+        pattern = stripped.trim();
+    }
+    if let Some(stripped) = pattern.strip_prefix("--exclude=") {
+        pattern = stripped.trim();
+    }
+    let pattern = pattern.trim_matches('"').trim_matches('\'').trim();
+    if pattern.is_empty() {
+        return false;
+    }
+
+    let anchored = pattern.starts_with('/');
+    let directory_pattern = pattern.ends_with('/');
+    let pattern = pattern.trim_start_matches('/').trim_end_matches('/');
+    let relative = doctor_path_to_slash_string(relative_path);
+    let relative = relative.trim_start_matches("./");
+    if relative.is_empty() {
+        return false;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/**")
+        && (relative == prefix || relative.starts_with(&format!("{prefix}/")))
+    {
+        return true;
+    }
+    if pattern == relative || relative.starts_with(&format!("{pattern}/")) {
+        return true;
+    }
+
+    let mut candidates = vec![pattern.to_string()];
+    if directory_pattern {
+        candidates.push(format!("{pattern}/**"));
+    }
+    if !anchored && !pattern.contains('/') {
+        candidates.push(format!("**/{pattern}"));
+        candidates.push(format!("**/{pattern}/**"));
+    }
+    candidates.iter().any(|candidate| {
+        glob::Pattern::new(candidate)
+            .map(|compiled| compiled.matches(relative))
+            .unwrap_or(false)
+    })
+}
+
+fn doctor_parse_exclusion_pattern_line(line: &str) -> Option<(String, bool)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('!') {
+        return Some((rest.trim().to_string(), true));
+    }
+    if let Some(rest) = trimmed.strip_prefix("+ ") {
+        return Some((rest.trim().to_string(), true));
+    }
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return Some((rest.trim().to_string(), false));
+    }
+    if let Some(rest) = trimmed.strip_prefix("exclude ") {
+        return Some((rest.trim().to_string(), false));
+    }
+    if let Some(rest) = trimmed.strip_prefix("--exclude=") {
+        return Some((rest.trim().to_string(), false));
+    }
+    Some((trimmed.to_string(), false))
+}
+
+fn doctor_last_matching_exclusion_in_file(
+    config_path: &Path,
+    base_dir: &Path,
+    target_path: &Path,
+) -> Option<DoctorConfigPatternMatch> {
+    let relative_path = target_path.strip_prefix(base_dir).ok()?;
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let mut last_match = None;
+    for (line_index, line) in content.lines().enumerate() {
+        let Some((pattern, include)) = doctor_parse_exclusion_pattern_line(line) else {
+            continue;
+        };
+        if doctor_pattern_matches_relative_path(&pattern, relative_path) {
+            last_match = Some(DoctorConfigPatternMatch {
+                config_path: config_path.to_path_buf(),
+                line_number: line_index + 1,
+                pattern,
+                include,
+            });
+        }
+    }
+    last_match
+}
+
+fn doctor_existing_or_parent(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if ancestor.exists() {
+            return ancestor.to_path_buf();
+        }
+    }
+    path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+}
+
+fn doctor_repo_root_for_path(path: &Path) -> Option<PathBuf> {
+    let start = doctor_existing_or_parent(path);
+    let start = if start.is_file() {
+        start.parent().unwrap_or(&start).to_path_buf()
+    } else {
+        start
+    };
+    start
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+fn doctor_gitignore_files_between(repo_root: &Path, target_path: &Path) -> Vec<PathBuf> {
+    let target_parent = target_path.parent().unwrap_or(target_path);
+    let Ok(relative_parent) = target_parent.strip_prefix(repo_root) else {
+        return Vec::new();
+    };
+    let mut dirs = vec![repo_root.to_path_buf()];
+    let mut current = repo_root.to_path_buf();
+    for component in relative_parent.components() {
+        if let std::path::Component::Normal(part) = component {
+            current.push(part);
+            dirs.push(current.clone());
+        }
+    }
+    dirs.into_iter()
+        .map(|dir| dir.join(".gitignore"))
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn doctor_repo_gitignore_exclusion(
+    target_path: &Path,
+) -> Option<DoctorConfigPatternMatch> {
+    let repo_root = doctor_repo_root_for_path(target_path)?;
+    let mut last_match = None;
+    for config_path in doctor_gitignore_files_between(&repo_root, target_path) {
+        let base_dir = config_path.parent().unwrap_or(&repo_root);
+        if let Some(pattern_match) =
+            doctor_last_matching_exclusion_in_file(&config_path, base_dir, target_path)
+        {
+            last_match = Some(pattern_match);
+        }
+    }
+    last_match.filter(|pattern_match| !pattern_match.include)
+}
+
+fn doctor_local_exclusion_config_files(data_dir: &Path) -> Vec<PathBuf> {
+    [
+        ".gitignore",
+        ".ignore",
+        ".backupignore",
+        ".rsync-filter",
+        "backup-excludes.txt",
+        "restic-excludes.txt",
+        "borg-excludes.txt",
+        "rclone-excludes.txt",
+    ]
+    .into_iter()
+    .map(|name| data_dir.join(name))
+    .filter(|path| path.exists())
+    .collect()
+}
+
+fn doctor_path_has_cache_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        let std::path::Component::Normal(part) = component else {
+            return false;
+        };
+        let part = part.to_string_lossy().to_ascii_lowercase();
+        part == ".cache"
+            || part == "cache"
+            || part == "caches"
+            || part == "temporaryitems"
+            || part == "temporary items"
+    })
+}
+
+fn doctor_config_target_recommended_action(target: &DoctorConfigExclusionTarget) -> String {
+    format!(
+        "Review backup, sync, and ignore configuration before trusting archival coverage for {}; remove broad exclusions or add a later include/allow rule. cass will not edit these files automatically.",
+        target.label
+    )
+}
+
+fn doctor_push_config_exclusion_risk(
+    risks: &mut Vec<DoctorConfigExclusionRiskReport>,
+    seen: &mut HashSet<(String, String, String)>,
+    target: &DoctorConfigExclusionTarget,
+    risk_kind: &str,
+    evidence: Vec<String>,
+    confidence: &str,
+) {
+    let path = target.path.display().to_string();
+    let evidence_key = evidence.join("\n");
+    let key = (path.clone(), risk_kind.to_string(), evidence_key);
+    if !seen.insert(key) {
+        return;
+    }
+    risks.push(DoctorConfigExclusionRiskReport {
+        schema_version: 1,
+        path,
+        risk_kind: risk_kind.to_string(),
+        evidence,
+        confidence: confidence.to_string(),
+        recommended_action: doctor_config_target_recommended_action(target),
+        auto_fix_available: false,
+    });
+}
+
+fn doctor_scan_text_config_for_exclusion_mentions(
+    risks: &mut Vec<DoctorConfigExclusionRiskReport>,
+    seen: &mut HashSet<(String, String, String)>,
+    config_path: &Path,
+    risk_kind: &str,
+    targets: &[DoctorConfigExclusionTarget],
+) {
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return;
+    };
+    for (line_index, line) in content.lines().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("exclude")
+            || lower.contains("ignore")
+            || lower.contains("filter")
+            || lower.contains("prune")
+            || lower.contains("skip"))
+        {
+            continue;
+        }
+        for target in targets {
+            if target.tokens.iter().any(|token| lower.contains(token)) {
+                doctor_push_config_exclusion_risk(
+                    risks,
+                    seen,
+                    target,
+                    risk_kind,
+                    vec![format!(
+                        "{}:{} mentions exclusion-like policy for {}: {}",
+                        config_path.display(),
+                        line_index + 1,
+                        target.label,
+                        line.trim()
+                    )],
+                    "medium",
+                );
+            }
+        }
+    }
+}
+
+fn collect_doctor_config_exclusion_risks(
+    data_dir: &Path,
+    db_path: &Path,
+    config_path: &Path,
+    sources_path: &Path,
+) -> Vec<DoctorConfigExclusionRiskReport> {
+    let targets = doctor_config_exclusion_targets(data_dir, db_path);
+    let mut risks = Vec::new();
+    let mut seen = HashSet::new();
+
+    for target in &targets {
+        if doctor_path_has_cache_component(&target.path) {
+            doctor_push_config_exclusion_risk(
+                &mut risks,
+                &mut seen,
+                target,
+                "volatile-cache-location",
+                vec![format!(
+                    "{} is under a cache-like directory; cache cleaners and sync tools commonly exclude or prune this location",
+                    target.path.display()
+                )],
+                "high",
+            );
+        }
+
+        if let Some(pattern_match) = doctor_repo_gitignore_exclusion(&target.path) {
+            doctor_push_config_exclusion_risk(
+                &mut risks,
+                &mut seen,
+                target,
+                "repo-ignore-excludes-cass-evidence",
+                vec![format!(
+                    "{}:{} pattern {:?} excludes {} ({})",
+                    pattern_match.config_path.display(),
+                    pattern_match.line_number,
+                    pattern_match.pattern,
+                    target.label,
+                    doctor_asset_class_name(target.asset_class)
+                )],
+                "high",
+            );
+        }
+
+        for config_file in doctor_local_exclusion_config_files(data_dir) {
+            if let Some(pattern_match) =
+                doctor_last_matching_exclusion_in_file(&config_file, data_dir, &target.path)
+                && !pattern_match.include
+            {
+                doctor_push_config_exclusion_risk(
+                    &mut risks,
+                    &mut seen,
+                    target,
+                    "backup-filter-excludes-cass-evidence",
+                    vec![format!(
+                        "{}:{} pattern {:?} excludes {} ({})",
+                        pattern_match.config_path.display(),
+                        pattern_match.line_number,
+                        pattern_match.pattern,
+                        target.label,
+                        doctor_asset_class_name(target.asset_class)
+                    )],
+                    "high",
+                );
+            }
+        }
+    }
+
+    if config_path.exists() {
+        doctor_scan_text_config_for_exclusion_mentions(
+            &mut risks,
+            &mut seen,
+            config_path,
+            "cass-config-excludes-cass-evidence",
+            &targets,
+        );
+    }
+    if sources_path.exists() {
+        doctor_scan_text_config_for_exclusion_mentions(
+            &mut risks,
+            &mut seen,
+            sources_path,
+            "sources-config-excludes-cass-evidence",
+            &targets,
+        );
+    }
+
+    risks
 }
 
 fn doctor_fallback_mode_from_state(state: &serde_json::Value) -> String {
@@ -20300,7 +21168,6 @@ fn doctor_summary_risk_level(coverage_risk: &DoctorCoverageRiskSummary) -> &'sta
 fn doctor_summary_health_class(
     coverage_risk: &DoctorCoverageRiskSummary,
     repair_blocked_reason: Option<&str>,
-    initialized: bool,
     healthy: bool,
 ) -> &'static str {
     if repair_blocked_reason.is_some() {
@@ -20313,8 +21180,6 @@ fn doctor_summary_health_class(
         "degraded-archive-risk"
     } else if healthy {
         "healthy"
-    } else if !initialized {
-        "degraded-derived-assets"
     } else {
         "degraded-derived-assets"
     }
@@ -20333,7 +21198,8 @@ fn build_doctor_runtime_summary(input: DoctorRuntimeSummaryInput<'_>) -> serde_j
     let doctor_lock = doctor_probe_mutation_lock(input.data_dir);
     let active_doctor_repair = matches!(
         doctor_lock,
-        DoctorMutationLockObservation::Active { .. } | DoctorMutationLockObservation::Unavailable { .. }
+        DoctorMutationLockObservation::Active { .. }
+            | DoctorMutationLockObservation::Unavailable { .. }
     );
     let active_index_maintenance = input
         .state
@@ -20355,13 +21221,17 @@ fn build_doctor_runtime_summary(input: DoctorRuntimeSummaryInput<'_>) -> serde_j
     let health_class = doctor_summary_health_class(
         input.coverage_risk,
         repair_blocked_reason.as_deref(),
-        input.initialized,
         input.healthy,
     );
-    let doctor_check_recommended = !input.coverage_checked
-        || repair_blocked_reason.is_some()
+    let archive_initialized = input.initialized && input.db_exists;
+    let doctor_check_recommended = repair_blocked_reason.is_some()
         || repair_previously_failed
-        || !matches!(input.coverage_risk.status.as_str(), "ok" | "not_initialized");
+        || (archive_initialized
+            && (!input.coverage_checked
+                || !matches!(
+                    input.coverage_risk.status.as_str(),
+                    "ok" | "not_initialized"
+                )));
     let repair_recommended = input.coverage_risk.recommended_action != "none"
         && input.coverage_risk.confidence_tier != "unchecked";
     let recommended_action = if let Some(reason) = repair_blocked_reason.as_ref() {
@@ -20392,7 +21262,8 @@ fn build_doctor_runtime_summary(input: DoctorRuntimeSummaryInput<'_>) -> serde_j
         .quarantine_summary
         .and_then(|summary| serde_json::to_value(summary).ok())
         .unwrap_or(serde_json::Value::Null);
-    let coverage_known = input.coverage_checked && input.coverage_risk.confidence_tier != "unchecked";
+    let coverage_known =
+        input.coverage_checked && input.coverage_risk.confidence_tier != "unchecked";
     let coverage_delta = serde_json::json!({
         "status": if coverage_known { "unchanged" } else { "unknown" },
         "archive_conversation_count": coverage_known.then_some(input.coverage_risk.archive_conversation_count),
@@ -20424,9 +21295,20 @@ fn build_doctor_runtime_summary(input: DoctorRuntimeSummaryInput<'_>) -> serde_j
     } else {
         "ok"
     };
+    let operator_action_needed = input
+        .recommended_action
+        .as_ref()
+        .is_some_and(|action| action.as_str() != "none");
+    let next_command = if doctor_check_recommended || repair_blocked_reason.is_some() {
+        serde_json::json!("cass doctor check --json")
+    } else if !archive_initialized {
+        serde_json::json!("cass index --full")
+    } else {
+        serde_json::Value::Null
+    };
     let operation_outcome_kind = if repair_blocked_reason.is_some() {
         "repair-blocked"
-    } else if doctor_check_recommended {
+    } else if doctor_check_recommended || operator_action_needed {
         "ok-read-only-diagnosed"
     } else {
         "ok-no-action-needed"
@@ -20456,6 +21338,8 @@ fn build_doctor_runtime_summary(input: DoctorRuntimeSummaryInput<'_>) -> serde_j
             "kind": operation_outcome_kind,
             "reason": if repair_blocked_reason.is_some() {
                 "repair readiness is blocked by active work"
+            } else if !archive_initialized {
+                "archive database is not initialized yet, so doctor coverage cannot be checked"
             } else if doctor_check_recommended {
                 "health/status used bounded readiness evidence and recommends doctor check for full archive coverage"
             } else {
@@ -20466,11 +21350,7 @@ fn build_doctor_runtime_summary(input: DoctorRuntimeSummaryInput<'_>) -> serde_j
             "safe_to_retry": repair_blocked_reason.is_none(),
             "requires_override": false,
             "data_loss_risk": risk_level,
-            "next_command": if doctor_check_recommended || repair_blocked_reason.is_some() {
-                serde_json::json!("cass doctor check --json")
-            } else {
-                serde_json::Value::Null
-            },
+            "next_command": next_command,
             "artifact_manifest_path": serde_json::Value::Null,
             "exit_code_kind": if repair_blocked_reason.is_some() { "lock-busy" } else { "success" },
         },
@@ -20504,6 +21384,8 @@ fn build_doctor_runtime_summary(input: DoctorRuntimeSummaryInput<'_>) -> serde_j
             "source_report_id": serde_json::Value::Null,
             "recommended_action": if input.coverage_checked {
                 "Use this bounded status summary for routing; run cass doctor check --json before mutating."
+            } else if !archive_initialized {
+                "Run cass index --full once before archive coverage can be assessed."
             } else {
                 "Run cass doctor check --json for current archive coverage; health/status did not run deep collectors."
             },
@@ -22584,6 +23466,1090 @@ fn doctor_candidate_promotion_root(data_dir: &Path) -> PathBuf {
     data_dir.join("doctor").join("candidate-promotions")
 }
 
+const DOCTOR_BACKUP_MANIFEST_KIND: &str = "cass_doctor_candidate_promotion_backup_manifest_v1";
+const DOCTOR_BACKUP_RESTORE_PLAN_PREFIX: &str = "doctor-backup-restore-plan-v1";
+
+#[derive(Debug, Clone)]
+struct DoctorBackupManifestRecord {
+    backup_id: String,
+    manifest_path: PathBuf,
+    manifest: serde_json::Value,
+    manifest_blake3: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DoctorBackupArtifactVerification {
+    artifact_kind: String,
+    backup_path: Option<PathBuf>,
+    expected_blake3: Option<String>,
+    actual_blake3: Option<String>,
+    size_bytes: Option<u64>,
+    status: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DoctorBackupVerification {
+    backup_id: String,
+    manifest_path: PathBuf,
+    manifest_blake3: Option<String>,
+    status: String,
+    checksum_status_counts: BTreeMap<String, usize>,
+    restore_rehearsal_allowed: bool,
+    sidecar_bundle_status: String,
+    prior_live_db_path: Option<PathBuf>,
+    prior_live_wal_path: Option<PathBuf>,
+    prior_live_shm_path: Option<PathBuf>,
+    prior_live_db_blake3: Option<String>,
+    prior_live_wal_blake3: Option<String>,
+    prior_live_shm_blake3: Option<String>,
+    artifact_count: usize,
+    total_size_bytes: u64,
+    artifacts: Vec<DoctorBackupArtifactVerification>,
+    warnings: Vec<String>,
+    blocked_reasons: Vec<String>,
+}
+
+fn doctor_backup_id_is_safe(backup_id: &str) -> bool {
+    !backup_id.is_empty()
+        && backup_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn doctor_path_has_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+fn doctor_backup_artifact_path_is_safe(path: &Path, backup_dir: &Path, data_dir: &Path) -> bool {
+    if path == backup_dir || !path.starts_with(backup_dir) || doctor_path_has_parent_component(path)
+    {
+        return false;
+    }
+    if !path.starts_with(data_dir) || path_has_symlink_below_root(path, data_dir) {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(canonical_path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(canonical_backup_dir) = std::fs::canonicalize(backup_dir) else {
+        return false;
+    };
+    canonical_path.starts_with(canonical_backup_dir)
+}
+
+fn doctor_backup_manifest_record_from_path(
+    data_dir: &Path,
+    manifest_path: &Path,
+) -> Result<DoctorBackupManifestRecord, String> {
+    let promotion_root = doctor_candidate_promotion_root(data_dir);
+    let raw = std::fs::read(manifest_path).map_err(|err| {
+        format!(
+            "failed to read backup manifest {}: {err}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: serde_json::Value = serde_json::from_slice(&raw).map_err(|err| {
+        format!(
+            "failed to parse backup manifest {}: {err}",
+            manifest_path.display()
+        )
+    })?;
+    let backup_id = manifest
+        .get("promotion_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            manifest_path
+                .strip_prefix(&promotion_root)
+                .ok()
+                .and_then(|relative| relative.components().next())
+                .and_then(|component| match component {
+                    std::path::Component::Normal(value) => {
+                        Some(value.to_string_lossy().to_string())
+                    }
+                    _ => None,
+                })
+        })
+        .unwrap_or_else(|| "unknown-backup".to_string());
+    Ok(DoctorBackupManifestRecord {
+        backup_id,
+        manifest_path: manifest_path.to_path_buf(),
+        manifest,
+        manifest_blake3: file_blake3_hex(manifest_path).ok(),
+    })
+}
+
+fn collect_doctor_backup_manifest_records(data_dir: &Path) -> Vec<DoctorBackupManifestRecord> {
+    let root = doctor_candidate_promotion_root(data_dir);
+    let mut records = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return records;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let manifest_path = entry.path().join("backup").join("manifest.json");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        match doctor_backup_manifest_record_from_path(data_dir, &manifest_path) {
+            Ok(record) => records.push(record),
+            Err(err) => {
+                let backup_id = entry.file_name().to_string_lossy().to_string();
+                records.push(DoctorBackupManifestRecord {
+                    backup_id,
+                    manifest_path,
+                    manifest: serde_json::json!({
+                        "manifest_kind": "unparseable",
+                        "parse_error": err,
+                    }),
+                    manifest_blake3: None,
+                });
+            }
+        }
+    }
+    records.sort_by(|left, right| left.backup_id.cmp(&right.backup_id));
+    records
+}
+
+fn find_doctor_backup_manifest_record(
+    data_dir: &Path,
+    backup_id: &str,
+) -> Result<DoctorBackupManifestRecord, String> {
+    if !doctor_backup_id_is_safe(backup_id) {
+        return Err(format!(
+            "refusing unsafe backup id {backup_id:?}; use an id from `cass doctor backups list --json`"
+        ));
+    }
+    let direct_manifest_path = doctor_candidate_promotion_root(data_dir)
+        .join(backup_id)
+        .join("backup")
+        .join("manifest.json");
+    if direct_manifest_path.is_file() {
+        return doctor_backup_manifest_record_from_path(data_dir, &direct_manifest_path);
+    }
+    collect_doctor_backup_manifest_records(data_dir)
+        .into_iter()
+        .find(|record| record.backup_id == backup_id)
+        .ok_or_else(|| format!("backup id {backup_id:?} was not found"))
+}
+
+fn doctor_backup_artifact_verification_value(
+    data_dir: &Path,
+    artifact: &DoctorBackupArtifactVerification,
+) -> serde_json::Value {
+    serde_json::json!({
+        "artifact_kind": artifact.artifact_kind,
+        "backup_path": artifact.backup_path.as_ref().map(|path| path.display().to_string()),
+        "redacted_backup_path": artifact.backup_path.as_ref().map(|path| {
+            doctor_redacted_path(&path.display().to_string(), data_dir)
+        }),
+        "expected_blake3": artifact.expected_blake3,
+        "actual_blake3": artifact.actual_blake3,
+        "size_bytes": artifact.size_bytes,
+        "status": artifact.status,
+        "error": artifact.error,
+    })
+}
+
+fn doctor_backup_verification_value(
+    data_dir: &Path,
+    verification: &DoctorBackupVerification,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "backup_id": verification.backup_id,
+        "backup_kind": "candidate-promotion",
+        "manifest_path": verification.manifest_path.display().to_string(),
+        "redacted_manifest_path": doctor_redacted_path(&verification.manifest_path.display().to_string(), data_dir),
+        "manifest_blake3": verification.manifest_blake3,
+        "status": verification.status,
+        "checksum_status_counts": verification.checksum_status_counts,
+        "restore_rehearsal_allowed": verification.restore_rehearsal_allowed,
+        "sidecar_bundle_status": verification.sidecar_bundle_status,
+        "artifact_count": verification.artifact_count,
+        "total_size_bytes": verification.total_size_bytes,
+        "prior_live_db_path": verification.prior_live_db_path.as_ref().map(|path| path.display().to_string()),
+        "redacted_prior_live_db_path": verification.prior_live_db_path.as_ref().map(|path| {
+            doctor_redacted_path(&path.display().to_string(), data_dir)
+        }),
+        "prior_live_db_blake3": verification.prior_live_db_blake3,
+        "prior_live_wal_blake3": verification.prior_live_wal_blake3,
+        "prior_live_shm_blake3": verification.prior_live_shm_blake3,
+        "artifacts": verification.artifacts.iter().map(|artifact| {
+            doctor_backup_artifact_verification_value(data_dir, artifact)
+        }).collect::<Vec<_>>(),
+        "warnings": verification.warnings,
+        "blocked_reasons": verification.blocked_reasons,
+    })
+}
+
+fn verify_doctor_backup_record(
+    data_dir: &Path,
+    record: DoctorBackupManifestRecord,
+) -> DoctorBackupVerification {
+    let backup_dir = record
+        .manifest
+        .get("backup_dir")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            record
+                .manifest_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        });
+    let mut verification = DoctorBackupVerification {
+        backup_id: record.backup_id,
+        manifest_path: record.manifest_path,
+        manifest_blake3: record.manifest_blake3,
+        status: "failed".to_string(),
+        checksum_status_counts: BTreeMap::new(),
+        restore_rehearsal_allowed: false,
+        sidecar_bundle_status: "not-evaluated".to_string(),
+        prior_live_db_path: None,
+        prior_live_wal_path: None,
+        prior_live_shm_path: None,
+        prior_live_db_blake3: None,
+        prior_live_wal_blake3: None,
+        prior_live_shm_blake3: None,
+        artifact_count: 0,
+        total_size_bytes: 0,
+        artifacts: Vec::new(),
+        warnings: Vec::new(),
+        blocked_reasons: Vec::new(),
+    };
+    if record
+        .manifest
+        .get("manifest_kind")
+        .and_then(serde_json::Value::as_str)
+        != Some(DOCTOR_BACKUP_MANIFEST_KIND)
+    {
+        verification
+            .blocked_reasons
+            .push("backup manifest kind is not supported".to_string());
+    }
+    if !backup_dir.starts_with(data_dir) || doctor_path_has_parent_component(&backup_dir) {
+        verification.blocked_reasons.push(format!(
+            "backup_dir is not safely confined to cass data dir: {}",
+            backup_dir.display()
+        ));
+    }
+    let Some(artifacts) = record
+        .manifest
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+    else {
+        verification
+            .blocked_reasons
+            .push("backup manifest has no artifacts array".to_string());
+        return verification;
+    };
+    for artifact in artifacts {
+        let artifact_kind = artifact
+            .get("artifact_kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let expected_blake3 = artifact
+            .get("checksum_blake3")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let backup_path = artifact
+            .get("backup_path")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from);
+        let mut artifact_verification = DoctorBackupArtifactVerification {
+            artifact_kind: artifact_kind.clone(),
+            backup_path: backup_path.clone(),
+            expected_blake3,
+            actual_blake3: None,
+            size_bytes: None,
+            status: "not-recorded".to_string(),
+            error: None,
+        };
+        let Some(path) = backup_path else {
+            artifact_verification.status = "missing-path".to_string();
+            artifact_verification.error = Some("artifact has no backup_path".to_string());
+            *verification
+                .checksum_status_counts
+                .entry(artifact_verification.status.clone())
+                .or_default() += 1;
+            verification.artifacts.push(artifact_verification);
+            continue;
+        };
+        if !doctor_backup_artifact_path_is_safe(&path, &backup_dir, data_dir) {
+            artifact_verification.status = "unsafe-path".to_string();
+            artifact_verification.error = Some(format!(
+                "backup artifact path is outside the manifest backup dir or is not a regular file: {}",
+                path.display()
+            ));
+            verification.blocked_reasons.push(format!(
+                "unsafe backup artifact path for {artifact_kind}: {}",
+                path.display()
+            ));
+        } else {
+            match std::fs::metadata(&path) {
+                Ok(metadata) => {
+                    artifact_verification.size_bytes = Some(metadata.len());
+                    verification.total_size_bytes =
+                        verification.total_size_bytes.saturating_add(metadata.len());
+                }
+                Err(err) => {
+                    artifact_verification.status = "missing".to_string();
+                    artifact_verification.error =
+                        Some(format!("failed to inspect backup artifact: {err}"));
+                }
+            }
+            if artifact_verification.status == "not-recorded" {
+                match file_blake3_hex(&path) {
+                    Ok(hash) => {
+                        artifact_verification.actual_blake3 = Some(hash.clone());
+                        artifact_verification.status =
+                            if artifact_verification.expected_blake3.as_deref() == Some(&hash) {
+                                "matched".to_string()
+                            } else if artifact_verification.expected_blake3.is_some() {
+                                "checksum-mismatch".to_string()
+                            } else {
+                                "not-recorded".to_string()
+                            };
+                    }
+                    Err(err) => {
+                        artifact_verification.status = "hash-error".to_string();
+                        artifact_verification.error = Some(err);
+                    }
+                }
+            }
+        }
+        match artifact_kind.as_str() {
+            "prior_live_archive_db_backup" => {
+                verification.prior_live_db_path = Some(path.clone());
+                verification.prior_live_db_blake3 = artifact_verification.actual_blake3.clone();
+            }
+            "prior_live_archive_wal_backup" => {
+                verification.prior_live_wal_path = Some(path.clone());
+                verification.prior_live_wal_blake3 = artifact_verification.actual_blake3.clone();
+            }
+            "prior_live_archive_shm_backup" => {
+                verification.prior_live_shm_path = Some(path.clone());
+                verification.prior_live_shm_blake3 = artifact_verification.actual_blake3.clone();
+            }
+            _ => {}
+        }
+        *verification
+            .checksum_status_counts
+            .entry(artifact_verification.status.clone())
+            .or_default() += 1;
+        verification.artifacts.push(artifact_verification);
+    }
+    verification.artifact_count = verification.artifacts.len();
+    let prior_live_db_matched = verification.artifacts.iter().any(|artifact| {
+        artifact.artifact_kind == "prior_live_archive_db_backup" && artifact.status == "matched"
+    });
+    let wal_matched = verification.artifacts.iter().any(|artifact| {
+        artifact.artifact_kind == "prior_live_archive_wal_backup" && artifact.status == "matched"
+    });
+    let shm_matched = verification.artifacts.iter().any(|artifact| {
+        artifact.artifact_kind == "prior_live_archive_shm_backup" && artifact.status == "matched"
+    });
+    verification.sidecar_bundle_status = if !prior_live_db_matched {
+        "missing-required-db".to_string()
+    } else if shm_matched && !wal_matched {
+        verification
+            .blocked_reasons
+            .push("prior-live sqlite SHM sidecar exists without a matching WAL".to_string());
+        "sidecar-mismatch".to_string()
+    } else if wal_matched && shm_matched {
+        "complete-with-sidecars".to_string()
+    } else if wal_matched {
+        "complete-with-wal".to_string()
+    } else {
+        "single-file-db".to_string()
+    };
+    if prior_live_db_matched {
+        if let Some(db_path) = verification.prior_live_db_path.as_ref() {
+            match open_franken_with_flags(
+                &db_path.to_string_lossy(),
+                FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) {
+                Ok(connection) => {
+                    drop(connection);
+                    verification
+                        .warnings
+                        .push("frankensqlite read-only probe passed".to_string());
+                }
+                Err(err) => {
+                    verification.blocked_reasons.push(format!(
+                        "frankensqlite read-only probe failed for prior-live backup DB: {err}"
+                    ));
+                }
+            }
+        }
+    } else {
+        verification
+            .blocked_reasons
+            .push("restore requires a checksum-matched prior-live archive DB backup".to_string());
+    }
+    verification.restore_rehearsal_allowed = verification.blocked_reasons.is_empty();
+    verification.status = if verification.restore_rehearsal_allowed {
+        "verified".to_string()
+    } else {
+        "failed".to_string()
+    };
+    verification
+}
+
+fn doctor_restore_fingerprint_inputs(
+    backup_id: &str,
+    verification: &DoctorBackupVerification,
+    live_inventory: &DoctorCandidateLiveInventory,
+) -> serde_json::Value {
+    serde_json::json!({
+        "backup_id": backup_id,
+        "backup_manifest_blake3": verification.manifest_blake3,
+        "restore_role": "prior-live",
+        "prior_live_db_blake3": verification.prior_live_db_blake3,
+        "prior_live_wal_blake3": verification.prior_live_wal_blake3,
+        "prior_live_shm_blake3": verification.prior_live_shm_blake3,
+        "sidecar_bundle_status": verification.sidecar_bundle_status,
+        "current_live_inventory": live_inventory,
+    })
+}
+
+fn doctor_restore_plan_payload(
+    data_dir: &Path,
+    db_path: &Path,
+    backup_id: &str,
+    verification: &DoctorBackupVerification,
+    apply_requested: bool,
+    provided_plan_fingerprint: Option<String>,
+) -> (serde_json::Value, String) {
+    let live_inventory = doctor_candidate_live_inventory(
+        db_path,
+        &crate::search::tantivy::expected_index_dir(data_dir),
+    );
+    let fingerprint_inputs =
+        doctor_restore_fingerprint_inputs(backup_id, verification, &live_inventory);
+    let plan_fingerprint = doctor_canonical_blake3(
+        DOCTOR_BACKUP_RESTORE_PLAN_PREFIX,
+        fingerprint_inputs.clone(),
+    );
+    let apply_argv = vec![
+        "doctor".to_string(),
+        "backups".to_string(),
+        "restore".to_string(),
+        backup_id.to_string(),
+        "--yes".to_string(),
+        "--plan-fingerprint".to_string(),
+        plan_fingerprint.clone(),
+        "--json".to_string(),
+    ];
+    let exact_apply_command = format!("cass {}", apply_argv.join(" "));
+    (
+        serde_json::json!({
+            "schema_version": 1,
+            "plan_kind": "doctor_backup_restore_plan_v1",
+            "mode": if apply_requested { "restore_apply" } else { "restore_rehearsal" },
+            "dry_run": !apply_requested,
+            "apply_requested": apply_requested,
+            "approval_required": true,
+            "approval_status": if apply_requested { "provided" } else { "dry_run_only" },
+            "provided_plan_fingerprint": provided_plan_fingerprint,
+            "plan_fingerprint": plan_fingerprint,
+            "fingerprint_algorithm": "blake3-canonical-json-v1",
+            "fingerprint_inputs": fingerprint_inputs,
+            "exact_apply_command": exact_apply_command,
+            "apply_argv": apply_argv,
+            "will_mutate": apply_requested,
+            "apply_authorized": apply_requested,
+            "restore_source": "prior-live-backup-bundle",
+            "pre_restore_backup_required": true,
+            "live_restore_reuses_candidate_promotion": true,
+            "never_deletes_backup": true,
+        }),
+        plan_fingerprint,
+    )
+}
+
+fn copy_doctor_backup_restore_bundle(
+    verification: &DoctorBackupVerification,
+    candidate_db_path: &Path,
+) -> Result<BTreeMap<String, String>, String> {
+    let Some(parent) = candidate_db_path.parent() else {
+        return Err(format!(
+            "restore candidate DB has no parent: {}",
+            candidate_db_path.display()
+        ));
+    };
+    doctor_forensic_create_private_dir_all(parent).map_err(|err| {
+        format!(
+            "failed to create restore candidate parent {}: {err}",
+            parent.display()
+        )
+    })?;
+    let mut checksum_set = BTreeMap::new();
+    let copy_component = |source: &Path,
+                          expected: Option<&str>,
+                          target: &Path,
+                          relative: &str,
+                          checksum_set: &mut BTreeMap<String, String>|
+     -> Result<(), String> {
+        let (_, hash) = doctor_copy_regular_file_to_private_target(
+            source,
+            target,
+            expected,
+            "doctor backup restore candidate component",
+        )?;
+        checksum_set.insert(relative.to_string(), hash);
+        Ok(())
+    };
+    let db_source = verification
+        .prior_live_db_path
+        .as_ref()
+        .ok_or_else(|| "restore verification has no prior-live DB path".to_string())?;
+    copy_component(
+        db_source,
+        verification.prior_live_db_blake3.as_deref(),
+        candidate_db_path,
+        "database/candidate.db",
+        &mut checksum_set,
+    )?;
+    if let Some(wal_source) = verification.prior_live_wal_path.as_ref() {
+        copy_component(
+            wal_source,
+            verification.prior_live_wal_blake3.as_deref(),
+            &candidate_db_path.with_file_name("candidate.db-wal"),
+            "database/candidate.db-wal",
+            &mut checksum_set,
+        )?;
+    }
+    if let Some(shm_source) = verification.prior_live_shm_path.as_ref() {
+        copy_component(
+            shm_source,
+            verification.prior_live_shm_blake3.as_deref(),
+            &candidate_db_path.with_file_name("candidate.db-shm"),
+            "database/candidate.db-shm",
+            &mut checksum_set,
+        )?;
+    }
+    Ok(checksum_set)
+}
+
+fn write_doctor_restore_candidate_manifest(
+    db_path: &Path,
+    index_path: &Path,
+    candidate_dir: &Path,
+    backup_id: &str,
+    checksum_set: BTreeMap<String, String>,
+) -> Result<String, String> {
+    let now_ms = doctor_now_ms();
+    let live_inventory = doctor_candidate_live_inventory(db_path, index_path);
+    let manifest = serde_json::json!({
+        "schema_version": DOCTOR_CANDIDATE_SCHEMA_VERSION,
+        "manifest_kind": DOCTOR_CANDIDATE_MANIFEST_KIND,
+        "candidate_id": format!("restore-{backup_id}"),
+        "lifecycle_status": "completed",
+        "artifact_count": checksum_set.len(),
+        "checksum_set": checksum_set,
+        "selected_authority": "verified_backup_restore",
+        "created_at_ms": now_ms,
+        "updated_at_ms": now_ms,
+        "live_inventory_after": live_inventory,
+        "live_inventory_unchanged": true,
+        "coverage_gate": {
+            "status": "backup-restore-explicit-fingerprint",
+            "promote_allowed": true
+        }
+    });
+    doctor_write_private_json_artifact(
+        &candidate_dir.join("manifest.json"),
+        &manifest,
+        "doctor backup restore candidate manifest",
+    )
+}
+
+fn run_doctor_backup_restore_rehearsal(
+    data_dir: &Path,
+    db_path: &Path,
+    backup_id: &str,
+    verification: &DoctorBackupVerification,
+    restore_plan: &serde_json::Value,
+) -> serde_json::Value {
+    let started_at_ms = doctor_now_ms();
+    let live_inventory_before = doctor_candidate_live_inventory(
+        db_path,
+        &crate::search::tantivy::expected_index_dir(data_dir),
+    );
+    let rehearsal_id = format!("{}-{backup_id}", started_at_ms);
+    let rehearsal_dir = data_dir
+        .join("doctor")
+        .join("restore-rehearsals")
+        .join(&rehearsal_id);
+    let candidate_db_path = rehearsal_dir.join("candidate").join("agent_search.db");
+    let mut blocked_reasons = Vec::new();
+    let mut checksum_set = BTreeMap::new();
+    if !verification.restore_rehearsal_allowed {
+        blocked_reasons.extend(verification.blocked_reasons.clone());
+    } else {
+        match copy_doctor_backup_restore_bundle(verification, &candidate_db_path) {
+            Ok(checksums) => checksum_set = checksums,
+            Err(err) => blocked_reasons.push(err),
+        }
+        if blocked_reasons.is_empty() {
+            match open_franken_with_flags(
+                &candidate_db_path.to_string_lossy(),
+                FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) {
+                Ok(connection) => drop(connection),
+                Err(err) => blocked_reasons.push(format!(
+                    "restore rehearsal frankensqlite probe failed: {err}"
+                )),
+            }
+        }
+    }
+    let live_inventory_after = doctor_candidate_live_inventory(
+        db_path,
+        &crate::search::tantivy::expected_index_dir(data_dir),
+    );
+    let live_untouched = serde_json::to_value(&live_inventory_before).unwrap_or_default()
+        == serde_json::to_value(&live_inventory_after).unwrap_or_default();
+    if !live_untouched {
+        blocked_reasons
+            .push("restore rehearsal detected live archive drift while rehearsing".to_string());
+    }
+    let status = if blocked_reasons.is_empty() {
+        "passed"
+    } else {
+        "blocked"
+    };
+    let receipt = serde_json::json!({
+        "schema_version": 1,
+        "receipt_kind": "doctor_backup_restore_rehearsal_receipt_v1",
+        "rehearsal_id": rehearsal_id,
+        "backup_id": backup_id,
+        "status": status,
+        "started_at_ms": started_at_ms,
+        "finished_at_ms": doctor_now_ms(),
+        "candidate_db_path": candidate_db_path.display().to_string(),
+        "redacted_candidate_db_path": doctor_redacted_path(&candidate_db_path.display().to_string(), data_dir),
+        "checksum_set": checksum_set,
+        "live_inventory_before": live_inventory_before,
+        "live_inventory_after": live_inventory_after,
+        "live_archive_untouched": live_untouched,
+        "restore_plan": restore_plan,
+        "blocked_reasons": blocked_reasons,
+    });
+    let receipt_path = rehearsal_dir.join("receipt.json");
+    let receipt_blake3 =
+        doctor_write_private_json_artifact(&receipt_path, &receipt, "restore rehearsal receipt")
+            .ok();
+    serde_json::json!({
+        "schema_version": 1,
+        "rehearsal_id": receipt["rehearsal_id"],
+        "status": status,
+        "receipt_path": receipt_path.display().to_string(),
+        "redacted_receipt_path": doctor_redacted_path(&receipt_path.display().to_string(), data_dir),
+        "receipt_blake3": receipt_blake3,
+        "candidate_db_path": candidate_db_path.display().to_string(),
+        "redacted_candidate_db_path": doctor_redacted_path(&candidate_db_path.display().to_string(), data_dir),
+        "live_archive_untouched": live_untouched,
+        "blocked_reasons": receipt["blocked_reasons"],
+    })
+}
+
+fn doctor_restore_apply_payload_with_receipt(
+    data_dir: &Path,
+    backup_id: &str,
+    mut payload: serde_json::Value,
+) -> serde_json::Value {
+    let receipt_dir = data_dir
+        .join("doctor")
+        .join("restore-applies")
+        .join(format!("{}-{backup_id}", doctor_now_ms()));
+    let receipt_path = receipt_dir.join("receipt.json");
+    payload["receipt_path"] = serde_json::json!(receipt_path.display().to_string());
+    payload["redacted_receipt_path"] = serde_json::json!(doctor_redacted_path(
+        &receipt_path.display().to_string(),
+        data_dir
+    ));
+    payload["receipt_blake3"] = serde_json::json!(
+        doctor_write_private_json_artifact(&receipt_path, &payload, "restore apply receipt").ok()
+    );
+    payload
+}
+
+fn doctor_backups_event_log(
+    command: doctor::DoctorBackupCommand,
+    execution_mode: doctor::DoctorExecutionMode,
+    backup_id: Option<&str>,
+    backup_count: usize,
+    elapsed_ms: u64,
+    status: &str,
+) -> DoctorEventLogMetadata {
+    let operation_id = format!(
+        "doctor_backups:{}:{}",
+        command.stable_name(),
+        doctor_now_ms()
+    );
+    let mode = match execution_mode {
+        doctor::DoctorExecutionMode::RestoreApply => DoctorRepairMode::RestoreApply,
+        doctor::DoctorExecutionMode::RestoreRehearsal => DoctorRepairMode::RestoreRehearsal,
+        _ => DoctorRepairMode::Check,
+    };
+    let backup_label = backup_id.unwrap_or("all-backups");
+    let mut events = Vec::new();
+    push_doctor_event(
+        &mut events,
+        doctor_status_event_draft(
+            &operation_id,
+            mode,
+            "operation_started",
+            Some(DoctorAssetClass::BackupBundle),
+            Some(0),
+            format!("doctor backups {} started", command.stable_name()),
+            Vec::new(),
+        ),
+    );
+    push_doctor_event(
+        &mut events,
+        doctor_status_event_draft(
+            &operation_id,
+            mode,
+            "backup_bundle_verified",
+            Some(DoctorAssetClass::BackupBundle),
+            None,
+            format!(
+                "doctor backups {} inspected {backup_label} with {backup_count} discovered backup(s)",
+                command.stable_name()
+            ),
+            Vec::new(),
+        ),
+    );
+    push_doctor_event(
+        &mut events,
+        doctor_status_event_draft(
+            &operation_id,
+            mode,
+            "operation_finished",
+            Some(DoctorAssetClass::BackupBundle),
+            Some(elapsed_ms.min(i64::MAX as u64) as i64),
+            format!(
+                "doctor backups {} finished with status {status}",
+                command.stable_name()
+            ),
+            Vec::new(),
+        ),
+    );
+    doctor_event_log_from_events("embedded_backup_events", events)
+}
+
+fn run_doctor_backup_restore_apply(
+    data_dir: &Path,
+    db_path: &Path,
+    backup_id: &str,
+    verification: &DoctorBackupVerification,
+    requested_plan_fingerprint: &str,
+    expected_plan_fingerprint: &str,
+) -> serde_json::Value {
+    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    if requested_plan_fingerprint != expected_plan_fingerprint {
+        return doctor_restore_apply_payload_with_receipt(
+            data_dir,
+            backup_id,
+            serde_json::json!({
+                "schema_version": 1,
+                "status": "refused",
+                "reason": "plan_fingerprint_mismatch",
+                "provided_plan_fingerprint": requested_plan_fingerprint,
+                "expected_plan_fingerprint": expected_plan_fingerprint,
+                "backup_deleted": false,
+            }),
+        );
+    }
+    if !verification.restore_rehearsal_allowed {
+        return doctor_restore_apply_payload_with_receipt(
+            data_dir,
+            backup_id,
+            serde_json::json!({
+                "schema_version": 1,
+                "status": "refused",
+                "reason": "backup_verification_failed",
+                "blocked_reasons": verification.blocked_reasons,
+                "backup_deleted": false,
+            }),
+        );
+    }
+    let (_lock_guard, lock_observation) = match doctor_acquire_mutation_lock(data_dir, db_path) {
+        Ok(lock) => lock,
+        Err(observation) => {
+            return doctor_restore_apply_payload_with_receipt(
+                data_dir,
+                backup_id,
+                serde_json::json!({
+                    "schema_version": 1,
+                    "status": "refused",
+                    "reason": "doctor_mutation_lock_unavailable",
+                    "lock": serde_json::json!(doctor_operation_owner_from_doctor_lock(data_dir, db_path, &observation)),
+                    "backup_deleted": false,
+                }),
+            );
+        }
+    };
+    let started_at_ms = doctor_now_ms();
+    let candidate_dir = data_dir
+        .join("doctor")
+        .join("restore-candidates")
+        .join(format!("{started_at_ms}-{backup_id}"));
+    let candidate_db_path = candidate_dir.join("database").join("candidate.db");
+    let mut blocked_reasons = Vec::new();
+    match copy_doctor_backup_restore_bundle(verification, &candidate_db_path) {
+        Ok(checksum_set) => {
+            if let Err(err) = write_doctor_restore_candidate_manifest(
+                db_path,
+                &index_path,
+                &candidate_dir,
+                backup_id,
+                checksum_set,
+            ) {
+                blocked_reasons.push(err);
+            }
+        }
+        Err(err) => blocked_reasons.push(err),
+    }
+    if !blocked_reasons.is_empty() {
+        return doctor_restore_apply_payload_with_receipt(
+            data_dir,
+            backup_id,
+            serde_json::json!({
+                "schema_version": 1,
+                "status": "blocked",
+                "reason": "restore_candidate_build_failed",
+                "candidate_dir": candidate_dir.display().to_string(),
+                "redacted_candidate_dir": doctor_redacted_path(&candidate_dir.display().to_string(), data_dir),
+                "lock": serde_json::json!(doctor_operation_owner_from_doctor_lock(data_dir, db_path, &lock_observation)),
+                "blocked_reasons": blocked_reasons,
+                "backup_deleted": false,
+            }),
+        );
+    }
+    let promotion =
+        promote_doctor_reconstruct_candidate_bundle(data_dir, db_path, &index_path, &candidate_dir);
+    doctor_restore_apply_payload_with_receipt(
+        data_dir,
+        backup_id,
+        serde_json::json!({
+            "schema_version": 1,
+            "status": if promotion.status == "applied" { "applied" } else { "failed" },
+            "backup_id": backup_id,
+            "restore_candidate_dir": candidate_dir.display().to_string(),
+            "redacted_restore_candidate_dir": doctor_redacted_path(&candidate_dir.display().to_string(), data_dir),
+            "lock": serde_json::json!(doctor_operation_owner_from_doctor_lock(data_dir, db_path, &lock_observation)),
+            "candidate_promotion": promotion,
+            "pre_restore_backup_manifest_path": promotion.backup_manifest_path,
+            "redacted_pre_restore_backup_manifest_path": promotion.redacted_backup_manifest_path,
+            "backup_deleted": false,
+        }),
+    )
+}
+
+pub(crate) fn run_doctor_backups_impl(
+    data_dir_override: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
+    command: doctor::DoctorBackupCommand,
+    backup_id: Option<String>,
+    execution_mode: doctor::DoctorExecutionMode,
+    requested_plan_fingerprint: Option<String>,
+) -> CliResult<()> {
+    let started = Instant::now();
+    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+    let backup_id_text = backup_id.clone().unwrap_or_default();
+    let records = collect_doctor_backup_manifest_records(&data_dir);
+    let mut payload = serde_json::json!({
+        "status": "ok",
+        "doctor_command": {
+            "surface": "backups",
+            "operation": command.stable_name(),
+            "execution_mode": execution_mode.stable_name(),
+            "read_only": !execution_mode.permits_mutation(),
+            "mutation_allowed": execution_mode.permits_mutation(),
+            "plan_fingerprint_required": execution_mode.requires_plan_fingerprint(),
+        },
+        "backup_root": doctor_candidate_promotion_root(&data_dir).display().to_string(),
+        "redacted_backup_root": doctor_redacted_path(&doctor_candidate_promotion_root(&data_dir).display().to_string(), &data_dir),
+        "backup_count": records.len(),
+        "notes": [
+            "Backup commands never delete backup artifacts.",
+            "Restore defaults to a rehearsal; live restore requires the matching plan_fingerprint.",
+            "Candidate-promotion backups preserve both the promoted candidate bundle and the prior-live bundle."
+        ],
+        "_meta": {
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "data_dir": data_dir.display().to_string(),
+            "db_path": db_path.display().to_string(),
+        }
+    });
+    match command {
+        doctor::DoctorBackupCommand::List => {
+            let backups = records
+                .into_iter()
+                .map(|record| {
+                    let verification = verify_doctor_backup_record(&data_dir, record);
+                    serde_json::json!({
+                        "backup_id": verification.backup_id,
+                        "backup_kind": "candidate-promotion",
+                        "manifest_path": verification.manifest_path.display().to_string(),
+                        "redacted_manifest_path": doctor_redacted_path(&verification.manifest_path.display().to_string(), &data_dir),
+                        "manifest_blake3": verification.manifest_blake3,
+                        "verification_status": verification.status,
+                        "restore_rehearsal_allowed": verification.restore_rehearsal_allowed,
+                        "sidecar_bundle_status": verification.sidecar_bundle_status,
+                        "artifact_count": verification.artifact_count,
+                        "total_size_bytes": verification.total_size_bytes,
+                        "checksum_status_counts": verification.checksum_status_counts,
+                        "asset_classes": ["backup_bundle"],
+                        "verify_command": format!("cass doctor backups verify {} --json", verification.backup_id),
+                        "restore_rehearsal_command": format!("cass doctor backups restore {} --json", verification.backup_id),
+                    })
+                })
+                .collect::<Vec<_>>();
+            payload["backups"] = serde_json::Value::Array(backups);
+            payload["verify_command"] =
+                serde_json::json!("cass doctor backups verify <backup-id> --json");
+            payload["restore_rehearsal_command"] =
+                serde_json::json!("cass doctor backups restore <backup-id> --json");
+        }
+        doctor::DoctorBackupCommand::Verify | doctor::DoctorBackupCommand::Restore => {
+            let record =
+                find_doctor_backup_manifest_record(&data_dir, &backup_id_text).map_err(|err| {
+                    CliError {
+                        code: 13,
+                        kind: "not-found",
+                        message: err,
+                        hint: Some("Run `cass doctor backups list --json` first.".to_string()),
+                        retryable: false,
+                    }
+                })?;
+            let verification = verify_doctor_backup_record(&data_dir, record);
+            payload["backup_verification"] =
+                doctor_backup_verification_value(&data_dir, &verification);
+            if command == doctor::DoctorBackupCommand::Restore {
+                let apply_requested = execution_mode == doctor::DoctorExecutionMode::RestoreApply;
+                let (restore_plan, plan_fingerprint) = doctor_restore_plan_payload(
+                    &data_dir,
+                    &db_path,
+                    &backup_id_text,
+                    &verification,
+                    apply_requested,
+                    requested_plan_fingerprint.clone(),
+                );
+                payload["restore_plan"] = restore_plan.clone();
+                payload["restore_rehearsal"] = if apply_requested {
+                    serde_json::json!({
+                        "status": "skipped-for-apply",
+                        "reason": "apply reruns verification and candidate promotion checks immediately before mutation"
+                    })
+                } else {
+                    run_doctor_backup_restore_rehearsal(
+                        &data_dir,
+                        &db_path,
+                        &backup_id_text,
+                        &verification,
+                        &restore_plan,
+                    )
+                };
+                if apply_requested {
+                    let requested = requested_plan_fingerprint.as_deref().unwrap_or_default();
+                    payload["restore_apply"] = run_doctor_backup_restore_apply(
+                        &data_dir,
+                        &db_path,
+                        &backup_id_text,
+                        &verification,
+                        requested,
+                        &plan_fingerprint,
+                    );
+                    if payload["restore_apply"]["status"].as_str() != Some("applied") {
+                        payload["status"] = serde_json::json!("refused");
+                    }
+                }
+            }
+        }
+    }
+    payload["_meta"]["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis() as u64);
+    let payload_status = payload["status"].as_str().unwrap_or("ok").to_string();
+    payload["event_log"] = serde_json::to_value(doctor_backups_event_log(
+        command,
+        execution_mode,
+        backup_id.as_deref(),
+        payload["backup_count"].as_u64().unwrap_or(0) as usize,
+        started.elapsed().as_millis() as u64,
+        &payload_status,
+    ))
+    .unwrap_or(serde_json::Value::Null);
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        match command {
+            doctor::DoctorBackupCommand::List => {
+                println!(
+                    "doctor backups: {} backup(s) under {}",
+                    payload["backup_count"].as_u64().unwrap_or(0),
+                    payload["redacted_backup_root"]
+                        .as_str()
+                        .unwrap_or("[cass-data]")
+                );
+            }
+            doctor::DoctorBackupCommand::Verify => {
+                println!(
+                    "doctor backup {} verification: {}",
+                    backup_id_text,
+                    payload["backup_verification"]["status"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                );
+            }
+            doctor::DoctorBackupCommand::Restore => {
+                println!(
+                    "doctor backup {} restore {}: {}",
+                    backup_id_text,
+                    if execution_mode.permits_mutation() {
+                        "apply"
+                    } else {
+                        "rehearsal"
+                    },
+                    payload
+                        .pointer("/restore_rehearsal/status")
+                        .or_else(|| payload.pointer("/restore_apply/status"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn doctor_candidate_promotion_id(candidate_id: &str, created_at_ms: i64) -> String {
     let safe_candidate_id = candidate_id
         .chars()
@@ -23214,6 +25180,24 @@ fn doctor_remove_candidate_replace_tmp(temp_path: &Path) -> Result<(), String> {
     }
 }
 
+fn doctor_candidate_promotion_test_failpoint(phase: &str, path: &Path) -> Result<(), String> {
+    let Ok(raw) = dotenvy::var(CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT) else {
+        return Ok(());
+    };
+    let matched = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .any(|value| value == phase || value == "*" || value == "any");
+    if matched {
+        return Err(format!(
+            "injected test candidate promotion failpoint {phase} for {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn doctor_candidate_promotion_replace_file(
     source_path: &Path,
     target_path: &Path,
@@ -23394,6 +25378,14 @@ fn doctor_candidate_promotion_write_audit_artifacts(
     }
 
     let marker_path = promotion_dir.join("promotion-marker.json");
+    doctor_candidate_promotion_write_marker(data_dir, &marker_path, report);
+}
+
+fn doctor_candidate_promotion_write_marker(
+    data_dir: &Path,
+    marker_path: &Path,
+    report: &mut DoctorCandidatePromotionReport,
+) {
     let marker = serde_json::json!({
         "schema_version": 1,
         "manifest_kind": "cass_doctor_candidate_promotion_marker_v1",
@@ -23408,6 +25400,13 @@ fn doctor_candidate_promotion_write_audit_artifacts(
         "derived_assets_consistency_status": &report.derived_assets_consistency_status,
         "derived_lexical_rebuild_required": report.derived_lexical_rebuild_required,
         "derived_semantic_rebuild_required": report.derived_semantic_rebuild_required,
+        "derived_lexical_followup_status": &report.derived_lexical_followup_status,
+        "derived_semantic_followup_status": &report.derived_semantic_followup_status,
+        "derived_vector_followup_status": &report.derived_vector_followup_status,
+        "derived_memo_followup_status": &report.derived_memo_followup_status,
+        "derived_followup_artifact_path": &report.derived_followup_artifact_path,
+        "redacted_derived_followup_artifact_path": &report.redacted_derived_followup_artifact_path,
+        "derived_followup_artifact_blake3": &report.derived_followup_artifact_blake3,
         "candidate_lexical_metadata_path": &report.candidate_lexical_metadata_path,
         "redacted_candidate_lexical_metadata_path": &report.redacted_candidate_lexical_metadata_path,
         "candidate_lexical_metadata_blake3": &report.candidate_lexical_metadata_blake3,
@@ -23424,8 +25423,9 @@ fn doctor_candidate_promotion_write_audit_artifacts(
         "live_inventory_after": &report.live_inventory_after,
         "blocked_reasons": &report.blocked_reasons,
         "warnings": &report.warnings,
+        "notes": &report.notes,
     });
-    match doctor_write_private_json_artifact(&marker_path, &marker, "candidate promotion marker") {
+    match doctor_write_private_json_artifact(marker_path, &marker, "candidate promotion marker") {
         Ok(hash) => {
             report.promotion_marker_path = Some(marker_path.display().to_string());
             report.redacted_promotion_marker_path = Some(doctor_redacted_path(
@@ -23433,6 +25433,151 @@ fn doctor_candidate_promotion_write_audit_artifacts(
                 data_dir,
             ));
             report.promotion_marker_blake3 = Some(hash);
+        }
+        Err(err) => report.warnings.push(err),
+    }
+}
+
+fn doctor_candidate_promotion_record_derived_followup_artifact(
+    data_dir: &Path,
+    report: &mut DoctorCandidatePromotionReport,
+    lexical_message_count: usize,
+    semantic_fallback_mode: &str,
+) {
+    let lexical_status_before = report.derived_lexical_followup_status.clone();
+    let semantic_status_before = report.derived_semantic_followup_status.clone();
+    let vector_status_before = report.derived_vector_followup_status.clone();
+    let memo_status_before = report.derived_memo_followup_status.clone();
+
+    if report.derived_lexical_rebuild_required {
+        report.derived_lexical_rebuild_required = false;
+        report.derived_lexical_followup_status = "rebuild-completed".to_string();
+        report.notes.push(format!(
+            "Derived lexical index rebuilt from promoted archive DB ({lexical_message_count} messages)."
+        ));
+    } else if report.derived_lexical_followup_status.is_empty()
+        || report.derived_lexical_followup_status == "not-evaluated"
+    {
+        report.derived_lexical_followup_status = "not-required".to_string();
+    }
+
+    if report.derived_semantic_rebuild_required {
+        if semantic_fallback_mode == "lexical" {
+            report.derived_semantic_rebuild_required = false;
+            report.derived_semantic_followup_status =
+                "skipped-lexical-fallback-active-no-auto-download".to_string();
+            report.derived_vector_followup_status =
+                "skipped-lexical-fallback-active-no-auto-download".to_string();
+            report.derived_memo_followup_status =
+                "not-mutated-rebuildable-cache-does-not-block-archive-recovery".to_string();
+            report.notes.push(
+                "Derived semantic assets were not rebuilt automatically; lexical fallback remains active and model acquisition stays explicit."
+                    .to_string(),
+            );
+        } else {
+            report.derived_semantic_followup_status =
+                "rebuild-still-required-no-auto-download".to_string();
+            report.derived_vector_followup_status =
+                "rebuild-still-required-no-auto-download".to_string();
+            report.derived_memo_followup_status =
+                "refresh-still-required-after-semantic-rebuild".to_string();
+            report.notes.push(format!(
+                "Derived semantic assets still need explicit rebuild or fallback handling; doctor did not auto-download models (fallback_mode={semantic_fallback_mode})."
+            ));
+        }
+    } else if report.derived_semantic_followup_status.is_empty()
+        || report.derived_semantic_followup_status == "not-evaluated"
+    {
+        report.derived_semantic_followup_status = "not-required".to_string();
+    }
+    if report.derived_vector_followup_status.is_empty()
+        || report.derived_vector_followup_status == "not-evaluated"
+    {
+        report.derived_vector_followup_status = "not-required".to_string();
+    }
+    if report.derived_memo_followup_status.is_empty()
+        || report.derived_memo_followup_status == "not-evaluated"
+    {
+        report.derived_memo_followup_status = "not-required".to_string();
+    }
+
+    report.derived_assets_consistency_status = match (
+        report.derived_lexical_rebuild_required,
+        report.derived_semantic_rebuild_required,
+    ) {
+        (false, false) => "promoted-archive-derived-followup-completed".to_string(),
+        (false, true) => {
+            "promoted-archive-lexical-rebuild-completed-semantic-followup-required".to_string()
+        }
+        (true, false) => "promoted-archive-lexical-followup-required".to_string(),
+        (true, true) => "promoted-archive-derived-followup-required".to_string(),
+    };
+
+    let promotion_dir = PathBuf::from(&report.receipt_path)
+        .parent()
+        .map(Path::to_path_buf);
+    let Some(promotion_dir) = promotion_dir else {
+        report.warnings.push(format!(
+            "cannot write candidate promotion derived follow-up artifact without receipt parent: {}",
+            report.receipt_path
+        ));
+        return;
+    };
+    let artifact_path = promotion_dir.join("derived-followup.json");
+    let artifact = serde_json::json!({
+        "schema_version": 1,
+        "manifest_kind": "cass_doctor_candidate_promotion_derived_followup_v1",
+        "promotion_id": &report.promotion_id,
+        "candidate_id": &report.candidate_id,
+        "derived_assets_consistency_status": &report.derived_assets_consistency_status,
+        "derived_lexical_rebuild_required": report.derived_lexical_rebuild_required,
+        "derived_semantic_rebuild_required": report.derived_semantic_rebuild_required,
+        "derived_lexical_followup_status_before": lexical_status_before,
+        "derived_lexical_followup_status_after": &report.derived_lexical_followup_status,
+        "derived_semantic_followup_status_before": semantic_status_before,
+        "derived_semantic_followup_status_after": &report.derived_semantic_followup_status,
+        "derived_vector_followup_status_before": vector_status_before,
+        "derived_vector_followup_status_after": &report.derived_vector_followup_status,
+        "derived_memo_followup_status_before": memo_status_before,
+        "derived_memo_followup_status_after": &report.derived_memo_followup_status,
+        "lexical_rebuild_message_count": lexical_message_count,
+        "semantic_fallback_mode": semantic_fallback_mode,
+        "network_allowed": false,
+        "auto_download_attempted": false,
+        "derived_asset_actions": {
+            "semantic_model": {
+                "status": &report.derived_semantic_followup_status,
+                "network_allowed": false,
+                "auto_download_attempted": false,
+                "blocks_archive_recovery": false,
+            },
+            "semantic_vector_index": {
+                "status": &report.derived_vector_followup_status,
+                "network_allowed": false,
+                "auto_download_attempted": false,
+                "blocks_archive_recovery": false,
+            },
+            "memoization_cache": {
+                "status": &report.derived_memo_followup_status,
+                "network_allowed": false,
+                "auto_download_attempted": false,
+                "blocks_archive_recovery": false,
+            },
+        },
+        "notes": &report.notes,
+    });
+    match doctor_write_private_json_artifact(
+        &artifact_path,
+        &artifact,
+        "candidate promotion derived follow-up artifact",
+    ) {
+        Ok(hash) => {
+            report.derived_followup_artifact_path = Some(artifact_path.display().to_string());
+            report.redacted_derived_followup_artifact_path = Some(doctor_redacted_path(
+                &artifact_path.display().to_string(),
+                data_dir,
+            ));
+            report.derived_followup_artifact_blake3 = Some(hash);
         }
         Err(err) => report.warnings.push(err),
     }
@@ -23463,6 +25608,10 @@ fn promote_doctor_reconstruct_candidate_bundle(
         redacted_manifest_path: doctor_redacted_path(&manifest_path.display().to_string(), data_dir),
         reader_consistency_guarantee: "blocked-before-mutation".to_string(),
         derived_assets_consistency_status: "not-evaluated".to_string(),
+        derived_lexical_followup_status: "not-evaluated".to_string(),
+        derived_semantic_followup_status: "not-evaluated".to_string(),
+        derived_vector_followup_status: "not-evaluated".to_string(),
+        derived_memo_followup_status: "not-evaluated".to_string(),
         notes: vec![
             "Promotion preserves a backup copy before replacing the live archive.".to_string(),
             "WAL/SHM sidecars are treated as part of the SQLite bundle; every live sidecar must have a verified candidate replacement before promotion can proceed.".to_string(),
@@ -23677,6 +25826,26 @@ fn promote_doctor_reconstruct_candidate_bundle(
     report.derived_assets_consistency_status = derived_status;
     report.derived_lexical_rebuild_required = lexical_rebuild_required;
     report.derived_semantic_rebuild_required = semantic_rebuild_required;
+    report.derived_lexical_followup_status = if lexical_rebuild_required {
+        "rebuild-required".to_string()
+    } else {
+        "not-required".to_string()
+    };
+    report.derived_semantic_followup_status = if semantic_rebuild_required {
+        "rebuild-or-lexical-fallback-required".to_string()
+    } else {
+        "not-required".to_string()
+    };
+    report.derived_vector_followup_status = if semantic_rebuild_required {
+        "semantic-vector-rebuild-or-lexical-fallback-required".to_string()
+    } else {
+        "not-required".to_string()
+    };
+    report.derived_memo_followup_status = if lexical_rebuild_required || semantic_rebuild_required {
+        "not-mutated-rebuildable-cache-does-not-block-archive-recovery".to_string()
+    } else {
+        "not-required".to_string()
+    };
 
     if let Err(err) = doctor_forensic_create_private_dir_all(&backup_dir) {
         report.blocked_reasons.push(format!(
@@ -23883,6 +26052,14 @@ fn promote_doctor_reconstruct_candidate_bundle(
                 receipt
                     .precondition_checks
                     .push(format!("target_blake3_matched_source:{}", item.suffix));
+                if let Err(err) = doctor_candidate_promotion_test_failpoint(
+                    "after-component-replace",
+                    &item.target_path,
+                ) {
+                    receipt.status = DoctorActionStatus::Failed;
+                    receipt.blocked_reasons.push(err);
+                    break;
+                }
             }
             (Ok(hash), Some(expected)) => {
                 receipt.status = DoctorActionStatus::Failed;
@@ -23919,6 +26096,13 @@ fn promote_doctor_reconstruct_candidate_bundle(
                 receipt.blocked_reasons.push(err);
                 break;
             }
+        }
+        if receipt.status != DoctorActionStatus::Failed
+            && let Err(err) =
+                doctor_candidate_promotion_test_failpoint("before-parent-sync", db_parent)
+        {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(err);
         }
         if receipt.status != DoctorActionStatus::Failed {
             match sync_directory(db_parent) {
@@ -27145,12 +29329,13 @@ fn write_doctor_post_repair_probe_artifacts(
                 &failure_path.display().to_string(),
                 data_dir,
             ));
-            let failure_value = serde_json::json!({
-                "schema_version": 1,
-                "probe_run_id": probe_run_id,
-                "probe": probe,
-                "redaction_status": "local_probe_artifact_contains_exact_paths; robot metadata includes redacted path companions",
-            });
+            let failure_value = doctor_post_repair_probe_failure_context(
+                &probe_run_id,
+                probe,
+                data_dir,
+                &manifest_path,
+                &failure_path,
+            );
             if let Err(err) = std::fs::write(
                 &failure_path,
                 serde_json::to_vec_pretty(&failure_value).unwrap_or_default(),
@@ -27202,6 +29387,336 @@ fn write_doctor_post_repair_probe_artifacts(
             "failed to sync post-repair probe artifact directory: {err}"
         ));
     }
+}
+
+fn doctor_post_repair_probe_failure_context(
+    probe_run_id: &str,
+    probe: &DoctorPostRepairProbeReport,
+    data_dir: &Path,
+    manifest_path: &Path,
+    failure_path: &Path,
+) -> serde_json::Value {
+    let command_json = vec![
+        "cass".to_string(),
+        "doctor".to_string(),
+        "check".to_string(),
+        "--json".to_string(),
+        "--data-dir".to_string(),
+        "[cass-data]".to_string(),
+    ];
+    let shell_command = command_json
+        .iter()
+        .map(|arg| doctor_shell_quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let redacted_failure_reason = probe
+        .failure_reason
+        .as_ref()
+        .map(|reason| doctor_redacted_text(reason, data_dir));
+    let failure_reason_log_entries = redacted_failure_reason.iter().cloned().collect::<Vec<_>>();
+
+    doctor_canonical_json_value(serde_json::json!({
+        "schema_version": 1,
+        "context_kind": "cass_doctor_post_repair_probe_failure_context",
+        "probe_run_id": probe_run_id,
+        "operation_id": probe_run_id,
+        "failed_phase": "post_repair_probe",
+        "failed_check": &probe.probe_id,
+        "failure_reason": &redacted_failure_reason,
+        "asset_class": doctor_asset_class_name(probe.target_asset_class),
+        "authority_status": "post_repair_verification_failed",
+        "blocked_reasons": [
+            if probe.blocks_promotion { "blocks_promotion" } else { "promotion_not_blocked" },
+            if probe.blocks_cleanup { "blocks_cleanup" } else { "cleanup_not_blocked" },
+        ],
+        "artifacts": {
+            "artifact_manifest_path": doctor_redacted_path(&manifest_path.display().to_string(), data_dir),
+            "failure_context_path": doctor_redacted_path(&failure_path.display().to_string(), data_dir),
+        },
+        "probe": {
+            "probe_id": &probe.probe_id,
+            "status": &probe.status,
+            "duration_ms": probe.duration_ms,
+            "failure_reason": &redacted_failure_reason,
+            "blocks_promotion": probe.blocks_promotion,
+            "blocks_cleanup": probe.blocks_cleanup,
+            "rollback_confirmed": probe.rollback_confirmed,
+            "redacted_target_path": &probe.redacted_target_path,
+            "generation_identity": &probe.generation_identity,
+            "manifest_identity": &probe.manifest_identity,
+            "receipt_correlation_id": &probe.receipt_correlation_id,
+            "event_log_correlation_id": &probe.event_log_correlation_id,
+        },
+        "captured_logs": [
+            {
+                "kind": "probe_steps",
+                "entries": &probe.steps,
+            },
+            {
+                "kind": "failure_reason",
+                "entries": failure_reason_log_entries,
+            },
+        ],
+        "repro": {
+            "safety": "read-only-redacted-template",
+            "mutates_live_archive": false,
+            "requires_explicit_live_archive": true,
+            "target": "[cass-data]",
+            "command_json": command_json,
+            "shell_command": shell_command,
+            "notes": [
+                "Default repro is read-only and targets the redacted data-dir placeholder.",
+                "Copy the affected data directory to a scratch location before running any mutating doctor command.",
+                "Do not replace [cass-data] with a live archive for --fix or cleanup --yes unless the operator explicitly accepts that risk."
+            ],
+        },
+        "redaction_status": "redacted_by_default; exact local paths are omitted from the shareable failure context",
+    }))
+}
+
+fn doctor_failure_context_report_failed(
+    reason: impl Into<String>,
+    data_dir: &Path,
+) -> serde_json::Value {
+    let reason = reason.into();
+    serde_json::json!({
+        "status": "failed",
+        "context_kind": "cass_doctor_failure_context",
+        "path": serde_json::Value::Null,
+        "redacted_path": serde_json::Value::Null,
+        "checksum_blake3": serde_json::Value::Null,
+        "blocked_reason": doctor_redacted_text(&reason, data_dir),
+        "redaction_status": "redacted",
+    })
+}
+
+fn write_doctor_lock_contention_failure_context(
+    data_dir: &Path,
+    operation_id: &str,
+    command_line_mode: &str,
+    operation_state: &DoctorOperationStateReport,
+    locks: &[DoctorLockDiagnosticReport],
+    event_log: &DoctorEventLogMetadata,
+) -> serde_json::Value {
+    let root = data_dir.join("doctor").join("failures");
+    if let Err(err) = doctor_forensic_create_private_dir_all(&root) {
+        return doctor_failure_context_report_failed(
+            format!("failed to create doctor failure context directory: {err}"),
+            data_dir,
+        );
+    }
+    if existing_path_has_symlink_below_root(&root, data_dir) {
+        return doctor_failure_context_report_failed(
+            format!(
+                "refusing to write doctor failure context through symlinked directory {}",
+                root.display()
+            ),
+            data_dir,
+        );
+    }
+
+    let created_at_ms = doctor_now_ms();
+    let base_context_id = doctor_forensic_bundle_id(operation_id, created_at_ms);
+    let mut context_dir = root.join(&base_context_id);
+    let mut context_id = base_context_id.clone();
+    let mut allocated = false;
+    for suffix in 0..100 {
+        let candidate_id = if suffix == 0 {
+            base_context_id.clone()
+        } else {
+            format!("{base_context_id}-{suffix}")
+        };
+        let candidate_dir = root.join(&candidate_id);
+        match doctor_forensic_create_private_dir(&candidate_dir) {
+            Ok(()) => {
+                context_id = candidate_id;
+                context_dir = candidate_dir;
+                allocated = true;
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return doctor_failure_context_report_failed(
+                    format!(
+                        "failed to create doctor failure context directory {}: {err}",
+                        candidate_dir.display()
+                    ),
+                    data_dir,
+                );
+            }
+        }
+    }
+    if !allocated {
+        return doctor_failure_context_report_failed(
+            format!(
+                "failed to allocate unique doctor failure context directory under {}",
+                root.display()
+            ),
+            data_dir,
+        );
+    }
+
+    let failure_path = context_dir.join("failure_context.json");
+    let command_json = vec![
+        "cass".to_string(),
+        "doctor".to_string(),
+        "check".to_string(),
+        "--json".to_string(),
+        "--data-dir".to_string(),
+        "[cass-data]".to_string(),
+    ];
+    let shell_command = command_json
+        .iter()
+        .map(|arg| doctor_shell_quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let blocked_reason = operation_state
+        .mutation_blocked_reason
+        .as_deref()
+        .unwrap_or("doctor mutation blocked by active repair lock");
+    let redacted_reason = doctor_redacted_text(blocked_reason, data_dir);
+    let redacted_locks = locks
+        .iter()
+        .map(|lock| {
+            serde_json::json!({
+                "schema_version": lock.schema_version,
+                "lock_kind": doctor_serde_label(lock.lock_kind),
+                "redacted_lock_path": &lock.redacted_lock_path,
+                "active": lock.active,
+                "owned_by_current_process": lock.owned_by_current_process,
+                "owner_confidence": doctor_serde_label(lock.owner_confidence),
+                "pid_metadata_status": &lock.pid_metadata_status,
+                "pid_reuse_ambiguous": lock.pid_reuse_ambiguous,
+                "age_ms": lock.age_ms,
+                "last_heartbeat_age_ms": lock.last_heartbeat_age_ms,
+                "stale_suspected": lock.stale_suspected,
+                "wait_duration_ms": lock.wait_duration_ms,
+                "retry_policy": &lock.retry_policy,
+                "safe_to_wait": lock.safe_to_wait,
+                "manual_delete_allowed": lock.manual_delete_allowed,
+                "recommended_action": &lock.recommended_action,
+                "evidence": &lock.evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    let recent_events = event_log
+        .events
+        .iter()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|event| serde_json::to_value(event).unwrap_or_else(|_| serde_json::json!({})))
+        .collect::<Vec<_>>();
+    let failure_value = doctor_canonical_json_value(serde_json::json!({
+        "schema_version": 1,
+        "context_kind": "cass_doctor_lock_contention_failure_context",
+        "context_id": context_id,
+        "operation_id": operation_id,
+        "failed_phase": "mutation_lock_acquire",
+        "failed_check": "operation_state",
+        "reasons": [&redacted_reason],
+        "failure_reason": redacted_reason,
+        "asset_class": "operation_receipt",
+        "authority_status": "mutation_lock_blocked",
+        "blocked_reasons": ["active_doctor_repair", "lock_contention"],
+        "command": {
+            "command_line_mode": command_line_mode,
+            "safe_followup": "cass doctor check --json --data-dir [cass-data]",
+        },
+        "artifacts": {
+            "failure_context_path": doctor_redacted_path(&failure_path.display().to_string(), data_dir),
+            "event_log_path": event_log
+                .path
+                .as_ref()
+                .map(|path| doctor_redacted_path(path, data_dir))
+                .unwrap_or_else(|| "embedded_operation_events".to_string()),
+        },
+        "active_locks": redacted_locks,
+        "recent_events": recent_events,
+        "captured_logs": [
+            {
+                "kind": "operation_state",
+                "entries": [&redacted_reason],
+            },
+            {
+                "kind": "operator_safety",
+                "entries": [
+                    "Wait and retry instead of deleting lock files manually.",
+                    "The repro command is read-only and uses a redacted data-dir placeholder.",
+                ],
+            },
+        ],
+        "repro": {
+            "safety": "read-only-redacted-template",
+            "mutates_live_archive": false,
+            "requires_explicit_live_archive": true,
+            "target": "[cass-data]",
+            "command_json": command_json,
+            "shell_command": shell_command,
+            "notes": [
+                "Default repro is read-only and targets the redacted data-dir placeholder.",
+                "Use a copied fixture or explicit test data directory for any follow-up mutation.",
+                "Do not delete lock files manually; wait for the active doctor owner or inspect receipts.",
+            ],
+        },
+        "redaction_status": "redacted_by_default; exact local paths are omitted from the shareable failure context",
+    }));
+
+    let encoded = match serde_json::to_vec_pretty(&failure_value) {
+        Ok(encoded) => encoded,
+        Err(err) => {
+            return doctor_failure_context_report_failed(
+                format!("failed to encode doctor failure context: {err}"),
+                data_dir,
+            );
+        }
+    };
+    let write_result = (|| -> io::Result<()> {
+        let mut file = doctor_forensic_create_private_file(&failure_path)?;
+        file.write_all(&encoded)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        return doctor_failure_context_report_failed(
+            format!(
+                "failed to write doctor failure context {}: {err}",
+                failure_path.display()
+            ),
+            data_dir,
+        );
+    }
+    if let Err(err) = sync_directory(&context_dir) {
+        return doctor_failure_context_report_failed(
+            format!(
+                "failed to sync doctor failure context directory {}: {err}",
+                context_dir.display()
+            ),
+            data_dir,
+        );
+    }
+    if let Err(err) = sync_directory(&root) {
+        return doctor_failure_context_report_failed(
+            format!(
+                "failed to sync doctor failure context root {}: {err}",
+                root.display()
+            ),
+            data_dir,
+        );
+    }
+
+    serde_json::json!({
+        "status": "captured",
+        "context_kind": "cass_doctor_lock_contention_failure_context",
+        "path": failure_path.display().to_string(),
+        "redacted_path": doctor_redacted_path(&failure_path.display().to_string(), data_dir),
+        "checksum_blake3": file_blake3_hex(&failure_path).ok(),
+        "blocked_reason": serde_json::Value::Null,
+        "redaction_status": "redacted",
+    })
 }
 
 struct DoctorPostRepairProbeRunContext<'a> {
@@ -31644,6 +34159,50 @@ mod doctor_asset_taxonomy_tests {
         assert!(
             Path::new(failure_context_path).exists(),
             "failed probe should write artifact-backed context"
+        );
+        let failure_context: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(failure_context_path).expect("read failure context"),
+        )
+        .expect("failure context json");
+        assert_eq!(
+            failure_context["context_kind"].as_str(),
+            Some("cass_doctor_post_repair_probe_failure_context")
+        );
+        assert_eq!(
+            failure_context["failed_phase"].as_str(),
+            Some("post_repair_probe")
+        );
+        assert_eq!(
+            failure_context["failed_check"].as_str(),
+            Some("archive-db-rollback-write-read")
+        );
+        assert_eq!(
+            failure_context["repro"]["safety"].as_str(),
+            Some("read-only-redacted-template")
+        );
+        assert_eq!(
+            failure_context["repro"]["mutates_live_archive"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            failure_context["repro"]["command_json"]
+                .as_array()
+                .expect("repro argv")
+                .iter()
+                .any(|arg| arg.as_str() == Some("[cass-data]")),
+            "failure context should target a redacted data-dir placeholder: {failure_context:#}"
+        );
+        assert!(
+            !failure_context
+                .to_string()
+                .contains(temp.path().to_string_lossy().as_ref()),
+            "shareable failure context must not leak temp paths: {failure_context:#}"
+        );
+        assert_eq!(
+            failure_context["redaction_status"].as_str(),
+            Some(
+                "redacted_by_default; exact local paths are omitted from the shareable failure context"
+            )
         );
         assert!(
             failed_probe
@@ -36278,6 +38837,105 @@ mod doctor_asset_taxonomy_tests {
                 .get("derived_lexical_rebuild_required")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn doctor_candidate_promotion_records_derived_followup_after_lexical_rebuild() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        std::fs::create_dir_all(&index_path).expect("create live derived index");
+        std::fs::write(&db_path, b"prior archive identity").expect("write live db");
+        let candidate_dir = doctor_candidate_root(&data_dir).join("candidate-derived-followup");
+        write_candidate_promotion_test_manifest(
+            &db_path,
+            &index_path,
+            &candidate_dir,
+            "candidate-derived-followup",
+            b"replacement archive identity",
+            true,
+        );
+
+        let mut report = promote_doctor_reconstruct_candidate_bundle(
+            &data_dir,
+            &db_path,
+            &index_path,
+            &candidate_dir,
+        );
+        assert_eq!(report.status, "applied", "{report:#?}");
+        assert!(report.derived_lexical_rebuild_required);
+        assert!(report.derived_semantic_rebuild_required);
+
+        doctor_candidate_promotion_record_derived_followup_artifact(
+            &data_dir,
+            &mut report,
+            42,
+            "lexical",
+        );
+
+        assert_eq!(
+            report.derived_assets_consistency_status,
+            "promoted-archive-derived-followup-completed"
+        );
+        assert!(!report.derived_lexical_rebuild_required);
+        assert!(!report.derived_semantic_rebuild_required);
+        assert_eq!(report.derived_lexical_followup_status, "rebuild-completed");
+        assert_eq!(
+            report.derived_semantic_followup_status,
+            "skipped-lexical-fallback-active-no-auto-download"
+        );
+        assert_eq!(
+            report.derived_vector_followup_status,
+            "skipped-lexical-fallback-active-no-auto-download"
+        );
+        assert_eq!(
+            report.derived_memo_followup_status,
+            "not-mutated-rebuildable-cache-does-not-block-archive-recovery"
+        );
+        let followup_path = report
+            .derived_followup_artifact_path
+            .as_deref()
+            .map(Path::new)
+            .expect("derived follow-up artifact path");
+        assert!(
+            followup_path.exists(),
+            "follow-up artifact should be durable"
+        );
+        let followup: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(followup_path).expect("read followup"))
+                .expect("parse followup");
+        assert_eq!(
+            followup
+                .get("manifest_kind")
+                .and_then(serde_json::Value::as_str),
+            Some("cass_doctor_candidate_promotion_derived_followup_v1")
+        );
+        assert_eq!(
+            followup
+                .get("lexical_rebuild_message_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(42)
+        );
+        assert_eq!(
+            followup
+                .get("auto_download_attempted")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            followup
+                .pointer("/derived_asset_actions/semantic_vector_index/blocks_archive_recovery")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            followup
+                .pointer("/derived_asset_actions/memoization_cache/status")
+                .and_then(serde_json::Value::as_str),
+            Some("not-mutated-rebuildable-cache-does-not-block-archive-recovery")
         );
     }
 
@@ -42785,6 +45443,27 @@ pub(crate) fn run_doctor_impl(
         );
     }
 
+    let config_exclusion_risks =
+        collect_doctor_config_exclusion_risks(&data_dir, &db_path, &config_path, &sources_path);
+    if config_exclusion_risks.is_empty() {
+        add_check!(
+            "config_exclusion_risks",
+            "pass",
+            "No cass archive preservation exclusions found in the narrow config and ignore-file scan",
+            false
+        );
+    } else {
+        add_check!(
+            "config_exclusion_risks",
+            "warn",
+            format!(
+                "Preservation warning: {} backup/sync/ignore exclusion risk(s) may leave cass archive evidence unprotected; this is not proof backups are broken",
+                config_exclusion_risks.len()
+            ),
+            false
+        );
+    }
+
     // 7. Check common session directories exist
     let mut session_dirs_found = 0usize;
     let home = dirs::home_dir().unwrap_or_default();
@@ -43720,6 +46399,18 @@ pub(crate) fn run_doctor_impl(
                         fix_available: true,
                         fix_applied: true,
                     });
+                    if let Some(report) = candidate_promotion_report.as_mut()
+                        && report.status == "applied"
+                        && (report.derived_lexical_rebuild_required
+                            || report.derived_semantic_rebuild_required)
+                    {
+                        doctor_candidate_promotion_record_derived_followup_artifact(
+                            &data_dir,
+                            report,
+                            message_count,
+                            &fallback_mode,
+                        );
+                    }
                 }
                 Err(e) => {
                     checks.push(Check {
@@ -44091,11 +46782,6 @@ pub(crate) fn run_doctor_impl(
                 "embedded_operation_events",
             )
         });
-    let plan_fingerprint = cleanup_apply_result
-        .as_ref()
-        .and_then(|result| result.plan.as_ref())
-        .map(|plan| plan.plan_fingerprint.clone())
-        .unwrap_or_else(|| operation_id.clone());
     let command_line_mode = doctor_command_line_mode(
         fix,
         output_format,
@@ -44105,6 +46791,27 @@ pub(crate) fn run_doctor_impl(
         execution_mode,
         requested_plan_fingerprint.as_deref(),
     );
+    let should_capture_failure_context = fix
+        && (matches!(
+            operation_outcome.kind,
+            DoctorOperationOutcomeKind::RepairBlocked
+        ) || operation_state.mutation_blocked_reason.is_some()
+            || operation_state.active_doctor_repair);
+    let failure_context = should_capture_failure_context.then(|| {
+        write_doctor_lock_contention_failure_context(
+            &data_dir,
+            &operation_id,
+            &command_line_mode,
+            &operation_state,
+            &locks,
+            &operation_event_log,
+        )
+    });
+    let plan_fingerprint = cleanup_apply_result
+        .as_ref()
+        .and_then(|result| result.plan.as_ref())
+        .map(|plan| plan.plan_fingerprint.clone())
+        .unwrap_or_else(|| operation_id.clone());
     let should_write_failure_marker = fix
         && !repeat_repair_refused
         && matches!(
@@ -44217,6 +46924,7 @@ pub(crate) fn run_doctor_impl(
             "asset_taxonomy": doctor_asset_taxonomy_report(),
             "anomaly_taxonomy": doctor_anomaly_taxonomy_report(),
             "repair_contract": doctor_repair_contract_report(),
+            "config_exclusion_risks": config_exclusion_risks,
             "source_inventory": source_inventory,
             "raw_mirror": raw_mirror,
             "raw_mirror_backfill": raw_mirror_backfill,
@@ -44245,6 +46953,9 @@ pub(crate) fn run_doctor_impl(
         }
         if let Some(report) = candidate_promotion_report.as_ref() {
             payload["candidate_promotion"] = serde_json::json!(report);
+        }
+        if let Some(failure_context) = failure_context.as_ref() {
+            payload["failure_context"] = failure_context.clone();
         }
         if !fs_mutation_receipts.is_empty() {
             payload["fs_mutation_receipts"] = serde_json::json!(fs_mutation_receipts);
@@ -46918,6 +49629,144 @@ fn response_schema_doctor_v2_error_envelope() -> serde_json::Value {
     })
 }
 
+fn response_schema_doctor_failure_context_artifacts() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Redacted paths to nearby debugging artifacts. These are manifest and log references, not raw session logs.",
+        "additionalProperties": true,
+        "properties": {
+            "artifact_manifest_path": { "type": ["string", "null"] },
+            "commands_path": { "type": ["string", "null"] },
+            "doctor_events_path": { "type": ["string", "null"] },
+            "execution_flow_path": { "type": ["string", "null"] },
+            "receipts_path": { "type": ["string", "null"] },
+            "checksums_path": { "type": ["string", "null"] },
+            "stdout_path": { "type": ["string", "null"] },
+            "stderr_path": { "type": ["string", "null"] },
+            "failure_context_path": { "type": ["string", "null"] },
+            "failure_summary_path": { "type": ["string", "null"] },
+            "parsed_json_path": { "type": ["string", "null"] },
+            "event_log_path": { "type": ["string", "null"] }
+        }
+    })
+}
+
+fn response_schema_doctor_failure_context_repro() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Safe repro template. It must default to copied fixtures or redacted placeholders, not mutation of a live archive.",
+        "properties": {
+            "safety": { "type": "string" },
+            "mutates_live_archive": { "type": "boolean" },
+            "requires_explicit_live_archive": { "type": "boolean" },
+            "target": { "type": "string" },
+            "working_directory": { "type": ["string", "null"] },
+            "command_json": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "shell_command": { "type": "string" },
+            "notes": {
+                "type": "array",
+                "items": { "type": "string" }
+            }
+        },
+        "required": [
+            "safety",
+            "mutates_live_archive",
+            "requires_explicit_live_archive",
+            "target",
+            "command_json",
+            "shell_command"
+        ]
+    })
+}
+
+fn response_schema_doctor_failure_context() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Failure context artifact contract for blocked, refused, incomplete, or verification-failed doctor operations. This artifact is redacted by default and is safe to attach to support reports alongside manifest/commands/events artifacts.",
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "context_kind": { "type": ["string", "null"] },
+            "scenario_id": { "type": ["string", "null"] },
+            "probe_run_id": { "type": ["string", "null"] },
+            "operation_id": { "type": ["string", "null"] },
+            "failed_phase": { "type": "string" },
+            "failed_check": { "type": "string" },
+            "reasons": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "failure_reason": { "type": ["string", "null"] },
+            "command": response_schema_opaque_object(),
+            "command_history": response_schema_opaque_object_array(),
+            "platform": response_schema_opaque_object(),
+            "fixture": response_schema_opaque_object(),
+            "artifacts": response_schema_doctor_failure_context_artifacts(),
+            "repro": response_schema_doctor_failure_context_repro(),
+            "recent_events": response_schema_opaque_object_array(),
+            "captured_logs": response_schema_opaque_object_array(),
+            "probe": response_schema_opaque_object(),
+            "asset_class": { "type": ["string", "null"] },
+            "authority_status": { "type": ["string", "null"] },
+            "contract_provenance": { "type": ["string", "null"] },
+            "blocked_reasons": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "command_id": { "type": ["string", "null"] },
+            "exit_code": { "type": ["integer", "null"] },
+            "plan_fingerprint": { "type": ["string", "null"] },
+            "selected_authority": { "type": ["object", "array", "null"], "additionalProperties": true },
+            "rejected_authorities": { "type": ["object", "array", "null"], "additionalProperties": true },
+            "active_locks": { "type": ["object", "array", "null"], "additionalProperties": true },
+            "coverage_summary": { "type": ["object", "array", "null"], "additionalProperties": true },
+            "stdout_tail": { "type": ["string", "null"] },
+            "stderr_tail": { "type": ["string", "null"] },
+            "redaction_status": { "type": ["string", "null"] }
+        },
+        "required": [
+            "schema_version",
+            "failed_phase",
+            "failed_check",
+            "artifacts",
+            "repro"
+        ],
+        "examples": [{
+            "schema_version": 1,
+            "context_kind": "cass_doctor_post_repair_probe_failure_context",
+            "operation_id": "doctor-post-repair-probe-example",
+            "failed_phase": "post_repair_probe",
+            "failed_check": "rollback-confirmed",
+            "failure_reason": "post-repair verification failed",
+            "asset_class": "derived_lexical_index",
+            "authority_status": "post_repair_verification_failed",
+            "contract_provenance": "contract-example",
+            "blocked_reasons": ["blocks_promotion", "blocks_cleanup"],
+            "artifacts": {
+                "artifact_manifest_path": "[cass-data]/doctor/post-repair-probes/example/manifest.json",
+                "failure_context_path": "[cass-data]/doctor/post-repair-probes/example/failure_context.json"
+            },
+            "captured_logs": [{
+                "kind": "failure_reason",
+                "entries": ["post-repair verification failed"]
+            }],
+            "repro": {
+                "safety": "read-only-redacted-template",
+                "mutates_live_archive": false,
+                "requires_explicit_live_archive": true,
+                "target": "[cass-data]",
+                "command_json": ["cass", "doctor", "check", "--json", "--data-dir", "[cass-data]"],
+                "shell_command": "cass doctor check --json --data-dir '[cass-data]'",
+                "notes": ["Replace [cass-data] with a copied fixture or explicit test data directory."]
+            },
+            "recent_events": [],
+            "redaction_status": "redacted"
+        }]
+    })
+}
+
 fn response_schema_doctor_coverage_snapshot() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -47505,6 +50354,26 @@ fn response_schema_doctor_source_inventory() -> serde_json::Value {
             "detected_roots",
             "notes"
         ]
+    })
+}
+
+fn response_schema_doctor_config_exclusion_risk() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Read-only preservation warning for backup, sync, ignore, or cache placement rules that may exclude cass archival evidence. auto_fix_available is always false.",
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "path": { "type": "string" },
+            "risk_kind": {
+                "type": "string",
+                "description": "Stable code such as volatile-cache-location, repo-ignore-excludes-cass-evidence, backup-filter-excludes-cass-evidence, cass-config-excludes-cass-evidence, or sources-config-excludes-cass-evidence."
+            },
+            "evidence": { "type": "array", "items": { "type": "string" } },
+            "confidence": { "type": "string", "description": "high | medium | low, expressing how directly doctor observed the exclusion rule." },
+            "recommended_action": { "type": "string" },
+            "auto_fix_available": { "type": "boolean" }
+        },
+        "required": ["schema_version", "path", "risk_kind", "evidence", "confidence", "recommended_action", "auto_fix_available"]
     })
 }
 
@@ -49031,6 +51900,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "post_repair_probes": response_schema_opaque_object(),
                 "repair_failure_marker": response_schema_doctor_repair_failure_marker(),
                 "failure_marker_write_error": { "type": ["string", "null"] },
+                "failure_context": response_schema_opaque_object(),
                 "operation_outcome": response_schema_doctor_operation_outcome(),
                 "operation_state": response_schema_doctor_operation_state(),
                 "locks": response_schema_doctor_locks(),
@@ -49069,6 +51939,10 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "asset_taxonomy": response_schema_opaque_object_array(),
                 "anomaly_taxonomy": response_schema_opaque_object_array(),
                 "repair_contract": response_schema_opaque_object(),
+                "config_exclusion_risks": {
+                    "type": "array",
+                    "items": response_schema_doctor_config_exclusion_risk()
+                },
                 "source_inventory": response_schema_doctor_source_inventory(),
                 "raw_mirror": response_schema_doctor_raw_mirror(),
                 "raw_mirror_backfill": response_schema_doctor_raw_mirror_backfill(),
@@ -49104,7 +51978,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     }
                 }
             },
-            "required": ["status", "health_class", "risk_level", "healthy", "initialized", "recommended_action", "fallback_mode", "doctor_command", "check_scope", "repair_previously_failed", "failure_marker_path", "repeat_refusal_reason", "override_available", "override_used", "active_repair", "post_repair_probes", "repair_failure_marker", "operation_outcome", "operation_state", "locks", "slow_operations", "timing_summary", "retry_recommendation", "primary_incident_id", "incidents", "event_log", "lexical", "semantic", "storage_pressure", "raw_mirror_backfill", "coverage_summary", "sole_copy_warnings", "coverage_risk", "source_authority", "candidate_staging", "checks"]
+            "required": ["status", "health_class", "risk_level", "healthy", "initialized", "recommended_action", "fallback_mode", "doctor_command", "check_scope", "repair_previously_failed", "failure_marker_path", "repeat_refusal_reason", "override_available", "override_used", "active_repair", "post_repair_probes", "repair_failure_marker", "operation_outcome", "operation_state", "locks", "slow_operations", "timing_summary", "retry_recommendation", "primary_incident_id", "incidents", "event_log", "lexical", "semantic", "storage_pressure", "config_exclusion_risks", "raw_mirror_backfill", "coverage_summary", "sole_copy_warnings", "coverage_risk", "source_authority", "candidate_staging", "checks"]
         }),
     );
 
@@ -49148,6 +52022,10 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             },
             [
                 ("source_inventory", response_schema_doctor_source_inventory()),
+                ("config_exclusion_risks", serde_json::json!({
+                    "type": "array",
+                    "items": response_schema_doctor_config_exclusion_risk()
+                })),
                 ("raw_mirror", response_schema_doctor_raw_mirror()),
                 ("coverage_summary", response_schema_doctor_coverage_summary()),
                 ("sole_copy_warnings", serde_json::json!({ "type": "array", "items": response_schema_opaque_object() })),
@@ -49300,28 +52178,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
     );
     schemas.insert(
         "doctor-failure-context".to_string(),
-        response_schema_doctor_v2_surface(
-            DoctorV2SurfaceSchemaSpec {
-                description: "Failure context artifact contract for blocked, refused, incomplete, or verification-failed doctor operations.",
-                surface: "failure-context",
-                mode: "not-applicable",
-                status: "failed",
-                outcome_kind: "failed",
-                asset_class: "operation_receipt",
-                risk_level: "medium",
-                fallback_mode: "not-applicable",
-                authority_status: "unavailable",
-                recommended_action: "inspect failure_context_path and rerun cass doctor check --json",
-            },
-            [
-                ("failure_context_path", serde_json::json!({ "type": ["string", "null"] })),
-                ("repro_command", serde_json::json!({ "type": ["string", "null"] })),
-                ("last_successful_phase", serde_json::json!({ "type": ["string", "null"] })),
-                ("failed_phase", serde_json::json!({ "type": ["string", "null"] })),
-                ("captured_logs", serde_json::json!({ "type": "array", "items": response_schema_opaque_object() })),
-                ("redaction_report", response_schema_opaque_object()),
-            ],
-        ),
+        response_schema_doctor_failure_context(),
     );
     schemas.insert(
         "doctor-health-summary".to_string(),
@@ -49705,7 +52562,7 @@ mod response_schema_tests {
         for key in DOCTOR_V2_RESPONSE_SCHEMA_KEYS
             .iter()
             .copied()
-            .filter(|key| *key != "doctor-error-envelope")
+            .filter(|key| *key != "doctor-error-envelope" && *key != "doctor-failure-context")
         {
             let properties = schemas[key]["properties"]
                 .as_object()
@@ -49746,6 +52603,62 @@ mod response_schema_tests {
     }
 
     #[test]
+    fn doctor_failure_context_schema_matches_artifact_contract() {
+        let schemas = build_response_schemas();
+        let schema = &schemas["doctor-failure-context"];
+        let properties = schema["properties"]
+            .as_object()
+            .expect("failure context schema properties");
+
+        for field in [
+            "schema_version",
+            "failed_phase",
+            "failed_check",
+            "artifacts",
+            "repro",
+            "captured_logs",
+            "recent_events",
+            "redaction_status",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "failure context schema missing {field}"
+            );
+        }
+        assert!(
+            !properties.contains_key("repro_command"),
+            "failure context schema must advertise the structured repro object, not the old repro_command field"
+        );
+        assert_eq!(
+            properties["repro"]["properties"]["mutates_live_archive"]["type"],
+            serde_json::json!("boolean")
+        );
+        assert_eq!(
+            properties["repro"]["properties"]["command_json"]["items"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(
+            properties["artifacts"]["properties"]["failure_context_path"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        let required = schema["required"]
+            .as_array()
+            .expect("failure context required fields");
+        for field in [
+            "schema_version",
+            "failed_phase",
+            "failed_check",
+            "artifacts",
+            "repro",
+        ] {
+            assert!(
+                required.iter().any(|value| value.as_str() == Some(field)),
+                "failure context required list missing {field}"
+            );
+        }
+    }
+
+    #[test]
     fn health_and_status_schemas_advertise_doctor_summary() {
         let schemas = build_response_schemas();
 
@@ -49764,12 +52677,444 @@ mod response_schema_tests {
             "coverage_delta",
             "recommended_action",
             "redaction_status",
+            "archive_coverage_state",
+            "source_mirror_state",
+            "doctor_check_recommended",
+            "coverage_source",
+            "quarantine_summary",
         ] {
             assert!(
                 summary.get(field).is_some(),
                 "doctor_summary schema missing {field}"
             );
         }
+    }
+
+    #[test]
+    fn doctor_runtime_summary_marks_health_coverage_not_checked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = serde_json::json!({
+            "semantic": { "fallback_mode": "lexical" },
+            "rebuild": { "active": false },
+        });
+        let coverage_risk = doctor_fast_coverage_risk_unchecked(true);
+
+        let summary = build_doctor_runtime_summary(DoctorRuntimeSummaryInput {
+            surface: "health-summary",
+            state: &state,
+            status: "healthy",
+            healthy: true,
+            initialized: true,
+            db_exists: true,
+            rebuild_active: false,
+            coverage_risk: &coverage_risk,
+            coverage_source: "health-fast-state",
+            coverage_checked: false,
+            quarantine_summary: None,
+            recommended_action: None,
+            data_dir: temp.path(),
+        });
+
+        assert_eq!(summary["archive_coverage_state"], "not_checked");
+        assert_eq!(summary["coverage_source"]["status"], "not_checked");
+        assert_eq!(summary["coverage_source"]["source"], "health-fast-state");
+        assert_eq!(summary["doctor_check_recommended"], true);
+        assert_eq!(summary["quarantine_summary"], serde_json::Value::Null);
+        assert_eq!(
+            summary["cleanup_reclaimable_bytes"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            summary["operation_outcome"]["action_not_taken"],
+            "did not run deep doctor collectors, source sync, rebuild, model verification, or filesystem-wide repair work"
+        );
+    }
+
+    #[test]
+    fn doctor_runtime_summary_routes_uninitialized_archives_to_indexing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = serde_json::json!({
+            "semantic": { "fallback_mode": "lexical" },
+            "rebuild": { "active": false },
+        });
+        let coverage_risk = doctor_fast_coverage_risk_unchecked(false);
+        let recommended_action = cass_not_initialized_recommended_action();
+
+        let summary = build_doctor_runtime_summary(DoctorRuntimeSummaryInput {
+            surface: "health-summary",
+            state: &state,
+            status: "not_initialized",
+            healthy: false,
+            initialized: false,
+            db_exists: false,
+            rebuild_active: false,
+            coverage_risk: &coverage_risk,
+            coverage_source: "health-fast-state",
+            coverage_checked: false,
+            quarantine_summary: None,
+            recommended_action: Some(&recommended_action),
+            data_dir: temp.path(),
+        });
+
+        assert_eq!(summary["archive_coverage_state"], "not_initialized");
+        assert_eq!(summary["doctor_check_recommended"], false);
+        assert_eq!(summary["recommended_action"], recommended_action);
+        assert_eq!(
+            summary["coverage_source"]["recommended_action"],
+            "Run cass index --full once before archive coverage can be assessed."
+        );
+        assert_eq!(
+            summary["operation_outcome"]["next_command"],
+            "cass index --full"
+        );
+        assert_eq!(
+            summary["operation_outcome"]["reason"],
+            "archive database is not initialized yet, so doctor coverage cannot be checked"
+        );
+    }
+
+    #[test]
+    fn doctor_runtime_summary_carries_checked_status_coverage_and_quarantine_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = serde_json::json!({
+            "semantic": { "fallback_mode": "lexical" },
+            "rebuild": { "active": false },
+            "_meta": { "timestamp": "2026-05-06T00:00:00Z" },
+        });
+        let coverage_risk = DoctorCoverageRiskSummary {
+            schema_version: 1,
+            status: "sole_copy_risk".to_string(),
+            confidence_tier: "archive_db_without_raw_mirror".to_string(),
+            archive_conversation_count: 7,
+            missing_current_source_count: 2,
+            db_without_raw_mirror_count: 1,
+            db_projection_only_count: 1,
+            sole_copy_warning_count: 2,
+            recommended_action: "preserve archive and inspect doctor repair".to_string(),
+            ..DoctorCoverageRiskSummary::default()
+        };
+        let quarantine_summary = DiagQuarantineSummary {
+            cleanup_dry_run_reclaimable_bytes: 4096,
+            ..DiagQuarantineSummary::default()
+        };
+
+        let summary = build_doctor_runtime_summary(DoctorRuntimeSummaryInput {
+            surface: "status-summary",
+            state: &state,
+            status: "degraded",
+            healthy: false,
+            initialized: true,
+            db_exists: true,
+            rebuild_active: false,
+            coverage_risk: &coverage_risk,
+            coverage_source: "status-inline-small-archive",
+            coverage_checked: true,
+            quarantine_summary: Some(&quarantine_summary),
+            recommended_action: None,
+            data_dir: temp.path(),
+        });
+
+        assert_eq!(summary["archive_coverage_state"], "sole_copy_risk");
+        assert_eq!(
+            summary["source_mirror_state"],
+            "archive_rows_without_raw_mirror"
+        );
+        assert_eq!(summary["risk_level"], "high");
+        assert_eq!(summary["health_class"], "degraded-archive-risk");
+        assert_eq!(summary["repair_recommended"], true);
+        assert_eq!(summary["sole_copy_conversation_count"], 2);
+        assert_eq!(summary["cleanup_reclaimable_bytes"], 4096);
+        assert_eq!(summary["coverage_delta"]["archive_conversation_count"], 7);
+        assert_eq!(
+            summary["coverage_delta"]["visible_source_conversation_count"],
+            5
+        );
+        assert_eq!(
+            summary["coverage_source"]["source"],
+            "status-inline-small-archive"
+        );
+        assert_eq!(
+            summary["coverage_source"]["generated_at"],
+            "2026-05-06T00:00:00Z"
+        );
+    }
+
+    fn write_storage_fixture_file(root: &Path, relative_path: &str, bytes: usize) {
+        let path = root.join(relative_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create fixture parent");
+        }
+        std::fs::write(path, vec![b'x'; bytes]).expect("write storage fixture file");
+    }
+
+    #[test]
+    fn doctor_storage_pressure_classifies_precious_and_reclaimable_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        write_storage_fixture_file(root, "agent_search.db", 5);
+        write_storage_fixture_file(root, "raw-mirror/v1/codex/blob.jsonl", 7);
+        write_storage_fixture_file(root, "backups/agent_search.db.bak", 3);
+        write_storage_fixture_file(root, "doctor/receipts/cleanup.json", 2);
+        write_storage_fixture_file(root, "index/generation-failed-reclaimable/chunk", 11);
+        write_storage_fixture_file(root, "index/.lexical-publish-backups/old/shard", 13);
+        write_storage_fixture_file(root, "index/live/shard", 17);
+        write_storage_fixture_file(root, "index/generation-quarantined/manifest.json", 19);
+
+        let report = build_doctor_storage_pressure_report(root, root.to_path_buf(), Ok(1024), true);
+
+        assert_eq!(report.schema_version, 2);
+        assert_eq!(report.status, "warn");
+        assert_eq!(report.low_disk_risk, "low_free_space");
+        assert_eq!(report.total_accounted_bytes, 77);
+        assert_eq!(report.reclaimable_derived_bytes, 24);
+        assert_eq!(report.precious_evidence_bytes, 17);
+        assert_eq!(
+            report.reclaimable_bytes_by_class["reclaimable_derived_cache"],
+            11
+        );
+        assert_eq!(
+            report.reclaimable_bytes_by_class["retained_publish_backup"],
+            13
+        );
+        assert_eq!(report.precious_bytes_by_class["canonical_archive_db"], 5);
+        assert_eq!(report.precious_bytes_by_class["raw_mirror_blob"], 7);
+        assert_eq!(report.precious_bytes_by_class["backup_bundle"], 3);
+        assert_eq!(report.precious_bytes_by_class["operation_receipt"], 2);
+        assert_eq!(
+            report.protected_bytes_by_class["quarantined_lexical_generation"],
+            19
+        );
+        assert!(
+            !report
+                .reclaimable_bytes_by_class
+                .contains_key("raw_mirror_blob"),
+            "raw mirrors must never appear in reclaimable storage classes"
+        );
+        assert!(
+            report
+                .safe_cleanup_scope
+                .contains(&"reclaimable_derived_cache".to_string())
+        );
+        assert!(
+            report
+                .recommended_action
+                .contains("fingerprint-approved derived cleanup"),
+            "low-disk derived cleanup guidance should require fingerprint approval: {}",
+            report.recommended_action
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_storage_pressure_accounts_for_symlinked_archive_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_root = temp.path().join("real-cass-data");
+        std::fs::create_dir_all(&real_root).expect("create real root");
+        write_storage_fixture_file(&real_root, "bookmarks.json", 4);
+        let link_root = temp.path().join("cass-data-link");
+        std::os::unix::fs::symlink(&real_root, &link_root).expect("symlink data root");
+
+        let report = build_doctor_storage_pressure_report(
+            &link_root,
+            link_root.clone(),
+            Ok(DOCTOR_STORAGE_MIN_FREE_BYTES),
+            false,
+        );
+
+        assert!(report.data_dir_exists);
+        assert_eq!(report.precious_bytes_by_class["bookmark_store"], 4);
+        assert!(
+            !report
+                .reclaimable_bytes_by_class
+                .contains_key("bookmark_store"),
+            "bookmarks are user state and must not become reclaimable through a symlinked root"
+        );
+    }
+
+    #[test]
+    fn doctor_config_exclusion_risks_detect_cache_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join(".cache").join("cass");
+        std::fs::create_dir_all(&data_dir).expect("create cache data dir");
+
+        let risks = collect_doctor_config_exclusion_risks(
+            &data_dir,
+            &data_dir.join("agent_search.db"),
+            &data_dir.join("config.toml"),
+            &temp.path().join("sources.toml"),
+        );
+
+        assert!(
+            risks
+                .iter()
+                .any(|risk| risk.risk_kind == "volatile-cache-location"
+                    && risk.confidence == "high"
+                    && !risk.auto_fix_available),
+            "cache placement should be reported as a high-confidence preservation risk: {risks:#?}"
+        );
+    }
+
+    #[test]
+    fn doctor_config_exclusion_risks_detect_explicit_filter_patterns() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        std::fs::write(data_dir.join(".rsync-filter"), "- raw-mirror/**\n")
+            .expect("write rsync filter");
+
+        let risks = collect_doctor_config_exclusion_risks(
+            &data_dir,
+            &data_dir.join("agent_search.db"),
+            &data_dir.join("config.toml"),
+            &temp.path().join("sources.toml"),
+        );
+
+        assert!(
+            risks.iter().any(|risk| {
+                risk.risk_kind == "backup-filter-excludes-cass-evidence"
+                    && risk.path.ends_with("raw-mirror/v1")
+                    && risk.evidence.iter().any(|line| line.contains(".rsync-filter:1"))
+            }),
+            "local backup filter should identify raw mirror exclusion: {risks:#?}"
+        );
+    }
+
+    #[test]
+    fn doctor_config_exclusion_risks_detect_repo_gitignore_matches() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let data_dir = repo.join("cass-data");
+        std::fs::create_dir_all(repo.join(".git")).expect("create repo marker");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        std::fs::write(repo.join(".gitignore"), "cass-data/raw-mirror/**\n")
+            .expect("write repo gitignore");
+
+        let risks = collect_doctor_config_exclusion_risks(
+            &data_dir,
+            &data_dir.join("agent_search.db"),
+            &data_dir.join("config.toml"),
+            &temp.path().join("sources.toml"),
+        );
+
+        assert!(
+            risks.iter().any(|risk| {
+                risk.risk_kind == "repo-ignore-excludes-cass-evidence"
+                    && risk.path.ends_with("cass-data/raw-mirror/v1")
+                    && risk.evidence.iter().any(|line| line.contains(".gitignore:1"))
+            }),
+            "repo-local .gitignore should be scanned only for cass paths under that repo: {risks:#?}"
+        );
+    }
+
+    #[test]
+    fn doctor_config_exclusion_risks_no_config_found_is_clean() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+
+        let risks = collect_doctor_config_exclusion_risks(
+            &data_dir,
+            &data_dir.join("agent_search.db"),
+            &data_dir.join("missing-config.toml"),
+            &temp.path().join("missing-sources.toml"),
+        );
+
+        assert!(
+            risks.is_empty(),
+            "absence of directly scanned config should not invent a backup failure: {risks:#?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_config_exclusion_risks_respect_symlinked_data_dirs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let real_data = temp.path().join("real-cass-data");
+        let link_data = repo.join("cass-data-link");
+        std::fs::create_dir_all(repo.join(".git")).expect("create repo marker");
+        std::fs::create_dir_all(&real_data).expect("create real data dir");
+        std::os::unix::fs::symlink(&real_data, &link_data).expect("symlink data dir");
+        std::fs::write(repo.join(".gitignore"), "cass-data-link/raw-mirror/**\n")
+            .expect("write repo gitignore");
+
+        let risks = collect_doctor_config_exclusion_risks(
+            &link_data,
+            &link_data.join("agent_search.db"),
+            &link_data.join("config.toml"),
+            &temp.path().join("sources.toml"),
+        );
+
+        assert!(
+            risks.iter().any(|risk| {
+                risk.risk_kind == "repo-ignore-excludes-cass-evidence"
+                    && risk.path.ends_with("cass-data-link/raw-mirror/v1")
+            }),
+            "logical symlinked data-dir placement should still be checked against repo ignores: {risks:#?}"
+        );
+    }
+
+    #[test]
+    fn doctor_config_exclusion_risks_suppress_later_include_rules() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let data_dir = repo.join("cass-data");
+        std::fs::create_dir_all(repo.join(".git")).expect("create repo marker");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        std::fs::write(
+            repo.join(".gitignore"),
+            "cass-data/raw-mirror/**\n!cass-data/raw-mirror/v1/**\n",
+        )
+        .expect("write repo gitignore");
+
+        let risks = collect_doctor_config_exclusion_risks(
+            &data_dir,
+            &data_dir.join("agent_search.db"),
+            &data_dir.join("config.toml"),
+            &temp.path().join("sources.toml"),
+        );
+
+        assert!(
+            !risks
+                .iter()
+                .any(|risk| risk.risk_kind == "repo-ignore-excludes-cass-evidence"),
+            "last matching include rule should suppress the earlier repo ignore: {risks:#?}"
+        );
+    }
+
+    #[test]
+    fn doctor_config_exclusion_risks_scan_cass_config_and_sources_text() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let config_path = data_dir.join("config.toml");
+        let sources_path = temp.path().join("sources.toml");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        std::fs::write(&config_path, "backup_exclude = [\"backups/**\"]\n")
+            .expect("write config");
+        std::fs::write(&sources_path, "sync_ignore = [\"raw-mirror/**\"]\n")
+            .expect("write sources");
+
+        let risks = collect_doctor_config_exclusion_risks(
+            &data_dir,
+            &data_dir.join("agent_search.db"),
+            &config_path,
+            &sources_path,
+        );
+
+        assert!(
+            risks
+                .iter()
+                .any(|risk| risk.risk_kind == "cass-config-excludes-cass-evidence"
+                    && risk.path.ends_with("backups")),
+            "cass config exclusion-like entries should be surfaced with uncertainty: {risks:#?}"
+        );
+        assert!(
+            risks
+                .iter()
+                .any(|risk| risk.risk_kind == "sources-config-excludes-cass-evidence"
+                    && risk.path.ends_with("raw-mirror/v1")),
+            "sources config exclusion-like entries should be surfaced with uncertainty: {risks:#?}"
+        );
     }
 
     #[test]

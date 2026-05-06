@@ -24,18 +24,16 @@ use tempfile::TempDir;
 #[test]
 fn scan_nonexistent_directory_handles_gracefully() {
     let tmp = TempDir::new().unwrap();
-    // Make the path "look like" a Claude root so the connector doesn't fall back to
-    // scanning the real ~/.claude directory on developer machines.
     let nonexistent = tmp.path().join("fixture-claude");
 
     let conn = ClaudeCodeConnector::new();
     let ctx = ScanContext {
-        data_dir: nonexistent,
-        scan_roots: Vec::new(),
+        data_dir: tmp.path().join("unused-data-dir"),
+        scan_roots: vec![ScanRoot::local(nonexistent)],
         since_ts: None,
     };
 
-    // Should not panic - returns empty or error (connector may search ~/.claude anyway)
+    // Should not panic or fall back to scanning the developer's real ~/.claude tree.
     let result = conn.scan(&ctx);
     assert!(
         result.is_ok() || result.is_err(),

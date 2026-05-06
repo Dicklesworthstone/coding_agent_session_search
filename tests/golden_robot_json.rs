@@ -206,6 +206,25 @@ fn json_value_schema(value: &Value) -> Value {
     }
 }
 
+fn sort_example_paths(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(paths)) = map.get_mut("example_paths") {
+                paths.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+            }
+            for child in map.values_mut() {
+                sort_example_paths(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                sort_example_paths(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Strip non-deterministic values from a robot-mode JSON payload so the
 /// golden captures *shape* rather than ephemeral facts.
 ///
@@ -249,12 +268,17 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     for (key, replacement) in [
         ("latency_ms", "[LATENCY_MS]"),
         ("elapsed_ms", "[ELAPSED_MS]"),
+        ("slowest_elapsed_ms", "[ELAPSED_MS]"),
     ] {
         let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*\d+"#)).unwrap();
         out = re
             .replace_all(&out, format!(r#""{key}": "{replacement}""#).as_str())
             .to_string();
     }
+    let slowest_operation_re = regex::Regex::new(r#""slowest_operation"\s*:\s*"[^"]*""#).unwrap();
+    out = slowest_operation_re
+        .replace_all(&out, r#""slowest_operation": "[LIVE_OPERATION]""#)
+        .to_string();
 
     // 6. Live-sampled kernel metrics in health --json (load average per
     // core and PSI CPU pressure). These float values change between runs
@@ -320,15 +344,36 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         .replace_all(&out, r#""last_reason": "[LIVE_SAMPLE]""#)
         .to_string();
 
-    // Resource policy status reports include host-live available memory and
-    // derived cache caps. The shape is contractual; the sampled byte counts
-    // are not.
+    // Resource policy status reports include host-live CPU and memory budgets.
+    // The shape is contractual; the sampled worker/byte counts are not.
+    for key in [
+        "available_parallelism",
+        "reserved_cores",
+        "max_workers",
+        "effective_worker_ceiling",
+        "workers",
+        "tantivy_writer_threads",
+        "shard_builders",
+        "merge_workers",
+        "staged_shard_builders",
+        "staged_merge_workers",
+        "page_prep_workers",
+    ] {
+        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*("?\d+"?)"#)).unwrap();
+        out = re
+            .replace_all(&out, format!(r#""{key}": "[LIVE_COUNTER]""#).as_str())
+            .to_string();
+    }
+
     for key in [
         "memory_available_bytes",
+        "memory_total_bytes",
         "cache_cap_bytes",
         "available_bytes",
+        "max_inflight_bytes",
+        "pipeline_max_message_bytes_in_flight",
     ] {
-        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*\d+"#)).unwrap();
+        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*("?\d+"?)"#)).unwrap();
         out = re
             .replace_all(&out, format!(r#""{key}": "[LIVE_BYTES]""#).as_str())
             .to_string();
@@ -343,6 +388,13 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     out = last_read_re
         .replace_all(&out, r#""last_read_at_ms": "[LAST_READ_MS]""#)
         .to_string();
+
+    if let Ok(mut parsed) = serde_json::from_str::<Value>(&out) {
+        sort_example_paths(&mut parsed);
+        if let Ok(canonical) = serde_json::to_string_pretty(&parsed) {
+            out = canonical;
+        }
+    }
 
     out
 }
@@ -533,11 +585,12 @@ fn health_json_matches_golden() {
 #[test]
 fn health_shape_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let health = capture_robot_json_value(
+    let health = capture_robot_json(
         test_home.path(),
         &["health", "--json"],
         ExpectStatus::ExitAny,
     );
+    let health: Value = serde_json::from_str(&health).expect("parse scrubbed health JSON");
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&health)).expect("pretty-print JSON");
     assert_golden("robot/health_shape.json.golden", &canonical);
@@ -784,12 +837,8 @@ fn stats_json_missing_db_error_envelope_matches_golden() {
     // silent drift in the error-envelope shape — important because agent
     // error-handling branches key on these exact fields.
     //
-    // [coding_agent_session_search-hd89i] Post-fix: robot-mode JSON
-    // envelopes (data AND errors) ALWAYS emit on STDOUT to match the
-    // documented contract `stdout = data only; stderr = diagnostics
-    // only`. Pre-fix this test read out.stderr because the legacy
-    // routing in src/main.rs::handle_fatal_error sent JSON-shaped
-    // errors to stderr — fixing that routing is what hd89i closed.
+    // Robot-mode success payloads emit on stdout; fatal error envelopes
+    // emit on stderr so stdout remains data-only for successful commands.
     let test_home = tempfile::tempdir().expect("create temp home");
     let out = cass_cmd(test_home.path())
         .args([
@@ -800,9 +849,9 @@ fn stats_json_missing_db_error_envelope_matches_golden() {
         ])
         .output()
         .expect("run cass stats --json");
-    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
     let parsed: serde_json::Value =
-        serde_json::from_str(&stdout).expect("stats error envelope is JSON on stdout");
+        serde_json::from_str(&stderr).expect("stats error envelope is JSON on stderr");
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/stats_missing_db.json.golden", &scrubbed);
@@ -870,8 +919,7 @@ fn stats_json_happy_path_shape_matches_golden() {
 
 #[test]
 fn stats_json_missing_db_error_envelope_shape_matches_golden() {
-    // [coding_agent_session_search-hd89i] error envelope lives on
-    // STDOUT post-fix (see sibling test for context).
+    // Error envelope lives on stderr; stdout stays reserved for successful data.
     let test_home = tempfile::tempdir().expect("create temp home");
     let out = cass_cmd(test_home.path())
         .args([
@@ -883,7 +931,7 @@ fn stats_json_missing_db_error_envelope_shape_matches_golden() {
         .output()
         .expect("run cass stats --json");
     let parsed: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("stats error envelope is JSON on stdout");
+        serde_json::from_slice(&out.stderr).expect("stats error envelope is JSON on stderr");
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
     assert_golden("robot/stats_missing_db_shape.json.golden", &canonical);
@@ -1136,9 +1184,8 @@ fn doctor_shape_matches_golden() {
 #[test]
 fn sessions_json_missing_db_error_envelope_shape_matches_golden() {
     // Mirrors stats_json_missing_db_error_envelope_shape_matches_golden:
-    // no DB on a fresh data_dir ⇒ cass emits the `missing-db` error
-    // envelope on STDOUT (post-hd89i, JSON envelopes always land on
-    // stdout) with exit 3. Pinning the envelope shape lets agent
+    // no DB on a fresh data_dir means cass emits the `missing-db` error
+    // envelope on stderr with exit 3. Pinning the envelope shape lets agent
     // harnesses branch on kind="missing-db" without worrying about
     // silent contract drift.
     let test_home = tempfile::tempdir().expect("create temp home");
@@ -1153,7 +1200,7 @@ fn sessions_json_missing_db_error_envelope_shape_matches_golden() {
         .output()
         .expect("run cass sessions --current --json");
     let parsed: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("sessions error envelope is JSON on stdout");
+        serde_json::from_slice(&out.stderr).expect("sessions error envelope is JSON on stderr");
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
     assert_golden("robot/sessions_missing_db_shape.json.golden", &canonical);

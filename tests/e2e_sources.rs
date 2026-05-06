@@ -1275,6 +1275,7 @@ paths = ["~/.claude/projects"]
         .args(["sources", "remove", "laptop", "--purge", "-y"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
+        .env_remove("CASS_DATA_DIR")
         .output()
         .expect("sources remove --purge command");
     tracker.end(
@@ -1374,6 +1375,7 @@ paths = ["~/.claude/projects"]
         .args(["sources", "remove", "laptop", "--purge", "-y"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
+        .env_remove("CASS_DATA_DIR")
         .output()
         .expect("sources remove --purge command");
     tracker.end(

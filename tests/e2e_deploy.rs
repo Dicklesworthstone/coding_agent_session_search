@@ -118,6 +118,45 @@ fn clone_local_repo(bare_repo: &Path, work_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn checkout_remote_branch(work_dir: &Path, branch_name: &str) -> Result<()> {
+    let remote_ref = format!("origin/{branch_name}");
+    let output = Command::new("git")
+        .current_dir(work_dir)
+        .args(["checkout", "--detach", remote_ref.as_str()])
+        .output()?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to checkout {remote_ref}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn read_git_blob(repo: &Path, branch_name: &str, blob_path: &str) -> Result<String> {
+    let spec = format!("{branch_name}:{blob_path}");
+    let output = Command::new("git")
+        .args([
+            "--git-dir",
+            repo.to_str().expect("utf8 repo path"),
+            "show",
+            &spec,
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to read {spec}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(String::from_utf8(output.stdout)?)
+}
+
 /// Create an orphan branch and push to local bare repo
 fn create_and_push_orphan(work_dir: &Path, branch_name: &str, bundle_dir: &Path) -> Result<String> {
     // Configure git
@@ -143,12 +182,6 @@ fn create_and_push_orphan(work_dir: &Path, branch_name: &str, bundle_dir: &Path)
         );
     }
 
-    // Remove existing files
-    let _ = Command::new("git")
-        .current_dir(work_dir)
-        .args(["rm", "-rf", "."])
-        .output();
-
     // Copy bundle contents
     for entry in fs::read_dir(bundle_dir)? {
         let entry = entry?;
@@ -163,7 +196,7 @@ fn create_and_push_orphan(work_dir: &Path, branch_name: &str, bundle_dir: &Path)
     // Add all files
     let output = Command::new("git")
         .current_dir(work_dir)
-        .args(["add", "-A"])
+        .args(["add", "--force", "--all", "--", "."])
         .output()?;
 
     if !output.status.success() {
@@ -391,14 +424,7 @@ fn e2e_local_git_orphan_branch_workflow() -> Result<()> {
     let verify_dir = temp_dir.path().join("verify");
     clone_local_repo(&bare_repo, &verify_dir)?;
 
-    let output = Command::new("git")
-        .current_dir(&verify_dir)
-        .args(["checkout", "gh-pages"])
-        .output()?;
-    assert!(
-        output.status.success(),
-        "should be able to checkout gh-pages branch"
-    );
+    checkout_remote_branch(&verify_dir, "gh-pages")?;
 
     assert!(
         verify_dir.join("index.html").exists(),
@@ -459,22 +485,14 @@ fn e2e_local_git_bundle_copy_integrity() -> Result<()> {
 
     // Verify content integrity
     let start = tracker.start("verify_integrity", Some("Verify bundle content integrity"));
-    let verify_dir = temp_dir.path().join("verify");
-    clone_local_repo(&bare_repo, &verify_dir)?;
-
-    let _ = Command::new("git")
-        .current_dir(&verify_dir)
-        .args(["checkout", "gh-pages"])
-        .output()?;
-
     // Check content matches
-    let pushed_content = fs::read_to_string(verify_dir.join("test.txt"))?;
+    let pushed_content = read_git_blob(&bare_repo, "gh-pages", "test.txt")?;
     assert_eq!(
         pushed_content, test_content,
         "pushed content should match original"
     );
 
-    let pushed_nested = fs::read_to_string(verify_dir.join("nested/deep/file.json"))?;
+    let pushed_nested = read_git_blob(&bare_repo, "gh-pages", "nested/deep/file.json")?;
     assert_eq!(
         pushed_nested, r#"{"key": "value"}"#,
         "nested content should match"

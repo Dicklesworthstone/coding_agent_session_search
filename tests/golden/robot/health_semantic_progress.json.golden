@@ -13,7 +13,7 @@
     "fast_tier": {
       "present": true,
       "ready": true,
-      "current_db_matches": false,
+      "current_db_matches": null,
       "conversation_count": 12,
       "doc_count": 120,
       "embedder_id": "hash",
@@ -39,13 +39,13 @@
       "quality_tier_processed": 3,
       "quality_tier_remaining": 17,
       "pending_work": true,
-      "current_db_matches": false,
+      "current_db_matches": null,
       "computed_at": "[TIMESTAMP]"
     },
     "checkpoint": {
       "active": true,
       "tier": "quality",
-      "current_db_matches": false,
+      "current_db_matches": null,
       "completed": false,
       "conversations_processed": 3,
       "total_conversations": 20,

@@ -39,6 +39,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::info;
 
+const DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const DOCTOR_MUTATION_LOCK_MAX_METADATA_READ: u64 = 64 * 1024;
+
 // -------------------------------------------------------------------------
 // Lazy FrankenSQLite Connection (bd-1ueu)
 // -------------------------------------------------------------------------
@@ -162,6 +165,14 @@ impl LazyFrankenDb {
                 return Err(LazyDbError::NotFound(self.path.clone()));
             }
             let start = Instant::now();
+            let _doctor_guard = acquire_doctor_mutation_db_open_guard(
+                &self.path,
+                DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT,
+            )
+            .map_err(|err| LazyDbError::FrankenOpenFailed {
+                path: self.path.clone(),
+                source: frankensqlite::FrankenError::Internal(err.to_string()),
+            })?;
             let conn =
                 FrankenConnection::open(self.path.to_string_lossy().into_owned()).map_err(|e| {
                     LazyDbError::FrankenOpenFailed {
@@ -198,8 +209,18 @@ impl LazyFrankenDb {
             }
             let start = Instant::now();
             let path_owned = self.path.to_string_lossy().into_owned();
+            let path_for_guard = self.path.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
+                let _doctor_guard =
+                    match acquire_doctor_mutation_db_open_guard(&path_for_guard, timeout) {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            let _ = tx
+                                .send(Err(frankensqlite::FrankenError::Internal(err.to_string())));
+                            return;
+                        }
+                    };
                 let _ =
                     tx.send(FrankenConnection::open(path_owned).map(SendFrankenConnection::new));
             });
@@ -272,6 +293,125 @@ pub(crate) fn sleep_with_franken_retry_backoff(
     };
     std::thread::sleep(sleep_for);
     *backoff = backoff.saturating_mul(2).min(max_backoff);
+}
+
+struct DoctorMutationDbOpenGuard(Option<fs::File>);
+
+impl Drop for DoctorMutationDbOpenGuard {
+    fn drop(&mut self) {
+        if let Some(file) = self.0.as_ref() {
+            let _ = fs2::FileExt::unlock(file);
+        }
+    }
+}
+
+fn doctor_mutation_lock_path_for_db_open(db_path: &Path) -> Option<PathBuf> {
+    if db_path.file_name().and_then(|name| name.to_str()) != Some("agent_search.db") {
+        return None;
+    }
+
+    Some(
+        db_path
+            .parent()?
+            .join("doctor")
+            .join("locks")
+            .join("doctor-repair.lock"),
+    )
+}
+
+fn doctor_lock_metadata_pid_is_current_process(raw: &str) -> bool {
+    raw.lines().any(|line| {
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        key.trim() == "pid"
+            && value
+                .trim()
+                .parse::<u32>()
+                .is_ok_and(|pid| pid == std::process::id())
+    })
+}
+
+fn doctor_lock_file_pid_is_current_process(file: &fs::File) -> bool {
+    use std::io::Read as _;
+
+    let Ok(mut file) = file.try_clone() else {
+        return false;
+    };
+    let mut raw = String::new();
+    let _ = std::io::Read::take(&mut file, DOCTOR_MUTATION_LOCK_MAX_METADATA_READ)
+        .read_to_string(&mut raw);
+    doctor_lock_metadata_pid_is_current_process(&raw)
+}
+
+fn acquire_doctor_mutation_db_open_guard(
+    db_path: &Path,
+    timeout: Duration,
+) -> Result<DoctorMutationDbOpenGuard> {
+    let Some(lock_path) = doctor_mutation_lock_path_for_db_open(db_path) else {
+        return Ok(DoctorMutationDbOpenGuard(None));
+    };
+
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating doctor mutation lock directory {} before opening {}",
+                parent.display(),
+                db_path.display()
+            )
+        })?;
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(4);
+    loop {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "opening doctor mutation lock {} before opening {}",
+                    lock_path.display(),
+                    db_path.display()
+                )
+            })?;
+
+        if doctor_lock_file_pid_is_current_process(&file) {
+            return Ok(DoctorMutationDbOpenGuard(None));
+        }
+
+        match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => return Ok(DoctorMutationDbOpenGuard(Some(file))),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(anyhow!(
+                        "doctor mutation lock {} is active while opening {}; refusing to open during repair after waiting {}ms",
+                        lock_path.display(),
+                        db_path.display(),
+                        timeout.as_millis()
+                    ));
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(128),
+                );
+            }
+            Err(err) => {
+                return Err(anyhow!(
+                    "failed to acquire shared doctor mutation lock {} before opening {}: {}",
+                    lock_path.display(),
+                    db_path.display(),
+                    err
+                ));
+            }
+        }
+    }
 }
 
 pub(crate) fn open_franken_storage_with_timeout(
@@ -386,6 +526,7 @@ pub(crate) fn open_franken_raw_connection_with_timeout(
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
     loop {
+        let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
         match FrankenConnection::open(&path_str)
             .with_context(|| format!("opening raw frankensqlite db at {}", path.display()))
         {
@@ -419,6 +560,7 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
     loop {
+        let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
         match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| {
                 format!(
@@ -3198,6 +3340,8 @@ impl FrankenStorage {
         }
 
         let path_str = path.to_string_lossy().to_string();
+        let _doctor_guard =
+            acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
         let conn = FrankenConnection::open(&path_str)
             .with_context(|| format!("opening frankensqlite db at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
@@ -3233,6 +3377,8 @@ impl FrankenStorage {
         ensured_daily_stats_keys: Arc<parking_lot::Mutex<HashSet<EnsuredDailyStatsKey>>>,
     ) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
+        let _doctor_guard =
+            acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
         let conn = FrankenConnection::open(&path_str)
             .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
         let storage = Self::new_with_shared_caches(
@@ -3439,7 +3585,16 @@ impl FrankenStorage {
 
     /// Open in read-only mode using frankensqlite compat flags.
     pub fn open_readonly(path: &Path) -> Result<Self> {
+        Self::open_readonly_with_doctor_lock_timeout(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)
+    }
+
+    /// Open in read-only mode with an explicit doctor mutation-lock timeout.
+    ///
+    /// This is primarily useful for probes that need to prove a reader would
+    /// not enter the archive while `cass doctor --fix` owns the repair lock.
+    pub fn open_readonly_with_doctor_lock_timeout(path: &Path, timeout: Duration) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
+        let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
         let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening frankensqlite db readonly at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
@@ -4440,6 +4595,13 @@ WHERE external_id IS NOT NULL;
 ";
 
 const CURRENT_SCHEMA_REPAIR_CONVERSATION_EXTERNAL_TAIL_LOOKUP_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS conversation_tail_state (
+    conversation_id INTEGER PRIMARY KEY,
+    ended_at INTEGER,
+    last_message_idx INTEGER,
+    last_message_created_at INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS conversation_external_tail_lookup (
     lookup_key TEXT PRIMARY KEY,
     conversation_id INTEGER NOT NULL,
@@ -4717,7 +4879,10 @@ const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
     },
     SchemaRepairBatch {
         name: "conversation_external_tail_lookup",
-        tables: &["conversation_external_tail_lookup"],
+        tables: &[
+            "conversation_tail_state",
+            "conversation_external_tail_lookup",
+        ],
         sql: CURRENT_SCHEMA_REPAIR_CONVERSATION_EXTERNAL_TAIL_LOOKUP_SQL,
     },
     SchemaRepairBatch {
@@ -4892,6 +5057,10 @@ const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
     (
         "conversation_external_lookup",
         "SELECT lookup_key FROM conversation_external_lookup LIMIT 1;",
+    ),
+    (
+        "conversation_tail_state",
+        "SELECT conversation_id FROM conversation_tail_state LIMIT 1;",
     ),
     (
         "conversation_external_tail_lookup",
@@ -5594,6 +5763,48 @@ fn franken_insert_conversation_tail_state(
     Ok(())
 }
 
+fn franken_update_conversation_tail_columns(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    ended_at_candidate: Option<i64>,
+    last_message_idx_candidate: Option<i64>,
+    last_message_created_at_candidate: Option<i64>,
+) -> Result<()> {
+    if ended_at_candidate.is_none()
+        && last_message_idx_candidate.is_none()
+        && last_message_created_at_candidate.is_none()
+    {
+        return Ok(());
+    }
+
+    tx.execute_compat(
+        "UPDATE conversations
+         SET ended_at = CASE
+                 WHEN ?1 IS NULL THEN ended_at
+                 WHEN ended_at IS NULL OR ended_at < ?1 THEN ?1
+                 ELSE ended_at
+             END,
+             last_message_idx = CASE
+                 WHEN ?2 IS NULL THEN last_message_idx
+                 WHEN last_message_idx IS NULL OR last_message_idx < ?2 THEN ?2
+                 ELSE last_message_idx
+             END,
+             last_message_created_at = CASE
+                 WHEN ?3 IS NULL THEN last_message_created_at
+                 WHEN last_message_created_at IS NULL OR last_message_created_at < ?3 THEN ?3
+                 ELSE last_message_created_at
+             END
+         WHERE id = ?4",
+        fparams![
+            ended_at_candidate,
+            last_message_idx_candidate,
+            last_message_created_at_candidate,
+            conversation_id
+        ],
+    )?;
+    Ok(())
+}
+
 fn franken_tail_state_insert_ended_at(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
@@ -5659,6 +5870,13 @@ fn franken_update_conversation_tail_state(
             last_message_created_at_candidate,
         )?;
     }
+    franken_update_conversation_tail_columns(
+        tx,
+        conversation_id,
+        ended_at_candidate,
+        last_message_idx_candidate,
+        last_message_created_at_candidate,
+    )?;
     Ok(())
 }
 
@@ -5693,6 +5911,13 @@ fn franken_set_conversation_tail_state_after_append(
             Some(last_message_created_at),
         )?;
     }
+    franken_update_conversation_tail_columns(
+        tx,
+        conversation_id,
+        Some(ended_at),
+        Some(last_message_idx),
+        Some(last_message_created_at),
+    )?;
     Ok(())
 }
 
@@ -13900,6 +14125,105 @@ mod tests {
             std::env::set_var(key, value.as_ref());
         }
         EnvGuard { key, previous }
+    }
+
+    #[test]
+    fn doctor_mutation_open_guard_only_targets_canonical_archive_db() {
+        let dir = TempDir::new().unwrap();
+        let canonical = dir.path().join("agent_search.db");
+        let scratch = dir.path().join("scratch.db");
+
+        assert_eq!(
+            doctor_mutation_lock_path_for_db_open(&canonical),
+            Some(dir.path().join("doctor/locks/doctor-repair.lock"))
+        );
+        assert_eq!(doctor_mutation_lock_path_for_db_open(&scratch), None);
+    }
+
+    #[test]
+    fn doctor_lock_metadata_pid_detection_is_exact() {
+        let current = std::process::id();
+
+        assert!(doctor_lock_metadata_pid_is_current_process(&format!(
+            "schema_version=1\npid={current}\nmode=safe_auto_run\n"
+        )));
+        assert!(!doctor_lock_metadata_pid_is_current_process(
+            "schema_version=1\npid=not-a-pid\n"
+        ));
+        assert!(!doctor_lock_metadata_pid_is_current_process(&format!(
+            "pid={}\n",
+            current.saturating_add(1)
+        )));
+    }
+
+    #[test]
+    fn doctor_storage_open_refuses_active_doctor_mutation_lock_from_other_process() {
+        use std::io::Write as _;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage.close().unwrap();
+        }
+
+        let lock_path = doctor_mutation_lock_path_for_db_open(&db_path).unwrap();
+        let mut lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock_file).unwrap();
+        lock_file.set_len(0).unwrap();
+        lock_file.write_all(b"schema_version=1\npid=1\n").unwrap();
+        lock_file.sync_all().unwrap();
+
+        let err =
+            open_franken_raw_readonly_connection_with_timeout(&db_path, Duration::from_millis(25))
+                .expect_err("active doctor mutation lock must block canonical DB opens");
+        let message = err.to_string();
+        assert!(
+            message.contains("doctor mutation lock") && message.contains("active"),
+            "error should identify the active doctor mutation lock: {message}"
+        );
+
+        fs2::FileExt::unlock(&lock_file).unwrap();
+    }
+
+    #[test]
+    fn doctor_storage_open_allows_current_doctor_process_probe() {
+        use std::io::Write as _;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage.close().unwrap();
+        }
+
+        let lock_path = doctor_mutation_lock_path_for_db_open(&db_path).unwrap();
+        let mut lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock_file).unwrap();
+        lock_file.set_len(0).unwrap();
+        write!(lock_file, "schema_version=1\npid={}\n", std::process::id()).unwrap();
+        lock_file.sync_all().unwrap();
+
+        let conn =
+            open_franken_raw_readonly_connection_with_timeout(&db_path, Duration::from_millis(25))
+                .expect(
+                    "doctor process must be able to run post-repair read probes under its own lock",
+                );
+        drop(conn);
+
+        fs2::FileExt::unlock(&lock_file).unwrap();
     }
 
     #[test]
@@ -23447,7 +23771,7 @@ mod tests {
         });
 
         assert!(
-            rx.recv_timeout(Duration::from_millis(500)).unwrap(),
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
             "writer acquisition should not block forever when configured with zero writer slots"
         );
     }

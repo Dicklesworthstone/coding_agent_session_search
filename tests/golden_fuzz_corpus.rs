@@ -192,6 +192,18 @@ fn build_argv(input: ArgvInput) -> Vec<String> {
     argv
 }
 
+fn parse_cli_on_large_stack(argv: Vec<String>) -> bool {
+    let handle = std::thread::Builder::new()
+        .name("cass-fuzz-corpus-parse".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || parse_cli(argv).is_ok())
+        .expect("spawn large-stack parse thread");
+    match handle.join() {
+        Ok(parsed) => parsed,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
 fn contains_help_or_version(argv: &[String]) -> bool {
     argv.iter().any(|a| {
         let t = a.to_ascii_lowercase();
@@ -264,9 +276,10 @@ fn fuzz_corpus_replay_no_panics() {
         }
 
         replayed += 1;
-        match parse_cli(argv) {
-            Ok(_) => parse_ok += 1,
-            Err(_) => parse_err += 1,
+        if parse_cli_on_large_stack(argv) {
+            parse_ok += 1;
+        } else {
+            parse_err += 1;
         }
     }
 

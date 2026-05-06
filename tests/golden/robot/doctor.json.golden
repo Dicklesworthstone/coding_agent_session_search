@@ -210,8 +210,8 @@
     "measured_operation_count": 14,
     "slow_operation_count": 0,
     "default_threshold_ms": 500,
-    "slowest_operation": "semantic_probe",
-    "slowest_elapsed_ms": 1,
+    "slowest_operation": "[LIVE_OPERATION]",
+    "slowest_elapsed_ms": "[ELAPSED_MS]",
     "notes": [
       "Timing spans are advisory wall-clock measurements for the current doctor process.",
       "Health/status should consume cached summaries rather than rerunning expensive doctor collectors."
@@ -703,14 +703,29 @@
     }
   },
   "storage_pressure": {
-    "schema_version": 1,
+    "schema_version": 2,
     "status": "ok",
     "data_dir_exists": false,
     "probe_path": "[TEST_HOME]",
     "available_bytes": "[LIVE_BYTES]",
     "min_recommended_free_bytes": 1073741824,
+    "low_disk_risk": "none",
+    "total_accounted_bytes": 0,
+    "reclaimable_derived_bytes": 0,
+    "precious_evidence_bytes": 0,
+    "protected_non_reclaimable_bytes": 0,
+    "unknown_bytes": 0,
+    "reclaimable_bytes_by_class": {},
+    "precious_bytes_by_class": {},
+    "protected_bytes_by_class": {},
+    "bytes_by_class": {},
+    "safe_cleanup_scope": [],
+    "precious_evidence_classes": [],
+    "classification_warnings": [],
+    "recommended_action": "No immediate storage-pressure action is needed.",
     "notes": [
-      "Available space is above the doctor safety floor."
+      "Available space is above the doctor safety floor.",
+      "Storage inventory accounted for 0 bytes: 0 derived-reclaimable bytes and 0 precious evidence bytes."
     ]
   },
   "asset_taxonomy": [

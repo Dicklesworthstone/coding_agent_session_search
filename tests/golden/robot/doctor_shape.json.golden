@@ -932,6 +932,61 @@
         "min_recommended_free_bytes": {
           "type": "integer"
         },
+        "low_disk_risk": {
+          "type": "string"
+        },
+        "total_accounted_bytes": {
+          "type": "integer"
+        },
+        "reclaimable_derived_bytes": {
+          "type": "integer"
+        },
+        "precious_evidence_bytes": {
+          "type": "integer"
+        },
+        "protected_non_reclaimable_bytes": {
+          "type": "integer"
+        },
+        "unknown_bytes": {
+          "type": "integer"
+        },
+        "reclaimable_bytes_by_class": {
+          "type": "object",
+          "properties": {}
+        },
+        "precious_bytes_by_class": {
+          "type": "object",
+          "properties": {}
+        },
+        "protected_bytes_by_class": {
+          "type": "object",
+          "properties": {}
+        },
+        "bytes_by_class": {
+          "type": "object",
+          "properties": {}
+        },
+        "safe_cleanup_scope": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "precious_evidence_classes": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "classification_warnings": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "recommended_action": {
+          "type": "string"
+        },
         "notes": {
           "type": "array",
           "items": {

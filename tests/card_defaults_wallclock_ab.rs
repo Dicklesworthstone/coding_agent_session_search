@@ -88,10 +88,10 @@ impl Drop for EnvGuard {
 fn run_cell(label: &str, governor: &str, combine: &str, shadow: &str, corpus_size: usize) -> u128 {
     let tmp = TempDir::new().unwrap();
     let (data_dir, db_path) = create_corpus(&tmp, corpus_size);
-    let fake_home = tmp.path().join("home");
-    let fake_xdg = tmp.path().join("xdg");
-    fs::create_dir_all(&fake_home).unwrap();
-    fs::create_dir_all(&fake_xdg).unwrap();
+    let fixture_home = tmp.path().join("home");
+    let fixture_xdg = tmp.path().join("xdg");
+    fs::create_dir_all(&fixture_home).unwrap();
+    fs::create_dir_all(&fixture_xdg).unwrap();
 
     // Full rebuild path matches the original `bench_card_defaults_ab`
     // intent. The trailing FTS repair used to fail with "callback
@@ -124,8 +124,8 @@ fn run_cell(label: &str, governor: &str, combine: &str, shadow: &str, corpus_siz
         ("CASS_STREAMING_CONSUMER_COMBINE", combine),
         ("CASS_INDEXER_PARALLEL_WAL", shadow),
         ("CASS_IGNORE_SOURCES_CONFIG", "1"),
-        ("HOME", fake_home.to_str().unwrap()),
-        ("XDG_DATA_HOME", fake_xdg.to_str().unwrap()),
+        ("HOME", fixture_home.to_str().unwrap()),
+        ("XDG_DATA_HOME", fixture_xdg.to_str().unwrap()),
     ]);
 
     let t0 = Instant::now();

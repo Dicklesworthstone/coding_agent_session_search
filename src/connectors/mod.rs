@@ -114,11 +114,11 @@ fn codex_explicit_file_roots_for_root(
 
     let sessions = codex_sessions_dir(&root.path);
     if sessions == root.path
-        && !root
+        && root
             .path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name == "sessions")
+            .is_none_or(|name| name != "sessions")
     {
         return Err(io::Error::other(
             "roots without a sessions directory keep directory scan to preserve external IDs",

@@ -2713,18 +2713,15 @@ fn analytics_group_by_invalid_value_returns_actionable_error() {
     let mut cmd = simple_cmd();
     cmd.args(["analytics", "tokens", "--group-by", "fortnight", "--json"]);
     let output = cmd.assert().failure().get_output().clone();
-    // [coding_agent_session_search-hd89i] Post-fix, robot-mode (`--json`)
-    // envelopes — including the wrapped clap-error payload for invalid
-    // enum values — land on STDOUT to match the documented
-    // `stdout = data only` contract. Pre-hd89i this content lived on
-    // stderr.
-    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    // Robot-mode parse failures are diagnostics and belong on stderr; stdout
+    // remains data-only.
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
 
     assert!(
-        stdout.contains("possible values")
-            || stdout.contains("possible value")
-            || stdout.contains("invalid value"),
-        "invalid --group-by should report actionable enum guidance, stdout={stdout}"
+        stderr.contains("possible values")
+            || stderr.contains("possible value")
+            || stderr.contains("invalid value"),
+        "invalid --group-by should report actionable enum guidance, stderr={stderr}"
     );
 }
 
@@ -3180,19 +3177,17 @@ fn analytics_rebuild_json_envelope_structure() {
         assert!(data["tracks_rebuilt"].is_array());
         assert!(data["overall_elapsed_ms"].is_number());
     } else {
-        // In isolated env the DB does not exist — rebuild exits non-zero
-        // with a structured JSON envelope. [coding_agent_session_search-hd89i]
-        // Post-fix that envelope lands on STDOUT per the documented
-        // `stdout = data only` contract; pre-hd89i it lived on stderr.
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Robot-mode fatal diagnostics are emitted on stderr so stdout remains
+        // data-only.
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            !stdout.trim().is_empty(),
-            "analytics rebuild should emit an error envelope on stdout when DB is missing"
+            !stderr.trim().is_empty(),
+            "analytics rebuild should emit an error envelope on stderr when DB is missing"
         );
         // The envelope should mention the missing database.
         assert!(
-            stdout.contains("not found") || stdout.contains("missing") || stdout.contains("error"),
-            "rebuild error should describe the missing DB: {stdout}"
+            stderr.contains("not found") || stderr.contains("missing") || stderr.contains("error"),
+            "rebuild error should describe the missing DB: {stderr}"
         );
     }
 }

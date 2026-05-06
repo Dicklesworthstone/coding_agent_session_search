@@ -2757,6 +2757,10 @@
             "null"
           ]
         },
+        "failure_context": {
+          "type": "object",
+          "additionalProperties": true
+        },
         "operation_outcome": {
           "type": "object",
           "description": "Stable doctor operation outcome. Robots should branch on kind before consulting prose fields.",
@@ -14455,326 +14459,204 @@
     },
     "doctor-failure-context": {
       "type": "object",
-      "description": "Failure context artifact contract for blocked, refused, incomplete, or verification-failed doctor operations.",
+      "description": "Failure context artifact contract for blocked, refused, incomplete, or verification-failed doctor operations. This artifact is redacted by default and is safe to attach to support reports alongside manifest/commands/events artifacts.",
       "properties": {
         "schema_version": {
-          "type": "integer",
-          "description": "Doctor v2 response schema version. Version 2 is the first schema-first contract for typed agents."
+          "type": "integer"
         },
-        "surface": {
-          "type": "string",
-          "enum": [
-            "legacy-doctor",
-            "check",
-            "repair",
-            "cleanup",
-            "reconstruct",
-            "restore",
-            "baseline-diff",
-            "support-bundle",
-            "health-summary",
-            "status-summary",
-            "backups",
-            "archive-scan",
-            "archive-normalize",
-            "semantic-model-fallback",
-            "remote-source-sync-gaps",
-            "failure-context",
-            "error-envelope"
-          ]
-        },
-        "mode": {
-          "type": "string",
-          "enum": [
-            "read-only-check",
-            "repair-dry-run",
-            "fingerprint-apply",
-            "safe-auto-fix",
-            "cleanup-dry-run",
-            "cleanup-apply",
-            "reconstruct-dry-run",
-            "restore-rehearsal",
-            "support-bundle",
-            "baseline-diff",
-            "not-applicable"
-          ]
-        },
-        "status": {
-          "type": "string",
-          "enum": [
-            "ok",
-            "warn",
-            "planned",
-            "applied",
-            "partial",
-            "blocked",
-            "failed",
-            "skipped"
-          ]
-        },
-        "outcome_kind": {
-          "type": "string",
-          "enum": [
-            "no_op",
-            "planned",
-            "applied",
-            "partial",
-            "blocked",
-            "failed"
-          ]
-        },
-        "risk_level": {
-          "type": "string",
-          "enum": [
-            "none",
-            "low",
-            "medium",
-            "high",
-            "unknown"
-          ]
-        },
-        "asset_class": {
-          "type": "string",
-          "description": "Stable snake_case DoctorAssetClass such as canonical_archive_db, raw_mirror_blob, derived_lexical_index, support_bundle, or external_upstream_source."
-        },
-        "fallback_mode": {
-          "type": "string",
-          "enum": [
-            "none",
-            "lexical",
-            "semantic",
-            "hybrid",
-            "read-only",
-            "unavailable",
-            "not-applicable"
-          ]
-        },
-        "authority_status": {
-          "type": "string",
-          "enum": [
-            "read_only",
-            "selected",
-            "candidate_only",
-            "promotable",
-            "refused",
-            "unavailable",
-            "not_applicable"
-          ]
-        },
-        "coverage_delta": {
-          "type": "object",
-          "description": "Counts-only coverage delta. It never contains raw session text.",
-          "properties": {
-            "status": {
-              "type": "string",
-              "enum": [
-                "unchanged",
-                "improved",
-                "reduced",
-                "unknown"
-              ]
-            },
-            "archive_conversation_count": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "visible_source_conversation_count": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "raw_mirror_manifest_count": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "db_projection_only_count": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "missing_current_source_count": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "conversation_delta": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "message_delta": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "semantic_vector_delta": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "derived_asset_delta": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "status",
-            "archive_conversation_count",
-            "visible_source_conversation_count",
-            "raw_mirror_manifest_count",
-            "missing_current_source_count",
-            "conversation_delta",
-            "message_delta"
-          ]
-        },
-        "blocked_reasons": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Branchable machine codes; empty when the operation can proceed."
-        },
-        "plan_fingerprint": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "description": "Fingerprint that must be echoed back for mutating apply; null for read-only checks and summaries."
-        },
-        "receipt_path": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "description": "Path to the durable receipt when one is produced. Use redacted paths for export/support bundles."
-        },
-        "event_log_path": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "description": "Path to the operation event log. Progress/log details stay out of stdout and in this artifact."
-        },
-        "artifact_manifest_path": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "description": "Path to the manifest covering receipts, bundles, backups, or validation artifacts."
-        },
-        "recommended_action": {
-          "type": "string",
-          "description": "Single next command or operator action. Robots should not parse prose fields to infer this."
-        },
-        "redaction_status": {
-          "type": "string",
-          "enum": [
-            "redacted",
-            "not_applicable",
-            "contains_sensitive_paths",
-            "raw_content_included"
-          ]
-        },
-        "contract_provenance": {
-          "type": "string",
-          "enum": [
-            "runtime",
-            "contract-example",
-            "golden-fixture"
-          ]
-        },
-        "operation_outcome": {
-          "type": "object",
-          "description": "Stable doctor operation outcome. Robots should branch on kind before consulting prose fields.",
-          "properties": {
-            "kind": {
-              "type": "string",
-              "description": "Stable kebab-case outcome kind such as ok-no-action-needed, ok-read-only-diagnosed, fixed, partially-fixed, repair-blocked, repair-refused, repair-incomplete, verification-failed, cleanup-dry-run-only, cleanup-refused, auto-run-skipped, support-bundle-only, baseline-diff-only, or requires-manual-review."
-            },
-            "reason": {
-              "type": "string"
-            },
-            "action_taken": {
-              "type": "string"
-            },
-            "action_not_taken": {
-              "type": "string"
-            },
-            "safe_to_retry": {
-              "type": "boolean"
-            },
-            "requires_override": {
-              "type": "boolean"
-            },
-            "data_loss_risk": {
-              "type": "string",
-              "description": "none | low | medium | high | unknown"
-            },
-            "next_command": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "artifact_manifest_path": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "exit_code_kind": {
-              "type": "string",
-              "description": "success | health-failure | usage-error | lock-busy | repair-failure"
-            }
-          },
-          "required": [
-            "kind",
-            "reason",
-            "action_taken",
-            "action_not_taken",
-            "safe_to_retry",
-            "requires_override",
-            "data_loss_risk",
-            "next_command",
-            "artifact_manifest_path",
-            "exit_code_kind"
-          ]
-        },
-        "failure_context_path": {
+        "context_kind": {
           "type": [
             "string",
             "null"
           ]
         },
-        "repro_command": {
+        "scenario_id": {
           "type": [
             "string",
             "null"
           ]
         },
-        "last_successful_phase": {
+        "probe_run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation_id": {
           "type": [
             "string",
             "null"
           ]
         },
         "failed_phase": {
+          "type": "string"
+        },
+        "failed_check": {
+          "type": "string"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "failure_reason": {
           "type": [
             "string",
             "null"
           ]
+        },
+        "command": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "command_history": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "platform": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "fixture": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "artifacts": {
+          "type": "object",
+          "description": "Redacted paths to nearby debugging artifacts. These are manifest and log references, not raw session logs.",
+          "additionalProperties": true,
+          "properties": {
+            "artifact_manifest_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "commands_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "doctor_events_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "execution_flow_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "receipts_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "checksums_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stdout_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stderr_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "failure_context_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "failure_summary_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "parsed_json_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "event_log_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "repro": {
+          "type": "object",
+          "description": "Safe repro template. It must default to copied fixtures or redacted placeholders, not mutation of a live archive.",
+          "properties": {
+            "safety": {
+              "type": "string"
+            },
+            "mutates_live_archive": {
+              "type": "boolean"
+            },
+            "requires_explicit_live_archive": {
+              "type": "boolean"
+            },
+            "target": {
+              "type": "string"
+            },
+            "working_directory": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "command_json": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "shell_command": {
+              "type": "string"
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "safety",
+            "mutates_live_archive",
+            "requires_explicit_live_archive",
+            "target",
+            "command_json",
+            "shell_command"
+          ]
+        },
+        "recent_events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
         },
         "captured_logs": {
           "type": "array",
@@ -14783,74 +14665,157 @@
             "additionalProperties": true
           }
         },
-        "redaction_report": {
+        "probe": {
           "type": "object",
           "additionalProperties": true
+        },
+        "asset_class": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "authority_status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contract_provenance": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "blocked_reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "command_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "plan_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_authority": {
+          "type": [
+            "object",
+            "array",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "rejected_authorities": {
+          "type": [
+            "object",
+            "array",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "active_locks": {
+          "type": [
+            "object",
+            "array",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "coverage_summary": {
+          "type": [
+            "object",
+            "array",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "stdout_tail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stderr_tail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redaction_status": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
         "schema_version",
-        "surface",
-        "mode",
-        "status",
-        "outcome_kind",
-        "risk_level",
-        "asset_class",
-        "fallback_mode",
-        "authority_status",
-        "coverage_delta",
-        "blocked_reasons",
-        "plan_fingerprint",
-        "receipt_path",
-        "event_log_path",
-        "artifact_manifest_path",
-        "recommended_action",
-        "redaction_status",
-        "contract_provenance"
+        "failed_phase",
+        "failed_check",
+        "artifacts",
+        "repro"
       ],
       "examples": [
         {
-          "schema_version": 2,
-          "surface": "failure-context",
-          "mode": "not-applicable",
-          "status": "failed",
-          "outcome_kind": "failed",
-          "risk_level": "medium",
-          "asset_class": "operation_receipt",
-          "fallback_mode": "not-applicable",
-          "authority_status": "unavailable",
-          "coverage_delta": {
-            "status": "unchanged",
-            "archive_conversation_count": 42,
-            "visible_source_conversation_count": 41,
-            "raw_mirror_manifest_count": 42,
-            "db_projection_only_count": 0,
-            "missing_current_source_count": 1,
-            "conversation_delta": 0,
-            "message_delta": 0,
-            "semantic_vector_delta": null,
-            "derived_asset_delta": 0
-          },
-          "blocked_reasons": [],
-          "plan_fingerprint": null,
-          "receipt_path": null,
-          "event_log_path": "[DATA_DIR]/doctor/events/example.jsonl",
-          "artifact_manifest_path": "[DATA_DIR]/doctor/artifacts/example-manifest.json",
-          "recommended_action": "inspect failure_context_path and rerun cass doctor check --json",
-          "redaction_status": "redacted",
+          "schema_version": 1,
+          "context_kind": "cass_doctor_post_repair_probe_failure_context",
+          "operation_id": "doctor-post-repair-probe-example",
+          "failed_phase": "post_repair_probe",
+          "failed_check": "rollback-confirmed",
+          "failure_reason": "post-repair verification failed",
+          "asset_class": "derived_lexical_index",
+          "authority_status": "post_repair_verification_failed",
           "contract_provenance": "contract-example",
-          "operation_outcome": {
-            "kind": "repair-incomplete",
-            "reason": "example contract payload",
-            "action_taken": "example preserves failure context artifacts",
-            "action_not_taken": "doctor does not claim success without verification",
-            "safe_to_retry": false,
-            "requires_override": false,
-            "data_loss_risk": "medium",
-            "next_command": "inspect failure_context_path and rerun cass doctor check --json",
-            "artifact_manifest_path": "[DATA_DIR]/doctor/artifacts/example-manifest.json",
-            "exit_code_kind": "repair-failure"
-          }
+          "blocked_reasons": [
+            "blocks_promotion",
+            "blocks_cleanup"
+          ],
+          "artifacts": {
+            "artifact_manifest_path": "[cass-data]/doctor/post-repair-probes/example/manifest.json",
+            "failure_context_path": "[cass-data]/doctor/post-repair-probes/example/failure_context.json"
+          },
+          "captured_logs": [
+            {
+              "kind": "failure_reason",
+              "entries": [
+                "post-repair verification failed"
+              ]
+            }
+          ],
+          "repro": {
+            "safety": "read-only-redacted-template",
+            "mutates_live_archive": false,
+            "requires_explicit_live_archive": true,
+            "target": "[cass-data]",
+            "command_json": [
+              "cass",
+              "doctor",
+              "check",
+              "--json",
+              "--data-dir",
+              "[cass-data]"
+            ],
+            "shell_command": "cass doctor check --json --data-dir '[cass-data]'",
+            "notes": [
+              "Replace [cass-data] with a copied fixture or explicit test data directory."
+            ]
+          },
+          "recent_events": [],
+          "redaction_status": "redacted"
         }
       ]
     },
@@ -15173,6 +15138,100 @@
             "string",
             "null"
           ]
+        },
+        "repair_previously_failed": {
+          "type": "boolean"
+        },
+        "active_repair": {
+          "type": "object",
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "active_index_maintenance": {
+              "type": "boolean"
+            },
+            "repair_blocked_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "repair_recommended": {
+          "type": "boolean"
+        },
+        "repair_blocked_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "doctor_check_recommended": {
+          "type": "boolean"
+        },
+        "archive_coverage_state": {
+          "type": "string",
+          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+        },
+        "source_mirror_state": {
+          "type": "string",
+          "description": "Compact raw-mirror/source state derived from bounded evidence."
+        },
+        "sole_copy_conversation_count": {
+          "type": "integer"
+        },
+        "cleanup_reclaimable_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "quarantine_summary": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "coverage_source": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "confidence_tier": {
+              "type": "string"
+            },
+            "generated_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stale_after_seconds": {
+              "type": "integer"
+            },
+            "source_report_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "recommended_action": {
+              "type": "string"
+            }
+          }
+        },
+        "health_status": {
+          "type": "string"
+        },
+        "db_exists": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -22215,6 +22274,100 @@
             "string",
             "null"
           ]
+        },
+        "repair_previously_failed": {
+          "type": "boolean"
+        },
+        "active_repair": {
+          "type": "object",
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "active_index_maintenance": {
+              "type": "boolean"
+            },
+            "repair_blocked_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "repair_recommended": {
+          "type": "boolean"
+        },
+        "repair_blocked_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "doctor_check_recommended": {
+          "type": "boolean"
+        },
+        "archive_coverage_state": {
+          "type": "string",
+          "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+        },
+        "source_mirror_state": {
+          "type": "string",
+          "description": "Compact raw-mirror/source state derived from bounded evidence."
+        },
+        "sole_copy_conversation_count": {
+          "type": "integer"
+        },
+        "cleanup_reclaimable_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "quarantine_summary": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "coverage_source": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "confidence_tier": {
+              "type": "string"
+            },
+            "generated_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stale_after_seconds": {
+              "type": "integer"
+            },
+            "source_report_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "recommended_action": {
+              "type": "string"
+            }
+          }
+        },
+        "health_status": {
+          "type": "string"
+        },
+        "db_exists": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -23376,6 +23529,100 @@
                 "string",
                 "null"
               ]
+            },
+            "repair_previously_failed": {
+              "type": "boolean"
+            },
+            "active_repair": {
+              "type": "object",
+              "properties": {
+                "active": {
+                  "type": "boolean"
+                },
+                "active_index_maintenance": {
+                  "type": "boolean"
+                },
+                "repair_blocked_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "repair_recommended": {
+              "type": "boolean"
+            },
+            "repair_blocked_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "doctor_check_recommended": {
+              "type": "boolean"
+            },
+            "archive_coverage_state": {
+              "type": "string",
+              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+            },
+            "source_mirror_state": {
+              "type": "string",
+              "description": "Compact raw-mirror/source state derived from bounded evidence."
+            },
+            "sole_copy_conversation_count": {
+              "type": "integer"
+            },
+            "cleanup_reclaimable_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "quarantine_summary": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true
+            },
+            "coverage_source": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "confidence_tier": {
+                  "type": "string"
+                },
+                "generated_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "stale_after_seconds": {
+                  "type": "integer"
+                },
+                "source_report_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "recommended_action": {
+                  "type": "string"
+                }
+              }
+            },
+            "health_status": {
+              "type": "string"
+            },
+            "db_exists": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -27294,6 +27541,100 @@
                 "string",
                 "null"
               ]
+            },
+            "repair_previously_failed": {
+              "type": "boolean"
+            },
+            "active_repair": {
+              "type": "object",
+              "properties": {
+                "active": {
+                  "type": "boolean"
+                },
+                "active_index_maintenance": {
+                  "type": "boolean"
+                },
+                "repair_blocked_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "repair_recommended": {
+              "type": "boolean"
+            },
+            "repair_blocked_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "doctor_check_recommended": {
+              "type": "boolean"
+            },
+            "archive_coverage_state": {
+              "type": "string",
+              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+            },
+            "source_mirror_state": {
+              "type": "string",
+              "description": "Compact raw-mirror/source state derived from bounded evidence."
+            },
+            "sole_copy_conversation_count": {
+              "type": "integer"
+            },
+            "cleanup_reclaimable_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "quarantine_summary": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true
+            },
+            "coverage_source": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "confidence_tier": {
+                  "type": "string"
+                },
+                "generated_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "stale_after_seconds": {
+                  "type": "integer"
+                },
+                "source_report_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "recommended_action": {
+                  "type": "string"
+                }
+              }
+            },
+            "health_status": {
+              "type": "string"
+            },
+            "db_exists": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -28658,6 +28999,100 @@
                 "string",
                 "null"
               ]
+            },
+            "repair_previously_failed": {
+              "type": "boolean"
+            },
+            "active_repair": {
+              "type": "object",
+              "properties": {
+                "active": {
+                  "type": "boolean"
+                },
+                "active_index_maintenance": {
+                  "type": "boolean"
+                },
+                "repair_blocked_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "repair_recommended": {
+              "type": "boolean"
+            },
+            "repair_blocked_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "doctor_check_recommended": {
+              "type": "boolean"
+            },
+            "archive_coverage_state": {
+              "type": "string",
+              "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+            },
+            "source_mirror_state": {
+              "type": "string",
+              "description": "Compact raw-mirror/source state derived from bounded evidence."
+            },
+            "sole_copy_conversation_count": {
+              "type": "integer"
+            },
+            "cleanup_reclaimable_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "quarantine_summary": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true
+            },
+            "coverage_source": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "confidence_tier": {
+                  "type": "string"
+                },
+                "generated_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "stale_after_seconds": {
+                  "type": "integer"
+                },
+                "source_report_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "recommended_action": {
+                  "type": "string"
+                }
+              }
+            },
+            "health_status": {
+              "type": "string"
+            },
+            "db_exists": {
+              "type": "boolean"
             }
           },
           "required": [

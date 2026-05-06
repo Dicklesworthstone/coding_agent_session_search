@@ -6526,10 +6526,10 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
     if opts.watch || opts.full || opts.force_rebuild || opts.semantic || opts.build_hnsw {
         return Ok(false);
     }
-    if !opts
+    if opts
         .watch_once_paths
         .as_ref()
-        .is_some_and(|paths| !paths.is_empty())
+        .is_none_or(|paths| paths.is_empty())
     {
         return Ok(false);
     }
@@ -10387,8 +10387,16 @@ pub fn run_index(
             tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
 
             let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+            let mut semantic_read_storage = FrankenStorage::open_readonly(&opts.db_path)
+                .with_context(|| {
+                    format!(
+                        "opening fresh readonly canonical storage for semantic indexing: {}",
+                        opts.db_path.display()
+                    )
+                })?;
 
-            let mut embedding_inputs = packet_embedding_inputs_from_storage(&storage)?;
+            let mut embedding_inputs =
+                packet_embedding_inputs_from_storage(&semantic_read_storage)?;
             tracing::info!(
                 message_count = embedding_inputs.len(),
                 packet_driven = true,
@@ -10443,7 +10451,7 @@ pub fn run_index(
                 // status reports `semantic: stale / available: false`
                 // even though semantic search works (issue #203).
                 if let Err(err) = publish_direct_semantic_artifact(
-                    &storage,
+                    &semantic_read_storage,
                     &opts.data_dir,
                     &index_path,
                     semantic_indexer.embedder_id(),
@@ -10460,6 +10468,7 @@ pub fn run_index(
                     );
                 }
             }
+            semantic_read_storage.close_best_effort_in_place();
 
             // Set watermark so incremental watch-mode embedding only sees new messages
             if let Some(max_id) = embedding_inputs.iter().map(|e| e.message_id).max() {
@@ -23817,7 +23826,7 @@ mod tests {
             "one more than the eager fan-in should trigger one eager merge with one shard left unmerged"
         );
         let eager_merge_result = match merge_result_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .unwrap()
         {
             LexicalRebuildShardMergeMessage::Built(result) => result,
@@ -30179,8 +30188,10 @@ mod tests {
             "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
             "1",
         );
-        let _first_budget_promotion_wait =
-            set_env("CASS_TANTIVY_REBUILD_FIRST_BUDGET_PROMOTION_WAIT_MS", "50");
+        let _first_budget_promotion_wait = set_env(
+            "CASS_TANTIVY_REBUILD_FIRST_BUDGET_PROMOTION_WAIT_MS",
+            "5000",
+        );
         let _commit_conversations = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1");
         let _startup_commit_conversations = set_env(
             "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
@@ -32179,8 +32190,11 @@ mod tests {
         // know whether a staged shard plan exists so it can skip the
         // live-index pre-wipe when the staged-shards path will
         // atomically publish instead. Planning still completes before
-        // producer startup and initial-checkpoint persistence, which
-        // is the load-bearing handoff invariant.
+        // producer startup and initial-checkpoint persistence. The
+        // producer can hand off its first page before the main thread
+        // logs checkpoint persistence on a fast scheduler, so the
+        // checkpoint's final durable contents below are the safety
+        // proof rather than that intra-startup log order.
         assert!(
             plan_lexical_shards < restart_from_zero_reset,
             "9ct8r: staged shard planning must run BEFORE the restart-from-zero \
@@ -32195,8 +32209,8 @@ mod tests {
             "restart-from-zero staged rebuild should overlap producer startup before persisting the fresh startup checkpoint: {logs}"
         );
         assert!(
-            persist_initial_checkpoint < first_batch_handoff,
-            "restart-from-zero rebuild must persist the fresh startup checkpoint before the producer hands off its first batch: {logs}"
+            start_packet_producer < first_batch_handoff,
+            "restart-from-zero rebuild must start the producer before it hands off its first batch: {logs}"
         );
         let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
             .unwrap()

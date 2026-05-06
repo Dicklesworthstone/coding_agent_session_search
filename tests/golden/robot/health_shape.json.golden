@@ -23,7 +23,7 @@
       }
     },
     "latency_ms": {
-      "type": "integer"
+      "type": "string"
     },
     "rebuild_progress": {
       "type": "object",
@@ -112,6 +112,223 @@
           "type": "boolean"
         },
         "open_skipped": {
+          "type": "boolean"
+        }
+      }
+    },
+    "doctor_summary": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "surface": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "outcome_kind": {
+          "type": "string"
+        },
+        "health_class": {
+          "type": "string"
+        },
+        "risk_level": {
+          "type": "string"
+        },
+        "asset_class": {
+          "type": "string"
+        },
+        "fallback_mode": {
+          "type": "string"
+        },
+        "authority_status": {
+          "type": "string"
+        },
+        "coverage_delta": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "archive_conversation_count": {
+              "type": "null"
+            },
+            "visible_source_conversation_count": {
+              "type": "null"
+            },
+            "raw_mirror_manifest_count": {
+              "type": "null"
+            },
+            "db_projection_only_count": {
+              "type": "null"
+            },
+            "missing_current_source_count": {
+              "type": "null"
+            },
+            "conversation_delta": {
+              "type": "null"
+            },
+            "message_delta": {
+              "type": "null"
+            },
+            "semantic_vector_delta": {
+              "type": "null"
+            },
+            "derived_asset_delta": {
+              "type": "null"
+            }
+          }
+        },
+        "blocked_reasons": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "plan_fingerprint": {
+          "type": "null"
+        },
+        "receipt_path": {
+          "type": "null"
+        },
+        "event_log_path": {
+          "type": "null"
+        },
+        "artifact_manifest_path": {
+          "type": "null"
+        },
+        "recommended_action": {
+          "type": "string"
+        },
+        "redaction_status": {
+          "type": "string"
+        },
+        "contract_provenance": {
+          "type": "string"
+        },
+        "operation_outcome": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "action_taken": {
+              "type": "string"
+            },
+            "action_not_taken": {
+              "type": "string"
+            },
+            "safe_to_retry": {
+              "type": "boolean"
+            },
+            "requires_override": {
+              "type": "boolean"
+            },
+            "data_loss_risk": {
+              "type": "string"
+            },
+            "next_command": {
+              "type": "string"
+            },
+            "artifact_manifest_path": {
+              "type": "null"
+            },
+            "exit_code_kind": {
+              "type": "string"
+            }
+          }
+        },
+        "doctor_available": {
+          "type": "boolean"
+        },
+        "safe_auto_run_eligible": {
+          "type": "boolean"
+        },
+        "last_receipt_path": {
+          "type": "null"
+        },
+        "failure_marker_path": {
+          "type": "null"
+        },
+        "repair_previously_failed": {
+          "type": "boolean"
+        },
+        "active_repair": {
+          "type": "object",
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "active_index_maintenance": {
+              "type": "boolean"
+            },
+            "repair_blocked_reason": {
+              "type": "null"
+            }
+          }
+        },
+        "repair_recommended": {
+          "type": "boolean"
+        },
+        "repair_blocked_reason": {
+          "type": "null"
+        },
+        "doctor_check_recommended": {
+          "type": "boolean"
+        },
+        "archive_coverage_state": {
+          "type": "string"
+        },
+        "source_mirror_state": {
+          "type": "string"
+        },
+        "sole_copy_conversation_count": {
+          "type": "integer"
+        },
+        "cleanup_reclaimable_bytes": {
+          "type": "null"
+        },
+        "quarantine_summary": {
+          "type": "null"
+        },
+        "coverage_source": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "confidence_tier": {
+              "type": "string"
+            },
+            "generated_at": {
+              "type": "string"
+            },
+            "stale_after_seconds": {
+              "type": "integer"
+            },
+            "source_report_id": {
+              "type": "null"
+            },
+            "recommended_action": {
+              "type": "string"
+            }
+          }
+        },
+        "health_status": {
+          "type": "string"
+        },
+        "db_exists": {
           "type": "boolean"
         }
       }
@@ -239,19 +456,19 @@
           "type": "object",
           "properties": {
             "available_parallelism": {
-              "type": "integer"
+              "type": "string"
             },
             "reserved_cores": {
-              "type": "integer"
+              "type": "string"
             },
             "max_workers": {
-              "type": "integer"
+              "type": "string"
             },
             "effective_worker_ceiling": {
-              "type": "integer"
+              "type": "string"
             },
             "max_inflight_bytes": {
-              "type": "integer"
+              "type": "string"
             },
             "min_inflight_bytes": {
               "type": "integer"
@@ -259,7 +476,7 @@
           }
         },
         "healthy_streak": {
-          "type": "integer"
+          "type": "string"
         },
         "shrink_count": {
           "type": "integer"
@@ -268,21 +485,13 @@
           "type": "integer"
         },
         "ticks_total": {
-          "type": "integer"
+          "type": "string"
         },
         "disabled_via_env": {
           "type": "boolean"
         },
         "last_snapshot": {
-          "type": "object",
-          "properties": {
-            "load_per_core": {
-              "type": "number"
-            },
-            "psi_cpu_some_avg10": {
-              "type": "number"
-            }
-          }
+          "type": "string"
         },
         "last_reason": {
           "type": "string"
@@ -300,10 +509,10 @@
               "type": "string"
             },
             "load_window_len": {
-              "type": "integer"
+              "type": "string"
             },
             "psi_window_len": {
-              "type": "integer"
+              "type": "string"
             },
             "conformal_k": {
               "type": "integer"
@@ -324,7 +533,7 @@
               "type": "integer"
             },
             "observations_total": {
-              "type": "integer"
+              "type": "string"
             },
             "load_pressured_q": {
               "type": "null"
@@ -443,7 +652,7 @@
               "type": "null"
             },
             "age_seconds": {
-              "type": "null"
+              "type": "string"
             },
             "stale": {
               "type": "boolean"
@@ -588,22 +797,22 @@
               "type": "object",
               "properties": {
                 "workers": {
-                  "type": "integer"
+                  "type": "string"
                 },
                 "available_parallelism": {
-                  "type": "integer"
+                  "type": "string"
                 },
                 "reserved_cores": {
-                  "type": "integer"
+                  "type": "string"
                 },
                 "tantivy_writer_threads": {
-                  "type": "integer"
+                  "type": "string"
                 },
                 "staged_shard_builders": {
-                  "type": "integer"
+                  "type": "string"
                 },
                 "staged_merge_workers": {
-                  "type": "integer"
+                  "type": "string"
                 },
                 "controller_mode": {
                   "type": "string"
@@ -615,10 +824,10 @@
                   "type": "integer"
                 },
                 "pipeline_max_message_bytes_in_flight": {
-                  "type": "integer"
+                  "type": "string"
                 },
                 "page_prep_workers": {
-                  "type": "integer"
+                  "type": "string"
                 },
                 "page_size": {
                   "type": "integer"

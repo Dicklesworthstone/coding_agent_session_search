@@ -117,6 +117,7 @@ pub enum DoctorFixtureScenario {
     SourceTruncated,
     MirrorMissing,
     DbCorrupt,
+    DbCorruptWithStaleIndex,
     IndexCorrupt,
     StaleLock,
     ActiveLock,
@@ -529,6 +530,19 @@ impl DoctorFixtureFactory {
                     .expected_anomalies
                     .push_unique("archive-db-corrupt");
             }
+            DoctorFixtureScenario::DbCorruptWithStaleIndex => {
+                self.apply_scenario(DoctorFixtureScenario::DbCorrupt);
+                let index_path =
+                    coding_agent_search::search::tantivy::expected_index_dir(&self.data_dir);
+                self.write_confined_file(
+                    &index_path.join("stale-derived-segment.fixture"),
+                    b"stale derived lexical fixture",
+                    "derived_lexical_stale_fixture",
+                );
+                self.manifest
+                    .expected_anomalies
+                    .push_unique("derived-lexical-stale");
+            }
             DoctorFixtureScenario::IndexCorrupt => {
                 self.set_contract(
                     "derived-asset-risk",
@@ -645,9 +659,21 @@ impl DoctorFixtureFactory {
             }
             DoctorFixtureScenario::BackupExclusion => {
                 self.set_contract("archive-preservation-risk", "read-only", "warn-only");
+                fs::create_dir_all(self.root().join(".git")).expect("create fixture repo marker");
+                let repo_gitignore = self.root().join(".gitignore");
+                self.write_confined_file(
+                    &repo_gitignore,
+                    b"cass-data/raw-mirror/**\n",
+                    "repo_gitignore_exclusion",
+                );
+                self.write_marker(".rsync-filter", b"- backups/**\n- doctor/receipts/**\n");
+                self.write_marker(
+                    "config.toml",
+                    b"backup_exclude = [\"doctor/support-bundles/**\"]\n",
+                );
                 self.write_marker(
                     "backup-policy/exclusion-risk.fixture",
-                    b"raw-mirror excluded by test policy\n",
+                    b"fixture creates real .gitignore, .rsync-filter, and config.toml exclusion evidence\n",
                 );
                 self.manifest
                     .expected_anomalies
@@ -1295,12 +1321,14 @@ pub fn default_expected_artifact_keys() -> Vec<String> {
         "stderr_doctor_json".to_string(),
         "parsed_json_doctor_json".to_string(),
         "candidate_staging".to_string(),
+        "post_repair_probes".to_string(),
         "file_tree_before".to_string(),
         "file_tree_after".to_string(),
         "checksums".to_string(),
         "timing".to_string(),
         "receipts".to_string(),
         "doctor_logs".to_string(),
+        "redaction_report".to_string(),
     ]
 }
 

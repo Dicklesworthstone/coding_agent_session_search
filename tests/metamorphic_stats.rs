@@ -229,10 +229,15 @@ fn mr_stats_empty_data_dir_produces_zero_counters_or_structured_error() {
 
     if !output.status.success() {
         // Acceptable: empty data dir errors out with the missing-db
-        // envelope (the q931h-pinned shape). Verify the envelope is
-        // structured JSON on STDOUT (per hd89i contract).
-        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .expect("error envelope MUST still be valid JSON on stdout (per hd89i)");
+        // envelope (the q931h-pinned shape). Fatal robot-mode error
+        // envelopes are emitted on stderr so stdout remains data-only.
+        let envelope = if output.stdout.is_empty() {
+            &output.stderr
+        } else {
+            &output.stdout
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_slice(envelope).expect("error envelope MUST still be valid JSON");
         assert!(
             parsed.get("error").is_some(),
             "non-success stats output MUST emit a structured error envelope; got: {parsed:#}"

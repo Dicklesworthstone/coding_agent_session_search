@@ -23,7 +23,7 @@ use coding_agent_search::search::semantic_manifest::{
 };
 use coding_agent_search::search::tantivy::{expected_index_dir, index_dir};
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -53,6 +53,25 @@ fn isolated_health_json(test_home: Arc<tempfile::TempDir>) -> String {
 /// Scrub dynamic values. Mirrors the union of scrubs used by
 /// tests/golden_robot_json.rs::scrub_robot_json. Kept local so this test
 /// file is independent of the robot-json file's private helpers.
+fn sort_example_paths(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(paths)) = map.get_mut("example_paths") {
+                paths.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+            }
+            for child in map.values_mut() {
+                sort_example_paths(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                sort_example_paths(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn scrub(input: &str, test_home: &Path) -> String {
     let mut out = input.to_string();
     let crate_version_re = regex::Regex::new(r#""crate_version"\s*:\s*"[^"]*""#).unwrap();
@@ -71,9 +90,19 @@ fn scrub(input: &str, test_home: &Path) -> String {
         regex::Regex::new(r#"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"#)
             .unwrap();
     out = uuid_re.replace_all(&out, "[UUID]").to_string();
-    let latency_re = regex::Regex::new(r#""latency_ms"\s*:\s*\d+"#).unwrap();
-    out = latency_re
-        .replace_all(&out, r#""latency_ms": "[LATENCY_MS]""#)
+    for (key, replacement) in [
+        ("latency_ms", "[LATENCY_MS]"),
+        ("elapsed_ms", "[ELAPSED_MS]"),
+        ("slowest_elapsed_ms", "[ELAPSED_MS]"),
+    ] {
+        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*\d+"#)).unwrap();
+        out = re
+            .replace_all(&out, format!(r#""{key}": "{replacement}""#).as_str())
+            .to_string();
+    }
+    let slowest_operation_re = regex::Regex::new(r#""slowest_operation"\s*:\s*"[^"]*""#).unwrap();
+    out = slowest_operation_re
+        .replace_all(&out, r#""slowest_operation": "[LIVE_OPERATION]""#)
         .to_string();
     for key in ["load_per_core", "psi_cpu_some_avg10"] {
         let re = regex::Regex::new(&format!(
@@ -83,6 +112,75 @@ fn scrub(input: &str, test_home: &Path) -> String {
         out = re
             .replace_all(&out, format!(r#""{key}": "[LIVE_METRIC]""#).as_str())
             .to_string();
+    }
+    for key in [
+        "healthy_streak",
+        "ticks_total",
+        "load_window_len",
+        "psi_window_len",
+        "observations_total",
+    ] {
+        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*\d+"#)).unwrap();
+        out = re
+            .replace_all(&out, format!(r#""{key}": "[LIVE_COUNTER]""#).as_str())
+            .to_string();
+    }
+    let last_snapshot_obj_re = regex::Regex::new(r#"(?s)"last_snapshot"\s*:\s*\{[^}]*\}"#).unwrap();
+    out = last_snapshot_obj_re
+        .replace_all(&out, r#""last_snapshot": "[LIVE_SAMPLE]""#)
+        .to_string();
+    let last_snapshot_null_re = regex::Regex::new(r#""last_snapshot"\s*:\s*null"#).unwrap();
+    out = last_snapshot_null_re
+        .replace_all(&out, r#""last_snapshot": "[LIVE_SAMPLE]""#)
+        .to_string();
+    let last_reason_re = regex::Regex::new(r#""last_reason"\s*:\s*(null|"[^"]*")"#).unwrap();
+    out = last_reason_re
+        .replace_all(&out, r#""last_reason": "[LIVE_SAMPLE]""#)
+        .to_string();
+    for key in [
+        "available_parallelism",
+        "reserved_cores",
+        "max_workers",
+        "effective_worker_ceiling",
+        "workers",
+        "tantivy_writer_threads",
+        "shard_builders",
+        "merge_workers",
+        "staged_shard_builders",
+        "staged_merge_workers",
+        "page_prep_workers",
+    ] {
+        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*("?\d+"?)"#)).unwrap();
+        out = re
+            .replace_all(&out, format!(r#""{key}": "[LIVE_COUNTER]""#).as_str())
+            .to_string();
+    }
+    for key in [
+        "memory_available_bytes",
+        "memory_total_bytes",
+        "cache_cap_bytes",
+        "available_bytes",
+        "max_inflight_bytes",
+        "pipeline_max_message_bytes_in_flight",
+    ] {
+        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*("?\d+"?)"#)).unwrap();
+        out = re
+            .replace_all(&out, format!(r#""{key}": "[LIVE_BYTES]""#).as_str())
+            .to_string();
+    }
+    let age_seconds_re = regex::Regex::new(r#""age_seconds"\s*:\s*(\d+|null)"#).unwrap();
+    out = age_seconds_re
+        .replace_all(&out, r#""age_seconds": "[AGE_SECONDS]""#)
+        .to_string();
+    let last_read_re = regex::Regex::new(r#""last_read_at_ms"\s*:\s*(\d+|null)"#).unwrap();
+    out = last_read_re
+        .replace_all(&out, r#""last_read_at_ms": "[LAST_READ_MS]""#)
+        .to_string();
+    if let Ok(mut parsed) = serde_json::from_str::<Value>(&out) {
+        sort_example_paths(&mut parsed);
+        if let Ok(canonical) = serde_json::to_string_pretty(&parsed) {
+            out = canonical;
+        }
     }
     out
 }

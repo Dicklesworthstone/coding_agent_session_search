@@ -490,14 +490,15 @@ fn cline_sets_external_id_from_directory() {
     assert_eq!(convs[0].external_id, Some("unique-task-123".to_string()));
 }
 
-/// Test source_path is the task directory
+/// Test source_path is the selected source file
 #[test]
-fn cline_sets_source_path_to_task_dir() {
+fn cline_sets_source_path_to_selected_file() {
     let dir = TempDir::new().unwrap();
     let task = create_task_dir(dir.path(), "task-path");
 
     let msgs = serde_json::json!([{"role": "user", "content": "Test", "timestamp": 1000}]);
-    fs::write(task.join("ui_messages.json"), msgs.to_string()).unwrap();
+    let ui_messages = task.join("ui_messages.json");
+    fs::write(&ui_messages, msgs.to_string()).unwrap();
 
     let conn = ClineConnector::new();
     let ctx = ScanContext {
@@ -507,7 +508,7 @@ fn cline_sets_source_path_to_task_dir() {
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
-    assert_eq!(convs[0].source_path, task);
+    assert_eq!(convs[0].source_path, ui_messages);
 }
 
 /// Test empty directory returns no conversations

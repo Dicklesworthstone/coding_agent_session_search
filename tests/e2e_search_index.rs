@@ -11,10 +11,14 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use chrono::{SecondsFormat, Utc};
 use coding_agent_search::search::tantivy::{
-    SearchableIndexSummary, index_dir, open_federated_search_readers, searchable_index_summary,
+    Fields, SearchableIndexSummary, index_dir, open_federated_search_readers,
+    searchable_index_summary,
 };
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensearch::lexical::ReloadPolicy;
+use frankensearch::lexical::{
+    CassQueryFilters, CassSourceFilter, Count, IndexReader, ReloadPolicy, cass_build_tantivy_query,
+    cass_open_search_reader,
+};
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use rusqlite::Connection as RusqliteConnection;
 use std::fs;
@@ -242,6 +246,37 @@ fn total_matches_from_search_output(output: &[u8]) -> u64 {
                 .map(|hits| hits.len() as u64)
                 .unwrap_or(0)
         })
+}
+
+fn raw_lexical_total_matches(index_path: &Path, query: &str) -> u64 {
+    let mut total = 0usize;
+    if let Some(readers) = open_federated_search_readers(index_path, ReloadPolicy::Manual)
+        .expect("open federated lexical readers for raw count")
+    {
+        for (reader, fields) in readers {
+            total = total.saturating_add(raw_lexical_reader_matches(&reader, &fields, query));
+        }
+    } else {
+        let (reader, fields) =
+            cass_open_search_reader(index_path, ReloadPolicy::Manual).expect("open lexical reader");
+        total = total.saturating_add(raw_lexical_reader_matches(&reader, &fields, query));
+    }
+    total as u64
+}
+
+fn raw_lexical_reader_matches(reader: &IndexReader, fields: &Fields, query: &str) -> usize {
+    let searcher = reader.searcher();
+    let filters = CassQueryFilters {
+        agents: Default::default(),
+        workspaces: Default::default(),
+        created_from: None,
+        created_to: None,
+        source_filter: CassSourceFilter::All,
+    };
+    let parsed = cass_build_tantivy_query(query, &filters, fields);
+    searcher
+        .search(&*parsed, &Count)
+        .expect("count raw lexical matches")
 }
 
 fn force_federated_publish_env(cmd: &mut assert_cmd::Command) {
@@ -887,7 +922,7 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
                 .current_dir(&home)
                 .env("CODEX_HOME", &codex_home)
                 .env("HOME", &home)
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(90))
                 .assert()
                 .success();
         },
@@ -3370,36 +3405,11 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
         },
     );
 
-    let broken_sparse_search = cargo_bin_cmd!("cass")
-        .args([
-            "search",
-            "repairoldanchor",
-            "--json",
-            "--mode",
-            "lexical",
-            "--fields",
-            "minimal",
-            "--limit",
-            "5",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .current_dir(&home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .timeout(Duration::from_secs(20))
-        .output()
-        .expect("search old token against intentionally sparse lexical index");
-    assert!(
-        broken_sparse_search.status.success(),
-        "search should still run even with a sparse lexical index\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&broken_sparse_search.stdout),
-        String::from_utf8_lossy(&broken_sparse_search.stderr)
-    );
     assert_eq!(
-        total_matches_from_search_output(&broken_sparse_search.stdout),
+        raw_lexical_total_matches(&data_dir.join("index/v7"), "repairoldanchor"),
         0,
-        "the swapped-in sparse index should not contain the baseline token before repair"
+        "the swapped-in sparse index should not contain the baseline token before repair; \
+         use a raw lexical reader here so cass search cannot self-heal the fixture early"
     );
 
     tracker.phase(

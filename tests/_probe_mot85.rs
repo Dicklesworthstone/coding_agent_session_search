@@ -31,7 +31,7 @@ fn probe_mot85_fsqlite_writable_schema_writes() {
     eprintln!("[mot85-probe] writable_schema=ON result: {pragma:?}");
     let insert = conn.execute(
         "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql) \
-         VALUES('table', 'fake_tbl', 'fake_tbl', 0, 'CREATE TABLE fake_tbl(x)')",
+         VALUES('table', 'fixture_tbl', 'fixture_tbl', 0, 'CREATE TABLE fixture_tbl(x)')",
     );
     eprintln!("[mot85-probe] INSERT sqlite_master result: {insert:?}");
     assert!(

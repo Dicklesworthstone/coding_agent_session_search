@@ -8,6 +8,8 @@ guide:
   Doctor outcomes: branch on doctor.operation_outcome.kind (kebab-case) before prose; exit_code_kind says whether the outcome is success, health-failure, usage-error, lock-busy, or repair-failure.
   Doctor v2 schemas: use introspect.response_schemas doctor-* keys. First branch on err.kind/status/operation_outcome.kind/outcome_kind/asset_class/risk_level/fallback_mode; never scrape diagnostic prose.
   Doctor repairs: start with `cass doctor check --json`; use repair dry-run fingerprints for apply; support bundles and failure contexts report artifact_manifest_path/event_log_path instead of putting logs in stdout.
+  Doctor validation: use `scripts/e2e/doctor_v2.sh list|describe|run --json`; `--artifact-dir` creates a fresh run child, and run-summary.json lists scenario ids, labels, mutation class, log paths, failure_context path, and rerun command.
+  Doctor failure reports: attach the redacted failure_context.json plus manifest/commands/events artifacts; do not attach raw session logs, exact source paths, or live archive copies by default.
   Args: accepts --robot-docs=topic and misplaced globals; detailed errors with examples on parse failure
   Source control: use `cass robot-docs sources` for remote sync/setup plus persistent agent-harness exclusions
   TUI drill-in contract: Enter on selected hit opens detail modal (Messages tab); Enter with no selected hit falls back to query submit behavior

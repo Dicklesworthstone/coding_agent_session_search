@@ -948,7 +948,7 @@ fn materialize_federated_search_bundle_for_write(index_path: &Path) -> Result<()
         .map(|shard| index_path.join(&shard.relative_path))
         .collect::<Vec<_>>();
 
-    TantivyIndex::assemble_compatible_index_directories(&materialized_index_path, &shard_paths)
+    TantivyIndex::assemble_compatible_index_directory_files(&materialized_index_path, &shard_paths)
         .with_context(|| {
             format!(
                 "materializing federated lexical bundle into mutable Tantivy index {}",
@@ -1239,6 +1239,14 @@ impl TantivyIndex {
         output_path: &Path,
         input_paths: &[P],
     ) -> Result<Self> {
+        Self::assemble_compatible_index_directory_files(output_path, input_paths)?;
+        Self::open_or_create(output_path)
+    }
+
+    fn assemble_compatible_index_directory_files<P: AsRef<Path>>(
+        output_path: &Path,
+        input_paths: &[P],
+    ) -> Result<()> {
         if input_paths.is_empty() {
             return Err(anyhow::anyhow!(
                 "cannot assemble Tantivy index directories without at least one input"
@@ -1326,7 +1334,7 @@ impl TantivyIndex {
             &combined_index_meta,
             &mut managed_paths,
         )?;
-        Self::open_or_create(output_path)
+        Ok(())
     }
 
     pub fn add_messages(

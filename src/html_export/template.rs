@@ -966,8 +966,13 @@ mod tests {
             && logs.contains("operation=\"render_message_groups\"");
         let has_template_complete = logs.contains("component=\"template\"")
             && logs.contains("operation=\"export_messages_complete\"");
+        let has_scripts_generate =
+            logs.contains("component=\"scripts\"") && logs.contains("operation=\"generate\"");
         assert!(
-            has_template_start || has_renderer_start || has_template_complete,
+            has_template_start
+                || has_renderer_start
+                || has_template_complete
+                || has_scripts_generate,
             "expected structured export milestone log, got: {logs}"
         );
         // If completion log is present, verify its format

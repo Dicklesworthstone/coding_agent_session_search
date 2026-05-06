@@ -14,9 +14,12 @@ use coding_agent_search::storage::sqlite::SqliteStorage;
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 
 mod util;
 use util::EnvGuard;
+
+static STREAMING_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Helper to create Codex session with modern envelope format.
 fn make_codex_session(root: &Path, date_path: &str, filename: &str, content: &str, ts: u64) {
@@ -67,6 +70,7 @@ fn count_conversations(db_path: &Path) -> i64 {
 
 #[test]
 fn test_streaming_enabled_when_var_set_to_1() {
+    let _env_lock = STREAMING_ENV_LOCK.lock().unwrap();
     // Explicitly setting to "1" enables streaming
     let _guard = EnvGuard::set("CASS_STREAMING_INDEX", "1");
     assert!(
@@ -77,6 +81,7 @@ fn test_streaming_enabled_when_var_set_to_1() {
 
 #[test]
 fn test_streaming_disabled_via_env_var() {
+    let _env_lock = STREAMING_ENV_LOCK.lock().unwrap();
     // Setting to "0" disables streaming
     let _guard = EnvGuard::set("CASS_STREAMING_INDEX", "0");
     assert!(
@@ -87,6 +92,7 @@ fn test_streaming_disabled_via_env_var() {
 
 #[test]
 fn test_streaming_enabled_with_non_zero_value() {
+    let _env_lock = STREAMING_ENV_LOCK.lock().unwrap();
     // Any value other than "0" enables streaming
     let _guard = EnvGuard::set("CASS_STREAMING_INDEX", "yes");
     assert!(

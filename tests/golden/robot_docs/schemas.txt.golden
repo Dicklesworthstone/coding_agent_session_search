@@ -216,6 +216,7 @@ schemas: (auto-generated from contract)
       - path: ?
       - status: string
     - explanation: ?
+    - failure_context: object
     - failure_marker_path: ?
     - failure_marker_write_error: ?
     - failures: integer
@@ -1286,56 +1287,69 @@ schemas: (auto-generated from contract)
       - risk_level: string
       - surface: string
   doctor-failure-context:
-    - artifact_manifest_path: ?
-    - asset_class: string
-    - authority_status: string
+    - active_locks: ?
+    - artifacts: object
+      - artifact_manifest_path: ?
+      - checksums_path: ?
+      - commands_path: ?
+      - doctor_events_path: ?
+      - event_log_path: ?
+      - execution_flow_path: ?
+      - failure_context_path: ?
+      - failure_summary_path: ?
+      - parsed_json_path: ?
+      - receipts_path: ?
+      - stderr_path: ?
+      - stdout_path: ?
+    - asset_class: ?
+    - authority_status: ?
     - blocked_reasons: array
     - captured_logs: array
-    - contract_provenance: string
-    - coverage_delta: object
-      - archive_conversation_count: ?
-      - conversation_delta: ?
-      - db_projection_only_count: ?
-      - derived_asset_delta: ?
-      - message_delta: ?
-      - missing_current_source_count: ?
-      - raw_mirror_manifest_count: ?
-      - semantic_vector_delta: ?
-      - status: string
-      - visible_source_conversation_count: ?
-    - event_log_path: ?
-    - failed_phase: ?
-    - failure_context_path: ?
-    - fallback_mode: string
-    - last_successful_phase: ?
-    - mode: string
-    - operation_outcome: object
-      - action_not_taken: string
-      - action_taken: string
-      - artifact_manifest_path: ?
-      - data_loss_risk: string
-      - exit_code_kind: string
-      - kind: string
-      - next_command: ?
-      - reason: string
-      - requires_override: boolean
-      - safe_to_retry: boolean
-    - outcome_kind: string
+    - command: object
+    - command_history: array
+    - command_id: ?
+    - context_kind: ?
+    - contract_provenance: ?
+    - coverage_summary: ?
+    - exit_code: ?
+    - failed_check: string
+    - failed_phase: string
+    - failure_reason: ?
+    - fixture: object
+    - operation_id: ?
     - plan_fingerprint: ?
-    - receipt_path: ?
-    - recommended_action: string
-    - redaction_report: object
-    - redaction_status: string
-    - repro_command: ?
-    - risk_level: string
+    - platform: object
+    - probe: object
+    - probe_run_id: ?
+    - reasons: array
+    - recent_events: array
+    - redaction_status: ?
+    - rejected_authorities: ?
+    - repro: object
+      - command_json: array
+      - mutates_live_archive: boolean
+      - notes: array
+      - requires_explicit_live_archive: boolean
+      - safety: string
+      - shell_command: string
+      - target: string
+      - working_directory: ?
+    - scenario_id: ?
     - schema_version: integer
-    - status: string
-    - surface: string
+    - selected_authority: ?
+    - stderr_tail: ?
+    - stdout_tail: ?
   doctor-health-summary:
+    - active_repair: object
+      - active: boolean
+      - active_index_maintenance: boolean
+      - repair_blocked_reason: ?
+    - archive_coverage_state: string
     - artifact_manifest_path: ?
     - asset_class: string
     - authority_status: string
     - blocked_reasons: array
+    - cleanup_reclaimable_bytes: ?
     - contract_provenance: string
     - coverage_delta: object
       - archive_conversation_count: ?
@@ -1348,11 +1362,22 @@ schemas: (auto-generated from contract)
       - semantic_vector_delta: ?
       - status: string
       - visible_source_conversation_count: ?
+    - coverage_source: object
+      - confidence_tier: string
+      - generated_at: ?
+      - recommended_action: string
+      - source: string
+      - source_report_id: ?
+      - stale_after_seconds: integer
+      - status: string
+    - db_exists: boolean
     - doctor_available: boolean
+    - doctor_check_recommended: boolean
     - event_log_path: ?
     - failure_marker_path: ?
     - fallback_mode: string
     - health_class: string
+    - health_status: string
     - last_receipt_path: ?
     - mode: string
     - operation_outcome: object
@@ -1368,12 +1393,18 @@ schemas: (auto-generated from contract)
       - safe_to_retry: boolean
     - outcome_kind: string
     - plan_fingerprint: ?
+    - quarantine_summary: ?
     - receipt_path: ?
     - recommended_action: string
     - redaction_status: string
+    - repair_blocked_reason: ?
+    - repair_previously_failed: boolean
+    - repair_recommended: boolean
     - risk_level: string
     - safe_auto_run_eligible: boolean
     - schema_version: integer
+    - sole_copy_conversation_count: integer
+    - source_mirror_state: string
     - status: string
     - surface: string
   doctor-reconstruct-dry-run:
@@ -2050,10 +2081,16 @@ schemas: (auto-generated from contract)
     - status: string
     - surface: string
   doctor-status-summary:
+    - active_repair: object
+      - active: boolean
+      - active_index_maintenance: boolean
+      - repair_blocked_reason: ?
+    - archive_coverage_state: string
     - artifact_manifest_path: ?
     - asset_class: string
     - authority_status: string
     - blocked_reasons: array
+    - cleanup_reclaimable_bytes: ?
     - contract_provenance: string
     - coverage_delta: object
       - archive_conversation_count: ?
@@ -2066,11 +2103,22 @@ schemas: (auto-generated from contract)
       - semantic_vector_delta: ?
       - status: string
       - visible_source_conversation_count: ?
+    - coverage_source: object
+      - confidence_tier: string
+      - generated_at: ?
+      - recommended_action: string
+      - source: string
+      - source_report_id: ?
+      - stale_after_seconds: integer
+      - status: string
+    - db_exists: boolean
     - doctor_available: boolean
+    - doctor_check_recommended: boolean
     - event_log_path: ?
     - failure_marker_path: ?
     - fallback_mode: string
     - health_class: string
+    - health_status: string
     - last_receipt_path: ?
     - mode: string
     - operation_outcome: object
@@ -2086,12 +2134,18 @@ schemas: (auto-generated from contract)
       - safe_to_retry: boolean
     - outcome_kind: string
     - plan_fingerprint: ?
+    - quarantine_summary: ?
     - receipt_path: ?
     - recommended_action: string
     - redaction_status: string
+    - repair_blocked_reason: ?
+    - repair_previously_failed: boolean
+    - repair_recommended: boolean
     - risk_level: string
     - safe_auto_run_eligible: boolean
     - schema_version: integer
+    - sole_copy_conversation_count: integer
+    - source_mirror_state: string
     - status: string
     - surface: string
   doctor-support-bundle:
@@ -2183,10 +2237,16 @@ schemas: (auto-generated from contract)
       - open_skipped: boolean
       - opened: boolean
     - doctor_summary: object
+      - active_repair: object
+        - active: boolean
+        - active_index_maintenance: boolean
+        - repair_blocked_reason: ?
+      - archive_coverage_state: string
       - artifact_manifest_path: ?
       - asset_class: string
       - authority_status: string
       - blocked_reasons: array
+      - cleanup_reclaimable_bytes: ?
       - contract_provenance: string
       - coverage_delta: object
         - archive_conversation_count: ?
@@ -2199,11 +2259,22 @@ schemas: (auto-generated from contract)
         - semantic_vector_delta: ?
         - status: string
         - visible_source_conversation_count: ?
+      - coverage_source: object
+        - confidence_tier: string
+        - generated_at: ?
+        - recommended_action: string
+        - source: string
+        - source_report_id: ?
+        - stale_after_seconds: integer
+        - status: string
+      - db_exists: boolean
       - doctor_available: boolean
+      - doctor_check_recommended: boolean
       - event_log_path: ?
       - failure_marker_path: ?
       - fallback_mode: string
       - health_class: string
+      - health_status: string
       - last_receipt_path: ?
       - mode: string
       - operation_outcome: object
@@ -2219,12 +2290,18 @@ schemas: (auto-generated from contract)
         - safe_to_retry: boolean
       - outcome_kind: string
       - plan_fingerprint: ?
+      - quarantine_summary: ?
       - receipt_path: ?
       - recommended_action: string
       - redaction_status: string
+      - repair_blocked_reason: ?
+      - repair_previously_failed: boolean
+      - repair_recommended: boolean
       - risk_level: string
       - safe_auto_run_eligible: boolean
       - schema_version: integer
+      - sole_copy_conversation_count: integer
+      - source_mirror_state: string
       - status: string
       - surface: string
     - errors: array
@@ -2538,10 +2615,16 @@ schemas: (auto-generated from contract)
       - opened: boolean
       - path: string
     - doctor_summary: object
+      - active_repair: object
+        - active: boolean
+        - active_index_maintenance: boolean
+        - repair_blocked_reason: ?
+      - archive_coverage_state: string
       - artifact_manifest_path: ?
       - asset_class: string
       - authority_status: string
       - blocked_reasons: array
+      - cleanup_reclaimable_bytes: ?
       - contract_provenance: string
       - coverage_delta: object
         - archive_conversation_count: ?
@@ -2554,11 +2637,22 @@ schemas: (auto-generated from contract)
         - semantic_vector_delta: ?
         - status: string
         - visible_source_conversation_count: ?
+      - coverage_source: object
+        - confidence_tier: string
+        - generated_at: ?
+        - recommended_action: string
+        - source: string
+        - source_report_id: ?
+        - stale_after_seconds: integer
+        - status: string
+      - db_exists: boolean
       - doctor_available: boolean
+      - doctor_check_recommended: boolean
       - event_log_path: ?
       - failure_marker_path: ?
       - fallback_mode: string
       - health_class: string
+      - health_status: string
       - last_receipt_path: ?
       - mode: string
       - operation_outcome: object
@@ -2574,12 +2668,18 @@ schemas: (auto-generated from contract)
         - safe_to_retry: boolean
       - outcome_kind: string
       - plan_fingerprint: ?
+      - quarantine_summary: ?
       - receipt_path: ?
       - recommended_action: string
       - redaction_status: string
+      - repair_blocked_reason: ?
+      - repair_previously_failed: boolean
+      - repair_recommended: boolean
       - risk_level: string
       - safe_auto_run_eligible: boolean
       - schema_version: integer
+      - sole_copy_conversation_count: integer
+      - source_mirror_state: string
       - status: string
       - surface: string
     - explanation: ?
@@ -2782,10 +2882,16 @@ schemas: (auto-generated from contract)
       - opened: boolean
       - path: string
     - doctor_summary: object
+      - active_repair: object
+        - active: boolean
+        - active_index_maintenance: boolean
+        - repair_blocked_reason: ?
+      - archive_coverage_state: string
       - artifact_manifest_path: ?
       - asset_class: string
       - authority_status: string
       - blocked_reasons: array
+      - cleanup_reclaimable_bytes: ?
       - contract_provenance: string
       - coverage_delta: object
         - archive_conversation_count: ?
@@ -2798,11 +2904,22 @@ schemas: (auto-generated from contract)
         - semantic_vector_delta: ?
         - status: string
         - visible_source_conversation_count: ?
+      - coverage_source: object
+        - confidence_tier: string
+        - generated_at: ?
+        - recommended_action: string
+        - source: string
+        - source_report_id: ?
+        - stale_after_seconds: integer
+        - status: string
+      - db_exists: boolean
       - doctor_available: boolean
+      - doctor_check_recommended: boolean
       - event_log_path: ?
       - failure_marker_path: ?
       - fallback_mode: string
       - health_class: string
+      - health_status: string
       - last_receipt_path: ?
       - mode: string
       - operation_outcome: object
@@ -2818,12 +2935,18 @@ schemas: (auto-generated from contract)
         - safe_to_retry: boolean
       - outcome_kind: string
       - plan_fingerprint: ?
+      - quarantine_summary: ?
       - receipt_path: ?
       - recommended_action: string
       - redaction_status: string
+      - repair_blocked_reason: ?
+      - repair_previously_failed: boolean
+      - repair_recommended: boolean
       - risk_level: string
       - safe_auto_run_eligible: boolean
       - schema_version: integer
+      - sole_copy_conversation_count: integer
+      - source_mirror_state: string
       - status: string
       - surface: string
     - explanation: ?

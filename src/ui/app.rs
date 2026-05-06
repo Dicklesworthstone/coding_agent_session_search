@@ -22961,21 +22961,20 @@ fn split_editor_command(editor: &str) -> (String, Vec<String>) {
 
 #[cfg(test)]
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    let mut guard = TEST_CLIPBOARD.lock().map_err(|e| e.to_string())?;
-    *guard = Some(text.to_string());
+    TEST_CLIPBOARD.with(|clipboard| {
+        *clipboard.borrow_mut() = Some(text.to_string());
+    });
     Ok(())
 }
 
 #[cfg(test)]
-static TEST_CLIPBOARD: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+std::thread_local! {
+    static TEST_CLIPBOARD: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 fn take_test_clipboard() -> Option<String> {
-    TEST_CLIPBOARD
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take())
+    TEST_CLIPBOARD.with(|clipboard| clipboard.borrow_mut().take())
 }
 
 /// Copy text to the system clipboard using OSC52 with fallback to external tools.
@@ -25941,6 +25940,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn enter_routing_diagnostics_emit_query_submit_fallback_marker() {
         let mut app = CassApp::default();
         app.input_mode = InputMode::Query;
@@ -25961,6 +25961,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn enter_routing_diagnostics_emit_detail_modal_open_marker() {
         let mut app = CassApp::default();
         app.input_mode = InputMode::Query;

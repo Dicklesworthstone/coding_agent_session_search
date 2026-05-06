@@ -360,7 +360,7 @@ fn codex_skips_invalid_json() {
 #[test]
 fn codex_handles_missing_events() {
     let tmp = TempDir::new().unwrap();
-    let codex_home = tmp.path().join("codex-home");
+    let codex_home = tmp.path().join("codex");
     let sessions = codex_home.join("sessions");
     fs::create_dir_all(&sessions).unwrap();
 

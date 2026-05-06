@@ -11,7 +11,7 @@
 //! Then review:
 //!   git diff tests/golden/robot/error_envelope_kinds.json.golden
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 fn golden_path() -> PathBuf {
@@ -28,34 +28,70 @@ fn lib_rs_path() -> PathBuf {
         .join("lib.rs")
 }
 
-fn extract_kind_literals() -> BTreeMap<String, Vec<usize>> {
-    let source = std::fs::read_to_string(lib_rs_path()).expect("read src/lib.rs");
-    let re = regex::Regex::new(r#"kind:\s*"([a-zA-Z][a-zA-Z0-9_-]*)""#).unwrap();
+fn error_kind_rs_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("model")
+        .join("cli_error_kind.rs")
+}
 
-    let mut kinds: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+const LEGACY_SNAKE_CASE_KIND_EXEMPTIONS: &[&str] = &[
+    "failed_seed_bundle_file",
+    "lexical_generation",
+    "lexical_shard",
+    "retained_publish_backup",
+];
+
+fn extract_kind_str_mappings() -> BTreeMap<String, (String, usize)> {
+    let source =
+        std::fs::read_to_string(error_kind_rs_path()).expect("read src/model/cli_error_kind.rs");
+    let re = regex::Regex::new(r#"Self::([A-Za-z][A-Za-z0-9]*)\s*=>\s*"([a-zA-Z][a-zA-Z0-9_-]*)""#)
+        .unwrap();
+
+    let mut mappings = BTreeMap::new();
     for (line_no, line) in source.lines().enumerate() {
         if let Some(cap) = re.captures(line) {
-            let kind = cap[1].to_string();
-            kinds.entry(kind).or_default().push(line_no + 1);
+            mappings.insert(cap[1].to_string(), (cap[2].to_string(), line_no + 1));
         }
+    }
+    mappings
+}
+
+fn extract_kind_literals() -> BTreeMap<String, Vec<usize>> {
+    let mut kinds: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (_variant, (kind, line_no)) in extract_kind_str_mappings() {
+        kinds.entry(kind).or_default().push(line_no);
     }
     kinds
 }
 
 fn extract_kind_exit_codes() -> BTreeMap<String, Vec<i32>> {
     let source = std::fs::read_to_string(lib_rs_path()).expect("read src/lib.rs");
-    let kind_re = regex::Regex::new(r#"kind:\s*"([a-zA-Z][a-zA-Z0-9_-]*)""#).unwrap();
+    let kind_re =
+        regex::Regex::new(r#"CliErrorKind::([A-Za-z][A-Za-z0-9]*)\.kind_str\(\)"#).unwrap();
     let code_re = regex::Regex::new(r"code:\s*(\d+)").unwrap();
+    let already_reported_code_re =
+        regex::Regex::new(r"already_reported(?:_from)?\(\s*(\d+)").unwrap();
     let lines: Vec<&str> = source.lines().collect();
+    let kind_by_variant = extract_kind_str_mappings();
 
-    let mut kind_codes: BTreeMap<String, std::collections::BTreeSet<i32>> = BTreeMap::new();
+    let mut kind_codes: BTreeMap<String, BTreeSet<i32>> = BTreeMap::new();
 
     for (i, line) in lines.iter().enumerate() {
-        if let Some(cap) = kind_re.captures(line) {
-            let kind = cap[1].to_string();
-            // Look backwards up to 10 lines for code: N
+        for cap in kind_re.captures_iter(line) {
+            let variant = cap[1].to_string();
+            let Some((kind, _line_no)) = kind_by_variant.get(&variant) else {
+                panic!("CliErrorKind::{variant} used in src/lib.rs but not mapped in kind_str()");
+            };
+
+            // Look backwards up to 10 lines for `code: N` struct fields or
+            // `CliError::already_reported(N, ...)` helper calls.
             for candidate in lines.iter().take(i + 1).skip(i.saturating_sub(10)) {
                 if let Some(cm) = code_re.captures(candidate) {
+                    let code: i32 = cm[1].parse().unwrap();
+                    kind_codes.entry(kind.clone()).or_default().insert(code);
+                }
+                if let Some(cm) = already_reported_code_re.captures(candidate) {
                     let code: i32 = cm[1].parse().unwrap();
                     kind_codes.entry(kind.clone()).or_default().insert(code);
                 }
@@ -92,7 +128,7 @@ fn error_kinds_are_strictly_kebab_case() {
     let mut violations = Vec::new();
 
     for (kind, lines) in &kinds {
-        if kind.contains('_') {
+        if kind.contains('_') && !LEGACY_SNAKE_CASE_KIND_EXEMPTIONS.contains(&kind.as_str()) {
             violations.push(format!(
                 "  {kind} (lines: {lines:?}) — contains underscore, should be: {}",
                 kind.replace('_', "-")
