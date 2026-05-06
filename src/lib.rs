@@ -8790,7 +8790,9 @@ fn ensure_lexical_assets_for_search(
     let initial_index_exists = crate::search::tantivy::searchable_index_exists(index_path);
     let initial_rebuild_active = probe_index_run_lock(data_dir, db_path).active;
     if initial_rebuild_active {
-        if initial_index_exists {
+        if initial_index_exists
+            && search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none()
+        {
             return Ok(SearchLexicalSelfHeal {
                 action: "active-rebuild-searching-existing-index",
                 reason: Some("lexical repair is already running".to_string()),
@@ -9145,6 +9147,79 @@ mod search_lexical_self_heal_tests {
             )
             .expect("query superseded-db term");
         assert_eq!(old_hits.len(), 0);
+    }
+
+    #[test]
+    fn active_rebuild_waits_instead_of_searching_stale_existing_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let old_db_path = data_dir.join("old_agent_search.db");
+        let db_path = data_dir.join("agent_search.db");
+        seed_search_db_at(
+            &old_db_path,
+            "oldactiverebuildneedle exists only in the superseded database",
+            "old-active-rebuild-search-self-heal-conversation",
+        );
+        seed_search_db_at(
+            &db_path,
+            "newactiverebuildneedle exists only in the active database",
+            "new-active-rebuild-search-self-heal-conversation",
+        );
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &old_db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("initial rebuild from old database");
+        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
+            .expect("diagnose stale lexical index")
+            .expect("old database checkpoint should be stale for active db");
+        assert!(
+            diagnosis.reason.contains("lexical checkpoint references"),
+            "unexpected stale-index diagnosis: {}",
+            diagnosis.reason
+        );
+
+        let lock_path = data_dir.join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open index-run lock");
+        fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold active index-run lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
+            std::process::id(),
+            1_733_000_111_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let err = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            Some(0),
+            Instant::now(),
+            false,
+        )
+        .expect_err(
+            "stale existing index should wait for active rebuild instead of being searched",
+        );
+        assert_eq!(err.code, 7);
+        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
+        assert!(
+            err.message.contains("already repairing the search index"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
