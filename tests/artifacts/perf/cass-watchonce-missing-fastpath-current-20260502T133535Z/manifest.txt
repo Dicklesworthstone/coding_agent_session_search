@@ -1,6 +1,0 @@
-run_id=cass-watchonce-missing-fastpath-current-20260502T133535Z
-seed=/home/ubuntu/cass-post-tokenizer-hotspot-20260502T035907Z
-data_dir=/home/ubuntu/cass-watchonce-missing-fastpath-current-20260502T133535Z
-git_sha=56280c141fe16e3892d786c4c615e6c57b73f5fe
-timestamp_utc=2026-05-02T13:35:50Z
-exit_status=0

@@ -1,8 +1,0 @@
-run_id=cass-watchonce-existing-profile-20260502T134112Z
-seed=/home/ubuntu/cass-post-tokenizer-hotspot-20260502T035907Z
-source_path=/home/ubuntu/.codex/sessions/2025/12/17/rollout-2025-12-17T16-36-28-019b2e3e-3972-7390-b77f-a90f83498bff.jsonl
-source_bytes=14785
-data_dir=/home/ubuntu/cass-watchonce-existing-profile-20260502T134112Z
-git_sha=01a44183adfe1c9e4e1a0fa6fe8c9ea48e9d6584
-timestamp_utc=2026-05-02T13:41:28Z
-exit_status=0

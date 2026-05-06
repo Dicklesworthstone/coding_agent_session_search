@@ -1,3 +1,0 @@
-  874 tests/artifacts/perf/cass-watchonce-existing-profile-20260502T134112Z/index.out.json
-25871 tests/artifacts/perf/cass-watchonce-existing-profile-20260502T134112Z/index.stderr.txt
-26745 total

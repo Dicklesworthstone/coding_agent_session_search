@@ -1,6 +1,0 @@
-orphan_messages|3583
-orphan_msg_child_metrics|3583
-orphan_msg_child_token_usage|3583
-messages|4711459
-message_metrics|116027
-token_usage|116027

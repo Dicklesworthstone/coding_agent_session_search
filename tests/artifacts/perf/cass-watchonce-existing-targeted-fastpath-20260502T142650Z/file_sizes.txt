@@ -1,3 +1,0 @@
-  893 tests/artifacts/perf/cass-watchonce-existing-targeted-fastpath-20260502T142650Z/index.out.json
-15010 tests/artifacts/perf/cass-watchonce-existing-targeted-fastpath-20260502T142650Z/index.stderr.txt
-15903 total

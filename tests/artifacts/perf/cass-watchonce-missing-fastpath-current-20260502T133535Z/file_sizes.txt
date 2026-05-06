@@ -1,3 +1,0 @@
- 730 tests/artifacts/perf/cass-watchonce-missing-fastpath-current-20260502T133535Z/index.out.json
-3217 tests/artifacts/perf/cass-watchonce-missing-fastpath-current-20260502T133535Z/index.stderr.txt
-3947 total

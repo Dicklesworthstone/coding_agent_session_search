@@ -1,7 +1,0 @@
-run_id=cass-pageprep-default-rebuild-head-20260502T115045Z
-artifact_dir=tests/artifacts/perf/cass-pageprep-default-rebuild-head-20260502T115045Z
-data_dir=/home/ubuntu/cass-pageprep-default-rebuild-head-20260502T115045Z
-binary=/data/tmp/cass_perf_opt_target/profiling/cass
-seed=/home/ubuntu/cass-post-tokenizer-hotspot-20260502T035907Z
-seed_copy=agent_search.db* only, derived index omitted
-git=550bafaf02bae9a119762cd736920bd997bd32e7

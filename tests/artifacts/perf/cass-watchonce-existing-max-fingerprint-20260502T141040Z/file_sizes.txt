@@ -1,3 +1,0 @@
-  890 tests/artifacts/perf/cass-watchonce-existing-max-fingerprint-20260502T141040Z/index.out.json
-25910 tests/artifacts/perf/cass-watchonce-existing-max-fingerprint-20260502T141040Z/index.stderr.txt
-26800 total

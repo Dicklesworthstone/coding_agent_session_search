@@ -1,4 +1,0 @@
-schema_version|20
-orphan_messages|3583
-orphan_msg_child_metrics|3583
-orphan_msg_child_token_usage|3583
