@@ -1011,7 +1011,7 @@ fn unique_atomic_sidecar_path(
 }
 
 fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
-    if !final_dir.exists() {
+    if !ensure_replaceable_site_dir(final_dir)? {
         std::fs::rename(temp_dir, final_dir).with_context(|| {
             format!(
                 "failed renaming staged site {} into place at {}",
@@ -1059,6 +1059,34 @@ fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
                 temp_dir.display()
             ),
         },
+    }
+}
+
+fn ensure_replaceable_site_dir(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "Refusing to replace site directory through symlink: {}",
+                    path.display()
+                );
+            }
+            if !file_type.is_dir() {
+                bail!(
+                    "Refusing to replace site directory because it is not a directory: {}",
+                    path.display()
+                );
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed inspecting site directory before replacement: {}",
+                path.display()
+            )
+        }),
     }
 }
 
@@ -1903,6 +1931,58 @@ mod tests {
         assert!(
             !sidecars.iter().any(|name| name.contains(".archive.bak.")),
             "backup sidecar should be cleaned up, found: {sidecars:?}"
+        );
+    }
+
+    #[test]
+    fn test_replace_dir_from_temp_rejects_file_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let final_dir = temp_dir.path().join("archive");
+        let staged_dir = temp_dir.path().join("archive.staged");
+
+        std::fs::write(&final_dir, "not a directory").unwrap();
+        std::fs::create_dir_all(staged_dir.join("site")).unwrap();
+        std::fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
+
+        let err = replace_dir_from_temp(&staged_dir, &final_dir).unwrap_err();
+
+        assert!(
+            err.to_string().contains("not a directory"),
+            "unexpected error: {err:#}"
+        );
+        assert!(staged_dir.exists());
+        assert_eq!(
+            std::fs::read_to_string(&final_dir).unwrap(),
+            "not a directory"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_replace_dir_from_temp_rejects_dangling_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let final_dir = temp_dir.path().join("archive");
+        let staged_dir = temp_dir.path().join("archive.staged");
+        let missing_target = temp_dir.path().join("missing-archive");
+
+        symlink(&missing_target, &final_dir).unwrap();
+        std::fs::create_dir_all(staged_dir.join("site")).unwrap();
+        std::fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
+
+        let err = replace_dir_from_temp(&staged_dir, &final_dir).unwrap_err();
+
+        assert!(
+            err.to_string().contains("through symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert!(staged_dir.exists());
+        assert!(
+            std::fs::symlink_metadata(&final_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 
