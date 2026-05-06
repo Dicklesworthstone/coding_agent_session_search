@@ -8641,7 +8641,7 @@ impl SearchLexicalSelfHealDiagnosis {
     }
 
     fn permits_existing_index_during_active_rebuild(&self) -> bool {
-        self.checkpoint_refresh_allowed || self.reason == "lexical rebuild checkpoint missing"
+        self.reason == "lexical rebuild checkpoint missing"
     }
 }
 
@@ -9004,6 +9004,28 @@ mod search_lexical_self_heal_tests {
         index.commit().expect("commit standalone index");
     }
 
+    fn hold_active_index_run_lock(data_dir: &Path, db_path: &Path) -> std::fs::File {
+        let lock_path = data_dir.join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open index-run lock");
+        fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold active index-run lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
+            std::process::id(),
+            1_733_000_111_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+        lock_file
+    }
+
     #[test]
     fn search_self_heal_rebuilds_missing_lexical_index_from_canonical_db() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -9192,24 +9214,7 @@ mod search_lexical_self_heal_tests {
             diagnosis.reason
         );
 
-        let lock_path = data_dir.join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open index-run lock");
-        fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold active index-run lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
-            std::process::id(),
-            1_733_000_111_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        let _lock_file = hold_active_index_run_lock(data_dir, &db_path);
 
         let err = ensure_lexical_assets_for_search(
             data_dir,
@@ -9221,6 +9226,63 @@ mod search_lexical_self_heal_tests {
         )
         .expect_err(
             "stale existing index should wait for active rebuild instead of being searched",
+        );
+        assert_eq!(err.code, 7);
+        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
+        assert!(
+            err.message.contains("already repairing the search index"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn active_rebuild_waits_instead_of_searching_incomplete_checkpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("initial rebuild from active database");
+
+        let state_path = index_path.join(".lexical-rebuild-state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
+                .expect("parse checkpoint");
+        state["completed"] = serde_json::json!(false);
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
+        )
+        .expect("write incomplete checkpoint");
+
+        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
+            .expect("diagnose incomplete checkpoint")
+            .expect("incomplete checkpoint should require repair");
+        assert_eq!(diagnosis.reason, "lexical rebuild checkpoint is incomplete");
+        assert!(
+            !diagnosis.permits_existing_index_during_active_rebuild(),
+            "active rebuild must not search an index before checkpoint refresh proof"
+        );
+
+        let _lock_file = hold_active_index_run_lock(data_dir, &db_path);
+
+        let err = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            Some(0),
+            Instant::now(),
+            false,
+        )
+        .expect_err(
+            "incomplete checkpoint should wait for active rebuild instead of being searched",
         );
         assert_eq!(err.code, 7);
         assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
