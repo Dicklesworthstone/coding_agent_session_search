@@ -3,7 +3,7 @@
 //! Creates the deployable static site bundle (site/) and private offline artifacts (private/)
 //! from an export. Output is safe for public hosting (GitHub Pages / Cloudflare Pages).
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::prelude::*;
 use chrono::Utc;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
 use super::docs::{DocLocation, GeneratedDoc};
-use super::encrypt::{EncryptionConfig, validate_supported_payload_format};
+use super::encrypt::{validate_supported_payload_format, EncryptionConfig};
 
 /// Files embedded from pages_assets at compile time
 const PAGES_ASSETS: &[(&str, &[u8])] = &[
@@ -1577,11 +1577,9 @@ mod tests {
             .expect("rebuild");
 
         assert!(output_dir.join("site/config.json").exists());
-        assert!(
-            output_dir
-                .join("private/integrity-fingerprint.txt")
-                .exists()
-        );
+        assert!(output_dir
+            .join("private/integrity-fingerprint.txt")
+            .exists());
         assert!(!output_dir.join("site/stale.txt").exists());
         assert!(!output_dir.join("private/old-secret.txt").exists());
         assert!(!output_dir.join("site/payload/old.bin").exists());
@@ -1609,11 +1607,9 @@ mod tests {
 
         assert!(output_dir.join("site/marker.txt").exists());
         assert!(output_dir.join("site/config.json").exists());
-        assert!(
-            output_dir
-                .join("private/integrity-fingerprint.txt")
-                .exists()
-        );
+        assert!(output_dir
+            .join("private/integrity-fingerprint.txt")
+            .exists());
     }
 
     #[test]
