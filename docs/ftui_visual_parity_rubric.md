@@ -187,7 +187,7 @@ Use it as the source of truth for parity evidence and root-cause ownership.
 | `S7-command-palette-open` | Palette open over search/detail surfaces | `docs/assets/screenshots/screenshot_03.webp` | `tests/snapshots/cassapp_command_palette.snap` | captured | n/a |
 
 Canonical machine-readable manifest:
-- `docs/ftui_visual_parity_manifest.json`
+- `docs/artifacts/ftui-parity/visual_parity_manifest.json`
 
 ## Regeneration Commands (Deterministic)
 Run from repo root:

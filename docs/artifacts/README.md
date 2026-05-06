@@ -5,6 +5,10 @@ maintenance but are not source code, runtime state, or live issue-tracker data.
 
 - `migration-baseline/` contains the frankensearch/FAD migration baseline used
   by `scripts/migration_e2e_validate.sh`.
+- `ftui-parity/` contains reviewed FTUI visual-parity audit evidence, baseline
+  bundle notes, and the machine-readable parity manifest. The active scoring
+  rubric remains in `docs/ftui_visual_parity_rubric.md` because it is a living
+  reference, not a captured run artifact.
 - `no-mock-audit.md` is the durable audit narrative for the no-mock CI policy;
   the machine-enforced allowlist lives in `tests/policies/`.
 - `refactor-runs/` contains preserved simplification/refactor proof bundles

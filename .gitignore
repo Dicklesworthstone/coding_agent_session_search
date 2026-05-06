@@ -86,6 +86,24 @@ test-results/*
 /test-results-*.txt
 claude-upgrade-progress.json
 
+# Root-level skill-loop/test scratch outputs. Durable plans belong under
+# docs/planning/, durable evidence bundles under docs/artifacts/, and reference
+# guides under docs/reference/.
+/DASHBOARD.md
+/final_dashboard.md
+/baseline.md
+/architecture.md
+/pass*.md
+/duplication_map.*
+/skill_inventory.json
+/slop_scan.md
+/loc_delta_*.numstat
+/baseline_*.log
+/cargo_*.log
+/touched_rustfmt_check.log
+/validation_report.json
+/per_query_scores.json
+
 # Ephemeral E2E test artifacts
 /artifacts/
 tmp/
