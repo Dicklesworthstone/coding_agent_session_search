@@ -2885,6 +2885,13 @@
                       "null"
                     ]
                   },
+                  "owner_command": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "Command recorded by cass-owned lock metadata when safe to report; cass does not scrape arbitrary process command lines."
+                  },
                   "started_at_ms": {
                     "type": [
                       "integer",
@@ -3017,6 +3024,254 @@
             "owners",
             "interrupted_states",
             "next_action",
+            "notes"
+          ]
+        },
+        "locks": {
+          "type": "array",
+          "description": "Structured doctor lock diagnostics. Paths are paired with redacted paths; robots should display redacted_lock_path and never advise deleting lock files manually.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "schema_version": {
+                "type": "integer"
+              },
+              "lock_kind": {
+                "type": "string",
+                "description": "index_run | watch_ingestion | doctor_repair"
+              },
+              "lock_path": {
+                "type": "string"
+              },
+              "redacted_lock_path": {
+                "type": "string"
+              },
+              "active": {
+                "type": "boolean"
+              },
+              "owned_by_current_process": {
+                "type": "boolean"
+              },
+              "owner_confidence": {
+                "type": "string",
+                "description": "current_process | active_advisory_lock | active_missing_metadata | stale_metadata_only | unavailable"
+              },
+              "pid": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "owner_command": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "pid_metadata_status": {
+                "type": "string"
+              },
+              "pid_reuse_ambiguous": {
+                "type": "boolean"
+              },
+              "age_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "last_heartbeat_age_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "stale_suspected": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "wait_duration_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "retry_policy": {
+                "type": "string"
+              },
+              "safe_to_wait": {
+                "type": "boolean"
+              },
+              "manual_delete_allowed": {
+                "type": "boolean"
+              },
+              "recommended_action": {
+                "type": "string"
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "schema_version",
+              "lock_kind",
+              "lock_path",
+              "redacted_lock_path",
+              "active",
+              "owned_by_current_process",
+              "owner_confidence",
+              "pid",
+              "owner_command",
+              "pid_metadata_status",
+              "pid_reuse_ambiguous",
+              "age_ms",
+              "last_heartbeat_age_ms",
+              "stale_suspected",
+              "wait_duration_ms",
+              "retry_policy",
+              "safe_to_wait",
+              "manual_delete_allowed",
+              "recommended_action",
+              "evidence"
+            ]
+          }
+        },
+        "slow_operations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "schema_version": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "phase": {
+                "type": "string"
+              },
+              "elapsed_ms": {
+                "type": "integer"
+              },
+              "threshold_ms": {
+                "type": "integer"
+              },
+              "severity": {
+                "type": "string"
+              },
+              "event_log_correlation_id": {
+                "type": "string"
+              },
+              "recommended_action": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "schema_version",
+              "name",
+              "phase",
+              "elapsed_ms",
+              "threshold_ms",
+              "severity",
+              "event_log_correlation_id",
+              "recommended_action"
+            ]
+          }
+        },
+        "timing_summary": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "elapsed_ms": {
+              "type": "integer"
+            },
+            "measured_operation_count": {
+              "type": "integer"
+            },
+            "slow_operation_count": {
+              "type": "integer"
+            },
+            "default_threshold_ms": {
+              "type": "integer"
+            },
+            "slowest_operation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "slowest_elapsed_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "schema_version",
+            "elapsed_ms",
+            "measured_operation_count",
+            "slow_operation_count",
+            "default_threshold_ms",
+            "slowest_operation",
+            "slowest_elapsed_ms",
+            "notes"
+          ]
+        },
+        "retry_recommendation": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "policy": {
+              "type": "string"
+            },
+            "safe_to_retry": {
+              "type": "boolean"
+            },
+            "retry_after_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": "string"
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "schema_version",
+            "policy",
+            "safe_to_retry",
+            "retry_after_ms",
+            "command",
+            "reason",
             "notes"
           ]
         },
@@ -7284,6 +7539,10 @@
         "repair_failure_marker",
         "operation_outcome",
         "operation_state",
+        "locks",
+        "slow_operations",
+        "timing_summary",
+        "retry_recommendation",
         "primary_incident_id",
         "incidents",
         "event_log",
@@ -10859,6 +11118,13 @@
                       "integer",
                       "null"
                     ]
+                  },
+                  "owner_command": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "Command recorded by cass-owned lock metadata when safe to report; cass does not scrape arbitrary process command lines."
                   },
                   "started_at_ms": {
                     "type": [

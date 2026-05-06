@@ -250,6 +250,7 @@ schemas: (auto-generated from contract)
       - stale: boolean
       - stale_threshold_seconds: integer
       - status: string
+    - locks: array
     - needs_rebuild: boolean
     - operation_outcome: object
       - action_not_taken: string
@@ -428,6 +429,14 @@ schemas: (auto-generated from contract)
       - will_mutate: boolean
     - repair_previously_failed: boolean
     - repeat_refusal_reason: ?
+    - retry_recommendation: object
+      - command: ?
+      - notes: array
+      - policy: string
+      - reason: string
+      - retry_after_ms: ?
+      - safe_to_retry: boolean
+      - schema_version: integer
     - risk_level: string
     - semantic: object
       - availability: string
@@ -484,6 +493,7 @@ schemas: (auto-generated from contract)
       - status: string
       - summary: string
       - vector_index_path: ?
+    - slow_operations: array
     - sole_copy_warnings: array
     - source_authority: object
       - checksum_evidence: object
@@ -535,6 +545,15 @@ schemas: (auto-generated from contract)
       - unknown_mapping_count: integer
     - status: string
     - storage_pressure: object
+    - timing_summary: object
+      - default_threshold_ms: integer
+      - elapsed_ms: integer
+      - measured_operation_count: integer
+      - notes: array
+      - schema_version: integer
+      - slow_operation_count: integer
+      - slowest_elapsed_ms: ?
+      - slowest_operation: ?
     - warnings: integer
   doctor-archive-normalize:
     - artifact_manifest_path: ?

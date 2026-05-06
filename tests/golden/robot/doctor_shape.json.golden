@@ -435,6 +435,79 @@
         }
       }
     },
+    "locks": {
+      "type": "array",
+      "items": {
+        "type": "unknown"
+      }
+    },
+    "slow_operations": {
+      "type": "array",
+      "items": {
+        "type": "unknown"
+      }
+    },
+    "timing_summary": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "elapsed_ms": {
+          "type": "integer"
+        },
+        "measured_operation_count": {
+          "type": "integer"
+        },
+        "slow_operation_count": {
+          "type": "integer"
+        },
+        "default_threshold_ms": {
+          "type": "integer"
+        },
+        "slowest_operation": {
+          "type": "string"
+        },
+        "slowest_elapsed_ms": {
+          "type": "integer"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "retry_recommendation": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "policy": {
+          "type": "string"
+        },
+        "safe_to_retry": {
+          "type": "boolean"
+        },
+        "retry_after_ms": {
+          "type": "null"
+        },
+        "command": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "primary_incident_id": {
       "type": "string"
     },

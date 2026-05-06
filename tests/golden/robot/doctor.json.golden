@@ -202,6 +202,32 @@
       "Interrupted artifacts are never deleted by this state model; they block mutation until inspected."
     ]
   },
+  "locks": [],
+  "slow_operations": [],
+  "timing_summary": {
+    "schema_version": 1,
+    "elapsed_ms": "[ELAPSED_MS]",
+    "measured_operation_count": 14,
+    "slow_operation_count": 0,
+    "default_threshold_ms": 500,
+    "slowest_operation": "semantic_probe",
+    "slowest_elapsed_ms": 1,
+    "notes": [
+      "Timing spans are advisory wall-clock measurements for the current doctor process.",
+      "Health/status should consume cached summaries rather than rerunning expensive doctor collectors."
+    ]
+  },
+  "retry_recommendation": {
+    "schema_version": 1,
+    "policy": "retry-allowed",
+    "safe_to_retry": true,
+    "retry_after_ms": null,
+    "command": "cass index --full",
+    "reason": "doctor diagnosed 3 issue(s) in read-only mode",
+    "notes": [
+      "No active doctor/index lock owner was reported in this payload."
+    ]
+  },
   "primary_incident_id": "doctor-incident-v1-e74b084c6b952c5cc399b1c717aca0d3c3fe5514b5e7e8bbbe0174cd6194533b",
   "incidents": [
     {
