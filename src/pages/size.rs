@@ -72,7 +72,10 @@ impl SizeEstimate {
 
         if let Some(agents) = agents.filter(|a| !a.is_empty()) {
             let placeholders: Vec<_> = agents.iter().map(|_| "?").collect();
-            conditions.push(format!("c.agent IN ({})", placeholders.join(", ")));
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM agents a WHERE a.id = c.agent_id AND a.slug IN ({}))",
+                placeholders.join(", ")
+            ));
             for agent in agents {
                 param_values.push(ParamValue::from(agent.as_str()));
             }
@@ -100,9 +103,11 @@ impl SizeEstimate {
         let conv_sql = format!("SELECT COUNT(*) FROM conversations c{}", where_clause);
         let conversation_count: u64 = conn
             .query_row_map(&conv_sql, params_slice, |row: &Row| {
-                row.get_typed::<i64>(0).map(|v| v as u64)
+                row.get_typed::<i64>(0).map(|v| v.max(0) as u64)
             })
-            .unwrap_or(0);
+            .with_context(|| {
+                format!("Failed to count conversations for size estimate: {conv_sql}")
+            })?;
 
         // Query message count and content size
         let msg_sql = format!(
@@ -121,7 +126,7 @@ impl SizeEstimate {
                     raw_plaintext_bytes.max(0) as u64,
                 ))
             })
-            .unwrap_or((0, 0));
+            .with_context(|| format!("Failed to estimate message payload size: {msg_sql}"))?;
 
         Self::from_plaintext_size(plaintext_bytes, conversation_count, message_count)
     }
@@ -477,6 +482,52 @@ mod tests {
         assert!(display.contains("Estimated bundle size"));
         assert!(display.contains("Conversations: 50"));
         assert!(display.contains("Messages: 2500"));
+    }
+
+    #[test]
+    fn test_from_database_filters_agents_through_agents_table() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let db_path = temp.path().join("cass.db");
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())?;
+        conn.execute_batch(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL
+            );
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                started_at INTEGER
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                content TEXT NOT NULL
+            );
+            INSERT INTO agents (id, slug) VALUES (1, 'claude'), (2, 'codex');
+            INSERT INTO conversations (id, agent_id, started_at)
+                VALUES (10, 1, 1000), (20, 2, 2000);
+            INSERT INTO messages (id, conversation_id, content)
+                VALUES (100, 10, 'hello'), (200, 20, 'rust code');",
+        )?;
+
+        let all = SizeEstimate::from_database(&db_path, None, None, None)?;
+        assert_eq!(all.conversation_count, 2);
+        assert_eq!(all.message_count, 2);
+        assert_eq!(all.plaintext_bytes, 14);
+
+        let codex =
+            SizeEstimate::from_database(&db_path, Some(&["codex".to_string()]), None, None)?;
+        assert_eq!(codex.conversation_count, 1);
+        assert_eq!(codex.message_count, 1);
+        assert_eq!(codex.plaintext_bytes, 9);
+
+        let recent = SizeEstimate::from_database(&db_path, None, Some(1500), None)?;
+        assert_eq!(recent.conversation_count, 1);
+        assert_eq!(recent.message_count, 1);
+        assert_eq!(recent.plaintext_bytes, 9);
+
+        Ok(())
     }
 
     #[test]

@@ -5,17 +5,28 @@
  * offline caching, and proper resource management.
  */
 
-const CACHE_VERSION = 'v3';
+const CACHE_VERSION = 'v4';
 const STATIC_ASSETS = [
     './',
     './index.html',
-    './auth.js',
-    './session.js',
-    './crypto_worker.js',
     './styles.css',
+    './auth.js',
+    './password-strength.js',
+    './session.js',
+    './storage.js',
+    './coi-detector.js',
+    './crypto_worker.js',
     './viewer.js',
+    './router.js',
+    './share.js',
+    './stats.js',
     './search.js',
     './database.js',
+    './conversation.js',
+    './virtual-list.js',
+    './attachments.js',
+    './settings.js',
+    './sw-register.js',
     './vendor/sqlite3.js',
     './vendor/sqlite3.wasm',
     './vendor/argon2-wasm.js',

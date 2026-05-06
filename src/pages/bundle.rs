@@ -23,7 +23,15 @@ const PAGES_ASSETS: &[(&str, &[u8])] = &[
     ("index.html", include_bytes!("../pages_assets/index.html")),
     ("styles.css", include_bytes!("../pages_assets/styles.css")),
     ("auth.js", include_bytes!("../pages_assets/auth.js")),
+    (
+        "password-strength.js",
+        include_bytes!("../pages_assets/password-strength.js"),
+    ),
     ("viewer.js", include_bytes!("../pages_assets/viewer.js")),
+    ("router.js", include_bytes!("../pages_assets/router.js")),
+    ("share.js", include_bytes!("../pages_assets/share.js")),
+    ("stats.js", include_bytes!("../pages_assets/stats.js")),
+    ("storage.js", include_bytes!("../pages_assets/storage.js")),
     ("search.js", include_bytes!("../pages_assets/search.js")),
     (
         "conversation.js",

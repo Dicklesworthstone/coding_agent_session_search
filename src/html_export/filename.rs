@@ -341,8 +341,9 @@ pub fn get_downloads_dir() -> PathBuf {
 /// If the base filename exists, appends numeric suffixes: `file_1.html`, `file_2.html`, etc.
 /// As an ultimate fallback, appends a timestamp.
 pub fn unique_filename(dir: &Path, base_filename: &str) -> PathBuf {
-    let path = dir.join(base_filename);
-    if !path.exists() {
+    let base_filename = safe_unique_base_filename(base_filename);
+    let path = dir.join(&base_filename);
+    if !filename_path_is_occupied(&path) {
         return path;
     }
 
@@ -350,14 +351,15 @@ pub fn unique_filename(dir: &Path, base_filename: &str) -> PathBuf {
     let (stem, ext) = if let Some(dot_pos) = base_filename.rfind('.') {
         (&base_filename[..dot_pos], &base_filename[dot_pos..])
     } else {
-        (base_filename, "")
+        (base_filename.as_str(), "")
     };
 
     // Try numeric suffixes
     for i in 1..1000 {
-        let new_name = format!("{}_{}{}", stem, i, ext);
+        let suffix = format!("_{i}");
+        let new_name = unique_candidate_filename(stem, ext, &suffix);
         let new_path = dir.join(&new_name);
-        if !new_path.exists() {
+        if !filename_path_is_occupied(&new_path) {
             trace!(
                 component = "file",
                 operation = "collision_check",
@@ -369,19 +371,116 @@ pub fn unique_filename(dir: &Path, base_filename: &str) -> PathBuf {
         }
     }
 
-    // Ultimate fallback: timestamp
+    // Ultimate fallback: high-resolution timestamp with bounded collision probes.
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let fallback = dir.join(format!("{}_{}{}", stem, ts, ext));
-    trace!(
-        component = "file",
-        operation = "collision_fallback",
-        path = %fallback.display(),
-        "Resolved filename via timestamp"
-    );
-    fallback
+    unique_timestamp_fallback_filename(dir, stem, ext, ts)
+}
+
+fn unique_timestamp_fallback_filename(dir: &Path, stem: &str, ext: &str, ts: u128) -> PathBuf {
+    for attempt in 0..1000 {
+        let suffix = if attempt == 0 {
+            format!("_{ts}")
+        } else {
+            format!("_{ts}_{attempt}")
+        };
+        let fallback = dir.join(unique_candidate_filename(stem, ext, &suffix));
+        if !filename_path_is_occupied(&fallback) {
+            trace!(
+                component = "file",
+                operation = "collision_fallback",
+                attempts = attempt,
+                path = %fallback.display(),
+                "Resolved filename via timestamp"
+            );
+            return fallback;
+        }
+    }
+
+    let suffix = format!("_{}_{}", ts, std::process::id());
+    dir.join(unique_candidate_filename(stem, ext, &suffix))
+}
+
+fn filename_path_is_occupied(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+fn unique_candidate_filename(stem: &str, ext: &str, suffix: &str) -> String {
+    let reserved_len = suffix.len().saturating_add(ext.len());
+    let max_stem_len = MAX_FILENAME_LEN.saturating_sub(reserved_len).max(1);
+    let mut candidate_stem = if stem.len() > max_stem_len {
+        let safe_end = truncate_to_char_boundary(stem, max_stem_len);
+        trim_separators(&stem[..safe_end])
+    } else {
+        trim_separators(stem)
+    };
+    if candidate_stem.is_empty() {
+        candidate_stem = "session".to_string();
+    }
+    format!("{candidate_stem}{suffix}{ext}")
+}
+
+fn safe_unique_base_filename(base_filename: &str) -> String {
+    let raw = Path::new(base_filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .unwrap_or("session.html");
+
+    if is_valid_filename(raw) {
+        return raw.to_string();
+    }
+
+    let (stem_raw, ext) = split_safe_extension(raw);
+    let stem = sanitize(stem_raw);
+    let stem = if stem.is_empty() {
+        "session".to_string()
+    } else {
+        let max_stem_len = MAX_FILENAME_LEN.saturating_sub(ext.len()).max(1);
+        finalize_filename(stem, Some(max_stem_len))
+    };
+    let candidate = format!("{stem}{ext}");
+
+    if is_valid_filename(&candidate) {
+        candidate
+    } else if ext.is_empty() {
+        "session".to_string()
+    } else {
+        format!("session{ext}")
+    }
+}
+
+fn split_safe_extension(filename: &str) -> (&str, String) {
+    let Some(dot_pos) = filename.rfind('.') else {
+        return (filename, String::new());
+    };
+    if dot_pos == 0 {
+        return ("", sanitize_extension(&filename[1..]));
+    }
+
+    let extension = sanitize_extension(&filename[dot_pos + 1..]);
+    (&filename[..dot_pos], extension)
+}
+
+fn sanitize_extension(extension: &str) -> String {
+    let ext: String = extension
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(16)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{ext}")
+    }
 }
 
 // ============================================================================
@@ -945,6 +1044,93 @@ mod tests {
         assert!(
             path.to_string_lossy()
                 .contains(&unique_base.replace(".html", ""))
+        );
+    }
+
+    #[test]
+    fn test_unique_filename_confines_path_components_to_dir() {
+        let dir = Path::new("/exports");
+
+        assert_eq!(
+            unique_filename(dir, "../escape.html"),
+            PathBuf::from("/exports/escape.html")
+        );
+        assert_eq!(
+            unique_filename(dir, "/tmp/escape.html"),
+            PathBuf::from("/exports/escape.html")
+        );
+    }
+
+    #[test]
+    fn test_unique_filename_sanitizes_invalid_basename_preserving_extension() {
+        let dir = Path::new("/exports");
+
+        assert_eq!(
+            unique_filename(dir, "CON.html"),
+            PathBuf::from("/exports/session_con.html")
+        );
+        assert_eq!(
+            unique_filename(dir, "bad<name>.HTML"),
+            PathBuf::from("/exports/badname.html")
+        );
+        assert_eq!(
+            unique_filename(dir, "../../"),
+            PathBuf::from("/exports/session.html")
+        );
+    }
+
+    #[test]
+    fn test_unique_filename_collision_keeps_platform_length_limit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base_filename = format!("{}.html", "a".repeat(MAX_FILENAME_LEN - ".html".len()));
+        std::fs::write(temp.path().join(&base_filename), b"existing").expect("write existing");
+
+        let path = unique_filename(temp.path(), &base_filename);
+        let filename = path.file_name().unwrap().to_string_lossy();
+
+        assert_ne!(filename.as_ref(), base_filename);
+        assert!(filename.ends_with("_1.html"), "{filename}");
+        assert!(filename.len() <= MAX_FILENAME_LEN, "{filename}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unique_filename_treats_dangling_symlink_as_collision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let occupied = temp.path().join("session.html");
+        std::os::unix::fs::symlink(temp.path().join("missing-target.html"), &occupied)
+            .expect("create dangling symlink");
+
+        let path = unique_filename(temp.path(), "session.html");
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("session_1.html")
+        );
+        assert!(
+            std::fs::symlink_metadata(&occupied)
+                .expect("dangling symlink metadata")
+                .file_type()
+                .is_symlink(),
+            "unique_filename must not replace a dangling symlink placeholder"
+        );
+    }
+
+    #[test]
+    fn test_unique_timestamp_fallback_checks_occupied_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("session_123.html"), b"existing")
+            .expect("write occupied timestamp fallback");
+
+        let path = unique_timestamp_fallback_filename(temp.path(), "session", ".html", 123);
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("session_123_1.html")
+        );
+        assert!(
+            !filename_path_is_occupied(&path),
+            "fallback helper should return an unoccupied path"
         );
     }
 

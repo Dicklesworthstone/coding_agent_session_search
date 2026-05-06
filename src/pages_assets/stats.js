@@ -381,7 +381,7 @@ function renderErrorState(message) {
 function renderDashboard(data) {
     if (!container) return;
 
-    const { statistics, timeline, agentSummary, workspaceSummary, topTerms } = data;
+    const { statistics = {}, timeline = {}, agentSummary, workspaceSummary, topTerms } = data || {};
     const availableTimelineViews = getAvailableTimelineViews(timeline);
     const selectedTimelineView = getSelectedTimelineView(timeline);
     currentTimelineView = selectedTimelineView;
@@ -465,7 +465,7 @@ function renderDashboard(data) {
                                             </td>
                                             <td class="numeric">${formatNumber(agent.conversations)}</td>
                                             <td class="numeric">${formatNumber(agent.messages)}</td>
-                                            <td class="numeric">${agent.avg_messages_per_conversation?.toFixed(1) || '-'}</td>
+                                            <td class="numeric">${formatDecimal(agent.avg_messages_per_conversation, 1, '-')}</td>
                                         </tr>
                                     `).join('')}
                                 </tbody>
@@ -491,7 +491,7 @@ function renderDashboard(data) {
                                     ${workspaceSummary.workspaces.slice(0, 10).map(ws => `
                                         <tr>
                                             <td>
-                                                <span class="workspace-name" title="${escapeHtml(ws.path)}">
+                                                <span class="workspace-name" title="${escapeAttribute(ws.path)}">
                                                     ${escapeHtml(ws.display_name)}
                                                 </span>
                                             </td>
@@ -545,9 +545,12 @@ function renderDashboard(data) {
  * @returns {string} HTML string
  */
 function renderOverviewCard(label, value, id) {
+    const displayValue = typeof value === 'number'
+        ? formatNumber(value)
+        : escapeHtml(value);
     return `
         <div class="stat-card" role="listitem">
-            <div class="stat-card-value" id="${id}">${typeof value === 'number' ? formatNumber(value) : value}</div>
+            <div class="stat-card-value" id="${escapeAttribute(id)}">${displayValue}</div>
             <div class="stat-card-label">${escapeHtml(label)}</div>
         </div>
     `;
@@ -561,8 +564,10 @@ function renderOverviewCard(label, value, id) {
 function renderTimeSpan(timeRange) {
     if (!timeRange.earliest || !timeRange.latest) return '';
 
-    const earliest = new Date(timeRange.earliest);
-    const latest = new Date(timeRange.latest);
+    const earliest = parseValidDate(timeRange.earliest);
+    const latest = parseValidDate(timeRange.latest);
+    if (!earliest || !latest) return '';
+
     const days = Math.ceil((latest - earliest) / (1000 * 60 * 60 * 24));
 
     if (days === 0) return '<span class="time-span-badge">Same day</span>';
@@ -611,7 +616,11 @@ function formatTimelineViewLabel(view) {
  * @returns {string} SVG HTML string
  */
 function renderTimelineChart(timeline, view = currentTimelineView) {
-    const data = getTimelineEntries(timeline, view);
+    const data = getTimelineEntries(timeline, view).map((entry) => ({
+        ...entry,
+        messages: toNonNegativeNumber(entry?.messages),
+        conversations: toNonNegativeNumber(entry?.conversations),
+    }));
     if (data.length === 0) {
         return '<p class="no-data">No timeline data available</p>';
     }
@@ -635,11 +644,15 @@ function renderTimelineChart(timeline, view = currentTimelineView) {
         const x = padding + i * (barWidth + barSpacing);
         const y = padding + chartHeight - barHeight;
 
+        const label = getTimelineLabel(d);
+        const ariaLabel = `${label}: ${formatNumber(d.messages)} messages`;
+        const title = `${label}: ${formatNumber(d.messages)} messages, ${formatNumber(d.conversations)} conversations`;
+
         return `
             <rect x="${x}" y="${y}" width="${barWidth}" height="${barHeight}"
                   class="timeline-bar" data-messages="${d.messages}" data-conversations="${d.conversations}"
-                  aria-label="${getTimelineLabel(d)}: ${d.messages} messages">
-                <title>${getTimelineLabel(d)}: ${d.messages} messages, ${d.conversations} conversations</title>
+                  aria-label="${escapeAttribute(ariaLabel)}">
+                <title>${escapeHtml(title)}</title>
             </rect>
         `;
     }).join('');
@@ -676,9 +689,9 @@ function renderTimelineChart(timeline, view = currentTimelineView) {
  * @returns {string} Label
  */
 function getTimelineLabel(d) {
-    if (d.date) return d.date;
-    if (d.week) return d.week;
-    if (d.month) return d.month;
+    if (d?.date !== undefined && d.date !== null) return String(d.date);
+    if (d?.week !== undefined && d.week !== null) return String(d.week);
+    if (d?.month !== undefined && d.month !== null) return String(d.month);
     return '';
 }
 
@@ -688,11 +701,25 @@ function getTimelineLabel(d) {
  * @returns {string} HTML string
  */
 function renderTermsCloud(terms) {
-    const maxCount = Math.max(...terms.map(t => t[1]));
-    const minCount = Math.min(...terms.map(t => t[1]));
+    const normalizedTerms = terms
+        .slice(0, 30)
+        .map((termEntry) => {
+            if (Array.isArray(termEntry)) {
+                return [termEntry[0], toNonNegativeNumber(termEntry[1])];
+            }
+            return [termEntry, 0];
+        })
+        .filter(([term]) => term !== undefined && term !== null && String(term).length > 0);
+
+    if (normalizedTerms.length === 0) {
+        return '';
+    }
+
+    const maxCount = Math.max(...normalizedTerms.map(t => t[1]));
+    const minCount = Math.min(...normalizedTerms.map(t => t[1]));
     const range = maxCount - minCount || 1;
 
-    return terms.slice(0, 30).map(([term, count]) => {
+    return normalizedTerms.map(([term, count]) => {
         const size = 0.8 + ((count - minCount) / range) * 0.6; // 0.8em to 1.4em
         const opacity = 0.6 + ((count - minCount) / range) * 0.4; // 0.6 to 1.0
 
@@ -700,7 +727,7 @@ function renderTermsCloud(terms) {
             <span class="term-tag" role="listitem"
                   data-term-size="${size.toFixed(3)}"
                   data-term-opacity="${opacity.toFixed(3)}"
-                  title="${count} occurrences">
+                  title="${escapeAttribute(`${formatNumber(count)} occurrences`)}">
                 ${escapeHtml(term)}
             </span>
         `;
@@ -713,10 +740,12 @@ function renderTermsCloud(terms) {
  * @returns {string} HTML string
  */
 function renderRoleBars(roles) {
-    const total = Object.values(roles).reduce((sum, count) => sum + count, 0);
+    const roleEntries = Object.entries(roles)
+        .map(([role, count]) => [role, toNonNegativeNumber(count)]);
+    const total = roleEntries.reduce((sum, [, count]) => sum + count, 0);
     if (total === 0) return '';
 
-    return Object.entries(roles)
+    return roleEntries
         .sort((a, b) => b[1] - a[1])
         .map(([role, count]) => {
             const percent = (count / total * 100).toFixed(1);
@@ -815,7 +844,9 @@ function toCssSlug(value, fallback = 'unknown') {
 function formatDate(timestamp) {
     if (!timestamp) return 'Unknown';
 
-    const date = new Date(timestamp);
+    const date = parseValidDate(timestamp);
+    if (!date) return 'Unknown';
+
     return date.toLocaleDateString(undefined, {
         year: 'numeric',
         month: 'short',
@@ -831,7 +862,9 @@ function formatDate(timestamp) {
 function formatRelativeTime(timestamp) {
     if (!timestamp) return '';
 
-    const date = new Date(timestamp);
+    const date = parseValidDate(timestamp);
+    if (!date) return '';
+
     const now = new Date();
     const diff = now - date;
 
@@ -854,8 +887,29 @@ function formatRelativeTime(timestamp) {
  * @returns {string} Formatted number
  */
 function formatNumber(num) {
-    if (num === undefined || num === null) return '0';
-    return num.toLocaleString();
+    return toFiniteNumber(num).toLocaleString();
+}
+
+function formatDecimal(value, digits = 1, fallback = '-') {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+        return fallback;
+    }
+    return number.toFixed(digits);
+}
+
+function toFiniteNumber(value, fallback = 0) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+}
+
+function toNonNegativeNumber(value, fallback = 0) {
+    return Math.max(0, toFiniteNumber(value, fallback));
+}
+
+function parseValidDate(timestamp) {
+    const date = new Date(timestamp);
+    return Number.isFinite(date.getTime()) ? date : null;
 }
 
 /**
@@ -864,10 +918,16 @@ function formatNumber(num) {
  * @returns {string} Escaped text
  */
 function escapeHtml(text) {
-    if (!text) return '';
+    if (text === undefined || text === null) return '';
     const div = document.createElement('div');
-    div.textContent = text;
+    div.textContent = String(text);
     return div.innerHTML;
+}
+
+function escapeAttribute(text) {
+    return escapeHtml(text)
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 /**

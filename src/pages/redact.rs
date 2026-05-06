@@ -210,7 +210,7 @@ impl RedactionEngine {
                     if userinfo.is_empty() {
                         format!("{scheme}://[HOST_REDACTED]{port}")
                     } else {
-                        format!("{scheme}://{userinfo}@[HOST_REDACTED]{port}")
+                        format!("{scheme}://[USERINFO_REDACTED]@[HOST_REDACTED]{port}")
                     }
                 })
                 .to_string();
@@ -275,7 +275,7 @@ static EMAIL_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
 
 static URL_HOST_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
     Regex::new(
-        r"(?i)\b(?P<scheme>https?|ssh|wss?)://(?:(?P<userinfo>[A-Z0-9._%+-]+)@)?(?P<host>[A-Z0-9][A-Z0-9.-]*\.[A-Z]{2,})(?P<port>:\d+)?",
+        r"(?i)\b(?P<scheme>https?|ssh|wss?)://(?:(?P<userinfo>[^\s/@]+)@)?(?P<host>[A-Z0-9][A-Z0-9.-]*\.[A-Z]{2,})(?P<port>:\d+)?",
     )
     .expect("URL hostname redaction regex must compile")
 });
@@ -548,6 +548,31 @@ mod tests {
                 .iter()
                 .any(|change| change.kind == RedactionKind::Hostname)
         );
+    }
+
+    #[test]
+    fn test_hostname_redaction_redacts_url_userinfo() {
+        let config = RedactionConfig {
+            redact_hostnames: true,
+            redact_emails: false,
+            ..Default::default()
+        };
+        let engine = RedactionEngine::new(config);
+
+        let token_result = engine.redact_text("Fetch https://token@internal.example.corp/api");
+        assert_eq!(
+            token_result.output,
+            "Fetch https://[USERINFO_REDACTED]@[HOST_REDACTED]/api"
+        );
+        assert!(!token_result.output.contains("token"));
+
+        let password_result =
+            engine.redact_text("Clone ssh://alice:secret@git.internal.example.corp:2222/repo");
+        assert_eq!(
+            password_result.output,
+            "Clone ssh://[USERINFO_REDACTED]@[HOST_REDACTED]:2222/repo"
+        );
+        assert!(!password_result.output.contains("alice:secret"));
     }
 
     #[test]

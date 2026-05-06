@@ -44,6 +44,29 @@ mod tests {
         Ok(())
     }
 
+    const EXPECTED_PAGE_ASSETS: &[&str] = &[
+        "index.html",
+        "styles.css",
+        "auth.js",
+        "password-strength.js",
+        "viewer.js",
+        "router.js",
+        "share.js",
+        "stats.js",
+        "storage.js",
+        "search.js",
+        "conversation.js",
+        "database.js",
+        "session.js",
+        "sw.js",
+        "sw-register.js",
+        "crypto_worker.js",
+        "virtual-list.js",
+        "coi-detector.js",
+        "attachments.js",
+        "settings.js",
+    ];
+
     #[test]
     fn test_bundle_creates_directory_structure() -> Result<()> {
         let temp = TempDir::new()?;
@@ -88,25 +111,12 @@ mod tests {
         // Verify required files exist
         let site_dir = &result.site_dir;
 
-        // Web assets
-        assert!(
-            site_dir.join("index.html").exists(),
-            "index.html should exist"
-        );
-        assert!(
-            site_dir.join("styles.css").exists(),
-            "styles.css should exist"
-        );
-        assert!(site_dir.join("auth.js").exists(), "auth.js should exist");
-        assert!(
-            site_dir.join("viewer.js").exists(),
-            "viewer.js should exist"
-        );
-        assert!(
-            site_dir.join("search.js").exists(),
-            "search.js should exist"
-        );
-        assert!(site_dir.join("sw.js").exists(), "sw.js should exist");
+        for expected_asset in EXPECTED_PAGE_ASSETS {
+            assert!(
+                site_dir.join(*expected_asset).exists(),
+                "{expected_asset} should exist"
+            );
+        }
 
         // Static files
         assert!(
@@ -221,23 +231,22 @@ mod tests {
         let manifest: IntegrityManifest = serde_json::from_str(&integrity_content)?;
 
         assert_eq!(manifest.version, 1);
-        // BundleBuilder embeds a fixed set of static assets from
-        // src/pages/bundle.rs::PAGES_ASSETS (index.html + 14 JS/CSS
-        // modules = 15 assets) plus whatever payload chunks the
-        // encrypted archive produced. A manifest with fewer than 15
-        // entries means the asset-embedding step silently dropped
-        // files — `!is_empty()` would silently accept a broken 1-file
-        // bundle.
+        // BundleBuilder embeds every first-party page asset from
+        // src/pages/bundle.rs::PAGES_ASSETS plus whatever payload chunks the
+        // encrypted archive produced. Missing an imported module produces a
+        // deployable bundle whose viewer fails only at browser runtime, so the
+        // test names the complete asset set instead of checking a loose count.
         assert!(
-            manifest.files.len() >= 15,
-            "integrity manifest must list at least the 15 embedded \
+            manifest.files.len() >= EXPECTED_PAGE_ASSETS.len(),
+            "integrity manifest must list at least the {} embedded \
              PAGES_ASSETS + payload chunks; got {} entries: {:?}",
+            EXPECTED_PAGE_ASSETS.len(),
             manifest.files.len(),
             manifest.files.keys().collect::<Vec<_>>()
         );
-        for expected_asset in ["index.html", "styles.css", "sw.js", "viewer.js", "auth.js"] {
+        for expected_asset in EXPECTED_PAGE_ASSETS {
             assert!(
-                manifest.files.contains_key(expected_asset),
+                manifest.files.contains_key(*expected_asset),
                 "integrity manifest must list the expected static asset `{}`; \
                  got keys: {:?}",
                 expected_asset,
@@ -1414,7 +1423,9 @@ mod tests {
                 && stats_js
                     .contains("const selectedTimelineView = getSelectedTimelineView(timeline);")
                 && stats_js.contains("availableTimelineViews.length > 1")
-                && stats_js.contains("const data = getTimelineEntries(timeline, view);")
+                && stats_js
+                    .contains("const data = getTimelineEntries(timeline, view).map((entry) => ({")
+                && stats_js.contains("messages: toNonNegativeNumber(entry?.messages),")
                 && stats_js.contains(
                     "const availableViews = new Set(getAvailableTimelineViews(timeline));"
                 ),
@@ -1424,6 +1435,147 @@ mod tests {
             !stats_js.contains("timeline[currentTimelineView] || timeline.monthly || []"),
             "stats timeline rendering should not silently fall back to monthly data after the user selects an empty daily or weekly view"
         );
+    }
+
+    #[test]
+    fn test_stats_dashboard_escapes_malformed_precomputed_json_values() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                function escapeHtml(value) {
+                    return String(value)
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;');
+                }
+
+                class FixtureElement {
+                    constructor() {
+                        this._innerHTML = '';
+                    }
+
+                    set innerHTML(value) {
+                        this._innerHTML = String(value);
+                    }
+
+                    get innerHTML() {
+                        return this._innerHTML;
+                    }
+
+                    querySelectorAll() {
+                        return [];
+                    }
+
+                    querySelector() {
+                        return null;
+                    }
+                }
+
+                const originalDocument = globalThis.document;
+                const originalFetch = globalThis.fetch;
+                const container = new FixtureElement();
+
+                globalThis.document = {
+                    createElement() {
+                        const element = { _text: '' };
+                        Object.defineProperty(element, 'textContent', {
+                            set(value) {
+                                element._text = value === undefined || value === null ? '' : String(value);
+                            },
+                            get() {
+                                return element._text;
+                            },
+                        });
+                        Object.defineProperty(element, 'innerHTML', {
+                            get() {
+                                return escapeHtml(element._text);
+                            },
+                        });
+                        return element;
+                    },
+                    getElementById() {
+                        return null;
+                    },
+                };
+
+                const fixtures = new Map([
+                    ['statistics.json', {
+                        total_conversations: '<img src=x>',
+                        total_messages: '7<script>alert(2)</script>',
+                        total_characters: 'not-a-number',
+                        agents: { 'codex"><img src=x>': {} },
+                        roles: { 'user"><img src=x>': '4"><script>alert(4)</script>' },
+                        time_range: { earliest: 'invalid"><img src=x>', latest: 'also-invalid' },
+                        computed_at: 'invalid"><script>alert(6)</script>',
+                    }],
+                    ['timeline.json', {
+                        daily: [{
+                            date: '2026-01-01"><img src=x>',
+                            messages: 5,
+                            conversations: 2,
+                        }],
+                    }],
+                    ['agent_summary.json', {
+                        agents: [{
+                            name: 'codex"><img src=x>',
+                            conversations: '1<img src=x>',
+                            messages: '2<script>alert(11)</script>',
+                            avg_messages_per_conversation: 'not-a-number',
+                        }],
+                    }],
+                    ['workspace_summary.json', {
+                        workspaces: [{
+                            path: '/tmp/work"><img src=x>',
+                            display_name: 'work<script>alert(13)</script>',
+                            conversations: '3<img src=x>',
+                            messages: '4<script>alert(14)</script>',
+                        }],
+                    }],
+                    ['top_terms.json', {
+                        terms: [['term"><img src=x>', '6"><script>alert(16)</script>']],
+                    }],
+                ]);
+
+                globalThis.fetch = async (url) => {
+                    const key = String(url).split('/').pop();
+                    if (!fixtures.has(key)) {
+                        throw new Error(`unexpected fetch: ${url}`);
+                    }
+                    return {
+                        ok: true,
+                        status: 200,
+                        json: async () => fixtures.get(key),
+                    };
+                };
+
+                try {
+                    const { initStats, renderStatsDashboard, clearStatsCache } = await import('./src/pages_assets/stats.js');
+
+                    clearStatsCache();
+                    initStats(container);
+                    await renderStatsDashboard();
+
+                    const html = container.innerHTML;
+                    for (const needle of ['<img', '<script', 'NaN']) {
+                        if (html.includes(needle)) {
+                            throw new Error(`stats dashboard leaked unsafe token ${needle}: ${html}`);
+                        }
+                    }
+                    for (const needle of ['&lt;img', '&lt;script', '&quot;', '<svg']) {
+                        if (!html.includes(needle)) {
+                            throw new Error(`expected sanitized dashboard token ${needle}, got: ${html}`);
+                        }
+                    }
+                    if (!html.includes('<td class="numeric">-</td>')) {
+                        throw new Error(`expected malformed average to render as fallback, got: ${html}`);
+                    }
+
+                    clearStatsCache();
+                } finally {
+                    globalThis.document = originalDocument;
+                    globalThis.fetch = originalFetch;
+                }
+            "#,
+        )
     }
 
     #[test]
