@@ -113,8 +113,15 @@ impl TraceWriter {
             ));
         }
 
-        let render_file = render_path.map(open_trace_output).transpose()?;
-        let events_file = events_path.map(open_trace_output).transpose()?;
+        if let Some(path) = render_path {
+            ensure_trace_output_available(path)?;
+        }
+        if let Some(path) = events_path {
+            ensure_trace_output_available(path)?;
+        }
+
+        let render_file = render_path.map(create_trace_output).transpose()?;
+        let events_file = events_path.map(create_trace_output).transpose()?;
         Ok(Self {
             render_file,
             events_file,
@@ -193,7 +200,7 @@ impl TraceWriter {
     }
 }
 
-fn open_trace_output(path: &Path) -> std::io::Result<std::io::BufWriter<std::fs::File>> {
+fn ensure_trace_output_available(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {
             return Err(Error::new(
@@ -204,7 +211,11 @@ fn open_trace_output(path: &Path) -> std::io::Result<std::io::BufWriter<std::fs:
         Err(err) if err.kind() == ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
+    Ok(())
+}
 
+fn create_trace_output(path: &Path) -> std::io::Result<std::io::BufWriter<std::fs::File>> {
+    ensure_trace_output_available(path)?;
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -234,14 +245,20 @@ pub fn write_trace_bundle(
 ) -> std::io::Result<()> {
     ensure_trace_bundle_dir(bundle_dir)?;
 
-    // System info
     let sys_path = bundle_dir.join("system_info.json");
-    let mut sys_file = open_trace_output(&sys_path)?;
+    let state_path = tui_state_json.map(|_| bundle_dir.join("tui_state.json"));
+    ensure_trace_output_available(&sys_path)?;
+    if let Some(path) = &state_path {
+        ensure_trace_output_available(path)?;
+    }
+
+    // System info
+    let mut sys_file = create_trace_output(&sys_path)?;
     serde_json::to_writer_pretty(&mut sys_file, system_info)?;
 
     // TUI state
-    if let Some(state) = tui_state_json {
-        let mut state_file = open_trace_output(&bundle_dir.join("tui_state.json"))?;
+    if let (Some(state), Some(state_path)) = (tui_state_json, state_path) {
+        let mut state_file = create_trace_output(&state_path)?;
         state_file.write_all(state.as_bytes())?;
     }
 
@@ -491,6 +508,29 @@ mod tests {
     }
 
     #[test]
+    fn trace_writer_refuses_existing_event_path_without_creating_render_output() {
+        let tmp = TempDir::new().unwrap();
+        let render_path = tmp.path().join("render.trace.jsonl");
+        let events_path = tmp.path().join("events.trace.jsonl");
+        std::fs::write(&events_path, "existing events").unwrap();
+
+        let err = match TraceWriter::open(Some(&render_path), Some(&events_path)) {
+            Ok(_) => panic!("expected existing event trace output to be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert!(
+            !render_path.exists(),
+            "render trace should not be created when event trace preflight fails"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&events_path).unwrap(),
+            "existing events"
+        );
+    }
+
+    #[test]
     fn trace_writer_refuses_shared_render_and_event_path() {
         let tmp = TempDir::new().unwrap();
         let trace_path = tmp.path().join("trace.jsonl");
@@ -576,6 +616,27 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "rejected trace bundle symlink should remain untouched"
+        );
+    }
+
+    #[test]
+    fn write_trace_bundle_refuses_existing_state_without_creating_system_info() {
+        let tmp = TempDir::new().unwrap();
+        let bundle_dir = tmp.path().join("bundle");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        let state_path = bundle_dir.join("tui_state.json");
+        std::fs::write(&state_path, "existing state").unwrap();
+
+        let err = write_trace_bundle(&bundle_dir, &SystemInfo::capture(), Some("{}")).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert!(
+            !bundle_dir.join("system_info.json").exists(),
+            "system_info should not be created when state preflight fails"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            "existing state"
         );
     }
 
