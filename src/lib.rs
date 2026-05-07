@@ -65788,6 +65788,33 @@ fn strip_stdin_line_ending(mut input: String) -> String {
     input
 }
 
+fn create_unique_export_output_file(
+    output_directory: &Path,
+    final_filename: &str,
+    output_path: &mut PathBuf,
+) -> io::Result<std::fs::File> {
+    const OUTPUT_CREATE_ATTEMPTS: usize = 1000;
+
+    for _ in 0..OUTPUT_CREATE_ATTEMPTS {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output_path.as_path())
+        {
+            Ok(file) => return Ok(file),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                *output_path = html_export::unique_filename(output_directory, final_filename);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("could not reserve a unique output filename after {OUTPUT_CREATE_ATTEMPTS} tries"),
+    ))
+}
+
 #[cfg(test)]
 mod export_html_password_tests {
     use super::strip_stdin_line_ending;
@@ -65871,7 +65898,6 @@ fn run_export_html(
         ExportOptions as HtmlExportOptions, HtmlExporter, Message, TemplateMetadata,
         generate_full_filename, get_downloads_dir, is_valid_filename, unique_filename,
     };
-    use std::fs::OpenOptions;
     use std::io::{self, Write};
 
     if let Some(source_id) = source_id {
@@ -66408,7 +66434,7 @@ fn run_export_html(
         return Err(err);
     }
 
-    let output_path = unique_filename(&output_directory, &final_filename);
+    let mut output_path = unique_filename(&output_directory, &final_filename);
 
     // Estimate file size (rough: 200 bytes per message + overhead)
     let estimated_size = message_count * 200 + 15000;
@@ -66508,24 +66534,22 @@ fn run_export_html(
         emit_structured_error(&err);
         err
     })?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&output_path)
-        .map_err(|e| {
-            let err = CliError {
-                code: 4,
-                kind: CliErrorKind::OutputNotWritable.kind_str(),
-                message: format!("Could not create output file: {e}"),
-                hint: Some(format!(
-                    "Check permissions for {}",
-                    output_directory.display()
-                )),
-                retryable: false,
-            };
-            emit_structured_error(&err);
-            err
-        })?;
+    let mut file =
+        create_unique_export_output_file(&output_directory, &final_filename, &mut output_path)
+            .map_err(|e| {
+                let err = CliError {
+                    code: 4,
+                    kind: CliErrorKind::OutputNotWritable.kind_str(),
+                    message: format!("Could not create output file: {e}"),
+                    hint: Some(format!(
+                        "Check permissions for {}",
+                        output_directory.display()
+                    )),
+                    retryable: false,
+                };
+                emit_structured_error(&err);
+                err
+            })?;
     file.write_all(html.as_bytes()).map_err(|e| {
         let err = CliError {
             code: 4,
@@ -67177,9 +67201,10 @@ mod opencode_export_tests {
 
 #[cfg(test)]
 mod export_timestamp_tests {
-    use super::{extract_message_timestamp, run_export_html};
+    use super::{create_unique_export_output_file, extract_message_timestamp, run_export_html};
     use serde_json::json;
     use std::fs;
+    use std::io::Write;
     use tempfile::TempDir;
 
     #[test]
@@ -67294,6 +67319,33 @@ mod export_timestamp_tests {
         let actual_output = temp.path().join("out_1.html");
         let html = fs::read_to_string(&actual_output).expect("read suffixed export");
         assert!(html.contains("safe exported response"));
+    }
+
+    #[test]
+    fn export_output_file_retries_when_preselected_path_now_exists() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut output_path = temp.path().join("out.html");
+
+        fs::write(&output_path, "first writer").expect("create race winner");
+
+        let mut file = create_unique_export_output_file(temp.path(), "out.html", &mut output_path)
+            .expect("retry with suffixed filename");
+        file.write_all(b"second writer")
+            .expect("write retry output");
+        drop(file);
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("out.html")).expect("read original"),
+            "first writer"
+        );
+        assert_eq!(
+            output_path.file_name().and_then(|name| name.to_str()),
+            Some("out_1.html")
+        );
+        assert_eq!(
+            fs::read_to_string(&output_path).expect("read retry output"),
+            "second writer"
+        );
     }
 
     #[test]
