@@ -924,8 +924,12 @@ const COMPONENT_STYLES: &str = r#"
   border-style: solid;
 }
 
-/* Expanded state for overflow - show all badges */
-.message-header-right.expanded .tool-badge {
+/* Overflowed badges stay in the DOM so expansion can reveal them. */
+.tool-badge.tool-overflow-extra {
+  display: none;
+}
+
+.message-header-right.expanded .tool-overflow-extra {
   display: inline-flex;
 }
 
@@ -1785,6 +1789,16 @@ mod tests {
 
         // Overflow badge
         assert!(bundle.critical_css.contains(".tool-overflow"));
+        assert!(
+            bundle
+                .critical_css
+                .contains(".tool-badge.tool-overflow-extra")
+        );
+        assert!(
+            bundle
+                .critical_css
+                .contains(".message-header-right.expanded .tool-overflow-extra")
+        );
     }
 
     #[test]

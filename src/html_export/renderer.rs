@@ -796,15 +796,17 @@ fn render_tool_badges_with_overflow(
         // Render all badges
         let badges: String = tools
             .iter()
-            .map(render_single_tool_badge)
+            .map(|tool| render_single_tool_badge(tool, false))
             .collect::<Vec<_>>()
             .join("\n                        ");
         (badges, 0)
     } else {
-        // Render first N badges + overflow indicator
-        let visible: String = tools[..MAX_VISIBLE_BADGES]
+        // Render all badges so the overflow control can reveal the extra tools.
+        // The extra badges are hidden by CSS until the header is expanded.
+        let badges: String = tools
             .iter()
-            .map(render_single_tool_badge)
+            .enumerate()
+            .map(|(idx, tool)| render_single_tool_badge(tool, idx >= MAX_VISIBLE_BADGES))
             .collect::<Vec<_>>()
             .join("\n                        ");
 
@@ -821,19 +823,24 @@ fn render_tool_badges_with_overflow(
         );
 
         (
-            format!("{}\n                        {}", visible, overflow_badge),
+            format!("{}\n                        {}", badges, overflow_badge),
             overflow_count,
         )
     }
 }
 
 /// Render a single tool badge as a button with Lucide SVG icon.
-fn render_single_tool_badge(tool: &ToolCallWithResult) -> String {
+fn render_single_tool_badge(tool: &ToolCallWithResult, overflow_extra: bool) -> String {
     let icon = get_tool_lucide_icon(&tool.call.name);
     let status = tool.effective_status();
     let status_class = status.css_class();
     let status_label = status.label();
     let status_icon = status.icon_svg();
+    let overflow_extra_class = if overflow_extra {
+        " tool-overflow-extra"
+    } else {
+        ""
+    };
 
     // Format input/output for popover (full content, pretty-printed if JSON)
     let formatted_input = format_json_or_raw(&tool.call.input);
@@ -871,7 +878,7 @@ fn render_single_tool_badge(tool: &ToolCallWithResult) -> String {
     };
 
     format!(
-        r#"<button class="tool-badge {status_class}"
+        r#"<button class="tool-badge {status_class}{overflow_extra_class}"
                 aria-label="{name}: {status_label}"
                 aria-expanded="false"
                 data-tool-name="{name}">
@@ -883,6 +890,7 @@ fn render_single_tool_badge(tool: &ToolCallWithResult) -> String {
             </div>
         </button>"#,
         status_class = status_class,
+        overflow_extra_class = overflow_extra_class,
         name = super::template::html_escape(&tool.call.name),
         status_label = status_label,
         icon = icon,
@@ -1843,9 +1851,13 @@ mod tests {
         let opts = RenderOptions::default();
         let (html, overflow) = render_tool_badges_with_overflow(&tools, &opts);
 
-        // Should show MAX_VISIBLE_BADGES badges
+        // Should render all badges and hide extras until the overflow control expands them.
         assert!(overflow > 0, "Should have overflow");
         assert_eq!(overflow, tools.len() - MAX_VISIBLE_BADGES);
+        for name in tool_names {
+            assert!(html.contains(name), "overflow HTML should retain {name}");
+        }
+        assert_eq!(html.matches("tool-overflow-extra").count(), overflow);
 
         // Should have overflow badge
         assert!(html.contains("tool-overflow"));
@@ -1872,7 +1884,7 @@ mod tests {
     #[test]
     fn test_render_single_tool_badge_success() {
         let tool = test_tool_call_with_result("Bash", ToolStatus::Success);
-        let html = render_single_tool_badge(&tool);
+        let html = render_single_tool_badge(&tool, false);
 
         assert!(html.contains("tool-badge"));
         assert!(html.contains("tool-status-success"));
@@ -1884,7 +1896,7 @@ mod tests {
     #[test]
     fn test_render_single_tool_badge_error() {
         let tool = test_tool_call_with_result("Bash", ToolStatus::Error);
-        let html = render_single_tool_badge(&tool);
+        let html = render_single_tool_badge(&tool, false);
 
         assert!(html.contains("tool-status-error"));
         assert!(html.contains(r#"aria-label="Bash: error""#));
@@ -1893,11 +1905,20 @@ mod tests {
     #[test]
     fn test_render_single_tool_badge_with_inline_popover() {
         let tool = test_tool_call_with_result("Read", ToolStatus::Success);
-        let html = render_single_tool_badge(&tool);
+        let html = render_single_tool_badge(&tool, false);
 
         assert!(html.contains(r#"data-tool-name="Read""#));
         assert!(html.contains("tool-popover"));
         assert!(html.contains("tool-popover-label"));
+    }
+
+    #[test]
+    fn test_render_single_tool_badge_can_mark_overflow_extra() {
+        let tool = test_tool_call_with_result("Search", ToolStatus::Success);
+        let html = render_single_tool_badge(&tool, true);
+
+        assert!(html.contains(r#"class="tool-badge tool-status-success tool-overflow-extra""#));
+        assert!(html.contains(r#"data-tool-name="Search""#));
     }
 
     #[test]
@@ -2054,7 +2075,7 @@ mod tests {
         let mut call = test_tool_call("Bash");
         call.input = long_input;
         let tool = ToolCallWithResult::new(call);
-        let html = render_single_tool_badge(&tool);
+        let html = render_single_tool_badge(&tool, false);
 
         // Inline popovers preserve full content (scrollable), no truncation
         assert!(html.contains("tool-popover-section"));
@@ -2064,7 +2085,7 @@ mod tests {
     #[test]
     fn test_tool_badge_accessibility() {
         let tool = test_tool_call_with_result("Read", ToolStatus::Success);
-        let html = render_single_tool_badge(&tool);
+        let html = render_single_tool_badge(&tool, false);
 
         // Must be a button (keyboard accessible)
         assert!(html.contains("<button"));
