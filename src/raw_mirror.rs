@@ -59,6 +59,7 @@ struct RawMirrorBlobCacheKey {
     source_identity: Option<String>,
     source_size_bytes: u64,
     source_mtime_ns: Option<u128>,
+    source_change_time_ns: Option<u128>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,6 +369,24 @@ fn source_identity_token(_metadata: &fs::Metadata) -> Option<String> {
     None
 }
 
+#[cfg(unix)]
+fn source_change_time_ns(metadata: &fs::Metadata) -> Option<u128> {
+    use std::os::unix::fs::MetadataExt;
+
+    let seconds = u128::try_from(metadata.ctime()).ok()?;
+    let nanoseconds = u128::try_from(metadata.ctime_nsec()).ok()?;
+    Some(
+        seconds
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nanoseconds),
+    )
+}
+
+#[cfg(not(unix))]
+fn source_change_time_ns(_metadata: &fs::Metadata) -> Option<u128> {
+    None
+}
+
 fn source_file_changed_during_capture(
     initial: &fs::Metadata,
     final_metadata: &fs::Metadata,
@@ -668,6 +687,7 @@ fn raw_mirror_blob_cache_key(
         source_identity: source_identity_token(source_metadata),
         source_size_bytes: source_metadata.len(),
         source_mtime_ns: source_metadata.modified().ok().and_then(system_time_to_ns),
+        source_change_time_ns: source_change_time_ns(source_metadata),
     }
 }
 
@@ -1385,6 +1405,63 @@ mod tests {
             "unexpected cached-blob error: {err:#}"
         );
         assert_eq!(fs::read(&source_path).expect("source bytes"), source_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_source_file_does_not_reuse_cache_after_same_size_mtime_preserving_rewrite() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("same-size-rewrite.jsonl");
+        let first_bytes = b"same length payload A\n";
+        let second_bytes = b"same length payload B\n";
+        fs::write(&source_path, first_bytes).expect("write first source");
+
+        let first_modified = fs::metadata(&source_path)
+            .expect("first metadata")
+            .modified()
+            .expect("first modified time");
+        let first = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("first capture");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(&source_path, second_bytes).expect("rewrite source");
+        let source = OpenOptions::new()
+            .write(true)
+            .open(&source_path)
+            .expect("open rewritten source");
+        source
+            .set_times(std::fs::FileTimes::new().set_modified(first_modified))
+            .expect("restore original mtime");
+
+        let second = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("second capture");
+
+        assert_ne!(first.blob_blake3, second.blob_blake3);
+        assert_eq!(
+            second.blob_blake3,
+            blake3::hash(second_bytes).to_hex().to_string()
+        );
+        assert_eq!(
+            fs::read(&source_path).expect("source bytes after rewrite"),
+            second_bytes
+        );
     }
 
     #[cfg(unix)]
