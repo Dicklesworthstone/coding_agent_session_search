@@ -266,3 +266,6 @@ tests/golden/**/*.actual
 # tracked corpus lives at fuzz/corpus/<target>/; this nested tree is a
 # regeneratable mirror of the same seed files.
 fuzz/fuzz/
+
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/
