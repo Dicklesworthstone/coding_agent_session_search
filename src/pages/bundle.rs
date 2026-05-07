@@ -407,6 +407,8 @@ fn bundle_sidecar_random_nonce() -> Result<u128> {
 }
 
 fn ensure_replaceable_bundle_output_dir(path: &Path) -> Result<bool> {
+    ensure_existing_parent_ancestors_are_real_dirs(path, "bundle output path")?;
+
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             let file_type = metadata.file_type();
@@ -428,6 +430,48 @@ fn ensure_replaceable_bundle_output_dir(path: &Path) -> Result<bool> {
         Err(err) => Err(err)
             .with_context(|| format!("failed inspecting bundle output path {}", path.display())),
     }
+}
+
+fn ensure_existing_parent_ancestors_are_real_dirs(path: &Path, label: &str) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    let mut ancestors = Vec::new();
+    let mut current = Some(parent);
+    while let Some(ancestor) = current {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        ancestors.push(ancestor.to_path_buf());
+        current = ancestor.parent();
+    }
+    ancestors.reverse();
+
+    for ancestor in ancestors {
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() {
+                    bail!(
+                        "{label} parent must not contain symlinks: {}",
+                        ancestor.display()
+                    );
+                }
+                if !file_type.is_dir() {
+                    bail!("{label} parent must be a directory: {}", ancestor.display());
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed inspecting {label} parent {}", ancestor.display())
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
@@ -906,6 +950,8 @@ pub(crate) fn write_private_fingerprint(private_dir: &Path, fingerprint: &str) -
 }
 
 fn ensure_private_artifact_dir(private_dir: &Path) -> Result<()> {
+    ensure_existing_parent_ancestors_are_real_dirs(private_dir, "private artifact directory")?;
+
     match fs::symlink_metadata(private_dir) {
         Ok(metadata) => {
             let file_type = metadata.file_type();
@@ -1426,6 +1472,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_private_artifacts_reject_symlinked_parent_before_writing() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let linked_parent = temp.path().join("linked-parent");
+        let private_dir = linked_parent.join("private");
+        symlink(outside_dir.path(), &linked_parent).unwrap();
+
+        let err = write_private_fingerprint(&private_dir, "fingerprint").unwrap_err();
+
+        assert!(
+            err.to_string().contains("parent must not contain symlinks"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            fs::read_dir(outside_dir.path()).unwrap().next().is_none(),
+            "private artifact writer must not create files through a symlinked parent"
+        );
+    }
+
+    #[test]
     fn test_generate_public_readme() {
         let readme = generate_public_readme("Test Archive", "A test archive", true);
         assert!(readme.contains("Test Archive"));
@@ -1844,6 +1913,34 @@ mod tests {
         assert!(
             !outside.path().join("site").exists(),
             "build must not write through a symlinked output directory"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_build_rejects_symlinked_output_parent_before_staging() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempDir::new().unwrap();
+        let output_parent = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let linked_parent = output_parent.path().join("linked-parent");
+        let output_dir = linked_parent.join("bundle");
+
+        write_unencrypted_source(source.path(), "data.db", "payload");
+        symlink(outside.path(), &linked_parent).unwrap();
+
+        let err = BundleBuilder::new()
+            .build(source.path(), output_dir.as_path(), |_, _| {})
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("parent must not contain symlinks"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "bundle builder must not stage output through a symlinked parent"
         );
     }
 
