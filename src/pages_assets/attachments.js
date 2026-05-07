@@ -26,7 +26,7 @@ let manifestLoadPromise = null;
 let manifestLoadEpoch = 0;
 let attachmentEpoch = 0;
 
-// Blob cache: hash -> { data: Uint8Array, objectUrl: string|null, size: number }
+// Blob cache: hash -> { data: Uint8Array, objectUrls: Map<string, string>, size: number }
 const blobCache = new Map();
 const blobLoadPromises = new Map();
 const blobUrlPromises = new Map();
@@ -283,15 +283,18 @@ export async function loadBlob(hash, dek, exportId) {
 export async function loadBlobAsUrl(hash, mimeType, dek, exportId) {
     const epoch = attachmentEpoch;
     const normalizedHash = normalizeBlobHash(hash);
+    const normalizedMimeType = normalizeAttachmentMimeType(mimeType);
+    const urlCacheKey = blobUrlCacheKey(normalizedHash, normalizedMimeType);
 
     // Check if we already have an object URL
     const cached = blobCache.get(normalizedHash);
-    if (cached?.objectUrl) {
+    const cachedUrl = cached?.objectUrls.get(normalizedMimeType);
+    if (cachedUrl) {
         updateLru(normalizedHash);
-        return cached.objectUrl;
+        return cachedUrl;
     }
 
-    const inFlight = blobUrlPromises.get(normalizedHash);
+    const inFlight = blobUrlPromises.get(urlCacheKey);
     if (inFlight?.epoch === epoch) {
         return inFlight.promise;
     }
@@ -302,13 +305,14 @@ export async function loadBlobAsUrl(hash, mimeType, dek, exportId) {
         const data = await loadBlob(normalizedHash, dek, exportId);
 
         const cachedEntry = blobCache.get(normalizedHash);
-        if (cachedEntry?.objectUrl) {
+        const existingUrl = cachedEntry?.objectUrls.get(normalizedMimeType);
+        if (existingUrl) {
             updateLru(normalizedHash);
-            return cachedEntry.objectUrl;
+            return existingUrl;
         }
 
         // Create object URL
-        const blob = new Blob([data], { type: mimeType });
+        const blob = new Blob([data], { type: normalizedMimeType });
         const url = URL.createObjectURL(blob);
 
         if (!isCurrentEpoch(epoch)) {
@@ -325,17 +329,17 @@ export async function loadBlobAsUrl(hash, mimeType, dek, exportId) {
             );
         }
 
-        cacheEntry.objectUrl = url;
+        cacheEntry.objectUrls.set(normalizedMimeType, url);
         updateLru(normalizedHash);
         return url;
     })().finally(() => {
-        const current = blobUrlPromises.get(normalizedHash);
+        const current = blobUrlPromises.get(urlCacheKey);
         if (current?.epoch === epoch && current.promise === urlPromise) {
-            blobUrlPromises.delete(normalizedHash);
+            blobUrlPromises.delete(urlCacheKey);
         }
     });
 
-    blobUrlPromises.set(normalizedHash, { epoch, promise: urlPromise });
+    blobUrlPromises.set(urlCacheKey, { epoch, promise: urlPromise });
     return urlPromise;
 }
 
@@ -400,6 +404,22 @@ function normalizeBlobHash(hash) {
     }
 
     return normalized;
+}
+
+function normalizeAttachmentMimeType(mimeType) {
+    const normalized = typeof mimeType === 'string'
+        ? mimeType.trim()
+        : String(mimeType ?? '').trim();
+
+    if (!normalized || /[\0\r\n]/.test(normalized)) {
+        throw new Error('Attachment MIME type must be non-empty without control characters');
+    }
+
+    return normalized;
+}
+
+function blobUrlCacheKey(hash, mimeType) {
+    return `${hash}\0${mimeType}`;
 }
 
 function validateManifest(rawManifest) {
@@ -472,7 +492,7 @@ function cacheBlob(hash, data) {
     // Add to cache
     blobCache.set(hash, {
         data,
-        objectUrl: null,
+        objectUrls: new Map(),
         size: data.length,
     });
     cacheSize += data.length;
@@ -499,9 +519,9 @@ function evictOldest() {
 
     const entry = blobCache.get(hash);
     if (entry) {
-        // Revoke object URL if present
-        if (entry.objectUrl) {
-            URL.revokeObjectURL(entry.objectUrl);
+        // Revoke object URLs if present
+        for (const objectUrl of entry.objectUrls.values()) {
+            URL.revokeObjectURL(objectUrl);
         }
         cacheSize -= entry.size;
         blobCache.delete(hash);
@@ -513,8 +533,8 @@ function evictOldest() {
  */
 export function clearCache() {
     for (const entry of blobCache.values()) {
-        if (entry.objectUrl) {
-            URL.revokeObjectURL(entry.objectUrl);
+        for (const objectUrl of entry.objectUrls.values()) {
+            URL.revokeObjectURL(objectUrl);
         }
     }
     blobCache.clear();
