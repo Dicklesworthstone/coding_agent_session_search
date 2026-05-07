@@ -27,6 +27,7 @@ const UNIX_INSTALL_ASSET: &str = "install.sh";
 #[cfg(any(test, target_os = "windows"))]
 const WINDOWS_INSTALL_ASSET: &str = "install.ps1";
 const CHECKSUMS_ASSET: &str = "SHA256SUMS.txt";
+const CHECKSUMS_ASSET_ALT: &str = "SHA256SUMS";
 
 fn updates_disabled() -> bool {
     dotenvy::var("CASS_SKIP_UPDATE").is_ok()
@@ -323,7 +324,9 @@ trap cleanup EXIT
 script="$tmp/install.sh"
 sums="$tmp/SHA256SUMS.txt"
 curl -fsSL "$1" -o "$script"
-curl -fsSL "$2" -o "$sums"
+if ! curl -fsSL "$2" -o "$sums"; then
+    curl -fsSL "$4" -o "$sums"
+fi
 
 expected="$(awk '$2 == "install.sh" { print $1; exit }' "$sums")"
 if ! printf '%s' "$expected" | grep -Eq '^[0-9a-fA-F]{64}$'; then
@@ -367,7 +370,11 @@ try {
     $Script = Join-Path $Temp "install.ps1"
     $Sums = Join-Path $Temp "SHA256SUMS.txt"
     Invoke-WebRequest -Uri $InstallUrl -OutFile $Script -UseBasicParsing
-    Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $Sums -UseBasicParsing
+    try {
+        Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $Sums -UseBasicParsing
+    } catch {
+        Invoke-WebRequest -Uri $args[3] -OutFile $Sums -UseBasicParsing
+    }
 
     $Expected = $null
     foreach ($Line in Get-Content -LiteralPath $Sums) {
@@ -412,6 +419,7 @@ pub fn run_self_update(version: &str) -> ! {
         use std::os::unix::process::CommandExt;
         let install_url = release_asset_url(version, UNIX_INSTALL_ASSET);
         let checksums_url = release_asset_url(version, CHECKSUMS_ASSET);
+        let checksums_alt_url = release_asset_url(version, CHECKSUMS_ASSET_ALT);
         // Use positional args instead of string interpolation to prevent injection.
         let err = std::process::Command::new("bash")
             .args([
@@ -421,6 +429,7 @@ pub fn run_self_update(version: &str) -> ! {
                 &install_url,
                 &checksums_url,
                 version,
+                &checksums_alt_url,
             ])
             .exec();
         // If we get here, exec failed
@@ -432,6 +441,7 @@ pub fn run_self_update(version: &str) -> ! {
     {
         let install_url = release_asset_url(version, WINDOWS_INSTALL_ASSET);
         let checksums_url = release_asset_url(version, CHECKSUMS_ASSET);
+        let checksums_alt_url = release_asset_url(version, CHECKSUMS_ASSET_ALT);
         // Windows doesn't have exec(), so we spawn and wait.
         let status = std::process::Command::new("powershell")
             .args([
@@ -443,6 +453,7 @@ pub fn run_self_update(version: &str) -> ! {
                 &install_url,
                 &checksums_url,
                 version,
+                &checksums_alt_url,
             ])
             .status();
         match status {
@@ -707,6 +718,12 @@ mod tests {
             release_asset_url("v1.2.3", CHECKSUMS_ASSET),
             format!("https://github.com/{GITHUB_REPO}/releases/download/v1.2.3/{CHECKSUMS_ASSET}")
         );
+        assert_eq!(
+            release_asset_url("v1.2.3", CHECKSUMS_ASSET_ALT),
+            format!(
+                "https://github.com/{GITHUB_REPO}/releases/download/v1.2.3/{CHECKSUMS_ASSET_ALT}"
+            )
+        );
     }
 
     #[test]
@@ -754,6 +771,10 @@ mod tests {
     fn test_unix_self_update_verifies_installer_script_before_running() {
         let script = unix_self_update_script();
         assert!(script.contains(CHECKSUMS_ASSET));
+        assert!(
+            script.contains(r#"curl -fsSL "$4" -o "$sums""#),
+            "Unix self-update should fall back to legacy SHA256SUMS asset URL"
+        );
         assert!(script.contains(&format!(r#"$2 == "{UNIX_INSTALL_ASSET}""#)));
         assert!(script.contains("sha256sum -c -"));
         assert!(script.contains("shasum -a 256"));
@@ -765,6 +786,10 @@ mod tests {
     fn test_windows_self_update_verifies_installer_script_before_running() {
         let script = windows_self_update_script();
         assert!(script.contains(CHECKSUMS_ASSET));
+        assert!(
+            script.contains("Invoke-WebRequest -Uri $args[3] -OutFile $Sums"),
+            "Windows self-update should fall back to legacy SHA256SUMS asset URL"
+        );
         assert!(script.contains(&format!(r#"$Parts[1] -eq "{WINDOWS_INSTALL_ASSET}""#)));
         assert!(script.contains("Get-FileHash"));
         assert!(script.contains("-EasyMode -Verify -Version $Version"));
