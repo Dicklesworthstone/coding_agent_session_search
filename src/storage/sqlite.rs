@@ -1078,9 +1078,14 @@ pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsC
 ///
 /// Returns the path to the backup file, or None if the source doesn't exist.
 pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, MigrationError> {
-    if !db_path.exists() {
+    if !bundle_path_exists(db_path)? {
         return Ok(None);
     }
+
+    if !copyable_bundle_file_exists(db_path)? {
+        return Ok(None);
+    }
+    let _ = copyable_bundle_sidecar_sources(db_path)?;
 
     let backup_path = unique_backup_path(db_path);
     let vacuum_stage_path = vacuum_stage_backup_path(&backup_path);
@@ -1116,30 +1121,11 @@ pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, Migra
         return Ok(Some(backup_path));
     }
 
-    // Fallback to filesystem copy if VACUUM INTO failed (e.g., older SQLite or corruption)
-    // We strictly assume this is a single-user tool; if another process is writing,
-    // this raw copy might be inconsistent, but it's better than nothing.
-    fs::copy(db_path, &backup_path)?;
-    sync_file_if_exists(&backup_path)?;
-
-    // Best-effort copy of WAL/SHM sidecar files if they exist
-    // SQLite sidecars are named: <path>-wal and <path>-shm
-    let wal_src = database_sidecar_path(db_path, "-wal");
-    let shm_src = database_sidecar_path(db_path, "-shm");
-
-    if wal_src.exists() {
-        let wal_backup = database_sidecar_path(&backup_path, "-wal");
-        let _ = fs::copy(&wal_src, &wal_backup);
-        let _ = sync_file_if_exists(&wal_backup);
-    }
-    if shm_src.exists() {
-        let shm_backup = database_sidecar_path(&backup_path, "-shm");
-        let _ = fs::copy(&shm_src, &shm_backup);
-        let _ = sync_file_if_exists(&shm_backup);
-    }
-    if let Some(parent) = backup_path.parent() {
-        sync_parent_directory(parent)?;
-    }
+    // Fallback to a raw evidence copy if VACUUM INTO failed (e.g., older SQLite
+    // or corruption). Keep this on the same symlink-safe bundle path as
+    // historical seeding so a malformed archive root cannot make us copy an
+    // arbitrary symlink target or publish a partial sidecar backup.
+    copy_database_bundle(db_path, &backup_path)?;
 
     Ok(Some(backup_path))
 }
@@ -1261,6 +1247,9 @@ fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<(
             source_root.display()
         );
     }
+
+    let sidecars = copyable_bundle_sidecar_sources(source_root)?;
+
     fs::copy(source_root, destination_root).with_context(|| {
         format!(
             "copying database bundle {} -> {}",
@@ -1275,11 +1264,7 @@ fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<(
         )
     })?;
 
-    for suffix in ["-wal", "-shm"] {
-        let source_sidecar = database_sidecar_path(source_root, suffix);
-        if !copyable_bundle_file_exists(&source_sidecar)? {
-            continue;
-        }
+    for (source_sidecar, suffix) in sidecars {
         let destination_sidecar = database_sidecar_path(destination_root, suffix);
         fs::copy(&source_sidecar, &destination_sidecar).with_context(|| {
             format!(
@@ -1302,6 +1287,17 @@ fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<(
     }
 
     Ok(())
+}
+
+fn copyable_bundle_sidecar_sources(source_root: &Path) -> Result<Vec<(PathBuf, &'static str)>> {
+    let mut sidecars = Vec::new();
+    for suffix in ["-wal", "-shm"] {
+        let source_sidecar = database_sidecar_path(source_root, suffix);
+        if copyable_bundle_file_exists(&source_sidecar)? {
+            sidecars.push((source_sidecar, suffix));
+        }
+    }
+    Ok(sidecars)
 }
 
 fn copyable_bundle_file_exists(path: &Path) -> Result<bool> {
@@ -14721,6 +14717,68 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn create_backup_rejects_symlink_root_during_raw_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside_db = dir.path().join("outside.db");
+        let db_path = dir.path().join("test.db");
+        std::fs::write(&outside_db, b"not sqlite").unwrap();
+        symlink(&outside_db, &db_path).unwrap();
+
+        let err = create_backup(&db_path).unwrap_err();
+
+        assert!(
+            err.to_string().contains("bundle symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(std::fs::read(&outside_db).unwrap(), b"not sqlite");
+        let backup_roots: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("test.db.backup."))
+            .collect();
+        assert!(
+            backup_roots.is_empty(),
+            "symlinked backup source must not publish backup roots: {backup_roots:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_backup_rejects_symlink_sidecar_without_partial_backup() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let outside_wal = dir.path().join("outside.wal");
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        std::fs::write(&db_path, b"not sqlite").unwrap();
+        std::fs::write(&outside_wal, b"outside wal").unwrap();
+        symlink(&outside_wal, &wal_path).unwrap();
+
+        let err = create_backup(&db_path).unwrap_err();
+
+        assert!(
+            err.to_string().contains("bundle symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(std::fs::read(&outside_wal).unwrap(), b"outside wal");
+        let backup_roots: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("test.db.backup."))
+            .collect();
+        assert!(
+            backup_roots.is_empty(),
+            "sidecar preflight failure must not leave a partial backup root: {backup_roots:?}"
+        );
+    }
+
     // =========================================================================
     // Backup cleanup tests (bead yln.4)
     // =========================================================================
@@ -15026,6 +15084,7 @@ mod tests {
             "unexpected error: {err:#}"
         );
         assert_eq!(std::fs::read(&outside_wal).unwrap(), b"outside wal");
+        assert!(!copied_path.exists());
         assert!(!database_sidecar_path(&copied_path, "-wal").exists());
     }
 
