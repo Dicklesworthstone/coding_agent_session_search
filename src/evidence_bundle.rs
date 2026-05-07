@@ -55,6 +55,7 @@ pub enum EvidenceBundleIssueKind {
     MissingChunk,
     SizeMismatch,
     DigestMismatch,
+    InvalidWalStateChunk,
     WalMainMismatch,
 }
 
@@ -375,20 +376,29 @@ fn verify_manifest(
         ));
     }
 
-    if let Some(wal_state) = &manifest.database_wal_state
-        && wal_state.wal_chunk_path.is_some()
-        && wal_state.wal_base_fingerprint.as_deref()
-            != Some(wal_state.main_state_fingerprint.as_str())
-    {
-        issues.push(issue(
-            EvidenceBundleIssueKind::WalMainMismatch,
-            wal_state.wal_chunk_path.clone(),
-            format!(
-                "WAL base fingerprint {:?} does not match main DB fingerprint {}",
-                wal_state.wal_base_fingerprint, wal_state.main_state_fingerprint
-            ),
-            false,
-        ));
+    if let Some(wal_state) = &manifest.database_wal_state {
+        validate_wal_state_chunk_declaration(
+            &mut issues,
+            manifest,
+            &wal_state.main_chunk_path,
+            "main DB",
+        );
+        if let Some(wal_chunk_path) = wal_state.wal_chunk_path.as_deref() {
+            validate_wal_state_chunk_declaration(&mut issues, manifest, wal_chunk_path, "WAL");
+            if wal_state.wal_base_fingerprint.as_deref()
+                != Some(wal_state.main_state_fingerprint.as_str())
+            {
+                issues.push(issue(
+                    EvidenceBundleIssueKind::WalMainMismatch,
+                    wal_state.wal_chunk_path.clone(),
+                    format!(
+                        "WAL base fingerprint {:?} does not match main DB fingerprint {}",
+                        wal_state.wal_base_fingerprint, wal_state.main_state_fingerprint
+                    ),
+                    false,
+                ));
+            }
+        }
     }
 
     let repairable_issue_count = issues.iter().filter(|issue| issue.repairable).count();
@@ -492,6 +502,32 @@ fn chunk_failure_is_repairable(
         .copied()
         .unwrap_or_default();
     failures_in_group > 0 && failures_in_group <= group.repairable_failed_chunks
+}
+
+fn validate_wal_state_chunk_declaration(
+    issues: &mut Vec<EvidenceBundleIssue>,
+    manifest: &EvidenceBundleManifest,
+    path: &str,
+    label: &str,
+) {
+    let Some(chunk) = manifest.chunks.iter().find(|chunk| chunk.path == path) else {
+        issues.push(issue(
+            EvidenceBundleIssueKind::InvalidWalStateChunk,
+            Some(path.to_string()),
+            format!("database_wal_state {label} chunk {path} is not declared in manifest chunks"),
+            false,
+        ));
+        return;
+    };
+
+    if !chunk.required {
+        issues.push(issue(
+            EvidenceBundleIssueKind::InvalidWalStateChunk,
+            Some(path.to_string()),
+            format!("database_wal_state {label} chunk {path} must be declared as required"),
+            false,
+        ));
+    }
 }
 
 fn issue(
@@ -826,6 +862,82 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.kind == EvidenceBundleIssueKind::WalMainMismatch)
+        );
+    }
+
+    #[test]
+    fn database_wal_state_rejects_undeclared_wal_chunk() {
+        let tmp = TempDir::new().unwrap();
+        write_chunk(tmp.path(), "db/cass.db", b"main db bytes");
+
+        let mut manifest = EvidenceBundleManifest::new(
+            "db-backup-undeclared-wal",
+            EvidenceBundleKind::DatabaseBackup,
+            1_700_000_000_003,
+        );
+        manifest.chunks = vec![chunk(
+            tmp.path(),
+            "db/cass.db",
+            EvidenceBundleChunkRole::DatabaseMain,
+        )];
+        manifest.database_wal_state = Some(DatabaseWalStateEvidence {
+            main_chunk_path: "db/cass.db".to_string(),
+            wal_chunk_path: Some("db/cass.db-wal".to_string()),
+            main_state_fingerprint: "main-fp".to_string(),
+            wal_base_fingerprint: Some("main-fp".to_string()),
+        });
+
+        let report = manifest.verify(tmp.path());
+        assert!(report.is_unsafe(), "{report:?}");
+        assert!(
+            report.issues.iter().any(|issue| {
+                issue.kind == EvidenceBundleIssueKind::InvalidWalStateChunk
+                    && issue.path.as_deref() == Some("db/cass.db-wal")
+            }),
+            "database_wal_state must not certify an undeclared WAL chunk: {report:?}"
+        );
+    }
+
+    #[test]
+    fn database_wal_state_rejects_optional_wal_chunk() {
+        let tmp = TempDir::new().unwrap();
+        write_chunk(tmp.path(), "db/cass.db", b"main db bytes");
+
+        let mut manifest = EvidenceBundleManifest::new(
+            "db-backup-optional-wal",
+            EvidenceBundleKind::DatabaseBackup,
+            1_700_000_000_003,
+        );
+        manifest.chunks = vec![
+            chunk(
+                tmp.path(),
+                "db/cass.db",
+                EvidenceBundleChunkRole::DatabaseMain,
+            ),
+            EvidenceBundleChunk {
+                path: "db/cass.db-wal".to_string(),
+                role: EvidenceBundleChunkRole::DatabaseWal,
+                size_bytes: 0,
+                blake3: blake3::hash(b"").to_hex().to_string(),
+                required: false,
+                parity_group: None,
+            },
+        ];
+        manifest.database_wal_state = Some(DatabaseWalStateEvidence {
+            main_chunk_path: "db/cass.db".to_string(),
+            wal_chunk_path: Some("db/cass.db-wal".to_string()),
+            main_state_fingerprint: "main-fp".to_string(),
+            wal_base_fingerprint: Some("main-fp".to_string()),
+        });
+
+        let report = manifest.verify(tmp.path());
+        assert!(report.is_unsafe(), "{report:?}");
+        assert!(
+            report.issues.iter().any(|issue| {
+                issue.kind == EvidenceBundleIssueKind::InvalidWalStateChunk
+                    && issue.path.as_deref() == Some("db/cass.db-wal")
+            }),
+            "database_wal_state WAL chunks must not be optional: {report:?}"
         );
     }
 
