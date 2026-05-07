@@ -70,14 +70,18 @@ impl SizeEstimate {
         let mut conditions = Vec::new();
         let mut param_values: Vec<ParamValue> = Vec::new();
 
-        if let Some(agents) = agents.filter(|a| !a.is_empty()) {
-            let placeholders: Vec<_> = agents.iter().map(|_| "?").collect();
-            conditions.push(format!(
-                "EXISTS (SELECT 1 FROM agents a WHERE a.id = c.agent_id AND a.slug IN ({}))",
-                placeholders.join(", ")
-            ));
-            for agent in agents {
-                param_values.push(ParamValue::from(agent.as_str()));
+        if let Some(agents) = agents {
+            if agents.is_empty() {
+                conditions.push("1=0".to_string());
+            } else {
+                let placeholders: Vec<_> = agents.iter().map(|_| "?").collect();
+                conditions.push(format!(
+                    "EXISTS (SELECT 1 FROM agents a WHERE a.id = c.agent_id AND a.slug IN ({}))",
+                    placeholders.join(", ")
+                ));
+                for agent in agents {
+                    param_values.push(ParamValue::from(agent.as_str()));
+                }
             }
         }
 
@@ -521,6 +525,11 @@ mod tests {
         assert_eq!(codex.conversation_count, 1);
         assert_eq!(codex.message_count, 1);
         assert_eq!(codex.plaintext_bytes, 9);
+
+        let empty_agent_filter = SizeEstimate::from_database(&db_path, Some(&[]), None, None)?;
+        assert_eq!(empty_agent_filter.conversation_count, 0);
+        assert_eq!(empty_agent_filter.message_count, 0);
+        assert_eq!(empty_agent_filter.plaintext_bytes, 0);
 
         let recent = SizeEstimate::from_database(&db_path, None, Some(1500), None)?;
         assert_eq!(recent.conversation_count, 1);

@@ -776,11 +776,7 @@ impl RemoteInstaller {
         matches!(member, "cass" | "./cass")
     }
 
-    fn build_prebuilt_binary_install_script(
-        url: &str,
-        checksum: &str,
-        has_curl: bool,
-    ) -> String {
+    fn build_prebuilt_binary_install_script(url: &str, checksum: &str, has_curl: bool) -> String {
         // Download into a secure mktemp directory (not predictable /tmp/), verify
         // checksum BEFORE extracting/installing, validate the archive layout, and
         // clean up temp files on exit.
@@ -1318,16 +1314,42 @@ mod tests {
     }
 
     #[test]
-    fn test_choose_method_prebuilt_binary() {
+    fn test_verified_prebuilt_binary_method_requires_checksum() {
+        assert_eq!(
+            RemoteInstaller::verified_prebuilt_binary_method(
+                "https://example.com/cass.tar.gz".into(),
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_verified_prebuilt_binary_method_preserves_verified_fast_path() {
+        let checksum = "a".repeat(64);
+        assert_eq!(
+            RemoteInstaller::verified_prebuilt_binary_method(
+                "https://example.com/cass.tar.gz".into(),
+                Some(checksum.clone()),
+            ),
+            Some(InstallMethod::PrebuiltBinary {
+                url: "https://example.com/cass.tar.gz".into(),
+                checksum: Some(checksum),
+            })
+        );
+    }
+
+    #[test]
+    fn test_choose_method_falls_back_to_cargo_when_prebuilt_checksum_is_unavailable() {
         let system = fixture_system_info();
         let resources = fixture_resources();
 
         let installer = RemoteInstaller::new("test", system, resources);
-        // With curl available, should prefer pre-built binary over cargo install
-        assert!(matches!(
+        assert_eq!(
             installer.choose_method(),
-            Some(InstallMethod::PrebuiltBinary { .. })
-        ));
+            Some(InstallMethod::CargoInstall),
+            "unverified prebuilt assets should be skipped in favor of a source install"
+        );
     }
 
     #[test]
@@ -1369,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn test_choose_method_still_uses_prebuilt_binary_on_low_memory_hosts() {
+    fn test_choose_method_refuses_unverified_prebuilt_on_low_memory_hosts() {
         let mut system = fixture_system_info();
         system.has_cargo = false;
         system.has_cargo_binstall = false;
@@ -1380,12 +1402,10 @@ mod tests {
 
         let installer = RemoteInstaller::new("test", system, resources);
 
-        assert!(
-            matches!(
-                installer.choose_method(),
-                Some(InstallMethod::PrebuiltBinary { .. })
-            ),
-            "low-memory hosts should still use non-compiling prebuilt installs when available"
+        assert_eq!(
+            installer.choose_method(),
+            None,
+            "low-memory hosts should fail before mutation when the only compatible path is an unverified prebuilt install"
         );
     }
 
@@ -1429,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn test_choose_method_prefers_prebuilt_over_low_memory_binstall() {
+    fn test_choose_method_skips_low_memory_binstall_and_unverified_prebuilt() {
         let mut system = fixture_system_info();
         system.has_cargo = true;
         system.has_cargo_binstall = true;
@@ -1440,12 +1460,10 @@ mod tests {
 
         let installer = RemoteInstaller::new("test", system, resources);
 
-        assert!(
-            matches!(
-                installer.choose_method(),
-                Some(InstallMethod::PrebuiltBinary { .. })
-            ),
-            "low-memory hosts with direct release assets should bypass cargo-binstall's source fallback"
+        assert_eq!(
+            installer.choose_method(),
+            None,
+            "low-memory hosts should not use cargo-binstall's source fallback or an unverified prebuilt install"
         );
     }
 
@@ -1812,7 +1830,7 @@ mod tests {
     fn test_prebuilt_install_script_validates_tar_members_before_extract() {
         let script = RemoteInstaller::build_prebuilt_binary_install_script(
             "https://example.com/cass.tar.gz",
-            Some(&"a".repeat(64)),
+            &"a".repeat(64),
             true,
         );
         let list_index = script.find("tar -tzf").expect("tar listing validation");
@@ -1833,7 +1851,7 @@ mod tests {
     fn test_prebuilt_install_script_quotes_url_and_fails_without_checksum_tool() {
         let script = RemoteInstaller::build_prebuilt_binary_install_script(
             "https://example.com/cass'$(touch /tmp/pwned)'.tar.gz",
-            Some(&"a".repeat(64)),
+            &"a".repeat(64),
             true,
         );
 
