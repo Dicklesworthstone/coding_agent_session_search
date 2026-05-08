@@ -249,10 +249,10 @@ echo "  - Running Crypto Vector tests..."
 run_cargo test --test crypto_vectors
 
 echo "  - Running cargo audit (if installed)..."
-if cargo audit --version >/dev/null 2>&1; then
-    cargo audit
+if run_cargo audit --version >/dev/null 2>&1; then
+    run_cargo audit
 else
-    echo "    (Skipping cargo audit: cargo-audit not installed)"
+    echo "    (Skipping cargo audit: cargo-audit not available through rch)"
 fi
 
 if [ -f "web/package.json" ]; then
