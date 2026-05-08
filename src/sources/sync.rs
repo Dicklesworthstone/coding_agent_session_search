@@ -166,6 +166,28 @@ fn parse_null_terminated_utf8_paths(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+fn validate_remote_sync_path_entry(index: usize, path: &str) -> Result<(), SyncError> {
+    if path.trim().is_empty() {
+        return Err(SyncError::InvalidPath(format!(
+            "paths[{index}] cannot be empty"
+        )));
+    }
+
+    if path.trim() != path {
+        return Err(SyncError::InvalidPath(format!(
+            "paths[{index}] cannot have leading or trailing whitespace"
+        )));
+    }
+
+    if path.chars().any(char::is_control) {
+        return Err(SyncError::InvalidPath(format!(
+            "paths[{index}] cannot contain control characters"
+        )));
+    }
+
+    Ok(())
+}
+
 fn remote_file_to_safe_local_path(
     remote_root: &Path,
     remote_file: &Path,
@@ -265,6 +287,9 @@ pub enum SyncError {
 
     #[error("Source has no paths configured")]
     NoPaths,
+
+    #[error("Invalid source path: {0}")]
+    InvalidPath(String),
 
     #[error("rsync command failed: {0}")]
     RsyncFailed(String),
@@ -625,6 +650,10 @@ impl SyncEngine {
 
         if source.paths.is_empty() {
             return Err(SyncError::NoPaths);
+        }
+
+        for (index, remote_path) in source.paths.iter().enumerate() {
+            validate_remote_sync_path_entry(index, remote_path)?;
         }
 
         let method = Self::detect_sync_method();
@@ -2764,6 +2793,40 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_source_rejects_invalid_remote_paths_before_transfer() {
+        let temp = TempDir::new().unwrap();
+        let engine = SyncEngine::new(temp.path());
+
+        for (path, expected) in [
+            ("", "paths[0] cannot be empty"),
+            ("   ", "paths[0] cannot be empty"),
+            (" ~/.claude/projects", "paths[0] cannot have leading"),
+            ("~/.claude/projects ", "paths[0] cannot have leading"),
+            ("~/.claude\nprojects", "paths[0] cannot contain control"),
+        ] {
+            let mut source = SourceDefinition::ssh("laptop", "user@laptop.local");
+            source.paths = vec![path.to_string()];
+
+            let err = engine.sync_source(&source).unwrap_err();
+            assert!(
+                matches!(err, SyncError::InvalidPath(ref message) if message.contains(expected)),
+                "expected invalid path rejection for {path:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_remote_sync_path_validation_allows_internal_spaces() {
+        assert!(
+            validate_remote_sync_path_entry(
+                0,
+                "~/Library/Application Support/Cursor/User/globalStorage"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn test_remote_find_regular_files_command_uses_physical_traversal() {
         assert_eq!(
             remote_find_regular_files_command("/tmp/has space"),
@@ -3573,6 +3636,10 @@ Total transferred file size: 1,234 bytes
         assert_eq!(
             SyncError::NoPaths.to_string(),
             "Source has no paths configured"
+        );
+        assert_eq!(
+            SyncError::InvalidPath("paths[0] cannot be empty".to_string()).to_string(),
+            "Invalid source path: paths[0] cannot be empty"
         );
         assert_eq!(
             SyncError::Timeout(30).to_string(),
