@@ -490,6 +490,7 @@ fn semantic_shard_ann_index_path(
         .join(format!("shard-{shard_index:05}.chsw"))
 }
 
+#[cfg(not(windows))]
 fn sync_parent_directory(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -499,6 +500,11 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
     directory
         .sync_all()
         .with_context(|| format!("syncing parent directory {}", parent.display()))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn semantic_doc_id_for_embedded(embedded: &EmbeddedMessage) -> String {
