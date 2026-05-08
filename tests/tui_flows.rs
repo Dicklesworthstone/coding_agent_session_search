@@ -1,7 +1,10 @@
 use coding_agent_search::ftui_harness;
 use coding_agent_search::model::types::{Conversation, Message, MessageRole, Snippet};
 use coding_agent_search::search::query::{MatchType, SearchHit};
-use coding_agent_search::ui::app::{AgentPane, CassApp, CassMsg, DetailTab, SearchPass};
+use coding_agent_search::ui::app::{
+    AgentPane, AppSurface, CassApp, CassMsg, DetailTab, SearchPass, SwarmCockpitSnapshot,
+    SwarmCockpitState,
+};
 use coding_agent_search::ui::data::ConversationView;
 use coding_agent_search::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Model, Modifiers};
 use coding_agent_search::ui::style_system::UiThemePreset;
@@ -187,6 +190,12 @@ fn install_single_result(app: &mut CassApp, hit: SearchHit, view: ConversationVi
     app.active_pane = 0;
 }
 
+fn install_swarm_payload(app: &mut CassApp, payload: serde_json::Value) {
+    app.surface = AppSurface::Swarm;
+    app.swarm_cockpit =
+        SwarmCockpitState::from_snapshot(SwarmCockpitSnapshot::from_status_payload(&payload));
+}
+
 #[test]
 fn search_to_detail_snippets_tab() {
     let _guard = tui_flow_guard();
@@ -311,4 +320,129 @@ fn keystroke_driven_command_palette() {
             "<Ctrl-P> theme <Enter>"
         )
     );
+}
+
+#[test]
+fn swarm_surface_empty_snapshot_is_idle_and_read_only() {
+    let _guard = tui_flow_guard();
+    let mut app = CassApp::default();
+    pin_dark_theme(&mut app);
+    app.surface = AppSurface::Swarm;
+
+    let text = render_app_text(&app, 100, 24);
+
+    assert!(text.contains("No swarm snapshot cached"));
+    assert!(text.contains("read-only surface"));
+    assert!(!text.contains("force-release"));
+    assert!(!text.contains("rm -rf"));
+    assert!(!text.contains("delete"));
+}
+
+#[test]
+fn swarm_surface_renders_active_swarm_counts_from_cached_payload() {
+    let _guard = tui_flow_guard();
+    let mut app = CassApp::default();
+    pin_dark_theme(&mut app);
+    install_swarm_payload(
+        &mut app,
+        serde_json::json!({
+            "status": "ok",
+            "summary": {
+                "ready_count": 2,
+                "in_progress_count": 1,
+                "blocked_count": 0,
+                "active_agent_count": 3,
+                "active_reservation_count": 1,
+                "stale_candidate_count": 0,
+                "stale_state_counts": {"active": 1, "recently_quiet": 0, "likely_stale": 0, "conflicting_evidence": 0, "manual_review_required": 0},
+                "proof_gap_count": 0,
+                "build_pressure": "none",
+                "recommended_action": "claim-ready-bead"
+            },
+            "evidence": {"proof_gaps": [], "redaction_applied": false},
+            "privacy": {"redaction_applied": false},
+            "providers": []
+        }),
+    );
+
+    let text = render_app_text(&app, 110, 24);
+
+    assert!(text.contains("ready:2"));
+    assert!(text.contains("agents:3"));
+    assert!(text.contains("reservations:1"));
+    assert!(text.contains("Queue"));
+    assert!(text.contains("in-progress 1"));
+    assert!(text.contains("Safety"));
+}
+
+#[test]
+fn swarm_surface_renders_stale_advisory_states() {
+    let _guard = tui_flow_guard();
+    let mut app = CassApp::default();
+    pin_dark_theme(&mut app);
+    install_swarm_payload(
+        &mut app,
+        serde_json::json!({
+            "status": "ok",
+            "summary": {
+                "ready_count": 0,
+                "in_progress_count": 4,
+                "blocked_count": 0,
+                "active_agent_count": 0,
+                "active_reservation_count": 0,
+                "stale_candidate_count": 1,
+                "stale_state_counts": {"active": 0, "recently_quiet": 1, "likely_stale": 1, "conflicting_evidence": 1, "manual_review_required": 1},
+                "proof_gap_count": 0,
+                "build_pressure": "none",
+                "recommended_action": "inspect-stale"
+            },
+            "evidence": {"proof_gaps": [], "redaction_applied": false},
+            "privacy": {"redaction_applied": false},
+            "providers": []
+        }),
+    );
+
+    let text = render_app_text(&app, 120, 24);
+
+    assert!(text.contains("stale:1"));
+    assert!(text.contains("quiet 1"));
+    assert!(text.contains("likely 1"));
+    assert!(text.contains("conflict 1"));
+    assert!(text.contains("manual 1"));
+}
+
+#[test]
+fn swarm_surface_renders_build_pressure_and_proof_gaps() {
+    let _guard = tui_flow_guard();
+    let mut app = CassApp::default();
+    pin_dark_theme(&mut app);
+    install_swarm_payload(
+        &mut app,
+        serde_json::json!({
+            "status": "partial",
+            "summary": {
+                "ready_count": 1,
+                "in_progress_count": 0,
+                "blocked_count": 0,
+                "active_agent_count": 1,
+                "active_reservation_count": 0,
+                "stale_candidate_count": 0,
+                "stale_state_counts": {"active": 0, "recently_quiet": 0, "likely_stale": 0, "conflicting_evidence": 0, "manual_review_required": 0},
+                "proof_gap_count": 1,
+                "build_pressure": "high",
+                "recommended_action": "reduce-build-pressure"
+            },
+            "evidence": {"proof_gaps": [{"kind": "missing-rch-proof"}], "redaction_applied": true},
+            "privacy": {"redaction_applied": true},
+            "providers": [{"warning": "agent-mail unavailable"}]
+        }),
+    );
+
+    let text = render_app_text(&app, 120, 24);
+
+    assert!(text.contains("build:high"));
+    assert!(text.contains("gaps:1"));
+    assert!(text.contains("missing-rch-proof"));
+    assert!(text.contains("agent-mail unavailable"));
+    assert!(text.contains("redaction applied"));
 }

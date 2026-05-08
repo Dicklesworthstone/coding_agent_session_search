@@ -120,6 +120,7 @@ pub const SWARM_REDACTION_POLICY: &str = "strict";
 pub const SWARM_MAIL_BODY_OMITTED: &str = "[MAIL_BODY_OMITTED]";
 pub const SWARM_ENV_VALUE_REDACTED: &str = "[ENV_VALUE_REDACTED]";
 pub const SWARM_SECRET_ENV_ASSIGNMENT_REDACTED: &str = "[SECRET_ENV_REDACTED]";
+pub const SWARM_SECRET_LITERAL_REDACTED: &str = "[SECRET_REDACTED]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwarmEvidenceField {
@@ -450,7 +451,16 @@ pub fn swarm_evidence_redaction_config() -> RedactionConfig {
         name: "bearer_secret".to_string(),
         pattern: Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
             .expect("swarm bearer redaction regex must compile"),
-        replacement: "Bearer [SECRET_REDACTED]".to_string(),
+        replacement: format!("Bearer {SWARM_SECRET_LITERAL_REDACTED}"),
+        enabled: true,
+    });
+    config.custom_patterns.push(CustomPattern {
+        name: "api_key_literal".to_string(),
+        pattern: Regex::new(
+            r"(?i)\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|(?:AKIA|ASIA)[A-Z0-9]{16})\b",
+        )
+        .expect("swarm API key literal redaction regex must compile"),
+        replacement: SWARM_SECRET_LITERAL_REDACTED.to_string(),
         enabled: true,
     });
     config
@@ -936,6 +946,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn swarm_redaction_scrubs_api_key_literals_in_command_args() {
+        for (input, leaked_fragments) in [
+            (
+                "cass pack --api-key sk-live-secret --json",
+                &["sk-live-secret"][..],
+            ),
+            (
+                "curl -H 'Authorization: Bearer ghp_1234567890abcdef' https://api.example.com",
+                &["ghp_1234567890abcdef"][..],
+            ),
+            (
+                "AWS_ACCESS_KEY_ID ASIA1234567890ABCDEF",
+                &["ASIA1234567890ABCDEF"][..],
+            ),
+        ] {
+            let redacted = redact_swarm_text(input);
+
+            assert!(
+                redacted.contains(SWARM_SECRET_LITERAL_REDACTED),
+                "API key literal should be replaced in {redacted:?}"
+            );
+            for fragment in leaked_fragments {
+                assert!(
+                    !redacted.contains(fragment),
+                    "redacted command leaked {fragment:?}: {redacted:?}"
+                );
+            }
+        }
+
+        let redacted_json = redact_swarm_json_value(&serde_json::json!({
+            "command": "cass pack --api-key sk-live-secret --json"
+        }));
+        let serialized = redacted_json.to_string();
+
+        assert!(!serialized.contains("sk-live-secret"));
+        assert!(serialized.contains(SWARM_SECRET_LITERAL_REDACTED));
     }
 
     #[test]

@@ -1247,6 +1247,28 @@ pub enum SwarmCommand {
         #[arg(long, default_value = "healthy")]
         fixture_id: String,
     },
+    /// Assemble verification evidence for recent commits or a named bead.
+    Evidence {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Read provider input from a single swarm fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+
+        /// Read provider input from a swarm fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+
+        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
+        #[arg(long, default_value = "healthy")]
+        fixture_id: String,
+
+        /// Restrict the evidence ledger to a specific bead id.
+        #[arg(long)]
+        bead: Option<String>,
+    },
 }
 
 /// Subcommands for importing external data
@@ -4850,6 +4872,20 @@ fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
             fixture_dir.as_deref(),
             &fixture_id,
         ),
+        SwarmCommand::Evidence {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+            bead,
+        } => run_swarm_evidence(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+            bead.as_deref(),
+        ),
     }
 }
 
@@ -4901,6 +4937,62 @@ fn run_swarm_status(
             .and_then(serde_json::Value::as_str)
         {
             println!("Recommended action: {action}");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_swarm_evidence(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+    bead: Option<&str>,
+) -> CliResult<()> {
+    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
+    {
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
+            |err| CliError {
+                code: 10,
+                kind: CliErrorKind::Config.kind_str(),
+                message: err.to_string(),
+                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
+                retryable: false,
+            },
+        )?;
+        let privacy_probe = swarm_fixture_privacy_probe(&path)?;
+        let collection = set.collect_required();
+        render_swarm_evidence_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
+    } else {
+        render_swarm_evidence_live_partial(bead)
+    };
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!(
+            "Swarm evidence: {}",
+            payload
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        if let Some(gaps) = payload
+            .get("summary")
+            .and_then(|summary| summary.get("proof_gap_count"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("Proof gaps: {gaps}");
         }
     }
 
@@ -4999,6 +5091,136 @@ fn render_swarm_status_fixture(
         privacy_probe,
         false,
     )
+}
+
+fn render_swarm_evidence_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
+    use crate::swarm_status::{
+        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
+    };
+
+    let collection = SwarmSourceCollection {
+        snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
+            .iter()
+            .copied()
+            .map(|provider| {
+                SwarmSourceSnapshot::unavailable(
+                    provider,
+                    format!("live:{}", provider.fixture_key()),
+                    "live-provider-unimplemented",
+                    format!(
+                        "live provider {provider} is not wired yet; fixture-backed evidence is available"
+                    ),
+                )
+            })
+            .collect(),
+    };
+
+    render_swarm_evidence_payload(
+        "live",
+        "Live swarm evidence with unavailable providers",
+        &collection,
+        None,
+        bead_filter,
+        true,
+    )
+}
+
+fn render_swarm_evidence_fixture(
+    input: &crate::swarm_status::SwarmFixtureInput,
+    collection: &crate::swarm_status::SwarmSourceCollection,
+    privacy_probe: Option<&serde_json::Value>,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    render_swarm_evidence_payload(
+        input.fixture_id(),
+        input.description().unwrap_or("swarm evidence fixture"),
+        collection,
+        privacy_probe,
+        bead_filter,
+        false,
+    )
+}
+
+fn render_swarm_evidence_payload(
+    fixture_id: &str,
+    _description: &str,
+    collection: &crate::swarm_status::SwarmSourceCollection,
+    privacy_probe: Option<&serde_json::Value>,
+    bead_filter: Option<&str>,
+    live_partial: bool,
+) -> serde_json::Value {
+    use crate::swarm_status::SwarmProviderName;
+
+    let agent_mail = swarm_provider_payload(collection, SwarmProviderName::AgentMail);
+    let beads = swarm_provider_payload(collection, SwarmProviderName::Beads);
+    let evidence_source = swarm_provider_payload(collection, SwarmProviderName::Evidence);
+    let git = swarm_provider_payload(collection, SwarmProviderName::Git);
+    let messages = swarm_json_array(&agent_mail, "messages");
+    let evidence = swarm_evidence(&messages, privacy_probe, &evidence_source);
+    let privacy = swarm_privacy(fixture_id, &evidence);
+
+    let bead_rows = swarm_evidence_bead_rows(&beads, bead_filter);
+    let known_beads = swarm_evidence_known_bead_ids(&bead_rows);
+    let commit_rows = swarm_evidence_commit_rows(&git, &known_beads, bead_filter);
+    let proof_rows = swarm_evidence_proof_rows(&evidence, bead_filter);
+    let mail_rows = swarm_evidence_mail_rows(&agent_mail, &evidence, bead_filter);
+    let reservation_rows = swarm_evidence_reservation_rows(&agent_mail, bead_filter);
+    let proof_gaps = swarm_evidence_proof_gaps(
+        &bead_rows,
+        &commit_rows,
+        &proof_rows,
+        &git,
+        &evidence,
+        bead_filter,
+    );
+
+    let mut ledger = Vec::new();
+    ledger.extend(bead_rows.iter().cloned());
+    ledger.extend(commit_rows.iter().cloned());
+    ledger.extend(proof_rows.iter().cloned());
+    ledger.extend(mail_rows.iter().cloned());
+    ledger.extend(reservation_rows.iter().cloned());
+
+    serde_json::json!({
+        "schema_version": "cass.swarm.evidence.v1",
+        "status": if collection.partial() { "partial" } else { "ok" },
+        "_meta": {
+            "request_id": if fixture_id == "live" {
+                "live".to_string()
+            } else {
+                format!("fixture-{fixture_id}")
+            },
+            "generated_at_ms": 0,
+            "elapsed_ms": if fixture_id == "busy" { 2 } else { 1 },
+            "repo": if fixture_id == "live" { "[LIVE_REPO]" } else { "[FIXTURE_REPO]" },
+            "project_key": if fixture_id == "live" { "[LIVE_REPO]" } else { "[FIXTURE_REPO]" },
+            "hostname": if fixture_id == "live" { "live-host" } else { "fixture-host" },
+            "partial": collection.partial() || live_partial,
+            "warnings": swarm_meta_warnings(collection, fixture_id)
+        },
+        "providers": swarm_provider_statuses(collection),
+        "filter": {
+            "bead_id": bead_filter
+        },
+        "summary": {
+            "ledger_count": ledger.len(),
+            "bead_count": bead_rows.len(),
+            "commit_count": commit_rows.len(),
+            "proof_count": proof_rows.len(),
+            "mail_thread_count": mail_rows.len(),
+            "reservation_count": reservation_rows.len(),
+            "proof_gap_count": proof_gaps.len(),
+            "recommended_action": swarm_evidence_recommended_action(&proof_gaps, collection.partial() || live_partial),
+        },
+        "ledger": ledger,
+        "proof_gaps": proof_gaps,
+        "privacy": {
+            "raw_session_content_included": false,
+            "mail_body_snippets_included": false,
+            "redaction_policy": privacy["redaction_policy"],
+            "redaction_applied": privacy["redaction_applied"],
+        },
+    })
 }
 
 fn render_swarm_status_payload(
@@ -6052,6 +6274,480 @@ fn swarm_privacy(fixture_id: &str, evidence: &serde_json::Value) -> serde_json::
     })
 }
 
+fn swarm_evidence_bead_rows(
+    beads: &serde_json::Value,
+    bead_filter: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let categories = [
+        ("closed", "closed"),
+        ("ready", "open"),
+        ("in_progress", "in_progress"),
+        ("blocked", "blocked"),
+    ];
+    let mut rows = Vec::new();
+    for (key, default_status) in categories {
+        for bead in swarm_json_array(beads, key) {
+            let Some(bead_id) = bead.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !swarm_evidence_matches_bead(&bead, bead_filter) {
+                continue;
+            }
+
+            let mut row = serde_json::json!({
+                "kind": "bead",
+                "source": format!("beads.{key}"),
+                "bead_id": bead_id,
+                "status": bead
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(default_status),
+                "title": bead.get("title").cloned().unwrap_or(serde_json::Value::Null),
+                "updated_at": bead.get("updated_at").cloned().unwrap_or(serde_json::Value::Null),
+                "close_reason": bead.get("close_reason").cloned().unwrap_or(serde_json::Value::Null),
+                "redaction_status": "metadata_only"
+            });
+            if let Some(object) = row.as_object_mut() {
+                if let Some(commit_id) = bead
+                    .get("commit_id")
+                    .or_else(|| bead.get("commit"))
+                    .or_else(|| bead.get("commit_hash"))
+                {
+                    object.insert("commit_id".to_string(), commit_id.clone());
+                }
+            }
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+fn swarm_evidence_known_bead_ids(bead_rows: &[serde_json::Value]) -> BTreeSet<String> {
+    bead_rows
+        .iter()
+        .filter_map(|row| row.get("bead_id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn swarm_evidence_commit_rows(
+    git: &serde_json::Value,
+    known_beads: &BTreeSet<String>,
+    bead_filter: Option<&str>,
+) -> Vec<serde_json::Value> {
+    git.get("recent_commits")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|commit| swarm_evidence_matches_bead(commit, bead_filter))
+        .map(|commit| {
+            let bead_ids = swarm_evidence_bead_ids(commit, known_beads);
+            serde_json::json!({
+                "kind": "commit",
+                "source": "git.recent_commits",
+                "commit_id": commit
+                    .get("hash")
+                    .or_else(|| commit.get("commit_id"))
+                    .or_else(|| commit.get("commit"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "subject": commit
+                    .get("subject")
+                    .or_else(|| commit.get("message"))
+                    .or_else(|| commit.get("title"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "authored_ts": commit
+                    .get("authored_ts")
+                    .or_else(|| commit.get("committed_at"))
+                    .or_else(|| commit.get("timestamp"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "bead_ids": bead_ids,
+                "changed_paths": commit
+                    .get("changed_paths")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+                "redaction_status": commit
+                    .get("redaction_status")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("metadata_only")),
+            })
+        })
+        .collect()
+}
+
+fn swarm_evidence_proof_rows(
+    evidence: &serde_json::Value,
+    bead_filter: Option<&str>,
+) -> Vec<serde_json::Value> {
+    evidence
+        .get("recent_proofs")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|proof| swarm_evidence_matches_bead(proof, bead_filter))
+        .map(|proof| {
+            let mut object = proof.as_object().cloned().unwrap_or_default();
+            let proof_kind = object
+                .get("kind")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("proof"));
+            object.insert("kind".to_string(), serde_json::json!("proof"));
+            object.insert("source".to_string(), serde_json::json!("evidence.recent_proofs"));
+            object.insert("proof_kind".to_string(), proof_kind);
+            object
+                .entry("redaction_status".to_string())
+                .or_insert_with(|| serde_json::json!("metadata_only"));
+            serde_json::Value::Object(object)
+        })
+        .collect()
+}
+
+fn swarm_evidence_mail_rows(
+    agent_mail: &serde_json::Value,
+    evidence: &serde_json::Value,
+    bead_filter: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let threads = evidence
+        .get("recent_threads")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    let source_threads = if threads.is_empty() {
+        swarm_json_array(agent_mail, "messages")
+    } else {
+        threads
+    };
+
+    source_threads
+        .iter()
+        .filter(|thread| swarm_evidence_matches_bead(thread, bead_filter))
+        .map(|thread| {
+            serde_json::json!({
+                "kind": "mail_thread",
+                "source": "evidence.recent_threads",
+                "thread_id": thread.get("thread_id").cloned().unwrap_or(serde_json::Value::Null),
+                "subject": thread.get("subject").cloned().unwrap_or(serde_json::Value::Null),
+                "sender": thread
+                    .get("sender")
+                    .or_else(|| thread.get("from"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "created_ts": thread.get("created_ts").cloned().unwrap_or(serde_json::Value::Null),
+                "redaction_status": thread
+                    .get("redaction_status")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("metadata_only")),
+            })
+        })
+        .collect()
+}
+
+fn swarm_evidence_reservation_rows(
+    agent_mail: &serde_json::Value,
+    bead_filter: Option<&str>,
+) -> Vec<serde_json::Value> {
+    swarm_json_array(agent_mail, "reservations")
+        .iter()
+        .filter(|reservation| swarm_evidence_matches_bead(reservation, bead_filter))
+        .map(|reservation| {
+            serde_json::json!({
+                "kind": "reservation",
+                "source": "agent_mail.reservations",
+                "bead_id": reservation.get("reason").cloned().unwrap_or(serde_json::Value::Null),
+                "holder": reservation.get("holder").cloned().unwrap_or(serde_json::Value::Null),
+                "path_pattern": reservation.get("path_pattern").cloned().unwrap_or(serde_json::Value::Null),
+                "exclusive": reservation.get("exclusive").cloned().unwrap_or(serde_json::Value::Null),
+                "expires_ts": reservation.get("expires_ts").cloned().unwrap_or(serde_json::Value::Null),
+                "redaction_status": reservation
+                    .get("redaction_status")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("metadata_only")),
+            })
+        })
+        .collect()
+}
+
+fn swarm_evidence_proof_gaps(
+    bead_rows: &[serde_json::Value],
+    commit_rows: &[serde_json::Value],
+    proof_rows: &[serde_json::Value],
+    git: &serde_json::Value,
+    evidence: &serde_json::Value,
+    bead_filter: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let mut gaps = evidence
+        .get("proof_gaps")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|gap| swarm_evidence_matches_bead(gap, bead_filter))
+        .map(|gap| {
+            let mut object = gap.as_object().cloned().unwrap_or_default();
+            object
+                .entry("source".to_string())
+                .or_insert_with(|| serde_json::json!("evidence.proof_gaps"));
+            serde_json::Value::Object(object)
+        })
+        .collect::<Vec<_>>();
+
+    let proof_beads = swarm_evidence_linked_beads(proof_rows);
+    let commit_beads = swarm_evidence_linked_beads(commit_rows);
+    let proof_commits = swarm_evidence_linked_commits(proof_rows);
+
+    for bead in bead_rows {
+        let Some(bead_id) = bead.get("bead_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if bead.get("status").and_then(serde_json::Value::as_str) == Some("closed")
+            && !proof_beads.contains(bead_id)
+        {
+            gaps.push(serde_json::json!({
+                "kind": "missing-proof",
+                "severity": "high",
+                "source": "evidence.recent_proofs",
+                "bead_id": bead_id,
+                "summary": "Closed bead has no linked proof artifact."
+            }));
+        }
+        if bead.get("status").and_then(serde_json::Value::as_str) == Some("closed")
+            && !commit_beads.contains(bead_id)
+        {
+            gaps.push(serde_json::json!({
+                "kind": "missing-commit-link",
+                "severity": "medium",
+                "source": "git.recent_commits",
+                "bead_id": bead_id,
+                "summary": "Closed bead has no linked commit in recent git evidence."
+            }));
+        }
+    }
+
+    for commit in commit_rows {
+        let Some(commit_id) = swarm_evidence_commit_id(commit) else {
+            continue;
+        };
+        if !proof_commits.contains(&commit_id) {
+            gaps.push(serde_json::json!({
+                "kind": "missing-rch-proof",
+                "severity": "medium",
+                "source": "evidence.recent_proofs",
+                "commit_id": commit_id,
+                "bead_ids": commit.get("bead_ids").cloned().unwrap_or_else(|| serde_json::json!([])),
+                "summary": "Commit has no linked rch proof artifact."
+            }));
+        }
+    }
+
+    for proof in proof_rows {
+        swarm_evidence_push_proof_consistency_gaps(proof, &mut gaps);
+    }
+    swarm_evidence_push_unrelated_dirty_gaps(git, commit_rows, proof_rows, &mut gaps);
+
+    gaps
+}
+
+fn swarm_evidence_push_proof_consistency_gaps(
+    proof: &serde_json::Value,
+    gaps: &mut Vec<serde_json::Value>,
+) {
+    let status = proof
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let remote_exit_status = proof
+        .get("remote_exit_status")
+        .and_then(serde_json::Value::as_i64);
+    if let Some(exit) = remote_exit_status
+        && ((status == "passed" && exit != 0) || (status != "passed" && exit == 0))
+    {
+        gaps.push(serde_json::json!({
+            "kind": "conflicting-proof",
+            "severity": "high",
+            "source": "evidence.recent_proofs",
+            "bead_id": proof.get("bead_id").cloned().unwrap_or(serde_json::Value::Null),
+            "commit_id": proof.get("commit_id").cloned().unwrap_or(serde_json::Value::Null),
+            "status": status,
+            "remote_exit_status": exit,
+            "summary": "Proof status disagrees with recorded remote exit status."
+        }));
+    }
+
+    let retrieval = proof
+        .get("artifact_retrieval")
+        .or_else(|| proof.get("artifact_retrieval_status"))
+        .and_then(serde_json::Value::as_str);
+    if remote_exit_status == Some(0)
+        && retrieval.is_some_and(|value| {
+            matches!(
+                value,
+                "stalled" | "interrupted" | "killed-after-remote-success"
+            )
+        })
+    {
+        gaps.push(serde_json::json!({
+            "kind": "artifact-retrieval-interrupted-after-success",
+            "severity": "medium",
+            "source": "rch",
+            "bead_id": proof.get("bead_id").cloned().unwrap_or(serde_json::Value::Null),
+            "commit_id": proof.get("commit_id").cloned().unwrap_or(serde_json::Value::Null),
+            "remote_exit_status": 0,
+            "artifact_retrieval": retrieval,
+            "summary": "Remote command succeeded, but local artifact retrieval did not finish cleanly."
+        }));
+    }
+}
+
+fn swarm_evidence_push_unrelated_dirty_gaps(
+    git: &serde_json::Value,
+    commit_rows: &[serde_json::Value],
+    proof_rows: &[serde_json::Value],
+    gaps: &mut Vec<serde_json::Value>,
+) {
+    let linked_paths = commit_rows
+        .iter()
+        .chain(proof_rows.iter())
+        .flat_map(|row| {
+            row.get("changed_paths")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<BTreeSet<_>>();
+
+    for dirty in git
+        .get("dirty_paths")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(path) = dirty.get("path").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !linked_paths.contains(path) {
+            gaps.push(serde_json::json!({
+                "kind": "unrelated-dirty-file",
+                "severity": "info",
+                "source": "git.dirty_paths",
+                "path": path,
+                "summary": "Dirty worktree path is not linked to the evidence ledger."
+            }));
+        }
+    }
+}
+
+fn swarm_evidence_recommended_action(proof_gaps: &[serde_json::Value], partial: bool) -> &'static str {
+    if partial {
+        "inspect-unavailable-providers"
+    } else if proof_gaps.iter().any(|gap| {
+        gap.get("severity").and_then(serde_json::Value::as_str) == Some("high")
+    }) {
+        "inspect-proof-gaps"
+    } else if proof_gaps.iter().any(|gap| {
+        gap.get("severity").and_then(serde_json::Value::as_str) == Some("medium")
+    }) {
+        "review-retrieval-gaps"
+    } else {
+        "proof-ledger-complete"
+    }
+}
+
+fn swarm_evidence_matches_bead(value: &serde_json::Value, bead_filter: Option<&str>) -> bool {
+    let Some(bead_id) = bead_filter else {
+        return true;
+    };
+
+    if value
+        .get("bead_id")
+        .or_else(|| value.get("id"))
+        .or_else(|| value.get("reason"))
+        .or_else(|| value.get("thread_id"))
+        .and_then(serde_json::Value::as_str)
+        == Some(bead_id)
+    {
+        return true;
+    }
+    if value
+        .get("bead_ids")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .any(|candidate| candidate == bead_id)
+    {
+        return true;
+    }
+    ["subject", "message", "title", "body", "close_reason", "command_shape"]
+        .iter()
+        .filter_map(|field| value.get(*field).and_then(serde_json::Value::as_str))
+        .any(|text| text.contains(bead_id))
+}
+
+fn swarm_evidence_bead_ids(
+    value: &serde_json::Value,
+    known_beads: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut ids = value
+        .get("bead_ids")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if let Some(bead_id) = value.get("bead_id").and_then(serde_json::Value::as_str) {
+        ids.insert(bead_id.to_string());
+    }
+    for text in ["subject", "message", "title", "body"]
+        .iter()
+        .filter_map(|field| value.get(*field).and_then(serde_json::Value::as_str))
+    {
+        for bead_id in known_beads {
+            if text.contains(bead_id) {
+                ids.insert(bead_id.clone());
+            }
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn swarm_evidence_linked_beads(rows: &[serde_json::Value]) -> BTreeSet<String> {
+    rows.iter()
+        .flat_map(|row| {
+            let mut ids = row
+                .get("bead_ids")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if let Some(bead_id) = row.get("bead_id").and_then(serde_json::Value::as_str) {
+                ids.push(bead_id.to_string());
+            }
+            ids
+        })
+        .collect()
+}
+
+fn swarm_evidence_linked_commits(rows: &[serde_json::Value]) -> BTreeSet<String> {
+    rows.iter().filter_map(swarm_evidence_commit_id).collect()
+}
+
+fn swarm_evidence_commit_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("commit_id")
+        .or_else(|| value.get("hash"))
+        .or_else(|| value.get("commit"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 fn swarm_recommended_action_kind(
     live_partial: bool,
     fixture_id: &str,
@@ -6194,6 +6890,194 @@ mod swarm_status_cli_tests {
         assert_eq!(evidence["recent_proofs"][0]["kind"], "rch-test");
         assert_eq!(evidence["proof_gaps"][0]["kind"], "missing-clippy");
         assert_eq!(evidence["redaction_applied"], false);
+    }
+
+    #[test]
+    fn swarm_evidence_broker_links_bead_commit_proof_and_mail() {
+        let input = crate::swarm_status::SwarmFixtureInput::from_value(
+            "inline-evidence.json",
+            json!({
+                "fixture_id": "evidence-linked",
+                "sources": {
+                    "beads": {
+                        "closed": [{
+                            "id": "cass-proof-1",
+                            "title": "Proof-backed closeout",
+                            "status": "closed",
+                            "close_reason": "Verified by rch",
+                            "commit_id": "abc123"
+                        }]
+                    },
+                    "agent_mail": {
+                        "messages": [{
+                            "thread_id": "cass-proof-1",
+                            "subject": "Closeout proof",
+                            "from": "CreamRaven",
+                            "created_ts": "2026-05-08T16:00:00Z"
+                        }],
+                        "reservations": []
+                    },
+                    "git": {
+                        "dirty": false,
+                        "dirty_paths": [],
+                        "recent_commits": [{
+                            "hash": "abc123",
+                            "subject": "feat: finish cass-proof-1",
+                            "changed_paths": ["src/lib.rs", "tests/cli_robot.rs"]
+                        }]
+                    },
+                    "evidence": {
+                        "recent_threads": [{
+                            "thread_id": "cass-proof-1",
+                            "subject": "Closeout proof",
+                            "sender": "CreamRaven"
+                        }],
+                        "recent_proofs": [{
+                            "kind": "rch-test",
+                            "bead_id": "cass-proof-1",
+                            "commit_id": "abc123",
+                            "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo test --test cli_robot",
+                            "status": "passed",
+                            "remote_exit_status": 0,
+                            "changed_paths": ["src/lib.rs", "tests/cli_robot.rs"],
+                            "mail_thread_refs": ["cass-proof-1"]
+                        }],
+                        "proof_gaps": [],
+                        "redaction_applied": false
+                    },
+                    "processes": {},
+                    "cass_health": {},
+                    "cass_status": {}
+                }
+            }),
+        )
+        .expect("inline fixture should parse");
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_input(input);
+        let collection = set.collect_required();
+
+        let payload =
+            render_swarm_evidence_fixture(set.input(), &collection, None, Some("cass-proof-1"));
+
+        assert_eq!(payload["schema_version"], "cass.swarm.evidence.v1");
+        assert_eq!(payload["summary"]["proof_gap_count"], 0);
+        assert_eq!(
+            payload["summary"]["recommended_action"],
+            "proof-ledger-complete"
+        );
+        assert!(
+            payload["ledger"]
+                .as_array()
+                .expect("ledger")
+                .iter()
+                .any(|row| row["kind"] == "commit" && row["commit_id"] == "abc123")
+        );
+        assert!(
+            payload["ledger"]
+                .as_array()
+                .expect("ledger")
+                .iter()
+                .any(|row| row["kind"] == "proof"
+                    && row["proof_kind"] == "rch-test"
+                    && row["remote_exit_status"] == 0)
+        );
+    }
+
+    #[test]
+    fn swarm_evidence_broker_reports_missing_conflicting_interrupted_and_unrelated() {
+        let payload = render_swarm_evidence_payload(
+            "evidence-gaps",
+            "evidence gap fixture",
+            &crate::swarm_status::SwarmSourceCollection {
+                snapshots: vec![
+                    crate::swarm_status::SwarmSourceSnapshot::ok(
+                        crate::swarm_status::SwarmProviderName::Beads,
+                        "fixture:beads",
+                        json!({
+                            "closed": [
+                                {"id": "cass-missing", "status": "closed"},
+                                {"id": "cass-conflict", "status": "closed"},
+                                {"id": "cass-interrupted", "status": "closed"}
+                            ]
+                        }),
+                    ),
+                    crate::swarm_status::SwarmSourceSnapshot::ok(
+                        crate::swarm_status::SwarmProviderName::Git,
+                        "fixture:git",
+                        json!({
+                            "dirty": true,
+                            "dirty_paths": [{"path": "docs/unrelated.md"}],
+                            "recent_commits": [
+                                {"hash": "aaa111", "subject": "finish cass-missing", "changed_paths": ["src/missing.rs"]},
+                                {"hash": "bbb222", "subject": "finish cass-conflict", "changed_paths": ["src/conflict.rs"]},
+                                {"hash": "ccc333", "subject": "finish cass-interrupted", "changed_paths": ["src/interrupted.rs"]}
+                            ]
+                        }),
+                    ),
+                    crate::swarm_status::SwarmSourceSnapshot::ok(
+                        crate::swarm_status::SwarmProviderName::Evidence,
+                        "fixture:evidence",
+                        json!({
+                            "recent_proofs": [
+                                {
+                                    "kind": "rch-test",
+                                    "bead_id": "cass-conflict",
+                                    "commit_id": "bbb222",
+                                    "status": "failed",
+                                    "remote_exit_status": 0,
+                                    "changed_paths": ["src/conflict.rs"]
+                                },
+                                {
+                                    "kind": "rch-test",
+                                    "bead_id": "cass-interrupted",
+                                    "commit_id": "ccc333",
+                                    "status": "passed",
+                                    "remote_exit_status": 0,
+                                    "artifact_retrieval": "stalled",
+                                    "changed_paths": ["src/interrupted.rs"]
+                                }
+                            ],
+                            "proof_gaps": [],
+                            "redaction_applied": false
+                        }),
+                    ),
+                    crate::swarm_status::SwarmSourceSnapshot::ok(
+                        crate::swarm_status::SwarmProviderName::AgentMail,
+                        "fixture:agent_mail",
+                        json!({"messages": [], "reservations": []}),
+                    ),
+                    crate::swarm_status::SwarmSourceSnapshot::ok(
+                        crate::swarm_status::SwarmProviderName::Process,
+                        "fixture:processes",
+                        json!({}),
+                    ),
+                    crate::swarm_status::SwarmSourceSnapshot::ok(
+                        crate::swarm_status::SwarmProviderName::CassHealth,
+                        "fixture:cass_health",
+                        json!({}),
+                    ),
+                    crate::swarm_status::SwarmSourceSnapshot::ok(
+                        crate::swarm_status::SwarmProviderName::CassStatus,
+                        "fixture:cass_status",
+                        json!({}),
+                    ),
+                ],
+            },
+            None,
+            None,
+            false,
+        );
+        let gap_kinds = payload["proof_gaps"]
+            .as_array()
+            .expect("proof gaps")
+            .iter()
+            .filter_map(|gap| gap["kind"].as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(gap_kinds.contains("missing-proof"));
+        assert!(gap_kinds.contains("conflicting-proof"));
+        assert!(gap_kinds.contains("artifact-retrieval-interrupted-after-success"));
+        assert!(gap_kinds.contains("unrelated-dirty-file"));
+        assert_eq!(payload["summary"]["recommended_action"], "inspect-proof-gaps");
     }
 
     #[test]

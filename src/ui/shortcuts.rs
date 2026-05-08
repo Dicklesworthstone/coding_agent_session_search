@@ -63,6 +63,7 @@ pub const MACRO_TOGGLE: &str = "Alt+M";
 
 // Surface navigation
 pub const SURFACE_ANALYTICS: &str = "Alt+A";
+pub const SURFACE_SWARM: &str = "Alt+W";
 
 // Navigation
 pub const TAB_FOCUS: &str = "Tab";

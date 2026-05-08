@@ -617,6 +617,8 @@ pub enum AppSurface {
     Search,
     /// Analytics dashboard surface.
     Analytics,
+    /// Cached swarm operations cockpit surface.
+    Swarm,
     /// Sources management surface.
     Sources,
 }
@@ -626,6 +628,7 @@ impl AppSurface {
         match self {
             Self::Search => "Search",
             Self::Analytics => "Analytics",
+            Self::Swarm => "Swarm",
             Self::Sources => "Sources",
         }
     }
@@ -634,7 +637,8 @@ impl AppSurface {
         match self {
             Self::Search => 0,
             Self::Analytics => 1,
-            Self::Sources => 2,
+            Self::Swarm => 2,
+            Self::Sources => 3,
         }
     }
 }
@@ -4218,6 +4222,153 @@ struct FooterHudLane {
     value_style: ftui::Style,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SwarmStaleStateCounts {
+    pub active: u64,
+    pub recently_quiet: u64,
+    pub likely_stale: u64,
+    pub conflicting_evidence: u64,
+    pub manual_review_required: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwarmCockpitSnapshot {
+    pub status: String,
+    pub recommended_action: String,
+    pub ready_count: u64,
+    pub in_progress_count: u64,
+    pub blocked_count: u64,
+    pub active_agent_count: u64,
+    pub active_reservation_count: u64,
+    pub stale_candidate_count: u64,
+    pub proof_gap_count: u64,
+    pub build_pressure: String,
+    pub stale_state_counts: SwarmStaleStateCounts,
+    pub provider_warnings: Vec<String>,
+    pub evidence_gaps: Vec<String>,
+    pub redaction_applied: bool,
+}
+
+impl Default for SwarmCockpitSnapshot {
+    fn default() -> Self {
+        Self {
+            status: "unavailable".to_string(),
+            recommended_action: "inspect-status".to_string(),
+            ready_count: 0,
+            in_progress_count: 0,
+            blocked_count: 0,
+            active_agent_count: 0,
+            active_reservation_count: 0,
+            stale_candidate_count: 0,
+            proof_gap_count: 0,
+            build_pressure: "unknown".to_string(),
+            stale_state_counts: SwarmStaleStateCounts::default(),
+            provider_warnings: Vec::new(),
+            evidence_gaps: Vec::new(),
+            redaction_applied: false,
+        }
+    }
+}
+
+impl SwarmCockpitSnapshot {
+    pub fn from_status_payload(payload: &serde_json::Value) -> Self {
+        let summary = payload
+            .get("summary")
+            .unwrap_or(&serde_json::Value::Null);
+        let stale_counts = summary
+            .get("stale_state_counts")
+            .unwrap_or(&serde_json::Value::Null);
+        let evidence = payload
+            .get("evidence")
+            .unwrap_or(&serde_json::Value::Null);
+
+        let provider_warnings = payload
+            .get("providers")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|provider| {
+                provider
+                    .get("warning")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+
+        let evidence_gaps = evidence
+            .get("proof_gaps")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|gap| {
+                gap.get("kind")
+                    .or_else(|| gap.get("summary"))
+                    .or_else(|| gap.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+
+        Self {
+            status: string_value(payload, "status", "unknown"),
+            recommended_action: string_value(summary, "recommended_action", "inspect-status"),
+            ready_count: count_value(summary, "ready_count"),
+            in_progress_count: count_value(summary, "in_progress_count"),
+            blocked_count: count_value(summary, "blocked_count"),
+            active_agent_count: count_value(summary, "active_agent_count"),
+            active_reservation_count: count_value(summary, "active_reservation_count"),
+            stale_candidate_count: count_value(summary, "stale_candidate_count"),
+            proof_gap_count: count_value(summary, "proof_gap_count"),
+            build_pressure: string_value(summary, "build_pressure", "unknown"),
+            stale_state_counts: SwarmStaleStateCounts {
+                active: count_value(stale_counts, "active"),
+                recently_quiet: count_value(stale_counts, "recently_quiet"),
+                likely_stale: count_value(stale_counts, "likely_stale"),
+                conflicting_evidence: count_value(stale_counts, "conflicting_evidence"),
+                manual_review_required: count_value(stale_counts, "manual_review_required"),
+            },
+            provider_warnings,
+            evidence_gaps,
+            redaction_applied: payload
+                .get("privacy")
+                .and_then(|privacy| privacy.get("redaction_applied"))
+                .or_else(|| evidence.get("redaction_applied"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SwarmCockpitState {
+    pub snapshot: Option<SwarmCockpitSnapshot>,
+    pub status: String,
+}
+
+impl SwarmCockpitState {
+    pub fn from_snapshot(snapshot: SwarmCockpitSnapshot) -> Self {
+        Self {
+            snapshot: Some(snapshot),
+            status: "cached swarm snapshot".to_string(),
+        }
+    }
+}
+
+fn count_value(value: &serde_json::Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn string_value(value: &serde_json::Value, key: &str, fallback: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(fallback)
+        .to_string()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DoctorHudSummary {
     pub status: String,
@@ -5298,6 +5449,8 @@ pub struct CassApp {
     // -- Sources management (2noh9.4.9) -----------------------------------
     /// Sources management view state.
     pub sources_view: SourcesViewState,
+    /// Cached swarm operations cockpit view state. Rendering never refreshes it.
+    pub swarm_cockpit: SwarmCockpitState,
     /// Cached doctor v2 state shown in the footer. Rendering never refreshes it.
     pub doctor_hud_summary: Option<DoctorHudSummary>,
 
@@ -5499,6 +5652,7 @@ impl Default for CassApp {
             evidence: EvidenceSnapshots::default(),
             cockpit: CockpitState::new(),
             sources_view: SourcesViewState::default(),
+            swarm_cockpit: SwarmCockpitState::default(),
             doctor_hud_summary: None,
             status: String::new(),
             startup_state_bootstrapped: false,
@@ -6336,6 +6490,10 @@ impl CassApp {
             return "sources";
         }
 
+        if self.surface == AppSurface::Swarm {
+            return "swarm";
+        }
+
         if self.input_mode != InputMode::Query {
             return "filter";
         }
@@ -6674,6 +6832,11 @@ impl CassApp {
         } else {
             plain
         };
+        let swarm_active_style = if apply_style {
+            styles.style(style_system::STYLE_STATUS_INFO).bold()
+        } else {
+            plain
+        };
         let sources_active_style = if apply_style {
             styles.style(style_system::STYLE_STATUS_WARNING).bold()
         } else {
@@ -6697,6 +6860,7 @@ impl CassApp {
         let surface_tabs = [
             (AppSurface::Search, "Search", search_active_style),
             (AppSurface::Analytics, "Analytics", analytics_active_style),
+            (AppSurface::Swarm, "Swarm", swarm_active_style),
             (AppSurface::Sources, "Sources", sources_active_style),
         ];
         // Track tab column offsets for mouse hit-testing.
@@ -6741,6 +6905,7 @@ impl CassApp {
 
         let hint_pairs = [
             (shortcuts::SURFACE_ANALYTICS, "analytics"),
+            (shortcuts::SURFACE_SWARM, "swarm"),
             (shortcuts::SOURCES, "sources"),
             (shortcuts::PALETTE, "palette"),
             (shortcuts::HELP, "help"),
@@ -13128,6 +13293,185 @@ impl CassApp {
         }
     }
 
+    fn render_swarm_cockpit_surface(
+        &self,
+        frame: &mut super::ftui_adapter::Frame,
+        area: Rect,
+        border_type: BorderType,
+        borders: Borders,
+        render_content: bool,
+    ) {
+        let styles = self.resolved_style_context();
+        let plain = ftui::Style::default();
+        let pane_style = styles.style(style_system::STYLE_PANE_BASE);
+        let pane_focused_style = styles.style(style_system::STYLE_PANE_FOCUSED);
+        let text_muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
+        let value_style = styles.style(style_system::STYLE_STATUS_INFO).bold();
+        let warning_style = styles.style(style_system::STYLE_STATUS_WARNING).bold();
+        let danger_style = styles.style(style_system::STYLE_STATUS_ERROR).bold();
+        let success_style = styles.style(style_system::STYLE_STATUS_SUCCESS).bold();
+        let accent = if self.style_options.dark_mode {
+            ftui::PackedRgba::rgb(120, 210, 210)
+        } else {
+            ftui::PackedRgba::rgb(30, 120, 130)
+        };
+
+        let vertical = Flex::vertical()
+            .constraints([
+                Constraint::Fixed(3),
+                Constraint::Min(4),
+                Constraint::Fixed(1),
+            ])
+            .split(area);
+
+        let snapshot = self.swarm_cockpit.snapshot.as_ref();
+        let header_title = snapshot.map_or_else(
+            || " ██ cass · Swarm ".to_string(),
+            |snapshot| {
+                format!(
+                    " ██ cass · Swarm · {} · {} ",
+                    snapshot.status, snapshot.recommended_action
+                )
+            },
+        );
+        let header_block = Block::new()
+            .borders(borders)
+            .border_type(border_type)
+            .title(&header_title)
+            .title_alignment(Alignment::Left)
+            .border_style(pane_focused_style.fg(accent).bold())
+            .style(pane_focused_style);
+        let header_inner = header_block.inner(vertical[0]);
+        header_block.render(vertical[0], frame);
+        if render_content && !header_inner.is_empty() {
+            let header_text = snapshot.map_or_else(
+                || "No cached swarm snapshot · read-only surface".to_string(),
+                |snapshot| {
+                    format!(
+                        "ready:{}  agents:{}  reservations:{}  stale:{}  gaps:{}  build:{}",
+                        snapshot.ready_count,
+                        snapshot.active_agent_count,
+                        snapshot.active_reservation_count,
+                        snapshot.stale_candidate_count,
+                        snapshot.proof_gap_count,
+                        snapshot.build_pressure
+                    )
+                },
+            );
+            Paragraph::new(elide_text(&header_text, header_inner.width as usize))
+                .style(value_style)
+                .render(header_inner, frame);
+        }
+
+        let content_block = Block::new()
+            .borders(borders)
+            .border_type(border_type)
+            .title("Cached Operations Snapshot")
+            .title_alignment(Alignment::Left)
+            .border_style(pane_style.fg(accent))
+            .style(pane_style);
+        let content_inner = content_block.inner(vertical[1]);
+        content_block.render(vertical[1], frame);
+        if render_content && !content_inner.is_empty() {
+            let content = if let Some(snapshot) = snapshot {
+                let stale = &snapshot.stale_state_counts;
+                let mut rows = vec![
+                    format!(
+                        "Queue      ready {} · in-progress {} · blocked {}",
+                        snapshot.ready_count, snapshot.in_progress_count, snapshot.blocked_count
+                    ),
+                    format!(
+                        "Swarm      agents {} · reservations {} · build {}",
+                        snapshot.active_agent_count,
+                        snapshot.active_reservation_count,
+                        snapshot.build_pressure
+                    ),
+                    format!(
+                        "Stale      active {} · quiet {} · likely {} · conflict {} · manual {}",
+                        stale.active,
+                        stale.recently_quiet,
+                        stale.likely_stale,
+                        stale.conflicting_evidence,
+                        stale.manual_review_required
+                    ),
+                    format!(
+                        "Evidence   gaps {} · redaction {}",
+                        snapshot.proof_gap_count,
+                        if snapshot.redaction_applied {
+                            "applied"
+                        } else {
+                            "clean"
+                        }
+                    ),
+                ];
+                if !snapshot.evidence_gaps.is_empty() {
+                    rows.push(format!(
+                        "Gaps       {}",
+                        snapshot
+                            .evidence_gaps
+                            .iter()
+                            .take(3)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if !snapshot.provider_warnings.is_empty() {
+                    rows.push(format!(
+                        "Warnings   {}",
+                        snapshot
+                            .provider_warnings
+                            .iter()
+                            .take(3)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                rows.push(
+                    "Safety     read-only snapshot; no coordination action runs from render"
+                        .to_string(),
+                );
+                rows.into_iter()
+                    .map(|row| elide_text(&row, content_inner.width as usize))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                "No swarm snapshot cached.\nRender stays idle until a snapshot is supplied.\nSafety     read-only surface; no provider refresh runs during render."
+                    .to_string()
+            };
+            Paragraph::new(content).style(text_muted_style).render(content_inner, frame);
+        }
+
+        let footer = snapshot.map_or_else(
+            || "swarm cached:none | read-only | Esc back".to_string(),
+            |snapshot| {
+                format!(
+                    "swarm {} | action {} | {} back",
+                    snapshot.status,
+                    snapshot.recommended_action,
+                    shortcuts::DETAIL_CLOSE
+                )
+            },
+        );
+        let footer_style = snapshot.map_or(text_muted_style, |snapshot| {
+            if snapshot.proof_gap_count > 0 || snapshot.stale_candidate_count > 0 {
+                warning_style
+            } else if snapshot.status == "partial" {
+                danger_style
+            } else {
+                success_style
+            }
+        });
+        Paragraph::new(elide_text(&footer, vertical[2].width as usize))
+            .style(if render_content {
+                footer_style
+            } else {
+                plain
+            })
+            .render(vertical[2], frame);
+    }
+
     fn analytics_filter_count(&self) -> usize {
         let f = &self.analytics_filters;
         let mut count = 0;
@@ -14109,6 +14453,10 @@ pub enum CassMsg {
     BreakdownTabCycled { forward: bool },
     /// Cycle the Heatmap metric forward or backward.
     HeatmapMetricCycled { forward: bool },
+
+    // -- Swarm operations surface -----------------------------------------
+    /// Switch to the cached swarm operations cockpit surface.
+    SwarmEntered,
 
     // -- Sources management surface (2noh9.4.9) ----------------------------
     /// Switch to the sources management surface.
@@ -15398,6 +15746,10 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                         CassMsg::UpdateReleaseNotesRequested
                     }
                     KeyCode::Char('i') | KeyCode::Char('I') if alt => CassMsg::UpdateSkipped,
+
+                    // -- Swarm operations -----------------------------------------
+                    KeyCode::Char('w') if alt => CassMsg::SwarmEntered,
+                    KeyCode::Char('W') if alt => CassMsg::SwarmEntered,
 
                     // -- Sources management -----------------------------------------
                     KeyCode::Char('s') if ctrl && shift => CassMsg::SourcesEntered,
@@ -19881,6 +20233,7 @@ impl super::ftui_adapter::Model for CassApp {
                             }
                         }
                         AppSurface::Analytics => ftui::Cmd::msg(CassMsg::AnalyticsEntered),
+                        AppSurface::Swarm => ftui::Cmd::msg(CassMsg::SwarmEntered),
                         AppSurface::Sources => ftui::Cmd::msg(CassMsg::SourcesEntered),
                     },
                     // ── Click in search bar: enter query editing ───────
@@ -20287,6 +20640,21 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
 
+            // -- Swarm operations surface -----------------------------------------
+            CassMsg::SwarmEntered => {
+                self.pane_split_drag = None;
+                let previous_surface = self.surface;
+                let transition_cmd = if self.surface != AppSurface::Swarm {
+                    self.view_stack.push(self.surface);
+                    self.surface = AppSurface::Swarm;
+                    self.start_surface_transition(previous_surface, self.surface)
+                } else {
+                    ftui::Cmd::none()
+                };
+                self.clear_loading_context(LoadingContext::Analytics);
+                transition_cmd
+            }
+
             // -- Sources management (2noh9.4.9) ----------------------------------
             CassMsg::SourcesEntered => {
                 self.pane_split_drag = None;
@@ -20557,7 +20925,10 @@ impl super::ftui_adapter::Model for CassApp {
             CassMsg::QuitRequested => {
                 // ESC unwind: check pending state before quitting
                 // If on analytics or sources surface, pop back.
-                if self.surface == AppSurface::Analytics || self.surface == AppSurface::Sources {
+                if matches!(
+                    self.surface,
+                    AppSurface::Analytics | AppSurface::Swarm | AppSurface::Sources
+                ) {
                     return ftui::Cmd::msg(CassMsg::ViewStackPopped);
                 }
                 if self.show_consent_dialog {
@@ -21815,6 +22186,17 @@ impl super::ftui_adapter::Model for CassApp {
                     .style(text_muted_style)
                     .render(analytics_footer, frame);
                 }
+            }
+
+            AppSurface::Swarm => {
+                self.clear_search_surface_hit_regions();
+                self.render_swarm_cockpit_surface(
+                    frame,
+                    layout_area,
+                    border_type,
+                    adaptive_borders,
+                    render_content,
+                );
             }
 
             AppSurface::Sources => {
