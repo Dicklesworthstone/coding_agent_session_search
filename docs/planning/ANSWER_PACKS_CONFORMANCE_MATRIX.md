@@ -1,8 +1,8 @@
 # Answer-Pack Conformance Matrix
 
-**Spec:** `docs/planning/ANSWER_PACKS_CONTRACT.md`  
-**Bead:** `coding_agent_session_search-uuwye.6`  
-**Status:** Draft coverage map for implementation and golden gates  
+**Spec:** `docs/planning/ANSWER_PACKS_CONTRACT.md`
+**Bead:** `coding_agent_session_search-uuwye.6`
+**Status:** Draft coverage map for implementation and golden gates
 **Date:** 2026-05-08
 
 This matrix turns the answer-pack contract into testable requirements. It is not
