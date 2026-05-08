@@ -15,6 +15,11 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_validate_docs}"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -31,23 +36,34 @@ CHECKS=0
 # =============================================================================
 
 log_pass() {
-    ((CHECKS++))
+    ((CHECKS += 1))
     echo -e "${GREEN}✓${NC} $1"
 }
 
 log_fail() {
-    ((CHECKS++))
-    ((ERRORS++))
+    ((CHECKS += 1))
+    ((ERRORS += 1))
     echo -e "${RED}✗${NC} $1"
 }
 
 log_warn() {
-    ((WARNINGS++))
+    ((WARNINGS += 1))
     echo -e "${YELLOW}!${NC} $1"
 }
 
 log_info() {
     echo -e "  $1"
+}
+
+ensure_rch() {
+    if ! command -v "$RCH_BIN" &> /dev/null; then
+        log_fail "rch binary not found; validate_docs cargo work must be offloaded"
+        return 1
+    fi
+}
+
+run_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
 }
 
 section() {
@@ -176,18 +192,29 @@ check_help() {
     section "CLI Help Validation"
 
     # Check if binary exists
-    local binary="target/release/cass"
+    local binary="$RCH_TARGET_DIR/release/cass"
+    if [[ ! -x "$binary" ]]; then
+        binary="$RCH_TARGET_DIR/debug/cass"
+    fi
+    if [[ ! -x "$binary" ]]; then
+        binary="target/release/cass"
+    fi
     if [[ ! -x "$binary" ]]; then
         binary="target/debug/cass"
     fi
 
     if [[ ! -x "$binary" ]]; then
-        log_warn "cass binary not found, building..."
-        cargo build --quiet 2>/dev/null || {
+        log_warn "cass binary not found, building through rch..."
+        ensure_rch || return
+        run_cargo build --quiet --bin cass 2>/dev/null || {
             log_fail "Could not build cass binary"
             return
         }
-        binary="target/debug/cass"
+        binary="$RCH_TARGET_DIR/debug/cass"
+        if [[ ! -x "$binary" ]]; then
+            log_fail "Built cass binary not found at $binary"
+            return
+        fi
     fi
 
     log_info "Using binary: $binary"
@@ -321,7 +348,9 @@ check_cargo_docs() {
 
     log_info "Building documentation..."
 
-    if cargo doc --no-deps --quiet 2>/dev/null; then
+    ensure_rch || return
+
+    if run_cargo doc --no-deps --quiet 2>/dev/null; then
         log_pass "cargo doc builds successfully"
     else
         log_fail "cargo doc has errors"
@@ -329,7 +358,7 @@ check_cargo_docs() {
 
     # Check for documentation warnings
     local doc_output
-    doc_output=$(cargo doc --no-deps 2>&1 || true)
+    doc_output=$(run_cargo doc --no-deps 2>&1 || true)
 
     local missing_docs
     missing_docs=$(echo "$doc_output" | grep -c "missing documentation" || true)
@@ -350,7 +379,7 @@ main() {
     echo "║           CASS Documentation Validation                       ║"
     echo "╚═══════════════════════════════════════════════════════════════╝"
 
-    cd "$(dirname "$0")/.."
+    cd "$PROJECT_ROOT"
 
     case "${1:-all}" in
         --links)
