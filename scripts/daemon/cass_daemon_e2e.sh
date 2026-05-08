@@ -11,13 +11,20 @@
 # - target/e2e-daemon/run_<id>/daemon_e2e.jsonl  (JSONL events)
 # - target/e2e-daemon/run_<id>/report.json       (Final report)
 # - target/e2e-daemon/run_<id>/run.log           (Human-readable log)
+#
+# Environment:
+# - RCH_BIN         rch executable (default: rch)
+# - RCH_TARGET_DIR  cargo target dir for offloaded cass build
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_daemon_e2e}"
 
 # Source standard E2E logging library (emits to test-results/e2e/)
+# shellcheck disable=SC1091
 source "${PROJECT_ROOT}/scripts/lib/e2e_log.sh"
 e2e_init "shell" "daemon_fallback"
 
@@ -31,7 +38,6 @@ STDOUT_DIR="${RUN_DIR}/stdout"
 STDERR_DIR="${RUN_DIR}/stderr"
 
 SANDBOX_DIR="${RUN_DIR}/sandbox"
-BUILD_TARGET_DIR="${RUN_DIR}/target"
 DATA_DIR="${SANDBOX_DIR}/cass_data"
 CODEX_HOME="${SANDBOX_DIR}/.codex"
 HOME_DIR="${SANDBOX_DIR}/home"
@@ -86,6 +92,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# shellcheck disable=SC2034
 if [[ -t 1 ]]; then
     GREEN='\033[0;32m'
     RED='\033[0;31m'
@@ -175,7 +182,8 @@ emit_phase_start() {
 emit_phase_end() {
     local phase_name=$1
     local start_ms=${PHASE_STARTS["${phase_name}"]:-$(now_ms)}
-    local end_ms=$(now_ms)
+    local end_ms
+    end_ms=$(now_ms)
     local duration_ms=$((end_ms - start_ms))
     emit_jsonl "{\"ts\":\"$(iso_timestamp)\",\"event\":\"phase_end\",\"run_id\":\"${RUN_ID}\",\"runner\":\"bash\",\"phase\":{\"name\":\"${phase_name}\"},\"duration_ms\":${duration_ms}}"
 }
@@ -223,7 +231,8 @@ emit_metrics() {
 
 emit_run_end() {
     local exit_code=$1
-    local end_ms=$(now_ms)
+    local end_ms
+    end_ms=$(now_ms)
     local duration_ms=$((end_ms - RUN_START_MS))
     emit_jsonl "{\"ts\":\"$(iso_timestamp)\",\"event\":\"run_end\",\"run_id\":\"${RUN_ID}\",\"runner\":\"bash\",\"summary\":{\"total\":${TESTS_TOTAL},\"passed\":${TESTS_PASSED},\"failed\":${TESTS_FAILED},\"skipped\":0,\"duration_ms\":${duration_ms}},\"exit_code\":${exit_code}}"
 }
@@ -249,6 +258,27 @@ run_step() {
     return "$exit_code"
 }
 
+# shellcheck disable=SC2317
+ensure_rch() {
+    if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+        log "FAIL" "rch binary not found; daemon E2E cass build must be offloaded"
+        emit_run_end 1
+        e2e_run_end 0 0 0 0 "$(e2e_duration_since_start)"
+        exit 1
+    fi
+}
+
+# shellcheck disable=SC2317
+run_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+}
+
+# shellcheck disable=SC2317
+build_cass_binary() {
+    ensure_rch
+    (cd "$PROJECT_ROOT" && run_cargo build)
+}
+
 # =============================================================================
 # Main E2E Flow
 # =============================================================================
@@ -267,14 +297,14 @@ e2e_run_start
 if [[ $NO_BUILD -eq 0 ]]; then
     emit_phase_start "build" "Compile cass binary"
     e2e_phase_start "build" "Compile cass binary"
-    run_step "build" bash -c "cd \"$PROJECT_ROOT\" && CARGO_TARGET_DIR=\"$BUILD_TARGET_DIR\" cargo build"
+    run_step "build" build_cass_binary
     emit_phase_end "build"
     e2e_phase_end "build" 0
 fi
 
 if [[ -z "${CASS_BIN:-}" ]]; then
     if [[ $NO_BUILD -eq 0 ]]; then
-        CASS_BIN="${BUILD_TARGET_DIR}/debug/cass"
+        CASS_BIN="${RCH_TARGET_DIR}/debug/cass"
     else
         CASS_BIN="${PROJECT_ROOT}/target/debug/cass"
     fi
