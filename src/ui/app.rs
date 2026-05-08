@@ -12203,7 +12203,9 @@ impl CassApp {
                     .into(),
                 "  remotes/ - Synced session data from remote sources".into(),
                 "Config: ~/.config/cass/sources.toml (remote sources)".into(),
-                "Agents: Claude, Codex, Gemini, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Factory"
+                "Agents: Claude Code, Codex, Gemini, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent"
+                    .into(),
+                "        Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Kimi, Qwen, Factory"
                     .into(),
             ],
         );
