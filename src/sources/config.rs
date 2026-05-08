@@ -194,37 +194,12 @@ impl SourceDefinition {
         self.validate_paths()
     }
 
+    pub(crate) fn validate_name(&self) -> Result<(), ConfigError> {
+        validate_source_name(&self.name)
+    }
+
     fn validate_without_paths(&self) -> Result<(), ConfigError> {
-        if self.name.trim().is_empty() {
-            return Err(ConfigError::Validation(
-                "Source name cannot be empty".into(),
-            ));
-        }
-
-        if self.name.trim() != self.name {
-            return Err(ConfigError::Validation(
-                "Source name cannot have leading or trailing whitespace".into(),
-            ));
-        }
-
-        if source_names_equal(&self.name, BUILT_IN_LOCAL_SOURCE_NAME) {
-            return Err(ConfigError::Validation(format!(
-                "Source name '{}' is reserved for the built-in local source",
-                BUILT_IN_LOCAL_SOURCE_NAME
-            )));
-        }
-
-        if self.name.contains('/') || self.name.contains('\\') {
-            return Err(ConfigError::Validation(
-                "Source name cannot contain path separators".into(),
-            ));
-        }
-
-        if has_dot_components(Path::new(&self.name)) {
-            return Err(ConfigError::Validation(
-                "Source name cannot be '.' or '..'".into(),
-            ));
-        }
+        self.validate_name()?;
 
         if self.is_remote() && self.host.is_none() {
             return Err(ConfigError::Validation("SSH sources require a host".into()));
@@ -318,6 +293,41 @@ pub(crate) fn normalize_generated_remote_source_name(name: &str) -> String {
 fn has_dot_components(path: &Path) -> bool {
     path.components()
         .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+}
+
+fn validate_source_name(name: &str) -> Result<(), ConfigError> {
+    if name.trim().is_empty() {
+        return Err(ConfigError::Validation(
+            "Source name cannot be empty".into(),
+        ));
+    }
+
+    if name.trim() != name {
+        return Err(ConfigError::Validation(
+            "Source name cannot have leading or trailing whitespace".into(),
+        ));
+    }
+
+    if source_names_equal(name, BUILT_IN_LOCAL_SOURCE_NAME) {
+        return Err(ConfigError::Validation(format!(
+            "Source name '{}' is reserved for the built-in local source",
+            BUILT_IN_LOCAL_SOURCE_NAME
+        )));
+    }
+
+    if name.contains('/') || name.contains('\\') {
+        return Err(ConfigError::Validation(
+            "Source name cannot contain path separators".into(),
+        ));
+    }
+
+    if has_dot_components(Path::new(name)) {
+        return Err(ConfigError::Validation(
+            "Source name cannot be '.' or '..'".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_ssh_host(host: &str) -> Result<(), ConfigError> {

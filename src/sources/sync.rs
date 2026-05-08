@@ -285,6 +285,9 @@ pub enum SyncError {
     #[error("Invalid source path: {0}")]
     InvalidPath(String),
 
+    #[error("Invalid source definition: {0}")]
+    InvalidSource(String),
+
     #[error("rsync command failed: {0}")]
     RsyncFailed(String),
 
@@ -645,6 +648,10 @@ impl SyncEngine {
         if source.paths.is_empty() {
             return Err(SyncError::NoPaths);
         }
+
+        source
+            .validate_name()
+            .map_err(|e| SyncError::InvalidSource(e.to_string()))?;
 
         let method = Self::detect_sync_method();
         let mut report = SyncReport::new(&source.name, method);
@@ -2787,6 +2794,31 @@ mod tests {
                 "expected invalid-host rejection for {host:?}, got {err}"
             );
         }
+    }
+
+    #[test]
+    fn test_sync_source_rejects_invalid_source_name_before_mirror_creation() {
+        let temp = TempDir::new().unwrap();
+        let engine = SyncEngine::new(temp.path());
+        let mut source = SourceDefinition::ssh("../escape", "user@host");
+        source.paths = vec!["/tmp/sessions".to_string()];
+
+        let err = engine
+            .sync_source(&source)
+            .expect_err("invalid source name should fail before local writes");
+
+        assert!(
+            matches!(err, SyncError::InvalidSource(ref message) if message.contains("Source name cannot contain path separators")),
+            "expected invalid source-name rejection, got {err}"
+        );
+        assert!(
+            !temp.path().join("escape").exists(),
+            "invalid source name must not escape the remotes mirror layout"
+        );
+        assert!(
+            !temp.path().join("remotes").exists(),
+            "invalid source name must be rejected before creating mirror roots"
+        );
     }
 
     #[test]
