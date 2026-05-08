@@ -1125,17 +1125,17 @@ impl SourceConfigGenerator {
                     .push((source.name.clone(), SkipReason::AlreadyConfigured));
                 continue;
             }
-            if !preview_name_keys.insert(source_name_key) {
-                preview.sources_skipped.push((
-                    host_name.to_string(),
-                    SkipReason::GeneratedNameConflict(source.name.clone()),
-                ));
-                continue;
-            }
             if let Err(err) = source.validate() {
                 preview.sources_skipped.push((
                     host_name.to_string(),
                     SkipReason::InvalidSourceDefinition(err.to_string()),
+                ));
+                continue;
+            }
+            if !preview_name_keys.insert(source_name_key) {
+                preview.sources_skipped.push((
+                    host_name.to_string(),
+                    SkipReason::GeneratedNameConflict(source.name.clone()),
                 ));
                 continue;
             }
@@ -2358,6 +2358,35 @@ Host production !legacy-prod
         assert!(matches!(
             &preview.sources_skipped[0].1,
             SkipReason::GeneratedNameConflict(name) if name == "laptop"
+        ));
+    }
+
+    #[test]
+    fn test_generate_preview_invalid_source_does_not_shadow_later_valid_duplicate() {
+        let generator = SourceConfigGenerator::new();
+        let invalid_probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "bad\npath")],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+        let valid_probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+
+        let probes: Vec<(&str, &HostProbeResult)> =
+            vec![("Laptop", &invalid_probe), ("laptop", &valid_probe)];
+        let preview = generator.generate_preview(&probes, &HashSet::new());
+
+        assert_eq!(preview.sources_to_add.len(), 1);
+        assert_eq!(preview.sources_to_add[0].name, "laptop");
+        assert_eq!(preview.sources_skipped.len(), 1);
+        assert_eq!(preview.sources_skipped[0].0, "Laptop");
+        assert!(matches!(
+            &preview.sources_skipped[0].1,
+            SkipReason::InvalidSourceDefinition(message)
+                if message.contains("paths[0] cannot contain control characters")
         ));
     }
 
