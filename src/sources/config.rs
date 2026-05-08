@@ -776,7 +776,9 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
                 hosts.append(&mut current_hosts);
                 current_hosts = value
                     .split_whitespace()
-                    .filter(|name| !name.contains('*') && !name.contains('?'))
+                    .filter(|name| {
+                        !name.starts_with('!') && !name.contains('*') && !name.contains('?')
+                    })
                     .map(|name| DiscoveredHost {
                         name: name.to_string(),
                         hostname: None,
@@ -1996,6 +1998,25 @@ Host gamma
             assert_eq!(host.identity_file.as_deref(), Some("~/.ssh/id_ed25519"));
         }
         assert_eq!(hosts[2].user.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn test_parse_ssh_config_skips_negated_host_patterns() {
+        let hosts = super::parse_ssh_config(
+            r#"
+Host * !bastion staging
+  User ubuntu
+
+Host production !legacy-prod
+  User deploy
+"#,
+        );
+
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0].name, "staging");
+        assert_eq!(hosts[0].user.as_deref(), Some("ubuntu"));
+        assert_eq!(hosts[1].name, "production");
+        assert_eq!(hosts[1].user.as_deref(), Some("deploy"));
     }
 
     // ==========================================================================
