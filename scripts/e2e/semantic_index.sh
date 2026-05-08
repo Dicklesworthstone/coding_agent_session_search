@@ -12,13 +12,20 @@
 #     run.log, run.jsonl, summary.json
 #     stdout/*.out, stderr/*.err
 #     sandbox/
+#
+# Environment:
+#   RCH_BIN         rch executable (default: rch)
+#   RCH_TARGET_DIR  cargo target dir for offloaded cass build
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_semantic_index_e2e}"
 
 # Source standard E2E logging library (emits to test-results/e2e/)
+# shellcheck disable=SC1091
 source "${PROJECT_ROOT}/scripts/lib/e2e_log.sh"
 e2e_init "shell" "semantic_index"
 
@@ -32,7 +39,6 @@ STDOUT_DIR="${RUN_DIR}/stdout"
 STDERR_DIR="${RUN_DIR}/stderr"
 
 SANDBOX_DIR="${RUN_DIR}/sandbox"
-BUILD_TARGET_DIR="${RUN_DIR}/target"
 DATA_DIR="${SANDBOX_DIR}/cass_data"
 CODEX_HOME="${SANDBOX_DIR}/.codex"
 HOME_DIR="${SANDBOX_DIR}/home"
@@ -209,6 +215,26 @@ run_step_optional() {
     return 0
 }
 
+# shellcheck disable=SC2317
+ensure_rch() {
+    if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+        log "FAIL" "rch binary not found; semantic index E2E cass build must be offloaded"
+        write_summary
+        exit 1
+    fi
+}
+
+# shellcheck disable=SC2317
+run_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+}
+
+# shellcheck disable=SC2317
+build_cass_binary() {
+    ensure_rch
+    (cd "$PROJECT_ROOT" && run_cargo build --bin cass)
+}
+
 json_state() {
     local file=$1
     if command -v jq >/dev/null 2>&1; then
@@ -281,12 +307,12 @@ write_summary() {
 log "INFO" "Run directory: ${RUN_DIR}"
 
 if [[ $NO_BUILD -eq 0 ]]; then
-    run_step "build" bash -c "cd \"$PROJECT_ROOT\" && CARGO_TARGET_DIR=\"$BUILD_TARGET_DIR\" cargo build"
+    run_step "build" build_cass_binary
 fi
 
 if [[ -z "${CASS_BIN:-}" ]]; then
     if [[ $NO_BUILD -eq 0 ]]; then
-        CASS_BIN="${BUILD_TARGET_DIR}/debug/cass"
+        CASS_BIN="${RCH_TARGET_DIR}/debug/cass"
     else
         CASS_BIN="${PROJECT_ROOT}/target/debug/cass"
     fi
