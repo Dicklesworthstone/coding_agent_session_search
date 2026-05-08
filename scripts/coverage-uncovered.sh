@@ -10,6 +10,9 @@
 # Environment:
 #   RCH_BIN         rch executable (default: rch)
 #   RCH_TARGET_DIR  cargo target dir for offloaded coverage work
+#   CASS_COVERAGE_FEATURES
+#                   cass features to cover; defaults to routine feature set
+#                   without strict-path-dep-validation
 
 set -euo pipefail
 
@@ -17,6 +20,7 @@ THRESHOLD=60
 FAIL_MODE=false
 RCH_BIN="${RCH_BIN:-rch}"
 RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_coverage_uncovered}"
+CASS_COVERAGE_FEATURES="${CASS_COVERAGE_FEATURES:-qr encryption backtrace}"
 
 for arg in "$@"; do
     case $arg in
@@ -73,7 +77,7 @@ echo ""
 
 # Common options for all coverage runs
 COMMON_OPTS=(
-    --all-features
+    --features "$CASS_COVERAGE_FEATURES"
     --workspace
     --ignore-filename-regex='(tests/|benches/|\.cargo/)'
 )
