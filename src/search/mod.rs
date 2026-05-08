@@ -19,6 +19,7 @@
 //! - **[`canonicalize`]**: Text preprocessing for consistent embedding input.
 //! - **[`ann_index`]**: HNSW-based approximate nearest neighbor index (Opt 9).
 //! - **[`two_tier_search`]**: Two-tier progressive search with fast/quality embeddings (bd-3dcw).
+//! - **[`pack_planner`]**: Deterministic answer-pack evidence selection core.
 
 pub mod ann_index;
 pub mod asset_state;
@@ -31,6 +32,7 @@ pub mod fastembed_reranker;
 pub mod hash_embedder;
 pub mod model_download;
 pub mod model_manager;
+pub mod pack_planner;
 pub mod policy;
 pub mod query;
 pub(crate) mod readiness;
