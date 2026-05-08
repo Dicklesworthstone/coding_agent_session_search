@@ -195,6 +195,34 @@ owned string sizes. Treat a same-host p95 or Criterion typical-estimate drift
 over 10% as an investigation trigger and over 20% as a regression unless the
 artifact explains a deliberate tradeoff.
 
+#### Answer-Pack Token-Budget Tuning
+
+Answer packs are intended for copy-paste handoff contexts, so tune them by the
+receiving model's available context rather than by raw archive size. A practical
+default is:
+
+```bash
+cass pack "handoff query" --robot --max-tokens 12000 --limit 40 --max-evidence 8
+```
+
+Use the SLO report before changing defaults. It prints p50/p95 stage timings,
+candidate count, selected evidence count, omitted count, token utilization, and
+a memory proxy, which are the fields needed to tell whether a pack is too slow,
+too sparse, or simply under budget.
+
+Guidelines:
+
+1. Prefer `--max-evidence` and `--max-sessions` for compact handoffs that still
+   preserve high-signal citations.
+2. Lower `--max-excerpt-chars` only after evidence/session caps are reasonable;
+   very short excerpts can make citations hard to evaluate.
+3. Use `--sessions-from -` when a prior `cass search --robot-format sessions`
+   already identified the relevant files; this limits planner work and keeps
+   evidence scoped to the intended handoff.
+4. Treat very low utilization with many omitted candidates as a prompt to raise
+   `--max-tokens`; treat high utilization with few selected items as a prompt to
+   reduce excerpt length or evidence count.
+
 ### runtime_perf.rs
 
 Full runtime benchmarks:
