@@ -7,9 +7,14 @@
 #   ./scripts/test-report.sh --e2e     # Run E2E tests only
 #   ./scripts/test-report.sh --open    # Open HTML report after generation
 #
-# Reports are generated in target/nextest/<profile>/
+# Reports are generated in ${RCH_TARGET_DIR}/nextest/<profile>/
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_test_report}"
 
 QUICK_MODE=false
 E2E_ONLY=false
@@ -41,19 +46,37 @@ for arg in "$@"; do
             echo "  ci   - Full test suite with JUnit XML output"
             echo "  e2e  - E2E tests with sequential execution"
             echo ""
-            echo "Reports generated in: target/nextest/<profile>/junit.xml"
+            echo "Environment:"
+            echo "  RCH_BIN         rch executable (default: rch)"
+            echo "  RCH_TARGET_DIR  cargo target dir for offloaded tests (default: \${TMPDIR:-/tmp}/rch_target_cass_test_report)"
+            echo ""
+            echo "Reports generated in: \$RCH_TARGET_DIR/nextest/<profile>/junit.xml"
             echo ""
             exit 0
             ;;
     esac
 done
 
-# Check if cargo-nextest is installed
-if ! command -v cargo-nextest &> /dev/null; then
-    echo "Error: cargo-nextest not installed"
+cd "$PROJECT_ROOT"
+
+ensure_rch() {
+    if ! command -v "$RCH_BIN" &> /dev/null; then
+        echo "Error: rch binary not found; test-report cargo work must be offloaded"
+        exit 1
+    fi
+}
+
+run_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+}
+
+ensure_rch
+
+# Check if cargo-nextest is available through the offloaded cargo toolchain.
+if ! run_cargo nextest --version > /dev/null 2>&1; then
+    echo "Error: cargo-nextest is unavailable through rch"
     echo ""
-    echo "Install with:"
-    echo "  cargo install cargo-nextest"
+    echo "Install it on the rch worker toolchain, or use a worker image that includes cargo-nextest."
     echo ""
     exit 1
 fi
@@ -65,37 +88,37 @@ echo ""
 
 # Build first
 echo "Building project..."
-cargo build --tests --quiet
+run_cargo build --tests --quiet
 
 # Determine filter expression
-FILTER=""
+FILTER_ARGS=()
 if [ "$E2E_ONLY" = true ]; then
-    FILTER="-E 'binary(install_scripts) | binary(e2e_index_tui) | binary(e2e_filters) | binary(e2e_multi_connector)'"
+    FILTER_ARGS=(-E "binary(install_scripts) | binary(e2e_index_tui) | binary(e2e_filters) | binary(e2e_multi_connector)")
     echo "Running: E2E tests only"
 elif [ "$QUICK_MODE" = true ]; then
-    FILTER="-E 'not (test(install_sh) | test(install_ps1) | binary(~e2e) | binary(install_scripts))'"
+    FILTER_ARGS=(-E "not (test(install_sh) | test(install_ps1) | binary(~e2e) | binary(install_scripts))")
     echo "Running: Unit tests (skipping E2E and install script tests)"
 else
-    FILTER="-E 'not (test(install_sh) | test(install_ps1))'"
+    FILTER_ARGS=(-E "not (test(install_sh) | test(install_ps1))")
     echo "Running: All tests (skipping install script tests)"
 fi
 
 echo "Profile: $PROFILE"
+echo "Target dir: $RCH_TARGET_DIR"
 echo ""
 
 # Run tests
 echo "Running tests..."
 echo "-----------------------------------"
 
-# shellcheck disable=SC2086
-cargo nextest run --profile "$PROFILE" $FILTER --no-fail-fast 2>&1 || true
+run_cargo nextest run --profile "$PROFILE" "${FILTER_ARGS[@]}" --no-fail-fast 2>&1 || true
 
 echo ""
 echo "-----------------------------------"
 echo "Test Report"
 echo "-----------------------------------"
 
-JUNIT_PATH="target/nextest/$PROFILE/junit.xml"
+JUNIT_PATH="$RCH_TARGET_DIR/nextest/$PROFILE/junit.xml"
 
 if [ -f "$JUNIT_PATH" ]; then
     echo "JUnit XML report: $JUNIT_PATH"
@@ -119,7 +142,7 @@ if [ -f "$JUNIT_PATH" ]; then
     # Generate HTML report if junit2html is available
     if [ "$OPEN_REPORT" = true ]; then
         if command -v junit2html &> /dev/null; then
-            HTML_PATH="target/nextest/$PROFILE/report.html"
+            HTML_PATH="$RCH_TARGET_DIR/nextest/$PROFILE/report.html"
             echo ""
             echo "Generating HTML report..."
             junit2html "$JUNIT_PATH" "$HTML_PATH"
