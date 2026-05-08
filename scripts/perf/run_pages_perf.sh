@@ -8,12 +8,14 @@
 # Usage:
 #   ./scripts/perf/run_pages_perf.sh
 #   ./scripts/perf/run_pages_perf.sh --preset large --lighthouse
-#   CARGO_TARGET_DIR=target ./scripts/perf/run_pages_perf.sh
+#   RCH_TARGET_DIR=/tmp/rch_target_cass_pages_perf ./scripts/perf/run_pages_perf.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_pages_perf}"
 
 PRESET_FILTER=""
 RUN_LIGHTHOUSE=0
@@ -34,7 +36,13 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --help|-h)
-      echo "Usage: $0 [--preset <name>] [--lighthouse] [--fail-fast]"
+      cat <<EOF
+Usage: $0 [--preset <name>] [--lighthouse] [--fail-fast]
+
+Environment:
+  RCH_BIN         rch executable (default: rch)
+  RCH_TARGET_DIR  cargo target dir for offloaded helper build (default: \${TMPDIR:-/tmp}/rch_target_cass_pages_perf)
+EOF
       exit 0
       ;;
     *)
@@ -42,6 +50,17 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
  done
+
+ensure_rch() {
+  if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+    log "ERROR" "rch binary not found; pages perf helper build must be offloaded"
+    exit 1
+  fi
+}
+
+run_cargo() {
+  "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+}
 
 LOG_ROOT="${PROJECT_ROOT}/target/perf"
 RUN_ID="$(date +"%Y%m%d_%H%M%S")_${RANDOM}"
@@ -94,9 +113,18 @@ run_step() {
 }
 
 log "INFO" "Run dir: ${RUN_DIR}"
-log "INFO" "CARGO_TARGET_DIR: ${CARGO_TARGET_DIR:-<default>}"
+log "INFO" "RCH binary: ${RCH_BIN}"
+log "INFO" "RCH target dir: ${RCH_TARGET_DIR}"
 
 cd "${PROJECT_ROOT}"
+ensure_rch
+
+BUNDLE_BIN="${RCH_TARGET_DIR}/debug/cass-pages-perf-bundle"
+run_step "build_bundle_helper" run_cargo build --quiet --bin cass-pages-perf-bundle
+if [[ ! -x "$BUNDLE_BIN" ]]; then
+  log "ERROR" "cass-pages-perf-bundle not found at ${BUNDLE_BIN} after rch build"
+  exit 1
+fi
 
 if [[ ! -d tests/performance/node_modules ]]; then
   log "INFO" "Installing performance test dependencies"
@@ -118,7 +146,7 @@ for preset in "${PRESETS[@]}"; do
 
   mkdir -p "${preset_dir}"
 
-  run_step "bundle_${preset}" cargo run --quiet --bin cass-pages-perf-bundle -- \
+  run_step "bundle_${preset}" "$BUNDLE_BIN" \
     --output "${preset_dir}" --preset "${preset}" --json
 
   perf_cmd=(node tests/performance/run_perf.js --bundle "${bundle_dir}" --out "${perf_json}")
