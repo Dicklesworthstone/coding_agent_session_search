@@ -26,6 +26,7 @@ OUTPUT_DIR="${PROJECT_ROOT}/test-results/e2e"
 TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
 
 # Source the e2e logging library
+# shellcheck disable=SC1091
 source "${PROJECT_ROOT}/scripts/lib/e2e_log.sh"
 
 # =============================================================================
@@ -37,6 +38,8 @@ RUN_SHELL=${RUN_SHELL:-1}
 RUN_PLAYWRIGHT=${RUN_PLAYWRIGHT:-1}
 FAIL_FAST=${FAIL_FAST:-0}
 VERBOSE=${VERBOSE:-0}
+RCH_BIN=${RCH_BIN:-rch}
+RCH_TARGET_DIR=${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_tests_run_all}
 
 # Colors
 if [[ -t 1 ]]; then
@@ -62,12 +65,16 @@ Usage:
     ./scripts/tests/run_all.sh [OPTIONS]
 
 Options:
-    --rust-only       Run only Rust E2E tests (cargo test e2e_*)
+    --rust-only       Run only Rust E2E tests (rch cargo test e2e_*)
     --shell-only      Run only shell script tests (scripts/test-*.sh)
     --playwright-only Run only Playwright E2E tests
     --fail-fast       Stop execution on first suite failure
     --verbose         Show detailed output from each suite
     --help            Show this help message
+
+Environment:
+    RCH_BIN          rch executable to use for Rust E2E tests (default: rch)
+    RCH_TARGET_DIR   remote Cargo target dir for Rust E2E tests
 
 Outputs:
     test-results/e2e/<suite>/<test>/cass.log  Per-test JSONL logs (Rust E2E)
@@ -198,6 +205,13 @@ skip_suite() {
     ((TOTAL_SKIPPED++))
 }
 
+ensure_rch() {
+    if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+        echo "rch binary not found: ${RCH_BIN}" >&2
+        return 1
+    fi
+}
+
 # =============================================================================
 # Generate Summary
 # =============================================================================
@@ -262,7 +276,7 @@ EOF
 EOF
 
     while IFS= read -r -d '' f; do
-        echo "- ${f#${PROJECT_ROOT}/}" >> "$summary_file"
+        echo "- ${f#"${PROJECT_ROOT}"/}" >> "$summary_file"
     done < <(find "$OUTPUT_DIR" -type f \( -name "*.jsonl" -o -name "cass.log" \) \
         ! -name "trace.jsonl" ! -name "combined.jsonl" -print0 | sort -z)
 
@@ -316,7 +330,15 @@ main() {
             for t in "${rust_tests[@]}"; do
                 args+=(--test "$t")
             done
-            if run_suite "rust_e2e" "rust" env E2E_LOG=1 cargo test --all-features --verbose "${args[@]}" -- --test-threads=1 --nocapture; then
+            if ! ensure_rch; then
+                failed=1
+                SUITE_NAMES+=("rust_e2e")
+                SUITE_RESULTS+=("fail")
+                SUITE_DURATIONS+=("0")
+                ((TOTAL_FAILED++))
+                log_result "rust_e2e" "fail" "0"
+                [[ "$FAIL_FAST" -eq 1 ]] && { generate_summary; exit 1; }
+            elif run_suite "rust_e2e" "rust" "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" E2E_LOG=1 cargo test --all-features --verbose "${args[@]}" -- --test-threads=1 --nocapture; then
                 :
             else
                 failed=1
