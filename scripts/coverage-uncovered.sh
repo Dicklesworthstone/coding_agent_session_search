@@ -6,11 +6,17 @@
 # Usage:
 #   ./scripts/coverage-uncovered.sh           # Show uncovered lines
 #   ./scripts/coverage-uncovered.sh --fail    # Exit 1 if below threshold
+#
+# Environment:
+#   RCH_BIN         rch executable (default: rch)
+#   RCH_TARGET_DIR  cargo target dir for offloaded coverage work
 
 set -euo pipefail
 
 THRESHOLD=60
 FAIL_MODE=false
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_coverage_uncovered}"
 
 for arg in "$@"; do
     case $arg in
@@ -32,11 +38,23 @@ for arg in "$@"; do
     esac
 done
 
-# Check if cargo-llvm-cov is installed
-if ! command -v cargo-llvm-cov &> /dev/null; then
-    echo "Error: cargo-llvm-cov not installed"
+ensure_rch() {
+    if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+        echo "Error: rch binary not found; coverage Cargo work must be offloaded"
+        exit 1
+    fi
+}
+
+run_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+}
+
+# Check if cargo-llvm-cov is installed on the offloaded toolchain
+ensure_rch
+if ! run_cargo llvm-cov --version >/dev/null 2>&1; then
+    echo "Error: cargo-llvm-cov is not available through rch"
     echo ""
-    echo "Install with:"
+    echo "Install it on the remote toolchain with:"
     echo "  rustup component add llvm-tools-preview"
     echo "  cargo install cargo-llvm-cov"
     echo ""
@@ -69,19 +87,19 @@ TEST_OPTS=(
 
 # Clean previous coverage data
 echo "Cleaning previous coverage data..."
-cargo llvm-cov clean --workspace
+run_cargo llvm-cov clean --workspace
 
 # Run tests ONCE with coverage instrumentation (no report yet)
 echo ""
 echo "Running tests with coverage instrumentation..."
-cargo llvm-cov "${COMMON_OPTS[@]}" \
+run_cargo llvm-cov "${COMMON_OPTS[@]}" \
     --no-report \
     "${TEST_OPTS[@]}"
 
 # Show uncovered lines from collected data (no re-running tests)
 echo ""
 echo "Showing uncovered lines..."
-cargo llvm-cov report "${COMMON_OPTS[@]}" \
+run_cargo llvm-cov report "${COMMON_OPTS[@]}" \
     --show-missing-lines
 
 echo ""
@@ -92,7 +110,7 @@ echo ""
 
 # Get coverage percentage from JSON (no re-running tests)
 if command -v jq &> /dev/null; then
-    COVERAGE_JSON=$(cargo llvm-cov report "${COMMON_OPTS[@]}" --json 2>/dev/null)
+    COVERAGE_JSON=$(run_cargo llvm-cov report "${COMMON_OPTS[@]}" --json 2>/dev/null)
 
     if [ -n "$COVERAGE_JSON" ]; then
         TOTAL_LINES=$(echo "$COVERAGE_JSON" | jq -r '.data[0].totals.lines.count // 0')

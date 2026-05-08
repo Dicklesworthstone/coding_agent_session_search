@@ -6,12 +6,18 @@
 #   ./scripts/coverage.sh           # Generate full coverage report
 #   ./scripts/coverage.sh --quick   # Skip HTML generation (faster)
 #   ./scripts/coverage.sh --open    # Open HTML report after generation
+#
+# Environment:
+#   RCH_BIN         rch executable (default: rch)
+#   RCH_TARGET_DIR  cargo target dir for offloaded coverage work
 
 set -euo pipefail
 
 REPORT_DIR="target/coverage"
 QUICK_MODE=false
 OPEN_REPORT=false
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_coverage}"
 
 # Parse arguments
 for arg in "$@"; do
@@ -35,10 +41,23 @@ for arg in "$@"; do
 done
 
 # Check dependencies
-if ! command -v cargo-llvm-cov &> /dev/null; then
-    echo "Error: cargo-llvm-cov not installed"
+ensure_rch() {
+    if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+        echo "Error: rch binary not found; coverage Cargo work must be offloaded"
+        exit 1
+    fi
+}
+
+run_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+}
+
+ensure_rch
+
+if ! run_cargo llvm-cov --version >/dev/null 2>&1; then
+    echo "Error: cargo-llvm-cov is not available through rch"
     echo ""
-    echo "Install with:"
+    echo "Install it on the remote toolchain with:"
     echo "  rustup component add llvm-tools-preview"
     echo "  cargo install cargo-llvm-cov"
     echo ""
@@ -58,7 +77,7 @@ echo ""
 
 # Clean previous coverage data
 echo "Cleaning previous coverage data..."
-cargo llvm-cov clean --workspace
+run_cargo llvm-cov clean --workspace
 
 # Common options for all coverage runs
 COMMON_OPTS=(
@@ -77,26 +96,26 @@ TEST_OPTS=(
 # Run tests ONCE with coverage instrumentation (no report yet)
 echo ""
 echo "Running tests with coverage instrumentation..."
-cargo llvm-cov "${COMMON_OPTS[@]}" \
+run_cargo llvm-cov "${COMMON_OPTS[@]}" \
     --no-report \
     "${TEST_OPTS[@]}"
 
 # Generate reports from collected coverage data (no re-running tests)
 echo ""
 echo "Generating LCOV report..."
-cargo llvm-cov report "${COMMON_OPTS[@]}" \
+run_cargo llvm-cov report "${COMMON_OPTS[@]}" \
     --lcov \
     --output-path "$REPORT_DIR/lcov.info"
 
 echo "Generating JSON summary..."
-cargo llvm-cov report "${COMMON_OPTS[@]}" \
+run_cargo llvm-cov report "${COMMON_OPTS[@]}" \
     --json \
     --output-path "$REPORT_DIR/coverage.json"
 
 # Generate HTML report (unless quick mode)
 if [ "$QUICK_MODE" = false ]; then
     echo "Generating HTML report..."
-    cargo llvm-cov report "${COMMON_OPTS[@]}" \
+    run_cargo llvm-cov report "${COMMON_OPTS[@]}" \
         --html \
         --output-dir "$REPORT_DIR/html"
 fi
@@ -105,7 +124,7 @@ fi
 echo ""
 echo "Coverage Summary"
 echo "================"
-cargo llvm-cov report "${COMMON_OPTS[@]}"
+run_cargo llvm-cov report "${COMMON_OPTS[@]}"
 
 echo ""
 echo "Reports generated:"
