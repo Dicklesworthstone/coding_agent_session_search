@@ -12,6 +12,7 @@ use super::query::SearchHit;
 
 const TOKEN_ESTIMATE_CHARS_PER_TOKEN: usize = 4;
 const DEFAULT_FRESHNESS_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
+const PACK_CANDIDATE_LIMIT_CAP: usize = 2_048;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackPlannerLimits {
@@ -227,8 +228,25 @@ pub struct PlannedAnswerPack {
     pub selected_evidence_count: usize,
     pub selected_session_count: usize,
     pub estimated_tokens: usize,
+    pub diagnostics: PackPlannerDiagnostics,
     pub evidence: Vec<PlannedPackEvidence>,
     pub omitted: Vec<OmittedPackCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackPlannerDiagnostics {
+    pub candidate_fetch_limit: usize,
+    pub budget: PackPlannerBudget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackPlannerBudget {
+    pub max_tokens: usize,
+    pub metadata_tokens: usize,
+    pub outline_tokens: usize,
+    pub evidence_tokens: usize,
+    pub omitted_tokens: usize,
+    pub max_output_tokens_with_overflow: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -292,6 +310,46 @@ pub enum PackSelectedReason {
     BudgetFit,
 }
 
+pub fn pack_candidate_fetch_limit(
+    limits: &PackPlannerLimits,
+) -> Result<usize, PackPlannerLimitError> {
+    limits.validate()?;
+    Ok(limits
+        .max_evidence
+        .saturating_mul(8)
+        .max(limits.max_sessions.saturating_mul(16))
+        .clamp(64, PACK_CANDIDATE_LIMIT_CAP))
+}
+
+pub fn pack_planner_budget(
+    limits: &PackPlannerLimits,
+) -> Result<PackPlannerBudget, PackPlannerLimitError> {
+    limits.validate()?;
+    Ok(pack_planner_budget_unchecked(limits.max_tokens))
+}
+
+fn pack_planner_budget_unchecked(max_tokens: usize) -> PackPlannerBudget {
+    let metadata_tokens = percent_tokens(max_tokens, 15);
+    let outline_tokens = percent_tokens(max_tokens, 15);
+    let evidence_tokens = percent_tokens(max_tokens, 60);
+    let omitted_tokens = max_tokens
+        .saturating_sub(metadata_tokens)
+        .saturating_sub(outline_tokens)
+        .saturating_sub(evidence_tokens);
+    PackPlannerBudget {
+        max_tokens,
+        metadata_tokens,
+        outline_tokens,
+        evidence_tokens,
+        omitted_tokens,
+        max_output_tokens_with_overflow: max_tokens.saturating_add(max_tokens / 20),
+    }
+}
+
+fn percent_tokens(max_tokens: usize, percent: usize) -> usize {
+    max_tokens.saturating_mul(percent) / 100
+}
+
 #[derive(Debug, Clone)]
 struct ScoredCandidate {
     index: usize,
@@ -315,6 +373,10 @@ pub fn plan_answer_pack(
     request.limits.validate()?;
 
     let candidate_count = request.candidates.len();
+    let diagnostics = PackPlannerDiagnostics {
+        candidate_fetch_limit: pack_candidate_fetch_limit(&request.limits)?,
+        budget: pack_planner_budget_unchecked(request.limits.max_tokens),
+    };
     let lexical_range = ScoreRange::from_values(
         request
             .candidates
@@ -411,7 +473,9 @@ pub fn plan_answer_pack(
         remaining = next_remaining;
         let candidate = &request.candidates[best_candidate.index];
 
-        if used_tokens.saturating_add(best_candidate.score.token_cost) > request.limits.max_tokens {
+        if used_tokens.saturating_add(best_candidate.score.token_cost)
+            > diagnostics.budget.evidence_tokens
+        {
             omitted.push(omitted_candidate(
                 candidate,
                 PackOmittedReason::TokenBudgetExhausted,
@@ -486,6 +550,7 @@ pub fn plan_answer_pack(
         selected_evidence_count: selected.len(),
         selected_session_count: selected_state.sessions.len(),
         estimated_tokens: used_tokens,
+        diagnostics,
         evidence: selected,
         omitted,
     })
@@ -935,8 +1000,57 @@ mod tests {
 
         assert_eq!(plan.candidate_count, 0);
         assert_eq!(plan.selected_evidence_count, 0);
+        assert_eq!(plan.diagnostics.candidate_fetch_limit, 192);
         assert!(plan.evidence.is_empty());
         assert!(plan.omitted.is_empty());
+    }
+
+    #[test]
+    fn candidate_fetch_limit_matches_contract_formula() {
+        let mut limits = PackPlannerLimits {
+            max_tokens: 12_000,
+            max_sessions: 2,
+            max_evidence: 3,
+            context_lines: 3,
+            max_excerpt_chars: 1_600,
+        };
+
+        assert_eq!(pack_candidate_fetch_limit(&limits).unwrap(), 64);
+
+        limits.max_sessions = 20;
+        assert_eq!(pack_candidate_fetch_limit(&limits).unwrap(), 320);
+
+        limits.max_sessions = 64;
+        limits.max_evidence = 256;
+        assert_eq!(
+            pack_candidate_fetch_limit(&limits).unwrap(),
+            PACK_CANDIDATE_LIMIT_CAP
+        );
+    }
+
+    #[test]
+    fn token_budget_reserves_documented_sections() {
+        let budget = pack_planner_budget(&PackPlannerLimits {
+            max_tokens: 12_000,
+            max_sessions: 8,
+            max_evidence: 24,
+            context_lines: 3,
+            max_excerpt_chars: 1_600,
+        })
+        .unwrap();
+
+        assert_eq!(budget.metadata_tokens, 1_800);
+        assert_eq!(budget.outline_tokens, 1_800);
+        assert_eq!(budget.evidence_tokens, 7_200);
+        assert_eq!(budget.omitted_tokens, 1_200);
+        assert_eq!(budget.max_output_tokens_with_overflow, 12_600);
+        assert_eq!(
+            budget.metadata_tokens
+                + budget.outline_tokens
+                + budget.evidence_tokens
+                + budget.omitted_tokens,
+            budget.max_tokens
+        );
     }
 
     #[test]
@@ -953,6 +1067,39 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_span_and_overlapping_ranges_are_omitted_once() {
+        let span_source = candidate("span-source", "local", "/s/span.jsonl", 10.0);
+        let mut span_duplicate = candidate("span-dup", "remote", "/s/other.jsonl", 9.0);
+        span_duplicate.span_hash = span_source.span_hash.clone();
+
+        let range_source = candidate("range-source", "local", "/s/range.jsonl", 8.0);
+        let mut range_duplicate = candidate("range-dup", "remote", "/s/range.jsonl", 7.0);
+        range_duplicate.line_start = Some(11);
+        range_duplicate.line_end = Some(14);
+
+        let plan = plan_answer_pack(request(vec![
+            span_source,
+            span_duplicate,
+            range_source,
+            range_duplicate,
+        ]))
+        .unwrap();
+
+        let omitted_ids: Vec<_> = plan
+            .omitted
+            .iter()
+            .map(|omitted| (omitted.candidate_id.as_str(), omitted.reason))
+            .collect();
+        assert_eq!(
+            omitted_ids,
+            vec![
+                ("span-dup", PackOmittedReason::DuplicateContent),
+                ("range-dup", PackOmittedReason::DuplicateContent),
+            ]
+        );
+    }
+
+    #[test]
     fn exact_token_budget_boundary_selects_until_budget_exhausted() {
         let mut first = candidate("a", "local", "/s/a.jsonl", 10.0);
         first.excerpt = "12345678".to_string();
@@ -962,13 +1109,36 @@ mod tests {
         let mut req = request(vec![first, second]);
         req.limits.max_tokens = 1_024;
         req.limits.max_excerpt_chars = 4_096;
-        req.candidates[0].excerpt = "x".repeat(4_096);
+        let evidence_budget = pack_planner_budget(&req.limits).unwrap().evidence_tokens;
+        req.candidates[0].excerpt = "x".repeat(evidence_budget * TOKEN_ESTIMATE_CHARS_PER_TOKEN);
         req.candidates[1].excerpt = "y".repeat(4);
 
         let plan = plan_answer_pack(req).unwrap();
 
         assert_eq!(plan.selected_evidence_count, 1);
-        assert_eq!(plan.estimated_tokens, 1_024);
+        assert_eq!(plan.estimated_tokens, evidence_budget);
+        assert_eq!(
+            plan.omitted[0].reason,
+            PackOmittedReason::TokenBudgetExhausted
+        );
+    }
+
+    #[test]
+    fn oversized_high_score_candidate_can_be_skipped_for_budget_fit() {
+        let mut oversized = candidate("oversized", "local", "/s/oversized.jsonl", 10.0);
+        let mut fitting = candidate("fit", "remote", "/s/fit.jsonl", 9.0);
+
+        let mut req = request(vec![oversized.clone(), fitting.clone()]);
+        req.limits.max_excerpt_chars = 8_000;
+        let evidence_budget = pack_planner_budget(&req.limits).unwrap().evidence_tokens;
+        oversized.excerpt = "x".repeat((evidence_budget + 1) * TOKEN_ESTIMATE_CHARS_PER_TOKEN);
+        fitting.excerpt = "y".repeat(TOKEN_ESTIMATE_CHARS_PER_TOKEN);
+        req.candidates = vec![oversized, fitting];
+
+        let plan = plan_answer_pack(req).unwrap();
+
+        assert_eq!(plan.evidence[0].candidate.candidate_id, "fit");
+        assert_eq!(plan.omitted.len(), 1);
         assert_eq!(
             plan.omitted[0].reason,
             PackOmittedReason::TokenBudgetExhausted
@@ -1013,6 +1183,37 @@ mod tests {
     }
 
     #[test]
+    fn null_timestamps_sort_last_when_scores_tie() {
+        let mut unknown = candidate("unknown", "a", "/a.jsonl", 1.0);
+        unknown.created_at_ms = None;
+        let mut timestamped = candidate("timestamped", "z", "/z.jsonl", 1.0);
+        timestamped.created_at_ms = Some(1_000_000);
+
+        let mut req = request(vec![unknown, timestamped]);
+        req.freshness_policy = PackFreshnessPolicy::AllowStale;
+
+        let plan = plan_answer_pack(req).unwrap();
+
+        assert_eq!(plan.evidence[0].candidate.candidate_id, "timestamped");
+    }
+
+    #[test]
+    fn freshness_policy_scores_unknown_timestamps_explicitly() {
+        let mut unknown = candidate("unknown", "local", "/s/unknown.jsonl", 1.0);
+        unknown.created_at_ms = None;
+        let mut req = request(vec![unknown.clone()]);
+
+        req.freshness_policy = PackFreshnessPolicy::PreferRecent;
+        assert_eq!(freshness_score(&unknown, &req), 0.25);
+
+        req.freshness_policy = PackFreshnessPolicy::AllowStale;
+        assert_eq!(freshness_score(&unknown, &req), 1.0);
+
+        req.freshness_policy = PackFreshnessPolicy::Strict;
+        assert_eq!(freshness_score(&unknown, &req), 0.0);
+    }
+
+    #[test]
     fn lexical_score_drives_relevance_when_semantic_is_absent() {
         let plan =
             plan_answer_pack(request(vec![candidate("a", "local", "/s/a.jsonl", 7.0)])).unwrap();
@@ -1034,5 +1235,70 @@ mod tests {
 
         assert_eq!(left.evidence[0].candidate.source_path, "/a.jsonl");
         assert_eq!(right.evidence[0].candidate.source_path, "/a.jsonl");
+    }
+
+    #[test]
+    fn stable_ordering_keeps_cursor_like_page_boundaries() {
+        let candidates = vec![
+            candidate("e", "remote", "/e.jsonl", 1.0),
+            candidate("b", "remote", "/b.jsonl", 1.0),
+            candidate("d", "remote", "/d.jsonl", 1.0),
+            candidate("a", "remote", "/a.jsonl", 1.0),
+            candidate("c", "remote", "/c.jsonl", 1.0),
+        ];
+        let mut reversed = candidates.clone();
+        reversed.reverse();
+
+        let left = plan_answer_pack(request(candidates)).unwrap();
+        let right = plan_answer_pack(request(reversed)).unwrap();
+        let left_ids: Vec<_> = left
+            .evidence
+            .iter()
+            .map(|evidence| evidence.candidate.candidate_id.as_str())
+            .collect();
+        let right_ids: Vec<_> = right
+            .evidence
+            .iter()
+            .map(|evidence| evidence.candidate.candidate_id.as_str())
+            .collect();
+
+        assert_eq!(
+            left_ids.chunks(2).collect::<Vec<_>>(),
+            right_ids.chunks(2).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn omitted_reasons_serialize_to_documented_snake_case() {
+        let reasons = [
+            (
+                PackOmittedReason::TokenBudgetExhausted,
+                "token_budget_exhausted",
+            ),
+            (
+                PackOmittedReason::MaxSessionsReached,
+                "max_sessions_reached",
+            ),
+            (
+                PackOmittedReason::MaxEvidenceReached,
+                "max_evidence_reached",
+            ),
+            (PackOmittedReason::DuplicateContent, "duplicate_content"),
+            (
+                PackOmittedReason::SameSessionLowerRank,
+                "same_session_lower_rank",
+            ),
+            (
+                PackOmittedReason::StaleUnderStrictPolicy,
+                "stale_under_strict_policy",
+            ),
+            (PackOmittedReason::SourceUnavailable, "source_unavailable"),
+            (PackOmittedReason::RedactedToEmpty, "redacted_to_empty"),
+            (PackOmittedReason::FieldMaskExcluded, "field_mask_excluded"),
+        ];
+
+        for (reason, expected) in reasons {
+            assert_eq!(serde_json::to_value(reason).unwrap(), expected);
+        }
     }
 }
