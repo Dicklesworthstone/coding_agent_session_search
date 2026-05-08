@@ -11,6 +11,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/rch_target_cass_test_quick}"
 
 # Colors
 if [[ -t 1 ]]; then
@@ -23,39 +25,30 @@ else
     GREEN='' RED='' CYAN='' BOLD='' NC=''
 fi
 
-# Check for nextest
-USE_NEXTEST=1
-if ! command -v cargo-nextest &> /dev/null && ! cargo nextest --version &> /dev/null 2>&1; then
-    USE_NEXTEST=0
-fi
-
 cd "$PROJECT_ROOT"
+
+run_cargo_test() {
+    if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+        echo "ERROR: rch binary not found; quick tests must be offloaded" >&2
+        return 127
+    fi
+
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo test "$@"
+}
 
 run_lib_tests() {
     echo -e "${CYAN}Running library unit tests...${NC}"
-    if [[ $USE_NEXTEST -eq 1 ]]; then
-        cargo nextest run --profile default -E 'kind(lib)' --color=always
-    else
-        cargo test --lib --color=always
-    fi
+    run_cargo_test --lib --color=always
 }
 
 run_cli_tests() {
     echo -e "${CYAN}Running CLI tests...${NC}"
-    if [[ $USE_NEXTEST -eq 1 ]]; then
-        cargo nextest run --profile default -E 'binary(e2e_cli_flows)' --color=always
-    else
-        cargo test --test e2e_cli_flows --color=always
-    fi
+    run_cargo_test --test e2e_cli_flows --color=always
 }
 
 run_connector_tests() {
     echo -e "${CYAN}Running Claude connector tests...${NC}"
-    if [[ $USE_NEXTEST -eq 1 ]]; then
-        cargo nextest run --profile default -E 'binary(connector_claude)' --color=always
-    else
-        cargo test --test connector_claude --color=always
-    fi
+    run_cargo_test --test connector_claude --color=always
 }
 
 show_help() {
@@ -94,7 +87,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo -e "${BOLD}Quick Test Runner${NC}"
-echo "Using: $([ $USE_NEXTEST -eq 1 ] && echo 'cargo-nextest' || echo 'cargo test')"
+echo "Using: rch-backed cargo test"
+echo "Target dir: $RCH_TARGET_DIR"
 echo ""
 
 START_TIME=$(date +%s)
