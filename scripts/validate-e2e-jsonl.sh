@@ -56,13 +56,17 @@ validate_line() {
                 return 1
             fi
             ;;
-        test_start|test_end)
+        test_start)
             if ! echo "$line" | jq -e '.test.name' >/dev/null 2>&1; then
                 errors+=("$file:$line_num: $event missing 'test.name' field")
                 return 1
             fi
             ;;
         test_end)
+            if ! echo "$line" | jq -e '.test.name' >/dev/null 2>&1; then
+                errors+=("$file:$line_num: $event missing 'test.name' field")
+                return 1
+            fi
             if ! echo "$line" | jq -e '.result.status' >/dev/null 2>&1; then
                 errors+=("$file:$line_num: test_end missing 'result.status' field")
                 return 1
@@ -111,7 +115,8 @@ validate_file() {
         return 0
     fi
 
-    # Validate each line
+    # Validate each line. The helper only uses the file path for diagnostics.
+    # shellcheck disable=SC2094
     while IFS= read -r line || [[ -n "$line" ]]; do
         ((line_num++)) || true
         ((total_events++)) || true

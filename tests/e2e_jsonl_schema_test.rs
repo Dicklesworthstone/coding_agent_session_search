@@ -6,6 +6,7 @@
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 mod util;
 use util::e2e_log::{E2eError, E2ePerformanceMetrics, PhaseTracker};
@@ -154,6 +155,49 @@ fn validate_file_structure(events: &[Value]) -> Vec<String> {
     }
 
     warnings
+}
+
+#[test]
+fn shell_validator_rejects_test_end_without_result_status() {
+    let tracker = tracker_for("shell_validator_rejects_test_end_without_result_status");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let log_path = temp.path().join("missing_status.jsonl");
+    fs::write(
+        &log_path,
+        r#"{"ts":"2026-01-01T00:00:00Z","event":"run_start","run_id":"r1","runner":"rust","env":{}}
+{"ts":"2026-01-01T00:00:01Z","event":"test_start","run_id":"r1","runner":"rust","test":{"name":"status_required"}}
+{"ts":"2026-01-01T00:00:02Z","event":"test_end","run_id":"r1","runner":"rust","test":{"name":"status_required"}}
+{"ts":"2026-01-01T00:00:03Z","event":"run_end","run_id":"r1","runner":"rust","summary":{}}
+"#,
+    )
+    .expect("write malformed jsonl fixture");
+
+    let output = Command::new("bash")
+        .arg("scripts/validate-e2e-jsonl.sh")
+        .arg(&log_path)
+        .output()
+        .expect("run shell JSONL validator");
+
+    assert!(
+        !output.status.success(),
+        "shell validator accepted a test_end event without result.status\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("test_end missing 'result.status' field"),
+        "shell validator failed without the expected result.status diagnostic:\n{combined}"
+    );
+
+    tracker.complete();
 }
 
 #[test]
