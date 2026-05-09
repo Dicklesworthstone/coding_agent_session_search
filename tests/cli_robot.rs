@@ -520,6 +520,128 @@ fn root_robot_format_defaults_to_triage() {
 }
 
 #[test]
+fn leading_json_before_search_attaches_to_search() {
+    let tmp = TempDir::new().unwrap();
+    let mut cmd = base_cmd();
+    cmd.args([
+        "--json",
+        "search",
+        "foo",
+        "--data-dir",
+        tmp.path().to_str().unwrap(),
+    ]);
+    let output = cmd.assert().failure().get_output().clone();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        output.stdout.is_empty(),
+        "search errors should stay on stderr in robot mode"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("stderr should contain JSON error");
+    let json: Value = serde_json::from_str(last_line).expect("valid JSON error");
+    assert_eq!(json["error"]["kind"], "missing-index");
+}
+
+#[test]
+fn leading_robot_before_search_attaches_to_search() {
+    let tmp = TempDir::new().unwrap();
+    let mut cmd = base_cmd();
+    cmd.args([
+        "--robot",
+        "search",
+        "foo",
+        "--data-dir",
+        tmp.path().to_str().unwrap(),
+    ]);
+    let output = cmd.assert().failure().get_output().clone();
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("stderr should contain JSON error");
+    let json: Value = serde_json::from_str(last_line).expect("valid JSON error");
+    assert_eq!(json["error"]["kind"], "missing-index");
+}
+
+#[test]
+fn leading_robot_before_status_attaches_to_status() {
+    let tmp = TempDir::new().unwrap();
+    let mut cmd = base_cmd();
+    cmd.args([
+        "--robot",
+        "status",
+        "--data-dir",
+        tmp.path().to_str().unwrap(),
+    ]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid status json");
+
+    assert_eq!(json["status"], "not_initialized");
+    assert_eq!(json["initialized"], false);
+    assert_eq!(json["surface"], Value::Null);
+    assert_not_initialized_recommended_commands(&json, tmp.path());
+}
+
+#[test]
+fn leading_json_before_capabilities_attaches_to_capabilities() {
+    let mut cmd = base_cmd();
+    cmd.args(["--json", "capabilities"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid capabilities json");
+
+    assert_eq!(json["contract_version"], "1");
+    assert!(json["commands"].as_array().is_some_and(|commands| {
+        commands
+            .iter()
+            .any(|command| command["name"] == "capabilities")
+    }));
+}
+
+#[test]
+fn leading_json_before_search_deduplicates_existing_json_flag() {
+    let tmp = TempDir::new().unwrap();
+    let mut cmd = base_cmd();
+    cmd.args([
+        "--json",
+        "search",
+        "foo",
+        "--json",
+        "--data-dir",
+        tmp.path().to_str().unwrap(),
+    ]);
+    let output = cmd.assert().failure().get_output().clone();
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("stderr should contain JSON error");
+    let json: Value = serde_json::from_str(last_line).expect("valid JSON error");
+    assert_eq!(json["error"]["kind"], "missing-index");
+}
+
+#[test]
+fn leading_json_before_robot_docs_is_removed_as_redundant() {
+    let mut cmd = base_cmd();
+    cmd.args(["--json", "robot-docs", "commands", "--color=never"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("commands:"));
+    assert!(stdout.contains("cass search <query>"));
+    assert!(!stdout.contains('\u{1b}'));
+}
+
+#[test]
 fn introspect_includes_contract_and_globals() {
     let mut cmd = base_cmd();
     cmd.args(["introspect", "--json"]);

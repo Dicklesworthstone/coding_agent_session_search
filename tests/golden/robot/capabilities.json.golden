@@ -3015,6 +3015,18 @@
       "canonical": "cass triage --json",
       "accepted": true,
       "behavior": "A top-level robot-mode request defaults to read-only agent triage."
+    },
+    {
+      "wrong": "cass --json search auth",
+      "canonical": "cass search auth --json",
+      "accepted": true,
+      "behavior": "A leading structured-output flag is moved after the robot-capable subcommand."
+    },
+    {
+      "wrong": "cass --robot status",
+      "canonical": "cass status --json",
+      "accepted": true,
+      "behavior": "A leading robot-mode flag is canonicalized to the subcommand's JSON output flag."
     }
   ],
   "limits": {

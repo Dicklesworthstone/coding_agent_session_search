@@ -5,6 +5,7 @@ Updated: 2026-05-09
 ## TL;DR (copy/paste)
 - First command: `cass triage --json` (follow `next_command` when present)
 - Zero-context fallback: `cass --json`, `cass --robot`, and `cass --robot-format json` also run triage
+- Leading flag recovery: `cass --json search "query"` is accepted as `cass search "query" --json`
 - First index: `cass index --full --json`
 - Search JSON: `cass search "query" --robot`
 - Handoff pack: `cass pack "query" --robot --max-tokens 12000 --limit 40`
@@ -72,7 +73,7 @@ Updated: 2026-05-09
 
 ## Best practices for agents
 - Always pass `--robot`/`--json` and `--robot-meta` when you care about freshness or pagination.
-- Start unknown automation with `cass triage --json`; aliases `cass ready --json` and `cass preflight --json` are accepted. If an agent only knows to request structured output, `cass --json`, `cass --robot`, and `cass --robot-format json` default to the same read-only triage response.
+- Start unknown automation with `cass triage --json`; aliases `cass ready --json` and `cass preflight --json` are accepted. If an agent only knows to request structured output, `cass --json`, `cass --robot`, and `cass --robot-format json` default to the same read-only triage response. If the agent puts `--json` or `--robot` before a robot-capable subcommand, cass moves it to that subcommand.
 - Use `--fields minimal` during wide scans; fetch details with `cass view` if needed.
 - Respect `_warning`, `index_freshness.stale`, and health/status `recommended_action`; run `cass index --full` for first setup or explicit recommended refresh, not as a blind repair loop.
 - Treat lexical fallback in default hybrid search as expected when semantic assets are not ready. Escalate only when lexical itself is unavailable after the recommended rebuild path.

@@ -2156,6 +2156,64 @@ fn root_structured_triage_rewrite(args: &[String]) -> Option<Vec<String>> {
     }
 }
 
+fn command_accepts_leading_structured_flag(command: &str) -> bool {
+    matches!(
+        command,
+        "analytics"
+            | "api-version"
+            | "capabilities"
+            | "context"
+            | "diag"
+            | "doctor"
+            | "expand"
+            | "export-html"
+            | "health"
+            | "import"
+            | "index"
+            | "introspect"
+            | "models"
+            | "pack"
+            | "pages"
+            | "resume"
+            | "robot-docs"
+            | "search"
+            | "sessions"
+            | "sources"
+            | "state"
+            | "stats"
+            | "status"
+            | "timeline"
+            | "triage"
+            | "upgrade"
+            | "view"
+    )
+}
+
+fn move_leading_structured_flag_to_subcommand(rest: &mut Vec<String>) -> bool {
+    let mut leading_count = 0;
+    while rest
+        .get(leading_count)
+        .is_some_and(|arg| arg == "--json" || arg == "--robot")
+    {
+        leading_count += 1;
+    }
+    let Some(command) = rest.get(leading_count) else {
+        return false;
+    };
+    if leading_count == 0
+        || command.starts_with('-')
+        || !command_accepts_leading_structured_flag(command)
+    {
+        return false;
+    }
+
+    rest.drain(0..leading_count);
+    if !rest.iter().any(|arg| arg == "--json" || arg == "--robot") {
+        rest.push("--json".to_string());
+    }
+    true
+}
+
 /// Normalize common robot-mode invocation mistakes to make the CLI more forgiving for AI agents.
 ///
 /// This function applies multiple layers of normalization to maximize acceptance of
@@ -2165,7 +2223,9 @@ fn root_structured_triage_rewrite(args: &[String]) -> Option<Vec<String>> {
 /// 2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
 /// 3. **Subcommand aliases**: `find`/`query`/`q` → `search`, `ls`/`list` → `stats`, etc.
 /// 4. **Flag-as-subcommand**: `--robot-docs` → `robot-docs` subcommand
-/// 5. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 5. **Root structured-output default**: `--json`/`--robot` with no command → `triage --json`
+/// 6. **Leading structured-output recovery**: `--json search` → `search --json`
+/// 7. **Global flag hoisting**: Moves global flags to front regardless of position
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -2499,6 +2559,11 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     }
 
     let mut normalized = Vec::with_capacity(1 + globals.len() + rest.len());
+    if move_leading_structured_flag_to_subcommand(&mut rest) {
+        corrections.push(
+            "Leading --json/--robot moved after the subcommand (structured output flag)".into(),
+        );
+    }
     if rest
         .first()
         .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
@@ -11145,6 +11210,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass ready --json      # accepted alias".to_string(),
             "  cass preflight --json  # accepted alias".to_string(),
             "  cass --json            # also defaults to triage for zero-context agents".to_string(),
+            "  cass --json search \"auth\"  # leading --json is moved to the search subcommand".to_string(),
             "  # Follow next_command when present; use discovery.schemas_command for typed clients.".to_string(),
             String::new(),
             "# Basic search with JSON output for agents".to_string(),
@@ -62371,6 +62437,18 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass triage --json",
             true,
             "A top-level robot-mode request defaults to read-only agent triage.",
+        ),
+        mistake_recovery_capability(
+            "cass --json search auth",
+            "cass search auth --json",
+            true,
+            "A leading structured-output flag is moved after the robot-capable subcommand.",
+        ),
+        mistake_recovery_capability(
+            "cass --robot status",
+            "cass status --json",
+            true,
+            "A leading robot-mode flag is canonicalized to the subcommand's JSON output flag.",
         ),
     ]
 }
