@@ -120,8 +120,7 @@ fn run_with_capture<F: FnOnce()>(f: F) -> Vec<CapturedRow> {
         .with(layer.with_filter(tracing_subscriber::filter::LevelFilter::TRACE))
         .set_default();
     f();
-    let rows = captured.lock().unwrap().clone();
-    rows
+    captured.lock().unwrap().clone()
 }
 
 #[test]

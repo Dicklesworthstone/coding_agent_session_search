@@ -101,7 +101,10 @@ fn logical_lines(body: &str) -> Vec<(usize, String)> {
             continue;
         }
         current.push_str(raw);
-        out.push((current_start.unwrap_or(line_no), std::mem::take(&mut current)));
+        out.push((
+            current_start.unwrap_or(line_no),
+            std::mem::take(&mut current),
+        ));
         current_start = None;
     }
     if !current.is_empty()

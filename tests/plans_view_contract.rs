@@ -75,7 +75,6 @@ fn plans_view_fixture_directory_present_for_future_snapshots() {
         eprintln!(
             "[vz9t8_3_test] tests/fixtures/analytics/ not yet present; documented as follow-up"
         );
-        return;
     }
 }
 

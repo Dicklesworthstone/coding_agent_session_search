@@ -41,7 +41,6 @@ fn log_file_or_regenerate_script_present() {
             verdict = "log_absent_but_script_present",
             note = "regenerate script available; log will be created on first run"
         );
-        return;
     }
 }
 

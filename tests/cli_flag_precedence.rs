@@ -103,8 +103,9 @@ fn env_data_dir_used_when_no_flag() {
         .arg("--json");
     let output = cmd.output().expect("runs");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let resolved = data_dir_from_health(&stdout)
-        .unwrap_or_else(|| panic!("cass health --json must emit a `data_dir` field; got: {stdout}"));
+    let resolved = data_dir_from_health(&stdout).unwrap_or_else(|| {
+        panic!("cass health --json must emit a `data_dir` field; got: {stdout}")
+    });
     let resolved_path = std::path::Path::new(&resolved);
     assert!(
         paths_resolve_equal(resolved_path, &env_dir),
