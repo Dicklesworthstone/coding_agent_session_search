@@ -83,7 +83,7 @@ const CONTRACTS: &[DependencyContract] = &[
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
         expected_rev: "7e288f493631020a4660443c5ad8fc7d4e49faa7",
         expected_version: "0.1.3",
-        expected_features: &["chatgpt", "connectors", "crush", "cursor", "opencode"],
+        expected_features: &["chatgpt", "connectors", "crush", "cursor", "hermes", "opencode"],
         expected_default_features: None,
         repo_rel: "../franken_agent_detection",
         manifest_rel: "Cargo.toml",

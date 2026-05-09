@@ -211,6 +211,7 @@ pub mod crush;
 pub mod cursor;
 pub mod factory;
 pub mod gemini;
+pub mod hermes;
 pub mod kimi;
 pub mod openclaw;
 pub mod opencode;
