@@ -399,6 +399,22 @@ fn capabilities_are_self_describing_for_agents() {
                 && recovery["accepted"] == true),
         "capabilities should advertise root --json as a safe triage default"
     );
+    assert!(
+        recoveries.iter().any(
+            |recovery| recovery["wrong"] == "cass search query=auth --json"
+                && recovery["canonical"] == "cass search auth --json"
+                && recovery["accepted"] == true
+        ),
+        "capabilities should advertise query assignment recovery"
+    );
+    assert!(
+        recoveries.iter().any(
+            |recovery| recovery["wrong"] == "cass view session.jsonl:42 --json"
+                && recovery["canonical"] == "cass view session.jsonl --line 42 --json"
+                && recovery["accepted"] == true
+        ),
+        "capabilities should advertise path:line drill-down recovery"
+    );
 }
 
 #[test]

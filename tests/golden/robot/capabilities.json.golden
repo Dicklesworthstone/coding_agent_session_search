@@ -3035,10 +3035,22 @@
       "behavior": "A named query option is converted to the required positional query for agent-facing commands."
     },
     {
+      "wrong": "cass search query=auth --json",
+      "canonical": "cass search auth --json",
+      "accepted": true,
+      "behavior": "A bare query=<value> assignment is converted to the required positional query."
+    },
+    {
       "wrong": "cass view --path session.jsonl --line 42 --json",
       "canonical": "cass view session.jsonl --line 42 --json",
       "accepted": true,
       "behavior": "A named path option is converted to the required positional path for drill-down commands."
+    },
+    {
+      "wrong": "cass view session.jsonl:42 --json",
+      "canonical": "cass view session.jsonl --line 42 --json",
+      "accepted": true,
+      "behavior": "A grep-style path:line argument is split into the positional path plus --line."
     },
     {
       "wrong": "cass search auth --format json",

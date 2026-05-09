@@ -62745,10 +62745,22 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "A named query option is converted to the required positional query for agent-facing commands.",
         ),
         mistake_recovery_capability(
+            "cass search query=auth --json",
+            "cass search auth --json",
+            true,
+            "A bare query=<value> assignment is converted to the required positional query.",
+        ),
+        mistake_recovery_capability(
             "cass view --path session.jsonl --line 42 --json",
             "cass view session.jsonl --line 42 --json",
             true,
             "A named path option is converted to the required positional path for drill-down commands.",
+        ),
+        mistake_recovery_capability(
+            "cass view session.jsonl:42 --json",
+            "cass view session.jsonl --line 42 --json",
+            true,
+            "A grep-style path:line argument is split into the positional path plus --line.",
         ),
         mistake_recovery_capability(
             "cass search auth --format json",
