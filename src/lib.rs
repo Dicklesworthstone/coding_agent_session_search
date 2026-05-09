@@ -2240,6 +2240,22 @@ fn take_named_value(rest: &mut Vec<String>, names: &[&str]) -> Option<(String, S
     None
 }
 
+fn take_assignment_value(rest: &mut Vec<String>, names: &[&str]) -> Option<(String, String)> {
+    for index in 1..rest.len() {
+        let arg = rest[index].clone();
+        let Some((key, value)) = arg.split_once('=') else {
+            continue;
+        };
+        if value.is_empty() || !names.contains(&key) {
+            continue;
+        }
+
+        rest.remove(index);
+        return Some((key.to_string(), value.to_string()));
+    }
+    None
+}
+
 fn rewrite_named_assignment_positional(
     rest: &mut [String],
     names: &[&str],
@@ -2502,7 +2518,7 @@ fn recover_limit_aliases(rest: &mut Vec<String>, corrections: &mut Vec<String>) 
         return;
     }
 
-    let Some((flag, value)) = take_named_value(
+    let named_limit = take_named_value(
         rest,
         &[
             "--max-results",
@@ -2515,7 +2531,27 @@ fn recover_limit_aliases(rest: &mut Vec<String>, corrections: &mut Vec<String>) 
             "--n",
             "-n",
         ],
-    ) else {
+    );
+    let assignment_limit = || {
+        take_assignment_value(
+            rest,
+            &[
+                "limit",
+                "max-results",
+                "max_results",
+                "num-results",
+                "num_results",
+                "results",
+                "count",
+                "top-k",
+                "topk",
+                "top_k",
+                "n",
+            ],
+        )
+    };
+
+    let Some((flag, value)) = named_limit.or_else(assignment_limit) else {
         return;
     };
 
@@ -62852,6 +62888,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass search auth --limit 5 --json",
             true,
             "A common result-count alias is converted to the canonical limit flag.",
+        ),
+        mistake_recovery_capability(
+            "cass search auth max_results=5 --json",
+            "cass search auth --limit 5 --json",
+            true,
+            "A bare result-count assignment is converted to the canonical limit flag.",
         ),
         mistake_recovery_capability(
             "cass search auth -n 5 --json",

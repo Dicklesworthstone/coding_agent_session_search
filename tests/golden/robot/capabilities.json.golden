@@ -3077,6 +3077,12 @@
       "behavior": "A common result-count alias is converted to the canonical limit flag."
     },
     {
+      "wrong": "cass search auth max_results=5 --json",
+      "canonical": "cass search auth --limit 5 --json",
+      "accepted": true,
+      "behavior": "A bare result-count assignment is converted to the canonical limit flag."
+    },
+    {
       "wrong": "cass search auth -n 5 --json",
       "canonical": "cass search auth --limit 5 --json",
       "accepted": true,

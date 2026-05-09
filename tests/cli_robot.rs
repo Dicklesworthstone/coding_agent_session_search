@@ -422,6 +422,13 @@ fn capabilities_are_self_describing_for_agents() {
             && recovery["accepted"] == true),
         "capabilities should advertise drill-down assignment recovery"
     );
+    assert!(
+        recoveries.iter().any(|recovery| recovery["wrong"]
+            == "cass search auth max_results=5 --json"
+            && recovery["canonical"] == "cass search auth --limit 5 --json"
+            && recovery["accepted"] == true),
+        "capabilities should advertise result-count assignment recovery"
+    );
 }
 
 #[test]
@@ -1923,6 +1930,16 @@ fn search_max_results_alias_attaches_to_limit() {
 #[test]
 fn search_count_alias_attaches_to_limit() {
     assert_search_limit_alias_limits_to_one(&["--count=1"]);
+}
+
+#[test]
+fn search_limit_assignment_attaches_to_limit() {
+    assert_search_limit_alias_limits_to_one(&["limit=1"]);
+}
+
+#[test]
+fn search_max_results_assignment_attaches_to_limit() {
+    assert_search_limit_alias_limits_to_one(&["max_results=1"]);
 }
 
 #[test]
