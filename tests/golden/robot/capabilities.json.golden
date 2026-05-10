@@ -3036,6 +3036,12 @@
       "behavior": "A named query option is converted to the required positional query for agent-facing commands."
     },
     {
+      "wrong": "cass search auth error --json",
+      "canonical": "cass search \"auth error\" --json",
+      "accepted": true,
+      "behavior": "Adjacent bare words after search/pack are folded into the query positional before filters are parsed."
+    },
+    {
       "wrong": "cass auth error --json",
       "canonical": "cass search \"auth error\" --json",
       "accepted": true,

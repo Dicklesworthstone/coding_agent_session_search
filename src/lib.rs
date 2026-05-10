@@ -3117,7 +3117,24 @@ fn is_query_assignment(arg: &str) -> bool {
         .is_some_and(|(key, value)| !value.is_empty() && matches!(key, "query" | "q"))
 }
 
-fn is_search_recovery_assignment(arg: &str) -> bool {
+fn is_result_count_assignment_key(key: &str) -> bool {
+    matches!(
+        key,
+        "limit"
+            | "max-results"
+            | "max_results"
+            | "num-results"
+            | "num_results"
+            | "results"
+            | "count"
+            | "top-k"
+            | "topk"
+            | "top_k"
+            | "n"
+    )
+}
+
+fn is_query_boundary_assignment(command: &str, arg: &str) -> bool {
     let Some((key, value)) = arg.split_once('=') else {
         return false;
     };
@@ -3126,22 +3143,9 @@ fn is_search_recovery_assignment(arg: &str) -> bool {
     }
 
     let key = key.to_ascii_lowercase();
-    assignment_option_for_command("search", &key).is_some()
-        || time_assignment_option_for_command("search", &key, value).is_some()
-        || matches!(
-            key.as_str(),
-            "limit"
-                | "max-results"
-                | "max_results"
-                | "num-results"
-                | "num_results"
-                | "results"
-                | "count"
-                | "top-k"
-                | "topk"
-                | "top_k"
-                | "n"
-        )
+    assignment_option_for_command(command, &key).is_some()
+        || time_assignment_option_for_command(command, &key, value).is_some()
+        || is_result_count_assignment_key(&key)
 }
 
 fn looks_like_top_level_command_or_typo(arg: &str) -> bool {
@@ -3174,7 +3178,7 @@ fn recover_implicit_robot_search_query(rest: &mut Vec<String>, corrections: &mut
 
     let mut query_token_count = 0;
     for arg in rest.iter() {
-        if arg.starts_with('-') || is_search_recovery_assignment(arg) {
+        if arg.starts_with('-') || is_query_boundary_assignment("search", arg) {
             break;
         }
         query_token_count += 1;
@@ -3190,6 +3194,35 @@ fn recover_implicit_robot_search_query(rest: &mut Vec<String>, corrections: &mut
     ));
 }
 
+fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut Vec<String>) {
+    let Some(command) = rest.first().cloned() else {
+        return;
+    };
+    if !matches!(command.as_str(), "search" | "pack") {
+        return;
+    }
+    if rest.get(1).is_none_or(|arg| arg.starts_with('-')) {
+        return;
+    }
+
+    let mut query_end = 1;
+    while let Some(arg) = rest.get(query_end) {
+        if arg.starts_with('-') || is_query_boundary_assignment(&command, arg) {
+            break;
+        }
+        query_end += 1;
+    }
+    if query_end <= 2 {
+        return;
+    }
+
+    let query = rest[1..query_end].join(" ");
+    rest.splice(1..query_end, [query.clone()]);
+    corrections.push(format!(
+        "'{command} {query}' → '{command} \"{query}\"' (multi-word query positional)"
+    ));
+}
+
 /// Normalize common robot-mode invocation mistakes to make the CLI more forgiving for AI agents.
 ///
 /// This function applies multiple layers of normalization to maximize acceptance of
@@ -3202,13 +3235,14 @@ fn recover_implicit_robot_search_query(rest: &mut Vec<String>, corrections: &mut
 /// 5. **Root structured-output default**: `--json`/`--robot` with no command → `triage --json`
 /// 6. **Leading structured-output recovery**: `--json search` → `search --json`
 /// 7. **Named positional recovery**: `search --query foo` → `search foo`
-/// 8. **Structured format alias recovery**: `search foo --format json` → `search foo --robot-format json`
-/// 9. **Result-count alias recovery**: `search foo --max-results 5` → `search foo --limit 5`
-/// 10. **Time-window alias recovery**: `search foo --last 7` → `search foo --since -7d`
-/// 11. **Provider alias recovery**: `search foo --provider codex` → `search foo --agent codex`
-/// 12. **Implicit robot search recovery**: `foo bar --json` → `search "foo bar" --json`
-/// 13. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
-/// 14. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 8. **Multi-word query recovery**: `search foo bar --json` → `search "foo bar" --json`
+/// 9. **Structured format alias recovery**: `search foo --format json` → `search foo --robot-format json`
+/// 10. **Result-count alias recovery**: `search foo --max-results 5` → `search foo --limit 5`
+/// 11. **Time-window alias recovery**: `search foo --last 7` → `search foo --since -7d`
+/// 12. **Provider alias recovery**: `search foo --provider codex` → `search foo --agent codex`
+/// 13. **Implicit robot search recovery**: `foo bar --json` → `search "foo bar" --json`
+/// 14. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
+/// 15. **Global flag hoisting**: Moves global flags to front regardless of position
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -3585,6 +3619,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     recover_time_alias_flags(&mut rest, &mut corrections);
     recover_agent_filter_alias_flags(&mut rest, &mut corrections);
     recover_named_required_positionals(&mut rest, &mut corrections);
+    recover_multiword_query_positionals(&mut rest, &mut corrections);
     recover_drilldown_assignment_flags(&mut rest, &mut corrections);
     recover_key_value_option_assignments(&mut rest, &mut corrections);
     recover_path_line_positionals(&mut rest, &mut corrections);
@@ -64613,6 +64648,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass search auth --json",
             true,
             "A named query option is converted to the required positional query for agent-facing commands.",
+        ),
+        mistake_recovery_capability(
+            "cass search auth error --json",
+            "cass search \"auth error\" --json",
+            true,
+            "Adjacent bare words after search/pack are folded into the query positional before filters are parsed.",
         ),
         mistake_recovery_capability(
             "cass auth error --json",

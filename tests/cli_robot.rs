@@ -408,6 +408,14 @@ fn capabilities_are_self_describing_for_agents() {
         "capabilities should advertise query assignment recovery"
     );
     assert!(
+        recoveries.iter().any(
+            |recovery| recovery["wrong"] == "cass search auth error --json"
+                && recovery["canonical"] == "cass search \"auth error\" --json"
+                && recovery["accepted"] == true
+        ),
+        "capabilities should advertise multi-word search query recovery"
+    );
+    assert!(
         recoveries
             .iter()
             .any(|recovery| recovery["wrong"] == "cass auth error --json"
@@ -4872,6 +4880,28 @@ fn top_level_subcommand_typo_recovers_before_implicit_search() {
 fn implicit_robot_search_folds_unquoted_query_words() {
     let mut cmd = base_cmd();
     cmd.args([
+        "authentication",
+        "error",
+        "--robot",
+        "--dry-run",
+        "provider=codex",
+        "max_results=5",
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid dry-run JSON");
+
+    assert_eq!(json["dry_run"].as_bool(), Some(true));
+    assert_eq!(json["valid"].as_bool(), Some(true));
+    assert_eq!(json["query"].as_str(), Some("authentication error"));
+}
+
+#[test]
+fn explicit_search_folds_unquoted_query_words_before_assignments() {
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
         "authentication",
         "error",
         "--robot",
