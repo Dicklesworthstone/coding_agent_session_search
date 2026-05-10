@@ -687,14 +687,25 @@ mod tests {
 
     #[test]
     fn pass3_decompose_unix_seconds_clamps_pre_1970_year() {
-        // Negative epoch seconds (1969-12-31T23:00:00 in epoch time) used to
-        // wrap to a u32 underflow; pass-3 clamps to 0000.
-        // -3600 seconds == 1969-12-31T23:00:00 UTC
-        let (year, _m, _d, _h, _mi, _se) = decompose_unix_seconds(-3600);
-        // After clamping, year is either the algorithm's raw output (1969 if
-        // it's representable in u32, which it is — but the original bug is
-        // when y goes well negative). Sanity check: no underflow value.
-        assert!(year < 10_000, "year should be clampable to 4-digit display");
+        // Pass-11 fix: this test now exercises the actual underflow path.
+        // Pre-fix, far-pre-epoch timestamps produced raw_year < 0 which the
+        // `as u32` cast wrapped to ~4.2 billion. Pass-3's clamp returns 0
+        // instead.
+        //
+        // -100 trillion seconds is ~3170 BC, well into negative-year
+        // territory for the Howard-Hinnant algorithm. Verify the year is
+        // representable as a 4-digit ISO8601 component (i.e., the clamp
+        // fired) and not the underflow value 4_294_966_-something.
+        let (year, _m, _d, _h, _mi, _se) = decompose_unix_seconds(-100_000_000_000_000);
+        assert!(
+            year < 10_000,
+            "pre-fix bug would underflow to ~4.29 billion; got {year}"
+        );
+
+        // Sanity: 1970-01-01 itself decomposes correctly (the canonical
+        // anchor point — must NOT be clamped to 0).
+        let (year2, m, d, _, _, _) = decompose_unix_seconds(0);
+        assert_eq!((year2, m, d), (1970, 1, 1));
     }
 
     // ---- Pass-6 band-journal helpers ----

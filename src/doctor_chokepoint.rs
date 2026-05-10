@@ -239,9 +239,13 @@ pub(crate) fn mutate(req: MutationRequest) -> Result<MutationReceipt, Chokepoint
             ));
         }
     }
-    // Pass-3 fix (P2): Op::Quarantine idempotence. If the source is missing
-    // AND a sidecar quarantine exists with the same basename in this run,
-    // treat the call as a no-op rather than failing on fs::rename.
+    // Pass-3 fix (P2) + Pass-11 fix (P3): Op::Quarantine idempotence. If the
+    // source is missing AND a sidecar quarantine exists with the same basename
+    // in this run, treat the call as a no-op rather than failing on
+    // fs::rename. Pass-11 fix: tighten the prefix match from `starts_with(basename)`
+    // (which falsely matched "food.123" for basename "foo") to
+    // `starts_with("{basename}.")` so only entries created by *this* basename
+    // count.
     if let Op::Quarantine { .. } = &req.op
         && !req.path.exists()
     {
@@ -251,14 +255,16 @@ pub(crate) fn mutate(req: MutationRequest) -> Result<MutationReceipt, Chokepoint
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("orphan");
+        let basename_prefix = format!("{basename}.");
         let quarantine_dir = run_dir.join("quarantine");
         if quarantine_dir.exists() {
-            // Look for any prior quarantine entry with this basename prefix.
+            // Look for any prior quarantine entry with this exact basename
+            // followed by the timestamp separator.
             if let Ok(entries) = std::fs::read_dir(&quarantine_dir) {
                 let already_quarantined = entries.filter_map(|e| e.ok()).any(|e| {
                     e.file_name()
                         .to_str()
-                        .map(|n| n.starts_with(basename))
+                        .map(|n| n.starts_with(&basename_prefix))
                         .unwrap_or(false)
                 });
                 if already_quarantined {
@@ -1631,6 +1637,84 @@ mod tests {
             },
         });
         assert!(matches!(res, Err(ChokepointError::PathOutOfScope(_))));
+    }
+
+    // ---- Pass-10 end-to-end agent journey ----
+
+    /// End-to-end test that exercises the full pass-1+ agent surface in one
+    /// in-tree journey: chokepoint mutation → list_runs → --diff drift
+    /// detection → --undo with tamper refusal → --undo clean → --explain.
+    /// Models the canonical sequence agents drive through the dispatch helpers.
+    #[test]
+    fn pass10_e2e_agent_journey_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+
+        // Step 1: simulate corruption.
+        let target = data_dir.join("config.toml");
+        let pre = b"original_setting=true\nport=8080\n";
+        fs::write(&target, pre).unwrap();
+
+        // Step 2: doctor "fix" via the chokepoint.
+        let run_id = RunId::from_parts("e2e-sha", 1_700_000_000_000);
+        let _run_dir = crate::doctor_runs::create_run_dir(&data_dir, &run_id).unwrap();
+        let post = b"replaced_setting=false\nport=9090\n";
+        let receipt = mutate(MutationRequest {
+            run_id: run_id.clone(),
+            data_dir: data_dir.clone(),
+            fm_id: "fm-e2e-journey".into(),
+            path: target.clone(),
+            op: Op::Write {
+                content: post.to_vec(),
+            },
+        })
+        .expect("step-2 mutate");
+        assert_eq!(fs::read(&target).unwrap(), post.to_vec());
+
+        // Step 3: --ls equivalent: list_runs returns our run.
+        let runs = crate::doctor_runs::list_runs(&data_dir).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, run_id.as_str());
+
+        // Step 4: --diff equivalent: re-hash the touched file vs after_blake3.
+        let post_bytes = fs::read(&target).unwrap();
+        let mut h = blake3::Hasher::new();
+        h.update(&post_bytes);
+        let current_hash = h.finalize().to_hex().to_string();
+        assert_eq!(Some(current_hash), receipt.after_blake3);
+
+        // Step 5: simulate drift — third party tampers with the file.
+        // (Doctor's --undo should refuse to overwrite tampered post-mutation
+        // state, per the AfterHashMismatch contract.)
+        fs::write(&target, b"third-party-tamper").unwrap();
+        let undo_res = crate::doctor_undo::undo_run(&data_dir, &run_id, "e2e-sha");
+        assert!(matches!(
+            undo_res,
+            Err(crate::doctor_undo::UndoError::AfterHashMismatch { .. })
+        ));
+
+        // Step 6: restore the post-mutation state and undo cleanly.
+        fs::write(&target, post).unwrap();
+        let undo = crate::doctor_undo::undo_run(&data_dir, &run_id, "e2e-sha")
+            .expect("step-6 undo");
+        assert_eq!(undo.steps_succeeded, 1);
+        assert_eq!(fs::read(&target).unwrap(), pre.to_vec());
+
+        // Step 7: --explain equivalent: walk the run's actions.jsonl, count
+        // mutations, confirm the journal shape matches the contract.
+        let run_dir = crate::doctor_runs::run_dir_for(&data_dir, &run_id);
+        let (records, errs) = crate::doctor_runs::read_actions(&run_dir).unwrap();
+        assert!(errs.is_empty());
+        let mutation_count = records
+            .iter()
+            .filter(|r| matches!(r, ActionRecord::Mutation { .. }))
+            .count();
+        assert_eq!(mutation_count, 1);
+
+        // Step 8: list_runs now includes BOTH the original run AND the undo
+        // run (the undo creates its own run-id).
+        let runs2 = crate::doctor_runs::list_runs(&data_dir).unwrap();
+        assert!(runs2.len() >= 2, "undo creates a new run-id of its own");
     }
 
     /// fm-tui-asciicast-orphan-dir: orphaned asciicast file. Quarantine

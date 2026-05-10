@@ -198,6 +198,11 @@ pub(crate) fn undo_run(
                 };
                 steps.push(receipt);
                 // Conservative: stop on first hard failure. Operator inspects.
+                // Pass-11 fix: dropped a dead-code `let receipt = ...; let _ =
+                // receipt;` block that constructed an UndoReceipt and then
+                // discarded it before returning Err. The receipt was never
+                // surfaced; the journal's RunEnded record is the canonical
+                // failure signal here.
                 if !matches!(e, UndoError::TargetMissing(_)) {
                     let ended_at_ms = current_unix_ms();
                     append_action(
@@ -209,18 +214,6 @@ pub(crate) fn undo_run(
                             ended_at_ms,
                         },
                     )?;
-                    let receipt = UndoReceipt {
-                        schema_version: 1,
-                        original_run_id: original_run_id.as_str().to_string(),
-                        undo_run_id: undo_run_id.as_str().to_string(),
-                        steps_total: mutations_rev.len(),
-                        steps_succeeded: succeeded,
-                        steps_skipped: skipped,
-                        steps_failed: failed,
-                        steps,
-                    };
-                    // Surface the underlying error to the caller via Err
-                    let _ = receipt;
                     return Err(e);
                 }
                 continue;
@@ -259,14 +252,26 @@ fn undo_one(
     before_blake3: Option<&str>,
     after_blake3: Option<&str>,
 ) -> Result<&'static str, UndoError> {
-    // Step 1: verify the current file matches the recorded after_blake3
+    // Step 1: tamper-check the post-mutation state. The recorded
+    // `after_blake3` is what the chokepoint observed RIGHT after the
+    // mutation; the current file's hash must match (or both must be None
+    // for a mutation that moved/quarantined the file out of req.path).
+    //
+    // **Pass-11 fix:** the previous `(None, None) → noop` arm silently
+    // skipped Op::Quarantine / Op::Rename undos because those mutations
+    // record `after_blake3 = None` (the file is gone from req.path) but
+    // `before_blake3 = Some(...)` (we still have a backup). We now fall
+    // through to step 2 + step 3 in that case so the backup actually
+    // gets restored. Genuine no-ops (where both `before` and `after` are
+    // None — e.g. Op::CreateDir on an existing dir) are handled by the
+    // step-2 branch returning early.
     let current = blake3_of_file_if_exists(target)?;
     match (current.as_deref(), after_blake3) {
         (Some(actual), Some(expected)) if actual == expected => {
-            // OK — proceed to restore
+            // OK — post-mutation state intact; proceed to restore.
         }
         (None, Some(_)) => {
-            // The mutation produced a file but it's gone now — skip
+            // The mutation produced a file but it's gone now — skip.
             return Err(UndoError::TargetMissing(target.to_path_buf()));
         }
         (Some(actual), Some(expected)) => {
@@ -277,21 +282,40 @@ fn undo_one(
             });
         }
         (None, None) => {
-            // Mutation was a delete and the file is still gone — nothing to undo
-            return Ok("noop-already-restored");
+            // Both absent: this is the Op::Quarantine / Op::Rename case
+            // (req.path was emptied) OR a true noop (Op::CreateDir on a
+            // dir that's still missing). Step 2 below distinguishes via
+            // before_blake3 and either restores or no-ops.
         }
-        (Some(_), None) => {
-            // Mutation was a delete and the file came back — that's surprising; refuse.
+        (Some(actual), None) => {
+            // The mutation moved/removed the file from req.path, but a
+            // file is now back at req.path. Two sub-cases:
+            //   1. Idempotent re-undo: the file matches before_blake3,
+            //      so we're already in the desired post-undo state.
+            //   2. Tamper: someone wrote arbitrary content to req.path.
+            //      Refuse to overwrite.
+            if let Some(before) = before_blake3
+                && actual == before
+            {
+                return Ok("noop-already-idempotent-restored");
+            }
             return Err(UndoError::AfterHashMismatch {
                 path: target.to_path_buf(),
-                expected: "<deleted>".to_string(),
-                actual: current.unwrap(),
+                expected: "<absent>".to_string(),
+                actual: actual.to_string(),
             });
         }
     }
 
     // Step 2: if before_blake3 is None, the mutation was a CREATE; quarantine instead of unlink.
+    // (Per AGENTS.md RULE NUMBER 1: never delete files; quarantine instead.)
     if before_blake3.is_none() {
+        // Genuine no-op when there's nothing on disk to quarantine
+        // (e.g., Op::CreateDir on a directory that was already removed
+        // out of band).
+        if !target.exists() {
+            return Ok("noop-create-already-removed");
+        }
         let undo_quarantine_dir = data_dir
             .join("doctor")
             .join("undo-quarantine")
@@ -507,6 +531,86 @@ mod tests {
 
         let res = undo_run(&data_dir, &run_id, "sha2");
         assert!(matches!(res, Err(UndoError::AfterHashMismatch { .. })));
+    }
+
+    /// Pass-11 regression test for a P0 bug found via fresh-eyes review:
+    /// `undo_one` previously matched `(None, None)` to "noop-already-restored"
+    /// without checking `before_blake3`. For Op::Quarantine where the file
+    /// was moved out of req.path, `after_blake3 = None` but `before_blake3 =
+    /// Some(...)` and a backup exists at `backups/<rel>` — the file should
+    /// be restored. Pre-fix: undo silently returned success without
+    /// touching the file. Post-fix: undo restores from backup.
+    #[test]
+    fn pass11_undo_of_op_quarantine_restores_from_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let run_id = RunId::from_parts("sha-quar-undo", 1_700_000_000_000);
+        let _ = create_run_dir(&data_dir, &run_id).unwrap();
+
+        // Pre-existing file with content.
+        let target = data_dir.join("config.toml");
+        let pre = b"original=true\n";
+        fs::write(&target, pre).unwrap();
+
+        // Op::Quarantine via the chokepoint moves the file out + records a
+        // backup at backups/<rel>.
+        let _r = crate::doctor_chokepoint::mutate(crate::doctor_chokepoint::MutationRequest {
+            run_id: run_id.clone(),
+            data_dir: data_dir.clone(),
+            fm_id: "fm-test-quarantine-undo".into(),
+            path: target.clone(),
+            op: crate::doctor_chokepoint::Op::Quarantine {
+                reason: "regression test for pass-11 bug".into(),
+            },
+        })
+        .expect("quarantine ok");
+        assert!(!target.exists(), "post-fix: file moved out");
+
+        // Undo MUST restore the file from backup byte-identically.
+        let receipt = undo_run(&data_dir, &run_id, "sha-quar-undo").expect("undo ok");
+        assert_eq!(receipt.steps_succeeded, 1);
+        assert!(target.exists(), "post-undo: file restored at original location");
+        assert_eq!(fs::read(&target).unwrap(), pre.to_vec());
+    }
+
+    /// Pass-11 regression test: idempotent re-undo. After a successful
+    /// undo, the file is back at req.path with `before_blake3` content.
+    /// A second undo invocation against the same original run should now
+    /// be classified as already-idempotent rather than fail.
+    #[test]
+    fn pass11_undo_of_quarantine_is_idempotent_on_re_undo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let run_id = RunId::from_parts("sha-idem", 1_700_000_000_000);
+        let _ = create_run_dir(&data_dir, &run_id).unwrap();
+
+        let target = data_dir.join("foo.bin");
+        let pre = b"v1";
+        fs::write(&target, pre).unwrap();
+
+        let _r = crate::doctor_chokepoint::mutate(crate::doctor_chokepoint::MutationRequest {
+            run_id: run_id.clone(),
+            data_dir: data_dir.clone(),
+            fm_id: "fm-test-idem".into(),
+            path: target.clone(),
+            op: crate::doctor_chokepoint::Op::Quarantine {
+                reason: "test".into(),
+            },
+        })
+        .expect("quar ok");
+
+        // First undo: restores.
+        let r1 = undo_run(&data_dir, &run_id, "sha-idem").expect("undo1 ok");
+        assert_eq!(r1.steps_succeeded, 1);
+        assert_eq!(fs::read(&target).unwrap(), pre.to_vec());
+
+        // Second undo: should NOT fail with AfterHashMismatch — the file
+        // at req.path matches before_blake3, so it's idempotent.
+        let r2 = undo_run(&data_dir, &run_id, "sha-idem").expect("undo2 ok (idempotent)");
+        // The second undo's first step succeeds via the
+        // "noop-already-idempotent-restored" path — not classified as
+        // failure.
+        assert_eq!(r2.steps_failed, 0);
     }
 
     #[test]

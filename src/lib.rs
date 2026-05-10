@@ -34952,9 +34952,15 @@ fn run_doctor_undo(
                     retryable: false,
                 }
             }
+            // Pass-11 fix: BackupHashMismatch was code 5 ("concurrency-lost"
+            // per the documented contract) but actually means "the per-run
+            // backup was tampered with". The robot-docs handbook explicitly
+            // documents code 3 for "undo failed (hash mismatch on a backup)".
+            // Use code 3 + kind "repair-failure" so agents branching on
+            // exit_code_kind get a precise signal.
             crate::doctor_undo::UndoError::BackupHashMismatch { path, expected, actual } => CliError {
-                code: 5,
-                kind: "data-corruption",
+                code: 3,
+                kind: "repair-failure",
                 message: format!(
                     "undo backup hash mismatch on {}: expected {expected}, got {actual}",
                     path.display()
@@ -35055,26 +35061,109 @@ fn run_doctor_robot_triage(
     let recent_run = runs.first().cloned();
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
+    // Pass-10: real findings. Surface anything an agent could act on without
+    // running the heavyweight doctor pipeline:
+    //   1. data_dir missing entirely → recoverable with `cass doctor --json`
+    //   2. recent run incomplete → recoverable with `cass doctor --undo`
+    //   3. in-flight band on most-recent run → crash-recovery candidate
+    //   4. quarantine dir non-empty → operator inspection candidate
+    let mut findings: Vec<serde_json::Value> = Vec::new();
+
+    if !data_dir.exists() {
+        findings.push(serde_json::json!({
+            "severity": "P1",
+            "kind": "data-dir-missing",
+            "message": format!("data_dir {} does not exist", data_dir.display()),
+            "recommended_action": "Run `cass doctor --json` to populate it.",
+        }));
+    }
+
+    if let Some(run) = recent_run.as_ref()
+        && run.status == "incomplete"
+    {
+        findings.push(serde_json::json!({
+            "severity": "P1",
+            "kind": "incomplete-run",
+            "message": format!(
+                "Most-recent run {} did not finish cleanly (no RunEnded event observed)",
+                run.run_id
+            ),
+            "recommended_action": format!("cass doctor --undo {} --json", run.run_id),
+        }));
+    }
+
+    let in_flight_band = recent_run.as_ref().and_then(|r| {
+        crate::doctor_runs::find_in_flight_band(std::path::Path::new(&r.run_dir))
+            .ok()
+            .flatten()
+    });
+    if let Some(band) = &in_flight_band {
+        findings.push(serde_json::json!({
+            "severity": "P0",
+            "kind": "in-flight-band",
+            "message": format!("Repair band {band} started but never completed — possible crash mid-run"),
+            "recommended_action": format!(
+                "cass doctor --explain {} --json",
+                recent_run.as_ref().map(|r| r.run_id.as_str()).unwrap_or("latest")
+            ),
+        }));
+    }
+
+    let quarantine_dir = data_dir.join("doctor").join("quarantine");
+    let quarantine_count: usize = std::fs::read_dir(&quarantine_dir)
+        .ok()
+        .map(|it| it.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    if quarantine_count > 0 {
+        findings.push(serde_json::json!({
+            "severity": "P2",
+            "kind": "non-empty-quarantine",
+            "message": format!(
+                "{quarantine_count} entries in {} — operator review recommended",
+                quarantine_dir.display()
+            ),
+            "recommended_action": "cass doctor --json --quarantine",
+        }));
+    }
+
+    let highest_severity = findings
+        .iter()
+        .filter_map(|f| f.get("severity").and_then(|s| s.as_str()))
+        .min()
+        .map(|s| s.to_string());
+
     let summary = serde_json::json!({
         "data_dir": data_dir.display().to_string(),
         "elapsed_ms": elapsed_ms,
         "recent_run": recent_run,
         "run_count": runs.len(),
+        "findings_count": findings.len(),
+        "highest_severity": highest_severity,
     });
 
-    let recommended_command = match recent_run.as_ref() {
-        Some(run) if run.status == "incomplete" => {
-            format!("cass doctor --undo {} --json", run.run_id)
-        }
-        _ => "cass doctor --json".to_string(),
-    };
+    // Pass-10 + Pass-11 fix: recommended_command derives from the
+    // *highest-priority* finding's recommended_action, not the first inserted
+    // one. We sort by severity ('P0' < 'P1' < 'P2' < 'P3' lexicographically
+    // so min() picks the most severe). Falls back to the canonical full-check
+    // command when no findings exist.
+    let recommended_command = findings
+        .iter()
+        .min_by_key(|f| {
+            f.get("severity")
+                .and_then(|s| s.as_str())
+                .unwrap_or("P9")
+                .to_string()
+        })
+        .and_then(|f| f.get("recommended_action").and_then(|s| s.as_str()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "cass doctor --json".to_string());
 
     let envelope = serde_json::json!({
         "schema_version": 2,
         "doctor_contract_version": 1,
         "kind": "robot-triage",
         "summary": summary,
-        "findings": serde_json::Value::Array(Vec::new()),
+        "findings": findings,
         "actions_planned": serde_json::Value::Array(Vec::new()),
         "recommended_command": recommended_command,
         "capabilities_url": "cass capabilities --json",
@@ -35529,8 +35618,17 @@ fn current_unix_ms_for_gc() -> i64 {
 /// in real time.
 ///
 /// Stop conditions:
-/// - SIGINT (Ctrl+C) — clean exit code 130
+/// - SIGINT (Ctrl+C) — handled by the OS default signal disposition; the
+///   process terminates immediately and the shell reports exit code 130.
+///   Each emitted JSONL event is line-flushed via `println!` before the
+///   thread sleeps, so SIGINT during the sleep window never loses a tick
+///   the operator already saw on stdout.
 /// - `--watch-iterations N` reached (0 = run forever)
+///
+/// Pass-9 deliberately keeps the SIGINT path on the OS default rather than
+/// adding a `signal_hook`/`ctrlc` dependency or an `unsafe` libc::signal
+/// handler (forbidden by AGENTS.md). Agents reading this code should rely
+/// on the documented exit-code-130 contract for clean cancellation.
 fn run_doctor_watch(
     data_dir_override: Option<PathBuf>,
     poll_interval_ms: u64,
