@@ -3036,6 +3036,12 @@
       "behavior": "A named query option is converted to the required positional query for agent-facing commands."
     },
     {
+      "wrong": "cass auth error --json",
+      "canonical": "cass search \"auth error\" --json",
+      "accepted": true,
+      "behavior": "Unquoted top-level words in robot mode are folded into an implicit search query unless they look like a subcommand typo."
+    },
+    {
       "wrong": "cass search query=auth --json",
       "canonical": "cass search auth --json",
       "accepted": true,

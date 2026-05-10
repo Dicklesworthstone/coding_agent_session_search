@@ -2248,6 +2248,7 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
             | "state"
             | "stats"
             | "status"
+            | "swarm"
             | "timeline"
             | "triage"
             | "upgrade"
@@ -3102,6 +3103,93 @@ fn recover_limit_aliases(rest: &mut Vec<String>, corrections: &mut Vec<String>) 
     ));
 }
 
+fn has_explicit_structured_output_request(rest: &[String]) -> bool {
+    rest.iter().enumerate().any(|(index, arg)| {
+        matches!(arg.as_str(), "--json" | "--robot")
+            || arg == "--robot-format"
+            || arg.starts_with("--robot-format=")
+            || parse_format_alias_at(rest, index).is_some()
+    })
+}
+
+fn is_query_assignment(arg: &str) -> bool {
+    arg.split_once('=')
+        .is_some_and(|(key, value)| !value.is_empty() && matches!(key, "query" | "q"))
+}
+
+fn is_search_recovery_assignment(arg: &str) -> bool {
+    let Some((key, value)) = arg.split_once('=') else {
+        return false;
+    };
+    if value.is_empty() {
+        return false;
+    }
+
+    let key = key.to_ascii_lowercase();
+    assignment_option_for_command("search", &key).is_some()
+        || time_assignment_option_for_command("search", &key, value).is_some()
+        || matches!(
+            key.as_str(),
+            "limit"
+                | "max-results"
+                | "max_results"
+                | "num-results"
+                | "num_results"
+                | "results"
+                | "count"
+                | "top-k"
+                | "topk"
+                | "top_k"
+                | "n"
+        )
+}
+
+fn looks_like_top_level_command_or_typo(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "help" | "--help" | "-h" | "--version" | "-v"
+    ) || CANONICAL_TOP_LEVEL_COMMANDS.contains(&lower.as_str())
+        || closest_top_level_command(&lower).is_some()
+}
+
+fn recover_implicit_robot_search_query(rest: &mut Vec<String>, corrections: &mut Vec<String>) {
+    let Some(first) = rest.first().cloned() else {
+        return;
+    };
+    if first.starts_with('-')
+        || !has_explicit_structured_output_request(rest)
+        || looks_like_top_level_command_or_typo(&first)
+    {
+        return;
+    }
+
+    if is_query_assignment(&first) {
+        rest.insert(0, "search".to_string());
+        corrections.push(
+            "'query=<value> --json' → 'search <value> --json' (implicit robot search query)".into(),
+        );
+        return;
+    }
+
+    let mut query_token_count = 0;
+    for arg in rest.iter() {
+        if arg.starts_with('-') || is_search_recovery_assignment(arg) {
+            break;
+        }
+        query_token_count += 1;
+    }
+    if query_token_count == 0 {
+        return;
+    }
+
+    let query = rest[..query_token_count].join(" ");
+    rest.splice(0..query_token_count, ["search".to_string(), query.clone()]);
+    corrections.push(format!(
+        "'{query}' → 'search \"{query}\"' (implicit robot search query)"
+    ));
+}
+
 /// Normalize common robot-mode invocation mistakes to make the CLI more forgiving for AI agents.
 ///
 /// This function applies multiple layers of normalization to maximize acceptance of
@@ -3118,8 +3206,9 @@ fn recover_limit_aliases(rest: &mut Vec<String>, corrections: &mut Vec<String>) 
 /// 9. **Result-count alias recovery**: `search foo --max-results 5` → `search foo --limit 5`
 /// 10. **Time-window alias recovery**: `search foo --last 7` → `search foo --since -7d`
 /// 11. **Provider alias recovery**: `search foo --provider codex` → `search foo --agent codex`
-/// 12. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
-/// 13. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 12. **Implicit robot search recovery**: `foo bar --json` → `search "foo bar" --json`
+/// 13. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
+/// 14. **Global flag hoisting**: Moves global flags to front regardless of position
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -3490,6 +3579,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             "Leading --json/--robot moved after the subcommand (structured output flag)".into(),
         );
     }
+    recover_implicit_robot_search_query(&mut rest, &mut corrections);
     recover_structured_format_aliases(&mut rest, &mut corrections);
     recover_limit_aliases(&mut rest, &mut corrections);
     recover_time_alias_flags(&mut rest, &mut corrections);
@@ -4120,6 +4210,7 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "sources",
     "analytics",
     "context",
+    "swarm",
     "timeline",
     "export",
     "export-html",
@@ -64522,6 +64613,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass search auth --json",
             true,
             "A named query option is converted to the required positional query for agent-facing commands.",
+        ),
+        mistake_recovery_capability(
+            "cass auth error --json",
+            "cass search \"auth error\" --json",
+            true,
+            "Unquoted top-level words in robot mode are folded into an implicit search query unless they look like a subcommand typo.",
         ),
         mistake_recovery_capability(
             "cass search query=auth --json",

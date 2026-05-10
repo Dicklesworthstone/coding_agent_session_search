@@ -761,6 +761,7 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass --json search "auth"` | `cass search "auth" --json` | Leading structured flag moved to the robot-capable subcommand |
 | `cass --robot status` | `cass status --json` | Leading robot flag canonicalized to JSON output |
 | `cass search --query "auth" --json` | `cass search "auth" --json` | Named query option converted to required positional query |
+| `cass auth error --json` | `cass search "auth error" --json` | Unquoted robot-mode query words folded into search |
 | `cass view --path session.jsonl --line 42 --json` | `cass view session.jsonl --line 42 --json` | Named path option converted to required positional path |
 | `cass search "auth" --format json` | `cass search "auth" --robot-format json` | Familiar format spelling converted to robot format |
 | `cass --format json status` | `cass status --robot-format json` | Leading format request moved to the target subcommand |
@@ -784,7 +785,8 @@ The CLI applies multiple normalization layers:
 9. **Result-count aliases**: `--max-results`, `--num-results`, `--results`, `--count`, `--top-k`, and `-n` become `--limit` on commands with result limits
 10. **Time-window aliases**: `--last 7`, `--before now`, `last=7d`, and `before=now` become canonical `--since`/`--until` filters
 11. **Provider aliases**: `--provider`, `--tool`, `--connector`, and matching assignments become canonical `--agent` filters on search-like commands
-12. **Global flag hoisting**: Position-independent flag handling
+12. **Implicit robot search**: unquoted top-level words with an explicit robot/JSON output request become a `search` query unless they look like a subcommand typo
+13. **Global flag hoisting**: Position-independent flag handling
 
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
 
