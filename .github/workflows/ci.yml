@@ -46,11 +46,13 @@ jobs:
           ALLOWLIST_FILE="tests/policies/no_mock_allowlist.json"
           AUDIT_REPORT="test-results/no_mock_ci_audit.md"
 
-          echo "# No-Mock CI Audit" > "$AUDIT_REPORT"
-          echo "" >> "$AUDIT_REPORT"
-          echo "**Run:** $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$AUDIT_REPORT"
-          echo "**Commit:** ${{ github.sha }}" >> "$AUDIT_REPORT"
-          echo "" >> "$AUDIT_REPORT"
+          {
+            echo "# No-Mock CI Audit"
+            echo ""
+            echo "**Run:** $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "**Commit:** ${{ github.sha }}"
+            echo ""
+          } > "$AUDIT_REPORT"
 
           # Search for mock/fake/stub patterns
           VIOLATIONS=$(mktemp)
@@ -67,9 +69,11 @@ jobs:
           VIOLATION_COUNT=$(wc -l < "$VIOLATIONS" | tr -d ' ')
 
           if [ "$VIOLATION_COUNT" -eq 0 ]; then
-            echo "## Status: ✅ PASS" >> "$AUDIT_REPORT"
-            echo "" >> "$AUDIT_REPORT"
-            echo "No mock/fake/stub patterns found." >> "$AUDIT_REPORT"
+            {
+              echo "## Status: ✅ PASS"
+              echo ""
+              echo "No mock/fake/stub patterns found."
+            } >> "$AUDIT_REPORT"
             echo "status=pass" >> "$GITHUB_OUTPUT"
             rm -f "$VIOLATIONS"
             exit 0
@@ -78,9 +82,11 @@ jobs:
           echo "Found $VIOLATION_COUNT pattern(s), checking allowlist..."
 
           if [ ! -f "$ALLOWLIST_FILE" ]; then
-            echo "## Status: ❌ FAIL" >> "$AUDIT_REPORT"
-            echo "" >> "$AUDIT_REPORT"
-            echo "Allowlist file not found: $ALLOWLIST_FILE" >> "$AUDIT_REPORT"
+            {
+              echo "## Status: ❌ FAIL"
+              echo ""
+              echo "Allowlist file not found: $ALLOWLIST_FILE"
+            } >> "$AUDIT_REPORT"
             echo "status=fail" >> "$GITHUB_OUTPUT"
             rm -f "$VIOLATIONS"
             exit 1
@@ -114,33 +120,37 @@ jobs:
           rm -f "$VIOLATIONS"
 
           if [ "$UNALLOWED_COUNT" -gt 0 ]; then
-            echo "## Status: ❌ FAIL" >> "$AUDIT_REPORT"
-            echo "" >> "$AUDIT_REPORT"
-            echo "**Unapproved patterns:** $UNALLOWED_COUNT" >> "$AUDIT_REPORT"
-            echo "" >> "$AUDIT_REPORT"
-            echo "### Violations" >> "$AUDIT_REPORT"
-            echo -e "$UNALLOWED_LIST" >> "$AUDIT_REPORT"
-            echo "" >> "$AUDIT_REPORT"
-            echo "### How to Fix" >> "$AUDIT_REPORT"
-            echo "" >> "$AUDIT_REPORT"
-            echo "1. Replace mock/fake/stub with real fixtures (preferred)" >> "$AUDIT_REPORT"
-            echo "2. OR add to \`tests/policies/no_mock_allowlist.json\` with:" >> "$AUDIT_REPORT"
-            echo "   - \`rationale\`: Why this exception is necessary" >> "$AUDIT_REPORT"
-            echo "   - \`review_date\`: 6-month review date" >> "$AUDIT_REPORT"
-            echo "   - \`permanent: true\` only for true platform boundaries" >> "$AUDIT_REPORT"
-            echo "" >> "$AUDIT_REPORT"
-            echo "See TESTING.md 'No-Mock Policy' for details." >> "$AUDIT_REPORT"
+            {
+              echo "## Status: ❌ FAIL"
+              echo ""
+              echo "**Unapproved patterns:** $UNALLOWED_COUNT"
+              echo ""
+              echo "### Violations"
+              echo -e "$UNALLOWED_LIST"
+              echo ""
+              echo "### How to Fix"
+              echo ""
+              echo "1. Replace mock/fake/stub with real fixtures (preferred)"
+              echo "2. OR add to \`tests/policies/no_mock_allowlist.json\` with:"
+              echo "   - \`rationale\`: Why this exception is necessary"
+              echo "   - \`review_date\`: 6-month review date"
+              echo "   - \`permanent: true\` only for true platform boundaries"
+              echo ""
+              echo "See TESTING.md 'No-Mock Policy' for details."
+            } >> "$AUDIT_REPORT"
             echo "status=fail" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
-          echo "## Status: ✅ PASS" >> "$AUDIT_REPORT"
-          echo "" >> "$AUDIT_REPORT"
-          echo "**Total patterns found:** $VIOLATION_COUNT" >> "$AUDIT_REPORT"
-          echo "**All patterns allowlisted:** Yes" >> "$AUDIT_REPORT"
-          echo "" >> "$AUDIT_REPORT"
-          echo "### Allowlist Summary" >> "$AUDIT_REPORT"
-          echo "" >> "$AUDIT_REPORT"
+          {
+            echo "## Status: ✅ PASS"
+            echo ""
+            echo "**Total patterns found:** $VIOLATION_COUNT"
+            echo "**All patterns allowlisted:** Yes"
+            echo ""
+            echo "### Allowlist Summary"
+            echo ""
+          } >> "$AUDIT_REPORT"
           jq -r '.entries[] | "- `\(.path)`: \(.pattern)` — \(.rationale)"' "$ALLOWLIST_FILE" >> "$AUDIT_REPORT"
           echo "status=pass" >> "$GITHUB_OUTPUT"
 
@@ -188,8 +198,8 @@ jobs:
         run: cargo clippy --all-targets --features "qr encryption backtrace" -- -D warnings
 
   # UBS pre-merge gate per coding_agent_session_search-dpfvr.
-  # Runs `ubs --ci --fail-on-warning <changed-files>` against the diff for the
-  # PR (or push range on main). Skips when no relevant files changed.
+  # Runs UBS against changed files and fails when a PR introduces new critical
+  # or warning findings versus the same files from the base branch.
   ubs-changed-files:
     name: UBS (Ultimate Bug Scanner) Pre-Merge Gate
     needs: [no-mock-audit]
@@ -202,99 +212,25 @@ jobs:
           # `origin/main` must be reachable for `git diff origin/main...HEAD`.
           fetch-depth: 0
 
-      - name: Compute changed files
-        id: changed
-        shell: bash
-        run: |
-          set -euo pipefail
-          # PR runs: diff against the merge-base with the target branch.
-          # Push runs: diff against main's previous tip.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            range="origin/${{ github.base_ref }}...HEAD"
-          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            range="${{ github.event.before }}...HEAD"
-          else
-            # workflow_dispatch / other — diff against origin/main.
-            range="origin/main...HEAD"
-          fi
-          echo "Diff range: $range"
-
-          # Filter to the file extensions UBS supports. Skip everything else.
-          # Use a robust extension list and -z to handle filenames with spaces.
-          mapfile -t files < <(git diff --name-only "$range" -- \
-              '*.rs' '*.toml' '*.ts' '*.tsx' '*.js' '*.jsx' '*.py' '*.sh' '*.yml' '*.yaml' '*.md' \
-              2>/dev/null | grep -v -E '^test-results/|^target/|^node_modules/' || true)
-
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "No UBS-relevant files changed; skipping gate."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-          # Persist file list for the next step. Use NUL-delim safe via base64
-          # to avoid shell escaping issues with unusual filenames.
-          printf '%s\n' "${files[@]}" > /tmp/ubs-changed-files.txt
-          echo "files_count=${#files[@]}" >> "$GITHUB_OUTPUT"
-          echo "Files (first 20):"
-          head -20 /tmp/ubs-changed-files.txt
-
       - name: Install UBS
-        if: steps.changed.outputs.skip != 'true'
         shell: bash
-        run: |
-          set -euo pipefail
-          # UBS is distributed as a single shell installer per the project's
-          # README. We pin a version via .github/workflows/ubs-version.txt so
-          # CI is reproducible across runs. If the file is absent, fall back
-          # to the latest stable release tag.
-          if [ -f .github/workflows/ubs-version.txt ]; then
-            UBS_VERSION="$(tr -d '[:space:]' < .github/workflows/ubs-version.txt)"
-          else
-            UBS_VERSION="latest"
-          fi
-          echo "Installing UBS version: $UBS_VERSION"
-          # Heuristic install: prefer cargo-binstall -> direct binary -> source.
-          # The project's existing tooling assumes ubs is on PATH.
-          if command -v ubs >/dev/null 2>&1; then
-            echo "ubs already on PATH: $(command -v ubs)"
-            ubs --version || true
-          else
-            # Fall back: build from source. Slow but reliable.
-            cargo install ubs --locked --version "$UBS_VERSION" 2>/dev/null || \
-              cargo install ubs --locked
-          fi
+        run: .github/scripts/install-ubs.sh
 
-      - name: Run UBS on changed files
-        if: steps.changed.outputs.skip != 'true'
+      - name: Run UBS changed-file delta gate
         shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p test-results
-          # Pass the changed-file list to UBS. Use --ci for machine-readable
-          # output and --fail-on-warning so warnings block merge.
-          xargs -a /tmp/ubs-changed-files.txt \
-            ubs --ci --fail-on-warning \
-            > test-results/ubs-report.json 2> test-results/ubs-stderr.log || {
-              rc=$?
-              echo "UBS exited $rc"
-              echo "::group::UBS stderr (last 50 lines)"
-              tail -50 test-results/ubs-stderr.log || true
-              echo "::endgroup::"
-              echo "::group::UBS findings (jq)"
-              jq -c '.' test-results/ubs-report.json 2>/dev/null | head -100 || cat test-results/ubs-report.json | head -2000
-              echo "::endgroup::"
-              exit "$rc"
-            }
-          echo "UBS PASS — no findings on changed files."
+        run: .github/scripts/run-ubs-changed-files.sh
 
       - name: Upload UBS report
-        if: always() && steps.changed.outputs.skip != 'true'
+        if: always()
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4
         with:
           name: ubs-report-${{ github.run_id }}
           path: |
             test-results/ubs-report.json
-            test-results/ubs-stderr.log
+            test-results/ubs-current.json
+            test-results/ubs-baseline.json
+            test-results/ubs-current.stderr.log
+            test-results/ubs-baseline.stderr.log
           if-no-files-found: ignore
           retention-days: 7
 

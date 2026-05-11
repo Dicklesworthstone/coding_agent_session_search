@@ -218,12 +218,13 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ### UBS Pre-Merge Gate
 
-Per `coding_agent_session_search-dpfvr`, every PR runs `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges.
+Per `coding_agent_session_search-dpfvr`, every PR runs UBS against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking**: new critical or warning findings versus the same files on the base branch stop merges. Existing broad-file findings remain visible in the artifact, but do not block an unrelated patch unless the patch increases the critical or warning totals.
 
 **Local pre-flight before pushing:**
 
 ```bash
-ubs $(git diff --name-only origin/main...HEAD)
+.github/scripts/install-ubs.sh
+.github/scripts/run-ubs-changed-files.sh
 ```
 
 Or, scoped to staged files:
@@ -232,7 +233,7 @@ Or, scoped to staged files:
 ubs $(git diff --name-only --cached)
 ```
 
-If a known-acceptable warning needs to ship despite the gate, suppress at the UBS config level (`tests/policies/no_mock_allowlist.json` or per-file inline pragma) — never bypass by removing the gate.
+If a known-acceptable new warning needs to ship despite the gate, suppress at the UBS config level (`tests/policies/no_mock_allowlist.json` or per-file inline pragma) — never bypass by removing the gate.
 
 The pinned UBS version lives in `.github/workflows/ubs-version.txt`; the CI installer reads that file. Local installs should match.
 
