@@ -672,6 +672,13 @@ fn semantic_runtime_surface(inputs: SemanticRuntimeInputs<'_>) -> SemanticRuntim
 
     let quality_queryable = semantic_tier_queryable(availability, quality_tier);
     let fast_queryable = semantic_tier_queryable(availability, fast_tier);
+    let queryable_tier_verified_current = if quality_queryable {
+        quality_tier.current_db_matches == Some(true)
+    } else if fast_queryable {
+        fast_tier.current_db_matches == Some(true)
+    } else {
+        false
+    };
     let checkpoint_active = checkpoint.active;
     let backlog_pending = backlog.pending_work;
     let manifest_assets_present = fast_tier.present || quality_tier.present;
@@ -705,7 +712,11 @@ fn semantic_runtime_surface(inputs: SemanticRuntimeInputs<'_>) -> SemanticRuntim
 
     if quality_queryable || fast_queryable {
         let fully_ready = (quality_queryable || fast_queryable) && !backfill_active;
-        let summary = if quality_queryable && backfill_active {
+        let summary = if fully_ready && !queryable_tier_verified_current && quality_queryable {
+            "semantic quality tier ready; current database match was not inspected".to_string()
+        } else if fully_ready && !queryable_tier_verified_current {
+            "semantic fast tier ready; current database match was not inspected".to_string()
+        } else if quality_queryable && backfill_active {
             "semantic quality tier is usable; residual semantic backfill is still finishing"
                 .to_string()
         } else if quality_queryable {
@@ -716,7 +727,12 @@ fn semantic_runtime_surface(inputs: SemanticRuntimeInputs<'_>) -> SemanticRuntim
         } else {
             "semantic fast tier ready".to_string()
         };
-        let hint = if backfill_active {
+        let hint = if fully_ready && !queryable_tier_verified_current {
+            Some(
+                "Semantic search is usable from the published tier; current_db_matches is null because this status path did not inspect the database fingerprint."
+                    .to_string(),
+            )
+        } else if backfill_active {
             Some(
                 "Semantic refinement is already usable; continue searching while higher-quality backfill finishes."
                     .to_string(),
@@ -727,7 +743,11 @@ fn semantic_runtime_surface(inputs: SemanticRuntimeInputs<'_>) -> SemanticRuntim
         return SemanticRuntimeSurface {
             status: if fully_ready { "ready" } else { "building" },
             availability: if fully_ready {
-                "ready"
+                if queryable_tier_verified_current {
+                    "ready"
+                } else {
+                    "ready_unverified"
+                }
             } else {
                 "index_building"
             },
@@ -796,7 +816,7 @@ fn semantic_tier_queryable(
     availability: &SemanticAvailability,
     tier: &SemanticTierAssetState,
 ) -> bool {
-    if !tier.ready || tier.current_db_matches != Some(true) {
+    if !tier.ready || tier.current_db_matches == Some(false) {
         return false;
     }
     let Some(embedder_id) = tier.embedder_id.as_deref() else {
@@ -2630,6 +2650,59 @@ mod tests {
             Some(vector_path.as_path())
         );
         assert_eq!(state.hint, None);
+    }
+
+    #[test]
+    fn semantic_state_reports_ready_unverified_when_db_fingerprint_not_inspected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut manifest = SemanticManifest {
+            fast_tier: Some(ArtifactRecord {
+                tier: crate::search::semantic_manifest::TierKind::Fast,
+                embedder_id: HashEmbedder::default().id().to_string(),
+                model_revision: "hash".to_string(),
+                schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+                chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                dimension: 256,
+                doc_count: 12,
+                conversation_count: 3,
+                db_fingerprint: "current-db".to_string(),
+                index_path: "vector_index/vector.fast.idx".to_string(),
+                size_bytes: 4096,
+                started_at_ms: 1_733_100_000_000,
+                completed_at_ms: 1_733_100_100_000,
+                ready: true,
+            }),
+            ..Default::default()
+        };
+        manifest.save(temp.path()).expect("save semantic manifest");
+        let vector_path = vector_index_path(temp.path(), HashEmbedder::default().id());
+        std::fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector dir");
+        std::fs::write(&vector_path, b"fast").expect("write fast vector index");
+
+        let state = semantic_state_from_availability(
+            temp.path(),
+            &SemanticAvailability::NeedsConsent,
+            SemanticPreference::DefaultModel,
+            None,
+        );
+
+        assert_eq!(state.status, "ready");
+        assert_eq!(state.availability, "ready_unverified");
+        assert!(state.can_search);
+        assert_eq!(state.fallback_mode, None);
+        assert_eq!(state.fast_tier.current_db_matches, None);
+        assert!(
+            state
+                .summary
+                .contains("current database match was not inspected")
+        );
+        assert!(
+            state
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("current_db_matches is null"))
+        );
     }
 
     #[test]

@@ -25427,9 +25427,8 @@ fn doctor_build_derived_semantic_asset_report(
         "quarantined"
     } else {
         match semantic_availability.as_str() {
-            "ready" | "hash_fallback" | "index_missing" | "index_building" | "update_available" => {
-                "available-or-not-required"
-            }
+            "ready" | "ready_unverified" | "hash_fallback" | "index_missing" | "index_building"
+            | "update_available" => "available-or-not-required",
             "disabled" => "policy-disabled",
             "not_installed" | "needs_consent" | "model_missing" => {
                 "missing-explicit-install-required"
@@ -25499,6 +25498,7 @@ fn doctor_build_derived_semantic_asset_report(
             ready: Some(matches!(
                 semantic_availability.as_str(),
                 "ready"
+                    | "ready_unverified"
                     | "hash_fallback"
                     | "index_missing"
                     | "index_building"
