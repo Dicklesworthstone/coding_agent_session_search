@@ -12716,11 +12716,7 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
                     staged_index_path = %staged_index_path.display(),
                     "renameat2(RENAME_EXCHANGE) returned EINVAL; falling through to rename-pair publish (likely NFSv3 or other filesystem without RENAME_EXCHANGE support)"
                 );
-                publish_via_rename_pair(
-                    staged_index_path,
-                    index_path,
-                    &retained_backup_path,
-                )?;
+                publish_via_rename_pair(staged_index_path, index_path, &retained_backup_path)?;
                 sync_parent_directory(index_path)?;
                 sync_parent_directory(&retained_backup_path)?;
                 tracing::info!(

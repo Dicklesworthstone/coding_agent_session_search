@@ -54,7 +54,8 @@
     "copilot",
     "copilot_cli",
     "qwen",
-    "crush"
+    "crush",
+    "hermes"
   ],
   "global_flags": [
     {
@@ -3094,6 +3095,12 @@
       "canonical": "cass view session.jsonl --line 42 --json",
       "accepted": true,
       "behavior": "A bare line=<value> assignment is converted to the drill-down --line option."
+    },
+    {
+      "wrong": "cass view session.jsonl --line-number 42 --json",
+      "canonical": "cass view session.jsonl --line 42 --json",
+      "accepted": true,
+      "behavior": "Search-result field names such as line_number/line-number are accepted as drill-down line aliases."
     },
     {
       "wrong": "cass search auth --format json",

@@ -707,10 +707,10 @@ pub enum Commands {
         /// Path to the source file
         path: PathBuf,
         /// Exact source_id from search output (e.g. 'local', 'work-laptop')
-        #[arg(long, alias = "source-id")]
+        #[arg(long, alias = "source-id", alias = "source_id")]
         source: Option<String>,
         /// Line number to show (1-indexed)
-        #[arg(long, short = 'n')]
+        #[arg(long, short = 'n', alias = "line-number", alias = "line_number")]
         line: Option<usize>,
         /// Number of context lines before/after
         #[arg(long, short = 'C', default_value_t = 5)]
@@ -1103,10 +1103,10 @@ pub enum Commands {
         /// Path to session file
         path: PathBuf,
         /// Exact source_id from search output (e.g. 'local', 'work-laptop')
-        #[arg(long, alias = "source-id")]
+        #[arg(long, alias = "source-id", alias = "source_id")]
         source: Option<String>,
         /// Line number to show context around
-        #[arg(long, short = 'n')]
+        #[arg(long, short = 'n', alias = "line-number", alias = "line_number")]
         line: usize,
         /// Number of messages before/after (default: 3)
         #[arg(long, short = 'C', default_value_t = 3)]
@@ -2352,8 +2352,11 @@ fn split_path_line_assignment(arg: &str) -> Option<(String, usize)> {
 }
 
 fn has_line_arg(rest: &[String]) -> bool {
-    rest.iter()
-        .any(|arg| arg == "--line" || arg == "-n" || arg.starts_with("--line="))
+    rest.iter().any(|arg| {
+        matches!(arg.as_str(), "--line" | "-n" | "--line-number")
+            || arg.starts_with("--line=")
+            || arg.starts_with("--line-number=")
+    })
 }
 
 fn has_option_alias(rest: &[String], aliases: &[&str]) -> bool {
@@ -3137,7 +3140,9 @@ fn drilldown_assignment_flag(
     }
 
     match key {
-        "line" | "n" => Some(("--line", &["--line", "-n"])),
+        "line" | "line-number" | "line_number" | "n" => {
+            Some(("--line", &["--line", "--line-number", "-n"]))
+        }
         "context" | "c" => Some(("--context", &["--context", "-C"])),
         _ => None,
     }
@@ -3537,7 +3542,8 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 16. **Leading-filter query recovery**: `search --agent codex foo bar` → `search "foo bar" --agent codex`
 /// 17. **Implicit robot search recovery**: `foo bar --json` → `search "foo bar" --json`
 /// 18. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
-/// 19. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 19. **Search-result field aliases**: `view file --line-number 42` → `view file --line 42`
+/// 20. **Global flag hoisting**: Moves global flags to front regardless of position
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -3625,6 +3631,8 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         // Subcommand-specific flags
         "path",
         "source-path",
+        "source-id",
+        "line-number",
         "file",
         "session",
         "line",
@@ -65226,6 +65234,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass view session.jsonl --line 42 --json",
             true,
             "A bare line=<value> assignment is converted to the drill-down --line option.",
+        ),
+        mistake_recovery_capability(
+            "cass view session.jsonl --line-number 42 --json",
+            "cass view session.jsonl --line 42 --json",
+            true,
+            "Search-result field names such as line_number/line-number are accepted as drill-down line aliases.",
         ),
         mistake_recovery_capability(
             "cass search auth --format json",

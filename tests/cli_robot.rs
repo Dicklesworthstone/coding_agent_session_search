@@ -485,6 +485,13 @@ fn capabilities_are_self_describing_for_agents() {
     );
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
+            == "cass view session.jsonl --line-number 42 --json"
+            && recovery["canonical"] == "cass view session.jsonl --line 42 --json"
+            && recovery["accepted"] == true),
+        "capabilities should advertise line_number drill-down alias recovery"
+    );
+    assert!(
+        recoveries.iter().any(|recovery| recovery["wrong"]
             == "cass search auth --max_results 5 --json"
             && recovery["canonical"] == "cass search auth --limit 5 --json"
             && recovery["accepted"] == true),
@@ -953,6 +960,45 @@ fn view_path_line_shorthand_attaches_to_line_option() {
 fn view_line_and_context_assignments_attach_to_options() {
     let mut cmd = base_cmd();
     cmd.args(["view", "README.md", "line=1", "context=0", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid view JSON");
+
+    assert_eq!(json["path"], "README.md");
+    assert_eq!(json["target_line"].as_u64(), Some(1));
+    assert_eq!(
+        json["lines"].as_array().map(Vec::len),
+        Some(1),
+        "context=0 should produce only the target line"
+    );
+}
+
+#[test]
+fn view_accepts_search_result_line_number_aliases() {
+    for line_arg in ["--line-number", "--line_number"] {
+        let mut cmd = base_cmd();
+        cmd.args([
+            "view",
+            "README.md",
+            line_arg,
+            "1",
+            "--context",
+            "0",
+            "--json",
+        ]);
+        let output = cmd.assert().success().get_output().clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: Value = serde_json::from_str(stdout.trim()).expect("valid view JSON");
+
+        assert_eq!(json["path"], "README.md");
+        assert_eq!(json["target_line"].as_u64(), Some(1));
+    }
+}
+
+#[test]
+fn view_line_number_assignment_attaches_to_line_option() {
+    let mut cmd = base_cmd();
+    cmd.args(["view", "README.md", "line_number=1", "context=0", "--json"]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid view JSON");

@@ -469,7 +469,7 @@ impl ThemePalette {
             "copilot" => (colors::AGENT_COPILOT_BG, PackedRgba::rgb(92, 200, 120)),    // Blue-green
             "copilot_cli" => (colors::AGENT_COPILOT_CLI_BG, PackedRgba::rgb(80, 170, 230)), // Navy
             "crush" => (colors::AGENT_CRUSH_BG, PackedRgba::rgb(255, 120, 80)),        // Coral
-            "hermes" => (colors::AGENT_HERMES_BG, PackedRgba::rgb(240, 200, 100)), // Gold
+            "hermes" => (colors::AGENT_HERMES_BG, PackedRgba::rgb(240, 200, 100)),     // Gold
             "kimi" => (colors::AGENT_KIMI_BG, PackedRgba::rgb(190, 220, 80)), // Yellow-green
             "qwen" => (colors::AGENT_QWEN_BG, PackedRgba::rgb(80, 210, 180)), // Mint
             _ => (colors::BG_DEEP, colors::ACCENT_PRIMARY),
