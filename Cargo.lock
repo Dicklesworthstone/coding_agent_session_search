@@ -1975,7 +1975,7 @@ dependencies = [
 [[package]]
 name = "franken-agent-detection"
 version = "0.1.3"
-source = "git+https://github.com/Dicklesworthstone/franken_agent_detection?rev=7e288f493631020a4660443c5ad8fc7d4e49faa7#7e288f493631020a4660443c5ad8fc7d4e49faa7"
+source = "git+https://github.com/Dicklesworthstone/franken_agent_detection?rev=2262339794520540d52cb3a2e0fa9cfc627ad4fb#2262339794520540d52cb3a2e0fa9cfc627ad4fb"
 dependencies = [
  "aes-gcm",
  "anyhow",

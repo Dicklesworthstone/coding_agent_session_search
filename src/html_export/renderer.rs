@@ -500,6 +500,7 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "openclaw" => "agent-copilot",
         "vibe" | "mistral" => "agent-chatgpt",
         "crush" => "agent-amp",
+        "hermes" => "agent-default", // Reuse default styling until hermes gets its own palette
         _ => "agent-default",
     }
 }
@@ -529,6 +530,7 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "vibe" => "Vibe",
         "mistral" => "Mistral",
         "crush" => "Crush",
+        "hermes" => "Hermes",
         "kimi" => "Kimi",
         "qwen" => "Qwen",
         _ => "AI Assistant",
