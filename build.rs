@@ -244,6 +244,8 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed={STRICT_PATH_DEP_ENV}");
 
+    emit_platform_link_hints();
+
     let manifest_dir = PathBuf::from(
         env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set by Cargo"),
     );
@@ -255,6 +257,14 @@ fn main() {
 
     validate_path_dependency_contracts(&manifest_dir, &manifest);
     emit_vergen_metadata();
+}
+
+fn emit_platform_link_hints() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        // The aarch64-apple-darwin ONNX Runtime static archive used by ort-sys
+        // references CoreML symbols, but ort-sys only emits Foundation today.
+        println!("cargo:rustc-link-lib=framework=CoreML");
+    }
 }
 
 fn validate_path_dependency_contracts(manifest_dir: &Path, manifest: &Value) {

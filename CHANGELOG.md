@@ -13,6 +13,23 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## Unreleased
 
+## [v0.4.4] -- 2026-05-13
+
+**Release-publication fix for the v0.4.3 stability work.**
+
+The `v0.4.3` tag was already pushed before the macOS release builder exposed a
+native link failure in the ONNX Runtime static archive. This patch release keeps
+the v0.4.3 issue fixes intact and adds the missing macOS CoreML framework link
+hint so Apple Silicon release artifacts can be built without rewriting the
+already-pushed tag.
+
+### Fixed
+
+- **Apple Silicon release builds**: emit a macOS-only `CoreML` framework link
+  hint from `build.rs` because the aarch64 ONNX Runtime static archive used by
+  `ort-sys` references CoreML classes while `ort-sys` currently emits only
+  Foundation.
+
 ## [v0.4.3] -- 2026-05-13
 
 **Stability release for the v0.4.2 indexing, doctor, and connector reports.**
