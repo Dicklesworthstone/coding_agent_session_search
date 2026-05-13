@@ -65,11 +65,13 @@ analytics:
     (claude_code, codex, pi_agent, factory, opencode, cursor).
 
 ### analytics rebuild
-  data.track: string ('a')
+  data.track: string ('a' | 'b' | 'all')
   data.tracks_rebuilt: [string]
   data.track_a: { message_metrics_rows, usage_hourly_rows, usage_daily_rows,
                   usage_models_daily_rows, elapsed_ms, rows_per_sec }
+  data.track_b: { token_daily_stats_rows, elapsed_ms, rows_per_sec }
   data.overall_elapsed_ms: u64
+  --track <a|b|all>: rebuild a single track or both tracks (default all)
   --force: rebuild even when rollups appear fresh
 
 ### analytics validate
@@ -100,7 +102,7 @@ analytics:
   exit 9 + retryable=true: transient DB lock/busy — retry after 1s
   exit 9 + retryable=false: schema or data issue — run 'cass analytics rebuild' first
   exit 3: no database — run 'cass index --full' to create it
-  validate errors: use 'cass analytics validate --fix --json' for safe Track A repair, or 'cass analytics rebuild --force --json' for a manual rebuild loop
+  validate errors: use 'cass analytics validate --fix --json' for safe repair, or 'cass analytics rebuild --track all --force --json' for a manual rebuild loop
 
 ## Common Workflows
   # Quick health check
@@ -115,4 +117,4 @@ analytics:
   # Validation + remediation loop
   cass analytics validate --json | jq '.data.summary'
   # If errors: rebuild then re-validate
-  cass analytics rebuild --force --json && cass analytics validate --json
+  cass analytics rebuild --track all --force --json && cass analytics validate --json

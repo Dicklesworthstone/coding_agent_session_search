@@ -347,8 +347,8 @@ impl MemoizingRedactor {
 
     fn trace_audit(audit: &crate::indexer::memoization::MemoCacheAuditRecord) {
         // Severity tiers match operator expectations: hits are noise
-        // (trace), misses + inserts are routine (debug), evictions
-        // are noteworthy (info), invalidations and quarantines are
+        // (trace), misses, inserts, and bounded-cache evictions are
+        // routine (debug), while invalidations and quarantines are
         // alarming enough to warn so they show up in default-level
         // logs without dredging.
         use crate::indexer::memoization::MemoCacheEvent;
@@ -371,7 +371,7 @@ impl MemoizingRedactor {
                 live_entries = audit.stats.live_entries,
                 "redact memo insert"
             ),
-            MemoCacheEvent::Evict { ref reason } => tracing::info!(
+            MemoCacheEvent::Evict { ref reason } => tracing::debug!(
                 target: "cass::redact::memo",
                 evict_reason = ?reason,
                 live_entries = audit.stats.live_entries,

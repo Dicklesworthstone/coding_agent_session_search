@@ -2557,7 +2557,7 @@ fn is_backup_root_name(name: &str, prefix: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 20;
+pub const CURRENT_SCHEMA_VERSION: i64 = 21;
 const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
@@ -3179,6 +3179,15 @@ SELECT
 FROM conversations c
 LEFT JOIN conversation_tail_state ts ON ts.conversation_id = c.id
 WHERE c.external_id IS NOT NULL;
+";
+
+const MIGRATION_V21: &str = r"
+-- Speed replay de-duplication for incremental reprocessing. The merge path
+-- probes canonical messages by conversation_id plus created_at range to catch
+-- replay-equivalent messages whose idx shifted. Without this index that probe
+-- falls back to scanning the conversation's idx index.
+CREATE INDEX IF NOT EXISTS idx_messages_conv_created
+    ON messages(conversation_id, created_at);
 ";
 
 /// Row from the embedding_jobs table.
@@ -3919,6 +3928,30 @@ impl FrankenStorage {
                     missing_tables.push(table_name);
                     continue;
                 }
+                if table_name == "token_daily_stats" && error_indicates_corrupt_derived_table(&err)
+                {
+                    tracing::warn!(
+                        target: "cass::analytics",
+                        error = %err,
+                        "repairing corrupt derived token_daily_stats table during database open"
+                    );
+                    let conn = rusqlite::Connection::open(&self.db_path).with_context(|| {
+                        format!(
+                            "opening sqlite db at {} to repair token_daily_stats",
+                            self.db_path.display()
+                        )
+                    })?;
+                    conn.execute_batch(
+                        "PRAGMA journal_mode = WAL;
+                         PRAGMA synchronous = NORMAL;
+                         PRAGMA busy_timeout = 30000;",
+                    )
+                    .with_context(|| "applying sqlite pragmas for token_daily_stats open repair")?;
+                    recreate_token_daily_stats_table(&conn).with_context(
+                        || "recreating corrupt derived token_daily_stats during database open",
+                    )?;
+                    continue;
+                }
                 return Err(err).with_context(|| {
                     format!("probing required schema table {table_name} for completeness")
                 });
@@ -4222,6 +4255,7 @@ fn build_cass_migrations_after_tail_cache() -> MigrationRunner {
         .add(18, "conversation_tail_state_hot_table", MIGRATION_V18)
         .add(19, "conversation_external_lookup", MIGRATION_V19)
         .add(20, "conversation_external_tail_lookup", MIGRATION_V20)
+        .add(21, "message_created_at_replay_lookup", MIGRATION_V21)
 }
 
 fn schema_migration_is_applied(conn: &FrankenConnection, version: i64) -> Result<bool> {
@@ -4399,6 +4433,9 @@ CREATE TABLE IF NOT EXISTS messages (
     extra_bin BLOB,
     UNIQUE(conversation_id, idx)
 );
+
+CREATE INDEX IF NOT EXISTS idx_messages_conv_created
+    ON messages(conversation_id, created_at);
 
 CREATE TABLE IF NOT EXISTS snippets (
     id INTEGER PRIMARY KEY,
@@ -5070,7 +5107,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 20] = [
+const MIGRATION_NAMES: [(i64, &str); 21] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -5091,6 +5128,7 @@ const MIGRATION_NAMES: [(i64, &str); 20] = [
     (18, "conversation_tail_state_hot_table"),
     (19, "conversation_external_lookup"),
     (20, "conversation_external_tail_lookup"),
+    (21, "message_created_at_replay_lookup"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -5238,6 +5276,14 @@ fn error_indicates_missing_table(err: &impl std::fmt::Display) -> bool {
     err.to_string()
         .to_ascii_lowercase()
         .contains("no such table")
+}
+
+fn error_indicates_corrupt_derived_table(err: &impl std::fmt::Display) -> bool {
+    let lower = err.to_string().to_ascii_lowercase();
+    lower.contains("database disk image is malformed")
+        || lower.contains("malformed")
+        || lower.contains("could not open storage cursor")
+        || lower.contains("root page")
 }
 
 fn error_indicates_missing_column(err: &impl std::fmt::Display) -> bool {
@@ -9974,12 +10020,23 @@ impl FrankenStorage {
         })
     }
 
-    /// Batch insert multiple conversations with full analytics (token usage,
-    /// message metrics, rollups).  Frankensqlite equivalent of
-    /// `SqliteStorage::insert_conversations_batched`.
+    /// Batch insert multiple conversations with full derived updates by default.
+    ///
+    /// Frankensqlite equivalent of `SqliteStorage::insert_conversations_batched`.
     pub fn insert_conversations_batched(
         &self,
         conversations: &[(i64, Option<i64>, &Conversation)],
+    ) -> Result<Vec<InsertOutcome>> {
+        self.insert_conversations_batched_with_options(
+            conversations,
+            InsertConversationsOptions::from_env(),
+        )
+    }
+
+    pub(crate) fn insert_conversations_batched_with_options(
+        &self,
+        conversations: &[(i64, Option<i64>, &Conversation)],
+        options: InsertConversationsOptions,
     ) -> Result<Vec<InsertOutcome>> {
         if conversations.is_empty() {
             return Ok(Vec::new());
@@ -9987,8 +10044,8 @@ impl FrankenStorage {
 
         self.ensure_sources_for_batch(conversations)?;
 
-        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
-        let defer_analytics_updates = defer_analytics_updates_enabled();
+        let defer_lexical_updates = options.defer_lexical_updates;
+        let defer_analytics_updates = options.defer_analytics_updates;
 
         let pricing_table = PricingTable::franken_load(&self.conn).unwrap_or_else(|e| {
             tracing::warn!(target: "cass::analytics::pricing", error = %e, "failed to load pricing table");
@@ -10512,18 +10569,8 @@ impl FrankenStorage {
             );
         }
 
-        // Batched token_daily_stats update
-        if !defer_analytics_updates && !token_stats.is_empty() {
-            let entries = token_stats.expand();
-            let affected = franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
-            tracing::debug!(
-                target: "cass::perf::token_daily_stats",
-                raw = token_stats.raw_entry_count(),
-                expanded = entries.len(),
-                affected = affected,
-                "franken_batched_token_stats_update_complete"
-            );
-        }
+        let rebuild_token_daily_stats_after_commit =
+            !defer_analytics_updates && !token_stats.is_empty();
 
         // Batch insert message_metrics rows
         if !defer_analytics_updates && !metrics_entries.is_empty() {
@@ -10561,6 +10608,17 @@ impl FrankenStorage {
         }
 
         tx.commit()?;
+
+        if rebuild_token_daily_stats_after_commit {
+            let rows = self
+                .rebuild_token_daily_stats()
+                .with_context(|| "rebuilding token_daily_stats after token_usage commit")?;
+            tracing::debug!(
+                target: "cass::perf::token_daily_stats",
+                rows,
+                "token_daily_stats_post_commit_rebuild_complete"
+            );
+        }
 
         pricing_diag.log_summary();
 
@@ -10824,6 +10882,28 @@ fn defer_storage_lexical_updates_enabled() -> bool {
 
 fn defer_analytics_updates_enabled() -> bool {
     env_flag_enabled("CASS_DEFER_ANALYTICS_UPDATES")
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InsertConversationsOptions {
+    pub(crate) defer_lexical_updates: bool,
+    pub(crate) defer_analytics_updates: bool,
+}
+
+impl InsertConversationsOptions {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            defer_lexical_updates: defer_storage_lexical_updates_enabled(),
+            defer_analytics_updates: defer_analytics_updates_enabled(),
+        }
+    }
+
+    pub(crate) fn defer_derived_updates() -> Self {
+        Self {
+            defer_lexical_updates: true,
+            defer_analytics_updates: true,
+        }
+    }
 }
 
 enum ConversationInsertStatus {
@@ -11835,7 +11915,7 @@ fn franken_existing_message_lookup(
         )?;
         rows.extend(tx.query_params(
             "SELECT idx, role, author, created_at, content
-             FROM messages INDEXED BY sqlite_autoindex_messages_1
+             FROM messages INDEXED BY idx_messages_conv_created
              WHERE conversation_id = ?1
                AND created_at IS NOT NULL
                AND created_at >= ?2
@@ -12289,77 +12369,54 @@ fn franken_insert_token_usage_batched_in_tx(
     Ok(total_inserted)
 }
 
-/// Batch upsert token_daily_stats within a frankensqlite transaction.
-fn franken_update_token_daily_stats_batched_in_tx(
-    tx: &FrankenTransaction<'_>,
-    entries: &[(i64, String, String, String, TokenStatsDelta)],
-) -> Result<usize> {
-    if entries.is_empty() {
-        return Ok(0);
-    }
-
-    let now = FrankenStorage::now_millis();
-    let mut total_affected = 0;
-
-    for (day_id, agent, source, model, delta) in entries {
-        total_affected += tx.execute_compat(
-            "INSERT INTO token_daily_stats (
-                day_id, agent_slug, source_id, model_family,
-                api_call_count, user_message_count, assistant_message_count, tool_message_count,
-                total_input_tokens, total_output_tokens, total_cache_read_tokens,
-                total_cache_creation_tokens, total_thinking_tokens, grand_total_tokens,
-                total_content_chars, total_tool_calls, estimated_cost_usd, session_count,
-                last_updated
-            )
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
-            ON CONFLICT(day_id, agent_slug, source_id, model_family) DO UPDATE SET
-                api_call_count = api_call_count + excluded.api_call_count,
-                user_message_count = user_message_count + excluded.user_message_count,
-                assistant_message_count = assistant_message_count + excluded.assistant_message_count,
-                tool_message_count = tool_message_count + excluded.tool_message_count,
-                total_input_tokens = total_input_tokens + excluded.total_input_tokens,
-                total_output_tokens = total_output_tokens + excluded.total_output_tokens,
-                total_cache_read_tokens = total_cache_read_tokens + excluded.total_cache_read_tokens,
-                total_cache_creation_tokens = total_cache_creation_tokens + excluded.total_cache_creation_tokens,
-                total_thinking_tokens = total_thinking_tokens + excluded.total_thinking_tokens,
-                grand_total_tokens = grand_total_tokens + excluded.grand_total_tokens,
-                total_content_chars = total_content_chars + excluded.total_content_chars,
-                total_tool_calls = total_tool_calls + excluded.total_tool_calls,
-                estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
-                session_count = session_count + excluded.session_count,
-                last_updated = excluded.last_updated",
-            fparams![
-                *day_id,
-                agent.as_str(),
-                source.as_str(),
-                model.as_str(),
-                delta.api_call_count,
-                delta.user_message_count,
-                delta.assistant_message_count,
-                delta.tool_message_count,
-                delta.total_input_tokens,
-                delta.total_output_tokens,
-                delta.total_cache_read_tokens,
-                delta.total_cache_creation_tokens,
-                delta.total_thinking_tokens,
-                delta.grand_total_tokens,
-                delta.total_content_chars,
-                delta.total_tool_calls,
-                delta.estimated_cost_usd,
-                delta.session_count,
-                now
-            ],
-        )?;
-    }
-
-    Ok(total_affected)
-}
-
 /// Batch insert message_metrics rows within a frankensqlite transaction.
 ///
 /// Uses row-wise INSERT OR IGNORE to avoid the frankensqlite limitation where
 /// multi-row VALUES lists fall through to INSERT...SELECT, which rejects
 /// UPSERT/OR IGNORE conflict clauses.
+const MESSAGE_METRICS_INSERT_SQL: &str = "\
+INSERT OR IGNORE INTO message_metrics (
+    message_id, created_at_ms, hour_id, day_id,
+    agent_slug, workspace_id, source_id, role,
+    content_chars, content_tokens_est,
+    model_name, model_family, model_tier, provider,
+    api_input_tokens, api_output_tokens, api_cache_read_tokens,
+    api_cache_creation_tokens, api_thinking_tokens,
+    api_service_tier, api_data_source,
+    tool_call_count, has_tool_calls, has_plan
+)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)";
+
+fn message_metrics_param_values(e: &MessageMetricsEntry) -> Vec<SqliteValue> {
+    let params_vec: Vec<ParamValue> = vec![
+        ParamValue::from(e.message_id),
+        ParamValue::from(e.created_at_ms),
+        ParamValue::from(e.hour_id),
+        ParamValue::from(e.day_id),
+        ParamValue::from(e.agent_slug.clone()),
+        ParamValue::from(e.workspace_id),
+        ParamValue::from(e.source_id.clone()),
+        ParamValue::from(e.role.clone()),
+        ParamValue::from(e.content_chars),
+        ParamValue::from(e.content_tokens_est),
+        ParamValue::from(e.model_name.clone()),
+        ParamValue::from(e.model_family.clone()),
+        ParamValue::from(e.model_tier.clone()),
+        ParamValue::from(e.provider.clone()),
+        ParamValue::from(e.api_input_tokens),
+        ParamValue::from(e.api_output_tokens),
+        ParamValue::from(e.api_cache_read_tokens),
+        ParamValue::from(e.api_cache_creation_tokens),
+        ParamValue::from(e.api_thinking_tokens),
+        ParamValue::from(e.api_service_tier.clone()),
+        ParamValue::from(e.api_data_source.clone()),
+        ParamValue::from(e.tool_call_count),
+        ParamValue::from(e.has_tool_calls as i64),
+        ParamValue::from(e.has_plan as i64),
+    ];
+    param_slice_to_values(&params_vec)
+}
+
 fn franken_insert_message_metrics_batched_in_tx(
     tx: &FrankenTransaction<'_>,
     entries: &[MessageMetricsEntry],
@@ -12371,48 +12428,8 @@ fn franken_insert_message_metrics_batched_in_tx(
     let mut total_inserted = 0;
 
     for e in entries {
-        let params_vec: Vec<ParamValue> = vec![
-            ParamValue::from(e.message_id),
-            ParamValue::from(e.created_at_ms),
-            ParamValue::from(e.hour_id),
-            ParamValue::from(e.day_id),
-            ParamValue::from(e.agent_slug.clone()),
-            ParamValue::from(e.workspace_id),
-            ParamValue::from(e.source_id.clone()),
-            ParamValue::from(e.role.clone()),
-            ParamValue::from(e.content_chars),
-            ParamValue::from(e.content_tokens_est),
-            ParamValue::from(e.model_name.clone()),
-            ParamValue::from(e.model_family.clone()),
-            ParamValue::from(e.model_tier.clone()),
-            ParamValue::from(e.provider.clone()),
-            ParamValue::from(e.api_input_tokens),
-            ParamValue::from(e.api_output_tokens),
-            ParamValue::from(e.api_cache_read_tokens),
-            ParamValue::from(e.api_cache_creation_tokens),
-            ParamValue::from(e.api_thinking_tokens),
-            ParamValue::from(e.api_service_tier.clone()),
-            ParamValue::from(e.api_data_source.clone()),
-            ParamValue::from(e.tool_call_count),
-            ParamValue::from(e.has_tool_calls as i64),
-            ParamValue::from(e.has_plan as i64),
-        ];
-
-        let values = param_slice_to_values(&params_vec);
-        total_inserted += tx.execute_with_params(
-            "INSERT OR IGNORE INTO message_metrics (
-                message_id, created_at_ms, hour_id, day_id,
-                agent_slug, workspace_id, source_id, role,
-                content_chars, content_tokens_est,
-                model_name, model_family, model_tier, provider,
-                api_input_tokens, api_output_tokens, api_cache_read_tokens,
-                api_cache_creation_tokens, api_thinking_tokens,
-                api_service_tier, api_data_source,
-                tool_call_count, has_tool_calls, has_plan
-            )
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
-            &values,
-        )?;
+        total_inserted +=
+            tx.execute_with_params(MESSAGE_METRICS_INSERT_SQL, &message_metrics_param_values(e))?;
     }
 
     Ok(total_inserted)
@@ -12613,159 +12630,468 @@ fn franken_update_conversation_token_summaries_in_tx(
     Ok(())
 }
 
+const ANALYTICS_REBUILD_MESSAGE_METRICS_BULK_SQL: &str = "\
+INSERT OR REPLACE INTO message_metrics (
+    message_id, created_at_ms, hour_id, day_id,
+    agent_slug, workspace_id, source_id, role,
+    content_chars, content_tokens_est,
+    model_name, model_family, model_tier, provider,
+    api_input_tokens, api_output_tokens, api_cache_read_tokens,
+    api_cache_creation_tokens, api_thinking_tokens,
+    api_service_tier, api_data_source,
+    tool_call_count, has_tool_calls, has_plan
+)
+SELECT
+    id,
+    ts,
+    CAST(((ts / 1000) - 1577836800) / 3600 AS INTEGER),
+    CAST(((ts / 1000) - 1577836800) / 86400 AS INTEGER),
+    agent_slug,
+    workspace_id,
+    source_id,
+    role,
+    content_chars,
+    content_chars / 4,
+    model_name,
+    COALESCE(model_family, 'unknown'),
+    COALESCE(model_tier, 'unknown'),
+    COALESCE(provider, 'unknown'),
+    CASE
+        WHEN input_tokens IS NOT NULL THEN input_tokens
+        WHEN data_source = 'api' AND role = 'user' THEN total_tokens
+        ELSE NULL
+    END,
+    CASE
+        WHEN output_tokens IS NOT NULL THEN output_tokens
+        WHEN data_source = 'api' AND role != 'user' THEN total_tokens
+        ELSE NULL
+    END,
+    cache_read_tokens,
+    cache_creation_tokens,
+    thinking_tokens,
+    service_tier,
+    COALESCE(data_source, 'estimated'),
+    COALESCE(tool_call_count, 0),
+    COALESCE(has_tool_calls, 0),
+    CASE
+        WHEN role IN ('assistant', 'agent')
+         AND content_lc LIKE '%plan%'
+         AND (content_lc LIKE '%step%' OR content_lc LIKE '%1.%' OR content_lc LIKE '%- %')
+        THEN 1 ELSE 0
+    END
+FROM (
+    SELECT
+        m.id AS id,
+        COALESCE(m.created_at, c.started_at, 0) AS ts,
+        COALESCE(a.slug, 'unknown') AS agent_slug,
+        COALESCE(c.workspace_id, 0) AS workspace_id,
+        c.source_id AS source_id,
+        m.role AS role,
+        COALESCE(LENGTH(CAST(m.content AS BLOB)), 0) AS content_chars,
+        LOWER(COALESCE(m.content, '')) AS content_lc,
+        tu.model_name AS model_name,
+        tu.model_family AS model_family,
+        tu.model_tier AS model_tier,
+        tu.provider AS provider,
+        tu.input_tokens AS input_tokens,
+        tu.output_tokens AS output_tokens,
+        tu.cache_read_tokens AS cache_read_tokens,
+        tu.cache_creation_tokens AS cache_creation_tokens,
+        tu.thinking_tokens AS thinking_tokens,
+        tu.total_tokens AS total_tokens,
+        tu.service_tier AS service_tier,
+        tu.data_source AS data_source,
+        tu.tool_call_count AS tool_call_count,
+        tu.has_tool_calls AS has_tool_calls
+    FROM messages m
+    JOIN conversations c ON m.conversation_id = c.id
+    LEFT JOIN agents a ON a.id = c.agent_id
+    LEFT JOIN token_usage tu ON tu.message_id = m.id
+)";
+
+const ANALYTICS_REBUILD_USAGE_HOURLY_BULK_SQL: &str = "\
+INSERT INTO usage_hourly (
+    hour_id, agent_slug, workspace_id, source_id,
+    message_count, user_message_count, assistant_message_count,
+    tool_call_count, plan_message_count, api_coverage_message_count,
+    content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
+    api_tokens_total, api_input_tokens_total, api_output_tokens_total,
+    api_cache_read_tokens_total, api_cache_creation_tokens_total,
+    api_thinking_tokens_total, last_updated,
+    plan_content_tokens_est_total, plan_api_tokens_total
+)
+SELECT
+    hour_id, agent_slug, workspace_id, source_id,
+    COUNT(*),
+    SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END),
+    SUM(CASE WHEN role IN ('assistant', 'agent') THEN 1 ELSE 0 END),
+    SUM(tool_call_count),
+    SUM(has_plan),
+    SUM(CASE WHEN api_data_source = 'api' THEN 1 ELSE 0 END),
+    SUM(content_tokens_est),
+    SUM(CASE WHEN role = 'user' THEN content_tokens_est ELSE 0 END),
+    SUM(CASE WHEN role IN ('assistant', 'agent') THEN content_tokens_est ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_input_tokens, 0) + COALESCE(api_output_tokens, 0) + COALESCE(api_cache_read_tokens, 0) + COALESCE(api_cache_creation_tokens, 0) + COALESCE(api_thinking_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_input_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_output_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_cache_read_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_cache_creation_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_thinking_tokens, 0) ELSE 0 END),
+    ?1,
+    SUM(CASE WHEN has_plan != 0 THEN content_tokens_est ELSE 0 END),
+    SUM(CASE WHEN has_plan != 0 AND api_data_source = 'api' THEN COALESCE(api_input_tokens, 0) + COALESCE(api_output_tokens, 0) + COALESCE(api_cache_read_tokens, 0) + COALESCE(api_cache_creation_tokens, 0) + COALESCE(api_thinking_tokens, 0) ELSE 0 END)
+FROM message_metrics
+GROUP BY hour_id, agent_slug, workspace_id, source_id";
+
+const ANALYTICS_REBUILD_USAGE_DAILY_BULK_SQL: &str = "\
+INSERT INTO usage_daily (
+    day_id, agent_slug, workspace_id, source_id,
+    message_count, user_message_count, assistant_message_count,
+    tool_call_count, plan_message_count, api_coverage_message_count,
+    content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
+    api_tokens_total, api_input_tokens_total, api_output_tokens_total,
+    api_cache_read_tokens_total, api_cache_creation_tokens_total,
+    api_thinking_tokens_total, last_updated,
+    plan_content_tokens_est_total, plan_api_tokens_total
+)
+SELECT
+    day_id, agent_slug, workspace_id, source_id,
+    COUNT(*),
+    SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END),
+    SUM(CASE WHEN role IN ('assistant', 'agent') THEN 1 ELSE 0 END),
+    SUM(tool_call_count),
+    SUM(has_plan),
+    SUM(CASE WHEN api_data_source = 'api' THEN 1 ELSE 0 END),
+    SUM(content_tokens_est),
+    SUM(CASE WHEN role = 'user' THEN content_tokens_est ELSE 0 END),
+    SUM(CASE WHEN role IN ('assistant', 'agent') THEN content_tokens_est ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_input_tokens, 0) + COALESCE(api_output_tokens, 0) + COALESCE(api_cache_read_tokens, 0) + COALESCE(api_cache_creation_tokens, 0) + COALESCE(api_thinking_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_input_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_output_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_cache_read_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_cache_creation_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_thinking_tokens, 0) ELSE 0 END),
+    ?1,
+    SUM(CASE WHEN has_plan != 0 THEN content_tokens_est ELSE 0 END),
+    SUM(CASE WHEN has_plan != 0 AND api_data_source = 'api' THEN COALESCE(api_input_tokens, 0) + COALESCE(api_output_tokens, 0) + COALESCE(api_cache_read_tokens, 0) + COALESCE(api_cache_creation_tokens, 0) + COALESCE(api_thinking_tokens, 0) ELSE 0 END)
+FROM message_metrics
+GROUP BY day_id, agent_slug, workspace_id, source_id";
+
+const ANALYTICS_REBUILD_USAGE_MODELS_DAILY_BULK_SQL: &str = "\
+INSERT INTO usage_models_daily (
+    day_id, agent_slug, workspace_id, source_id, model_family, model_tier,
+    message_count, user_message_count, assistant_message_count,
+    tool_call_count, plan_message_count, api_coverage_message_count,
+    content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
+    api_tokens_total, api_input_tokens_total, api_output_tokens_total,
+    api_cache_read_tokens_total, api_cache_creation_tokens_total,
+    api_thinking_tokens_total, last_updated
+)
+SELECT
+    day_id, agent_slug, workspace_id, source_id, model_family, model_tier,
+    COUNT(*),
+    SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END),
+    SUM(CASE WHEN role IN ('assistant', 'agent') THEN 1 ELSE 0 END),
+    SUM(tool_call_count),
+    SUM(has_plan),
+    SUM(CASE WHEN api_data_source = 'api' THEN 1 ELSE 0 END),
+    SUM(content_tokens_est),
+    SUM(CASE WHEN role = 'user' THEN content_tokens_est ELSE 0 END),
+    SUM(CASE WHEN role IN ('assistant', 'agent') THEN content_tokens_est ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_input_tokens, 0) + COALESCE(api_output_tokens, 0) + COALESCE(api_cache_read_tokens, 0) + COALESCE(api_cache_creation_tokens, 0) + COALESCE(api_thinking_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_input_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_output_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_cache_read_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_cache_creation_tokens, 0) ELSE 0 END),
+    SUM(CASE WHEN api_data_source = 'api' THEN COALESCE(api_thinking_tokens, 0) ELSE 0 END),
+    ?1
+FROM message_metrics
+GROUP BY day_id, agent_slug, workspace_id, source_id, model_family, model_tier";
+
+const TOKEN_DAILY_STATS_REBUILD_BULK_SQL: &str = "\
+WITH token_raw AS (
+    SELECT
+        tu.day_id AS day_id,
+        COALESCE(a.slug, 'unknown') AS agent_slug,
+        COALESCE(c.source_id, 'local') AS source_id,
+        COALESCE(tu.model_family, 'unknown') AS model_family,
+        COUNT(*) AS api_call_count,
+        SUM(CASE WHEN tu.role = 'user' THEN 1 ELSE 0 END) AS user_message_count,
+        SUM(CASE WHEN tu.role IN ('assistant', 'agent') THEN 1 ELSE 0 END) AS assistant_message_count,
+        SUM(CASE WHEN tu.role = 'tool' THEN 1 ELSE 0 END) AS tool_message_count,
+        SUM(COALESCE(tu.input_tokens, 0)) AS total_input_tokens,
+        SUM(COALESCE(tu.output_tokens, 0)) AS total_output_tokens,
+        SUM(COALESCE(tu.cache_read_tokens, 0)) AS total_cache_read_tokens,
+        SUM(COALESCE(tu.cache_creation_tokens, 0)) AS total_cache_creation_tokens,
+        SUM(COALESCE(tu.thinking_tokens, 0)) AS total_thinking_tokens,
+        SUM(COALESCE(
+            tu.total_tokens,
+            COALESCE(tu.input_tokens, 0) +
+            COALESCE(tu.output_tokens, 0) +
+            COALESCE(tu.cache_read_tokens, 0) +
+            COALESCE(tu.cache_creation_tokens, 0) +
+            COALESCE(tu.thinking_tokens, 0)
+        )) AS grand_total_tokens,
+        SUM(COALESCE(tu.content_chars, 0)) AS total_content_chars,
+        SUM(COALESCE(tu.tool_call_count, 0)) AS total_tool_calls,
+        SUM(COALESCE(tu.estimated_cost_usd, 0.0)) AS estimated_cost_usd,
+        0 AS session_count
+    FROM token_usage tu
+    LEFT JOIN conversations c ON c.id = tu.conversation_id
+    LEFT JOIN agents a ON a.id = c.agent_id
+    GROUP BY
+        tu.day_id,
+        COALESCE(a.slug, 'unknown'),
+        COALESCE(c.source_id, 'local'),
+        COALESCE(tu.model_family, 'unknown')
+),
+session_raw AS (
+    SELECT
+        CAST(((COALESCE(c.started_at, 0) / 1000) - 1577836800) / 86400 AS INTEGER) AS day_id,
+        COALESCE(a.slug, 'unknown') AS agent_slug,
+        COALESCE(c.source_id, 'local') AS source_id,
+        COALESCE((
+            SELECT COALESCE(tu2.model_family, 'unknown')
+            FROM token_usage tu2
+            WHERE tu2.conversation_id = c.id
+              AND COALESCE(tu2.model_family, 'unknown') != 'unknown'
+            ORDER BY tu2.id DESC
+            LIMIT 1
+        ), 'unknown') AS model_family,
+        0 AS api_call_count,
+        0 AS user_message_count,
+        0 AS assistant_message_count,
+        0 AS tool_message_count,
+        0 AS total_input_tokens,
+        0 AS total_output_tokens,
+        0 AS total_cache_read_tokens,
+        0 AS total_cache_creation_tokens,
+        0 AS total_thinking_tokens,
+        0 AS grand_total_tokens,
+        0 AS total_content_chars,
+        0 AS total_tool_calls,
+        0.0 AS estimated_cost_usd,
+        COUNT(*) AS session_count
+    FROM conversations c
+    LEFT JOIN agents a ON a.id = c.agent_id
+    GROUP BY
+        CAST(((COALESCE(c.started_at, 0) / 1000) - 1577836800) / 86400 AS INTEGER),
+        COALESCE(a.slug, 'unknown'),
+        COALESCE(c.source_id, 'local'),
+        model_family
+),
+raw AS (
+    SELECT * FROM token_raw
+    UNION ALL
+    SELECT * FROM session_raw
+),
+expanded AS (
+    SELECT * FROM raw
+    UNION ALL
+    SELECT day_id, 'all', source_id, model_family,
+           api_call_count, user_message_count, assistant_message_count, tool_message_count,
+           total_input_tokens, total_output_tokens, total_cache_read_tokens,
+           total_cache_creation_tokens, total_thinking_tokens, grand_total_tokens,
+           total_content_chars, total_tool_calls, estimated_cost_usd, session_count
+    FROM raw
+    WHERE agent_slug != 'all'
+    UNION ALL
+    SELECT day_id, agent_slug, 'all', model_family,
+           api_call_count, user_message_count, assistant_message_count, tool_message_count,
+           total_input_tokens, total_output_tokens, total_cache_read_tokens,
+           total_cache_creation_tokens, total_thinking_tokens, grand_total_tokens,
+           total_content_chars, total_tool_calls, estimated_cost_usd, session_count
+    FROM raw
+    WHERE source_id != 'all'
+    UNION ALL
+    SELECT day_id, agent_slug, source_id, 'all',
+           api_call_count, user_message_count, assistant_message_count, tool_message_count,
+           total_input_tokens, total_output_tokens, total_cache_read_tokens,
+           total_cache_creation_tokens, total_thinking_tokens, grand_total_tokens,
+           total_content_chars, total_tool_calls, estimated_cost_usd, session_count
+    FROM raw
+    WHERE model_family != 'all'
+    UNION ALL
+    SELECT day_id, 'all', 'all', 'all',
+           api_call_count, user_message_count, assistant_message_count, tool_message_count,
+           total_input_tokens, total_output_tokens, total_cache_read_tokens,
+           total_cache_creation_tokens, total_thinking_tokens, grand_total_tokens,
+           total_content_chars, total_tool_calls, estimated_cost_usd, session_count
+    FROM raw
+    WHERE NOT (agent_slug = 'all' AND source_id = 'all' AND model_family = 'all')
+)
+INSERT INTO token_daily_stats (
+    day_id, agent_slug, source_id, model_family,
+    api_call_count, user_message_count, assistant_message_count, tool_message_count,
+    total_input_tokens, total_output_tokens, total_cache_read_tokens,
+    total_cache_creation_tokens, total_thinking_tokens, grand_total_tokens,
+    total_content_chars, total_tool_calls, estimated_cost_usd, session_count,
+    last_updated
+)
+SELECT
+    day_id, agent_slug, source_id, model_family,
+    SUM(api_call_count),
+    SUM(user_message_count),
+    SUM(assistant_message_count),
+    SUM(tool_message_count),
+    SUM(total_input_tokens),
+    SUM(total_output_tokens),
+    SUM(total_cache_read_tokens),
+    SUM(total_cache_creation_tokens),
+    SUM(total_thinking_tokens),
+    SUM(grand_total_tokens),
+    SUM(total_content_chars),
+    SUM(total_tool_calls),
+    SUM(estimated_cost_usd),
+    SUM(session_count),
+    ?1
+FROM expanded
+GROUP BY day_id, agent_slug, source_id, model_family";
+
+const TOKEN_DAILY_STATS_CREATE_SQL: &str = "\
+CREATE TABLE token_daily_stats (
+    day_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    source_id TEXT NOT NULL DEFAULT 'all',
+    model_family TEXT NOT NULL DEFAULT 'all',
+
+    api_call_count INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+    tool_message_count INTEGER NOT NULL DEFAULT 0,
+
+    total_input_tokens INTEGER NOT NULL DEFAULT 0,
+    total_output_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    total_thinking_tokens INTEGER NOT NULL DEFAULT 0,
+    grand_total_tokens INTEGER NOT NULL DEFAULT 0,
+
+    total_content_chars INTEGER NOT NULL DEFAULT 0,
+    total_tool_calls INTEGER NOT NULL DEFAULT 0,
+
+    estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
+
+    session_count INTEGER NOT NULL DEFAULT 0,
+
+    last_updated INTEGER NOT NULL,
+
+    PRIMARY KEY (day_id, agent_slug, source_id, model_family)
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_daily_stats_agent
+    ON token_daily_stats(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_token_daily_stats_model
+    ON token_daily_stats(model_family, day_id);";
+
+fn recreate_token_daily_stats_table(conn: &rusqlite::Connection) -> Result<()> {
+    match conn.execute_batch("DROP TABLE IF EXISTS token_daily_stats;") {
+        Ok(()) => {}
+        Err(drop_err) => {
+            tracing::warn!(
+                target: "cass::analytics",
+                error = %drop_err,
+                "token_daily_stats drop failed; abandoning derived table schema"
+            );
+            abandon_token_daily_stats_schema(conn).with_context(|| {
+                format!("abandoning malformed token_daily_stats after drop failed: {drop_err}")
+            })?;
+        }
+    }
+
+    conn.execute_batch(TOKEN_DAILY_STATS_CREATE_SQL)
+        .with_context(|| "creating token_daily_stats")?;
+    Ok(())
+}
+
+fn abandon_token_daily_stats_schema(conn: &rusqlite::Connection) -> Result<()> {
+    let schema_version: i64 = conn
+        .query_row("PRAGMA schema_version;", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    conn.execute_batch("PRAGMA writable_schema = ON;")
+        .with_context(|| "enabling writable_schema for token_daily_stats repair")?;
+    let delete_result = conn.execute(
+        "DELETE FROM sqlite_schema
+         WHERE tbl_name = 'token_daily_stats'
+            OR name IN (
+                'token_daily_stats',
+                'idx_token_daily_stats_agent',
+                'idx_token_daily_stats_model',
+                'sqlite_autoindex_token_daily_stats_1'
+            )",
+        [],
+    );
+    let disable_result = conn.execute_batch("PRAGMA writable_schema = OFF;");
+
+    let deleted = match delete_result {
+        Ok(deleted) => deleted,
+        Err(err) => {
+            let _ = disable_result;
+            return Err(anyhow!(
+                "deleting malformed token_daily_stats schema entries: {err}"
+            ));
+        }
+    };
+    disable_result.with_context(|| "disabling writable_schema after token_daily_stats repair")?;
+
+    let next_schema_version = schema_version.saturating_add(1);
+    conn.execute_batch(&format!("PRAGMA schema_version = {next_schema_version};"))
+        .with_context(|| "bumping schema_version after token_daily_stats repair")?;
+    tracing::warn!(
+        target: "cass::analytics",
+        deleted,
+        "abandoned malformed token_daily_stats schema entries"
+    );
+    Ok(())
+}
+
 impl FrankenStorage {
     /// Rebuild token_daily_stats from the token_usage ledger.
     pub fn rebuild_token_daily_stats(&self) -> Result<usize> {
-        const CONVERSATION_BATCH_SIZE: usize = 1_000;
-        const TOKEN_USAGE_BATCH_SIZE: usize = 10_000;
+        let mut conn = rusqlite::Connection::open(&self.db_path)
+            .with_context(|| format!("opening sqlite db at {}", self.db_path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA cache_size = -65536;
+             PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 30000;",
+        )
+        .with_context(|| {
+            format!(
+                "applying sqlite token stats rebuild pragmas for {}",
+                self.db_path.display()
+            )
+        })?;
 
-        let total_usage_rows: i64 =
-            self.conn
-                .query_row_map("SELECT COUNT(*) FROM token_usage", fparams![], |row| {
-                    row.get_typed(0)
-                })?;
+        let total_usage_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM token_usage", [], |row| row.get(0))
+            .with_context(|| "counting token_usage before token_daily_stats rebuild")?;
         tracing::info!(
             target: "cass::analytics",
             total_usage_rows,
             "token_daily_stats_rebuild_start"
         );
 
-        let mut tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM token_daily_stats")?;
+        recreate_token_daily_stats_table(&conn)
+            .with_context(|| "recreating token_daily_stats before rebuild")?;
 
-        let mut last_conversation_id = 0_i64;
-        let mut rows_created = 0_usize;
-
-        loop {
-            let conversation_rows = tx.query_map_collect(
-                "SELECT c.id, c.started_at, c.source_id,
-                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown')
-                 FROM conversations c
-                 WHERE c.id > ?1
-                 ORDER BY c.id
-                 LIMIT ?2",
-                fparams![last_conversation_id, CONVERSATION_BATCH_SIZE as i64],
-                |row| {
-                    Ok((
-                        row.get_typed::<i64>(0)?,
-                        row.get_typed::<Option<i64>>(1)?,
-                        row.get_typed::<String>(2)?,
-                        row.get_typed::<String>(3)?,
-                    ))
-                },
-            )?;
-            if conversation_rows.is_empty() {
-                break;
-            }
-
-            let mut aggregate = TokenStatsAggregator::new();
-
-            for (conversation_id, started_at, source_id, agent_slug) in conversation_rows {
-                last_conversation_id = conversation_id;
-                let conversation_day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
-                let mut last_token_usage_id = 0_i64;
-                let mut session_model_family = String::from("unknown");
-
-                loop {
-                    let usage_rows = tx.query_map_collect(
-                        "SELECT id, day_id, role,
-                                COALESCE(model_family, 'unknown'),
-                                input_tokens, output_tokens, cache_read_tokens,
-                                cache_creation_tokens, thinking_tokens,
-                                has_tool_calls, tool_call_count,
-                                content_chars, estimated_cost_usd
-                         FROM token_usage
-                         WHERE conversation_id = ?1
-                           AND id > ?2
-                         ORDER BY id
-                         LIMIT ?3",
-                        fparams![
-                            conversation_id,
-                            last_token_usage_id,
-                            TOKEN_USAGE_BATCH_SIZE as i64
-                        ],
-                        |row| {
-                            Ok((
-                                row.get_typed::<i64>(0)?,
-                                row.get_typed::<i64>(1)?,
-                                row.get_typed::<String>(2)?,
-                                row.get_typed::<String>(3)?,
-                                row.get_typed::<Option<i64>>(4)?,
-                                row.get_typed::<Option<i64>>(5)?,
-                                row.get_typed::<Option<i64>>(6)?,
-                                row.get_typed::<Option<i64>>(7)?,
-                                row.get_typed::<Option<i64>>(8)?,
-                                row.get_typed::<i64>(9)?,
-                                row.get_typed::<i64>(10)?,
-                                row.get_typed::<i64>(11)?,
-                                row.get_typed::<Option<f64>>(12)?,
-                            ))
-                        },
-                    )?;
-                    if usage_rows.is_empty() {
-                        break;
-                    }
-
-                    for (
-                        token_usage_id,
-                        day_id,
-                        role,
-                        model_family,
-                        input_tokens,
-                        output_tokens,
-                        cache_read_tokens,
-                        cache_creation_tokens,
-                        thinking_tokens,
-                        has_tool_calls,
-                        tool_call_count,
-                        content_chars,
-                        estimated_cost_usd,
-                    ) in usage_rows
-                    {
-                        last_token_usage_id = token_usage_id;
-                        if model_family != "unknown" {
-                            session_model_family = model_family.clone();
-                        }
-                        let usage = crate::connectors::ExtractedTokenUsage {
-                            model_name: None,
-                            provider: None,
-                            input_tokens,
-                            output_tokens,
-                            cache_read_tokens,
-                            cache_creation_tokens,
-                            thinking_tokens,
-                            service_tier: None,
-                            has_tool_calls: has_tool_calls != 0,
-                            tool_call_count: u32::try_from(tool_call_count.max(0)).unwrap_or(0),
-                            data_source: franken_agent_detection::TokenDataSource::Api,
-                        };
-                        aggregate.record(
-                            &agent_slug,
-                            &source_id,
-                            day_id,
-                            &model_family,
-                            &role,
-                            &usage,
-                            content_chars,
-                            estimated_cost_usd.unwrap_or(0.0),
-                        );
-                    }
-                }
-
-                aggregate.record_session(
-                    &agent_slug,
-                    &source_id,
-                    conversation_day_id,
-                    &session_model_family,
-                );
-            }
-
-            let entries = aggregate.expand();
-            rows_created = rows_created.saturating_add(entries.len());
-            franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
-        }
-
-        tx.commit()?;
+        let tx = conn
+            .transaction()
+            .with_context(|| "starting token_daily_stats rebuild transaction")?;
+        let now = Self::now_millis();
+        tx.execute(TOKEN_DAILY_STATS_REBUILD_BULK_SQL, rusqlite::params![now])
+            .map_err(|err| anyhow!("rebuilding token_daily_stats from token_usage: {err}"))?;
+        let rows_created: usize = tx
+            .query_row("SELECT COUNT(*) FROM token_daily_stats", [], |row| {
+                row.get::<_, i64>(0).map(|count| count.max(0) as usize)
+            })
+            .with_context(|| "counting rebuilt token_daily_stats rows")?;
+        tx.commit()
+            .with_context(|| "committing token_daily_stats rebuild transaction")?;
+        conn.execute_batch("PRAGMA wal_checkpoint(RESTART);")
+            .with_context(|| "checkpointing token_daily_stats rebuild")?;
 
         tracing::info!(
             target: "cass::analytics",
@@ -12781,195 +13107,87 @@ impl FrankenStorage {
     pub fn rebuild_analytics(&self) -> Result<AnalyticsRebuildResult> {
         let start = Instant::now();
 
-        let total_messages: i64 =
-            self.conn
-                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                    row.get_typed(0)
-                })?;
+        let mut conn = rusqlite::Connection::open(&self.db_path)
+            .with_context(|| format!("opening sqlite db at {}", self.db_path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA cache_size = -65536;
+             PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 30000;",
+        )
+        .with_context(|| {
+            format!(
+                "applying sqlite analytics rebuild pragmas for {}",
+                self.db_path.display()
+            )
+        })?;
+
+        let total_messages: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .with_context(|| "counting messages before analytics rebuild")?;
         tracing::info!(
             target: "cass::analytics",
             total_messages,
             "analytics_rebuild_start"
         );
 
-        let mut tx = self.conn.transaction()?;
+        let tx = conn
+            .transaction()
+            .with_context(|| "starting analytics rebuild transaction")?;
 
-        tx.execute("DELETE FROM message_metrics")?;
-        tx.execute("DELETE FROM usage_hourly")?;
-        tx.execute("DELETE FROM usage_daily")?;
-        tx.execute("DELETE FROM usage_models_daily")?;
+        tx.execute_batch(
+            "DELETE FROM message_metrics;
+             DELETE FROM usage_hourly;
+             DELETE FROM usage_daily;
+             DELETE FROM usage_models_daily;",
+        )
+        .with_context(|| "clearing analytics tables before rebuild")?;
 
-        const CHUNK_SIZE: i64 = 10_000;
-        let mut offset: i64 = 0;
-        let mut total_inserted: usize = 0;
-        let mut usage_hourly_rows: usize = 0;
-        let mut usage_daily_rows: usize = 0;
-        let mut usage_models_daily_rows: usize = 0;
+        tx.execute(ANALYTICS_REBUILD_MESSAGE_METRICS_BULK_SQL, [])
+            .with_context(|| "rebuilding message_metrics from messages")?;
+        let now = Self::now_millis();
+        tx.execute(
+            ANALYTICS_REBUILD_USAGE_HOURLY_BULK_SQL,
+            rusqlite::params![now],
+        )
+        .with_context(|| "rebuilding usage_hourly from message_metrics")?;
+        tx.execute(
+            ANALYTICS_REBUILD_USAGE_DAILY_BULK_SQL,
+            rusqlite::params![now],
+        )
+        .with_context(|| "rebuilding usage_daily from message_metrics")?;
+        tx.execute(
+            ANALYTICS_REBUILD_USAGE_MODELS_DAILY_BULK_SQL,
+            rusqlite::params![now],
+        )
+        .with_context(|| "rebuilding usage_models_daily from message_metrics")?;
 
-        loop {
-            #[allow(clippy::type_complexity)]
-            let rows: Vec<(
-                i64,
-                String,
-                String,
-                Option<serde_json::Value>,
-                Option<i64>,
-                Option<i64>,
-                String,
-                Option<i64>,
-                String,
-            )> = tx.query_map_collect(
-                // Avoid the 3-table JOIN with LIMIT/OFFSET that triggers
-                // frankensqlite's materialization fallback (see 860acb12).
-                // Inline the agent slug lookup as a correlated subquery and
-                // fall back to 'unknown' for NULL agent_id, matching the
-                // FTS / lexical rebuild paths.
-                "SELECT m.id, m.idx, m.role, m.content, m.extra_json, m.extra_bin,
-                        m.created_at,
-                        c.id AS conv_id, c.started_at AS conv_started_at,
-                        c.source_id, c.workspace_id,
-                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown') AS agent_slug
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 ORDER BY m.id
-                 LIMIT ?1 OFFSET ?2",
-                fparams![CHUNK_SIZE, offset],
-                |row| {
-                    let msg_id: i64 = row.get_typed(0)?;
-                    let role: String = row.get_typed(2)?;
-                    let content: String = row.get_typed(3)?;
-                    let extra_json = row
-                        .get_typed::<Option<String>>(4)?
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .or_else(|| {
-                            row.get_typed::<Option<Vec<u8>>>(5)
-                                .ok()
-                                .flatten()
-                                .and_then(|b| rmp_serde::from_slice(&b).ok())
-                        });
-                    let msg_ts: Option<i64> = row.get_typed(6)?;
-                    let conv_started_at: Option<i64> = row.get_typed(8)?;
-                    let source_id: String = row.get_typed(9)?;
-                    let workspace_id: Option<i64> = row.get_typed(10)?;
-                    let agent_slug: String = row.get_typed(11)?;
-                    let effective_ts = msg_ts.or(conv_started_at).unwrap_or(0);
+        let total_inserted: usize = tx
+            .query_row("SELECT COUNT(*) FROM message_metrics", [], |row| {
+                row.get::<_, i64>(0).map(|count| count.max(0) as usize)
+            })
+            .with_context(|| "counting rebuilt message_metrics rows")?;
+        let usage_hourly_rows: usize = tx
+            .query_row("SELECT COUNT(*) FROM usage_hourly", [], |row| {
+                row.get::<_, i64>(0).map(|count| count.max(0) as usize)
+            })
+            .with_context(|| "counting rebuilt usage_hourly rows")?;
+        let usage_daily_rows: usize = tx
+            .query_row("SELECT COUNT(*) FROM usage_daily", [], |row| {
+                row.get::<_, i64>(0).map(|count| count.max(0) as usize)
+            })
+            .with_context(|| "counting rebuilt usage_daily rows")?;
+        let usage_models_daily_rows: usize = tx
+            .query_row("SELECT COUNT(*) FROM usage_models_daily", [], |row| {
+                row.get::<_, i64>(0).map(|count| count.max(0) as usize)
+            })
+            .with_context(|| "counting rebuilt usage_models_daily rows")?;
 
-                    Ok((
-                        msg_id,
-                        role,
-                        content,
-                        extra_json,
-                        Some(effective_ts),
-                        workspace_id,
-                        source_id,
-                        conv_started_at,
-                        agent_slug,
-                    ))
-                },
-            )?;
-
-            if rows.is_empty() {
-                break;
-            }
-
-            let chunk_len = rows.len();
-            let mut entries = Vec::with_capacity(chunk_len);
-            let mut rollup_agg = AnalyticsRollupAggregator::new();
-
-            for (
-                msg_id,
-                role,
-                content,
-                extra_json,
-                effective_ts,
-                workspace_id,
-                source_id,
-                _conv_started_at,
-                agent_slug,
-            ) in &rows
-            {
-                let ts = effective_ts.unwrap_or(0);
-                let day_id = Self::day_id_from_millis(ts);
-                let hour_id = Self::hour_id_from_millis(ts);
-                let content_chars = content.len() as i64;
-                let content_tokens_est = content_chars / 4;
-                let extra = extra_json
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let usage =
-                    crate::connectors::extract_tokens_for_agent(agent_slug, &extra, content, role);
-                let model_info = usage
-                    .model_name
-                    .as_deref()
-                    .map(crate::connectors::normalize_model);
-                let model_family = model_info
-                    .as_ref()
-                    .map(|i| i.family.clone())
-                    .unwrap_or_else(|| "unknown".into());
-                let model_tier = model_info
-                    .as_ref()
-                    .map(|i| i.tier.clone())
-                    .unwrap_or_else(|| "unknown".into());
-                let provider = usage
-                    .provider
-                    .clone()
-                    .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
-                    .unwrap_or_else(|| "unknown".into());
-
-                let entry = MessageMetricsEntry {
-                    message_id: *msg_id,
-                    created_at_ms: ts,
-                    hour_id,
-                    day_id,
-                    agent_slug: agent_slug.clone(),
-                    workspace_id: workspace_id.unwrap_or(0),
-                    source_id: source_id.clone(),
-                    role: role.clone(),
-                    content_chars,
-                    content_tokens_est,
-                    model_name: usage.model_name.clone(),
-                    model_family,
-                    model_tier,
-                    provider,
-                    api_input_tokens: usage.input_tokens,
-                    api_output_tokens: usage.output_tokens,
-                    api_cache_read_tokens: usage.cache_read_tokens,
-                    api_cache_creation_tokens: usage.cache_creation_tokens,
-                    api_thinking_tokens: usage.thinking_tokens,
-                    api_service_tier: usage.service_tier,
-                    api_data_source: usage.data_source.as_str().to_string(),
-                    tool_call_count: usage.tool_call_count as i64,
-                    has_tool_calls: usage.has_tool_calls,
-                    has_plan: has_plan_for_role(role, content),
-                };
-                rollup_agg.record(&entry);
-                entries.push(entry);
-            }
-
-            total_inserted += franken_insert_message_metrics_batched_in_tx(&tx, &entries)?;
-            let (hourly, daily, models_daily) =
-                franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
-            usage_hourly_rows += hourly;
-            usage_daily_rows += daily;
-            usage_models_daily_rows += models_daily;
-            offset += chunk_len as i64;
-
-            tracing::debug!(
-                target: "cass::analytics",
-                offset,
-                chunk = chunk_len,
-                inserted = entries.len(),
-                total = total_inserted,
-                "analytics_rebuild_chunk"
-            );
-
-            if (chunk_len as i64) < CHUNK_SIZE {
-                break;
-            }
-        }
-
-        tx.commit()?;
+        tx.commit()
+            .with_context(|| "committing analytics rebuild transaction")?;
+        conn.execute_batch("PRAGMA wal_checkpoint(RESTART);")
+            .with_context(|| "checkpointing analytics rebuild")?;
 
         let elapsed = start.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;
@@ -14458,6 +14676,17 @@ mod tests {
             Some(dir.path().join("doctor/locks/doctor-repair.lock"))
         );
         assert_eq!(doctor_mutation_lock_path_for_db_open(&scratch), None);
+    }
+
+    #[test]
+    fn corrupt_derived_table_error_detector_matches_live_failures() {
+        assert!(error_indicates_corrupt_derived_table(
+            &"OpenRead failed: could not open storage cursor on root page 35116"
+        ));
+        assert!(error_indicates_corrupt_derived_table(
+            &"database disk image is malformed"
+        ));
+        assert!(!error_indicates_corrupt_derived_table(&"no such table"));
     }
 
     #[test]
@@ -16299,6 +16528,25 @@ mod tests {
     }
 
     #[test]
+    fn analytics_rebuild_uses_bulk_sql_without_offset() {
+        assert!(
+            ANALYTICS_REBUILD_MESSAGE_METRICS_BULK_SQL
+                .contains("INSERT OR REPLACE INTO message_metrics"),
+            "analytics rebuild should bulk-populate message_metrics"
+        );
+        assert!(
+            ANALYTICS_REBUILD_USAGE_DAILY_BULK_SQL.contains("GROUP BY day_id"),
+            "analytics rebuild should bulk-populate daily rollups from message_metrics"
+        );
+        assert!(
+            !ANALYTICS_REBUILD_MESSAGE_METRICS_BULK_SQL
+                .to_ascii_uppercase()
+                .contains("OFFSET"),
+            "analytics rebuild must not use LIMIT/OFFSET pagination on large message tables"
+        );
+    }
+
+    #[test]
     fn rebuild_analytics_repopulates_from_messages() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
@@ -16447,12 +16695,11 @@ mod tests {
             "Rebuild should be fast for 3 msgs"
         );
 
-        // Verify rebuilt data matches
-        let conn = storage.raw();
+        // Verify rebuilt data matches through the same SQLite engine used by
+        // the repair path.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
         let rebuilt_mm: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM message_metrics", &[], |row| {
-                row.get_typed(0)
-            })
+            .query_row("SELECT COUNT(*) FROM message_metrics", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
             rebuilt_mm, orig_mm,
@@ -16460,9 +16707,7 @@ mod tests {
         );
 
         let rebuilt_hourly: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM usage_hourly", &[], |row| {
-                row.get_typed(0)
-            })
+            .query_row("SELECT COUNT(*) FROM usage_hourly", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
             rebuilt_hourly, orig_hourly,
@@ -16470,15 +16715,13 @@ mod tests {
         );
 
         let rebuilt_daily: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM usage_daily", &[], |row| {
-                row.get_typed(0)
-            })
+            .query_row("SELECT COUNT(*) FROM usage_daily", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rebuilt_daily, orig_daily, "Rebuilt daily rows should match");
 
         let rebuilt_models_daily: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM usage_models_daily", &[], |row| {
-                row.get_typed(0)
+            .query_row("SELECT COUNT(*) FROM usage_models_daily", [], |row| {
+                row.get(0)
             })
             .unwrap();
         assert_eq!(
@@ -16488,10 +16731,10 @@ mod tests {
 
         // Verify API token data preserved through rebuild
         let rebuilt_api_input: i64 = conn
-            .query_row_map(
+            .query_row(
                 "SELECT COALESCE(SUM(api_input_tokens), 0) FROM message_metrics WHERE api_data_source = 'api'",
-                &[],
-                |row: &FrankenRow| row.get_typed(0),
+                [],
+                |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
@@ -16508,19 +16751,19 @@ mod tests {
             i64,
             i64,
         ) = conn
-            .query_row_map(
+            .query_row(
                 "SELECT message_count, user_message_count, assistant_message_count, plan_message_count,
                         plan_content_tokens_est_total, plan_api_tokens_total
                  FROM usage_hourly WHERE hour_id = ?",
-                fparams![expected_hour],
-                |row: &FrankenRow| {
+                rusqlite::params![expected_hour],
+                |row| {
                     Ok((
-                        row.get_typed(0)?,
-                        row.get_typed(1)?,
-                        row.get_typed(2)?,
-                        row.get_typed(3)?,
-                        row.get_typed(4)?,
-                        row.get_typed(5)?,
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
@@ -16533,10 +16776,10 @@ mod tests {
         assert!(uh_plan_api > 0);
 
         let ud_msg: i64 = conn
-            .query_row_map(
+            .query_row(
                 "SELECT message_count FROM usage_daily WHERE day_id = ?",
-                fparams![expected_day],
-                |row| row.get_typed(0),
+                rusqlite::params![expected_day],
+                |row| row.get(0),
             )
             .unwrap();
         assert_eq!(ud_msg, 3);
@@ -16617,6 +16860,115 @@ mod tests {
 
         assert_eq!(message_count, conv.messages.len() as i64);
         assert_eq!(fts_count, conv.messages.len() as i64);
+    }
+
+    #[test]
+    fn insert_conversations_batched_with_options_can_defer_derived_updates() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .ensure_search_fallback_fts_consistency()
+            .expect("ensure FTS consistency before insert");
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: Some("1.0".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let ts_ms = 1_770_551_400_000_i64;
+        let usage_json = serde_json::json!({
+            "message": {
+                "model": "claude-opus-4-6",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50
+                }
+            }
+        });
+        let conv = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("defer-derived-updates".into()),
+            title: Some("Deferred derived updates".into()),
+            source_path: PathBuf::from("/tmp/defer-derived.jsonl"),
+            started_at: Some(ts_ms),
+            ended_at: Some(ts_ms + 1_000),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(ts_ms),
+                    content: "please draft a plan".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: vec![],
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: Some(ts_ms + 1_000),
+                    content:
+                        "## Plan\n\n1. Persist canonical rows\n2. Rebuild derived tables later"
+                            .into(),
+                    extra_json: usage_json,
+                    snippets: vec![],
+                },
+            ],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let outcomes = storage
+            .insert_conversations_batched_with_options(
+                &[(agent_id, None, &conv)],
+                InsertConversationsOptions::defer_derived_updates(),
+            )
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].inserted_indices.len(), conv.messages.len());
+
+        let message_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let fts_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let metrics_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let token_usage_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM token_usage", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+
+        assert_eq!(message_count, conv.messages.len() as i64);
+        assert_eq!(fts_count, 0);
+        assert_eq!(metrics_count, 0);
+        assert_eq!(token_usage_count, 0);
     }
 
     fn make_profiled_storage_remote_conversation(
@@ -17992,7 +18344,7 @@ mod tests {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
-        const MESSAGE_COUNT: i64 = 64;
+        const MESSAGE_COUNT: i64 = 192;
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
@@ -18071,6 +18423,27 @@ mod tests {
 
         assert_eq!(conversation_count, 1);
         assert_eq!(message_count, MESSAGE_COUNT);
+    }
+
+    #[test]
+    fn current_schema_has_message_created_at_replay_lookup_index() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let index_count: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*)
+                 FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name = 'idx_messages_conv_created'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        assert_eq!(index_count, 1);
     }
 
     #[test]

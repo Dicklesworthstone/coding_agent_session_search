@@ -1785,6 +1785,38 @@ impl std::fmt::Display for AnalyticsBucketing {
     }
 }
 
+/// Analytics rebuild target.
+#[derive(Copy, Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
+pub enum AnalyticsRebuildTrack {
+    /// Rebuild message_metrics and Track A rollups.
+    A,
+    /// Rebuild token_daily_stats from token_usage.
+    B,
+    /// Rebuild both analytics tracks.
+    #[default]
+    All,
+}
+
+impl AnalyticsRebuildTrack {
+    fn includes_track_a(self) -> bool {
+        matches!(self, Self::A | Self::All)
+    }
+
+    fn includes_track_b(self) -> bool {
+        matches!(self, Self::B | Self::All)
+    }
+}
+
+impl std::fmt::Display for AnalyticsRebuildTrack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::A => write!(f, "a"),
+            Self::B => write!(f, "b"),
+            Self::All => write!(f, "all"),
+        }
+    }
+}
+
 /// Subcommands for analytics (token usage, tool, and model breakdowns).
 ///
 /// All subcommands share time-range, dimensional-filter, and output flags
@@ -1831,6 +1863,9 @@ pub enum AnalyticsCommand {
         /// Force full rebuild even if rollups appear fresh
         #[arg(long)]
         force: bool,
+        /// Analytics track to rebuild
+        #[arg(long, value_enum, default_value_t = AnalyticsRebuildTrack::All)]
+        track: AnalyticsRebuildTrack,
     },
     /// Check rollup invariants and detect drift between raw data and aggregates
     Validate {
@@ -9811,9 +9846,11 @@ fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>, cli: &Cli) -> 
         AnalyticsCommand::Tokens { common, group_by } => {
             run_analytics_tokens(common, *group_by, db_path.as_ref())?
         }
-        AnalyticsCommand::Rebuild { common, force } => {
-            run_analytics_rebuild(common, *force, db_path.as_ref())?
-        }
+        AnalyticsCommand::Rebuild {
+            common,
+            force,
+            track,
+        } => run_analytics_rebuild(common, *force, *track, db_path.as_ref())?,
         AnalyticsCommand::Tools {
             common,
             group_by,
@@ -10311,12 +10348,10 @@ fn run_analytics_tokens(
 // ---------------------------------------------------------------------------
 
 /// Run `cass analytics rebuild` — rebuild analytics rollup tables.
-///
-/// Currently rebuilds Track A (message_metrics + usage_hourly + usage_daily).
-/// Track B rebuild will be wired when z9fse.13 lands.
 fn run_analytics_rebuild(
     common: &AnalyticsCommon,
     _force: bool,
+    track: AnalyticsRebuildTrack,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
     use crate::storage::sqlite::FrankenStorage;
@@ -10339,9 +10374,6 @@ fn run_analytics_rebuild(
         });
     }
 
-    // Progress diagnostics go to stderr.
-    eprintln!("Rebuilding analytics (Track A)...");
-
     let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
         code: 9,
         kind: CliErrorKind::DbError.kind_str(),
@@ -10350,35 +10382,80 @@ fn run_analytics_rebuild(
         retryable: false,
     })?;
 
-    let result = storage.rebuild_analytics().map_err(|e| CliError {
-        code: 9,
-        kind: CliErrorKind::RebuildError.kind_str(),
-        message: format!("Analytics rebuild failed: {e}"),
-        hint: Some("Check database integrity with 'cass health --json'.".into()),
-        retryable: true,
-    })?;
+    let overall_start = Instant::now();
+    let mut tracks_rebuilt = Vec::new();
+    let mut track_a_json = serde_json::Value::Null;
+    let mut track_b_json = serde_json::Value::Null;
 
-    eprintln!(
-        "Rebuild complete: {} message_metrics, {} hourly, {} daily rows in {}ms ({:.0} msg/sec)",
-        result.message_metrics_rows,
-        result.usage_hourly_rows,
-        result.usage_daily_rows,
-        result.elapsed_ms,
-        result.messages_per_sec
-    );
+    if track.includes_track_a() {
+        eprintln!("Rebuilding analytics (Track A)...");
 
-    Ok(serde_json::json!({
-        "track": "a",
-        "tracks_rebuilt": ["a"],
-        "track_a": {
+        let result = storage.rebuild_analytics().map_err(|e| CliError {
+            code: 9,
+            kind: CliErrorKind::RebuildError.kind_str(),
+            message: format!("Track A analytics rebuild failed: {e}"),
+            hint: Some("Check database integrity with 'cass health --json'.".into()),
+            retryable: true,
+        })?;
+
+        eprintln!(
+            "Track A rebuild complete: {} message_metrics, {} hourly, {} daily rows in {}ms ({:.0} msg/sec)",
+            result.message_metrics_rows,
+            result.usage_hourly_rows,
+            result.usage_daily_rows,
+            result.elapsed_ms,
+            result.messages_per_sec
+        );
+
+        tracks_rebuilt.push("a");
+        track_a_json = serde_json::json!({
             "message_metrics_rows": result.message_metrics_rows,
             "usage_hourly_rows": result.usage_hourly_rows,
             "usage_daily_rows": result.usage_daily_rows,
             "usage_models_daily_rows": result.usage_models_daily_rows,
             "elapsed_ms": result.elapsed_ms,
             "rows_per_sec": result.messages_per_sec,
-        },
-        "overall_elapsed_ms": result.elapsed_ms,
+        });
+    }
+
+    if track.includes_track_b() {
+        eprintln!("Rebuilding analytics (Track B)...");
+
+        let track_b_start = Instant::now();
+        let token_daily_stats_rows = storage.rebuild_token_daily_stats().map_err(|e| CliError {
+            code: 9,
+            kind: CliErrorKind::RebuildError.kind_str(),
+            message: format!("Track B analytics rebuild failed: {e}"),
+            hint: Some("Check database integrity with 'cass health --json'.".into()),
+            retryable: true,
+        })?;
+        let track_b_elapsed_ms = track_b_start.elapsed().as_millis() as u64;
+        let rows_per_sec = if track_b_elapsed_ms > 0 {
+            (token_daily_stats_rows as f64) / (track_b_elapsed_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "Track B rebuild complete: {} token_daily_stats rows in {}ms ({:.0} rows/sec)",
+            token_daily_stats_rows, track_b_elapsed_ms, rows_per_sec
+        );
+
+        tracks_rebuilt.push("b");
+        track_b_json = serde_json::json!({
+            "token_daily_stats_rows": token_daily_stats_rows,
+            "elapsed_ms": track_b_elapsed_ms,
+            "rows_per_sec": rows_per_sec,
+        });
+    }
+
+    let overall_elapsed_ms = overall_start.elapsed().as_millis() as u64;
+    Ok(serde_json::json!({
+        "track": track.to_string(),
+        "tracks_rebuilt": tracks_rebuilt,
+        "track_a": track_a_json,
+        "track_b": track_b_json,
+        "overall_elapsed_ms": overall_elapsed_ms,
     }))
 }
 
@@ -13760,11 +13837,13 @@ fn render_analytics_docs() -> Vec<String> {
         "    (claude_code, codex, pi_agent, factory, opencode, cursor).".into(),
         String::new(),
         "### analytics rebuild".into(),
-        "  data.track: string ('a')".into(),
+        "  data.track: string ('a' | 'b' | 'all')".into(),
         "  data.tracks_rebuilt: [string]".into(),
         "  data.track_a: { message_metrics_rows, usage_hourly_rows, usage_daily_rows,".into(),
         "                  usage_models_daily_rows, elapsed_ms, rows_per_sec }".into(),
+        "  data.track_b: { token_daily_stats_rows, elapsed_ms, rows_per_sec }".into(),
         "  data.overall_elapsed_ms: u64".into(),
+        "  --track <a|b|all>: rebuild a single track or both tracks (default all)".into(),
         "  --force: rebuild even when rollups appear fresh".into(),
         String::new(),
         "### analytics validate".into(),
@@ -13795,7 +13874,7 @@ fn render_analytics_docs() -> Vec<String> {
         "  exit 9 + retryable=true: transient DB lock/busy — retry after 1s".into(),
         "  exit 9 + retryable=false: schema or data issue — run 'cass analytics rebuild' first".into(),
         "  exit 3: no database — run 'cass index --full' to create it".into(),
-        "  validate errors: use 'cass analytics validate --fix --json' for safe Track A repair, or 'cass analytics rebuild --force --json' for a manual rebuild loop".into(),
+        "  validate errors: use 'cass analytics validate --fix --json' for safe repair, or 'cass analytics rebuild --track all --force --json' for a manual rebuild loop".into(),
         String::new(),
         "## Common Workflows".into(),
         "  # Quick health check".into(),
@@ -13810,7 +13889,7 @@ fn render_analytics_docs() -> Vec<String> {
         "  # Validation + remediation loop".into(),
         "  cass analytics validate --json | jq '.data.summary'".into(),
         "  # If errors: rebuild then re-validate".into(),
-        "  cass analytics rebuild --force --json && cass analytics validate --json".into(),
+        "  cass analytics rebuild --track all --force --json && cass analytics validate --json".into(),
     ]
 }
 

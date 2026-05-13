@@ -584,9 +584,7 @@ fn validate_track_b(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
             ok: false,
             severity: Severity::Error,
             details: "Track B tables missing (token_daily_stats or token_usage)".into(),
-            suggested_action: Some(
-                "Run 'cass analytics rebuild --track all' (requires z9fse.13)".into(),
-            ),
+            suggested_action: Some("Run 'cass analytics rebuild --track all'".into()),
         });
         return (checks, 0, 0);
     }
@@ -617,29 +615,69 @@ fn validate_track_b(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
 
     let sql = if has_agents_table {
         format!(
-            "SELECT tds.day_id, tds.agent_slug, tds.source_id, tds.model_family,
-                    tds.grand_total_tokens,
-                    COALESCE(tu.sum_total, 0),
-                    tds.total_tool_calls,
-                    COALESCE(tu.sum_tools, 0),
-                    tds.api_call_count,
-                    COALESCE(tu.sum_rows, 0)
-             FROM token_daily_stats tds
-             LEFT JOIN (
+            "WITH raw AS (
                  SELECT t.day_id,
-                        a.slug AS agent_slug,
-                        t.source_id,
+                        COALESCE(a.slug, 'unknown') AS agent_slug,
+                        COALESCE(c.source_id, 'local') AS source_id,
                         COALESCE(t.model_family, 'unknown') AS model_family,
-                        SUM(COALESCE(t.total_tokens, 0)) AS sum_total,
+                        SUM(COALESCE(
+                            t.total_tokens,
+                            COALESCE(t.input_tokens, 0) +
+                            COALESCE(t.output_tokens, 0) +
+                            COALESCE(t.cache_read_tokens, 0) +
+                            COALESCE(t.cache_creation_tokens, 0) +
+                            COALESCE(t.thinking_tokens, 0)
+                        )) AS sum_total,
                         SUM(t.tool_call_count) AS sum_tools,
                         COUNT(*) AS sum_rows
                  FROM token_usage t
-                 JOIN agents a ON a.id = t.agent_id
-                 GROUP BY t.day_id, a.slug, t.source_id, COALESCE(t.model_family, 'unknown')
-             ) tu ON tds.day_id = tu.day_id
-                   AND tds.agent_slug = tu.agent_slug
-                   AND tds.source_id = tu.source_id
-                   AND tds.model_family = tu.model_family
+                 LEFT JOIN conversations c ON c.id = t.conversation_id
+                 LEFT JOIN agents a ON a.id = c.agent_id
+                 GROUP BY
+                    t.day_id,
+                    COALESCE(a.slug, 'unknown'),
+                    COALESCE(c.source_id, 'local'),
+                    COALESCE(t.model_family, 'unknown')
+             ),
+             expanded AS (
+                 SELECT * FROM raw
+                 UNION ALL
+                 SELECT day_id, 'all', source_id, model_family, sum_total, sum_tools, sum_rows
+                 FROM raw
+                 WHERE agent_slug != 'all'
+                 UNION ALL
+                 SELECT day_id, agent_slug, 'all', model_family, sum_total, sum_tools, sum_rows
+                 FROM raw
+                 WHERE source_id != 'all'
+                 UNION ALL
+                 SELECT day_id, agent_slug, source_id, 'all', sum_total, sum_tools, sum_rows
+                 FROM raw
+                 WHERE model_family != 'all'
+                 UNION ALL
+                 SELECT day_id, 'all', 'all', 'all', sum_total, sum_tools, sum_rows
+                 FROM raw
+                 WHERE NOT (agent_slug = 'all' AND source_id = 'all' AND model_family = 'all')
+             ),
+             expected AS (
+                 SELECT day_id, agent_slug, source_id, model_family,
+                        SUM(sum_total) AS sum_total,
+                        SUM(sum_tools) AS sum_tools,
+                        SUM(sum_rows) AS sum_rows
+                 FROM expanded
+                 GROUP BY day_id, agent_slug, source_id, model_family
+             )
+             SELECT tds.day_id, tds.agent_slug, tds.source_id, tds.model_family,
+                    tds.grand_total_tokens,
+                    COALESCE(expected.sum_total, 0),
+                    tds.total_tool_calls,
+                    COALESCE(expected.sum_tools, 0),
+                    tds.api_call_count,
+                    COALESCE(expected.sum_rows, 0)
+             FROM token_daily_stats tds
+             LEFT JOIN expected ON tds.day_id = expected.day_id
+                   AND tds.agent_slug = expected.agent_slug
+                   AND tds.source_id = expected.source_id
+                   AND tds.model_family = expected.model_family
              ORDER BY tds.day_id DESC
              {limit_clause}"
         )
@@ -819,9 +857,26 @@ fn validate_cross_track_drift(
     }
 
     let track_b_rows = match conn.query_map_collect(
-        "SELECT day_id, agent_slug, source_id, SUM(grand_total_tokens) AS grand_total
-         FROM token_daily_stats
-         GROUP BY day_id, agent_slug, source_id",
+        "SELECT
+             t.day_id,
+             COALESCE(a.slug, 'unknown') AS agent_slug,
+             COALESCE(c.source_id, t.source_id, 'local') AS source_id,
+             SUM(COALESCE(
+                 t.total_tokens,
+                 COALESCE(t.input_tokens, 0) +
+                 COALESCE(t.output_tokens, 0) +
+                 COALESCE(t.cache_read_tokens, 0) +
+                 COALESCE(t.cache_creation_tokens, 0) +
+                 COALESCE(t.thinking_tokens, 0)
+             )) AS api_total
+         FROM token_usage t
+         LEFT JOIN conversations c ON c.id = t.conversation_id
+         LEFT JOIN agents a ON a.id = COALESCE(c.agent_id, t.agent_id)
+         WHERE t.data_source = 'api'
+         GROUP BY
+             t.day_id,
+             COALESCE(a.slug, 'unknown'),
+             COALESCE(c.source_id, t.source_id, 'local')",
         &[],
         |row: &Row| {
             Ok((
@@ -1270,6 +1325,14 @@ mod tests {
             );
             INSERT INTO agents VALUES (1, 'claude_code');
 
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                source_id TEXT NOT NULL DEFAULT 'local',
+                started_at INTEGER
+            );
+            INSERT INTO conversations VALUES (100, 1, 'local', 1750000000000);
+
             CREATE TABLE token_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message_id INTEGER NOT NULL,
@@ -1437,6 +1500,56 @@ mod tests {
         assert!(!report.drift.is_empty());
         assert_eq!(report.drift[0].track_a_total, 880);
         assert_eq!(report.drift[0].track_b_total, 0);
+    }
+
+    #[test]
+    fn cross_track_drift_ignores_estimated_only_track_b_rows() {
+        let conn = setup_both_tracks_fixture();
+
+        conn.execute("INSERT INTO conversations VALUES (101, 1, 'local', 1750086400000)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO token_usage (
+                id, message_id, conversation_id, agent_id, workspace_id, source_id,
+                timestamp_ms, day_id, model_name, model_family, model_tier, service_tier,
+                provider, input_tokens, output_tokens, cache_read_tokens,
+                cache_creation_tokens, thinking_tokens, total_tokens, estimated_cost_usd,
+                role, content_chars, has_tool_calls, tool_call_count, data_source
+             ) VALUES (
+                2, 3, 101, 1, 1, 'local',
+                1750086400000, 20255, NULL, 'unknown', NULL, NULL,
+                NULL, 0, 123, NULL,
+                NULL, NULL, 123, NULL,
+                'assistant', 492, 0, 0, 'estimated'
+             )",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO token_daily_stats (
+                day_id, agent_slug, source_id, model_family,
+                api_call_count, assistant_message_count,
+                total_output_tokens, grand_total_tokens, total_content_chars,
+                total_tool_calls, session_count, last_updated
+             ) VALUES (
+                20255, 'claude_code', 'local', 'unknown',
+                1, 1,
+                123, 123, 492,
+                0, 1, 0
+             )",
+        )
+        .unwrap();
+
+        let (checks, drift) = validate_cross_track_drift(&conn, &ValidateConfig::deep());
+        let drift_check = checks
+            .iter()
+            .find(|check| check.id == "cross_track.drift")
+            .expect("cross-track drift check");
+
+        assert!(
+            drift_check.ok,
+            "estimated-only token rows must not be compared to Track A API totals: {drift:#?}"
+        );
+        assert!(drift.is_empty());
     }
 
     #[test]

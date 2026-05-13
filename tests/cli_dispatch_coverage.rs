@@ -339,116 +339,10 @@ fn seed_analytics_models_workspace_fixture(temp_home: &TempDir) -> PathBuf {
         .unwrap();
     }
 
-    let token_daily_rows = conn
-        .query_map_collect(
-            "SELECT tu.day_id,
-                    a.slug,
-                    tu.source_id,
-                    COALESCE(tu.model_family, 'unknown'),
-                    COUNT(*) AS api_call_count,
-                    SUM(CASE WHEN tu.role = 'user' THEN 1 ELSE 0 END) AS user_message_count,
-                    SUM(CASE WHEN tu.role IN ('assistant', 'agent') THEN 1 ELSE 0 END) AS assistant_message_count,
-                    SUM(CASE WHEN tu.role = 'tool' THEN 1 ELSE 0 END) AS tool_message_count,
-                    SUM(COALESCE(tu.input_tokens, 0)) AS total_input_tokens,
-                    SUM(COALESCE(tu.output_tokens, 0)) AS total_output_tokens,
-                    SUM(COALESCE(tu.cache_read_tokens, 0)) AS total_cache_read_tokens,
-                    SUM(COALESCE(tu.cache_creation_tokens, 0)) AS total_cache_creation_tokens,
-                    SUM(COALESCE(tu.thinking_tokens, 0)) AS total_thinking_tokens,
-                    SUM(COALESCE(tu.total_tokens, 0)) AS grand_total_tokens,
-                    SUM(COALESCE(tu.content_chars, 0)) AS total_content_chars,
-                    SUM(COALESCE(tu.tool_call_count, 0)) AS total_tool_calls,
-                    SUM(COALESCE(tu.estimated_cost_usd, 0.0)) AS estimated_cost_usd,
-                    COUNT(DISTINCT tu.conversation_id) AS session_count,
-                    MAX(tu.timestamp_ms) AS last_updated
-             FROM token_usage tu
-             JOIN agents a ON a.id = tu.agent_id
-             GROUP BY tu.day_id, a.slug, tu.source_id, COALESCE(tu.model_family, 'unknown')
-             ORDER BY tu.day_id, a.slug",
-            &[],
-            |row: &frankensqlite::Row| {
-                Ok((
-                    row.get_typed::<i64>(0)?,
-                    row.get_typed::<String>(1)?,
-                    row.get_typed::<String>(2)?,
-                    row.get_typed::<String>(3)?,
-                    row.get_typed::<i64>(4)?,
-                    row.get_typed::<i64>(5)?,
-                    row.get_typed::<i64>(6)?,
-                    row.get_typed::<i64>(7)?,
-                    row.get_typed::<i64>(8)?,
-                    row.get_typed::<i64>(9)?,
-                    row.get_typed::<i64>(10)?,
-                    row.get_typed::<i64>(11)?,
-                    row.get_typed::<i64>(12)?,
-                    row.get_typed::<i64>(13)?,
-                    row.get_typed::<i64>(14)?,
-                    row.get_typed::<i64>(15)?,
-                    row.get_typed::<f64>(16)?,
-                    row.get_typed::<i64>(17)?,
-                    row.get_typed::<i64>(18)?,
-                ))
-            },
-        )
-        .unwrap();
-
-    for (
-        day_id,
-        agent_slug,
-        source_id,
-        model_family,
-        api_call_count,
-        user_message_count,
-        assistant_message_count,
-        tool_message_count,
-        total_input_tokens,
-        total_output_tokens,
-        total_cache_read_tokens,
-        total_cache_creation_tokens,
-        total_thinking_tokens,
-        grand_total_tokens,
-        total_content_chars,
-        total_tool_calls,
-        estimated_cost_usd,
-        session_count,
-        last_updated,
-    ) in token_daily_rows
-    {
-        conn.execute_compat(
-            "INSERT OR REPLACE INTO token_daily_stats (
-                day_id, agent_slug, source_id, model_family,
-                api_call_count, user_message_count, assistant_message_count, tool_message_count,
-                total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_creation_tokens,
-                total_thinking_tokens, grand_total_tokens, total_content_chars, total_tool_calls,
-                estimated_cost_usd, session_count, last_updated
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-            frankensqlite::params![
-                day_id,
-                agent_slug,
-                source_id,
-                model_family,
-                api_call_count,
-                user_message_count,
-                assistant_message_count,
-                tool_message_count,
-                total_input_tokens,
-                total_output_tokens,
-                total_cache_read_tokens,
-                total_cache_creation_tokens,
-                total_thinking_tokens,
-                grand_total_tokens,
-                total_content_chars,
-                total_tool_calls,
-                estimated_cost_usd,
-                session_count,
-                last_updated,
-            ],
-        )
-        .unwrap();
-    }
-
     drop(conn);
     let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
     storage.rebuild_analytics().unwrap();
+    storage.rebuild_token_daily_stats().unwrap();
 
     workspace_a
 }
@@ -1647,7 +1541,8 @@ fn missing_required_arg_returns_error() {
 // =============================================================================
 
 use coding_agent_search::{
-    AnalyticsBucketing, AnalyticsCommand, Commands, DisplayFormat, RobotFormat,
+    AnalyticsBucketing, AnalyticsCommand, AnalyticsRebuildTrack, Commands, DisplayFormat,
+    RobotFormat,
 };
 
 #[test]
@@ -3366,8 +3261,13 @@ fn analytics_rebuild_json_envelope_structure() {
         assert!(data["track_a"]["usage_hourly_rows"].is_number());
         assert!(data["track_a"]["usage_daily_rows"].is_number());
         assert!(data["track_a"]["elapsed_ms"].is_number());
-        assert_eq!(data["track"], "a");
+        assert_eq!(data["track"], "all");
         assert!(data["tracks_rebuilt"].is_array());
+        assert!(
+            data["track_b"].is_object(),
+            "analytics/rebuild must expose track_b results on default all-track success: {data}"
+        );
+        assert!(data["track_b"]["token_daily_stats_rows"].is_number());
         assert!(data["overall_elapsed_ms"].is_number());
     } else {
         // Robot-mode fatal diagnostics are emitted on stderr so stdout remains
@@ -3480,7 +3380,10 @@ fn analytics_validate_fix_noops_when_reports_are_clean() {
         "clean analytics validate --fix should finish without remaining errors: {json}"
     );
     assert_eq!(json["data"]["fix"]["requested"], true);
-    assert_eq!(json["data"]["fix"]["changed"], false);
+    assert_eq!(
+        json["data"]["fix"]["changed"], false,
+        "clean analytics validate --fix should not change anything: {json}"
+    );
     assert_eq!(
         json["data"]["fix"]["applied_repairs"]
             .as_array()
@@ -3493,7 +3396,8 @@ fn analytics_validate_fix_noops_when_reports_are_clean() {
             .as_array()
             .expect("skipped repairs array")
             .len(),
-        0
+        0,
+        "clean analytics validate --fix should not skip repairs: {json}"
     );
 }
 
@@ -3609,6 +3513,7 @@ fn analytics_rebuild_help_shows_force_flag() {
     cmd.assert()
         .success()
         .stdout(contains("--force"))
+        .stdout(contains("--track"))
         .stdout(contains("--json"));
 }
 
@@ -3620,10 +3525,85 @@ fn analytics_rebuild_parses_force_and_json_flags() {
     );
 
     match cli.command {
-        Some(Commands::Analytics(AnalyticsCommand::Rebuild { common, force })) => {
+        Some(Commands::Analytics(AnalyticsCommand::Rebuild {
+            common,
+            force,
+            track,
+        })) => {
             assert!(force, "--force should be true");
             assert!(common.json, "--json should be true");
+            assert_eq!(track, AnalyticsRebuildTrack::All);
         }
         other => panic!("expected analytics rebuild, got {other:?}"),
     }
+}
+
+#[test]
+fn analytics_rebuild_parses_track_flag() {
+    let cli = parse_cli_ok(
+        ["cass", "analytics", "rebuild", "--track", "b", "--json"],
+        "parse analytics rebuild with track b",
+    );
+
+    match cli.command {
+        Some(Commands::Analytics(AnalyticsCommand::Rebuild { track, .. })) => {
+            assert_eq!(track, AnalyticsRebuildTrack::B);
+        }
+        other => panic!("expected analytics rebuild, got {other:?}"),
+    }
+}
+
+#[test]
+fn analytics_rebuild_track_b_json_rebuilds_token_daily_stats() {
+    let tmp_home = TempDir::new().expect("temp home");
+    let _workspace = seed_analytics_models_workspace_fixture(&tmp_home);
+    let data_dir = tmp_home.path().join(".local/share/coding-agent-search");
+    let db_path = data_dir.join("agent_search.db");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open analytics db");
+    conn.execute("DELETE FROM token_daily_stats", [])
+        .expect("clear track b rollup");
+    let empty_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM token_daily_stats", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(empty_rows, 0);
+    drop(conn);
+
+    let mut cmd = base_cmd(tmp_home.path());
+    cmd.args([
+        "analytics",
+        "rebuild",
+        "--track",
+        "b",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid analytics rebuild JSON");
+
+    assert_eq!(json["command"], "analytics/rebuild");
+    let data = &json["data"];
+    assert_eq!(data["track"], "b");
+    assert_eq!(data["tracks_rebuilt"], json!(["b"]));
+    assert_eq!(data["track_a"], Value::Null);
+    let rebuilt_rows = data["track_b"]["token_daily_stats_rows"]
+        .as_i64()
+        .expect("track b row count");
+    assert!(
+        rebuilt_rows > 0,
+        "track b rebuild should repopulate token_daily_stats: {json}"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).expect("reopen analytics db");
+    let stored_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM token_daily_stats", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored_rows, rebuilt_rows);
 }
