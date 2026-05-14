@@ -435,14 +435,13 @@ case "$TAR" in
   *.tar.xz) tar -xJf "$TMP/$TAR" -C "$TMP" ;;
   *) tar -xf "$TMP/$TAR" -C "$TMP" ;;
 esac
-BIN="$TMP/cass"
+BIN="$TMP/$INSTALL_BASENAME"
 if [ ! -x "$BIN" ] && [ -n "$TARGET" ]; then
-  BIN="$TMP/cass-${TARGET}/cass"
+  BIN="$TMP/cass-${TARGET}/$INSTALL_BASENAME"
 fi
 if [ ! -x "$BIN" ]; then
   BIN=$(find "$TMP" -maxdepth 3 -type f -name "cass" -perm -111 | head -n 1)
 fi
-# Check for Windows .exe
 if [ ! -x "$BIN" ] && [ -f "$TMP/cass.exe" ]; then
   BIN="$TMP/cass.exe"
 fi
