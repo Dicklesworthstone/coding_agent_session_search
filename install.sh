@@ -108,7 +108,8 @@ archive_member_allowed() {
   member="${1#./}"
 
   case "$member" in
-    cass|coding-agent-search) return 0 ;;
+    cass|coding-agent-search)
+      [ "${INSTALL_BASENAME:-cass}" != "cass.exe" ] && return 0 ;;
     cass.exe|coding-agent-search.exe)
       [ "${INSTALL_BASENAME:-cass}" = "cass.exe" ] && return 0 ;;
   esac
@@ -116,7 +117,8 @@ archive_member_allowed() {
   if [ -n "$TARGET" ]; then
     case "$member" in
       "cass-${TARGET}"|"cass-${TARGET}/") return 0 ;;
-      "cass-${TARGET}/cass"|"cass-${TARGET}/coding-agent-search") return 0 ;;
+      "cass-${TARGET}/cass"|"cass-${TARGET}/coding-agent-search")
+        [ "${INSTALL_BASENAME:-cass}" != "cass.exe" ] && return 0 ;;
       "cass-${TARGET}/cass.exe"|"cass-${TARGET}/coding-agent-search.exe")
         [ "${INSTALL_BASENAME:-cass}" = "cass.exe" ] && return 0 ;;
     esac
@@ -130,14 +132,16 @@ archive_member_is_installable_binary() {
   member="${1#./}"
 
   case "$member" in
-    cass|coding-agent-search) return 0 ;;
+    cass|coding-agent-search)
+      [ "${INSTALL_BASENAME:-cass}" != "cass.exe" ] && return 0 ;;
     cass.exe|coding-agent-search.exe)
       [ "${INSTALL_BASENAME:-cass}" = "cass.exe" ] && return 0 ;;
   esac
 
   if [ -n "$TARGET" ]; then
     case "$member" in
-      "cass-${TARGET}/cass"|"cass-${TARGET}/coding-agent-search") return 0 ;;
+      "cass-${TARGET}/cass"|"cass-${TARGET}/coding-agent-search")
+        [ "${INSTALL_BASENAME:-cass}" != "cass.exe" ] && return 0 ;;
       "cass-${TARGET}/cass.exe"|"cass-${TARGET}/coding-agent-search.exe")
         [ "${INSTALL_BASENAME:-cass}" = "cass.exe" ] && return 0 ;;
     esac
@@ -445,13 +449,13 @@ BIN="$TMP/$INSTALL_BASENAME"
 if [ ! -x "$BIN" ] && [ -n "$TARGET" ]; then
   BIN="$TMP/cass-${TARGET}/$INSTALL_BASENAME"
 fi
-if [ ! -x "$BIN" ]; then
+if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" != "cass.exe" ]; then
   BIN=$(find "$TMP" -maxdepth 3 -type f -name "cass" -perm -111 | head -n 1)
 fi
-if [ ! -x "$BIN" ] && [ -f "$TMP/cass.exe" ]; then
+if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" = "cass.exe" ] && [ -f "$TMP/cass.exe" ]; then
   BIN="$TMP/cass.exe"
 fi
-if [ ! -x "$BIN" ] && [ -n "$TARGET" ] && [ -f "$TMP/cass-${TARGET}/cass.exe" ]; then
+if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" = "cass.exe" ] && [ -n "$TARGET" ] && [ -f "$TMP/cass-${TARGET}/cass.exe" ]; then
   BIN="$TMP/cass-${TARGET}/cass.exe"
 fi
 if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" = "cass.exe" ]; then
@@ -460,17 +464,10 @@ if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" = "cass.exe" ]; then
       warn "Found 'coding-agent-search.exe' binary instead of 'cass.exe'; installing it as 'cass.exe'"
    fi
 fi
-# Fallback for older versions or if name mismatch?
-if [ ! -x "$BIN" ]; then
+if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" != "cass.exe" ]; then
    BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search" -perm -111 | head -n 1)
    if [ -x "$BIN" ]; then
       warn "Found 'coding-agent-search' binary instead of 'cass'; installing as 'cass'"
-   fi
-fi
-if [ ! -x "$BIN" ]; then
-   BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search.exe" -perm -111 | head -n 1)
-   if [ -x "$BIN" ]; then
-      warn "Found 'coding-agent-search.exe' binary instead of 'cass'; installing as 'cass'"
    fi
 fi
 
