@@ -57923,7 +57923,8 @@ paths = ["~/.claude/projects"]
     }
 
     #[test]
-    fn pass18_journal_mutation_schema_fingerprint_is_stable() {
+    fn pass18_journal_mutation_schema_fingerprint_is_stable()
+    -> Result<(), Box<dyn std::error::Error>> {
         // Pass-18 golden-style schema fingerprint: pin the exact byte form
         // of an ActionRecord::Mutation line so any silent field add / remove /
         // reorder fails visibly. The proptest in pass-17 checks parseability +
@@ -57932,9 +57933,9 @@ paths = ["~/.claude/projects"]
         // schema legitimately changed and downstream consumers (`--diff`,
         // `--ls`, `--undo`) must be updated, or (b) someone introduced an
         // accidental schema regression.
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = tempfile::tempdir()?;
         let run_dir = temp.path().join("run-dir");
-        std::fs::create_dir_all(&run_dir).expect("create run dir");
+        std::fs::create_dir_all(&run_dir)?;
 
         let receipt = DoctorFsMutationReceipt {
             schema_version: 1,
@@ -57964,10 +57965,8 @@ paths = ["~/.claude/projects"]
             precondition_checks: Vec::new(),
             forensic_bundle: doctor_forensic_bundle_uncaptured("fingerprint"),
         };
-        journal_fs_mutation_receipt_to_actions_log(&run_dir, "rid-fp", &receipt, 100, 200)
-            .expect("journal");
-        let body =
-            std::fs::read_to_string(run_dir.join("actions.jsonl")).expect("read actions.jsonl");
+        journal_fs_mutation_receipt_to_actions_log(&run_dir, "rid-fp", &receipt, 100, 200)?;
+        let body = std::fs::read_to_string(run_dir.join("actions.jsonl"))?;
 
         // Expected exact wire form. Field order is determined by serde's
         // serialization order of `ActionRecord::Mutation` fields, plus the
@@ -57987,12 +57986,14 @@ paths = ["~/.claude/projects"]
             "\"ended_at_ms\":200",
             "}\n",
         );
-        assert_eq!(
-            body, expected,
-            "Mutation record wire format drifted. If this is intentional, \
-             update the expected literal and bump RUN_ARTIFACT_SCHEMA_VERSION \
-             so consumers know to refresh their parsers."
-        );
+        if body.as_bytes().cmp(expected.as_bytes()).is_ne() {
+            return Err(
+                "Mutation record wire format drifted. If this is intentional, update the expected literal and bump RUN_ARTIFACT_SCHEMA_VERSION so consumers know to refresh their parsers."
+                    .into(),
+            );
+        }
+
+        Ok(())
     }
 
     proptest::proptest! {

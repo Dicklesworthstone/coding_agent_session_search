@@ -35,8 +35,12 @@ fn ubs_gate_runs_canonical_invocation() {
     tracing::info!(target: "dpfvr_test", check = "canonical_invocation");
     let body = std::fs::read_to_string(ci_yml_path()).expect("ci.yml must exist");
     assert!(
-        body.contains("ubs --ci --fail-on-warning"),
-        "ci.yml ubs-changed-files job must run `ubs --ci --fail-on-warning`"
+        body.contains("ubs --format=json --ci"),
+        "ci.yml ubs-changed-files job must run `ubs --format=json --ci`"
+    );
+    assert!(
+        body.contains("UBS PASS — no new critical/warning findings on changed files."),
+        "ci.yml ubs-changed-files job must enforce the changed-file UBS delta gate"
     );
 }
 
@@ -72,6 +76,10 @@ fn ubs_gate_uploads_report_artifact() {
     assert!(
         body.contains("ubs-report-${{ github.run_id }}"),
         "ci.yml must upload the UBS report artifact named ubs-report-<run-id>"
+    );
+    assert!(
+        body.contains("test-results/ubs-baseline.json"),
+        "ci.yml must upload the UBS baseline report used by the delta gate"
     );
 }
 
