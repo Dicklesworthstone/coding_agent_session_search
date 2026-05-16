@@ -1684,7 +1684,12 @@ fn historical_bundle_root_paths(db_path: &Path) -> Vec<PathBuf> {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if name.ends_with("-wal") || name.ends_with("-shm") {
+            if name.ends_with("-wal")
+                || name.ends_with("-shm")
+                || name.ends_with("-lock-shared")
+                || name.ends_with("-lock-reserved")
+                || name.ends_with("-lock-pending")
+            {
                 continue;
             }
             if name.starts_with(&format!("{db_name}.backup."))
@@ -1702,7 +1707,12 @@ fn historical_bundle_root_paths(db_path: &Path) -> Vec<PathBuf> {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if name.ends_with("-wal") || name.ends_with("-shm") {
+            if name.ends_with("-wal")
+                || name.ends_with("-shm")
+                || name.ends_with("-lock-shared")
+                || name.ends_with("-lock-reserved")
+                || name.ends_with("-lock-pending")
+            {
                 continue;
             }
             if name.starts_with(&format!("{db_name}.")) && name.ends_with(".bak") {
