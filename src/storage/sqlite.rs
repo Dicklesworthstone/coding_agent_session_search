@@ -1684,7 +1684,7 @@ fn historical_bundle_root_paths(db_path: &Path) -> Vec<PathBuf> {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if name.ends_with("-wal") || name.ends_with("-shm") {
+            if has_db_sidecar_suffix(name) {
                 continue;
             }
             if name.starts_with(&format!("{db_name}.backup."))
@@ -1702,7 +1702,7 @@ fn historical_bundle_root_paths(db_path: &Path) -> Vec<PathBuf> {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if name.ends_with("-wal") || name.ends_with("-shm") {
+            if has_db_sidecar_suffix(name) {
                 continue;
             }
             if name.starts_with(&format!("{db_name}.")) && name.ends_with(".bak") {
@@ -2554,6 +2554,25 @@ fn message_payload_size_hint(message: &Message) -> usize {
 
 fn is_backup_root_name(name: &str, prefix: &str) -> bool {
     name.starts_with(prefix) && !name.ends_with("-wal") && !name.ends_with("-shm")
+}
+
+// Suffixes that mark sqlite sidecar files we must never re-open as a DB root.
+// Includes the standard -wal/-shm pair plus frankensqlite's Windows advisory-
+// lock sidecars (-lock-shared/-lock-reserved/-lock-pending). Used by directory
+// enumeration paths in `historical_bundle_root_paths`; deliberately NOT used
+// by `is_backup_root_name`, because the existing backup-rotation cleanup must
+// continue to sweep up any pre-existing orphan lock sidecars.
+fn has_db_sidecar_suffix(name: &str) -> bool {
+    const SIDECAR_SUFFIXES: &[&str] = &[
+        "-wal",
+        "-shm",
+        "-lock-shared",
+        "-lock-reserved",
+        "-lock-pending",
+    ];
+    SIDECAR_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
 }
 
 /// Public schema version constant for external checks.
