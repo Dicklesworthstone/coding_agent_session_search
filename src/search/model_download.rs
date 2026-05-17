@@ -645,10 +645,15 @@ impl ModelManifest {
     /// MS MARCO MiniLM reranker manifest (baseline for bake-off).
     ///
     /// Verified: 2026-02-02 - All checksums verified from HuggingFace.
-    /// Note: Repo is ms-marco-MiniLM-L6-v2 (no hyphen between L and 6).
+    ///
+    /// Note on naming: HuggingFace repo is `cross-encoder/ms-marco-MiniLM-L6-v2`
+    /// (no hyphen between L and 6). The on-disk directory name used by the
+    /// reranker loader (`reranker_registry::canonical_dir_name`) is
+    /// `ms-marco-MiniLM-L-6-v2` (with hyphen). The manifest `id` is the
+    /// on-disk identifier, so it uses the hyphen form to match the loader.
     pub fn msmarco_reranker() -> Self {
         Self {
-            id: "ms-marco-MiniLM-L6-v2".into(),
+            id: "ms-marco-MiniLM-L-6-v2".into(),
             repo: "cross-encoder/ms-marco-MiniLM-L6-v2".into(),
             revision: "c5ee24cb16019beea0893ab7796b1df96625c6b8".into(),
             files: vec![
