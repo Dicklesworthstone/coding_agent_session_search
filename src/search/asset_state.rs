@@ -395,13 +395,16 @@ struct ParsedLexicalStorageFingerprint {
 
 fn parse_lexical_storage_fingerprint(raw: &str) -> Option<ParsedLexicalStorageFingerprint> {
     let mut parts = raw.split(':');
-    Some(ParsedLexicalStorageFingerprint {
+    let fingerprint = ParsedLexicalStorageFingerprint {
         db_len: parts.next()?.parse().ok()?,
         db_mtime_ms: parts.next()?.parse().ok()?,
         wal_len: parts.next()?.parse().ok()?,
         wal_mtime_ms: parts.next()?.parse().ok()?,
-    })
-    .filter(|_| parts.next().is_none())
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(fingerprint)
 }
 
 pub(crate) fn lexical_storage_fingerprints_match(current: &str, saved: &str) -> bool {

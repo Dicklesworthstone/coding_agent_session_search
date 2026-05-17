@@ -171,23 +171,19 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
     std::process::exit(err.code);
 }
 
-const DEFAULT_TANTIVY_MAX_WRITER_THREADS: usize = 26;
-
 fn apply_default_tantivy_writer_thread_cap() {
     let configured = dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0);
     if configured.is_none() {
-        // Empirical full-corpus benchmarking on a 128-core host found that a
-        // 26-thread Tantivy writer beats the previous 32-thread default by
-        // reducing startup overhead and writer contention without hurting the
-        // rebuild window.
+        // Keep explicit operator tuning authoritative, otherwise use the same
+        // memory-aware default as the search layer before frankensearch opens
+        // any Tantivy writers.
+        let default_cap =
+            coding_agent_search::search::tantivy::default_tantivy_max_writer_threads();
         unsafe {
-            std::env::set_var(
-                "CASS_TANTIVY_MAX_WRITER_THREADS",
-                DEFAULT_TANTIVY_MAX_WRITER_THREADS.to_string(),
-            );
+            std::env::set_var("CASS_TANTIVY_MAX_WRITER_THREADS", default_cap.to_string());
         }
     }
 }

@@ -82,7 +82,10 @@ pub const SCHEMA_HASH: &str = CASS_SCHEMA_HASH;
 const ENV_TANTIVY_ADD_BATCH_MAX_CHARS: &str = "CASS_TANTIVY_ADD_BATCH_MAX_CHARS";
 const ENV_TANTIVY_ADD_BATCH_MAX_MESSAGES: &str = "CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES";
 const ENV_TANTIVY_MAX_WRITER_THREADS: &str = "CASS_TANTIVY_MAX_WRITER_THREADS";
-const DEFAULT_TANTIVY_MAX_WRITER_THREADS: usize = 26;
+const DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING: usize = 26;
+const DEFAULT_TANTIVY_ASSUMED_CONCURRENT_WRITERS: u64 = 8;
+const DEFAULT_TANTIVY_WRITER_HEAP_PER_THREAD_BYTES: u64 = 128 * 1024 * 1024;
+const DEFAULT_TANTIVY_WRITER_HEAP_RAM_FRACTION: u64 = 10;
 
 fn positive_usize_env(name: &str) -> Option<usize> {
     dotenvy::var(name)
@@ -91,9 +94,66 @@ fn positive_usize_env(name: &str) -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
+#[cfg(target_os = "linux")]
+fn linux_available_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return kb.checked_mul(1024);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn host_memory_bytes_for_tantivy_default() -> Option<u64> {
+    linux_available_memory_bytes()
+}
+
+#[cfg(target_os = "macos")]
+fn host_memory_bytes_for_tantivy_default() -> Option<u64> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout.trim().parse::<u64>().ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn host_memory_bytes_for_tantivy_default() -> Option<u64> {
+    None
+}
+
+pub(crate) fn default_tantivy_max_writer_threads_for_memory_bytes(
+    memory_bytes: Option<u64>,
+) -> usize {
+    let Some(memory_bytes) = memory_bytes else {
+        return DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING;
+    };
+    let per_thread_peak = DEFAULT_TANTIVY_WRITER_HEAP_PER_THREAD_BYTES
+        .saturating_mul(DEFAULT_TANTIVY_ASSUMED_CONCURRENT_WRITERS);
+    if per_thread_peak == 0 {
+        return DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING;
+    }
+    let budget = memory_bytes / DEFAULT_TANTIVY_WRITER_HEAP_RAM_FRACTION;
+    let threads = budget / per_thread_peak;
+    usize::try_from(threads)
+        .unwrap_or(usize::MAX)
+        .clamp(1, DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING)
+}
+
+pub fn default_tantivy_max_writer_threads() -> usize {
+    default_tantivy_max_writer_threads_for_memory_bytes(host_memory_bytes_for_tantivy_default())
+}
+
 pub(crate) fn tantivy_writer_parallelism_hint_for_available(available_parallelism: usize) -> usize {
     let max_threads = positive_usize_env(ENV_TANTIVY_MAX_WRITER_THREADS)
-        .unwrap_or(DEFAULT_TANTIVY_MAX_WRITER_THREADS);
+        .unwrap_or_else(default_tantivy_max_writer_threads);
 
     available_parallelism.max(1).clamp(1, max_threads)
 }
@@ -1128,7 +1188,11 @@ pub struct TantivyIndex {
 impl TantivyIndex {
     pub fn open_or_create(path: &Path) -> Result<Self> {
         materialize_federated_search_bundle_for_write(path)?;
-        let inner = FsCassTantivyIndex::open_or_create(path).map_err(map_fs_err)?;
+        let inner = FsCassTantivyIndex::open_or_create_with_writer_parallelism(
+            path,
+            tantivy_writer_parallelism_hint(),
+        )
+        .map_err(map_fs_err)?;
         let fields = inner.fields();
         Ok(Self { inner, fields })
     }
@@ -1776,6 +1840,29 @@ mod tests {
     fn schema_hash_matches_current_hash() {
         assert!(schema_hash_matches(SCHEMA_HASH));
         assert!(!schema_hash_matches("invalid"));
+    }
+
+    #[test]
+    fn default_tantivy_writer_cap_scales_with_memory() -> Result<(), &'static str> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        require_default_tantivy_writer_cap(None, 26, "unknown memory uses ceiling")?;
+        require_default_tantivy_writer_cap(Some(8 * GIB), 1, "8 GiB caps at one thread")?;
+        require_default_tantivy_writer_cap(Some(24 * GIB), 2, "24 GiB caps at two threads")?;
+        require_default_tantivy_writer_cap(Some(64 * GIB), 6, "64 GiB allows six threads")?;
+        require_default_tantivy_writer_cap(Some(512 * GIB), 26, "512 GiB reaches ceiling")?;
+        Ok(())
+    }
+
+    fn require_default_tantivy_writer_cap(
+        memory_bytes: Option<u64>,
+        expected: usize,
+        label: &'static str,
+    ) -> Result<(), &'static str> {
+        if default_tantivy_max_writer_threads_for_memory_bytes(memory_bytes) == expected {
+            return Ok(());
+        }
+        Err(label)
     }
 
     #[test]
