@@ -7089,6 +7089,15 @@ async fn execute_cli(
                 Commands::Import(subcmd) => {
                     handle_import(subcmd, cli).await?;
                 }
+                #[cfg(unix)]
+                Commands::Daemon {
+                    socket,
+                    idle_timeout,
+                    max_connections,
+                    data_dir,
+                } => {
+                    run_daemon(socket, idle_timeout, max_connections, data_dir)?;
+                }
                 _ => {}
             }
         }
