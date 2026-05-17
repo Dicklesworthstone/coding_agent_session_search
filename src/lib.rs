@@ -83835,24 +83835,40 @@ fn run_models_install(
 
     let registry_name = resolve_cli_model_name(model_name)?;
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let model_dir =
-        FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| CliError {
+    // Route to the embedder install path or the reranker install path
+    // depending on which registry knows this canonical name. Embedders
+    // get their on-disk directory from `FastEmbedder::model_dir_for`;
+    // rerankers use `data_dir/models/<manifest.id>`, matching the
+    // convention the reranker loader expects.
+    let (model_dir, manifest) = if let Some(manifest) = ModelManifest::for_embedder(registry_name)
+    {
+        let dir =
+            FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| CliError {
+                code: 20,
+                kind: CliErrorKind::Model.kind_str(),
+                message: format!(
+                    "no model directory mapping for registered embedder '{}'",
+                    registry_name
+                ),
+                hint: None,
+                retryable: false,
+            })?;
+        (dir, manifest)
+    } else if let Some(manifest) = ModelManifest::for_reranker(registry_name) {
+        let dir = data_dir.join("models").join(&manifest.id);
+        (dir, manifest)
+    } else {
+        return Err(CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
-                "no model directory mapping for registered embedder '{}'",
+                "no manifest registered for '{}' (neither embedder nor reranker)",
                 registry_name
             ),
             hint: None,
             retryable: false,
-        })?;
-    let manifest = ModelManifest::for_embedder(registry_name).ok_or_else(|| CliError {
-        code: 20,
-        kind: CliErrorKind::Model.kind_str(),
-        message: format!("no manifest registered for embedder '{}'", registry_name),
-        hint: None,
-        retryable: false,
-    })?;
+        });
+    };
     let mirror_base_url = mirror
         .map(normalize_mirror_base_url)
         .transpose()
@@ -84592,21 +84608,29 @@ fn run_models_remove(
     data_dir_override: Option<PathBuf>,
 ) -> CliResult<()> {
     use crate::search::fastembed_embedder::FastEmbedder;
+    use crate::search::model_download::ModelManifest;
     use colored::Colorize;
 
     let registry_name = resolve_cli_model_name(model_name)?;
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let model_dir =
-        FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| CliError {
+    // Mirror run_models_install: pick embedder path or reranker path
+    // based on which registry knows the canonical name.
+    let model_dir = if let Some(dir) = FastEmbedder::model_dir_for(&data_dir, registry_name) {
+        dir
+    } else if let Some(manifest) = ModelManifest::for_reranker(registry_name) {
+        data_dir.join("models").join(&manifest.id)
+    } else {
+        return Err(CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
-                "no model directory mapping for registered embedder '{}'",
+                "no model directory mapping for '{}' (neither embedder nor reranker)",
                 registry_name
             ),
             hint: None,
             retryable: false,
-        })?;
+        });
+    };
 
     if !model_dir.is_dir() {
         println!("{} Model is not installed.", "✗".yellow());
