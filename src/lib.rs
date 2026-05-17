@@ -83794,12 +83794,22 @@ fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
             Ok("snowflake-arctic-s")
         }
         "nomic-embed" | "nomic-embed-768" | "nomic-embed-text-v1.5" => Ok("nomic-embed"),
+        // Rerankers — registry already has manifests via
+        // `ModelManifest::for_reranker`; resolve aliases to canonical
+        // reranker names so `run_models_install` can route to the right
+        // manifest + directory.
+        "ms-marco"
+        | "ms-marco-minilm"
+        | "ms-marco-minilm-l-6-v2"
+        | "ms-marco-minilm-l6-v2" => Ok("ms-marco"),
+        "jina-reranker-turbo" | "jina-reranker-v1-turbo-en" => Ok("jina-reranker-turbo"),
         _ => Err(CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
-                "Unknown model '{}'. Supported: all-minilm-l6-v2 (alias minilm), \
-                 snowflake-arctic-s, nomic-embed.",
+                "Unknown model '{}'. Supported embedders: all-minilm-l6-v2 (alias \
+                 minilm), snowflake-arctic-s, nomic-embed. Supported rerankers: \
+                 ms-marco, jina-reranker-turbo.",
                 model_name
             ),
             hint: Some("Use 'cass models status' to see available models".into()),
@@ -85778,6 +85788,14 @@ mod cli_models_resolution_tests {
             ("nomic-embed-768", "nomic-embed"),
             ("nomic-embed-text-v1.5", "nomic-embed"),
             ("NOMIC-EMBED", "nomic-embed"),
+            // Rerankers
+            ("ms-marco", "ms-marco"),
+            ("ms-marco-minilm", "ms-marco"),
+            ("ms-marco-minilm-l-6-v2", "ms-marco"),
+            ("ms-marco-minilm-l6-v2", "ms-marco"),
+            ("MS-MARCO", "ms-marco"),
+            ("jina-reranker-turbo", "jina-reranker-turbo"),
+            ("jina-reranker-v1-turbo-en", "jina-reranker-turbo"),
         ] {
             assert_eq!(
                 resolve_cli_model_name(alias).expect("registered alias must resolve"),
@@ -85818,12 +85836,14 @@ mod cli_models_resolution_tests {
     }
 
     /// `coding_agent_session_search-v3of1`: every name that
-    /// `resolve_cli_model_name` returns MUST be a name that both
-    /// `ModelManifest::for_embedder` and `FastEmbedder::model_dir_for`
-    /// accept. Otherwise install/remove would resolve the alias and
-    /// then crash at the manifest/dir lookup. This is the cross-module
-    /// contract that the original hardcoded `all-minilm-l6-v2` check
-    /// silently maintained — making it explicit prevents drift.
+    /// `resolve_cli_model_name` returns MUST resolve to either:
+    ///   - an embedder with `ModelManifest::for_embedder` AND
+    ///     `FastEmbedder::model_dir_for` mapping, OR
+    ///   - a reranker with `ModelManifest::for_reranker` mapping.
+    /// Otherwise install/remove would resolve the alias and then crash
+    /// at the manifest/dir lookup. This is the cross-module contract
+    /// that the original hardcoded `all-minilm-l6-v2` check silently
+    /// maintained — making it explicit prevents drift.
     #[test]
     fn every_resolved_canonical_name_has_manifest_and_dir_mapping() {
         use crate::search::fastembed_embedder::FastEmbedder;
@@ -85833,13 +85853,20 @@ mod cli_models_resolution_tests {
         for canonical in ["minilm", "snowflake-arctic-s", "nomic-embed"] {
             assert!(
                 ModelManifest::for_embedder(canonical).is_some(),
-                "canonical name {canonical:?} returned by resolve_cli_model_name must have a \
-                 ModelManifest registered"
+                "embedder {canonical:?} returned by resolve_cli_model_name must have a \
+                 ModelManifest::for_embedder"
             );
             assert!(
                 FastEmbedder::model_dir_for(probe_data_dir, canonical).is_some(),
-                "canonical name {canonical:?} returned by resolve_cli_model_name must have a \
+                "embedder {canonical:?} returned by resolve_cli_model_name must have a \
                  FastEmbedder::model_dir_for mapping"
+            );
+        }
+        for canonical in ["ms-marco", "jina-reranker-turbo"] {
+            assert!(
+                ModelManifest::for_reranker(canonical).is_some(),
+                "reranker {canonical:?} returned by resolve_cli_model_name must have a \
+                 ModelManifest::for_reranker"
             );
         }
     }
