@@ -7089,6 +7089,15 @@ async fn execute_cli(
                 Commands::Import(subcmd) => {
                     handle_import(subcmd, cli).await?;
                 }
+                #[cfg(unix)]
+                Commands::Daemon {
+                    socket,
+                    idle_timeout,
+                    max_connections,
+                    data_dir,
+                } => {
+                    run_daemon(socket, idle_timeout, max_connections, data_dir)?;
+                }
                 _ => {}
             }
         }
@@ -83794,18 +83803,69 @@ fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
             Ok("snowflake-arctic-s")
         }
         "nomic-embed" | "nomic-embed-768" | "nomic-embed-text-v1.5" => Ok("nomic-embed"),
+        "ms-marco" | "ms-marco-minilm" | "ms-marco-minilm-l-6-v2" | "ms-marco-minilm-l6-v2" => {
+            Ok("ms-marco")
+        }
+        "jina-reranker-turbo" | "jina-reranker-v1-turbo" | "jina-reranker-v1-turbo-en" => {
+            Ok("jina-reranker-turbo")
+        }
         _ => Err(CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
-                "Unknown model '{}'. Supported: all-minilm-l6-v2 (alias minilm), \
-                 snowflake-arctic-s, nomic-embed.",
+                "Unknown model '{}'. Embedders: all-minilm-l6-v2 (alias minilm), \
+                 snowflake-arctic-s, nomic-embed. Rerankers: ms-marco, jina-reranker-turbo.",
                 model_name
             ),
             hint: Some("Use 'cass models status' to see available models".into()),
             retryable: false,
         }),
     }
+}
+
+/// Returns the on-disk model directory for either an embedder or a reranker.
+///
+/// `registry_name` must be a canonical name returned by `resolve_cli_model_name`.
+/// Embedders are routed through `FastEmbedder::model_dir_for`; rerankers use
+/// `<data_dir>/models/<manifest.id>` so install layout matches the directory
+/// `FastEmbedReranker` reads at startup.
+fn resolve_model_install_dir(
+    data_dir: &Path,
+    registry_name: &str,
+) -> CliResult<(PathBuf, crate::search::model_download::ModelManifest)> {
+    use crate::search::fastembed_embedder::FastEmbedder;
+    use crate::search::model_download::ModelManifest;
+
+    if let Some(manifest) = ModelManifest::for_embedder(registry_name) {
+        let model_dir =
+            FastEmbedder::model_dir_for(data_dir, registry_name).ok_or_else(|| CliError {
+                code: 20,
+                kind: CliErrorKind::Model.kind_str(),
+                message: format!(
+                    "no model directory mapping for registered embedder '{}'",
+                    registry_name
+                ),
+                hint: None,
+                retryable: false,
+            })?;
+        return Ok((model_dir, manifest));
+    }
+
+    if let Some(manifest) = ModelManifest::for_reranker(registry_name) {
+        let model_dir = data_dir.join("models").join(&manifest.id);
+        return Ok((model_dir, manifest));
+    }
+
+    Err(CliError {
+        code: 20,
+        kind: CliErrorKind::Model.kind_str(),
+        message: format!(
+            "no manifest registered for model '{}' (neither embedder nor reranker)",
+            registry_name
+        ),
+        hint: None,
+        retryable: false,
+    })
 }
 
 /// Download and install the semantic search model
@@ -83816,33 +83876,15 @@ fn run_models_install(
     skip_confirm: bool,
     data_dir_override: Option<PathBuf>,
 ) -> CliResult<()> {
-    use crate::search::fastembed_embedder::FastEmbedder;
     use crate::search::model_download::{
-        ModelDownloader, ModelManifest, check_model_installed, normalize_mirror_base_url,
+        ModelDownloader, check_model_installed, normalize_mirror_base_url,
     };
     use colored::Colorize;
     use indicatif::{ProgressBar, ProgressStyle};
 
     let registry_name = resolve_cli_model_name(model_name)?;
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let model_dir =
-        FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| CliError {
-            code: 20,
-            kind: CliErrorKind::Model.kind_str(),
-            message: format!(
-                "no model directory mapping for registered embedder '{}'",
-                registry_name
-            ),
-            hint: None,
-            retryable: false,
-        })?;
-    let manifest = ModelManifest::for_embedder(registry_name).ok_or_else(|| CliError {
-        code: 20,
-        kind: CliErrorKind::Model.kind_str(),
-        message: format!("no manifest registered for embedder '{}'", registry_name),
-        hint: None,
-        retryable: false,
-    })?;
+    let (model_dir, manifest) = resolve_model_install_dir(&data_dir, registry_name)?;
     let mirror_base_url = mirror
         .map(normalize_mirror_base_url)
         .transpose()
@@ -84581,22 +84623,11 @@ fn run_models_remove(
     skip_confirm: bool,
     data_dir_override: Option<PathBuf>,
 ) -> CliResult<()> {
-    use crate::search::fastembed_embedder::FastEmbedder;
     use colored::Colorize;
 
     let registry_name = resolve_cli_model_name(model_name)?;
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let model_dir =
-        FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| CliError {
-            code: 20,
-            kind: CliErrorKind::Model.kind_str(),
-            message: format!(
-                "no model directory mapping for registered embedder '{}'",
-                registry_name
-            ),
-            hint: None,
-            retryable: false,
-        })?;
+    let (model_dir, _manifest) = resolve_model_install_dir(&data_dir, registry_name)?;
 
     if !model_dir.is_dir() {
         println!("{} Model is not installed.", "✗".yellow());
@@ -85840,6 +85871,67 @@ mod cli_models_resolution_tests {
                 FastEmbedder::model_dir_for(probe_data_dir, canonical).is_some(),
                 "canonical name {canonical:?} returned by resolve_cli_model_name must have a \
                  FastEmbedder::model_dir_for mapping"
+            );
+        }
+    }
+
+    /// Reranker aliases must round-trip through `resolve_cli_model_name`
+    /// and `resolve_model_install_dir` so `cass models install --model
+    /// ms-marco` actually lands the files where `FastEmbedReranker` looks
+    /// for them. Without this contract the resolver accepts the alias,
+    /// the install path ships the bytes, and the daemon still logs
+    /// "reranker model directory not found" because the manifest `id`
+    /// drifted from the loader's hard-coded directory name.
+    #[test]
+    fn reranker_aliases_resolve_and_install_path_matches_loader_dir() {
+        use crate::search::model_download::ModelManifest;
+        use crate::search::reranker_registry::RERANKERS;
+
+        for (alias, canonical) in [
+            ("ms-marco", "ms-marco"),
+            ("ms-marco-minilm", "ms-marco"),
+            ("ms-marco-minilm-l-6-v2", "ms-marco"),
+            ("ms-marco-minilm-l6-v2", "ms-marco"),
+            ("MS-MARCO", "ms-marco"),
+            ("jina-reranker-turbo", "jina-reranker-turbo"),
+            ("jina-reranker-v1-turbo-en", "jina-reranker-turbo"),
+        ] {
+            assert_eq!(
+                resolve_cli_model_name(alias).expect("reranker alias must resolve"),
+                canonical,
+                "reranker alias {alias:?} must resolve to {canonical:?}"
+            );
+            assert!(
+                ModelManifest::for_reranker(canonical).is_some(),
+                "canonical reranker {canonical:?} must have a ModelManifest registered"
+            );
+        }
+
+        // The install path uses `manifest.id` as the directory name. That
+        // name MUST equal the last path segment of the loader's
+        // `RegisteredReranker::model_dir`, otherwise install delivers
+        // files to one location and the loader reads from another —
+        // the exact bug that left "WARN Failed to load reranker" on
+        // every fresh daemon start (cass#242).
+        let probe = std::path::Path::new("/tmp/cass-reranker-probe");
+        for canonical in ["ms-marco", "jina-reranker-turbo"] {
+            let manifest = ModelManifest::for_reranker(canonical)
+                .unwrap_or_else(|| panic!("{canonical} manifest must be registered"));
+            let registered = RERANKERS
+                .iter()
+                .find(|r| r.name == canonical)
+                .unwrap_or_else(|| panic!("{canonical} must be in RERANKERS"));
+            let loader_dir = registered
+                .model_dir(probe)
+                .unwrap_or_else(|| panic!("{canonical} must have a model_dir"));
+            let loader_dir_name = loader_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_else(|| panic!("{canonical} model_dir must have a final segment"));
+            assert_eq!(
+                manifest.id, loader_dir_name,
+                "{canonical} manifest.id must match the loader's model_dir name so install and \
+                 loader agree on the on-disk directory"
             );
         }
     }

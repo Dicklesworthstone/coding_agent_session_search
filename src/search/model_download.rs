@@ -645,10 +645,15 @@ impl ModelManifest {
     /// MS MARCO MiniLM reranker manifest (baseline for bake-off).
     ///
     /// Verified: 2026-02-02 - All checksums verified from HuggingFace.
-    /// Note: Repo is ms-marco-MiniLM-L6-v2 (no hyphen between L and 6).
+    /// Note: The HuggingFace repo is ms-marco-MiniLM-L6-v2 (no hyphen between
+    /// L and 6), but the on-disk directory name carries an extra hyphen
+    /// (ms-marco-MiniLM-L-6-v2) to match `reranker_registry::ReRanker::model_dir`.
+    /// Install paths use `id` as the directory; keeping them aligned is what
+    /// lets `cass models install --model ms-marco` deliver the files where
+    /// `FastEmbedReranker` actually looks for them.
     pub fn msmarco_reranker() -> Self {
         Self {
-            id: "ms-marco-MiniLM-L6-v2".into(),
+            id: "ms-marco-MiniLM-L-6-v2".into(),
             repo: "cross-encoder/ms-marco-MiniLM-L6-v2".into(),
             revision: "c5ee24cb16019beea0893ab7796b1df96625c6b8".into(),
             files: vec![
