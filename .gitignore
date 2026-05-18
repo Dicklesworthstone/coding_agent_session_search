@@ -251,6 +251,15 @@ storage.sqlite3-wal.corrupt-*
 # Recovery build artifacts
 .target_cass_recovery/
 
+# /git-stash-janitor skill scratch tree (per-run mining workspace for accumulated
+# stashes); regenerated on each invocation.
+.stash_janitor_workspace/
+
+# Root-level ad-hoc reproducer programs (e.g. test_dir_symlink.rs, test_xss.rs
+# created to verify behavior outside the test harness). Real tests live under
+# tests/ or in #[cfg(test)] modules; this glob applies only to the repo root.
+/test_*.rs
+
 # NTM per-repo state (rate-limit tracking, session metadata) — regenerated on demand
 .ntm/
 .claude/settings.local.json
