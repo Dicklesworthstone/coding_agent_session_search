@@ -8789,6 +8789,25 @@ fn streaming_combine_max_bytes() -> usize {
         .unwrap_or(STREAMING_MAX_BYTES_IN_FLIGHT / 2)
 }
 
+/// Cap on how many raw messages a single `ingest_batch` call may carry.
+/// `ingest_batch` is single-threaded and the commit-interval check that
+/// flushes the in-memory tantivy writer only fires AFTER it returns, so a
+/// batch containing one or more very-large conversations can run for
+/// minutes and grow the writer heap to multi-GB before the first
+/// incremental commit. When a combined batch exceeds this cap the consumer
+/// splits it into whole-conversation chunks and runs a commit check
+/// between them.
+///
+/// 0 disables splitting. Override with `CASS_STREAMING_INGEST_CHUNK_MESSAGES`
+/// (clamped to `[0, 1_000_000]`). Default 1024.
+fn streaming_consumer_max_ingest_messages() -> usize {
+    dotenvy::var("CASS_STREAMING_INGEST_CHUNK_MESSAGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|v| v.min(1_000_000))
+        .unwrap_or(1024)
+}
+
 /// Run the streaming indexing consumer.
 ///
 /// Receives batches from producer threads and ingests them into storage.
@@ -8963,17 +8982,110 @@ fn run_streaming_consumer(
 
                 // Ingest the combined batch (== original single batch when
                 // combine_enabled = false or no extras were drained).
-                let ingest_result = ingest_batch(
-                    storage,
-                    t_index.as_deref_mut(),
-                    data_dir,
-                    &combined_conversations,
-                    progress,
-                    lexical_strategy,
-                    defer_streaming_checkpoints,
-                );
+                //
+                // To bound peak tantivy writer heap when a Batch carries
+                // one or more very-large conversations, split into
+                // whole-conversation chunks of at most
+                // `max_ingest_messages` messages. ingest_batch is
+                // single-threaded and synchronous; the
+                // commit-interval flush below only fires AFTER it
+                // returns, so without splitting a 12k-message batch can
+                // run for many minutes accumulating multi-GB of
+                // in-memory tantivy state before the first incremental
+                // commit. We run a commit check between chunks too.
+                let max_ingest_messages = streaming_consumer_max_ingest_messages();
+                let chunk_bounds: Vec<(usize, usize)> =
+                    if max_ingest_messages == 0
+                        || combined_message_count <= max_ingest_messages
+                    {
+                        vec![(0, combined_conversations.len())]
+                    } else {
+                        let mut bounds = Vec::new();
+                        let mut start = 0usize;
+                        let mut acc = 0usize;
+                        for (i, c) in combined_conversations.iter().enumerate() {
+                            let cm = c.messages.len();
+                            // Cut before this conversation if including
+                            // it would exceed the cap AND the current
+                            // chunk already has at least one
+                            // conversation. Single conversations larger
+                            // than the cap go in their own chunk
+                            // (whole-conversation atomicity is
+                            // preserved).
+                            if acc.saturating_add(cm) > max_ingest_messages
+                                && i > start
+                            {
+                                bounds.push((start, i));
+                                start = i;
+                                acc = 0;
+                            }
+                            acc = acc.saturating_add(cm);
+                        }
+                        if start < combined_conversations.len() {
+                            bounds.push((start, combined_conversations.len()));
+                        }
+                        bounds
+                    };
+                let num_chunks = chunk_bounds.len();
+                if num_chunks > 1 {
+                    tracing::info!(
+                        connector = connector_name,
+                        conversations = combined_batch_size,
+                        messages = combined_message_count,
+                        chunks = num_chunks,
+                        max_ingest_messages,
+                        "splitting streaming batch to bound tantivy writer heap"
+                    );
+                }
+                let mut chunk_idx = 0usize;
+                let mut ingest_err: Option<anyhow::Error> = None;
+                for (start, end) in chunk_bounds {
+                    let chunk_slice = &combined_conversations[start..end];
+                    match ingest_batch(
+                        storage,
+                        t_index.as_deref_mut(),
+                        data_dir,
+                        chunk_slice,
+                        progress,
+                        lexical_strategy,
+                        defer_streaming_checkpoints,
+                    ) {
+                        Ok(counts) => {
+                            canonical_mutations =
+                                canonical_mutations.accumulate(counts);
+                        }
+                        Err(e) => {
+                            ingest_err = Some(e);
+                            break;
+                        }
+                    }
+                    chunk_idx += 1;
+                    // Commit between chunks (skip after the very last one
+                    // — the post-Batch commit check handles that case).
+                    if chunk_idx < num_chunks
+                        && last_commit.elapsed()
+                            >= streaming_consumer_commit_interval()
+                        && let Some(t_index) = t_index.as_deref_mut()
+                    {
+                        if let Err(e) = t_index.commit() {
+                            tracing::warn!(
+                                "mid-batch incremental commit failed: {}",
+                                e
+                            );
+                        } else {
+                            tracing::info!(
+                                chunks_done = chunk_idx,
+                                num_chunks,
+                                "mid-batch incremental commit completed"
+                            );
+                        }
+                        last_commit = std::time::Instant::now();
+                    }
+                }
                 flow_limiter.release(combined_byte_reservation);
-                canonical_mutations = canonical_mutations.accumulate(ingest_result?);
+                if let Some(e) = ingest_err {
+                    return Err(e);
+                }
 
                 // For tracing parity with the per-message path, use the
                 // first batch's connector_name + the combined totals.
