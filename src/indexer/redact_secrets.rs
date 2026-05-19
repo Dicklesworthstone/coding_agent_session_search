@@ -227,9 +227,14 @@ pub(crate) struct MemoizingRedactor {
 #[allow(dead_code)]
 impl MemoizingRedactor {
     /// Default cache capacity for typical refresh batches. Sized to
-    /// cover a few thousand distinct message bodies before LRU
-    /// eviction kicks in.
-    pub(crate) const DEFAULT_CAPACITY: usize = 4096;
+    /// cover the distinct strings produced by one large session — a
+    /// 20k-message claude-code conversation can carry ~200k distinct
+    /// strings once tool args / system prompts / quoted file contents
+    /// are counted, so the prior 4_096-entry cap thrashed during bulk
+    /// catch-up indexing (each eviction recomputed the regex over the
+    /// dropped string). Override with `CASS_REDACT_MEMO_CAPACITY`
+    /// (clamped to `[1024, 1_048_576]`).
+    pub(crate) const DEFAULT_CAPACITY: usize = 65_536;
 
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -240,8 +245,16 @@ impl MemoizingRedactor {
         }
     }
 
+    pub(crate) fn configured_capacity() -> usize {
+        dotenvy::var("CASS_REDACT_MEMO_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1024, 1_048_576))
+            .unwrap_or(Self::DEFAULT_CAPACITY)
+    }
+
     pub(crate) fn new() -> Self {
-        Self::with_capacity(Self::DEFAULT_CAPACITY)
+        Self::with_capacity(Self::configured_capacity())
     }
 
     pub(crate) fn algorithm_fingerprint(&self) -> &str {
