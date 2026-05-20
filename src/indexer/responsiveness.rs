@@ -1354,8 +1354,22 @@ fn default_max_inflight_bytes_for_available(available_bytes: Option<u64>) -> usi
 
 pub(crate) fn available_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+    proc_kib_field_bytes(&meminfo, "MemAvailable:")
+}
+
+pub(crate) fn total_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    proc_kib_field_bytes(&meminfo, "MemTotal:")
+}
+
+pub(crate) fn process_resident_memory_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    proc_kib_field_bytes(&status, "VmRSS:")
+}
+
+fn proc_kib_field_bytes(contents: &str, prefix: &str) -> Option<u64> {
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix(prefix) {
             let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
             return kb.checked_mul(1024);
         }

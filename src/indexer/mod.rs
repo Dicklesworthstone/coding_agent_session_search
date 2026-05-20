@@ -833,6 +833,10 @@ pub struct IndexingProgress {
     pub rebuild_pipeline_producer_handoff_wait_ms: AtomicUsize,
     /// Sampled host 1-minute load average while the rebuild is active, in milli-loadavg units.
     pub rebuild_pipeline_host_loadavg_1m_milli: Mutex<Option<u32>>,
+    /// Sampled host MemAvailable while the rebuild is active.
+    pub rebuild_pipeline_host_available_memory_bytes: Mutex<Option<u64>>,
+    /// Sampled process resident set size while the rebuild is active.
+    pub rebuild_pipeline_process_rss_bytes: Mutex<Option<u64>>,
     /// Human-readable runtime controller mode for the active rebuild.
     pub rebuild_pipeline_controller_mode: Mutex<String>,
     /// Human-readable reason explaining the current controller mode.
@@ -859,6 +863,24 @@ pub struct IndexingProgress {
     pub rebuild_pipeline_staged_shard_build_pending_jobs: AtomicUsize,
     /// Human-readable reason explaining the current staged shard-build budget.
     pub rebuild_pipeline_staged_shard_build_controller_reason: Mutex<String>,
+    /// Host memory reserve below which new staged shard builds are throttled.
+    pub rebuild_pipeline_staged_shard_build_memory_reserve_bytes: AtomicUsize,
+    /// Host memory reserve below which new staged shard builds are paused.
+    pub rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes: AtomicUsize,
+    /// Completed staged shard-build jobs in the active rebuild.
+    pub rebuild_pipeline_staged_shard_build_completed_jobs: AtomicUsize,
+    /// Last completed staged shard index.
+    pub rebuild_pipeline_staged_shard_build_last_shard_index: Mutex<Option<usize>>,
+    /// Raw message bytes in the last completed staged shard.
+    pub rebuild_pipeline_staged_shard_build_last_message_bytes: AtomicUsize,
+    /// On-disk bytes in the last completed staged shard index.
+    pub rebuild_pipeline_staged_shard_build_last_index_size_bytes: AtomicU64,
+    /// Wall-clock milliseconds spent building the last staged shard.
+    pub rebuild_pipeline_staged_shard_build_last_duration_ms: AtomicU64,
+    /// Last observed index-size/raw-message-byte amplification in milli-units.
+    pub rebuild_pipeline_staged_shard_build_last_amplification_milli: Mutex<Option<u64>>,
+    /// Conservative observed amplification used by staged shard admission.
+    pub rebuild_pipeline_staged_shard_build_observed_amplification_milli: Mutex<Option<u64>>,
 }
 
 impl IndexingProgress {
@@ -931,6 +953,16 @@ impl IndexingProgress {
             .lock()
             .ok()
             .and_then(|value| *value);
+        let rebuild_pipeline_host_available_memory_bytes = self
+            .rebuild_pipeline_host_available_memory_bytes
+            .lock()
+            .ok()
+            .and_then(|value| *value);
+        let rebuild_pipeline_process_rss_bytes = self
+            .rebuild_pipeline_process_rss_bytes
+            .lock()
+            .ok()
+            .and_then(|value| *value);
         let rebuild_pipeline_controller_mode = self
             .rebuild_pipeline_controller_mode
             .lock()
@@ -978,6 +1010,39 @@ impl IndexingProgress {
             .lock()
             .map(|value| value.clone())
             .unwrap_or_default();
+        let rebuild_pipeline_staged_shard_build_memory_reserve_bytes = self
+            .rebuild_pipeline_staged_shard_build_memory_reserve_bytes
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes = self
+            .rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_staged_shard_build_completed_jobs = self
+            .rebuild_pipeline_staged_shard_build_completed_jobs
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_staged_shard_build_last_shard_index = self
+            .rebuild_pipeline_staged_shard_build_last_shard_index
+            .lock()
+            .ok()
+            .and_then(|value| *value);
+        let rebuild_pipeline_staged_shard_build_last_message_bytes = self
+            .rebuild_pipeline_staged_shard_build_last_message_bytes
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_staged_shard_build_last_index_size_bytes = self
+            .rebuild_pipeline_staged_shard_build_last_index_size_bytes
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_staged_shard_build_last_duration_ms = self
+            .rebuild_pipeline_staged_shard_build_last_duration_ms
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_staged_shard_build_last_amplification_milli = self
+            .rebuild_pipeline_staged_shard_build_last_amplification_milli
+            .lock()
+            .ok()
+            .and_then(|value| *value);
+        let rebuild_pipeline_staged_shard_build_observed_amplification_milli = self
+            .rebuild_pipeline_staged_shard_build_observed_amplification_milli
+            .lock()
+            .ok()
+            .and_then(|value| *value);
         let (quarantined_conversations, lexical_update_deferred) = self
             .stats
             .lock()
@@ -1035,6 +1100,8 @@ impl IndexingProgress {
                 "host_loadavg_1m": rebuild_pipeline_host_loadavg_1m_milli.map(|value| {
                     f64::from(value) / 1000.0
                 }),
+                "host_available_memory_bytes": rebuild_pipeline_host_available_memory_bytes,
+                "process_rss_bytes": rebuild_pipeline_process_rss_bytes,
                 "controller_mode": non_empty_json_string(rebuild_pipeline_controller_mode),
                 "controller_reason": non_empty_json_string(rebuild_pipeline_controller_reason),
                 // The staged-merge / staged-shard-build controllers
@@ -1060,6 +1127,15 @@ impl IndexingProgress {
                 "staged_shard_build_active_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_active_jobs),
                 "staged_shard_build_pending_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_pending_jobs),
                 "staged_shard_build_controller_reason": active_rebuild_json_string(is_rebuilding, rebuild_pipeline_staged_shard_build_controller_reason),
+                "staged_shard_build_memory_reserve_bytes": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_memory_reserve_bytes),
+                "staged_shard_build_emergency_memory_reserve_bytes": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes),
+                "staged_shard_build_completed_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_completed_jobs),
+                "staged_shard_build_last_shard_index": active_rebuild_json_optional_usize(is_rebuilding, rebuild_pipeline_staged_shard_build_last_shard_index),
+                "staged_shard_build_last_message_bytes": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_last_message_bytes),
+                "staged_shard_build_last_index_size_bytes": staged_u64_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_last_index_size_bytes),
+                "staged_shard_build_last_duration_ms": staged_u64_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_last_duration_ms),
+                "staged_shard_build_last_amplification_milli": active_rebuild_json_optional_u64(is_rebuilding, rebuild_pipeline_staged_shard_build_last_amplification_milli),
+                "staged_shard_build_observed_amplification_milli": active_rebuild_json_optional_u64(is_rebuilding, rebuild_pipeline_staged_shard_build_observed_amplification_milli),
             },
         })
     }
@@ -1078,12 +1154,39 @@ fn staged_field_or_null(is_rebuilding: bool, value: usize) -> serde_json::Value 
     }
 }
 
+fn staged_u64_field_or_null(is_rebuilding: bool, value: u64) -> serde_json::Value {
+    if is_rebuilding {
+        serde_json::json!(value)
+    } else {
+        serde_json::Value::Null
+    }
+}
+
 fn non_empty_json_string(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
 fn active_rebuild_json_string(is_rebuilding: bool, value: String) -> Option<String> {
     (is_rebuilding && !value.is_empty()).then_some(value)
+}
+
+fn active_rebuild_json_optional_usize(
+    is_rebuilding: bool,
+    value: Option<usize>,
+) -> serde_json::Value {
+    if is_rebuilding {
+        serde_json::json!(value)
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+fn active_rebuild_json_optional_u64(is_rebuilding: bool, value: Option<u64>) -> serde_json::Value {
+    if is_rebuilding {
+        serde_json::json!(value)
+    } else {
+        serde_json::Value::Null
+    }
 }
 
 #[derive(Clone)]
@@ -1445,6 +1548,8 @@ fn capture_lexical_rebuild_pipeline_runtime(
         producer_handoff_wait_count: producer_snapshot.handoff_wait_count,
         producer_handoff_wait_ms: producer_snapshot.handoff_wait_ms,
         host_loadavg_1m_milli: lexical_rebuild_host_loadavg_1m_milli(),
+        host_available_memory_bytes: responsiveness::available_memory_bytes(),
+        process_rss_bytes: responsiveness::process_resident_memory_bytes(),
         controller_mode,
         controller_reason,
         staged_merge_workers_max: 0,
@@ -1458,6 +1563,15 @@ fn capture_lexical_rebuild_pipeline_runtime(
         staged_shard_build_active_jobs: 0,
         staged_shard_build_pending_jobs: 0,
         staged_shard_build_controller_reason: String::new(),
+        staged_shard_build_memory_reserve_bytes: 0,
+        staged_shard_build_emergency_memory_reserve_bytes: 0,
+        staged_shard_build_completed_jobs: 0,
+        staged_shard_build_last_shard_index: None,
+        staged_shard_build_last_message_bytes: 0,
+        staged_shard_build_last_index_size_bytes: 0,
+        staged_shard_build_last_duration_ms: 0,
+        staged_shard_build_last_amplification_milli: None,
+        staged_shard_build_observed_amplification_milli: None,
         updated_at_ms: FrankenStorage::now_millis(),
     }
 }
@@ -1523,6 +1637,14 @@ fn refresh_lexical_rebuild_pipeline_runtime(
     if let Ok(mut host_loadavg) = progress.rebuild_pipeline_host_loadavg_1m_milli.lock() {
         *host_loadavg = latest_runtime.host_loadavg_1m_milli;
     }
+    if let Ok(mut host_available_memory) =
+        progress.rebuild_pipeline_host_available_memory_bytes.lock()
+    {
+        *host_available_memory = latest_runtime.host_available_memory_bytes;
+    }
+    if let Ok(mut process_rss) = progress.rebuild_pipeline_process_rss_bytes.lock() {
+        *process_rss = latest_runtime.process_rss_bytes;
+    }
     if let Ok(mut controller_mode) = progress.rebuild_pipeline_controller_mode.lock() {
         *controller_mode = latest_runtime.controller_mode.clone();
     }
@@ -1582,6 +1704,60 @@ fn refresh_lexical_rebuild_pipeline_runtime(
         .lock()
     {
         *staged_shard_build_reason = latest_runtime.staged_shard_build_controller_reason.clone();
+    }
+    progress
+        .rebuild_pipeline_staged_shard_build_memory_reserve_bytes
+        .store(
+            latest_runtime.staged_shard_build_memory_reserve_bytes,
+            Ordering::Relaxed,
+        );
+    progress
+        .rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes
+        .store(
+            latest_runtime.staged_shard_build_emergency_memory_reserve_bytes,
+            Ordering::Relaxed,
+        );
+    progress
+        .rebuild_pipeline_staged_shard_build_completed_jobs
+        .store(
+            latest_runtime.staged_shard_build_completed_jobs,
+            Ordering::Relaxed,
+        );
+    if let Ok(mut last_shard_index) = progress
+        .rebuild_pipeline_staged_shard_build_last_shard_index
+        .lock()
+    {
+        *last_shard_index = latest_runtime.staged_shard_build_last_shard_index;
+    }
+    progress
+        .rebuild_pipeline_staged_shard_build_last_message_bytes
+        .store(
+            latest_runtime.staged_shard_build_last_message_bytes,
+            Ordering::Relaxed,
+        );
+    progress
+        .rebuild_pipeline_staged_shard_build_last_index_size_bytes
+        .store(
+            latest_runtime.staged_shard_build_last_index_size_bytes,
+            Ordering::Relaxed,
+        );
+    progress
+        .rebuild_pipeline_staged_shard_build_last_duration_ms
+        .store(
+            latest_runtime.staged_shard_build_last_duration_ms,
+            Ordering::Relaxed,
+        );
+    if let Ok(mut last_amplification) = progress
+        .rebuild_pipeline_staged_shard_build_last_amplification_milli
+        .lock()
+    {
+        *last_amplification = latest_runtime.staged_shard_build_last_amplification_milli;
+    }
+    if let Ok(mut observed_amplification) = progress
+        .rebuild_pipeline_staged_shard_build_observed_amplification_milli
+        .lock()
+    {
+        *observed_amplification = latest_runtime.staged_shard_build_observed_amplification_milli;
     }
 }
 
@@ -3106,6 +3282,76 @@ struct LexicalRebuildShardBuildResult {
     indexed_docs: usize,
     segments: usize,
     shard_index_path: PathBuf,
+    message_bytes: usize,
+    index_size_bytes: u64,
+    build_duration_ms: u64,
+    amplification_milli: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LexicalRebuildShardBuildTelemetrySnapshot {
+    completed_jobs: usize,
+    last_shard_index: Option<usize>,
+    last_message_bytes: usize,
+    last_index_size_bytes: u64,
+    last_duration_ms: u64,
+    last_amplification_milli: Option<u64>,
+    observed_amplification_milli: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct LexicalRebuildShardBuildTelemetry {
+    completed_jobs: AtomicUsize,
+    last_shard_index: AtomicUsize,
+    last_message_bytes: AtomicUsize,
+    last_index_size_bytes: AtomicU64,
+    last_duration_ms: AtomicU64,
+    last_amplification_milli: AtomicU64,
+    observed_amplification_milli: AtomicU64,
+}
+
+impl LexicalRebuildShardBuildTelemetry {
+    fn record(&self, result: &LexicalRebuildShardBuildResult) {
+        self.completed_jobs.fetch_add(1, Ordering::Relaxed);
+        self.last_shard_index
+            .store(result.shard.shard_index, Ordering::Relaxed);
+        self.last_message_bytes
+            .store(result.message_bytes, Ordering::Relaxed);
+        self.last_index_size_bytes
+            .store(result.index_size_bytes, Ordering::Relaxed);
+        self.last_duration_ms
+            .store(result.build_duration_ms, Ordering::Relaxed);
+        self.last_amplification_milli
+            .store(result.amplification_milli.unwrap_or(0), Ordering::Relaxed);
+        if let Some(amplification_milli) = result.amplification_milli {
+            let conservative_amplification = amplification_milli
+                .max(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI);
+            let _ = self.observed_amplification_milli.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.max(conservative_amplification)),
+            );
+        }
+    }
+
+    fn snapshot(&self) -> LexicalRebuildShardBuildTelemetrySnapshot {
+        let completed_jobs = self.completed_jobs.load(Ordering::Relaxed);
+        let last_shard_index = self.last_shard_index.load(Ordering::Relaxed);
+        let last_amplification_milli = self.last_amplification_milli.load(Ordering::Relaxed);
+        let observed_amplification_milli =
+            self.observed_amplification_milli.load(Ordering::Relaxed);
+        LexicalRebuildShardBuildTelemetrySnapshot {
+            completed_jobs,
+            last_shard_index: (completed_jobs > 0).then_some(last_shard_index),
+            last_message_bytes: self.last_message_bytes.load(Ordering::Relaxed),
+            last_index_size_bytes: self.last_index_size_bytes.load(Ordering::Relaxed),
+            last_duration_ms: self.last_duration_ms.load(Ordering::Relaxed),
+            last_amplification_milli: (last_amplification_milli > 0)
+                .then_some(last_amplification_milli),
+            observed_amplification_milli: (observed_amplification_milli > 0)
+                .then_some(observed_amplification_milli),
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3154,6 +3400,14 @@ enum LexicalRebuildShardBuildMessage {
     Error { shard_index: usize, error: String },
 }
 
+fn lexical_rebuild_amplification_milli(index_size_bytes: u64, message_bytes: usize) -> Option<u64> {
+    if message_bytes == 0 {
+        return None;
+    }
+    let scaled = u128::from(index_size_bytes).saturating_mul(1_000);
+    u64::try_from(scaled / (message_bytes as u128)).ok()
+}
+
 fn spawn_lexical_rebuild_shard_builder_workers(
     worker_count: usize,
     rx: Receiver<LexicalRebuildShardBuildWork>,
@@ -3177,6 +3431,8 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                             .iter()
                             .map(|packet| packet.flow_reservation_bytes)
                             .sum::<usize>();
+                        let shard_message_bytes = work.shard.message_bytes;
+                        let build_started = Instant::now();
                         let result =
                             build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
                                 &work.shard_index_path,
@@ -3184,6 +3440,14 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                                 lexical_rebuild_worker_pool.as_deref(),
                                 Some(work.writer_parallelism),
                             );
+                        let build_duration_ms =
+                            u64::try_from(build_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let index_size_bytes =
+                            directory_size_bytes_best_effort(&work.shard_index_path);
+                        let amplification_milli = lexical_rebuild_amplification_milli(
+                            index_size_bytes,
+                            shard_message_bytes,
+                        );
                         flow_limiter.release(flow_reservation_bytes);
                         match result {
                             Ok(summary) => {
@@ -3193,6 +3457,10 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                                     writer_parallelism = work.writer_parallelism,
                                     indexed_docs = summary.docs,
                                     shard_conversations = work.shard.conversation_count,
+                                    shard_message_bytes,
+                                    index_size_bytes,
+                                    build_duration_ms,
+                                    amplification_milli,
                                     "built lexical rebuild shard index"
                                 );
                                 if tx
@@ -3202,6 +3470,10 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                                             indexed_docs: summary.docs,
                                             segments: summary.segments,
                                             shard_index_path: work.shard_index_path,
+                                            message_bytes: shard_message_bytes,
+                                            index_size_bytes,
+                                            build_duration_ms,
+                                            amplification_milli,
                                         },
                                     ))
                                     .is_err()
@@ -3740,13 +4012,34 @@ impl LexicalRebuildStagedMergeController {
 struct LexicalRebuildStagedShardBuildController {
     max_workers: usize,
     loadavg_high_watermark_1m_milli: Option<u32>,
+    memory_reserve_bytes: usize,
+    emergency_memory_reserve_bytes: usize,
 }
 
 impl LexicalRebuildStagedShardBuildController {
     fn new(max_workers: usize, loadavg_high_watermark_1m_milli: Option<u32>) -> Self {
+        Self::new_with_memory_reserves(
+            max_workers,
+            loadavg_high_watermark_1m_milli,
+            lexical_rebuild_staged_shard_build_memory_reserve_bytes(),
+            lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes(),
+        )
+    }
+
+    fn new_with_memory_reserves(
+        max_workers: usize,
+        loadavg_high_watermark_1m_milli: Option<u32>,
+        memory_reserve_bytes: usize,
+        emergency_memory_reserve_bytes: usize,
+    ) -> Self {
+        let memory_reserve_bytes = memory_reserve_bytes.max(1);
         Self {
             max_workers: max_workers.max(1),
             loadavg_high_watermark_1m_milli,
+            memory_reserve_bytes,
+            emergency_memory_reserve_bytes: emergency_memory_reserve_bytes
+                .max(1)
+                .min(memory_reserve_bytes),
         }
     }
 
@@ -3756,13 +4049,16 @@ impl LexicalRebuildStagedShardBuildController {
         staged_merge_runtime: &LexicalRebuildStagedMergeRuntimeSnapshot,
         active_jobs: usize,
         pending_jobs: usize,
+        next_pending_job_message_bytes: Option<usize>,
     ) -> LexicalRebuildStagedShardBuildRuntimeSnapshot {
         let backlog_jobs = active_jobs.saturating_add(pending_jobs);
         if backlog_jobs == 0 {
             return LexicalRebuildStagedShardBuildRuntimeSnapshot {
                 workers_max: self.max_workers,
+                allowed_jobs: 0,
+                active_jobs,
+                pending_jobs,
                 controller_reason: "no_staged_shard_build_backlog".to_string(),
-                ..LexicalRebuildStagedShardBuildRuntimeSnapshot::default()
             };
         }
 
@@ -3801,6 +4097,15 @@ impl LexicalRebuildStagedShardBuildController {
                 }
             };
 
+        let (allowed_jobs, controller_reason) = self.apply_memory_admission(
+            runtime,
+            active_jobs,
+            backlog_jobs,
+            next_pending_job_message_bytes,
+            allowed_jobs,
+            controller_reason,
+        );
+
         LexicalRebuildStagedShardBuildRuntimeSnapshot {
             workers_max: self.max_workers,
             allowed_jobs: allowed_jobs.min(backlog_jobs),
@@ -3808,6 +4113,112 @@ impl LexicalRebuildStagedShardBuildController {
             pending_jobs,
             controller_reason,
         }
+    }
+
+    fn apply_memory_admission(
+        &self,
+        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
+        active_jobs: usize,
+        backlog_jobs: usize,
+        next_pending_job_message_bytes: Option<usize>,
+        allowed_jobs: usize,
+        controller_reason: String,
+    ) -> (usize, String) {
+        let Some(available_memory_bytes) = runtime.host_available_memory_bytes else {
+            return (allowed_jobs, controller_reason);
+        };
+        let available_memory_bytes = usize_from_u64_saturating(available_memory_bytes);
+        let estimated_builder_bytes =
+            self.estimated_builder_memory_bytes(runtime, next_pending_job_message_bytes);
+        if available_memory_bytes <= self.emergency_memory_reserve_bytes {
+            if active_jobs == 0 && backlog_jobs > 0 {
+                let probe_ceiling =
+                    available_memory_bytes.saturating_sub(available_memory_bytes / 4);
+                if estimated_builder_bytes <= probe_ceiling {
+                    return (
+                        1.min(allowed_jobs).min(backlog_jobs),
+                        format!(
+                            "host_available_memory_bytes_{}_below_emergency_reserve_{}_admitting_single_small_staged_shard_build_estimated_builder_bytes_{}",
+                            available_memory_bytes,
+                            self.emergency_memory_reserve_bytes,
+                            estimated_builder_bytes
+                        ),
+                    );
+                }
+            }
+            return (
+                active_jobs.min(backlog_jobs),
+                format!(
+                    "host_available_memory_bytes_{}_below_emergency_reserve_{}_pausing_new_staged_shard_builds",
+                    available_memory_bytes, self.emergency_memory_reserve_bytes
+                ),
+            );
+        }
+        if available_memory_bytes <= self.memory_reserve_bytes {
+            let allowed_under_reserve = if active_jobs == 0 && backlog_jobs > 0 {
+                1
+            } else {
+                active_jobs
+            }
+            .min(allowed_jobs)
+            .min(backlog_jobs);
+            return (
+                allowed_under_reserve,
+                format!(
+                    "host_available_memory_bytes_{}_below_reserve_{}_limiting_staged_shard_builds_to_{}",
+                    available_memory_bytes, self.memory_reserve_bytes, allowed_under_reserve
+                ),
+            );
+        }
+
+        let memory_headroom = available_memory_bytes.saturating_sub(self.memory_reserve_bytes);
+        let active_estimated_bytes = estimated_builder_bytes.saturating_mul(active_jobs);
+        let additional_jobs =
+            memory_headroom.saturating_sub(active_estimated_bytes) / estimated_builder_bytes.max(1);
+        let memory_allowed_jobs = active_jobs
+            .saturating_add(additional_jobs)
+            .min(self.max_workers)
+            .min(backlog_jobs)
+            .max(active_jobs.min(backlog_jobs));
+        if memory_allowed_jobs < allowed_jobs {
+            (
+                memory_allowed_jobs,
+                format!(
+                    "host_available_memory_bytes_{}_reserve_{}_estimated_builder_bytes_{}_limiting_staged_shard_builds_to_{}",
+                    available_memory_bytes,
+                    self.memory_reserve_bytes,
+                    estimated_builder_bytes,
+                    memory_allowed_jobs
+                ),
+            )
+        } else {
+            (allowed_jobs, controller_reason)
+        }
+    }
+
+    fn estimated_builder_memory_bytes(
+        &self,
+        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
+        next_pending_job_message_bytes: Option<usize>,
+    ) -> usize {
+        let amplification_milli = runtime
+            .staged_shard_build_observed_amplification_milli
+            .unwrap_or(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI)
+            .max(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI)
+            .saturating_mul(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_HEADROOM_MILLI)
+            / 1_000;
+        let amplified_message_bytes = next_pending_job_message_bytes
+            .map(|message_bytes| {
+                let scaled =
+                    (message_bytes as u128).saturating_mul(u128::from(amplification_milli)) / 1_000;
+                usize::try_from(scaled).unwrap_or(usize::MAX)
+            })
+            .unwrap_or(0);
+        amplified_message_bytes
+            .max(usize_from_u64_saturating(
+                LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_ESTIMATED_BYTES,
+            ))
+            .max(1)
     }
 }
 
@@ -3879,6 +4290,66 @@ fn apply_staged_shard_build_runtime_snapshot(
         .lock()
     {
         *staged_shard_build_reason = staged_shard_build_runtime.controller_reason.clone();
+    }
+}
+
+fn apply_staged_shard_build_telemetry_snapshot(
+    latest_runtime: &mut LexicalRebuildPipelineRuntimeSnapshot,
+    progress: Option<&Arc<IndexingProgress>>,
+    memory_reserve_bytes: usize,
+    emergency_memory_reserve_bytes: usize,
+    telemetry: &LexicalRebuildShardBuildTelemetry,
+) {
+    let snapshot = telemetry.snapshot();
+    latest_runtime.staged_shard_build_memory_reserve_bytes = memory_reserve_bytes;
+    latest_runtime.staged_shard_build_emergency_memory_reserve_bytes =
+        emergency_memory_reserve_bytes;
+    latest_runtime.staged_shard_build_completed_jobs = snapshot.completed_jobs;
+    latest_runtime.staged_shard_build_last_shard_index = snapshot.last_shard_index;
+    latest_runtime.staged_shard_build_last_message_bytes = snapshot.last_message_bytes;
+    latest_runtime.staged_shard_build_last_index_size_bytes = snapshot.last_index_size_bytes;
+    latest_runtime.staged_shard_build_last_duration_ms = snapshot.last_duration_ms;
+    latest_runtime.staged_shard_build_last_amplification_milli = snapshot.last_amplification_milli;
+    latest_runtime.staged_shard_build_observed_amplification_milli =
+        snapshot.observed_amplification_milli;
+    let Some(progress) = progress else {
+        return;
+    };
+    progress
+        .rebuild_pipeline_staged_shard_build_memory_reserve_bytes
+        .store(memory_reserve_bytes, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes
+        .store(emergency_memory_reserve_bytes, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_staged_shard_build_completed_jobs
+        .store(snapshot.completed_jobs, Ordering::Relaxed);
+    if let Ok(mut last_shard_index) = progress
+        .rebuild_pipeline_staged_shard_build_last_shard_index
+        .lock()
+    {
+        *last_shard_index = snapshot.last_shard_index;
+    }
+    progress
+        .rebuild_pipeline_staged_shard_build_last_message_bytes
+        .store(snapshot.last_message_bytes, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_staged_shard_build_last_index_size_bytes
+        .store(snapshot.last_index_size_bytes, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_staged_shard_build_last_duration_ms
+        .store(snapshot.last_duration_ms, Ordering::Relaxed);
+    if let Ok(mut last_amplification) = progress
+        .rebuild_pipeline_staged_shard_build_last_amplification_milli
+        .lock()
+    {
+        *last_amplification = snapshot.last_amplification_milli;
+    }
+    if let Ok(mut observed_amplification) = progress
+        .rebuild_pipeline_staged_shard_build_observed_amplification_milli
+        .lock()
+    {
+        *observed_amplification = snapshot.observed_amplification_milli;
     }
 }
 
@@ -4126,6 +4597,8 @@ pub(crate) struct LexicalRebuildPipelineRuntimeSnapshot {
     pub producer_handoff_wait_count: usize,
     pub producer_handoff_wait_ms: usize,
     pub host_loadavg_1m_milli: Option<u32>,
+    pub host_available_memory_bytes: Option<u64>,
+    pub process_rss_bytes: Option<u64>,
     pub controller_mode: String,
     pub controller_reason: String,
     pub staged_merge_workers_max: usize,
@@ -4139,6 +4612,15 @@ pub(crate) struct LexicalRebuildPipelineRuntimeSnapshot {
     pub staged_shard_build_active_jobs: usize,
     pub staged_shard_build_pending_jobs: usize,
     pub staged_shard_build_controller_reason: String,
+    pub staged_shard_build_memory_reserve_bytes: usize,
+    pub staged_shard_build_emergency_memory_reserve_bytes: usize,
+    pub staged_shard_build_completed_jobs: usize,
+    pub staged_shard_build_last_shard_index: Option<usize>,
+    pub staged_shard_build_last_message_bytes: usize,
+    pub staged_shard_build_last_index_size_bytes: u64,
+    pub staged_shard_build_last_duration_ms: u64,
+    pub staged_shard_build_last_amplification_milli: Option<u64>,
+    pub staged_shard_build_observed_amplification_milli: Option<u64>,
     pub updated_at_ms: i64,
 }
 
@@ -4158,6 +4640,8 @@ impl LexicalRebuildPipelineRuntimeSnapshot {
             || self.producer_handoff_wait_count > 0
             || self.producer_handoff_wait_ms > 0
             || self.host_loadavg_1m_milli.is_some()
+            || self.host_available_memory_bytes.is_some()
+            || self.process_rss_bytes.is_some()
             || !self.controller_mode.is_empty()
             || !self.controller_reason.is_empty()
             || self.staged_merge_workers_max > 0
@@ -4171,6 +4655,17 @@ impl LexicalRebuildPipelineRuntimeSnapshot {
             || self.staged_shard_build_active_jobs > 0
             || self.staged_shard_build_pending_jobs > 0
             || !self.staged_shard_build_controller_reason.is_empty()
+            || self.staged_shard_build_memory_reserve_bytes > 0
+            || self.staged_shard_build_emergency_memory_reserve_bytes > 0
+            || self.staged_shard_build_completed_jobs > 0
+            || self.staged_shard_build_last_shard_index.is_some()
+            || self.staged_shard_build_last_message_bytes > 0
+            || self.staged_shard_build_last_index_size_bytes > 0
+            || self.staged_shard_build_last_duration_ms > 0
+            || self.staged_shard_build_last_amplification_milli.is_some()
+            || self
+                .staged_shard_build_observed_amplification_milli
+                .is_some()
     }
 }
 
@@ -5249,6 +5744,8 @@ struct LexicalRebuildResponsivenessController {
     loadavg_low_watermark_1m_milli: Option<u32>,
     restore_clear_samples: usize,
     restore_hold: Duration,
+    memory_reserve_bytes: usize,
+    emergency_memory_reserve_bytes: usize,
     state: LexicalRebuildResponsivenessState,
     reason: String,
     clear_samples: usize,
@@ -5297,6 +5794,9 @@ impl LexicalRebuildResponsivenessController {
             loadavg_low_watermark_1m_milli,
             restore_clear_samples: lexical_rebuild_controller_restore_clear_samples(),
             restore_hold: lexical_rebuild_controller_restore_hold(),
+            memory_reserve_bytes: lexical_rebuild_staged_shard_build_memory_reserve_bytes(),
+            emergency_memory_reserve_bytes:
+                lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes(),
             state,
             reason,
             clear_samples: 0,
@@ -5455,6 +5955,21 @@ impl LexicalRebuildResponsivenessController {
                 format_lexical_rebuild_loadavg_1m_milli(high_watermark_1m_milli)
             ));
         }
+        if let Some(available_memory_bytes) = runtime.host_available_memory_bytes {
+            let available_memory_bytes = usize_from_u64_saturating(available_memory_bytes);
+            if available_memory_bytes <= self.emergency_memory_reserve_bytes {
+                return Some(format!(
+                    "host_available_memory_bytes_{}_below_emergency_reserve_{}",
+                    available_memory_bytes, self.emergency_memory_reserve_bytes
+                ));
+            }
+            if available_memory_bytes <= self.memory_reserve_bytes {
+                return Some(format!(
+                    "host_available_memory_bytes_{}_below_reserve_{}",
+                    available_memory_bytes, self.memory_reserve_bytes
+                ));
+            }
+        }
         if new_producer_handoff_wait {
             return Some(format!(
                 "producer_handoff_wait_count_{}_observed_consumer_backpressure",
@@ -5511,6 +6026,12 @@ impl LexicalRebuildResponsivenessController {
             }
             (None, Some(_)) => true,
         };
+        let memory_is_clear = runtime
+            .host_available_memory_bytes
+            .map(|available_memory_bytes| {
+                usize_from_u64_saturating(available_memory_bytes) > self.memory_reserve_bytes
+            })
+            .unwrap_or(true);
         runtime.queue_depth == 0
             && runtime.ordered_buffered_pages == 0
             && runtime.pending_batch_conversations == 0
@@ -5521,6 +6042,7 @@ impl LexicalRebuildResponsivenessController {
                     .max_message_bytes_in_flight
                     .saturating_mul(Self::INFLIGHT_LOW_WATERMARK_PERCENT)
             && loadavg_is_clear
+            && memory_is_clear
     }
 }
 
@@ -7602,6 +8124,17 @@ struct LexicalRebuildShardBuilderSettings {
 const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_NUMERATOR: u64 = 2;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_DENOMINATOR: u64 = 3;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FRACTION: u64 = 8;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FALLBACK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FLOOR_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_CEILING_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_RESERVE_FRACTION: u64 = 32;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FALLBACK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI: u64 = 8_000;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_HEADROOM_MILLI: u64 = 1_500;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_ESTIMATED_BYTES: u64 = 512 * 1024 * 1024;
 
 fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
     workers: usize,
@@ -7627,6 +8160,60 @@ fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(workers:
         workers,
         responsiveness::available_memory_bytes(),
     )
+}
+
+fn usize_from_u64_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn lexical_rebuild_default_staged_shard_build_memory_reserve_bytes_for_total_memory(
+    total_memory_bytes: Option<u64>,
+) -> usize {
+    let reserve = total_memory_bytes
+        .map(|total| total / LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FRACTION.max(1))
+        .unwrap_or(LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FALLBACK_BYTES)
+        .clamp(
+            LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FLOOR_BYTES,
+            LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_CEILING_BYTES,
+        );
+    usize_from_u64_saturating(reserve)
+}
+
+fn lexical_rebuild_staged_shard_build_memory_reserve_bytes() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILD_MEMORY_RESERVE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            lexical_rebuild_default_staged_shard_build_memory_reserve_bytes_for_total_memory(
+                responsiveness::total_memory_bytes(),
+            )
+        })
+}
+
+fn lexical_rebuild_default_staged_shard_build_emergency_memory_reserve_bytes_for_total_memory(
+    total_memory_bytes: Option<u64>,
+) -> usize {
+    let reserve = total_memory_bytes
+        .map(|total| total / LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_RESERVE_FRACTION.max(1))
+        .unwrap_or(LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FALLBACK_BYTES)
+        .clamp(
+            LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FLOOR_BYTES,
+            LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_CEILING_BYTES,
+        );
+    usize_from_u64_saturating(reserve)
+}
+
+fn lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_MEMORY_RESERVE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            lexical_rebuild_default_staged_shard_build_emergency_memory_reserve_bytes_for_total_memory(
+                responsiveness::total_memory_bytes(),
+            )
+        })
 }
 
 fn lexical_rebuild_staged_shard_builder_parallelism() -> usize {
@@ -14311,7 +14898,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     let mut pending_completed_shards = BTreeMap::new();
     let mut completed_shard_artifacts = Vec::with_capacity(shard_plan.shards.len());
     let mut scheduled_completed_shard_artifacts = 0usize;
-    let mut pending_shard_build_jobs = VecDeque::new();
+    let mut pending_shard_build_jobs: VecDeque<LexicalRebuildShardBuildWork> = VecDeque::new();
     let mut merge_coordinator = LexicalRebuildShardMergeCoordinator::new(eager_merge_stage_root);
     let staged_merge_controller = LexicalRebuildStagedMergeController::new(
         shard_merge_settings.workers,
@@ -14321,6 +14908,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         shard_builder_settings.max_builders,
         pipeline_settings.controller_loadavg_high_watermark_1m_milli,
     );
+    let shard_build_telemetry = LexicalRebuildShardBuildTelemetry::default();
     let mut max_conversation_id = 0i64;
     let mut max_message_id = 0i64;
     let mut final_merge_input_artifacts: Option<Vec<LexicalRebuildShardMergeArtifact>> = None;
@@ -14376,11 +14964,21 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 progress.as_ref(),
                 &applied_runtime,
             );
+            apply_staged_shard_build_telemetry_snapshot(
+                latest_pipeline_runtime,
+                progress.as_ref(),
+                staged_shard_build_controller.memory_reserve_bytes,
+                staged_shard_build_controller.emergency_memory_reserve_bytes,
+                &shard_build_telemetry,
+            );
             let staged_shard_build_runtime = staged_shard_build_controller.decide(
                 latest_pipeline_runtime,
                 &applied_runtime,
                 *active_shard_build_jobs,
                 pending_shard_build_jobs.len(),
+                pending_shard_build_jobs
+                    .front()
+                    .map(|work| work.shard.message_bytes),
             );
             while *active_shard_build_jobs < staged_shard_build_runtime.allowed_jobs {
                 let Some(mut work) = pending_shard_build_jobs.pop_front() else {
@@ -14406,11 +15004,21 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 &applied_runtime,
                 *active_shard_build_jobs,
                 pending_shard_build_jobs.len(),
+                pending_shard_build_jobs
+                    .front()
+                    .map(|work| work.shard.message_bytes),
             );
             apply_staged_shard_build_runtime_snapshot(
                 latest_pipeline_runtime,
                 progress.as_ref(),
                 &applied_shard_build_runtime,
+            );
+            apply_staged_shard_build_telemetry_snapshot(
+                latest_pipeline_runtime,
+                progress.as_ref(),
+                staged_shard_build_controller.memory_reserve_bytes,
+                staged_shard_build_controller.emergency_memory_reserve_bytes,
+                &shard_build_telemetry,
             );
             Ok(())
         };
@@ -14427,11 +15035,21 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         &initial_staged_merge_runtime,
         active_shard_build_jobs,
         pending_shard_build_jobs.len(),
+        pending_shard_build_jobs
+            .front()
+            .map(|work| work.shard.message_bytes),
     );
     apply_staged_shard_build_runtime_snapshot(
         &mut latest_pipeline_runtime,
         progress.as_ref(),
         &initial_staged_shard_build_runtime,
+    );
+    apply_staged_shard_build_telemetry_snapshot(
+        &mut latest_pipeline_runtime,
+        progress.as_ref(),
+        staged_shard_build_controller.memory_reserve_bytes,
+        staged_shard_build_controller.emergency_memory_reserve_bytes,
+        &shard_build_telemetry,
     );
 
     let advance_completed_shards =
@@ -14520,6 +15138,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         Ok(LexicalRebuildShardBuildMessage::Built(result)) => {
                             active_shard_build_jobs = active_shard_build_jobs.saturating_sub(1);
                             received_shard_results = received_shard_results.saturating_add(1);
+                            shard_build_telemetry.record(&result);
                             pending_completed_shards.insert(result.shard.shard_index, result);
                         }
                         Ok(LexicalRebuildShardBuildMessage::Error { shard_index, error }) => {
@@ -14833,6 +15452,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         Ok(LexicalRebuildShardBuildMessage::Built(result)) => {
                             active_shard_build_jobs = active_shard_build_jobs.saturating_sub(1);
                             received_shard_results = received_shard_results.saturating_add(1);
+                            shard_build_telemetry.record(&result);
                             pending_completed_shards.insert(result.shard.shard_index, result);
                         }
                         Ok(LexicalRebuildShardBuildMessage::Error { shard_index, error }) => {
@@ -25250,6 +25870,10 @@ mod tests {
             indexed_docs,
             segments: 1,
             shard_index_path: shard_path.clone(),
+            message_bytes: shard.message_bytes,
+            index_size_bytes: 0,
+            build_duration_ms: 0,
+            amplification_milli: None,
         };
 
         let artifact = validate_lexical_rebuild_shard_build_result(&result).unwrap();
@@ -25331,6 +25955,10 @@ mod tests {
             indexed_docs: 1,
             segments: 1,
             shard_index_path: shard_path,
+            message_bytes: "mismatch alpha".len() + "mismatch beta".len(),
+            index_size_bytes: 0,
+            build_duration_ms: 0,
+            amplification_milli: None,
         };
 
         let err = validate_lexical_rebuild_shard_build_result(&result)
@@ -25418,6 +26046,10 @@ mod tests {
             indexed_docs,
             segments: 1,
             shard_index_path: shard_path.clone(),
+            message_bytes: shard.message_bytes,
+            index_size_bytes: 0,
+            build_duration_ms: 0,
+            amplification_milli: None,
         };
 
         // Pre-fix this would have errored with "indexed 2 docs but
@@ -25513,6 +26145,10 @@ mod tests {
             indexed_docs,
             segments: 1,
             shard_index_path: shard_path.clone(),
+            message_bytes: shard.message_bytes,
+            index_size_bytes: 0,
+            build_duration_ms: 0,
+            amplification_milli: None,
         };
 
         let err = validate_lexical_rebuild_shard_build_result(&result)
@@ -26303,7 +26939,7 @@ mod tests {
             controller_reason: "no_staged_merge_backlog".to_string(),
         };
 
-        let decision = controller.decide(&runtime, &staged_merge_runtime, 2, 3);
+        let decision = controller.decide(&runtime, &staged_merge_runtime, 2, 3, None);
 
         assert_eq!(decision.workers_max, 6);
         assert_eq!(decision.allowed_jobs, 5);
@@ -26328,7 +26964,7 @@ mod tests {
             controller_reason: "pipeline_active".to_string(),
         };
 
-        let decision = controller.decide(&runtime, &staged_merge_runtime, 3, 3);
+        let decision = controller.decide(&runtime, &staged_merge_runtime, 3, 3, None);
 
         assert_eq!(decision.workers_max, 6);
         assert_eq!(decision.allowed_jobs, 4);
@@ -26337,6 +26973,163 @@ mod tests {
         assert_eq!(
             decision.controller_reason,
             "reserving_2_slots_for_staged_merge_active_jobs_1_ready_groups_1"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_staged_shard_build_controller_pauses_new_jobs_at_emergency_memory_reserve() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
+            6,
+            None,
+            16 * GIB,
+            4 * GIB,
+        );
+        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            host_available_memory_bytes: Some(2 * GIB as u64),
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
+
+        let decision = controller.decide(&runtime, &staged_merge_runtime, 2, 4, Some(64 << 20));
+
+        assert_eq!(decision.allowed_jobs, 2);
+        assert_eq!(decision.active_jobs, 2);
+        assert_eq!(decision.pending_jobs, 4);
+        assert_eq!(
+            decision.controller_reason,
+            format!(
+                "host_available_memory_bytes_{}_below_emergency_reserve_{}_pausing_new_staged_shard_builds",
+                2 * GIB,
+                4 * GIB
+            )
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_staged_shard_build_controller_allows_one_idle_job_below_memory_reserve() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
+            6,
+            None,
+            16 * GIB,
+            4 * GIB,
+        );
+        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            host_available_memory_bytes: Some(8 * GIB as u64),
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
+
+        let decision = controller.decide(&runtime, &staged_merge_runtime, 0, 4, Some(64 << 20));
+
+        assert_eq!(decision.allowed_jobs, 1);
+        assert_eq!(
+            decision.controller_reason,
+            format!(
+                "host_available_memory_bytes_{}_below_reserve_{}_limiting_staged_shard_builds_to_1",
+                8 * GIB,
+                16 * GIB
+            )
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_staged_shard_build_controller_allows_small_idle_probe_below_emergency() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        const MIB: usize = 1024 * 1024;
+        let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
+            6,
+            None,
+            4 * GIB,
+            GIB,
+        );
+        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            host_available_memory_bytes: Some(768 * MIB as u64),
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
+
+        let decision = controller.decide(&runtime, &staged_merge_runtime, 0, 4, Some(MIB));
+
+        assert_eq!(decision.allowed_jobs, 1);
+        assert_eq!(
+            decision.controller_reason,
+            format!(
+                "host_available_memory_bytes_{}_below_emergency_reserve_{}_admitting_single_small_staged_shard_build_estimated_builder_bytes_{}",
+                768 * MIB,
+                GIB,
+                512 * MIB
+            )
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_staged_shard_build_controller_caps_override_fanout_by_memory_headroom() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
+            8,
+            None,
+            4 * GIB,
+            GIB,
+        );
+        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            host_available_memory_bytes: Some(8 * GIB as u64),
+            staged_shard_build_observed_amplification_milli: Some(24_000),
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
+
+        let decision = controller.decide(&runtime, &staged_merge_runtime, 0, 8, Some(64 << 20));
+
+        assert_eq!(decision.allowed_jobs, 1);
+        assert_eq!(
+            decision.controller_reason,
+            format!(
+                "host_available_memory_bytes_{}_reserve_{}_estimated_builder_bytes_{}_limiting_staged_shard_builds_to_1",
+                8 * GIB,
+                4 * GIB,
+                36usize * (64usize << 20)
+            )
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_shard_build_telemetry_records_conservative_amplification() {
+        let telemetry = LexicalRebuildShardBuildTelemetry::default();
+        let result = LexicalRebuildShardBuildResult {
+            shard: LexicalShardPlanShard {
+                shard_index: 7,
+                first_conversation_id: 10,
+                last_conversation_id: 11,
+                conversation_count: 2,
+                message_count: 4,
+                message_bytes: 1_000,
+                conversation_id_fingerprint: "fingerprint".to_string(),
+                oversized_single_conversation: false,
+            },
+            indexed_docs: 4,
+            segments: 1,
+            shard_index_path: PathBuf::from("/tmp/shard-7"),
+            message_bytes: 1_000,
+            index_size_bytes: 2_500,
+            build_duration_ms: 123,
+            amplification_milli: lexical_rebuild_amplification_milli(2_500, 1_000),
+        };
+
+        telemetry.record(&result);
+        let snapshot = telemetry.snapshot();
+
+        assert_eq!(snapshot.completed_jobs, 1);
+        assert_eq!(snapshot.last_shard_index, Some(7));
+        assert_eq!(snapshot.last_message_bytes, 1_000);
+        assert_eq!(snapshot.last_index_size_bytes, 2_500);
+        assert_eq!(snapshot.last_duration_ms, 123);
+        assert_eq!(snapshot.last_amplification_milli, Some(2_500));
+        assert_eq!(
+            snapshot.observed_amplification_milli,
+            Some(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI),
+            "admission should use a conservative floor until observed amplification exceeds it"
         );
     }
 
@@ -26693,6 +27486,76 @@ mod tests {
         );
 
         assert_eq!(budgets.max_message_bytes_per_shard, 65_536);
+    }
+
+    #[test]
+    #[serial]
+    fn lexical_rebuild_large_corpus_planner_keeps_5m_message_shards_byte_bounded() {
+        const CONVERSATIONS: usize = 56_512;
+        const MESSAGES: usize = 5_347_311;
+        const MESSAGE_BYTES: usize = 8 * 1024 * 1024 * 1024;
+        const SHARD_CAP: usize = 64 * 1024 * 1024;
+        let _cap = set_env(
+            "CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES",
+            &SHARD_CAP.to_string(),
+        );
+        let settings = LexicalRebuildPipelineSettingsSnapshot {
+            workers: 16,
+            available_parallelism: 16,
+            reserved_cores: 2,
+            tantivy_writer_threads: 8,
+            staged_shard_builders: 2,
+            staged_merge_workers: 2,
+            controller_mode: "steady".into(),
+            controller_restore_clear_samples: 3,
+            controller_restore_hold_ms: 0,
+            controller_loadavg_high_watermark_1m_milli: None,
+            controller_loadavg_low_watermark_1m_milli: None,
+            page_size: LEXICAL_REBUILD_PAGE_SIZE,
+            steady_batch_fetch_conversations: 1024,
+            startup_batch_fetch_conversations: 256,
+            steady_commit_every_conversations: 10_000,
+            startup_commit_every_conversations: 2_048,
+            steady_commit_every_messages: 800_000,
+            startup_commit_every_messages: 800_000,
+            steady_commit_every_message_bytes: 512 * 1024 * 1024,
+            startup_commit_every_message_bytes: 128 * 1024 * 1024,
+            pipeline_channel_size: 4,
+            page_prep_workers: 8,
+            pipeline_max_message_bytes_in_flight: 512 * 1024 * 1024,
+        };
+        let budgets = lexical_rebuild_default_shard_planner_budgets_for_totals(
+            &settings,
+            CONVERSATIONS,
+            MESSAGES,
+            MESSAGE_BYTES,
+        );
+        let mut conversations = Vec::with_capacity(CONVERSATIONS);
+        for idx in 0..CONVERSATIONS {
+            let message_count =
+                MESSAGES / CONVERSATIONS + usize::from(idx < MESSAGES % CONVERSATIONS);
+            let message_bytes =
+                MESSAGE_BYTES / CONVERSATIONS + usize::from(idx < MESSAGE_BYTES % CONVERSATIONS);
+            conversations.push(LexicalShardPlannerConversation {
+                conversation_id: i64::try_from(idx + 1).unwrap(),
+                message_count,
+                message_bytes,
+            });
+        }
+
+        let plan = plan_lexical_rebuild_shards(&conversations, budgets);
+
+        assert_eq!(budgets.max_message_bytes_per_shard, SHARD_CAP);
+        assert!(
+            plan.shards.len() >= MESSAGE_BYTES.div_ceil(SHARD_CAP),
+            "large corpus should be split into enough shards to keep Tantivy builder heaps bounded"
+        );
+        assert!(
+            plan.shards
+                .iter()
+                .all(|shard| shard.message_bytes <= SHARD_CAP),
+            "no synthetic 5M-message shard should exceed the staged shard byte cap"
+        );
     }
 
     #[test]
@@ -27901,7 +28764,7 @@ mod tests {
         );
 
         let saturation_deadline = Instant::now() + Duration::from_secs(5);
-        while rx.len() == 0 && Instant::now() < saturation_deadline {
+        while rx.is_empty() && Instant::now() < saturation_deadline {
             assert!(
                 !handle.is_finished(),
                 "producer finished before bounded handoff queue filled"
@@ -29147,6 +30010,14 @@ mod tests {
             .lock()
             .expect("lock host loadavg") = Some(7_250);
         *progress
+            .rebuild_pipeline_host_available_memory_bytes
+            .lock()
+            .expect("lock host available memory") = Some(123_456_789);
+        *progress
+            .rebuild_pipeline_process_rss_bytes
+            .lock()
+            .expect("lock process rss") = Some(98_765_432);
+        *progress
             .rebuild_pipeline_controller_mode
             .lock()
             .expect("lock controller mode") = "pressure_limited".to_string();
@@ -29191,6 +30062,36 @@ mod tests {
             .lock()
             .expect("lock staged shard-build reason") =
             "reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1".to_string();
+        progress
+            .rebuild_pipeline_staged_shard_build_memory_reserve_bytes
+            .store(16_000, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_staged_shard_build_emergency_memory_reserve_bytes
+            .store(4_000, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_staged_shard_build_completed_jobs
+            .store(7, Ordering::Relaxed);
+        *progress
+            .rebuild_pipeline_staged_shard_build_last_shard_index
+            .lock()
+            .expect("lock last shard index") = Some(6);
+        progress
+            .rebuild_pipeline_staged_shard_build_last_message_bytes
+            .store(65_000_000, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_staged_shard_build_last_index_size_bytes
+            .store(130_000_000, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_staged_shard_build_last_duration_ms
+            .store(2_500, Ordering::Relaxed);
+        *progress
+            .rebuild_pipeline_staged_shard_build_last_amplification_milli
+            .lock()
+            .expect("lock last amplification") = Some(2_000);
+        *progress
+            .rebuild_pipeline_staged_shard_build_observed_amplification_milli
+            .lock()
+            .expect("lock observed amplification") = Some(8_000);
 
         let snapshot = progress.snapshot_json(2500);
 
@@ -29247,6 +30148,14 @@ mod tests {
             serde_json::json!(7.25)
         );
         assert_eq!(
+            snapshot["rebuild_pipeline"]["host_available_memory_bytes"],
+            serde_json::json!(123_456_789)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["process_rss_bytes"],
+            serde_json::json!(98_765_432)
+        );
+        assert_eq!(
             snapshot["rebuild_pipeline"]["controller_mode"],
             serde_json::json!("pressure_limited")
         );
@@ -29297,6 +30206,42 @@ mod tests {
         assert_eq!(
             snapshot["rebuild_pipeline"]["staged_shard_build_controller_reason"],
             serde_json::json!("reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1")
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_memory_reserve_bytes"],
+            serde_json::json!(16_000)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_emergency_memory_reserve_bytes"],
+            serde_json::json!(4_000)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_completed_jobs"],
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_last_shard_index"],
+            serde_json::json!(6)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_last_message_bytes"],
+            serde_json::json!(65_000_000)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_last_index_size_bytes"],
+            serde_json::json!(130_000_000u64)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_last_duration_ms"],
+            serde_json::json!(2_500u64)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_last_amplification_milli"],
+            serde_json::json!(2_000u64)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["staged_shard_build_observed_amplification_milli"],
+            serde_json::json!(8_000u64)
         );
     }
 
@@ -37263,6 +38208,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_124_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         });
         state.record_pending_commit(
             Some(200),
@@ -37340,6 +38286,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_224_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         });
         state.record_pending_commit(
             Some(200),
@@ -37652,6 +38599,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_224_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         });
         persist_lexical_rebuild_state(&index_path, &state).unwrap();
 
@@ -37745,6 +38693,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_224_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         });
         persist_lexical_rebuild_state(&index_path, &stale_state).unwrap();
 
@@ -37825,6 +38774,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_111_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         });
         persist_lexical_rebuild_state(&index_path, &state).unwrap();
 
@@ -37857,6 +38807,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_222_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
 
         persist_pending_lexical_rebuild_progress(
@@ -37996,6 +38947,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_333_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
         let mut state = LexicalRebuildState::new(
             LexicalRebuildDbState {
@@ -38088,6 +39040,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: String::new(),
             updated_at_ms: 1_733_000_555_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
 
         commit_lexical_rebuild_progress(
@@ -38177,6 +39130,7 @@ mod tests {
             staged_shard_build_pending_jobs: 3,
             staged_shard_build_controller_reason: "backlog".to_string(),
             updated_at_ms: 1_733_000_444_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
         let base_meta_fingerprint = index_meta_fingerprint(&index_path).unwrap();
         let mut conversations_since_progress_persist = 1usize;
@@ -38255,6 +39209,7 @@ mod tests {
             staged_shard_build_pending_jobs: 3,
             staged_shard_build_controller_reason: "backlog".to_string(),
             updated_at_ms: 1_733_000_555_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         });
         persist_lexical_rebuild_state(&index_path, &state).unwrap();
 
@@ -38287,6 +39242,7 @@ mod tests {
             staged_shard_build_pending_jobs: 0,
             staged_shard_build_controller_reason: "builders_idle".to_string(),
             updated_at_ms: 1_733_000_666_000_i64,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
         let mut conversations_since_progress_persist = 0usize;
         let mut last_progress_persist = Instant::now();

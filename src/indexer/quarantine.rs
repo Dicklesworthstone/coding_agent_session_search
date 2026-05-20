@@ -133,9 +133,8 @@ impl QuarantineState {
         }
     }
 
-    /// Atomically write the quarantine state to disk. Uses a temp file
-    /// + rename so partial writes can never produce a corrupt
-    /// quarantine_state.json.
+    /// Atomically write the quarantine state to disk via temp file + rename,
+    /// so partial writes can never produce a corrupt quarantine_state.json.
     pub fn save(&self, data_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(data_dir)?;
         let final_path = Self::path(data_dir);
