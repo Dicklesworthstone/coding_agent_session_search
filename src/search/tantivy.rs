@@ -1998,7 +1998,9 @@ mod tests {
     fn index_dir_creates_versioned_path() {
         let dir = TempDir::new().expect("temp dir");
         let result = index_dir(dir.path()).expect("index dir");
-        assert!(result.ends_with("index/v7"));
+        // frankensearch CASS_SCHEMA_VERSION bumped v7 -> v8 with the tantivy 0.26.1
+        // upgrade (rev 2cad158f / frankensearch 0.3.2).
+        assert!(result.ends_with("index/v8"));
     }
 
     #[test]
