@@ -17,6 +17,17 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## Unreleased
 
+## [v0.5.2] -- 2026-05-21
+
+**Data-loss fix: stop v0.5.1's quarantine system from permanently dropping active sessions and small JSONLs.**
+
+Two coupled fixes for [#251](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/251), where 63% of `cass index --watch` ingest attempts on macOS were being permanently quarantined as "out of memory", including 2.4 KB files and the JSONLs Claude Code was actively writing to.
+
+- **OOM detection is now typed, not a substring match.** `is_out_of_memory_error` (`src/storage/sqlite.rs`) and `error_is_out_of_memory` (`src/indexer/mod.rs`) walk the `anyhow::Error` chain and look for `frankensqlite::FrankenError::OutOfMemory` via `downcast_ref`, mirroring the existing `retryable_franken_anyhow` pattern. The previous heuristic — `error.to_string().to_lowercase().contains("out of memory")` — caught every error chain whose rendered text included that phrase, including frankensqlite's typed `OutOfMemory` variant emitted for non-process-OOM internal conditions (VFS buffer / VDBE register allocation) and any context layer mentioning memory. Quarantine records now also capture the full `error.chain()` so post-mortem triage shows the actual subsystem instead of the bare "out of memory" line.
+- **Active-source filter now has an mtime fallback that catches macOS append-mode writes.** `ActiveSessionSourceFilter::active_writer_reason` (`src/indexer/mod.rs`) consults `metadata.modified()` *first*, before the lsof-fd and advisory-lock probes. If a session JSONL was modified inside `CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS` (default `120s`), the filter skips it. Claude Code's macOS writer holds no writable fd that `lsof` advertises and takes no advisory lock, so the previous filter never fired and mid-write JSONLs were ingested, failed mid-parse, and got quarantined.
+
+Both fixes ship together by necessity: tightening OOM detection without the mtime fallback pushes mid-write parse errors back onto the v0.4.7 (#250) hard-error / exit-9 crash-loop path that was the original quarantine system's reason to exist.
+
 ## [v0.5.1] -- 2026-05-21
 
 **Watch-mode reliability: no more silent crash-loops, redundant salvage re-scans, or unrecoverable rebuild loops.**

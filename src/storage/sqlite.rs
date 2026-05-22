@@ -14558,10 +14558,48 @@ fn rebuild_batch_size_env(var: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn is_out_of_memory_error(err: &impl std::fmt::Display) -> bool {
-    err.to_string()
-        .to_ascii_lowercase()
-        .contains("out of memory")
+/// Returns true when the error chain represents a real `FrankenError::OutOfMemory`
+/// (typed variant) or a bare "out of memory" / "not enough memory" message.
+///
+/// We *deliberately* do not do substring matching on the rendered chain: frankensqlite's
+/// `FrankenError::OutOfMemory` renders as the literal "out of memory" and is also emitted
+/// for several non-process-OOM internal conditions (VFS buffer / VDBE register allocation).
+/// Contextual messages like "connector parse failed: not enough memory in record" must not
+/// be promoted into the OOM-bisect/quarantine path. See `retryable_franken_anyhow` above
+/// for the same downcast idiom.
+fn is_out_of_memory_error<E: OutOfMemoryProbe + ?Sized>(err: &E) -> bool {
+    err.is_out_of_memory()
+}
+
+trait OutOfMemoryProbe {
+    fn is_out_of_memory(&self) -> bool;
+}
+
+impl OutOfMemoryProbe for anyhow::Error {
+    fn is_out_of_memory(&self) -> bool {
+        self.chain().any(|cause| {
+            if cause
+                .downcast_ref::<frankensqlite::FrankenError>()
+                .is_some_and(|err| matches!(err, frankensqlite::FrankenError::OutOfMemory))
+            {
+                return true;
+            }
+            is_exact_out_of_memory_message(&cause.to_string())
+        })
+    }
+}
+
+impl OutOfMemoryProbe for frankensqlite::FrankenError {
+    fn is_out_of_memory(&self) -> bool {
+        matches!(self, frankensqlite::FrankenError::OutOfMemory)
+    }
+}
+
+fn is_exact_out_of_memory_message(message: &str) -> bool {
+    matches!(
+        message.trim().to_ascii_lowercase().as_str(),
+        "out of memory" | "not enough memory"
+    )
 }
 
 // Second SqliteStorage impl block removed: SqliteStorage is now a type alias for FrankenStorage.

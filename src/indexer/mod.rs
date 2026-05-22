@@ -104,29 +104,92 @@ struct SourceFileId {
     ino: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveSessionSourceReason {
+    TestOverride,
+    WritableFileDescriptor,
+    AdvisoryLock,
+    RecentlyModified,
+}
+
 #[derive(Debug, Default)]
 struct ActiveSessionSourceFilter {
     writable_file_ids: HashSet<SourceFileId>,
+    recent_write_window: Option<Duration>,
 }
 
 impl ActiveSessionSourceFilter {
-    fn new() -> Self {
+    fn new(enable_recent_write_window: bool) -> Self {
         Self {
             writable_file_ids: collect_writable_open_session_file_ids(),
+            recent_write_window: active_session_recent_write_window(enable_recent_write_window),
         }
     }
 
-    fn is_active_writer_source(&self, path: &Path) -> bool {
+    #[cfg(test)]
+    fn with_recent_write_window_for_test(recent_write_window: Option<Duration>) -> Self {
+        Self {
+            writable_file_ids: HashSet::new(),
+            recent_write_window,
+        }
+    }
+
+    fn active_writer_reason(&self, path: &Path) -> Option<ActiveSessionSourceReason> {
         if !is_session_log_source_candidate(path) {
-            return false;
+            return None;
         }
         if test_active_session_source_path_matches(path) {
-            return true;
+            return Some(ActiveSessionSourceReason::TestOverride);
+        }
+        // Cheap mtime check first: a single `stat` is dramatically cheaper than
+        // walking `/proc/*/fd` (Linux) or shelling out to `lsof` (macOS), and it
+        // is the only signal that catches macOS Claude Code's buffered-append
+        // writers (which hold no writable fd advertised through lsof and do not
+        // take advisory locks). False positives just defer a just-finished file
+        // to the next watch cycle (acceptable). See #251 — the v0.5.1 data-loss
+        // regression — for the original root cause.
+        if self
+            .recent_write_window
+            .is_some_and(|window| source_file_recently_modified(path, window))
+        {
+            tracing::debug!(
+                source_path = %path.display(),
+                "active-source filter: mtime fallback fired"
+            );
+            return Some(ActiveSessionSourceReason::RecentlyModified);
         }
         if source_file_id(path).is_some_and(|file_id| self.writable_file_ids.contains(&file_id)) {
-            return true;
+            return Some(ActiveSessionSourceReason::WritableFileDescriptor);
         }
-        source_file_has_active_advisory_lock(path)
+        if source_file_has_active_advisory_lock(path) {
+            return Some(ActiveSessionSourceReason::AdvisoryLock);
+        }
+        None
+    }
+}
+
+fn active_session_recent_write_window(enable_recent_write_window: bool) -> Option<Duration> {
+    if !enable_recent_write_window {
+        return None;
+    }
+    let seconds = dotenvy::var("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(120)
+        .min(3_600);
+    (seconds > 0).then_some(Duration::from_secs(seconds))
+}
+
+fn source_file_recently_modified(path: &Path, window: Duration) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified_at) = metadata.modified() else {
+        return false;
+    };
+    match SystemTime::now().duration_since(modified_at) {
+        Ok(age) => age <= window,
+        Err(_) => true,
     }
 }
 
@@ -161,15 +224,16 @@ fn should_skip_active_session_source(
     if source_id != LOCAL_SOURCE_ID {
         return false;
     }
-    let active = active_source_filter.is_active_writer_source(source_path);
-    if active {
-        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
-        tracing::debug!(
-            source_path = %source_path.display(),
-            "skipping session source currently open for writing"
-        );
-    }
-    active
+    let Some(reason) = active_source_filter.active_writer_reason(source_path) else {
+        return false;
+    };
+    ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
+    tracing::info!(
+        source_path = %source_path.display(),
+        ?reason,
+        "skipping session source that appears to be actively written"
+    );
+    true
 }
 
 #[cfg(unix)]
@@ -3149,7 +3213,9 @@ fn assign_lexical_rebuild_flow_reservation_bytes(
         .map(|packet| packet.message_bytes)
         .sum::<usize>();
     if total_message_bytes == 0 {
-        packets[0].flow_reservation_bytes = reserved_bytes;
+        if let Some(first_packet) = packets.first_mut() {
+            first_packet.flow_reservation_bytes = reserved_bytes;
+        }
         return;
     }
 
@@ -3167,6 +3233,36 @@ fn assign_lexical_rebuild_flow_reservation_bytes(
         packet.flow_reservation_bytes = share;
         remaining_reserved = remaining_reserved.saturating_sub(share);
         remaining_message_bytes = remaining_message_bytes.saturating_sub(packet.message_bytes);
+    }
+}
+
+struct StreamingBatchFlowReservation<'a> {
+    limiter: Option<&'a StreamingByteLimiter>,
+    reserved_bytes: usize,
+}
+
+impl<'a> StreamingBatchFlowReservation<'a> {
+    fn new(limiter: Option<&'a StreamingByteLimiter>, reserved_bytes: usize) -> Self {
+        Self {
+            limiter,
+            reserved_bytes,
+        }
+    }
+
+    fn release_now(&mut self) {
+        let reserved_bytes = std::mem::take(&mut self.reserved_bytes);
+        if reserved_bytes == 0 {
+            return;
+        }
+        if let Some(limiter) = self.limiter {
+            limiter.release(reserved_bytes);
+        }
+    }
+}
+
+impl Drop for StreamingBatchFlowReservation<'_> {
+    fn drop(&mut self) {
+        self.release_now();
     }
 }
 
@@ -3225,6 +3321,10 @@ fn flush_streamed_lexical_rebuild_batch(
         .iter()
         .map(|packet| packet.flow_reservation_bytes)
         .sum::<usize>();
+    let mut flow_reservation = StreamingBatchFlowReservation::new(
+        lexical_rebuild_flow_limiter,
+        chunk_flow_reservation_bytes,
+    );
     let chunk_limit = *current_batch_conversation_limit;
     let prepare_started = perf_profile.as_ref().map(|_| Instant::now());
     let prepared_docs =
@@ -3250,9 +3350,7 @@ fn flush_streamed_lexical_rebuild_batch(
     }
     *messages_since_commit = (*messages_since_commit).saturating_add(chunk_message_count);
     *message_bytes_since_commit = (*message_bytes_since_commit).saturating_add(chunk_message_bytes);
-    if let Some(flow_limiter) = lexical_rebuild_flow_limiter {
-        flow_limiter.release(chunk_flow_reservation_bytes);
-    }
+    flow_reservation.release_now();
     tracing::info!(
         page_size,
         packet_version = pending_batch
@@ -10499,7 +10597,9 @@ fn run_streaming_index_with_connector_factories(
         additional_scan_roots: additional_scan_roots.clone(),
         since_ts,
         progress: opts.progress.clone(),
-        active_source_filter: Arc::new(ActiveSessionSourceFilter::new()),
+        active_source_filter: Arc::new(ActiveSessionSourceFilter::new(
+            opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
+        )),
     };
 
     // Spawn producer threads for each connector
@@ -10638,7 +10738,9 @@ fn run_batch_index_with_connector_factories(
 
     let progress_ref = opts.progress.as_ref();
     let data_dir = opts.data_dir.clone();
-    let active_source_filter = Arc::new(ActiveSessionSourceFilter::new());
+    let active_source_filter = Arc::new(ActiveSessionSourceFilter::new(
+        opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
+    ));
 
     // Return type includes whether agent was discovered (for post-parallel name collection)
     let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>, bool)> =
@@ -17317,7 +17419,10 @@ fn ingest_non_watch_batch_once(
     defer_checkpoints: bool,
 ) -> Result<NonWatchIngestOutcome> {
     if should_inject_non_watch_ingest_test_oom(convs) {
-        anyhow::bail!("out of memory");
+        // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
+        // exercises the downcast path that real frankensqlite OOMs hit, instead
+        // of relying on the plain-string fallback.
+        return Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory));
     }
 
     ingest_batch_detailed(
@@ -17523,7 +17628,10 @@ fn ingest_watch_batch_with_oom_split(
     debug_assert!(!convs.is_empty());
 
     let batch_result = if should_inject_watch_ingest_test_oom(convs) {
-        Err(anyhow::anyhow!("out of memory"))
+        // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
+        // exercises the downcast path that real frankensqlite OOMs hit, instead
+        // of relying on the plain-string fallback.
+        Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
     } else {
         let mut semantic_delta = WatchSemanticDelta::default();
         ingest_batch_with_semantic_delta(
@@ -17592,7 +17700,7 @@ fn ingest_watch_batch_with_oom_split(
                 batch_outcome: persist::PersistBatchOutcome::default(),
                 processed_conversations: 1,
                 quarantined_conversations: 1,
-                max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
+                max_payload_watermark_ms: None,
             })
         }
         Err(error) => Err(error),
@@ -17644,9 +17752,45 @@ fn save_watch_state_watermark(
 
 fn error_is_out_of_memory(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        let message = cause.to_string().to_ascii_lowercase();
-        message.contains("out of memory") || message.contains("not enough memory")
+        if cause
+            .downcast_ref::<frankensqlite::FrankenError>()
+            .is_some_and(|err| matches!(err, frankensqlite::FrankenError::OutOfMemory))
+        {
+            return true;
+        }
+        error_message_is_exact_out_of_memory(&cause.to_string())
     })
+}
+
+fn error_message_is_exact_out_of_memory(message: &str) -> bool {
+    matches!(
+        message.trim().to_ascii_lowercase().as_str(),
+        "out of memory" | "not enough memory"
+    )
+}
+
+/// Render the full `anyhow::Error` chain as ` | `-joined causes so quarantine
+/// records preserve which subsystem produced the error. The top-level
+/// `error.to_string()` only shows the outermost cause, which for typed
+/// `FrankenError::OutOfMemory` is the bare literal "out of memory" — useless
+/// for triage.
+fn format_error_chain(error: &anyhow::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for cause in error.chain() {
+        let rendered = cause.to_string();
+        let trimmed = rendered.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if parts.last().is_some_and(|prev| prev == trimmed) {
+            continue;
+        }
+        parts.push(trimmed.to_string());
+    }
+    if parts.is_empty() {
+        return error.to_string();
+    }
+    parts.join(" | ")
 }
 
 fn record_watch_poison_conversation(
@@ -17680,6 +17824,8 @@ fn record_index_poison_conversation(
 const WATCH_INGEST_POISON_FILE: &str = "watch_ingest_poison.jsonl";
 const INDEX_INGEST_POISON_FILE: &str = "index_ingest_poison.jsonl";
 const POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION: i64 = 1;
+const INGEST_QUARANTINE_CIRCUIT_DEFAULT_WINDOW_SECONDS: i64 = 3_600;
+const INGEST_QUARANTINE_CIRCUIT_DEFAULT_LIMIT: usize = 25;
 
 fn record_poison_conversation(
     data_dir: &Path,
@@ -17737,6 +17883,12 @@ fn record_poison_conversation(
         .unwrap_or(0)
         .saturating_add(1);
 
+    // Capture the FULL error chain in `last_error` so post-mortem triage can
+    // see why the OOM bubbled up (which crate, which operation). Without this
+    // we only saw the top-level `anyhow::Error::Display` rendering, which for
+    // `FrankenError::OutOfMemory` is just the bare string "out of memory" and
+    // tells us nothing about which subsystem failed.
+    let full_error_chain = format_error_chain(error);
     let record = serde_json::json!({
         "schema_version": POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION,
         "conversation_id": conversation_id,
@@ -17746,7 +17898,7 @@ fn record_poison_conversation(
         "attempt_count": attempt_count,
         "reason": reason,
         "error_kind": "out-of-memory",
-        "last_error": error.to_string(),
+        "last_error": full_error_chain,
         "error": error.to_string(),
         "agent_slug": conv.agent_slug,
         "external_id": conv.external_id.as_deref(),
@@ -17903,6 +18055,10 @@ pub struct ConversationIngestQuarantineSummary {
     pub schema_version: i64,
     pub status: String,
     pub quarantined_conversations: usize,
+    pub recent_quarantined_conversations: usize,
+    pub recent_window_seconds: i64,
+    pub circuit_breaker_limit: usize,
+    pub circuit_breaker_active: bool,
     pub quarantine_files: Vec<String>,
     pub newest_last_attempt_at_ms: Option<i64>,
     pub recommended_action: Option<String>,
@@ -17913,16 +18069,25 @@ pub fn conversation_ingest_quarantine_summary(
 ) -> ConversationIngestQuarantineSummary {
     let quarantine_dir = data_dir.join("quarantine");
     let mut keys = BTreeSet::<(String, i64)>::new();
+    let mut recent_keys = BTreeSet::<(String, i64)>::new();
     let mut quarantine_files = Vec::new();
     let mut newest_last_attempt_at_ms: Option<i64> = None;
+    let recent_window_seconds = ingest_quarantine_circuit_window_seconds();
+    let recent_cutoff_ms =
+        FrankenStorage::now_millis().saturating_sub(recent_window_seconds.saturating_mul(1_000));
+    let circuit_breaker_limit = ingest_quarantine_circuit_limit();
 
     let state_path = QuarantineState::path(data_dir);
     if state_path.exists() {
         quarantine_files.push(state_path.display().to_string());
         let state = QuarantineState::load(data_dir);
         for (key, record) in state.iter() {
-            keys.insert((key.conversation_id, i64::from(key.schema_version)));
             let last_attempt_at_ms = record.last_attempt_at.timestamp_millis();
+            let summary_key = (key.conversation_id, i64::from(key.schema_version));
+            keys.insert(summary_key.clone());
+            if last_attempt_at_ms >= recent_cutoff_ms {
+                recent_keys.insert(summary_key);
+            }
             newest_last_attempt_at_ms = Some(
                 newest_last_attempt_at_ms.map_or(last_attempt_at_ms, |current| {
                     current.max(last_attempt_at_ms)
@@ -17948,9 +18113,7 @@ pub fn conversation_ingest_quarantine_summary(
             let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
                 continue;
             };
-            if let Some(key) = poison_record_key_from_value(&value) {
-                keys.insert(key);
-            }
+            let key = poison_record_key_from_value(&value);
             if let Some(last_attempt_at_ms) = value
                 .get("last_attempt_at_ms")
                 .and_then(serde_json::Value::as_i64)
@@ -17960,31 +18123,70 @@ pub fn conversation_ingest_quarantine_summary(
                         .and_then(serde_json::Value::as_i64)
                 })
             {
+                if let Some(key) = key.as_ref()
+                    && last_attempt_at_ms >= recent_cutoff_ms
+                {
+                    recent_keys.insert(key.clone());
+                }
                 newest_last_attempt_at_ms = Some(
                     newest_last_attempt_at_ms.map_or(last_attempt_at_ms, |current| {
                         current.max(last_attempt_at_ms)
                     }),
                 );
             }
+            if let Some(key) = key {
+                keys.insert(key);
+            }
         }
     }
 
     let quarantined_conversations = keys.len();
+    let recent_quarantined_conversations = recent_keys.len();
+    let circuit_breaker_active =
+        circuit_breaker_limit > 0 && recent_quarantined_conversations >= circuit_breaker_limit;
     ConversationIngestQuarantineSummary {
         schema_version: POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION,
-        status: if quarantined_conversations > 0 {
+        status: if circuit_breaker_active {
+            "critical".to_string()
+        } else if quarantined_conversations > 0 {
             "degraded".to_string()
         } else {
             "ok".to_string()
         },
         quarantined_conversations,
+        recent_quarantined_conversations,
+        recent_window_seconds,
+        circuit_breaker_limit,
+        circuit_breaker_active,
         quarantine_files,
         newest_last_attempt_at_ms,
-        recommended_action: (quarantined_conversations > 0).then(|| {
-            "Inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` or run a bounded full refresh."
-                .to_string()
-        }),
+        recommended_action: if circuit_breaker_active {
+            Some(
+                "Quarantine volume exceeded the recent circuit-breaker threshold; pause the watcher, inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` before resuming watch."
+                    .to_string(),
+            )
+        } else {
+            (quarantined_conversations > 0).then(|| {
+                "Inspect the listed quarantine file(s), then retry repaired source paths with `cass index --watch-once <path> --json --no-progress-events` or run a bounded full refresh."
+                    .to_string()
+            })
+        },
     }
+}
+
+fn ingest_quarantine_circuit_window_seconds() -> i64 {
+    dotenvy::var("CASS_INGEST_QUARANTINE_CIRCUIT_WINDOW_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(INGEST_QUARANTINE_CIRCUIT_DEFAULT_WINDOW_SECONDS)
+}
+
+fn ingest_quarantine_circuit_limit() -> usize {
+    dotenvy::var("CASS_INGEST_QUARANTINE_CIRCUIT_LIMIT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(INGEST_QUARANTINE_CIRCUIT_DEFAULT_LIMIT)
 }
 
 #[cfg(test)]
@@ -18411,7 +18613,9 @@ fn reindex_paths_with_semantic_delta(
 
     let mut semantic_delta = semantic_delta;
     let preserve_watch_watermark = scan_path_exclusions_active();
-    let active_source_filter = ActiveSessionSourceFilter::new();
+    let active_source_filter = ActiveSessionSourceFilter::new(
+        opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
+    );
 
     for (kind, root, min_ts, max_ts) in triggers {
         let conn = kind.create_connector();
@@ -18669,9 +18873,16 @@ fn reindex_paths_with_semantic_delta(
 
                 if !explicit_watch_once
                     && !preserve_this_watch_watermark
+                    && chunk_outcome.quarantined_conversations == 0
                     && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
                 {
                     save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
+                } else if chunk_outcome.quarantined_conversations > 0 {
+                    tracing::info!(
+                        ?kind,
+                        quarantined_conversations = chunk_outcome.quarantined_conversations,
+                        "preserving partial watch watermark so quarantined source can be retried"
+                    );
                 } else if preserve_this_watch_watermark {
                     tracing::debug!(
                         ?kind,
@@ -18730,14 +18941,21 @@ fn reindex_paths_with_semantic_delta(
         if !explicit_watch_once
             && conv_count > 0
             && !preserve_this_watch_watermark
+            && quarantined_conversations == 0
             && let Some(ts_val) = max_ts
         {
-            // Once every chunk for this trigger has either persisted or been
-            // explicitly quarantined, advance to the filesystem event
-            // high-water mark. Partial per-chunk updates above deliberately
-            // use payload timestamps so an unexpected later failure cannot
-            // hide unprocessed conversations that share the same source file.
+            // Once every chunk for this trigger has persisted without poison
+            // quarantine, advance to the filesystem event high-water mark.
+            // Partial per-chunk updates above deliberately use payload
+            // timestamps so an unexpected later failure cannot hide
+            // unprocessed conversations that share the same source file.
             save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
+        } else if !explicit_watch_once && quarantined_conversations > 0 {
+            tracing::info!(
+                ?kind,
+                quarantined_conversations,
+                "preserving final watch watermark so quarantined source can be retried"
+            );
         } else if !explicit_watch_once && conv_count > 0 && preserve_this_watch_watermark {
             tracing::info!(
                 ?kind,
@@ -25033,6 +25251,112 @@ mod tests {
     }
 
     #[test]
+    fn active_session_recent_write_detection_is_watch_opt_in() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source_path = tmp.path().join("active-session.jsonl");
+        std::fs::write(&source_path, b"{\"type\":\"session\"}\n").expect("write source");
+
+        let inactive_filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(None);
+        assert_eq!(inactive_filter.active_writer_reason(&source_path), None);
+
+        let active_filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(Some(
+            Duration::from_secs(3_600),
+        ));
+        assert_eq!(
+            active_filter.active_writer_reason(&source_path),
+            Some(ActiveSessionSourceReason::RecentlyModified)
+        );
+    }
+
+    #[test]
+    fn out_of_memory_classifier_rejects_contextual_substrings() {
+        let typed: anyhow::Error = frankensqlite::FrankenError::OutOfMemory.into();
+        assert!(error_is_out_of_memory(&typed));
+
+        let exact = anyhow::anyhow!("out of memory");
+        assert!(error_is_out_of_memory(&exact));
+
+        let contextual = anyhow::anyhow!("connector parse failed: not enough memory in record");
+        assert!(
+            !error_is_out_of_memory(&contextual),
+            "contextual text must not be promoted into permanent OOM quarantine"
+        );
+    }
+
+    #[test]
+    fn poison_quarantine_record_preserves_full_error_chain() {
+        use crate::connectors::{NormalizedConversation, NormalizedMessage};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let data_dir = tmp.path().join("poison-chain");
+
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: Some("chain-capture-conv".into()),
+            title: Some("chain capture".into()),
+            workspace: Some(std::path::PathBuf::from("/ws/chain")),
+            source_path: std::path::PathBuf::from("/log/chain.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_010),
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1_700_000_000_005),
+                content: "trigger".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+
+        // Build a realistic wrapped chain: low-level FrankenError::OutOfMemory
+        // bubbling up through two layers of context (mirrors how it actually
+        // arrives at the quarantine path inside the watch ingest flow).
+        let typed: anyhow::Error = frankensqlite::FrankenError::OutOfMemory.into();
+        let with_inner_ctx = typed.context("vdbe register allocation");
+        let error: anyhow::Error = with_inner_ctx.context("ingest_batch_with_semantic_delta");
+
+        super::record_poison_conversation(
+            &data_dir,
+            WATCH_INGEST_POISON_FILE,
+            "watch-ingest-out-of-memory",
+            &conv,
+            &error,
+        )
+        .expect("record poison");
+
+        let path = data_dir.join("quarantine").join(WATCH_INGEST_POISON_FILE);
+        let contents = std::fs::read_to_string(&path).expect("read quarantine file");
+        let line = contents
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .expect("at least one record");
+        let value: serde_json::Value = serde_json::from_str(line).expect("parse record");
+        let last_error = value
+            .get("last_error")
+            .and_then(serde_json::Value::as_str)
+            .expect("last_error string");
+        assert!(
+            last_error.contains("ingest_batch_with_semantic_delta"),
+            "last_error must include outer context: {last_error}"
+        );
+        assert!(
+            last_error.contains("vdbe register allocation"),
+            "last_error must include intermediate context: {last_error}"
+        );
+        assert!(
+            last_error.contains("out of memory"),
+            "last_error must include innermost cause: {last_error}"
+        );
+        assert!(
+            last_error.contains(" | "),
+            "last_error must be ` | `-joined chain: {last_error}"
+        );
+    }
+
+    #[test]
     fn heartbeat_index_run_lock_refreshes_updated_at_without_touching_identity_fields() {
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("index-run.lock");
@@ -25050,17 +25374,22 @@ mod tests {
         assert!(refreshed.contains("started_at_ms=111"));
         assert!(refreshed.contains("db_path=/tmp/db.sqlite"));
         assert!(refreshed.contains("job_id=lexical_refresh-123"));
-        let updated_at_values: Vec<i64> = refreshed
+        let updated_at_raw_values: Vec<&str> = refreshed
             .lines()
             .filter_map(|line| line.strip_prefix("updated_at_ms="))
-            .map(|value| value.parse::<i64>().unwrap())
             .collect();
         assert_eq!(
-            updated_at_values.len(),
+            updated_at_raw_values.len(),
             1,
             "heartbeat refresh should replace the existing updated_at_ms line"
         );
-        assert!(updated_at_values[0] >= 222);
+        let updated_at_value = updated_at_raw_values
+            .first()
+            .and_then(|value| value.parse::<i64>().ok());
+        assert!(
+            updated_at_value.is_some_and(|value| value >= 222),
+            "updated_at_ms should be parseable and should not move backwards: {updated_at_raw_values:?}"
+        );
 
         let temp_artifacts: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
@@ -26006,6 +26335,25 @@ mod tests {
         );
         assert_eq!(packets[1].flow_reservation_bytes, 0);
         assert!(packets[2].flow_reservation_bytes >= packets[0].flow_reservation_bytes);
+    }
+
+    #[test]
+    fn streaming_batch_flow_reservation_releases_on_drop_and_is_idempotent() {
+        let limiter = StreamingByteLimiter::new(16);
+        let reserved = limiter.acquire(7).unwrap();
+        {
+            let _guard = StreamingBatchFlowReservation::new(Some(&limiter), reserved);
+            assert_eq!(limiter.bytes_in_flight(), reserved);
+        }
+        assert_eq!(limiter.bytes_in_flight(), 0);
+
+        let reserved = limiter.acquire(5).unwrap();
+        {
+            let mut guard = StreamingBatchFlowReservation::new(Some(&limiter), reserved);
+            guard.release_now();
+            guard.release_now();
+        }
+        assert_eq!(limiter.bytes_in_flight(), 0);
     }
 
     #[test]
@@ -37319,6 +37667,11 @@ mod tests {
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
         let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "2");
         let _chunk_guard = set_env("CASS_WATCH_INGEST_CHUNK_SIZE", "4");
+        // Disable the mtime fallback for this test — we just wrote the source
+        // files, so they would all trip the active-source filter and never be
+        // ingested. The OOM-split behavior we want to verify here is unrelated
+        // to the active-source skip path.
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
 
         let data_dir = xdg.join("amp");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -37409,6 +37762,79 @@ mod tests {
         } else {
             unsafe { std::env::remove_var("XDG_DATA_HOME") };
         }
+    }
+
+    #[test]
+    #[serial]
+    fn watch_reindex_quarantine_preserves_watermark_for_retry() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-quarantine-retry");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let now_u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let created_at = i64::try_from(now_u128)
+            .unwrap_or(i64::MAX)
+            .saturating_add(10_000);
+        let amp_file = amp_dir.join("thread-watch-quarantine-retry.json");
+        std::fs::write(
+            &amp_file,
+            format!(
+                r#"{{"id":"thread-watch-quarantine-retry","messages":[{{"role":"user","text":"retry me","createdAt":{created_at}}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![amp_file],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 1);
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "quarantined watch sources must remain eligible for later retry"
+        );
+        assert!(
+            data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "watch OOM should still be recorded for operator visibility"
+        );
     }
 
     #[test]
@@ -37601,6 +38027,71 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn watch_mode_recent_session_source_skips_without_quarantine_or_watermarking() {
+        let _active_skip_reset = ActiveSessionSkipReset;
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("recent-active-source-skip");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let amp_file = amp_dir.join("thread-recent-active-source.json");
+        std::fs::write(
+            &amp_file,
+            r#"{"id":"thread-recent-active-source","messages":[{"role":"user","text":"still streaming","createdAt":1700000000100}]}"#,
+        )
+        .unwrap();
+
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "3600");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_file.clone()))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![amp_file.clone()],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 0);
+        let last_indexed_at = storage.lock().unwrap().get_last_indexed_at().unwrap();
+        assert_eq!(
+            last_indexed_at, None,
+            "recent active source skips must not advance last_indexed_at"
+        );
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "recent active source skips are retryable, not poison quarantine"
+        );
+    }
+
+    #[test]
     fn watch_conversation_sort_orders_missing_then_ascending_watermarks() {
         fn conv(
             source: &str,
@@ -37643,6 +38134,12 @@ mod tests {
         std::fs::create_dir_all(&xdg).unwrap();
         let prev = dotenvy::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
+        // Disable the active-source mtime fallback: the test writes the source
+        // file inline and immediately calls reindex_paths in watch mode, so
+        // every fresh write would otherwise be skipped as "still being
+        // written". The semantic-delta behavior under test is independent of
+        // the active-source filter.
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
 
         let data_dir = xdg.join("amp");
         std::fs::create_dir_all(&data_dir).unwrap();
