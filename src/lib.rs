@@ -5499,6 +5499,89 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
     result
 }
 
+/// Run startup-sensitive commands before constructing the async runtime.
+///
+/// `cass health --json` is documented as a <50ms fast-readiness surface. Even
+/// the current-thread runtime setup is visible in subprocess latency tests, so
+/// keep this command on a synchronous path and leave the general async runner
+/// for commands that actually need it.
+pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<ParsedCli>> {
+    let ParsedCli {
+        cli,
+        raw_args,
+        parse_note,
+        heuristic_note,
+    } = parsed;
+
+    let Some(Commands::Health {
+        data_dir,
+        robot_meta,
+        stale_threshold,
+        json,
+    }) = cli.command.clone()
+    else {
+        return Err(Box::new(ParsedCli {
+            cli,
+            raw_args,
+            parse_note,
+            heuristic_note,
+        }));
+    };
+
+    let stdout_is_tty = io::stdout().is_terminal();
+    let stderr_is_tty = io::stderr().is_terminal();
+    configure_color(cli.color, stdout_is_tty, stderr_is_tty);
+
+    let start_ts = Utc::now();
+    let start_instant = Instant::now();
+    let command_label = describe_command(&cli);
+
+    let is_robot_mode = raw_args
+        .iter()
+        .any(|s| matches!(s.as_str(), "--json" | "--robot" | "-json" | "-robot"))
+        || cli.robot_format.is_some()
+        || robot_format_from_env().is_some();
+    let all_notes: Vec<&str> = [parse_note.as_deref(), heuristic_note.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    if !all_notes.is_empty() && !is_robot_mode {
+        eprintln!("Note: Your command was auto-corrected:");
+        for note in &all_notes {
+            eprintln!("  • {note}");
+        }
+        eprintln!("Tip: Run 'cass --help' for proper syntax.");
+    }
+
+    let structured_format = resolve_subcommand_structured_format(&cli, json);
+    let result = run_health(
+        &data_dir,
+        cli.db.clone(),
+        structured_format,
+        stale_threshold,
+        robot_meta,
+    );
+
+    if let Some(path) = &cli.trace_file {
+        let duration_ms = start_instant.elapsed().as_millis();
+        let exit_code = result.as_ref().map_or_else(|e| e.code, |()| 0);
+        if let Err(trace_err) = write_trace_line(
+            path,
+            &command_label,
+            &cli,
+            &start_ts,
+            duration_ms,
+            exit_code,
+            result.as_ref().err(),
+        ) {
+            eprintln!("trace-write error: {trace_err}");
+        }
+    }
+
+    Ok(result)
+}
+
 async fn execute_cli(
     cli: &Cli,
     wrap: WrapConfig,
@@ -11758,7 +11841,11 @@ fn state_meta_json_inner(
     }
     let lexical = &assets.lexical;
     let semantic = &assets.semantic;
-    let lexical_rebuild_pipeline = crate::indexer::lexical_rebuild_pipeline_settings_snapshot();
+    let lexical_rebuild_pipeline = if skip_db_open {
+        crate::indexer::lexical_rebuild_pipeline_settings_snapshot_passive()
+    } else {
+        crate::indexer::lexical_rebuild_pipeline_settings_snapshot()
+    };
     let lexical_rebuild_pipeline_runtime = if lexical.rebuilding {
         crate::indexer::load_active_lexical_rebuild_pipeline_runtime(&index_path, db_path)
             .ok()
@@ -19074,10 +19161,19 @@ fn output_robot_results(
     Ok(())
 }
 
+#[cfg(test)]
 fn source_filter_where_clause(
     source_filter: Option<&crate::sources::provenance::SourceFilter>,
 ) -> (String, Option<String>) {
-    let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+    source_filter_where_clause_with_columns(source_filter, "c.source_id", "c.origin_host")
+}
+
+fn source_filter_where_clause_with_columns(
+    source_filter: Option<&crate::sources::provenance::SourceFilter>,
+    source_id_sql: &str,
+    origin_host_sql: &str,
+) -> (String, Option<String>) {
+    let normalized_source_sql = normalized_source_identity_sql_expr(source_id_sql, origin_host_sql);
     match source_filter {
         None | Some(crate::sources::provenance::SourceFilter::All) => (String::new(), None),
         Some(crate::sources::provenance::SourceFilter::Local) => (
@@ -19129,7 +19225,23 @@ fn append_source_filter_condition(
     params: &mut Vec<frankensqlite::compat::ParamValue>,
     source_filter: &crate::sources::provenance::SourceFilter,
 ) {
-    let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+    append_source_filter_condition_with_columns(
+        sql,
+        params,
+        source_filter,
+        "c.source_id",
+        "c.origin_host",
+    );
+}
+
+fn append_source_filter_condition_with_columns(
+    sql: &mut String,
+    params: &mut Vec<frankensqlite::compat::ParamValue>,
+    source_filter: &crate::sources::provenance::SourceFilter,
+    source_id_sql: &str,
+    origin_host_sql: &str,
+) {
+    let normalized_source_sql = normalized_source_identity_sql_expr(source_id_sql, origin_host_sql);
     match source_filter {
         crate::sources::provenance::SourceFilter::All => {}
         crate::sources::provenance::SourceFilter::Local => {
@@ -19172,13 +19284,28 @@ fn run_stats(
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let conn = open_franken_cli_read_db(db_path.clone(), "stats", Duration::from_secs(30))?;
+    let conversation_columns = doctor_table_columns(&conn, "conversations");
+    let source_id_sql = if conversation_columns.contains("source_id") {
+        "c.source_id"
+    } else {
+        "'local'"
+    };
+    let origin_host_sql = if conversation_columns.contains("origin_host") {
+        "c.origin_host"
+    } else {
+        "NULL"
+    };
 
     // Parse source filter (P3.7)
     let source_filter = source.map(SourceFilter::parse);
 
     // Build WHERE clause for source filtering
     let (source_where, source_param): (String, Option<String>) =
-        source_filter_where_clause(source_filter.as_ref());
+        source_filter_where_clause_with_columns(
+            source_filter.as_ref(),
+            source_id_sql,
+            origin_host_sql,
+        );
 
     // Helper: build params slice from optional source param
     let make_params = |param: &Option<String>| -> Vec<ParamValue> {
@@ -19292,7 +19419,7 @@ fn run_stats(
     // Get per-source breakdown if requested (P3.7)
     let source_rows: Vec<(String, i64, i64)> = if by_source {
         let normalized_source_sql =
-            normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+            normalized_source_identity_sql_expr(source_id_sql, origin_host_sql);
         let source_sql = format!(
             "SELECT {normalized_source_sql} as source_id, COUNT(DISTINCT c.id) as convs, COUNT(m.id) as msgs
              FROM conversations c
@@ -60921,7 +61048,7 @@ fn run_health(
         // (or confirm that it is not). The snapshot is a cheap read of an
         // in-memory ring buffer plus a handful of atomics; it does not fail.
         let responsiveness =
-            serde_json::to_value(crate::indexer::responsiveness::telemetry_snapshot())
+            serde_json::to_value(crate::indexer::responsiveness::telemetry_snapshot_passive())
                 .unwrap_or(serde_json::Value::Null);
         // Parallel-WAL shadow observer (Card 1, shadow-only phase). Present
         // in every health response; `active=false` when the env isn't set.
@@ -68096,6 +68223,7 @@ fn response_schema_index_state() -> serde_json::Value {
             "activity_at": { "type": ["string", "null"] },
             "documents": { "type": ["integer", "null"] },
             "empty_with_messages": { "type": "boolean" },
+            "quarantined_conversations": { "type": "integer" },
             "fingerprint": {
                 "type": "object",
                 "properties": {
@@ -68115,6 +68243,24 @@ fn response_schema_index_state() -> serde_json::Value {
                     "page_size_compatible": { "type": ["boolean", "null"] }
                 }
             }
+        }
+    })
+}
+
+fn response_schema_ingest_quarantine() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "status": { "type": "string" },
+            "quarantined_conversations": { "type": "integer" },
+            "recent_quarantined_conversations": { "type": "integer" },
+            "recent_window_seconds": { "type": "integer" },
+            "circuit_breaker_limit": { "type": "integer" },
+            "circuit_breaker_active": { "type": "boolean" },
+            "quarantine_files": { "type": "array", "items": { "type": "string" } },
+            "newest_last_attempt_at_ms": { "type": ["integer", "null"] },
+            "recommended_action": { "type": ["string", "null"] }
         }
     })
 }
@@ -68512,6 +68658,7 @@ fn response_schema_state_meta() -> serde_json::Value {
             "pending": response_schema_pending_state(),
             "rebuild": response_schema_rebuild_state(),
             "semantic": response_schema_semantic_state(),
+            "ingest_quarantine": response_schema_ingest_quarantine(),
             "policy_registry": response_schema_policy_registry(),
             "_meta": {
                 "type": "object",
@@ -71325,8 +71472,10 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "properties": {
                 "status": { "type": "string" },
                 "healthy": { "type": "boolean" },
+                "health_level": { "type": "string" },
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },
+                "warnings": { "type": "array", "items": { "type": "string" } },
                 "data_dir": { "type": "string" },
                 "recommended_action": { "type": ["string", "null"] },
                 "recommended_commands": response_schema_recommended_commands(),
@@ -71336,6 +71485,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "rebuild": response_schema_rebuild_state(),
                 "rebuild_progress": response_schema_rebuild_progress(),
                 "semantic": response_schema_semantic_state(),
+                "ingest_quarantine": response_schema_ingest_quarantine(),
                 "policy_registry": response_schema_policy_registry(),
                 "topology_budget": response_schema_topology_budget(),
                 "doctor_summary": response_schema_doctor_v2_summary("status-summary"),
@@ -71475,8 +71625,10 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "properties": {
                 "status": { "type": "string" },
                 "healthy": { "type": "boolean" },
+                "health_level": { "type": "string" },
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },
+                "warnings": { "type": "array", "items": { "type": "string" } },
                 "data_dir": { "type": "string" },
                 "recommended_action": { "type": ["string", "null"] },
                 "recommended_commands": response_schema_recommended_commands(),
@@ -71486,6 +71638,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "rebuild": response_schema_rebuild_state(),
                 "rebuild_progress": response_schema_rebuild_progress(),
                 "semantic": response_schema_semantic_state(),
+                "ingest_quarantine": response_schema_ingest_quarantine(),
                 "policy_registry": response_schema_policy_registry(),
                 "topology_budget": response_schema_topology_budget(),
                 "doctor_summary": response_schema_doctor_v2_summary("status-summary"),
@@ -71708,6 +71861,8 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "db_path": { "type": ["string", "null"] },
                 "conversations": { "type": ["integer", "null"] },
                 "messages": { "type": ["integer", "null"] },
+                "quarantined_conversations": { "type": "integer" },
+                "lexical_update_deferred": { "type": "boolean" },
                 "indexing_stats": response_schema_opaque_object(),
                 "error": { "type": ["string", "null"] }
             }
@@ -71859,8 +72014,10 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "properties": {
                 "status": { "type": "string" },
                 "healthy": { "type": "boolean" },
+                "health_level": { "type": "string" },
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },
+                "warnings": { "type": "array", "items": { "type": "string" } },
                 "data_dir": { "type": "string" },
                 "recommended_action": { "type": ["string", "null"] },
                 "recommended_commands": response_schema_recommended_commands(),
@@ -71875,6 +72032,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "remote_source_sync": response_schema_doctor_remote_source_sync_runtime_summary(),
                 "coverage_risk": response_schema_doctor_coverage_risk(),
                 "policy_registry": response_schema_policy_registry(),
+                "ingest_quarantine": response_schema_ingest_quarantine(),
                 "responsiveness": {
                     "type": "object",
                     "description": "Machine-responsiveness governor telemetry. Explains why the indexer is running at reduced fan-out and what pressure triggered any recent shrinkage.",

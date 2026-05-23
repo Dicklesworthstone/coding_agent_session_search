@@ -11,10 +11,19 @@ use coding_agent_search::search::pack_planner::{
 };
 use coding_agent_search::search::query::{MatchType, SearchHit};
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const ANSWER_PACK_PERF_NOW_MS: i64 = 1_764_000_000_000;
 const ANSWER_PACK_FRESHNESS_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
+static CLI_PERF_LOCK: Mutex<()> = Mutex::new(());
+
+fn cli_perf_lock() -> MutexGuard<'static, ()> {
+    match CLI_PERF_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 fn base_cmd() -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
@@ -187,6 +196,8 @@ fn answer_pack_candidate_memory_proxy_bytes(candidates: &[PackCandidate]) -> usi
 
 #[test]
 fn robot_help_latency_under_200ms() {
+    let _guard = cli_perf_lock();
+
     // Warm-up run (cold start may be slower)
     let _ = base_cmd().args(["--robot-help"]).output();
 
@@ -201,6 +212,8 @@ fn robot_help_latency_under_200ms() {
 
 #[test]
 fn robot_help_with_color_never_latency() {
+    let _guard = cli_perf_lock();
+
     let _ = base_cmd().args(["--color=never", "--robot-help"]).output();
 
     let median = measure_median(&["--color=never", "--robot-help"], 5);
@@ -218,6 +231,8 @@ fn robot_help_with_color_never_latency() {
 
 #[test]
 fn robot_docs_guide_latency_under_300ms() {
+    let _guard = cli_perf_lock();
+
     let _ = base_cmd().args(["robot-docs", "guide"]).output();
 
     let median = measure_median(&["robot-docs", "guide"], 5);
@@ -231,6 +246,8 @@ fn robot_docs_guide_latency_under_300ms() {
 
 #[test]
 fn robot_docs_commands_latency_under_300ms() {
+    let _guard = cli_perf_lock();
+
     let _ = base_cmd().args(["robot-docs", "commands"]).output();
 
     let median = measure_median(&["robot-docs", "commands"], 5);
@@ -244,6 +261,8 @@ fn robot_docs_commands_latency_under_300ms() {
 
 #[test]
 fn robot_docs_topics_latency_under_200ms() {
+    let _guard = cli_perf_lock();
+
     let _ = base_cmd().args(["robot-docs", "topics"]).output();
 
     let median = measure_median(&["robot-docs", "topics"], 5);
@@ -257,6 +276,8 @@ fn robot_docs_topics_latency_under_200ms() {
 
 #[test]
 fn robot_docs_exit_codes_latency_under_200ms() {
+    let _guard = cli_perf_lock();
+
     let _ = base_cmd().args(["robot-docs", "exit-codes"]).output();
 
     let median = measure_median(&["robot-docs", "exit-codes"], 5);
@@ -270,6 +291,8 @@ fn robot_docs_exit_codes_latency_under_200ms() {
 
 #[test]
 fn robot_docs_wrap_latency_under_200ms() {
+    let _guard = cli_perf_lock();
+
     let _ = base_cmd().args(["robot-docs", "wrap"]).output();
 
     let median = measure_median(&["robot-docs", "wrap"], 5);
@@ -287,6 +310,8 @@ fn robot_docs_wrap_latency_under_200ms() {
 
 #[test]
 fn introspect_latency_under_300ms() {
+    let _guard = cli_perf_lock();
+
     let _ = base_cmd().args(["introspect", "--json"]).output();
 
     let median = measure_median(&["introspect", "--json"], 5);
@@ -300,6 +325,8 @@ fn introspect_latency_under_300ms() {
 
 #[test]
 fn api_version_latency_under_150ms() {
+    let _guard = cli_perf_lock();
+
     let _ = base_cmd().args(["api-version", "--json"]).output();
 
     let median = measure_median(&["api-version", "--json"], 5);
@@ -313,6 +340,8 @@ fn api_version_latency_under_150ms() {
 
 #[test]
 fn capabilities_latency_under_300ms() {
+    let _guard = cli_perf_lock();
+
     let _ = base_cmd().args(["capabilities", "--json"]).output();
 
     let median = measure_median(&["capabilities", "--json"], 5);
@@ -330,6 +359,8 @@ fn capabilities_latency_under_300ms() {
 
 #[test]
 fn trace_mode_adds_minimal_overhead() {
+    let _guard = cli_perf_lock();
+
     // Warm-up runs
     let _ = base_cmd().args(["--robot-help"]).output();
     let _ = base_cmd().args(["--trace", "--robot-help"]).output();
@@ -353,6 +384,8 @@ fn trace_mode_adds_minimal_overhead() {
 
 #[test]
 fn trace_mode_on_robot_docs_adds_minimal_overhead() {
+    let _guard = cli_perf_lock();
+
     // Warm-up runs
     let _ = base_cmd().args(["robot-docs", "guide"]).output();
     let _ = base_cmd().args(["--trace", "robot-docs", "guide"]).output();
@@ -480,6 +513,8 @@ fn answer_pack_planner_and_render_p95_under_slo() {
 
 #[test]
 fn help_flag_latency_under_200ms() {
+    let _guard = cli_perf_lock();
+
     let _ = base_cmd().args(["--help"]).output();
 
     let median = measure_median(&["--help"], 5);
@@ -493,6 +528,8 @@ fn help_flag_latency_under_200ms() {
 
 #[test]
 fn version_flag_latency_under_150ms() {
+    let _guard = cli_perf_lock();
+
     let _ = base_cmd().args(["--version"]).output();
 
     let median = measure_median(&["--version"], 5);
@@ -510,6 +547,8 @@ fn version_flag_latency_under_150ms() {
 
 #[test]
 fn robot_help_cold_start_under_500ms() {
+    let _guard = cli_perf_lock();
+
     // Single invocation (no warm-up) - cold start scenario
     let mut cmd = base_cmd();
     cmd.args(["--robot-help"]);
@@ -529,6 +568,8 @@ fn robot_help_cold_start_under_500ms() {
 
 #[test]
 fn typical_agent_discovery_workflow_under_1sec() {
+    let _guard = cli_perf_lock();
+
     // Simulate typical agent discovery workflow:
     // 1. api-version
     // 2. capabilities
@@ -551,6 +592,8 @@ fn typical_agent_discovery_workflow_under_1sec() {
 
 #[test]
 fn health_check_latency_under_100ms() {
+    let _guard = cli_perf_lock();
+
     let data_dir = health_fixture_data_dir();
     let data_dir = data_dir
         .to_str()

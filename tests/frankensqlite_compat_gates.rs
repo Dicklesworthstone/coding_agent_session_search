@@ -231,7 +231,7 @@ fn gate1_fts5_multi_column() {
 }
 
 #[test]
-fn gate1_fts5_rank_function() {
+fn gate1_fts5_bm25_rank_function() {
     let conn = Connection::open(":memory:").expect("in-memory connection");
     conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
         .unwrap();
@@ -240,9 +240,15 @@ fn gate1_fts5_rank_function() {
     conn.execute("INSERT INTO test_fts(content) VALUES ('hello rust')") // low relevance
         .unwrap();
 
+    // cass ranks FTS fallback queries through explicit bm25(table) calls. The
+    // SQLite hidden `rank` column is useful compatibility coverage, but it is
+    // not part of cass's required query surface.
     let rows = conn
-        .query("SELECT content, rank FROM test_fts WHERE test_fts MATCH 'rust' ORDER BY rank")
-        .expect("GATE 1.8 FAIL: FTS5 rank function failed");
+        .query(
+            "SELECT content, bm25(test_fts) AS rank \
+             FROM test_fts WHERE test_fts MATCH 'rust' ORDER BY rank",
+        )
+        .expect("GATE 1.8 FAIL: FTS5 bm25 rank function failed");
 
     assert_eq!(rows.len(), 2, "GATE 1.8 FAIL: Expected 2 ranked results");
     // rank is a negative BM25 score (more negative = better match)

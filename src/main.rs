@@ -210,7 +210,6 @@ fn main() -> anyhow::Result<()> {
 
     // Load .env early; ignore if missing.
     dotenvy::dotenv().ok();
-    apply_default_tantivy_writer_thread_cap();
 
     let raw_args: Vec<String> = std::env::args().collect();
     let parsed = match coding_agent_search::parse_cli(raw_args) {
@@ -218,9 +217,24 @@ fn main() -> anyhow::Result<()> {
         Err(err) => handle_fatal_error(err),
     };
 
+    let parsed = match coding_agent_search::try_run_with_parsed_fast(parsed) {
+        Ok(result) => {
+            return match result {
+                Ok(()) => Ok(()),
+                Err(err) => handle_fatal_error(err),
+            };
+        }
+        Err(parsed) => *parsed,
+    };
+
+    apply_default_tantivy_writer_thread_cap();
+
     let use_current_thread = matches!(
         parsed.cli.command,
-        Some(coding_agent_search::Commands::Search { .. })
+        Some(
+            coding_agent_search::Commands::Search { .. }
+                | coding_agent_search::Commands::Health { .. }
+        )
     );
     let runtime = if use_current_thread {
         asupersync::runtime::RuntimeBuilder::current_thread().build()?

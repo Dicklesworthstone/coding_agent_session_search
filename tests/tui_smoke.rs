@@ -9,6 +9,7 @@
 //! All tests use `--once` and `TUI_HEADLESS=1` for non-interactive execution.
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use coding_agent_search::search::tantivy::expected_index_dir;
 use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -142,7 +143,7 @@ fn tui_headless_launches_with_valid_index() {
 
     // Verify index artifacts exist
     assert!(data_dir.join("agent_search.db").exists(), "DB should exist");
-    assert!(data_dir.join("index/v7").exists(), "Index should exist");
+    assert!(expected_index_dir(&data_dir).exists(), "Index should exist");
 
     // Log test completion
     eprintln!("[SMOKE] tui_headless_launches_with_valid_index: PASSED");

@@ -341,6 +341,7 @@ schemas: (auto-generated from contract)
         - matches_current_db_fingerprint: ?
       - fresh: boolean
       - last_indexed_at: ?
+      - quarantined_conversations: integer
       - reason: ?
       - rebuilding: boolean
       - stale: boolean
@@ -2720,7 +2721,19 @@ schemas: (auto-generated from contract)
       - surface: string
     - errors: array
     - explanation: ?
+    - health_level: string
     - healthy: boolean
+    - ingest_quarantine: object
+      - circuit_breaker_active: boolean
+      - circuit_breaker_limit: integer
+      - newest_last_attempt_at_ms: ?
+      - quarantine_files: array
+      - quarantined_conversations: integer
+      - recent_quarantined_conversations: integer
+      - recent_window_seconds: integer
+      - recommended_action: ?
+      - schema_version: integer
+      - status: string
     - initialized: boolean
     - latency_ms: integer
     - parallel_wal_shadow: object
@@ -2831,10 +2844,22 @@ schemas: (auto-generated from contract)
         - fingerprint: object
         - fresh: boolean
         - last_indexed_at: ?
+        - quarantined_conversations: integer
         - reason: ?
         - rebuilding: boolean
         - stale: boolean
         - stale_threshold_seconds: integer
+        - status: string
+      - ingest_quarantine: object
+        - circuit_breaker_active: boolean
+        - circuit_breaker_limit: integer
+        - newest_last_attempt_at_ms: ?
+        - quarantine_files: array
+        - quarantined_conversations: integer
+        - recent_quarantined_conversations: integer
+        - recent_window_seconds: integer
+        - recommended_action: ?
+        - schema_version: integer
         - status: string
       - pending: object
         - orphaned: boolean
@@ -2877,6 +2902,7 @@ schemas: (auto-generated from contract)
         - summary: string
         - vector_index_path: ?
     - status: string
+    - warnings: array
   index:
     - conversations: ?
     - data_dir: ?
@@ -2887,7 +2913,9 @@ schemas: (auto-generated from contract)
     - force_rebuild: ?
     - full: ?
     - indexing_stats: object
+    - lexical_update_deferred: boolean
     - messages: ?
+    - quarantined_conversations: integer
     - success: boolean
   introspect:
     - api_version: integer
@@ -3056,6 +3084,7 @@ schemas: (auto-generated from contract)
         - _meta: object
         - database: object
         - index: object
+        - ingest_quarantine: object
         - pending: object
         - policy_registry: object
         - rebuild: object
@@ -3200,6 +3229,7 @@ schemas: (auto-generated from contract)
       - status: string
       - surface: string
     - explanation: ?
+    - health_level: string
     - healthy: boolean
     - index: object
       - activity_at: ?
@@ -3220,10 +3250,22 @@ schemas: (auto-generated from contract)
         - matches_current_db_fingerprint: ?
       - fresh: boolean
       - last_indexed_at: ?
+      - quarantined_conversations: integer
       - reason: ?
       - rebuilding: boolean
       - stale: boolean
       - stale_threshold_seconds: integer
+      - status: string
+    - ingest_quarantine: object
+      - circuit_breaker_active: boolean
+      - circuit_breaker_limit: integer
+      - newest_last_attempt_at_ms: ?
+      - quarantine_files: array
+      - quarantined_conversations: integer
+      - recent_quarantined_conversations: integer
+      - recent_window_seconds: integer
+      - recommended_action: ?
+      - schema_version: integer
       - status: string
     - initialized: boolean
     - pending: object
@@ -3379,6 +3421,7 @@ schemas: (auto-generated from contract)
         - sockets: integer
         - source: string
         - topology_class: string
+    - warnings: array
   stats:
     - by_agent: array
     - conversations: integer
@@ -3518,6 +3561,7 @@ schemas: (auto-generated from contract)
       - status: string
       - surface: string
     - explanation: ?
+    - health_level: string
     - healthy: boolean
     - index: object
       - activity_at: ?
@@ -3538,10 +3582,22 @@ schemas: (auto-generated from contract)
         - matches_current_db_fingerprint: ?
       - fresh: boolean
       - last_indexed_at: ?
+      - quarantined_conversations: integer
       - reason: ?
       - rebuilding: boolean
       - stale: boolean
       - stale_threshold_seconds: integer
+      - status: string
+    - ingest_quarantine: object
+      - circuit_breaker_active: boolean
+      - circuit_breaker_limit: integer
+      - newest_last_attempt_at_ms: ?
+      - quarantine_files: array
+      - quarantined_conversations: integer
+      - recent_quarantined_conversations: integer
+      - recent_window_seconds: integer
+      - recommended_action: ?
+      - schema_version: integer
       - status: string
     - initialized: boolean
     - pending: object
@@ -3697,6 +3753,7 @@ schemas: (auto-generated from contract)
         - sockets: integer
         - source: string
         - topology_class: string
+    - warnings: array
   triage:
     - _meta: object
       - data_dir: string
@@ -3733,6 +3790,7 @@ schemas: (auto-generated from contract)
         - fingerprint: object
         - fresh: boolean
         - last_indexed_at: ?
+        - quarantined_conversations: integer
         - reason: ?
         - rebuilding: boolean
         - stale: boolean

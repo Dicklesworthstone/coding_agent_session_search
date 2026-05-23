@@ -11,7 +11,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use chrono::{SecondsFormat, Utc};
 use coding_agent_search::search::tantivy::{
-    Fields, SearchableIndexSummary, index_dir, open_federated_search_readers,
+    Fields, SearchableIndexSummary, expected_index_dir, index_dir, open_federated_search_readers,
     searchable_index_summary,
 };
 use coding_agent_search::storage::sqlite::SqliteStorage;
@@ -3432,9 +3432,13 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
                 .assert()
                 .success();
 
-            let live_index = data_dir.join("index/v7");
-            let backup_index = data_dir.join("index/v7.baseline-backup");
-            let sparse_index = sparse_data_dir.join("index/v7");
+            let live_index = expected_index_dir(&data_dir);
+            let backup_name = live_index
+                .file_name()
+                .map(|name| format!("{}.baseline-backup", name.to_string_lossy()))
+                .unwrap_or_else(|| "lexical-index.baseline-backup".to_string());
+            let backup_index = live_index.with_file_name(backup_name);
+            let sparse_index = expected_index_dir(&sparse_data_dir);
             fs::rename(&live_index, &backup_index).expect("move healthy index aside");
             fs::rename(&sparse_index, &live_index)
                 .expect("replace healthy index with sparse real tantivy index");
@@ -3442,7 +3446,7 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
     );
 
     assert_eq!(
-        raw_lexical_total_matches(&data_dir.join("index/v7"), "repairoldanchor"),
+        raw_lexical_total_matches(&expected_index_dir(&data_dir), "repairoldanchor"),
         0,
         "the swapped-in sparse index should not contain the baseline token before repair; \
          use a raw lexical reader here so cass search cannot self-heal the fixture early"

@@ -196,24 +196,32 @@ sync_schedule = "manual"
 }
 
 #[test]
-fn sources_agents_exclude_and_list_json() {
+fn sources_agents_exclude_and_list_json() -> Result<(), Box<dyn std::error::Error>> {
     let tracker = tracker_for("sources_agents_exclude_and_list_json");
     let _trace_guard = tracker.trace_env_guard();
 
-    let tmp = tempfile::TempDir::new().unwrap();
+    let tmp = tempfile::TempDir::new()?;
     let config_dir = tmp.path().join("config");
-    fs::create_dir_all(&config_dir).unwrap();
+    let data_dir = cass_data_dir(&tmp.path().join("data"));
+    fs::create_dir_all(&config_dir)?;
     let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    let _guard_data = EnvGuard::set("CASS_DATA_DIR", data_dir.to_string_lossy());
 
     let start = tracker.start(
         "exclude_agent",
         Some("Exclude openclaw from future indexing runs"),
     );
     let output = cargo_bin_cmd!("cass")
-        .args(["sources", "agents", "exclude", "openclaw"])
+        .args([
+            "sources",
+            "agents",
+            "exclude",
+            "openclaw",
+            "--keep-indexed-data",
+        ])
         .env("XDG_CONFIG_HOME", &config_dir)
-        .output()
-        .expect("sources agents exclude command");
+        .env("CASS_DATA_DIR", &data_dir)
+        .output()?;
     tracker.end(
         "exclude_agent",
         Some("Exclude openclaw from future indexing runs"),
@@ -236,8 +244,8 @@ fn sources_agents_exclude_and_list_json() {
     let output = cargo_bin_cmd!("cass")
         .args(["sources", "agents", "list", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
-        .output()
-        .expect("sources agents list command");
+        .env("CASS_DATA_DIR", &data_dir)
+        .output()?;
     tracker.end(
         "list_agents_json",
         Some("List excluded agents in JSON"),
@@ -249,19 +257,20 @@ fn sources_agents_exclude_and_list_json() {
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
-    let json: Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    let json: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(json["disabled_agents"], serde_json::json!(["openclaw"]));
 
     let output = cargo_bin_cmd!("cass")
         .args(["sources", "list", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
-        .output()
-        .expect("sources list --json command");
+        .env("CASS_DATA_DIR", &data_dir)
+        .output()?;
     assert!(output.status.success(), "sources list --json failed");
-    let json: Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    let json: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(json["disabled_agents"], serde_json::json!(["openclaw"]));
 
     tracker.complete();
+    Ok(())
 }
 
 #[test]

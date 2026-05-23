@@ -4101,6 +4101,9 @@
             "empty_with_messages": {
               "type": "boolean"
             },
+            "quarantined_conversations": {
+              "type": "integer"
+            },
             "fingerprint": {
               "type": "object",
               "properties": {
@@ -26033,6 +26036,9 @@
         "healthy": {
           "type": "boolean"
         },
+        "health_level": {
+          "type": "string"
+        },
         "initialized": {
           "type": "boolean"
         },
@@ -26041,6 +26047,12 @@
             "string",
             "null"
           ]
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "data_dir": {
           "type": "string"
@@ -26985,6 +26997,50 @@
             "controllers"
           ]
         },
+        "ingest_quarantine": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_window_seconds": {
+              "type": "integer"
+            },
+            "circuit_breaker_limit": {
+              "type": "integer"
+            },
+            "circuit_breaker_active": {
+              "type": "boolean"
+            },
+            "quarantine_files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "newest_last_attempt_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "recommended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
         "responsiveness": {
           "type": "object",
           "description": "Machine-responsiveness governor telemetry. Explains why the indexer is running at reduced fan-out and what pressure triggered any recent shrinkage.",
@@ -27133,6 +27189,9 @@
                 },
                 "empty_with_messages": {
                   "type": "boolean"
+                },
+                "quarantined_conversations": {
+                  "type": "integer"
                 },
                 "fingerprint": {
                   "type": "object",
@@ -27593,6 +27652,50 @@
                 }
               }
             },
+            "ingest_quarantine": {
+              "type": "object",
+              "properties": {
+                "schema_version": {
+                  "type": "integer"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "quarantined_conversations": {
+                  "type": "integer"
+                },
+                "recent_quarantined_conversations": {
+                  "type": "integer"
+                },
+                "recent_window_seconds": {
+                  "type": "integer"
+                },
+                "circuit_breaker_limit": {
+                  "type": "integer"
+                },
+                "circuit_breaker_active": {
+                  "type": "boolean"
+                },
+                "quarantine_files": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "newest_last_attempt_at_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "recommended_action": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
             "policy_registry": {
               "type": "object",
               "description": "Data-only registry of active runtime controller policies, their deterministic inputs, and fallback state.",
@@ -27893,6 +27996,12 @@
             "integer",
             "null"
           ]
+        },
+        "quarantined_conversations": {
+          "type": "integer"
+        },
+        "lexical_update_deferred": {
+          "type": "boolean"
         },
         "indexing_stats": {
           "type": "object",
@@ -29240,6 +29349,9 @@
                     "empty_with_messages": {
                       "type": "boolean"
                     },
+                    "quarantined_conversations": {
+                      "type": "integer"
+                    },
                     "fingerprint": {
                       "type": "object",
                       "properties": {
@@ -29699,6 +29811,50 @@
                     }
                   }
                 },
+                "ingest_quarantine": {
+                  "type": "object",
+                  "properties": {
+                    "schema_version": {
+                      "type": "integer"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "quarantined_conversations": {
+                      "type": "integer"
+                    },
+                    "recent_quarantined_conversations": {
+                      "type": "integer"
+                    },
+                    "recent_window_seconds": {
+                      "type": "integer"
+                    },
+                    "circuit_breaker_limit": {
+                      "type": "integer"
+                    },
+                    "circuit_breaker_active": {
+                      "type": "boolean"
+                    },
+                    "quarantine_files": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "newest_last_attempt_at_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "recommended_action": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
                 "policy_registry": {
                   "type": "object",
                   "description": "Data-only registry of active runtime controller policies, their deterministic inputs, and fallback state.",
@@ -29946,6 +30102,9 @@
         "healthy": {
           "type": "boolean"
         },
+        "health_level": {
+          "type": "string"
+        },
         "initialized": {
           "type": "boolean"
         },
@@ -29954,6 +30113,12 @@
             "string",
             "null"
           ]
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "data_dir": {
           "type": "string"
@@ -30066,6 +30231,9 @@
             },
             "empty_with_messages": {
               "type": "boolean"
+            },
+            "quarantined_conversations": {
+              "type": "integer"
             },
             "fingerprint": {
               "type": "object",
@@ -30645,6 +30813,50 @@
                   ]
                 }
               }
+            }
+          }
+        },
+        "ingest_quarantine": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_window_seconds": {
+              "type": "integer"
+            },
+            "circuit_breaker_limit": {
+              "type": "integer"
+            },
+            "circuit_breaker_active": {
+              "type": "boolean"
+            },
+            "quarantine_files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "newest_last_attempt_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "recommended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         },
@@ -31654,6 +31866,9 @@
         "healthy": {
           "type": "boolean"
         },
+        "health_level": {
+          "type": "string"
+        },
         "initialized": {
           "type": "boolean"
         },
@@ -31662,6 +31877,12 @@
             "string",
             "null"
           ]
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "data_dir": {
           "type": "string"
@@ -31774,6 +31995,9 @@
             },
             "empty_with_messages": {
               "type": "boolean"
+            },
+            "quarantined_conversations": {
+              "type": "integer"
             },
             "fingerprint": {
               "type": "object",
@@ -32353,6 +32577,50 @@
                   ]
                 }
               }
+            }
+          }
+        },
+        "ingest_quarantine": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            },
+            "quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_window_seconds": {
+              "type": "integer"
+            },
+            "circuit_breaker_limit": {
+              "type": "integer"
+            },
+            "circuit_breaker_active": {
+              "type": "boolean"
+            },
+            "quarantine_files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "newest_last_attempt_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "recommended_action": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         },
@@ -33380,6 +33648,9 @@
                 },
                 "empty_with_messages": {
                   "type": "boolean"
+                },
+                "quarantined_conversations": {
+                  "type": "integer"
                 },
                 "fingerprint": {
                   "type": "object",

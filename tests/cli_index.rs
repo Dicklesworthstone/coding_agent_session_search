@@ -430,7 +430,7 @@ fn index_robot_trace_ingest_emits_batch_ndjson_with_lookup_counters()
     make_codex_session(
         &codex_home,
         "2026/05/13",
-        "trace-ingest.jsonl",
+        "rollout-trace-ingest.jsonl",
         "trace_ingest_probe",
     );
 
@@ -792,7 +792,7 @@ fn index_json_reports_full_refresh_lexical_strategy() {
     make_codex_session(
         &codex_home,
         "2025/11/24",
-        "strategy-full.jsonl",
+        "rollout-strategy-full.jsonl",
         "full_strategy_content",
     );
 
@@ -850,7 +850,7 @@ fn index_json_reports_repeat_full_refresh_strategy_on_populated_canonical_db() {
     make_codex_session(
         &codex_home,
         "2025/11/24",
-        "strategy-canonical.jsonl",
+        "rollout-strategy-canonical.jsonl",
         "canonical_only_strategy_content",
     );
 
@@ -914,7 +914,7 @@ fn repeat_full_json_preserves_exact_totals_when_noop_scan_underreports() {
     make_codex_session(
         &codex_home,
         "2025/11/24",
-        "repeat-full-noop.jsonl",
+        "rollout-repeat-full-noop.jsonl",
         "repeat_full_noop_content",
     );
 
@@ -1039,7 +1039,7 @@ fn index_full_persists_lexical_rebuild_equivalence_ledger() {
         make_codex_session(
             &codex_home,
             "2026/04/22",
-            &format!("equivalence-ledger-{idx:02}.jsonl"),
+            &format!("rollout-equivalence-ledger-{idx:02}.jsonl"),
             content,
         );
     }
@@ -1161,7 +1161,7 @@ fn index_json_reports_incremental_lexical_strategy() {
     make_codex_session(
         &codex_home,
         "2025/11/24",
-        "strategy-incremental-1.jsonl",
+        "rollout-strategy-incremental-1.jsonl",
         "incremental_strategy_content_alpha",
     );
 
@@ -1175,7 +1175,7 @@ fn index_json_reports_incremental_lexical_strategy() {
     make_codex_session(
         &codex_home,
         "2025/11/25",
-        "strategy-incremental-2.jsonl",
+        "rollout-strategy-incremental-2.jsonl",
         "incremental_strategy_content_beta",
     );
 
@@ -1228,7 +1228,7 @@ fn index_json_reports_watch_once_incremental_lexical_strategy() {
     make_codex_session(
         &codex_home,
         "2025/11/24",
-        "strategy-watch-once-1.jsonl",
+        "rollout-strategy-watch-once-1.jsonl",
         "watch_once_strategy_seed",
     );
 
@@ -1239,11 +1239,11 @@ fn index_json_reports_watch_once_incremental_lexical_strategy() {
     initial_index.assert().success();
 
     std::thread::sleep(std::time::Duration::from_secs(2));
-    let targeted_path = codex_home.join("sessions/2025/11/25/strategy-watch-once-2.jsonl");
+    let targeted_path = codex_home.join("sessions/2025/11/25/rollout-strategy-watch-once-2.jsonl");
     make_codex_session(
         &codex_home,
         "2025/11/25",
-        "strategy-watch-once-2.jsonl",
+        "rollout-strategy-watch-once-2.jsonl",
         "watch_once_strategy_delta",
     );
 
@@ -1299,7 +1299,7 @@ fn plain_index_recreates_missing_lexical_checkpoint_from_live_assets() {
     make_codex_session(
         &codex_home,
         "2025/11/24",
-        "checkpoint-bootstrap.jsonl",
+        "rollout-checkpoint-bootstrap.jsonl",
         "checkpoint_bootstrap_content",
     );
 
@@ -1554,7 +1554,7 @@ fn plain_index_self_heals_when_entire_lexical_index_directory_is_missing() {
         make_codex_session(
             &codex_home,
             "2026/04/23",
-            &format!("self-heal-fixture-{idx:02}.jsonl"),
+            &format!("rollout-self-heal-fixture-{idx:02}.jsonl"),
             keyword,
         );
     }

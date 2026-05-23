@@ -182,7 +182,12 @@ fn markdown_theme_handles_empty_render_input_safely() {
 #[test]
 fn markdown_theme_admonition_colors_match_severity() {
     tracing::info!(target: "3n06q_test", scenario = "admonition_severity");
-    let opts = StyleOptions::default();
+    let opts = StyleOptions {
+        dark_mode: true,
+        preset: UiThemePreset::TokyoNight,
+        color_profile: ColorProfile::TrueColor,
+        ..StyleOptions::default()
+    };
     let ctx = StyleContext::from_options(opts);
     let md = ctx.markdown_theme();
     // admonition_caution (error severity) must differ from admonition_tip

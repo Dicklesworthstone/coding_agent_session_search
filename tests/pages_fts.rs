@@ -270,29 +270,29 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let conn = create_runtime_fts_db(&temp_dir)?;
 
-        // The pinned frankensqlite query path evaluates phrases after parsing
-        // them, so code punctuation is represented as adjacent tokenizer terms.
+        let (_, query) = format_fts5_query("my_function", Fts5SearchMode::Code);
         let count: i64 = conn.query_row_map(
-            r#"SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH '"my function"'"#,
-            &[],
+            "SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH ?1",
+            fparams![query.as_str()],
             |row| row.get_typed(0),
         )?;
 
         assert!(
             count > 0,
-            "Code FTS should match 'my_function' through adjacent code terms"
+            "Code FTS should match 'my_function' as a preserved code token"
         );
 
         // Also test get_user_by_id
+        let (_, query) = format_fts5_query("get_user_by_id", Fts5SearchMode::Code);
         let count2: i64 = conn.query_row_map(
-            r#"SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH '"get user by id"'"#,
-            &[],
+            "SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH ?1",
+            fparams![query.as_str()],
             |row| row.get_typed(0),
         )?;
 
         assert!(
             count2 > 0,
-            "Code FTS should match 'get_user_by_id' through adjacent code terms"
+            "Code FTS should match 'get_user_by_id' as a preserved code token"
         );
 
         Ok(())
@@ -304,15 +304,16 @@ mod tests {
         let conn = create_runtime_fts_db(&temp_dir)?;
 
         // Search for filename with extension
+        let (_, query) = format_fts5_query("AuthController.ts", Fts5SearchMode::Code);
         let count: i64 = conn.query_row_map(
-            r#"SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH '"AuthController ts"'"#,
-            &[],
+            "SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH ?1",
+            fparams![query.as_str()],
             |row| row.get_typed(0),
         )?;
 
         assert!(
             count > 0,
-            "Code FTS should match 'AuthController.ts' through adjacent filename terms"
+            "Code FTS should match 'AuthController.ts' as a preserved code token"
         );
 
         Ok(())

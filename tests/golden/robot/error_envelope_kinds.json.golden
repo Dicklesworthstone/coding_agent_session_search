@@ -398,7 +398,8 @@
     },
     "storage": {
       "exit_codes": [
-        5
+        5,
+        14
       ]
     },
     "storage-fingerprint": {

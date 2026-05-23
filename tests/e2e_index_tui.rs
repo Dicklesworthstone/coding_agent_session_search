@@ -1,4 +1,5 @@
 use assert_cmd::cargo::cargo_bin_cmd;
+use coding_agent_search::search::tantivy::expected_index_dir;
 use std::fs;
 use std::path::Path;
 
@@ -149,7 +150,7 @@ fn index_then_tui_once_headless() {
     // Phase: verify artifacts
     let verify_start = tracker.start("verify_artifacts", Some("Checking index artifacts exist"));
     assert!(data_dir.join("agent_search.db").exists());
-    assert!(data_dir.join("index/v7").exists());
+    assert!(expected_index_dir(&data_dir).exists());
     let verify_ms = verify_start.elapsed().as_millis() as u64;
     tracker.end(
         "verify_artifacts",
