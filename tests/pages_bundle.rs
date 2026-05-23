@@ -1717,6 +1717,33 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_fallback_top_terms_tie_breaks_deterministically() {
+        let stats_js = include_str!("../src/pages_assets/stats.js");
+        assert!(
+            stats_js.contains(
+                ".sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))"
+            ),
+            "database fallback top-term ranking should use alphabetical tie-breaking so equal-frequency terms do not depend on object insertion order"
+        );
+    }
+
+    #[test]
+    fn test_stats_precomputed_fetches_are_bounded() {
+        let stats_js = include_str!("../src/pages_assets/stats.js");
+        assert!(
+            stats_js.contains("const ANALYTICS_FETCH_TIMEOUT_MS = 10000;")
+                && stats_js.contains("async function fetchWithTimeout(url)")
+                && stats_js.contains("AbortSignal.timeout(timeoutMs)")
+                && stats_js
+                    .contains("const timeoutId = setTimeout(() => controller.abort(), timeoutMs);")
+                && stats_js.contains("clearTimeout(timeoutId);")
+                && stats_js.contains("await fetchWithTimeout(`./data/${file}`)")
+                && stats_js.contains("await fetchWithTimeout(`./${file}`)"),
+            "precomputed analytics fetches should use an AbortSignal timeout so a stalled asset request cannot hang stats rendering indefinitely"
+        );
+    }
+
+    #[test]
     fn test_stats_dashboard_escapes_malformed_precomputed_json_values() -> Result<()> {
         run_node_module_assertions(
             r#"

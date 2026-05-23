@@ -2,7 +2,7 @@
 //!
 //! Supports both encrypted and unencrypted bundles via an untagged enum.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::encrypt::EncryptionConfig;
 
@@ -44,6 +44,10 @@ impl ArchiveConfig {
 #[serde(deny_unknown_fields)]
 pub struct UnencryptedConfig {
     /// Whether the bundle is encrypted (must be false).
+    #[serde(
+        serialize_with = "serialize_unencrypted_false",
+        deserialize_with = "deserialize_unencrypted_false"
+    )]
     pub encrypted: bool,
     /// Config version.
     pub version: String,
@@ -65,6 +69,31 @@ pub struct UnencryptedPayload {
     /// Optional byte size of the payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
+}
+
+fn serialize_unencrypted_false<S>(encrypted: &bool, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if *encrypted {
+        return Err(serde::ser::Error::custom(
+            "unencrypted config must set encrypted=false",
+        ));
+    }
+    serializer.serialize_bool(false)
+}
+
+fn deserialize_unencrypted_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let encrypted = bool::deserialize(deserializer)?;
+    if encrypted {
+        return Err(serde::de::Error::custom(
+            "unencrypted config must set encrypted=false",
+        ));
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -93,11 +122,12 @@ mod tests {
     // Helper to create a minimal EncryptionConfig for testing
     fn make_encryption_config() -> EncryptionConfig {
         use crate::pages::encrypt::{Argon2Params, PayloadMeta};
+        use base64::prelude::{BASE64_STANDARD, Engine as _};
 
         EncryptionConfig {
             version: 1,
-            export_id: "AAAAAAAAAAAAAAAAAAAAAA==".to_string(),
-            base_nonce: "AAAAAAAAAAAAAAA=".to_string(),
+            export_id: BASE64_STANDARD.encode([0u8; 16]),
+            base_nonce: BASE64_STANDARD.encode([0u8; 12]),
             compression: "deflate".to_string(),
             kdf_defaults: Argon2Params::default(),
             payload: PayloadMeta {
@@ -174,6 +204,44 @@ mod tests {
         assert_eq!(original.payload.path, deserialized.payload.path);
         assert_eq!(original.payload.format, deserialized.payload.format);
         assert_eq!(original.warning, deserialized.warning);
+    }
+
+    #[test]
+    fn test_unencrypted_config_rejects_encrypted_true() {
+        let json = r#"{
+            "encrypted": true,
+            "version": "1.0",
+            "payload": {
+                "path": "payload.sqlite",
+                "format": "sqlite"
+            }
+        }"#;
+
+        let err = serde_json::from_str::<UnencryptedConfig>(json)
+            .expect_err("unencrypted config must reject encrypted=true");
+        assert!(
+            err.to_string()
+                .contains("unencrypted config must set encrypted=false"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_unencrypted_config_refuses_to_serialize_encrypted_true() {
+        let invalid = UnencryptedConfig {
+            encrypted: true,
+            version: "1.0".to_string(),
+            payload: make_unencrypted_payload(),
+            warning: None,
+        };
+
+        let err = serde_json::to_string(&invalid)
+            .expect_err("unencrypted config must not serialize encrypted=true");
+        assert!(
+            err.to_string()
+                .contains("unencrypted config must set encrypted=false"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -266,6 +334,21 @@ mod tests {
         assert!(!config.is_encrypted());
         let inner = config.as_unencrypted().expect("should be unencrypted");
         assert_eq!(inner.payload.path, "payload.sqlite");
+    }
+
+    #[test]
+    fn test_untagged_deserialize_rejects_unencrypted_shape_with_encrypted_true() {
+        let json = r#"{
+            "encrypted": true,
+            "version": "1.0",
+            "payload": {
+                "path": "payload.sqlite",
+                "format": "sqlite"
+            }
+        }"#;
+
+        serde_json::from_str::<ArchiveConfig>(json)
+            .expect_err("encrypted=true must not classify as unencrypted archive config");
     }
 
     #[test]

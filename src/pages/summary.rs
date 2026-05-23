@@ -32,6 +32,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+const SUMMARY_ID_CHUNK_SIZE: usize = 500;
+
 /// Pre-publish summary containing all information about content to be exported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrePublishSummary {
@@ -414,6 +416,23 @@ pub struct SummaryFilters {
     pub until_ts: Option<i64>,
 }
 
+#[derive(Default)]
+struct WorkspaceAggregate {
+    conversation_ids: Vec<i64>,
+    min_ts: Option<i64>,
+    max_ts: Option<i64>,
+    sample_titles: Vec<String>,
+}
+
+#[derive(Default)]
+struct ExclusionRecount {
+    conversation_ids: Vec<i64>,
+    total_messages: usize,
+    total_characters: usize,
+    earliest_ts: Option<i64>,
+    latest_ts: Option<i64>,
+}
+
 /// Generator for pre-publish summaries.
 pub struct SummaryGenerator<'a> {
     db: &'a Connection,
@@ -481,23 +500,48 @@ impl<'a> SummaryGenerator<'a> {
             ws.included = !exclusions.is_workspace_excluded(&ws.path);
         }
 
-        // Recalculate totals based on included workspaces
-        let included_workspaces: HashSet<_> = summary
-            .workspaces
-            .iter()
-            .filter(|w| w.included)
-            .map(|w| w.path.clone())
-            .collect();
-
         if exclusions.has_exclusions() {
             // Recalculate counts excluding excluded items
-            let (conv_count, msg_count, char_count) =
-                self.recalculate_with_exclusions(filters, &included_workspaces, exclusions)?;
+            let recount = self.recalculate_with_exclusions(filters, exclusions)?;
 
-            summary.total_conversations = conv_count;
-            summary.total_messages = msg_count;
-            summary.total_characters = char_count;
-            summary.estimated_size_bytes = estimate_compressed_size(char_count);
+            summary.total_conversations = recount.conversation_ids.len();
+            summary.total_messages = recount.total_messages;
+            summary.total_characters = recount.total_characters;
+            summary.estimated_size_bytes = estimate_compressed_size(recount.total_characters);
+            summary.earliest_timestamp = recount
+                .earliest_ts
+                .and_then(DateTime::from_timestamp_millis);
+            summary.latest_timestamp = recount.latest_ts.and_then(DateTime::from_timestamp_millis);
+            summary.date_histogram =
+                self.get_date_histogram_for_conversation_ids(&recount.conversation_ids)?;
+            summary.agents = self.get_agent_summary_for_conversation_ids(
+                &recount.conversation_ids,
+                summary.total_conversations,
+            )?;
+
+            let mut included_workspace_summaries = self
+                .get_workspace_summary_for_conversation_ids(&recount.conversation_ids)?
+                .into_iter()
+                .map(|workspace| (workspace.path.clone(), workspace))
+                .collect::<HashMap<_, _>>();
+            for workspace in &mut summary.workspaces {
+                if !workspace.included {
+                    continue;
+                }
+                if let Some(updated) = included_workspace_summaries.remove(workspace.path.as_str())
+                {
+                    *workspace = updated;
+                } else {
+                    workspace.conversation_count = 0;
+                    workspace.message_count = 0;
+                    workspace.date_range = DateRange {
+                        earliest: None,
+                        latest: None,
+                    };
+                    workspace.sample_titles.clear();
+                }
+                workspace.included = true;
+            }
         }
 
         Ok(summary)
@@ -559,22 +603,46 @@ impl<'a> SummaryGenerator<'a> {
 
     /// Count messages across a known set of conversation IDs.
     fn count_messages_for_conversation_ids(&self, conversation_ids: &[i64]) -> Result<usize> {
+        let (message_count, _) =
+            self.count_messages_and_characters_for_conversation_ids(conversation_ids)?;
+        Ok(message_count)
+    }
+
+    /// Count messages and characters across a known set of conversation IDs.
+    fn count_messages_and_characters_for_conversation_ids(
+        &self,
+        conversation_ids: &[i64],
+    ) -> Result<(usize, usize)> {
         if conversation_ids.is_empty() {
-            return Ok(0);
+            return Ok((0, 0));
         }
 
-        let params: Vec<ParamValue> = conversation_ids
-            .iter()
-            .copied()
-            .map(ParamValue::from)
-            .collect();
-        let placeholders = vec!["?"; params.len()].join(", ");
-        let query =
-            format!("SELECT COUNT(*) FROM messages WHERE conversation_id IN ({placeholders})");
-        let count: i64 = self
-            .db
-            .query_row_map(&query, &params, |row: &Row| row.get_typed(0))?;
-        Ok(count as usize)
+        let mut total_messages = 0usize;
+        let mut total_characters = 0usize;
+        for chunk in conversation_ids.chunks(SUMMARY_ID_CHUNK_SIZE) {
+            let params: Vec<ParamValue> = chunk.iter().copied().map(ParamValue::from).collect();
+            let placeholders = vec!["?"; params.len()].join(", ");
+            let query = format!(
+                "SELECT COUNT(*), SUM(LENGTH(content))
+                 FROM messages
+                 WHERE conversation_id IN ({placeholders})"
+            );
+            let (message_count, character_count): (i64, i64) = self
+                .db
+                .query_map_collect(&query, &params, |row: &Row| {
+                    Ok((
+                        row.get_typed::<Option<i64>>(0)?.unwrap_or(0),
+                        row.get_typed::<Option<i64>>(1)?.unwrap_or(0),
+                    ))
+                })?
+                .into_iter()
+                .next()
+                .unwrap_or((0, 0));
+            total_messages = total_messages.saturating_add(message_count as usize);
+            total_characters = total_characters.saturating_add(character_count as usize);
+        }
+
+        Ok((total_messages, total_characters))
     }
 
     /// Get basic counts.
@@ -718,14 +786,6 @@ impl<'a> SummaryGenerator<'a> {
         where_clause: &str,
         params: &[ParamValue],
     ) -> Result<Vec<WorkspaceSummaryItem>> {
-        #[derive(Default)]
-        struct WorkspaceAggregate {
-            conversation_ids: Vec<i64>,
-            min_ts: Option<i64>,
-            max_ts: Option<i64>,
-            sample_titles: Vec<String>,
-        }
-
         let query = format!(
             "SELECT c.id, c.workspace_id, c.title, c.started_at
              FROM conversations c
@@ -798,34 +858,7 @@ impl<'a> SummaryGenerator<'a> {
             }
         }
 
-        let mut workspaces = Vec::new();
-        for (workspace, aggregate) in aggregates {
-            let msg_count =
-                self.count_messages_for_conversation_ids(&aggregate.conversation_ids)?;
-            // Extract display name
-            let display_name = std::path::Path::new(&workspace)
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| workspace.clone());
-
-            workspaces.push(WorkspaceSummaryItem {
-                path: workspace,
-                display_name,
-                conversation_count: aggregate.conversation_ids.len(),
-                message_count: msg_count,
-                date_range: DateRange::from_timestamps(aggregate.min_ts, aggregate.max_ts),
-                sample_titles: aggregate.sample_titles,
-                included: true,
-            });
-        }
-
-        workspaces.sort_by(|a, b| {
-            b.conversation_count
-                .cmp(&a.conversation_count)
-                .then_with(|| a.path.cmp(&b.path))
-        });
-
-        Ok(workspaces)
+        self.workspace_items_from_aggregates(aggregates)
     }
 
     /// Get agent summary.
@@ -888,21 +921,226 @@ impl<'a> SummaryGenerator<'a> {
         Ok(agents)
     }
 
+    fn get_date_histogram_for_conversation_ids(
+        &self,
+        conversation_ids: &[i64],
+    ) -> Result<Vec<DateHistogramEntry>> {
+        if conversation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut message_counts: HashMap<i64, usize> = HashMap::new();
+        let mut conversation_counts: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for chunk in conversation_ids.chunks(SUMMARY_ID_CHUNK_SIZE) {
+            let params: Vec<ParamValue> = chunk.iter().copied().map(ParamValue::from).collect();
+            let placeholders = vec!["?"; params.len()].join(", ");
+            let query = format!(
+                "SELECT conversation_id, created_at / 1000 / 86400, COUNT(*)
+                 FROM messages
+                 WHERE created_at IS NOT NULL
+                   AND conversation_id IN ({placeholders})
+                 GROUP BY conversation_id, created_at / 1000 / 86400"
+            );
+
+            for (conversation_id, day_epoch, message_count) in
+                self.db.query_map_collect(&query, &params, |row: &Row| {
+                    Ok((
+                        row.get_typed::<i64>(0)?,
+                        row.get_typed::<Option<i64>>(1)?.unwrap_or(0),
+                        row.get_typed::<Option<i64>>(2)?.unwrap_or(0) as usize,
+                    ))
+                })?
+            {
+                *message_counts.entry(day_epoch).or_insert(0) += message_count;
+                conversation_counts
+                    .entry(day_epoch)
+                    .or_default()
+                    .insert(conversation_id);
+            }
+        }
+
+        use chrono::{NaiveDate, TimeDelta};
+        let epoch_base = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let mut days: Vec<_> = message_counts.keys().copied().collect();
+        days.sort_unstable();
+        Ok(days
+            .into_iter()
+            .map(|day_epoch| {
+                let date = epoch_base
+                    .checked_add_signed(TimeDelta::days(day_epoch))
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| format!("{day_epoch}"));
+                DateHistogramEntry {
+                    date,
+                    message_count: message_counts.get(&day_epoch).copied().unwrap_or(0),
+                    conversation_count: conversation_counts
+                        .get(&day_epoch)
+                        .map(HashSet::len)
+                        .unwrap_or(0),
+                }
+            })
+            .collect())
+    }
+
+    fn get_workspace_summary_for_conversation_ids(
+        &self,
+        conversation_ids: &[i64],
+    ) -> Result<Vec<WorkspaceSummaryItem>> {
+        if conversation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut aggregates: HashMap<String, WorkspaceAggregate> = HashMap::new();
+        for chunk in conversation_ids.chunks(SUMMARY_ID_CHUNK_SIZE) {
+            let params: Vec<ParamValue> = chunk.iter().copied().map(ParamValue::from).collect();
+            let placeholders = vec!["?"; params.len()].join(", ");
+            let query = format!(
+                "SELECT c.id, w.path, c.title, c.started_at
+                 FROM conversations c
+                 JOIN workspaces w ON c.workspace_id = w.id
+                 WHERE c.id IN ({placeholders})
+                 ORDER BY c.started_at DESC"
+            );
+
+            for (conversation_id, workspace, title, started_at) in
+                self.db.query_map_collect(&query, &params, |row: &Row| {
+                    Ok((
+                        row.get_typed::<i64>(0)?,
+                        row.get_typed::<String>(1)?,
+                        row.get_typed::<Option<String>>(2)?,
+                        row.get_typed::<Option<i64>>(3)?,
+                    ))
+                })?
+            {
+                let aggregate = aggregates.entry(workspace).or_default();
+                aggregate.conversation_ids.push(conversation_id);
+                aggregate.min_ts = match (aggregate.min_ts, started_at) {
+                    (Some(existing), Some(value)) => Some(existing.min(value)),
+                    (None, value) => value,
+                    (existing, None) => existing,
+                };
+                aggregate.max_ts = match (aggregate.max_ts, started_at) {
+                    (Some(existing), Some(value)) => Some(existing.max(value)),
+                    (None, value) => value,
+                    (existing, None) => existing,
+                };
+                if let Some(title) = title
+                    && !title.is_empty()
+                    && aggregate.sample_titles.len() < 5
+                {
+                    aggregate.sample_titles.push(title);
+                }
+            }
+        }
+
+        self.workspace_items_from_aggregates(aggregates)
+    }
+
+    fn workspace_items_from_aggregates(
+        &self,
+        aggregates: HashMap<String, WorkspaceAggregate>,
+    ) -> Result<Vec<WorkspaceSummaryItem>> {
+        let mut workspaces = Vec::new();
+        for (workspace, aggregate) in aggregates {
+            let msg_count =
+                self.count_messages_for_conversation_ids(&aggregate.conversation_ids)?;
+            let display_name = std::path::Path::new(&workspace)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| workspace.clone());
+
+            workspaces.push(WorkspaceSummaryItem {
+                path: workspace,
+                display_name,
+                conversation_count: aggregate.conversation_ids.len(),
+                message_count: msg_count,
+                date_range: DateRange::from_timestamps(aggregate.min_ts, aggregate.max_ts),
+                sample_titles: aggregate.sample_titles,
+                included: true,
+            });
+        }
+
+        workspaces.sort_by(|a, b| {
+            b.conversation_count
+                .cmp(&a.conversation_count)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+
+        Ok(workspaces)
+    }
+
+    fn get_agent_summary_for_conversation_ids(
+        &self,
+        conversation_ids: &[i64],
+        total_conversations: usize,
+    ) -> Result<Vec<AgentSummaryItem>> {
+        if conversation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut aggregates: HashMap<String, Vec<i64>> = HashMap::new();
+        for chunk in conversation_ids.chunks(SUMMARY_ID_CHUNK_SIZE) {
+            let params: Vec<ParamValue> = chunk.iter().copied().map(ParamValue::from).collect();
+            let placeholders = vec!["?"; params.len()].join(", ");
+            let query = format!(
+                "SELECT c.id, COALESCE(a.slug, 'unknown')
+                 FROM conversations c
+                 LEFT JOIN agents a ON c.agent_id = a.id
+                 WHERE c.id IN ({placeholders})"
+            );
+
+            for (conversation_id, agent_slug) in
+                self.db.query_map_collect(&query, &params, |row: &Row| {
+                    Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?))
+                })?
+            {
+                aggregates
+                    .entry(agent_slug)
+                    .or_default()
+                    .push(conversation_id);
+            }
+        }
+
+        let mut agents = Vec::new();
+        for (agent, conversation_ids) in aggregates {
+            let conv_count = conversation_ids.len();
+            let msg_count = self.count_messages_for_conversation_ids(&conversation_ids)?;
+            let percentage = if total_conversations > 0 {
+                (conv_count as f64 / total_conversations as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            agents.push(AgentSummaryItem {
+                name: agent,
+                conversation_count: conv_count,
+                message_count: msg_count,
+                percentage,
+                included: true,
+            });
+        }
+
+        agents.sort_by(|a, b| {
+            b.conversation_count
+                .cmp(&a.conversation_count)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        Ok(agents)
+    }
+
     /// Recalculate counts with exclusions.
     fn recalculate_with_exclusions(
         &self,
         filters: Option<&SummaryFilters>,
-        included_workspaces: &HashSet<String>,
         exclusions: &ExclusionSet,
-    ) -> Result<(usize, usize, usize)> {
-        let enforce_workspace_inclusion = !included_workspaces.is_empty();
-
+    ) -> Result<ExclusionRecount> {
         let (where_clause, params) = filters
             .map(|active_filters| self.build_filter_clause(active_filters))
             .unwrap_or_default();
 
         let query = format!(
-            "SELECT c.id, c.workspace_id, c.title
+            "SELECT c.id, c.workspace_id, c.title, c.started_at
              FROM conversations c
              WHERE 1=1{}",
             where_clause
@@ -913,12 +1151,15 @@ impl<'a> SummaryGenerator<'a> {
                 row.get_typed::<i64>(0)?,
                 row.get_typed::<Option<i64>>(1)?,
                 row.get_typed::<Option<String>>(2)?,
+                row.get_typed::<Option<i64>>(3)?,
             ))
         })?;
-        let workspace_ids: Vec<i64> = conv_rows
+        let mut workspace_ids: Vec<i64> = conv_rows
             .iter()
-            .filter_map(|(_, workspace_id, _)| *workspace_id)
+            .filter_map(|(_, workspace_id, _, _)| *workspace_id)
             .collect();
+        workspace_ids.sort_unstable();
+        workspace_ids.dedup();
         let workspace_map = if workspace_ids.is_empty() {
             HashMap::new()
         } else {
@@ -939,7 +1180,9 @@ impl<'a> SummaryGenerator<'a> {
         };
 
         let mut included_conversation_ids = Vec::new();
-        for (id, workspace_id, title) in conv_rows {
+        let mut earliest_ts: Option<i64> = None;
+        let mut latest_ts: Option<i64> = None;
+        for (id, workspace_id, title, started_at) in conv_rows {
             let workspace = workspace_id.and_then(|id| workspace_map.get(&id).cloned());
             let title_str = title.as_deref().unwrap_or("");
 
@@ -947,48 +1190,33 @@ impl<'a> SummaryGenerator<'a> {
                 continue;
             }
 
-            if enforce_workspace_inclusion
-                && let Some(ws) = &workspace
-                && !included_workspaces.contains(ws)
-            {
-                continue;
-            }
-
             included_conversation_ids.push(id);
+            earliest_ts = match (earliest_ts, started_at) {
+                (Some(existing), Some(value)) => Some(existing.min(value)),
+                (None, value) => value,
+                (existing, None) => existing,
+            };
+            latest_ts = match (latest_ts, started_at) {
+                (Some(existing), Some(value)) => Some(existing.max(value)),
+                (None, value) => value,
+                (existing, None) => existing,
+            };
         }
 
         if included_conversation_ids.is_empty() {
-            return Ok((0, 0, 0));
+            return Ok(ExclusionRecount::default());
         }
 
-        let msg_params: Vec<ParamValue> = included_conversation_ids
-            .iter()
-            .copied()
-            .map(ParamValue::from)
-            .collect();
-        let placeholders = vec!["?"; msg_params.len()].join(", ");
-        let msg_query = format!(
-            "SELECT COUNT(*), SUM(LENGTH(content))
-             FROM messages
-             WHERE conversation_id IN ({placeholders})"
-        );
-        let (msg_count, char_count): (i64, i64) = self
-            .db
-            .query_map_collect(&msg_query, &msg_params, |row: &Row| {
-                Ok((
-                    row.get_typed::<Option<i64>>(0)?.unwrap_or(0),
-                    row.get_typed::<Option<i64>>(1)?.unwrap_or(0),
-                ))
-            })?
-            .into_iter()
-            .next()
-            .unwrap_or((0, 0));
+        let (total_messages, total_characters) =
+            self.count_messages_and_characters_for_conversation_ids(&included_conversation_ids)?;
 
-        Ok((
-            included_conversation_ids.len(),
-            msg_count as usize,
-            char_count as usize,
-        ))
+        Ok(ExclusionRecount {
+            conversation_ids: included_conversation_ids,
+            total_messages,
+            total_characters,
+            earliest_ts,
+            latest_ts,
+        })
     }
 }
 
@@ -1310,7 +1538,7 @@ mod tests {
         let claude = summary
             .agents
             .iter()
-            .find(|a| a.name == "claude-code")
+            .find(|a| a.name.as_str().eq("claude-code"))
             .unwrap();
         assert_eq!(claude.message_count, 8);
     }
@@ -1414,7 +1642,7 @@ mod tests {
         let claude = summary
             .agents
             .iter()
-            .find(|a| a.name == "claude-code")
+            .find(|a| a.name.as_str().eq("claude-code"))
             .unwrap();
         assert_eq!(claude.conversation_count, 1);
         assert_eq!(claude.message_count, 3);
@@ -1447,7 +1675,10 @@ mod tests {
         let generator = SummaryGenerator::new(&conn);
         let summary = generator.generate(None).unwrap();
 
-        let claude = summary.agents.iter().find(|a| a.name == "claude-code");
+        let claude = summary
+            .agents
+            .iter()
+            .find(|a| a.name.as_str().eq("claude-code"));
         assert!(claude.is_some());
         let claude = claude.unwrap();
         assert_eq!(claude.conversation_count, 2);
@@ -1519,7 +1750,37 @@ mod tests {
             .iter()
             .find(|w| w.path.contains("project-b"));
         assert!(project_b.is_some());
-        assert!(!project_b.unwrap().included);
+        let project_b = project_b.unwrap();
+        assert!(!project_b.included);
+        assert_eq!(project_b.conversation_count, 1);
+        assert_eq!(project_b.message_count, 4);
+
+        let project_a = summary
+            .workspaces
+            .iter()
+            .find(|w| w.path.contains("project-a"))
+            .unwrap();
+        assert!(project_a.included);
+        assert_eq!(project_a.conversation_count, 2);
+        assert_eq!(project_a.message_count, 8);
+        assert_eq!(summary.total_conversations, 2);
+        assert_eq!(summary.total_messages, 8);
+        assert_eq!(summary.agents.len(), 1);
+        assert_eq!(summary.agents[0].name, "claude-code");
+        assert_eq!(summary.agents[0].conversation_count, 2);
+        assert!((summary.agents[0].percentage - 100.0).abs() < f64::EPSILON);
+        assert_eq!(
+            summary
+                .date_histogram
+                .iter()
+                .map(|day| day.message_count)
+                .sum::<usize>(),
+            8
+        );
+        assert_eq!(
+            summary.latest_timestamp,
+            DateTime::from_timestamp_millis(1_700_100_000_000)
+        );
     }
 
     #[test]
@@ -1662,6 +1923,42 @@ mod tests {
     }
 
     #[test]
+    fn test_exclusion_recount_keeps_workspace_less_conversations_with_other_workspaces() {
+        let (_dir, conn) = create_test_db();
+        insert_test_data(&conn);
+
+        conn.execute("INSERT INTO agents (id, slug) VALUES (3, 'codex');")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
+             VALUES (10, 3, NULL, 'General session', '/path/no-workspace.jsonl', 1700300000000, 1);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (conversation_id, idx, role, content, created_at)
+             VALUES (10, 0, 'user', 'Workspace-less message', 1700300001000);",
+        )
+        .unwrap();
+
+        let mut exclusions = ExclusionSet::new();
+        exclusions.add_pattern("^DOES_NOT_MATCH$").unwrap();
+
+        let generator = SummaryGenerator::new(&conn);
+        let summary = generator
+            .generate_with_exclusions(None, &exclusions)
+            .unwrap();
+
+        assert_eq!(summary.total_conversations, 4);
+        assert_eq!(summary.total_messages, 13);
+        assert!(
+            summary
+                .agents
+                .iter()
+                .any(|agent| agent.name.as_str().eq("codex"))
+        );
+    }
+
+    #[test]
     fn test_exclusion_recount_respects_active_filters() {
         let (_dir, conn) = create_test_db();
         insert_test_data(&conn);
@@ -1687,5 +1984,63 @@ mod tests {
 
         assert_eq!(summary.total_conversations, 1);
         assert_eq!(summary.total_messages, 3);
+    }
+
+    #[test]
+    fn test_pattern_exclusion_recounts_breakdowns() {
+        let (_dir, conn) = create_test_db();
+        insert_test_data(&conn);
+
+        let mut exclusions = ExclusionSet::new();
+        exclusions.add_pattern("^Add user profile$").unwrap();
+
+        let generator = SummaryGenerator::new(&conn);
+        let summary = generator
+            .generate_with_exclusions(None, &exclusions)
+            .unwrap();
+
+        assert_eq!(summary.total_conversations, 2);
+        assert_eq!(summary.total_messages, 9);
+        assert_eq!(
+            summary
+                .date_histogram
+                .iter()
+                .map(|day| day.message_count)
+                .sum::<usize>(),
+            9
+        );
+
+        let project_a = summary
+            .workspaces
+            .iter()
+            .find(|w| w.path == "/home/user/project-a")
+            .unwrap();
+        assert!(project_a.included);
+        assert_eq!(project_a.conversation_count, 1);
+        assert_eq!(project_a.message_count, 5);
+        assert!(
+            project_a
+                .sample_titles
+                .iter()
+                .all(|title| title != "Add user profile")
+        );
+
+        let claude = summary
+            .agents
+            .iter()
+            .find(|agent| agent.name.as_str().eq("claude-code"))
+            .unwrap();
+        assert_eq!(claude.conversation_count, 1);
+        assert_eq!(claude.message_count, 5);
+        assert!((claude.percentage - 50.0).abs() < f64::EPSILON);
+
+        let aider = summary
+            .agents
+            .iter()
+            .find(|agent| agent.name.as_str().eq("aider"))
+            .unwrap();
+        assert_eq!(aider.conversation_count, 1);
+        assert_eq!(aider.message_count, 4);
+        assert!((aider.percentage - 50.0).abs() < f64::EPSILON);
     }
 }

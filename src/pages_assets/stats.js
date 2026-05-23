@@ -21,6 +21,8 @@ let analyticsEpoch = 0;
 // Cache for computed analytics (when using database fallback)
 let computedAnalytics = null;
 
+const ANALYTICS_FETCH_TIMEOUT_MS = 10000;
+
 function isCurrentAnalyticsEpoch(epoch) {
     return epoch === analyticsEpoch;
 }
@@ -94,7 +96,7 @@ async function loadPrecomputedAnalytics() {
 
     for (const file of files) {
         try {
-            const response = await fetch(`./data/${file}`);
+            const response = await fetchWithTimeout(`./data/${file}`);
             if (!response.ok) {
                 throw new Error(`Failed to load ${file}: ${response.status}`);
             }
@@ -102,7 +104,7 @@ async function loadPrecomputedAnalytics() {
             results[key] = await response.json();
         } catch (error) {
             // Try alternate path (root level)
-            const response = await fetch(`./${file}`);
+            const response = await fetchWithTimeout(`./${file}`);
             if (!response.ok) {
                 throw new Error(`Analytics file not found: ${file}`);
             }
@@ -118,6 +120,40 @@ async function loadPrecomputedAnalytics() {
         workspaceSummary: results.workspace_summary,
         topTerms: results.top_terms
     };
+}
+
+function createFetchTimeoutSignal(timeoutMs) {
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+        return {
+            signal: AbortSignal.timeout(timeoutMs),
+            cancel() {},
+        };
+    }
+
+    if (typeof AbortController === 'undefined') {
+        return {
+            signal: undefined,
+            cancel() {},
+        };
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    return {
+        signal: controller.signal,
+        cancel() {
+            clearTimeout(timeoutId);
+        },
+    };
+}
+
+async function fetchWithTimeout(url) {
+    const { signal, cancel } = createFetchTimeoutSignal(ANALYTICS_FETCH_TIMEOUT_MS);
+    try {
+        return await fetch(url, signal ? { signal } : undefined);
+    } finally {
+        cancel();
+    }
 }
 
 /**
@@ -282,7 +318,7 @@ function computeAnalyticsFromDatabase() {
         });
 
         topTerms.terms = Object.entries(termCounts)
-            .sort((a, b) => b[1] - a[1])
+            .sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
             .slice(0, 50);
     } catch (error) {
         console.warn('[Stats] Failed to compute top terms:', error);

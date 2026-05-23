@@ -455,120 +455,58 @@ impl<'a> AnalyticsGenerator<'a> {
     fn generate_timeline(&self) -> Result<Timeline> {
         info!("Generating timeline...");
 
-        // Daily aggregation from messages
-        let mut daily_map: HashMap<String, DailyEntry> = HashMap::new();
-        let mut daily_conv_ids: HashMap<String, HashSet<i64>> = HashMap::new();
-
-        let timeline_rows: Vec<(Option<String>, i64)> = self.db.query_map_collect(
-            "SELECT DATE(m.created_at/1000, 'unixepoch') as date, m.conversation_id
+        let timeline_rows: Vec<(Option<String>, String, i64, i64)> = self.db.query_map_collect(
+            "SELECT DATE(m.created_at/1000, 'unixepoch') as date,
+                    COALESCE(c.agent, 'unknown') as agent,
+                    m.conversation_id,
+                    COUNT(*) as messages
              FROM messages m
+             LEFT JOIN conversations c ON m.conversation_id = c.id
              WHERE m.created_at IS NOT NULL
-             ORDER BY date",
-            &[],
-            |row: &Row| {
-                Ok((
-                    row.get_typed::<Option<String>>(0)?,
-                    row.get_typed::<i64>(1)?,
-                ))
-            },
-        )?;
-
-        for (date_opt, conv_id) in timeline_rows {
-            if let Some(date) = date_opt {
-                let entry = daily_map.entry(date.clone()).or_insert(DailyEntry {
-                    date: date.clone(),
-                    messages: 0,
-                    conversations: 0,
-                });
-                entry.messages += 1;
-                daily_conv_ids.entry(date).or_default().insert(conv_id);
-            }
-        }
-
-        // Fill in conversation counts
-        for (date, conv_ids) in &daily_conv_ids {
-            if let Some(entry) = daily_map.get_mut(date) {
-                entry.conversations = conv_ids.len();
-            }
-        }
-
-        let mut daily: Vec<DailyEntry> = daily_map.into_values().collect();
-        daily.sort_by(|a, b| a.date.cmp(&b.date));
-
-        // Aggregate to weekly
-        let weekly = aggregate_to_weekly(&daily);
-
-        // Aggregate to monthly
-        let monthly = aggregate_to_monthly(&daily);
-
-        // Per-agent timeline
-        let mut by_agent: BTreeMap<String, AgentTimeline> = BTreeMap::new();
-        let mut agent_daily_map: HashMap<String, HashMap<String, DailyEntry>> = HashMap::new();
-        let mut agent_daily_conv_ids: HashMap<String, HashMap<String, HashSet<i64>>> =
-            HashMap::new();
-
-        let agent_timeline_rows: Vec<(Option<String>, String, i64)> = self.db.query_map_collect(
-            "SELECT DATE(m.created_at/1000, 'unixepoch') as date, c.agent, m.conversation_id
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
-             WHERE m.created_at IS NOT NULL
-             ORDER BY date",
+             GROUP BY DATE(m.created_at/1000, 'unixepoch'),
+                      COALESCE(c.agent, 'unknown'),
+                      m.conversation_id
+             ORDER BY date, agent, m.conversation_id",
             &[],
             |row: &Row| {
                 Ok((
                     row.get_typed::<Option<String>>(0)?,
                     row.get_typed::<String>(1)?,
                     row.get_typed::<i64>(2)?,
+                    row.get_typed::<i64>(3)?,
                 ))
             },
         )?;
 
-        for (date_opt, agent, conv_id) in agent_timeline_rows {
-            if let Some(date) = date_opt {
-                let agent_map = agent_daily_map.entry(agent.clone()).or_default();
-                let entry = agent_map.entry(date.clone()).or_insert(DailyEntry {
-                    date: date.clone(),
-                    messages: 0,
-                    conversations: 0,
-                });
-                entry.messages += 1;
+        let mut overall = TimelineAccumulator::default();
+        let mut agent_accumulators: HashMap<String, TimelineAccumulator> = HashMap::new();
 
-                agent_daily_conv_ids
+        for (date_opt, agent, conv_id, messages) in timeline_rows {
+            if let Some(date) = date_opt.as_deref() {
+                overall.record_message_group(date, conv_id, messages);
+                agent_accumulators
                     .entry(agent)
                     .or_default()
-                    .entry(date)
-                    .or_default()
-                    .insert(conv_id);
+                    .record_message_group(date, conv_id, messages);
             }
         }
 
-        // Fill in conversation counts per agent
-        for (agent, conv_ids_map) in &agent_daily_conv_ids {
-            if let Some(daily_map) = agent_daily_map.get_mut(agent) {
-                for (date, conv_ids) in conv_ids_map {
-                    if let Some(entry) = daily_map.get_mut(date) {
-                        entry.conversations = conv_ids.len();
-                    }
-                }
-            }
-        }
+        let (daily, weekly, monthly) = overall.into_parts();
 
-        // Convert to sorted vectors and build AgentTimeline
-        for (agent, daily_map) in agent_daily_map {
-            let mut agent_daily: Vec<DailyEntry> = daily_map.into_values().collect();
-            agent_daily.sort_by(|a, b| a.date.cmp(&b.date));
-            let agent_weekly = aggregate_to_weekly(&agent_daily);
-            let agent_monthly = aggregate_to_monthly(&agent_daily);
-
-            by_agent.insert(
-                agent,
-                AgentTimeline {
-                    daily: agent_daily,
-                    weekly: agent_weekly,
-                    monthly: agent_monthly,
-                },
-            );
-        }
+        let by_agent = agent_accumulators
+            .into_iter()
+            .map(|(agent, accumulator)| {
+                let (daily, weekly, monthly) = accumulator.into_parts();
+                (
+                    agent,
+                    AgentTimeline {
+                        daily,
+                        weekly,
+                        monthly,
+                    },
+                )
+            })
+            .collect();
 
         Ok(Timeline {
             daily,
@@ -821,14 +759,95 @@ impl<'a> AnalyticsGenerator<'a> {
             }
         }
 
-        // Sort by count descending
         let mut top: Vec<(String, usize)> = term_counts.into_iter().collect();
-        top.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         // Keep top 100
         top.truncate(100);
 
         Ok(TopTerms { terms: top })
+    }
+}
+
+#[derive(Default)]
+struct TimelineAccumulator {
+    daily_map: HashMap<String, DailyEntry>,
+    weekly_map: HashMap<String, WeeklyEntry>,
+    weekly_conv_ids: HashMap<String, HashSet<i64>>,
+    monthly_map: HashMap<String, MonthlyEntry>,
+    monthly_conv_ids: HashMap<String, HashSet<i64>>,
+}
+
+impl TimelineAccumulator {
+    fn record_message_group(&mut self, date: &str, conv_id: i64, messages: i64) {
+        let message_count = messages.max(0) as usize;
+        let date_key = date.to_string();
+        let daily = self
+            .daily_map
+            .entry(date_key.clone())
+            .or_insert(DailyEntry {
+                date: date_key,
+                messages: 0,
+                conversations: 0,
+            });
+        daily.messages = daily.messages.saturating_add(message_count);
+        daily.conversations = daily.conversations.saturating_add(1);
+
+        let Ok(parsed_date) = NaiveDate::parse_from_str(date, "%Y-%m-%d") else {
+            return;
+        };
+
+        let week = iso_week_label(parsed_date);
+        let weekly = self.weekly_map.entry(week.clone()).or_insert(WeeklyEntry {
+            week: week.clone(),
+            messages: 0,
+            conversations: 0,
+        });
+        weekly.messages = weekly.messages.saturating_add(message_count);
+        self.weekly_conv_ids
+            .entry(week)
+            .or_default()
+            .insert(conv_id);
+
+        let month = month_label(parsed_date);
+        let monthly = self
+            .monthly_map
+            .entry(month.clone())
+            .or_insert(MonthlyEntry {
+                month: month.clone(),
+                messages: 0,
+                conversations: 0,
+            });
+        monthly.messages = monthly.messages.saturating_add(message_count);
+        self.monthly_conv_ids
+            .entry(month)
+            .or_default()
+            .insert(conv_id);
+    }
+
+    fn into_parts(mut self) -> (Vec<DailyEntry>, Vec<WeeklyEntry>, Vec<MonthlyEntry>) {
+        for (week, conv_ids) in self.weekly_conv_ids {
+            if let Some(entry) = self.weekly_map.get_mut(&week) {
+                entry.conversations = conv_ids.len();
+            }
+        }
+
+        for (month, conv_ids) in self.monthly_conv_ids {
+            if let Some(entry) = self.monthly_map.get_mut(&month) {
+                entry.conversations = conv_ids.len();
+            }
+        }
+
+        let mut daily: Vec<DailyEntry> = self.daily_map.into_values().collect();
+        daily.sort_by(|a, b| a.date.cmp(&b.date));
+
+        let mut weekly: Vec<WeeklyEntry> = self.weekly_map.into_values().collect();
+        weekly.sort_by(|a, b| a.week.cmp(&b.week));
+
+        let mut monthly: Vec<MonthlyEntry> = self.monthly_map.into_values().collect();
+        monthly.sort_by(|a, b| a.month.cmp(&b.month));
+
+        (daily, weekly, monthly)
     }
 }
 
@@ -839,16 +858,15 @@ pub fn aggregate_to_weekly(daily: &[DailyEntry]) -> Vec<WeeklyEntry> {
     for entry in daily {
         // Parse date and get ISO week
         if let Ok(date) = NaiveDate::parse_from_str(&entry.date, "%Y-%m-%d") {
-            let iso_week = date.iso_week();
-            let week_str = format!("{}-W{:02}", iso_week.year(), iso_week.week());
+            let week_str = iso_week_label(date);
 
             let weekly = weekly_map.entry(week_str.clone()).or_insert(WeeklyEntry {
                 week: week_str,
                 messages: 0,
                 conversations: 0,
             });
-            weekly.messages += entry.messages;
-            weekly.conversations += entry.conversations;
+            weekly.messages = weekly.messages.saturating_add(entry.messages);
+            weekly.conversations = weekly.conversations.saturating_add(entry.conversations);
         }
     }
 
@@ -863,8 +881,8 @@ pub fn aggregate_to_monthly(daily: &[DailyEntry]) -> Vec<MonthlyEntry> {
 
     for entry in daily {
         // Extract YYYY-MM from date
-        if entry.date.len() >= 7 {
-            let month_str = entry.date[..7].to_string();
+        if let Ok(date) = NaiveDate::parse_from_str(&entry.date, "%Y-%m-%d") {
+            let month_str = month_label(date);
 
             let monthly = monthly_map
                 .entry(month_str.clone())
@@ -873,14 +891,23 @@ pub fn aggregate_to_monthly(daily: &[DailyEntry]) -> Vec<MonthlyEntry> {
                     messages: 0,
                     conversations: 0,
                 });
-            monthly.messages += entry.messages;
-            monthly.conversations += entry.conversations;
+            monthly.messages = monthly.messages.saturating_add(entry.messages);
+            monthly.conversations = monthly.conversations.saturating_add(entry.conversations);
         }
     }
 
     let mut result: Vec<MonthlyEntry> = monthly_map.into_values().collect();
     result.sort_by(|a, b| a.month.cmp(&b.month));
     result
+}
+
+fn iso_week_label(date: NaiveDate) -> String {
+    let iso_week = date.iso_week();
+    format!("{}-W{:02}", iso_week.year(), iso_week.week())
+}
+
+fn month_label(date: NaiveDate) -> String {
+    format!("{:04}-{:02}", date.year(), date.month())
 }
 
 #[cfg(test)]
@@ -1189,6 +1216,84 @@ mod tests {
     }
 
     #[test]
+    fn test_timeline_aggregation_saturates_counter_arithmetic() {
+        let daily = vec![
+            DailyEntry {
+                date: "2024-01-01".into(),
+                messages: usize::MAX,
+                conversations: usize::MAX,
+            },
+            DailyEntry {
+                date: "2024-01-02".into(),
+                messages: 1,
+                conversations: 1,
+            },
+        ];
+
+        let weekly = aggregate_to_weekly(&daily);
+        assert_eq!(weekly[0].messages, usize::MAX);
+        assert_eq!(weekly[0].conversations, usize::MAX);
+
+        let monthly = aggregate_to_monthly(&daily);
+        assert_eq!(monthly[0].messages, usize::MAX);
+        assert_eq!(monthly[0].conversations, usize::MAX);
+    }
+
+    #[test]
+    fn precomputed_weekly_and_monthly_timelines_count_distinct_conversations() {
+        let (_dir, conn) = create_test_db();
+
+        conn.execute(
+            "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
+             VALUES (1, 'codex', '/tmp/project', 'Multi-day conversation', '/path/one.jsonl', 1704067200000, 2)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
+             VALUES (2, 'codex', '/tmp/project', 'Second conversation', '/path/two.jsonl', 1704153600000, 1)",
+        )
+        .unwrap();
+
+        for (conv_id, idx, created_at) in [
+            (1_i64, 0_i64, 1_704_067_200_000_i64),
+            (1_i64, 1_i64, 1_704_153_600_000_i64),
+            (2_i64, 0_i64, 1_704_153_600_000_i64),
+        ] {
+            conn.execute_compat(
+                "INSERT INTO messages (conversation_id, idx, role, content, created_at)
+                 VALUES (?1, ?2, 'assistant', 'message', ?3)",
+                frankensqlite::params![conv_id, idx, created_at],
+            )
+            .unwrap();
+        }
+
+        let timeline = AnalyticsGenerator::new(&conn).generate_timeline().unwrap();
+
+        assert_eq!(timeline.daily.len(), 2);
+        assert_eq!(timeline.daily[0].conversations, 1);
+        assert_eq!(timeline.daily[1].conversations, 2);
+        assert_eq!(timeline.weekly.len(), 1);
+        assert_eq!(timeline.weekly[0].messages, 3);
+        assert_eq!(
+            timeline.weekly[0].conversations, 2,
+            "a conversation with messages on two days in the same ISO week must be counted once"
+        );
+        assert_eq!(timeline.monthly.len(), 1);
+        assert_eq!(timeline.monthly[0].messages, 3);
+        assert_eq!(
+            timeline.monthly[0].conversations, 2,
+            "a conversation with messages on two days in the same month must be counted once"
+        );
+
+        let codex = timeline
+            .by_agent
+            .get("codex")
+            .expect("codex agent timeline should exist");
+        assert_eq!(codex.weekly[0].conversations, 2);
+        assert_eq!(codex.monthly[0].conversations, 2);
+    }
+
+    #[test]
     fn test_top_terms_extraction() {
         let (_dir, conn) = create_test_db();
         insert_test_data(&conn);
@@ -1201,6 +1306,32 @@ mod tests {
             top.terms
                 .iter()
                 .any(|(term, count)| term == "authentication" && *count >= 2)
+        );
+    }
+
+    #[test]
+    fn test_top_terms_tie_break_alphabetically_for_deterministic_json() {
+        let (_dir, conn) = create_test_db();
+
+        for (id, title) in [(1_i64, "banana"), (2_i64, "apple"), (3_i64, "cherry")] {
+            let source_path = format!("/path/{id}.jsonl");
+            conn.execute_compat(
+                "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
+                 VALUES (?1, 'codex', '/tmp/project', ?2, ?3, 1704067200000, 0)",
+                frankensqlite::params![id, title, source_path.as_str()],
+            )
+            .unwrap();
+        }
+
+        let top = AnalyticsGenerator::new(&conn).generate_top_terms().unwrap();
+
+        assert_eq!(
+            top.terms,
+            vec![
+                ("apple".to_string(), 1),
+                ("banana".to_string(), 1),
+                ("cherry".to_string(), 1),
+            ]
         );
     }
 

@@ -316,6 +316,18 @@ fn resolve_env_var(env_var: &str) -> Result<String, ConfigError> {
     dotenvy::var(env_var).map_err(|_| ConfigError::EnvVarNotFound(env_var.to_string()))
 }
 
+fn option_has_non_empty_value(value: &Option<String>) -> bool {
+    value
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn option_has_empty_value(value: &Option<String>) -> bool {
+    value
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+}
+
 impl PagesConfig {
     fn normalized_path_mode(&self) -> Option<String> {
         self.filters
@@ -421,13 +433,19 @@ impl PagesConfig {
         let mut warnings = Vec::new();
 
         // Validate encryption config
-        if !self.encryption.no_encryption && self.encryption.password.is_none() {
-            errors.push(
-                "encryption.password is required when encryption is enabled. \
-                 Use \"env:VAR_NAME\" syntax to read from environment variable, \
-                 or set encryption.no_encryption: true (requires i_understand_risks: true)."
-                    .to_string(),
-            );
+        if !self.encryption.no_encryption {
+            match self.encryption.password.as_deref().map(str::trim) {
+                Some(password) if !password.is_empty() => {}
+                Some(_) => errors.push(
+                    "encryption.password must not be empty when encryption is enabled.".to_string(),
+                ),
+                None => errors.push(
+                    "encryption.password is required when encryption is enabled. \
+                     Use \"env:VAR_NAME\" syntax to read from environment variable, \
+                     or set encryption.no_encryption: true (requires i_understand_risks: true)."
+                        .to_string(),
+                ),
+            }
         }
 
         if self.encryption.no_encryption && !self.encryption.i_understand_risks {
@@ -453,6 +471,9 @@ impl PagesConfig {
 
         // Validate deployment target
         let target = self.normalized_target();
+        if self.deployment.output_dir.trim().is_empty() {
+            errors.push("deployment.output_dir must not be empty.".to_string());
+        }
         match target.as_str() {
             "local" | "github" | "cloudflare" => {}
             _ => {
@@ -464,24 +485,33 @@ impl PagesConfig {
         }
 
         // Validate GitHub deployment config
-        if target == "github" && self.deployment.repo.is_none() {
+        if target == "github" && !option_has_non_empty_value(&self.deployment.repo) {
             errors.push(
-                "deployment.repo is required when target is 'github'. \
+                "deployment.repo is required and must not be empty when target is 'github'. \
                  Specify the repository name for GitHub Pages deployment."
                     .to_string(),
             );
         }
 
         if target == "cloudflare" {
-            let account_id_set = self.deployment.account_id.is_some();
-            let api_token_set = self.deployment.api_token.is_some();
+            if option_has_empty_value(&self.deployment.account_id) {
+                errors.push("deployment.account_id must not be empty when set.".to_string());
+            }
+            if option_has_empty_value(&self.deployment.api_token) {
+                errors.push("deployment.api_token must not be empty when set.".to_string());
+            }
+
+            let account_id_set = option_has_non_empty_value(&self.deployment.account_id);
+            let api_token_set = option_has_non_empty_value(&self.deployment.api_token);
             if account_id_set ^ api_token_set {
                 errors.push(
                     "deployment.account_id and deployment.api_token must both be set for Cloudflare API-token auth (use env:VAR syntax if needed)."
                         .to_string(),
                 );
             }
-        } else if self.deployment.account_id.is_some() || self.deployment.api_token.is_some() {
+        } else if option_has_non_empty_value(&self.deployment.account_id)
+            || option_has_non_empty_value(&self.deployment.api_token)
+        {
             warnings.push(
                 "deployment.account_id/api_token are set but deployment.target is not cloudflare; these values will be ignored."
                     .to_string(),
@@ -752,6 +782,21 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_empty_password() {
+        let mut config = PagesConfig::default();
+        config.encryption.password = Some("   ".to_string());
+
+        let result = config.validate();
+        assert!(!result.valid);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("password") && e.contains("empty"))
+        );
+    }
+
+    #[test]
     fn test_validate_no_encryption_without_ack() {
         let mut config = PagesConfig::default();
         config.encryption.no_encryption = true;
@@ -782,6 +827,37 @@ mod tests {
         let result = config.validate();
         assert!(!result.valid);
         assert!(result.errors.iter().any(|e| e.contains("repo")));
+    }
+
+    #[test]
+    fn test_validate_github_with_blank_repo() {
+        let mut config = config_with_password();
+        config.deployment.target = "github".to_string();
+        config.deployment.repo = Some("   ".to_string());
+
+        let result = config.validate();
+        assert!(!result.valid);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("repo") && e.contains("empty"))
+        );
+    }
+
+    #[test]
+    fn test_validate_blank_output_dir() {
+        let mut config = config_with_password();
+        config.deployment.output_dir = "   ".to_string();
+
+        let result = config.validate();
+        assert!(!result.valid);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("output_dir") && e.contains("empty"))
+        );
     }
 
     #[test]
@@ -904,6 +980,23 @@ mod tests {
                 .errors
                 .iter()
                 .any(|e| e.contains("account_id") && e.contains("api_token"))
+        );
+    }
+
+    #[test]
+    fn test_validate_cloudflare_rejects_blank_credentials() {
+        let mut config = config_with_password();
+        config.deployment.target = "cloudflare".to_string();
+        config.deployment.account_id = Some("   ".to_string());
+        config.deployment.api_token = Some("token456".to_string());
+
+        let result = config.validate();
+        assert!(!result.valid);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("account_id") && e.contains("empty"))
         );
     }
 

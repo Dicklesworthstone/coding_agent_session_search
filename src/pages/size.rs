@@ -4,7 +4,6 @@
 //! exporting/encrypting data that would exceed GitHub Pages limits.
 
 use anyhow::{Context, Result, bail};
-use frankensqlite::Connection;
 use frankensqlite::Row;
 use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use serde::{Deserialize, Serialize};
@@ -63,13 +62,10 @@ impl SizeEstimate {
         since_ts: Option<i64>,
         until_ts: Option<i64>,
     ) -> Result<Self> {
-        let conn = Connection::open(db_path.as_ref().to_string_lossy().as_ref())
+        let conn = super::open_existing_sqlite_db(db_path.as_ref())
             .context("Failed to open database for size estimation")?;
 
-        conn.execute_batch(
-            "PRAGMA busy_timeout = 5000;
-             PRAGMA journal_mode = WAL;",
-        )?;
+        conn.execute("PRAGMA busy_timeout = 5000;")?;
 
         // Build filter conditions
         let mut conditions = Vec::new();
@@ -419,6 +415,7 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensqlite::Connection;
 
     #[test]
     fn test_size_estimate_from_plaintext() {
@@ -552,6 +549,48 @@ mod tests {
         assert_eq!(recent.message_count, 1);
         assert_eq!(recent.plaintext_bytes, 9);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_database_allows_read_only_source_db() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let db_path = temp.path().join("cass-read-only.db");
+        let conn = Connection::open(db_path.to_string_lossy().as_ref())?;
+        conn.execute_batch(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL
+            );
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                started_at INTEGER
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                content TEXT NOT NULL
+            );
+            INSERT INTO agents (id, slug) VALUES (1, 'claude');
+            INSERT INTO conversations (id, agent_id, started_at) VALUES (10, 1, 1000);
+            INSERT INTO messages (id, conversation_id, content) VALUES (100, 10, 'readonly');",
+        )?;
+        drop(conn);
+
+        let original_permissions = std::fs::metadata(&db_path)?.permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_readonly(true);
+        std::fs::set_permissions(&db_path, read_only_permissions)?;
+
+        let estimate = SizeEstimate::from_database(&db_path, None, None, None);
+
+        std::fs::set_permissions(&db_path, original_permissions)?;
+        let estimate = estimate?;
+
+        assert_eq!(estimate.conversation_count, 1);
+        assert_eq!(estimate.message_count, 1);
+        assert_eq!(estimate.plaintext_bytes, 8);
         Ok(())
     }
 
