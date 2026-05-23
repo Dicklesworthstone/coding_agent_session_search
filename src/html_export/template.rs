@@ -968,11 +968,14 @@ mod tests {
             && logs.contains("operation=\"export_messages_complete\"");
         let has_scripts_generate =
             logs.contains("component=\"scripts\"") && logs.contains("operation=\"generate\"");
+        let has_styles_generate =
+            logs.contains("component=\"styles\"") && logs.contains("operation=\"generate\"");
         assert!(
             has_template_start
                 || has_renderer_start
                 || has_template_complete
-                || has_scripts_generate,
+                || has_scripts_generate
+                || has_styles_generate,
             "expected structured export milestone log, got: {logs}"
         );
         // If completion log is present, verify its format

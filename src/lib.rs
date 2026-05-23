@@ -77276,27 +77276,26 @@ fn run_export_html(
     let messages: Vec<Message> = raw_messages
         .iter()
         .enumerate()
-        .filter_map(|(i, msg)| {
+        .flat_map(|(i, msg)| {
             let role = extract_role(msg);
-            let content = extract_text_content(msg);
             let ts = extract_message_timestamp(msg);
             let timestamp = ts
                 .and_then(|ts| chrono::Utc.timestamp_millis_opt(ts).single())
                 .map(|dt| dt.to_rfc3339());
 
-            // Extract tool call info if present
-            let tool_call = if include_tools {
-                extract_tool_call(msg)
+            // Extract all structured tool blocks if present. A single Claude
+            // message can contain multiple tool_use blocks; preserve each one
+            // as its own renderer message so grouping can attach all results.
+            let tool_calls = if include_tools {
+                extract_tool_calls(msg)
             } else {
-                None
+                Vec::new()
             };
 
-            // If we have a tool_call, strip the redundant "[Tool: X]" prefix from content
-            // since the tool call details are shown separately in the HTML export
-            let content = if tool_call.is_some() {
-                strip_tool_marker(&content)
+            let content = if !tool_calls.is_empty() {
+                strip_tool_marker(&extract_text_content_without_tool_blocks(msg))
             } else {
-                content
+                extract_text_content(msg)
             };
 
             // --- Drop entire messages that are skill injections (unless opted in) ---
@@ -77306,26 +77305,26 @@ fn run_export_html(
             // to parse, redact, or pattern-match the content. Just skip it.
             if !include_skills {
                 if content.contains("Base directory for this skill:") {
-                    return None;
+                    return Vec::new();
                 }
                 // System reminders contain skill listings, hook metadata, and other
                 // internal context. Drop entire messages that are system-reminder blocks.
                 if content.contains("<system-reminder>") {
-                    return None;
+                    return Vec::new();
                 }
                 // Skill listing dumps (injected by hooks)
                 if content
                     .contains("The following skills are available for use with the Skill tool:")
                 {
-                    return None;
+                    return Vec::new();
                 }
                 // Vercel plugin hook injections with skill metadata
                 if content.contains("skillInjection:") && content.contains("matchedSkills") {
-                    return None;
+                    return Vec::new();
                 }
                 // Hook injection blocks (contain skill names, patterns, metadata)
                 if content.contains("<!-- skillInjection:") {
-                    return None;
+                    return Vec::new();
                 }
             }
 
@@ -77334,29 +77333,48 @@ fn run_export_html(
             // Only user, assistant, system, tool, and unknown are valid message roles.
             match role.as_str() {
                 "user" | "assistant" | "system" | "tool" | "unknown" => {}
-                _ => return None,
+                _ => return Vec::new(),
             }
 
             // Skip empty messages: no content AND no tool call AND unknown role
             // This filters out malformed/empty entries that would look broken
-            if content.is_empty() && tool_call.is_none() && role == "unknown" {
-                return None;
+            if content.is_empty() && tool_calls.is_empty() && role == "unknown" {
+                return Vec::new();
             }
 
             // Also skip messages that are completely empty (no content, no tool call)
             // but keep tool calls even if content is empty (shows the tool interaction)
-            if content.is_empty() && tool_call.is_none() {
-                return None;
+            if content.is_empty() && tool_calls.is_empty() {
+                return Vec::new();
             }
 
-            Some(Message {
-                role,
-                content,
-                timestamp,
-                tool_call,
-                index: Some(i),
-                author: None,
-            })
+            if tool_calls.is_empty() {
+                return vec![Message {
+                    role,
+                    content,
+                    timestamp,
+                    tool_call: None,
+                    index: Some(i),
+                    author: None,
+                }];
+            }
+
+            tool_calls
+                .into_iter()
+                .enumerate()
+                .map(|(tool_index, tool_call)| Message {
+                    role: role.clone(),
+                    content: if tool_index == 0 {
+                        content.clone()
+                    } else {
+                        String::new()
+                    },
+                    timestamp: timestamp.clone(),
+                    tool_call: Some(tool_call),
+                    index: Some(i),
+                    author: None,
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -77686,12 +77704,22 @@ fn run_export_html(
     Ok(())
 }
 
-/// Extract tool call information from a message for HTML export.
+fn stringify_tool_value(value: &serde_json::Value) -> String {
+    if value.is_object() || value.is_array() {
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    } else if let Some(s) = value.as_str() {
+        s.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Extract all tool call/result blocks from a message for HTML export.
 ///
 /// Supports multiple formats:
 /// 1. Claude/Anthropic format: `content` array with `type: "tool_use"` or `type: "tool_result"` blocks
 /// 2. Cursor/generic format: `type: "tool"` at top level with `message.tool_name`, `message.tool_input`, `message.tool_output`
-fn extract_tool_call(msg: &serde_json::Value) -> Option<html_export::ToolCall> {
+fn extract_tool_calls(msg: &serde_json::Value) -> Vec<html_export::ToolCall> {
     // Format 2: Cursor/generic format - check for top-level type: "tool"
     if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str())
         && msg_type == "tool"
@@ -77704,25 +77732,9 @@ fn extract_tool_call(msg: &serde_json::Value) -> Option<html_export::ToolCall> {
             .and_then(|n| n.as_str())
             .unwrap_or("tool");
 
-        let tool_input = inner.get("tool_input").map(|i| {
-            if i.is_object() || i.is_array() {
-                serde_json::to_string_pretty(i).unwrap_or_default()
-            } else if let Some(s) = i.as_str() {
-                s.to_string()
-            } else {
-                i.to_string()
-            }
-        });
+        let tool_input = inner.get("tool_input").map(stringify_tool_value);
 
-        let tool_output = inner.get("tool_output").map(|o| {
-            if o.is_object() || o.is_array() {
-                serde_json::to_string_pretty(o).unwrap_or_default()
-            } else if let Some(s) = o.as_str() {
-                s.to_string()
-            } else {
-                o.to_string()
-            }
-        });
+        let tool_output = inner.get("tool_output").map(stringify_tool_value);
 
         // Determine status from explicit status field or presence of output
         let status_str = inner
@@ -77739,12 +77751,14 @@ fn extract_tool_call(msg: &serde_json::Value) -> Option<html_export::ToolCall> {
             _ => None,
         };
 
-        return Some(html_export::ToolCall {
+        return vec![html_export::ToolCall {
             name: tool_name.to_string(),
             input: tool_input.unwrap_or_default(),
             output: tool_output,
             status,
-        });
+            correlation_id: extract_tool_correlation_id(inner)
+                .or_else(|| extract_tool_correlation_id(msg)),
+        }];
     }
 
     // Format 1: Claude/Anthropic format - content array with tool_use/tool_result blocks
@@ -77753,45 +77767,32 @@ fn extract_tool_call(msg: &serde_json::Value) -> Option<html_export::ToolCall> {
         .and_then(|m| m.get("content"))
         .or_else(|| msg.get("content"));
 
+    let mut tool_calls = Vec::new();
     if let Some(arr) = content.and_then(|c| c.as_array()) {
         for block in arr {
             if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
                 match block_type {
                     "tool_use" => {
                         let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                        let input = block.get("input").map(|i| {
-                            if i.is_object() || i.is_array() {
-                                serde_json::to_string_pretty(i).unwrap_or_default()
-                            } else if let Some(s) = i.as_str() {
-                                s.to_string()
-                            } else {
-                                i.to_string()
-                            }
-                        });
-                        return Some(html_export::ToolCall {
+                        let input = block.get("input").map(stringify_tool_value);
+                        tool_calls.push(html_export::ToolCall {
                             name: name.to_string(),
                             input: input.unwrap_or_default(),
                             output: None,
                             // For exported conversations, don't show "pending" for tool invocations
                             // without explicit status - the output may be in a separate message
                             status: None,
+                            correlation_id: extract_tool_correlation_id(block),
                         });
                     }
                     "tool_result" => {
-                        let content = block.get("content").map(|c| {
-                            if c.is_object() || c.is_array() {
-                                serde_json::to_string_pretty(c).unwrap_or_default()
-                            } else if let Some(s) = c.as_str() {
-                                s.to_string()
-                            } else {
-                                c.to_string()
-                            }
-                        });
-                        return Some(html_export::ToolCall {
+                        let content = block.get("content").map(stringify_tool_value);
+                        tool_calls.push(html_export::ToolCall {
                             name: "tool_result".to_string(),
                             input: String::new(),
                             output: content,
                             status: Some(html_export::ToolStatus::Success),
+                            correlation_id: extract_tool_correlation_id(block),
                         });
                     }
                     _ => {}
@@ -77800,7 +77801,19 @@ fn extract_tool_call(msg: &serde_json::Value) -> Option<html_export::ToolCall> {
         }
     }
 
-    None
+    tool_calls
+}
+
+fn extract_tool_correlation_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("tool_use_id")
+        .or_else(|| value.get("tool_call_id"))
+        .or_else(|| value.get("call_id"))
+        .or_else(|| value.get("id"))
+        .and_then(|id| id.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 // ============================================================================
@@ -77916,6 +77929,13 @@ pub fn classify_message(msg: &html_export::Message, _format: AgentFormat) -> Mes
 
     match role {
         "user" => {
+            if msg
+                .tool_call
+                .as_ref()
+                .is_some_and(|tc| tc.name == "tool_result" && tc.output.is_some())
+            {
+                return MessageClassification::ToolResult;
+            }
             if has_content {
                 MessageClassification::UserContent
             } else {
@@ -77947,38 +77967,27 @@ pub fn classify_message(msg: &html_export::Message, _format: AgentFormat) -> Mes
     }
 }
 
-/// Extract correlation ID from a message for tool call/result matching.
-///
-/// Different formats use different correlation mechanisms:
-/// - Claude Code: tool_use_id in content blocks
-/// - Codex: function call name
-/// - Generic: message index fallback
+/// Extract provider correlation ID from a message for tool call/result matching.
 pub fn extract_correlation_id(msg: &html_export::Message, format: AgentFormat) -> Option<String> {
     use tracing::trace;
 
-    // First, try to use the tool call name as a simple correlation
-    // This works for most formats as a baseline
-    if let Some(ref tc) = msg.tool_call {
-        let corr_id = match format {
-            AgentFormat::ClaudeCode => {
-                // Claude uses tool_use_id but we don't have access to raw JSON here
-                // Fall back to tool name + index
-                Some(format!("claude-{}", tc.name))
-            }
-            AgentFormat::Codex => {
-                // Codex correlates by function name
-                Some(format!("codex-{}", tc.name))
-            }
-            AgentFormat::Cursor => Some(format!("cursor-{}", tc.name)),
-            AgentFormat::OpenCode => Some(format!("opencode-{}", tc.name)),
-            AgentFormat::Generic => Some(format!("generic-{}", tc.name)),
-        };
-        trace!(correlation_id = ?corr_id, tool_name = %tc.name, "Extracted correlation ID");
-        return corr_id;
+    if let Some(ref tc) = msg.tool_call
+        && let Some(corr_id) = tc.correlation_id.clone()
+    {
+        trace!(
+            correlation_id = %corr_id,
+            tool_name = %tc.name,
+            "Extracted provider tool correlation ID"
+        );
+        return Some(corr_id);
     }
 
-    // For tool results without explicit tool_call, use index as fallback
-    msg.index.map(|idx| format!("index-{}", idx))
+    trace!(
+        format = ?format,
+        has_tool_call = msg.tool_call.is_some(),
+        "No provider tool correlation ID present"
+    );
+    None
 }
 
 /// Flush the current group into the groups vector if it exists.
@@ -80674,6 +80683,7 @@ mod message_grouping_tests {
                 input: tool_input.to_string(),
                 output: None,
                 status: None,
+                correlation_id: None,
             }),
             index: None,
             author: None,
@@ -80691,6 +80701,7 @@ mod message_grouping_tests {
                 input: String::new(),
                 output: Some(output.to_string()),
                 status: Some(status),
+                correlation_id: None,
             }),
             index: None,
             author: None,
@@ -80761,6 +80772,127 @@ mod message_grouping_tests {
         assert_eq!(groups.len(), 1, "Should group assistant + tool into one");
         assert_eq!(groups[0].group_type, MessageGroupType::Assistant);
         assert_eq!(groups[0].tool_calls.len(), 1, "Should have 1 tool call");
+    }
+
+    #[test]
+    fn claude_tool_use_id_correlates_tool_result_for_html_export() {
+        let call_json = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_readme",
+                    "name": "Read",
+                    "input": { "file_path": "README.md" }
+                }]
+            }
+        });
+        let result_json = serde_json::json!({
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_readme",
+                    "content": "readme contents"
+                }]
+            }
+        });
+
+        let call = extract_tool_calls(&call_json)
+            .into_iter()
+            .next()
+            .expect("tool_use block");
+        let result = extract_tool_calls(&result_json)
+            .into_iter()
+            .next()
+            .expect("tool_result block");
+        assert_eq!(call.correlation_id.as_deref(), Some("toolu_readme"));
+        assert_eq!(result.correlation_id.as_deref(), Some("toolu_readme"));
+
+        let groups = group_messages_for_export(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: "Let me read the file.".to_string(),
+                timestamp: None,
+                tool_call: Some(call),
+                index: Some(0),
+                author: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: "readme contents".to_string(),
+                timestamp: None,
+                tool_call: Some(result),
+                index: Some(1),
+                author: None,
+            },
+        ]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tool_calls.len(), 1);
+        assert_eq!(
+            groups[0].tool_calls[0]
+                .result
+                .as_ref()
+                .map(|result| result.content.as_str()),
+            Some("readme contents")
+        );
+    }
+
+    #[test]
+    fn claude_multiple_tool_uses_are_preserved_for_html_export() {
+        let call_json = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "I'll inspect both files." },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_readme",
+                        "name": "Read",
+                        "input": { "file_path": "README.md" }
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_agents",
+                        "name": "Read",
+                        "input": { "file_path": "AGENTS.md" }
+                    }
+                ]
+            }
+        });
+
+        let calls = extract_tool_calls(&call_json);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].correlation_id.as_deref(), Some("toolu_readme"));
+        assert_eq!(calls[1].correlation_id.as_deref(), Some("toolu_agents"));
+        assert_eq!(
+            extract_text_content_without_tool_blocks(&call_json),
+            "I'll inspect both files."
+        );
+
+        let groups = group_messages_for_export(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: extract_text_content_without_tool_blocks(&call_json),
+                timestamp: None,
+                tool_call: Some(calls[0].clone()),
+                index: Some(0),
+                author: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: String::new(),
+                timestamp: None,
+                tool_call: Some(calls[1].clone()),
+                index: Some(0),
+                author: None,
+            },
+        ]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tool_calls.len(), 2);
+        assert_eq!(groups[0].primary.content, "I'll inspect both files.");
     }
 
     #[test]
@@ -81539,6 +81671,65 @@ fn extract_message_timestamp(msg: &serde_json::Value) -> Option<i64> {
                 .and_then(|p| p.get("timestamp"))
                 .and_then(crate::connectors::parse_timestamp)
         })
+}
+
+fn extract_text_content_without_tool_blocks(msg: &serde_json::Value) -> String {
+    fn flatten_without_tool_blocks(content: &serde_json::Value) -> Option<String> {
+        if let Some(s) = content.as_str() {
+            return (!s.is_empty()).then(|| s.to_string());
+        }
+
+        let arr = content.as_array()?;
+        let mut result = String::new();
+        for item in arr {
+            let item_type = item.get("type").and_then(|v| v.as_str());
+            if matches!(item_type, Some("tool_use" | "tool_result")) {
+                continue;
+            }
+
+            let part = if let Some(text) = item.as_str() {
+                Some(text.to_string())
+            } else if matches!(item_type, None | Some("text" | "input_text")) {
+                item.get("text")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            } else {
+                None
+            };
+
+            let Some(part) = part else {
+                continue;
+            };
+            if part.is_empty() {
+                continue;
+            }
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&part);
+        }
+
+        (!result.is_empty()).then_some(result)
+    }
+
+    if let Some(content) = msg.get("content")
+        && let Some(text) = flatten_without_tool_blocks(content)
+    {
+        return text;
+    }
+    if let Some(inner) = msg.get("message")
+        && let Some(content) = inner.get("content")
+        && let Some(text) = flatten_without_tool_blocks(content)
+    {
+        return text;
+    }
+    if let Some(payload) = msg.get("payload")
+        && let Some(content) = payload.get("content")
+        && let Some(text) = flatten_without_tool_blocks(content)
+    {
+        return text;
+    }
+    String::new()
 }
 
 fn extract_text_content(msg: &serde_json::Value) -> String {

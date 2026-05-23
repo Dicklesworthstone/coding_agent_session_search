@@ -107,6 +107,9 @@ pub struct ToolCall {
 
     /// Execution status (success, error, etc.)
     pub status: Option<ToolStatus>,
+
+    /// Provider correlation ID linking a tool call to its later result.
+    pub correlation_id: Option<String>,
 }
 
 /// Status of a tool execution.
@@ -233,10 +236,11 @@ pub struct ToolCallWithResult {
 impl ToolCallWithResult {
     /// Create a new tool call without a result yet.
     pub fn new(call: ToolCall) -> Self {
+        let correlation_id = call.correlation_id.clone();
         Self {
             call,
             result: None,
-            correlation_id: None,
+            correlation_id,
         }
     }
 
@@ -358,6 +362,12 @@ impl MessageGroup {
                     return;
                 }
             }
+            tracing::warn!(
+                tool_name = %result.tool_name,
+                correlation_id = %corr_id,
+                "Could not match correlated tool result to any call"
+            );
+            return;
         }
 
         // Fall back to matching by tool name (first unmatched call)
@@ -719,7 +729,7 @@ fn render_message_group(
     let (content_wrapper_start, content_wrapper_end) = if should_collapse {
         let preview_chars = options.collapse_threshold.min(500);
         let safe_len = byte_index_for_char_count(&group.primary.content, preview_chars);
-        let preview = &group.primary.content[..safe_len];
+        let preview = group.primary.content.get(..safe_len).unwrap_or("");
         (
             format!(
                 r#"<details class="message-collapse">
@@ -1020,7 +1030,7 @@ pub fn render_message(message: &Message, options: &RenderOptions) -> Result<Stri
         let preview_chars = options.collapse_threshold.min(500);
         // Safe truncation at char boundary to avoid panic on multi-byte UTF-8.
         let safe_len = byte_index_for_char_count(&message.content, preview_chars);
-        let preview = &message.content[..safe_len];
+        let preview = message.content.get(..safe_len).unwrap_or("");
         (
             format!(
                 r#"<details class="message-collapse">
@@ -1321,9 +1331,8 @@ fn format_timestamp(ts: &str) -> String {
         && ts.is_char_boundary(10)
         && ts.is_char_boundary(11)
         && ts.is_char_boundary(19)
+        && let (Some(date_part), Some(time_part)) = (ts.get(..10), ts.get(11..19))
     {
-        let date_part = &ts[..10];
-        let time_part = &ts[11..19];
         format!("{} {}", date_part, time_part)
     } else {
         ts.to_string()
@@ -1615,6 +1624,7 @@ mod tests {
                 input: r#"{"command": "ls -la"}"#.to_string(),
                 output: Some("file1.txt\nfile2.txt".to_string()),
                 status: Some(ToolStatus::Success),
+                correlation_id: None,
             }),
             index: None,
             author: None,
@@ -1701,6 +1711,7 @@ mod tests {
                 input: "{}".to_string(),
                 output: None,
                 status: None,
+                correlation_id: None,
             };
             let html = render_tool_badge(&tc, &RenderOptions::default());
             assert!(
@@ -1786,6 +1797,7 @@ mod tests {
                 input: "{}".to_string(),
                 output: Some(long_output_with_unicode),
                 status: Some(ToolStatus::Success),
+                correlation_id: None,
             }),
             index: None,
             author: None,
@@ -1819,6 +1831,7 @@ mod tests {
             input: r#"{"test": "input"}"#.to_string(),
             output: Some("test output".to_string()),
             status: Some(ToolStatus::Success),
+            correlation_id: None,
         }
     }
 
@@ -1862,6 +1875,58 @@ mod tests {
         assert!(html.contains("Read")); // Tool name in badge
         assert!(html.contains(r#"role="group""#)); // Accessibility for tool container
         assert!(html.contains("aria-label")); // Accessible
+    }
+
+    #[test]
+    fn test_tool_result_uses_exact_correlation_before_name_fallback() {
+        let msg = test_message("assistant", "Reading two files.");
+        let mut group = MessageGroup::assistant(msg);
+        group.add_tool_call(test_tool_call("Read"), Some("toolu_first".to_string()));
+        group.add_tool_call(test_tool_call("Read"), Some("toolu_second".to_string()));
+
+        group.add_tool_result(
+            ToolResult::new("Read", "second file contents", ToolStatus::Success)
+                .with_correlation_id("toolu_second"),
+        );
+
+        assert!(
+            group.tool_calls[0].result.is_none(),
+            "correlated result must not attach to the first same-name tool call"
+        );
+        assert_eq!(
+            group.tool_calls[1]
+                .result
+                .as_ref()
+                .map(|result| result.content.as_str()),
+            Some("second file contents")
+        );
+    }
+
+    #[test]
+    fn test_mismatched_correlated_tool_result_does_not_fall_back_by_name() {
+        let msg = test_message("assistant", "Reading a file.");
+        let mut group = MessageGroup::assistant(msg);
+        group.add_tool_call(test_tool_call("Read"), Some("toolu_expected".to_string()));
+
+        group.add_tool_result(
+            ToolResult::new("Read", "wrong file contents", ToolStatus::Success)
+                .with_correlation_id("toolu_other"),
+        );
+
+        assert!(
+            group.tool_calls[0].result.is_none(),
+            "a result with an explicit mismatched provider ID must not attach by name"
+        );
+    }
+
+    #[test]
+    fn test_tool_call_with_result_preserves_call_correlation_id() {
+        let mut call = test_tool_call("Read");
+        call.correlation_id = Some("toolu_from_call".to_string());
+
+        let tool = ToolCallWithResult::new(call);
+
+        assert_eq!(tool.correlation_id.as_deref(), Some("toolu_from_call"));
     }
 
     #[test]
