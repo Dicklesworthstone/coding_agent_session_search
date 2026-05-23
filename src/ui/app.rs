@@ -22582,9 +22582,13 @@ fn write_export_bytes_no_overwrite(
         {
             Ok(mut file) => {
                 if let Err(err) = file.write_all(payload) {
-                    // Avoid leaving a partially written export behind.
-                    let _ = std::fs::remove_file(&candidate);
-                    return Err(format!("Failed to write export: {err}"));
+                    return Err(export_write_error("writing", &candidate, err));
+                }
+                if let Err(err) = file.sync_all() {
+                    return Err(export_write_error("syncing", &candidate, err));
+                }
+                if let Err(err) = sync_parent_directory(&candidate) {
+                    return Err(export_write_error("finalizing", &candidate, err));
                 }
                 return Ok(candidate);
             }
@@ -22607,6 +22611,10 @@ fn write_export_bytes_no_overwrite(
         1024,
         output_path.display()
     ))
+}
+
+fn export_write_error(action: &str, path: &Path, err: impl std::fmt::Display) -> String {
+    format!("Failed {action} export {}: {err}", path.display())
 }
 
 fn tui_prefers_direct_followup_file(hit: &SearchHit) -> bool {

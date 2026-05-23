@@ -267,6 +267,14 @@ fn prepare_local_sync_container(sync_root: &Path, local_path: &Path) -> Result<(
     Ok(())
 }
 
+fn prepare_local_sync_root(local_store: &Path, mirror_dir: &Path) -> Result<(), String> {
+    reject_local_symlink_below_root(local_store, mirror_dir)?;
+    std::fs::create_dir_all(mirror_dir)
+        .map_err(|e| format!("Failed to create directory: {}", e))?;
+    reject_local_symlink_below_root(local_store, mirror_dir)?;
+    Ok(())
+}
+
 fn sftp_file_stat_is_symlink(stat: &FileStat) -> bool {
     stat.file_type().is_symlink()
 }
@@ -657,7 +665,8 @@ impl SyncEngine {
 
         // Create the mirror directory
         let mirror_dir = self.mirror_dir(&source.name);
-        std::fs::create_dir_all(&mirror_dir)?;
+        prepare_local_sync_root(&self.local_store, &mirror_dir)
+            .map_err(|e| SyncError::CreateDirFailed(std::io::Error::other(e)))?;
 
         // Pre-fetch remote home directory if any paths use tilde (avoids multiple SSH calls)
         let remote_home = if source.paths.iter().enumerate().any(|(index, path)| {
@@ -3104,6 +3113,33 @@ mod tests {
 
         assert!(err.contains("Refusing to write"));
         assert!(err.contains("mirror-link"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_prepare_local_sync_root_rejects_symlinked_source_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let local_store = temp.path().join("data");
+        let remotes = local_store.join("remotes");
+        let outside = temp.path().join("outside");
+        let source_link = remotes.join("laptop");
+        let mirror_dir = source_link.join("mirror");
+
+        std::fs::create_dir_all(&remotes).expect("create remotes");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        symlink(&outside, &source_link).expect("symlink source parent");
+
+        let err = prepare_local_sync_root(&local_store, &mirror_dir)
+            .expect_err("symlinked source parent should be rejected before mkdir");
+
+        assert!(err.contains("Refusing to write"));
+        assert!(err.contains("laptop"));
+        assert!(
+            !outside.join("mirror").exists(),
+            "sync root preparation must not create directories through source parent symlinks"
+        );
     }
 
     #[test]

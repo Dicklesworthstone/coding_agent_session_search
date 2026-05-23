@@ -507,7 +507,7 @@ static EMAIL_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
 
 static URL_HOST_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
     Regex::new(
-        r"(?i)\b(?P<scheme>https?|ssh|wss?)://(?:(?P<userinfo>[^\s/@]+)@)?(?P<host>[A-Z0-9][A-Z0-9.-]*\.[A-Z]{2,})(?P<port>:\d+)?",
+        r"(?i)\b(?P<scheme>https?|ssh|wss?)://(?:(?P<userinfo>[^\s/@]+)@)?(?P<host>\[[0-9A-F:.]+\]|[A-Z0-9](?:[A-Z0-9.-]{0,253}[A-Z0-9])?)(?P<port>:\d+)?",
     )
     .expect("URL hostname redaction regex must compile")
 });
@@ -805,6 +805,50 @@ mod tests {
             "Clone ssh://[USERINFO_REDACTED]@[HOST_REDACTED]:2222/repo"
         );
         assert!(!password_result.output.contains("alice:secret"));
+    }
+
+    #[test]
+    fn test_hostname_redaction_covers_single_label_and_ip_hosts() -> Result<(), &'static str> {
+        let config = RedactionConfig {
+            redact_hostnames: true,
+            redact_emails: false,
+            ..Default::default()
+        };
+        let engine = RedactionEngine::new(config);
+
+        for (input, expected) in [
+            (
+                "Open http://trj:8000/status",
+                "Open http://[HOST_REDACTED]:8000/status",
+            ),
+            (
+                "Open http://localhost:8000/status",
+                "Open http://[HOST_REDACTED]:8000/status",
+            ),
+            (
+                "Fetch https://192.168.1.124:8443/api",
+                "Fetch https://[HOST_REDACTED]:8443/api",
+            ),
+            (
+                "Fetch http://[::1]:8000/health",
+                "Fetch http://[HOST_REDACTED]:8000/health",
+            ),
+        ] {
+            let result = engine.redact_text(input);
+
+            if !result.output.as_str().eq(expected) {
+                return Err("hostname redaction output mismatch");
+            }
+            if !result
+                .changes
+                .iter()
+                .any(|change| change.kind == RedactionKind::Hostname)
+            {
+                return Err("hostname redaction change missing");
+            }
+        }
+
+        Ok(())
     }
 
     #[test]

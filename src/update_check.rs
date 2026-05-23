@@ -260,6 +260,9 @@ fn is_browser_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
+    if url_has_userinfo(&parsed) {
+        return false;
+    }
     matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
 }
 
@@ -267,7 +270,10 @@ fn is_trusted_release_notes_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
-    if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some("github.com")
+        || url_has_userinfo(&parsed)
+    {
         return false;
     }
 
@@ -290,6 +296,10 @@ fn is_trusted_release_notes_url(url: &str) -> bool {
     owner.eq_ignore_ascii_case(expected_owner)
         && repo.eq_ignore_ascii_case(expected_repo)
         && section == "releases"
+}
+
+fn url_has_userinfo(url: &url::Url) -> bool {
+    !url.username().is_empty() || url.password().is_some()
 }
 
 fn release_asset_url(version: &str, asset: &str) -> String {
@@ -524,6 +534,9 @@ fn is_allowed_update_api_url(url: &str) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
+    if url_has_userinfo(&parsed) {
+        return false;
+    }
 
     match parsed.scheme() {
         "https" => matches!(host, "api.github.com" | "github.com"),
@@ -833,6 +846,40 @@ mod tests {
         assert!(!is_browser_url("file:///etc/passwd"));
         assert!(!is_browser_url("javascript:alert(1)"));
         assert!(!is_browser_url("data:text/html,<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn test_url_validation_rejects_userinfo_credentials() -> Result<(), &'static str> {
+        for url in [
+            "https://user:pass@github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v1.2.3",
+            "http://user@localhost:8080/releases/v1.2.3",
+        ] {
+            if is_browser_url(url) {
+                return Err("browser URL validation accepted embedded credentials");
+            }
+        }
+
+        let state = UpdateState::default();
+        let release = GitHubRelease {
+            tag_name: "v9.9.9".to_string(),
+            html_url: format!("https://token@github.com/{GITHUB_REPO}/releases/tag/v9.9.9"),
+        };
+        if build_update_info("1.0.0", release, &state).is_some() {
+            return Err("release metadata accepted embedded credentials");
+        }
+
+        for url in [
+            "https://token@api.github.com/repos/foo/bar",
+            "https://token:secret@github.com/Dicklesworthstone/coding_agent_session_search/releases",
+            "http://user@localhost:8080/api",
+            "http://user:pass@[::1]:8080/api",
+        ] {
+            if is_allowed_update_api_url(url) {
+                return Err("update API override accepted embedded credentials");
+            }
+        }
+
+        Ok(())
     }
 
     #[test]
