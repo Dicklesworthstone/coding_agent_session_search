@@ -345,6 +345,339 @@ fn swarm_status_scenario_invariants_are_pinned() {
 }
 
 #[test]
+fn swarm_cockpit_integrated_gate_composes_operator_surfaces() -> Result<(), Box<dyn Error>> {
+    let manifest = read_json(repo_path(MANIFEST_PATH));
+
+    assert_swarm_status_action_matrix(&manifest)?;
+    assert_swarm_work_packets_follow_status(&manifest)?;
+    assert_swarm_stale_busy_and_dirty_signals(&manifest)?;
+    assert_swarm_proof_lint_and_pattern_surfaces_compose()?;
+
+    Ok(())
+}
+
+fn assert_swarm_status_action_matrix(manifest: &Value) -> Result<(), Box<dyn Error>> {
+    for (fixture_id, expected_action) in [
+        ("healthy", "claim-ready-bead"),
+        ("busy", "claim-ready-bead"),
+        ("stale_advisory", "inspect-stale"),
+        ("reservation_conflict", "coordinate-before-claim"),
+        ("build_pressure", "reduce-build-pressure"),
+        ("no_ready_work", "no-ready-work"),
+        ("privacy_guardrails", "review-redaction-report"),
+    ] {
+        let output = read_json(manifest_golden_path(manifest, fixture_id)?);
+        require_value_eq(
+            get_path(&output, &["summary", "recommended_action"]),
+            json!(expected_action),
+            &format!("{fixture_id} status recommended action"),
+        )?;
+        require_value_eq(
+            get_path(&output, &["privacy", "raw_session_content_included"]),
+            json!(false),
+            &format!("{fixture_id} raw session privacy flag"),
+        )?;
+        assert_no_forbidden_fixture_leaks(fixture_id, &output);
+    }
+    Ok(())
+}
+
+fn assert_swarm_work_packets_follow_status(manifest: &Value) -> Result<(), Box<dyn Error>> {
+    for case in [
+        WorkPacketCase {
+            fixture_id: "healthy",
+            expected_status_action: "claim-ready-bead",
+            expected_packet_action: "claim-ready-bead",
+            expected_readiness: "ready",
+            safe_to_start: true,
+        },
+        WorkPacketCase {
+            fixture_id: "reservation_conflict",
+            expected_status_action: "coordinate-before-claim",
+            expected_packet_action: "coordinate-before-claim",
+            expected_readiness: "blocked",
+            safe_to_start: false,
+        },
+        WorkPacketCase {
+            fixture_id: "build_pressure",
+            expected_status_action: "reduce-build-pressure",
+            expected_packet_action: "wait-for-rch-capacity",
+            expected_readiness: "build-pressure-high",
+            safe_to_start: false,
+        },
+    ] {
+        let fixture_path = manifest_input_path(manifest, case.fixture_id)?;
+        let status = run_swarm_status_fixture(&fixture_path)?;
+        let packet = run_swarm_work_packet_fixture(&fixture_path, None)?;
+
+        require_value_eq(
+            get_path(&status, &["summary", "recommended_action"]),
+            json!(case.expected_status_action),
+            &format!("{} status action", case.fixture_id),
+        )?;
+        require_value_eq(
+            get_path(&packet, &["summary", "recommended_action"]),
+            json!(case.expected_packet_action),
+            &format!("{} packet action", case.fixture_id),
+        )?;
+        require_value_eq(
+            get_path(&packet, &["summary", "readiness_state"]),
+            json!(case.expected_readiness),
+            &format!("{} packet readiness", case.fixture_id),
+        )?;
+        require_value_eq(
+            get_path(&packet, &["summary", "safe_to_start"]),
+            json!(case.safe_to_start),
+            &format!("{} packet safety", case.fixture_id),
+        )?;
+        require_value_eq(
+            get_path(&packet, &["source_status", "summary", "recommended_action"]),
+            json!(case.expected_status_action),
+            &format!("{} packet source-status action", case.fixture_id),
+        )?;
+        require_value_eq(
+            get_path(&packet, &["work_packet", "verification", "rch_required"]),
+            json!(true),
+            &format!("{} packet rch requirement", case.fixture_id),
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_swarm_stale_busy_and_dirty_signals(manifest: &Value) -> Result<(), Box<dyn Error>> {
+    let busy = read_json(manifest_golden_path(manifest, "busy")?);
+    require_value_eq(
+        get_path(&busy, &["summary", "active_agent_count"]),
+        json!(2),
+        "busy active agents",
+    )?;
+    require_value_eq(
+        get_path(&busy, &["summary", "active_reservation_count"]),
+        json!(1),
+        "busy active reservations",
+    )?;
+    require_value_eq(
+        get_path(&busy, &["summary", "dirty_worktree"]),
+        json!(true),
+        "busy dirty worktree",
+    )?;
+
+    let stale = read_json(manifest_golden_path(manifest, "stale_advisory")?);
+    require_value_eq(
+        get_path(&stale, &["summary", "stale_candidate_count"]),
+        json!(1),
+        "stale candidate count",
+    )?;
+    require_value_eq(
+        get_path(
+            &stale,
+            &["recommendations", "0", "requires_human_confirmation"],
+        ),
+        json!(true),
+        "stale human confirmation",
+    )?;
+    require_value_eq(
+        get_path(&stale, &["beads", "in_progress", "2", "stale_state"]),
+        json!("conflicting_evidence"),
+        "stale conflicting evidence",
+    )?;
+
+    let conflict = read_json(manifest_golden_path(manifest, "reservation_conflict")?);
+    require_value_eq(
+        get_path(&conflict, &["beads", "ready", "0", "safe_to_claim"]),
+        json!(false),
+        "reservation conflict safe_to_claim",
+    )?;
+    require_value_eq(
+        get_path(&conflict, &["reservations", "0", "overlaps_dirty_worktree"]),
+        json!(true),
+        "reservation conflict dirty overlap",
+    )?;
+    Ok(())
+}
+
+fn assert_swarm_proof_lint_and_pattern_surfaces_compose() -> Result<(), Box<dyn Error>> {
+    let (_clear_tmp, clear_path) =
+        write_swarm_evidence_fixture("integrated-clear-proof", integrated_clear_proof_sources())?;
+    assert_integrated_clear_proof(&clear_path)?;
+
+    let (_debt_tmp, debt_path) =
+        write_swarm_evidence_fixture("integrated-proof-debt", integrated_proof_debt_sources())?;
+    assert_integrated_proof_debt(&debt_path)?;
+
+    Ok(())
+}
+
+fn assert_integrated_clear_proof(fixture_path: &Path) -> Result<(), Box<dyn Error>> {
+    let evidence = run_swarm_evidence_fixture(fixture_path, Some("cass-integrated-clear"))?;
+    let proof_debt = run_swarm_proof_debt_fixture(fixture_path, Some("cass-integrated-clear"))?;
+    let patterns = run_swarm_failure_patterns_fixture(fixture_path, Some("cass-integrated-clear"))?;
+    let lint = run_swarm_lint_fixture(fixture_path, Some("cass-integrated-clear"))?;
+
+    require_value_eq(
+        get_path(&evidence, &["summary", "recommended_action"]),
+        json!("proof-ledger-complete"),
+        "clear evidence action",
+    )?;
+    require_value_eq(
+        get_path(&proof_debt, &["summary", "recommended_action"]),
+        json!("proof-debt-clear"),
+        "clear proof-debt action",
+    )?;
+    require_value_eq(
+        get_path(&patterns, &["summary", "recommended_action"]),
+        json!("no-recurring-patterns"),
+        "clear failure-pattern action",
+    )?;
+    require_value_eq(
+        get_path(&lint, &["summary", "recommended_action"]),
+        json!("coordination-clean"),
+        "clear lint action",
+    )?;
+    Ok(())
+}
+
+fn assert_integrated_proof_debt(fixture_path: &Path) -> Result<(), Box<dyn Error>> {
+    let lint = run_swarm_lint_fixture(fixture_path, None)?;
+    let evidence = run_swarm_evidence_fixture(fixture_path, None)?;
+    let proof_debt = run_swarm_proof_debt_fixture(fixture_path, None)?;
+    let patterns = run_swarm_failure_patterns_fixture(fixture_path, None)?;
+
+    require_value_eq(
+        get_path(&lint, &["status"]),
+        json!("partial"),
+        "debt lint status",
+    )?;
+    require_value_eq(
+        get_path(&lint, &["summary", "recommended_action"]),
+        json!("inspect-unavailable-providers"),
+        "debt lint action",
+    )?;
+    require_value_eq(
+        get_path(&evidence, &["summary", "recommended_action"]),
+        json!("inspect-unavailable-providers"),
+        "debt evidence action",
+    )?;
+    require_value_eq(
+        get_path(&proof_debt, &["summary", "recommended_action"]),
+        json!("inspect-unavailable-providers"),
+        "debt proof-debt action",
+    )?;
+    require(
+        get_path(&proof_debt, &["summary", "blocking_debt_count"])
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0),
+        "provider-partial proof debt should still expose blocking debt",
+    )?;
+    require(
+        get_path(&patterns, &["patterns"])
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|pattern| {
+                    pattern.get("kind").and_then(Value::as_str) == Some("proof-closeout-gap")
+                })
+            }),
+        "debt failure-pattern surface should explain the proof closeout gap",
+    )?;
+    Ok(())
+}
+
+struct WorkPacketCase {
+    fixture_id: &'static str,
+    expected_status_action: &'static str,
+    expected_packet_action: &'static str,
+    expected_readiness: &'static str,
+    safe_to_start: bool,
+}
+
+fn integrated_clear_proof_sources() -> Value {
+    json!({
+        "beads": {
+            "closed": [{
+                "id": "cass-integrated-clear",
+                "title": "Complete integrated proof",
+                "status": "closed",
+                "close_reason": "Verified by rch",
+                "commit_id": "abc123"
+            }]
+        },
+        "agent_mail": {
+            "messages": [{
+                "thread_id": "cass-integrated-clear",
+                "subject": "Closeout proof",
+                "from": "FixtureAgent",
+                "created_ts": "2026-05-08T16:00:00Z"
+            }],
+            "reservations": []
+        },
+        "git": {
+            "dirty": false,
+            "dirty_paths": [],
+            "recent_commits": [{
+                "hash": "abc123",
+                "subject": "test: finish cass-integrated-clear",
+                "changed_paths": ["tests/swarm_status_contract.rs"]
+            }]
+        },
+        "evidence": {
+            "recent_threads": [{
+                "thread_id": "cass-integrated-clear",
+                "subject": "Closeout proof",
+                "sender": "FixtureAgent"
+            }],
+            "recent_proofs": [{
+                "kind": "rch-test",
+                "bead_id": "cass-integrated-clear",
+                "commit_id": "abc123",
+                "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo test --test swarm_status_contract",
+                "status": "passed",
+                "remote_exit_status": 0,
+                "changed_paths": ["tests/swarm_status_contract.rs"],
+                "mail_thread_refs": ["cass-integrated-clear"]
+            }],
+            "proof_gaps": [],
+            "redaction_applied": false
+        },
+        "processes": {},
+        "cass_health": {},
+        "cass_status": {}
+    })
+}
+
+fn integrated_proof_debt_sources() -> Value {
+    json!({
+        "beads": {
+            "closed": [{
+                "id": "cass-integrated-debt",
+                "title": "Missing integrated proof",
+                "status": "closed",
+                "close_reason": "Closed before proof",
+                "commit_id": "def456"
+            }]
+        },
+        "git": {
+            "dirty": true,
+            "dirty_paths": [{"path": "docs/unrelated.md"}],
+            "recent_commits": [{
+                "hash": "def456",
+                "subject": "test: finish cass-integrated-debt",
+                "changed_paths": ["tests/swarm_status_contract.rs"]
+            }]
+        },
+        "evidence": {
+            "recent_threads": [],
+            "recent_proofs": [],
+            "proof_gaps": [],
+            "session_hits": [],
+            "redaction_applied": false
+        },
+        "processes": {},
+        "cass_health": {},
+        "cass_status": {}
+    })
+}
+
+#[test]
 fn swarm_work_packet_cli_builds_ready_read_only_packet() -> Result<(), Box<dyn Error>> {
     let fixture_path = repo_path("tests/fixtures/swarm_status/healthy.inputs.json");
     let output = run_swarm_work_packet_fixture(&fixture_path, None)?;
@@ -2296,6 +2629,26 @@ fn scenarios(manifest: &Value) -> Vec<&Value> {
         .collect()
 }
 
+fn manifest_input_path(manifest: &Value, fixture_id: &str) -> Result<PathBuf, Box<dyn Error>> {
+    manifest_path_field(manifest, fixture_id, "input_path")
+}
+
+fn manifest_golden_path(manifest: &Value, fixture_id: &str) -> Result<PathBuf, Box<dyn Error>> {
+    manifest_path_field(manifest, fixture_id, "golden_path")
+}
+
+fn manifest_path_field(
+    manifest: &Value,
+    fixture_id: &str,
+    field: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let scenario = scenarios(manifest)
+        .into_iter()
+        .find(|scenario| string_field(scenario, "fixture_id") == fixture_id)
+        .ok_or_else(|| test_error(format!("missing swarm fixture scenario {fixture_id}")))?;
+    Ok(repo_path(string_field(scenario, field)))
+}
+
 fn string_field<'a>(value: &'a Value, field: &str) -> &'a str {
     value
         .get(field)
@@ -2333,7 +2686,10 @@ fn assert_no_forbidden_fixture_leaks(fixture_id: &str, value: &Value) {
 fn get_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     let mut current = value;
     for key in path {
-        current = current.get(*key)?;
+        current = match current {
+            Value::Array(items) => items.get(key.parse::<usize>().ok()?)?,
+            _ => current.get(*key)?,
+        };
     }
     Some(current)
 }
