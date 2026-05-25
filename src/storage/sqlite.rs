@@ -16153,20 +16153,21 @@ mod tests {
             .unwrap();
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '10')")
                 .unwrap();
-            // Apply V1-V10 so schema is correct
-            let mut tx = conn.transaction().unwrap();
-            tx.execute_batch(MIGRATION_V1).unwrap();
-            tx.execute_batch(MIGRATION_V2).unwrap();
-            tx.execute_batch(MIGRATION_V4).unwrap();
-            tx.execute_batch(MIGRATION_V5).unwrap();
-            tx.execute_batch(MIGRATION_V6).unwrap();
-            tx.execute_batch(MIGRATION_V7).unwrap();
-            tx.execute_batch(MIGRATION_V8).unwrap();
-            tx.execute_batch(MIGRATION_V9).unwrap();
-            tx.execute_batch(MIGRATION_V10).unwrap();
-            tx.execute("UPDATE meta SET value = '10' WHERE key = 'schema_version'")
+            // Apply V1-V10 so schema is correct. Keep each historical DDL batch
+            // in autocommit mode; the fixture is testing cass migration
+            // transition behavior, not frankensqlite's handling of a giant
+            // synthetic legacy-DDL transaction.
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.execute_batch(MIGRATION_V4).unwrap();
+            conn.execute_batch(MIGRATION_V5).unwrap();
+            conn.execute_batch(MIGRATION_V6).unwrap();
+            conn.execute_batch(MIGRATION_V7).unwrap();
+            conn.execute_batch(MIGRATION_V8).unwrap();
+            conn.execute_batch(MIGRATION_V9).unwrap();
+            conn.execute_batch(MIGRATION_V10).unwrap();
+            conn.execute("UPDATE meta SET value = '10' WHERE key = 'schema_version'")
                 .unwrap();
-            tx.commit().unwrap();
         }
         materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
 
