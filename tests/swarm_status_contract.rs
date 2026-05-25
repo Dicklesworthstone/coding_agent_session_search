@@ -370,12 +370,12 @@ fn assert_swarm_status_action_matrix(manifest: &Value) -> Result<(), Box<dyn Err
         require_value_eq(
             get_path(&output, &["summary", "recommended_action"]),
             json!(expected_action),
-            &format!("{fixture_id} status recommended action"),
+            "status recommended action",
         )?;
         require_value_eq(
             get_path(&output, &["privacy", "raw_session_content_included"]),
             json!(false),
-            &format!("{fixture_id} raw session privacy flag"),
+            "raw session privacy flag",
         )?;
         assert_no_forbidden_fixture_leaks(fixture_id, &output);
     }
