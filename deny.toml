@@ -1,0 +1,329 @@
+# cargo-deny configuration (CI supply-chain gate)
+#
+# Filed per gauntlet round 1 finding F9-2 (deny.toml missing).
+# Configured to be permissive on widely-used OSS licenses while flagging
+# real supply-chain risks (vulns + duplicate deps + non-OSI sources).
+
+[graph]
+# Run on the host platform plus the published-release targets.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = false
+no-default-features = false
+
+[licenses]
+# All canonical OSI-approved + permissive licenses cass actually depends on.
+# Discovered via `cargo deny check licenses` rejection messages on first run.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "0BSD",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "Unlicense",
+    "BSL-1.0",            # Boost Software License — permissive OSS
+    "CDLA-Permissive-2.0", # Community Data License Agreement — permissive
+    "LPPL-1.3c",          # LaTeX Project Public License — permissive
+]
+confidence-threshold = 0.93
+exceptions = []
+
+# Sibling Franken-* crates lack a `license = "..."` field in their Cargo.toml.
+# Per the cass README ("license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg"),
+# the project license is MIT + OpenAI/Anthropic rider. The sibling crates
+# inherit this. Clarify per-crate until the upstream Cargo.toml entries
+# are filled in.
+[[licenses.clarify]]
+name = "coding-agent-search"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "asupersync"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "asupersync-macros"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "franken-decision"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "franken-evidence"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "franken-kernel"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "franken-agent-detection"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "frankensearch"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "frankensearch-core"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "frankensearch-embed"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "frankensearch-fusion"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "frankensearch-index"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "frankensearch-lexical"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "frankensearch-rerank"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-ast"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-btree"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-core"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-error"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-mvcc"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-pager"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-parser"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-planner"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-vdbe"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-vfs"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-wal"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui-extras"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui-runtime"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui-tty"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "toon"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-ext-fts5"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-ext-icu"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-ext-json"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-ext-misc"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-ext-rtree"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-func"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-observability"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "fsqlite-types"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui-a11y"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui-backend"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui-core"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui-i18n"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui-layout"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui-render"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui-style"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui-text"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+name = "ftui-widgets"
+expression = "MIT"
+license-files = []
+
+[advisories]
+# Use the latest advisory-db revision (no version pin).
+# Informational warnings escalate to errors by default; ignore the
+# 4 specific unmaintained-crate advisories that block transitively
+# through syntect/reqwest dep chains. These are evaluated each round
+# of the gauntlet — revisit when a viable replacement lands.
+yanked = "deny"
+ignore = [
+    # bincode v1 unmaintained — widely used; pending team-level migration call
+    "RUSTSEC-2025-0141",
+    # paste unmaintained — no functional successor offers drop-in compat
+    "RUSTSEC-2024-0436",
+    # rustls-pemfile unmaintained — migration to rustls-pki-types pending
+    "RUSTSEC-2025-0134",
+    # yaml-rust unmaintained — via syntect; cannot upgrade syntect without breaking
+    "RUSTSEC-2024-0320",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# No specific crate bans yet; revisit when supply-chain audits surface a target.
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Sibling projects pinned via [patch] entries in Cargo.toml or as path-deps.
+# Github org `Dicklesworthstone` covers frankensqlite, frankensearch,
+# franken_agent_detection, frankentui, asupersync, toon.
+allow-git = [
+    "https://github.com/Dicklesworthstone/frankensqlite",
+    "https://github.com/Dicklesworthstone/frankensearch",
+    "https://github.com/Dicklesworthstone/franken_agent_detection",
+    "https://github.com/Dicklesworthstone/frankentui",
+    "https://github.com/Dicklesworthstone/asupersync",
+    "https://github.com/Dicklesworthstone/toon",
+]
