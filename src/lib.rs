@@ -7,6 +7,7 @@ pub mod connectors;
 pub mod crash_replay;
 #[cfg(unix)]
 pub mod daemon;
+pub mod dependency_drift;
 pub mod doctor;
 pub(crate) mod doctor_chokepoint;
 pub(crate) mod doctor_robot_docs;
@@ -1479,6 +1480,24 @@ pub enum SwarmCommand {
         /// Restrict suggestions to a specific bead id.
         #[arg(long)]
         bead: Option<String>,
+    },
+    /// Detect pinned sibling dependency drift without mutating git or running builds.
+    DependencyDrift {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Read provider input from a single swarm fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+
+        /// Read provider input from a swarm fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+
+        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
+        #[arg(long, default_value = "healthy")]
+        fixture_id: String,
     },
 }
 
@@ -7575,6 +7594,18 @@ fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
             &fixture_id,
             bead.as_deref(),
         ),
+        SwarmCommand::DependencyDrift {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+        } => run_swarm_dependency_drift(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+        ),
     }
 }
 
@@ -7915,6 +7946,63 @@ fn run_swarm_failure_patterns(
             .and_then(serde_json::Value::as_u64)
         {
             println!("Patterns: {count}");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_swarm_dependency_drift(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+) -> CliResult<()> {
+    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
+    {
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
+            |err| CliError {
+                code: 10,
+                kind: CliErrorKind::Config.kind_str(),
+                message: err.to_string(),
+                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
+                retryable: false,
+            },
+        )?;
+        let source = set
+            .input()
+            .source_value(crate::swarm_status::SwarmProviderName::DependencyDrift);
+        crate::dependency_drift::render_dependency_drift_fixture(set.input().fixture_id(), source)
+    } else {
+        crate::dependency_drift::render_dependency_drift_live()
+    };
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!(
+            "Swarm dependency drift: {}",
+            payload
+                .get("summary")
+                .and_then(|summary| summary.get("recommended_action"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        if let Some(count) = payload
+            .get("summary")
+            .and_then(|summary| summary.get("warning_count"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("Warnings: {count}");
         }
     }
 
@@ -16027,6 +16115,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Swarm(SwarmCommand::FailurePatterns { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Swarm(SwarmCommand::DependencyDrift { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
         Commands::Models(ModelsCommand::Status { json }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -16267,6 +16358,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  cass pack \"your query\" --robot --max-tokens 4000 --max-evidence 8  # Tight paste budget",
         "  cass swarm status --json            # Read-only Beads/Agent Mail/git/rch swarm snapshot",
         "  cass swarm work-packet --json       # Advisory claim packet; does not claim or reserve",
+        "  cass swarm dependency-drift --json  # Read-only sibling pin/drift sentinel",
         "  cass search \"bug fix\" --today --robot  # Search today's sessions only",
         "  cass search \"api\" --week --agent codex --robot  # Last 7 days, codex only",
         "  cass stats --json                    # Get index statistics",
@@ -16352,6 +16444,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    It does not update Beads, send Agent Mail, create file reservations, or run the proof commands.".to_string(),
             "  cass swarm lint --json [--bead ID]".to_string(),
             "    Read-only protocol lint for missing start/closeout mail, unacked messages, stale reservations, bead-status mismatches, and proof gaps.".to_string(),
+            "  cass swarm dependency-drift --json".to_string(),
+            "    Read-only sibling dependency sentinel over Cargo.toml pins, optional local checkout HEAD/dirty state, strict validation commands, and release-risk recommendations.".to_string(),
+            "    It never fetches remotes, edits manifests, updates Beads, sends Agent Mail, runs builds, deletes files, or changes git state.".to_string(),
             "  cass stats [--json] [--data-dir DIR]".to_string(),
             "  cass triage [--json] [--stale-threshold N] [--data-dir DIR]".to_string(),
             "    One-shot agent preflight: readiness, next_command, recommended_commands, docs, schemas, workflows, and recoveries.".to_string(),
@@ -16514,6 +16609,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Swarm stale review: stale_candidate_count is advisory. Coordinate through Beads and Agent Mail before reopening, force-releasing, or taking over another agent's work.".to_string(),
             "  Swarm packets: `cass swarm work-packet --json --bead ID` suggests reservations, proof commands, and closeout copy; agents must still create reservations, update Beads, run rch proofs, and summarize artifacts.".to_string(),
             "  Swarm evidence handoff: use `cass pack \"query\" --robot` when status points at prior sessions or proof refs; pack is a bounded cited handoff, not a replacement for Beads or Agent Mail.".to_string(),
+            "  Dependency drift: `cass swarm dependency-drift --json` checks manifest pins against optional sibling checkout state and reports strict validation commands without fetching or mutating.".to_string(),
             "  Args: accepts --robot-docs=topic and misplaced globals; detailed errors with examples on parse failure".to_string(),
             "  Source control: use `cass robot-docs sources` for remote sync/setup plus persistent agent-harness exclusions".to_string(),
             "  TUI drill-in contract: Enter on selected hit opens detail modal (Messages tab); Enter with no selected hit falls back to query submit behavior".to_string(),

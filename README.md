@@ -894,6 +894,9 @@ cass swarm work-packet --json --bead coding_agent_session_search-example
 
 # Coordination hygiene check before closeout or takeover review
 cass swarm lint --json --bead coding_agent_session_search-example
+
+# Read-only sibling dependency drift sentinel
+cass swarm dependency-drift --json
 ```
 
 `swarm status` composes Beads, Agent Mail metadata, git state, rch/build
@@ -901,6 +904,11 @@ pressure, cass health/status, and proof references. Stale candidates are
 advisory only: coordinate through Beads and Agent Mail before reopening,
 force-releasing, or taking over work. Suggested commands are robot-safe
 templates, not automatic actions.
+
+`swarm dependency-drift` reads `Cargo.toml` and optional sibling checkouts to
+report manifest pins, local HEAD/dirty state, strict validation commands, and
+release-risk recommendations. It does not fetch remotes, edit manifests, run
+builds, update Beads, send Agent Mail, delete files, or mutate git state.
 
 When status points at prior evidence, use `cass pack "query" --robot` to create
 a bounded cited handoff for another agent. Packs complement the cockpit; they do
@@ -2569,6 +2577,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `swarm status --json` | Read-only shared-repo operations snapshot across Beads, Agent Mail metadata, git, build pressure, cass readiness, and proof refs |
 | `swarm work-packet --json` | Advisory one-agent packet with readiness, suggested reservations, verification commands, and closeout checklist; it does not claim or reserve |
 | `swarm lint --json` | Read-only coordination protocol lint for missing mail, stale reservations, status mismatches, and proof gaps |
+| `swarm dependency-drift --json` | Read-only sibling dependency sentinel for Cargo.toml pins, optional local checkout HEAD/dirty state, strict validation commands, and release-risk recommendations |
 | `sessions [--workspace DIR] [--current]` | Discover recent session files for follow-up actions |
 | `context <path>` | Find related sessions by workspace, day, or agent |
 | `view <path> -n N` | View source file at specific line (follow-up on search) |
@@ -2915,14 +2924,14 @@ Update check state is stored in the data directory:
 
 ## Sibling Dependency Contract
 
-`cass` pins git revisions in [`Cargo.toml`](Cargo.toml) for `asupersync`, `frankensqlite`/`fsqlite-types`, `franken-agent-detection`, `frankensearch`, `frankentui`, and `toon` (`tru`). The repo also commits local `[patch]` overrides for `frankensqlite`, `franken-agent-detection`, and `frankensearch`; the remaining sibling repos can be switched to `/data/projects/*` checkouts during local development.
+`cass` pins git revisions in [`Cargo.toml`](Cargo.toml) for `asupersync`, `frankensqlite`/`fsqlite-types`, `franken-agent-detection`, `frankensearch`, `frankentui`, and `toon` (`tru`). The repo keeps local `[patch]` overrides commented out by default; enable them only for local development and never commit an active sibling path override.
 
 | Dependency | Pinned revision |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | `68426d3e` |
-| `franken-agent-detection` | `a0ce134b` |
+| `franken-agent-detection` | `b62d8597` |
 | `asupersync` | `0.3.1` |
-| `frankensearch` | `128d134a` |
+| `frankensearch` | `2cad158f` |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 
@@ -2930,6 +2939,7 @@ Update check state is stored in the data directory:
 - `build.rs` validates the active local overrides against the expected package name, package version, patch path, and Cargo feature/default-features contract.
 - If an active sibling checkout has drifted away from the pinned git revision or has a dirty worktree, the build emits a warning instead of silently trusting it.
 - Enable strict enforcement with `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation` or `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. Strict mode upgrades drift warnings to hard errors and also validates the optional sibling repos before you switch them to local path overrides.
+- Use `cass swarm dependency-drift --json` for a fast read-only preflight. It reports each manifest pin, optional sibling checkout HEAD/dirty state, upstream status as `not_checked`, and the exact strict-validation commands to run; it never fetches remotes or mutates files.
 
 **Expected interface contract**
 - `frankensqlite` (`fsqlite`): `Connection`, `params!`, and `compat::{ConnectionExt, RowExt}` with `row.get_typed(...)`.

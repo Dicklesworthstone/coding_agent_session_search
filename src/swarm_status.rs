@@ -23,6 +23,7 @@ pub enum SwarmProviderName {
     Beads,
     CassHealth,
     CassStatus,
+    DependencyDrift,
     Evidence,
     Git,
     Process,
@@ -36,6 +37,7 @@ impl SwarmProviderName {
             Self::Beads => "beads",
             Self::CassHealth => "cass_health",
             Self::CassStatus => "cass_status",
+            Self::DependencyDrift => "dependency_drift",
             Self::Evidence => "evidence",
             Self::Git => "git",
             Self::Process => "process",
@@ -69,7 +71,8 @@ pub const REQUIRED_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
 ];
 
 /// Optional source providers available to richer status/evidence projections.
-pub const OPTIONAL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[];
+pub const OPTIONAL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] =
+    &[SwarmProviderName::DependencyDrift];
 
 /// Every fixtureable provider named by the swarm status contract.
 pub const ALL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
@@ -77,6 +80,7 @@ pub const ALL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
     SwarmProviderName::Beads,
     SwarmProviderName::CassHealth,
     SwarmProviderName::CassStatus,
+    SwarmProviderName::DependencyDrift,
     SwarmProviderName::Evidence,
     SwarmProviderName::Git,
     SwarmProviderName::Process,

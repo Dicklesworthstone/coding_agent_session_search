@@ -44,6 +44,9 @@ commands:
     It does not update Beads, send Agent Mail, create file reservations, or run the proof commands.
   cass swarm lint --json [--bead ID]
     Read-only protocol lint for missing start/closeout mail, unacked messages, stale reservations, bead-status mismatches, and proof gaps.
+  cass swarm dependency-drift --json
+    Read-only sibling dependency sentinel over Cargo.toml pins, optional local checkout HEAD/dirty state, strict validation commands, and release-risk recommendations.
+    It never fetches remotes, edits manifests, updates Beads, sends Agent Mail, runs builds, deletes files, or changes git state.
   cass stats [--json] [--data-dir DIR]
   cass triage [--json] [--stale-threshold N] [--data-dir DIR]
     One-shot agent preflight: readiness, next_command, recommended_commands, docs, schemas, workflows, and recoveries.

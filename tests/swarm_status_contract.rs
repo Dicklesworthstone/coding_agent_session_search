@@ -1929,6 +1929,184 @@ fn swarm_failure_patterns_cli_ranks_test_suggestions_and_redacts_sessions()
 }
 
 #[test]
+fn swarm_dependency_drift_cli_reports_clean_read_only_fixture() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "dependency-drift-clean",
+        json!({
+            "dependency_drift": {
+                "network": {"upstream_status": "not_checked"},
+                "dependencies": [{
+                    "name": "frankensqlite",
+                    "package": "fsqlite",
+                    "manifest_key": "frankensqlite",
+                    "source_kind": "git",
+                    "pinned_rev": "abc123",
+                    "local_head": "abc123456789",
+                    "dirty": false,
+                    "sibling_status": "clean",
+                    "required_downstream_tests": [
+                        "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation"
+                    ]
+                }]
+            }
+        }),
+    )?;
+    let output = run_swarm_dependency_drift_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.dependency_drift.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("ok"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("dependencies-clean"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "release_readiness"]),
+        json!("ready"),
+        "release readiness",
+    )?;
+    require_value_eq(
+        get_path(
+            &output,
+            &["dependencies", "0", "sibling", "revision_matches_pin"],
+        ),
+        json!(true),
+        "pin match",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "touches_network"]),
+        json!(false),
+        "network mutation contract",
+    )?;
+    assert_no_forbidden_fixture_leaks("dependency-drift-clean", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_dependency_drift_cli_flags_pin_dirty_missing_and_network_risks()
+-> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "dependency-drift-risky",
+        json!({
+            "dependency_drift": {
+                "network": {"upstream_status": "unavailable"},
+                "dependencies": [
+                    {
+                        "name": "frankensqlite",
+                        "package": "fsqlite",
+                        "manifest_key": "frankensqlite",
+                        "source_kind": "git",
+                        "pinned_rev": "abc123",
+                        "local_head": "def456789",
+                        "dirty": true,
+                        "sibling_status": "dirty"
+                    },
+                    {
+                        "name": "frankensearch",
+                        "package": "frankensearch",
+                        "manifest_key": "frankensearch",
+                        "source_kind": "git",
+                        "pinned_rev": "1111111",
+                        "local_head": "2222222",
+                        "dirty": false,
+                        "sibling_status": "clean"
+                    },
+                    {
+                        "name": "fsqlite-types",
+                        "package": "fsqlite-types",
+                        "manifest_key": "fsqlite-types",
+                        "source_kind": "git",
+                        "manifest_status": "missing-rev",
+                        "dirty": false,
+                        "sibling_status": "clean"
+                    },
+                    {
+                        "name": "toon",
+                        "package": "tru",
+                        "manifest_key": "toon",
+                        "source_kind": "git",
+                        "pinned_rev": "5669b72a",
+                        "dirty": false,
+                        "sibling_status": "missing"
+                    }
+                ]
+            }
+        }),
+    )?;
+    let output = run_swarm_dependency_drift_fixture(&fixture_path)?;
+
+    require_value_eq(get_path(&output, &["status"]), json!("warning"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("restore-manifest-pin"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "release_readiness"]),
+        json!("blocked"),
+        "release readiness",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "warning_count"]),
+        json!(3),
+        "warning count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "dirty_count"]),
+        json!(1),
+        "dirty count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "local_rev_mismatch_count"]),
+        json!(2),
+        "local rev mismatch count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "missing_sibling_count"]),
+        json!(1),
+        "missing sibling count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "network_status"]),
+        json!("unavailable"),
+        "network status",
+    )?;
+
+    let recommendation_kinds = get_path(&output, &["recommendations"])
+        .and_then(Value::as_array)
+        .ok_or_else(|| test_error("recommendations missing"))?
+        .iter()
+        .filter_map(|recommendation| recommendation.get("kind").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    require(
+        recommendation_kinds.contains(&"frankensqlite-first"),
+        "frankensqlite-specific recommendation missing",
+    )?;
+    require(
+        serde_json::to_string(&output)?.contains(
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation",
+        ),
+        "strict validation command missing",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "mutates_git"]),
+        json!(false),
+        "git mutation contract",
+    )?;
+    assert_no_forbidden_fixture_leaks("dependency-drift-risky", &output);
+    Ok(())
+}
+
+#[test]
 fn swarm_status_large_fixture_fast_gate_names_budget_sections() -> Result<(), Box<dyn Error>> {
     let scale = SyntheticSwarmScale {
         ready_count: 850,
@@ -2609,6 +2787,24 @@ fn run_swarm_failure_patterns_fixture(
         output.stderr.is_empty(),
         format!(
             "swarm failure-patterns should not log to stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn run_swarm_dependency_drift_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass")); // ubs:ignore - fixed test binary from assert_cmd.
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    cmd.args(["swarm", "dependency-drift", "--json", "--fixture"]);
+    cmd.arg(fixture_path);
+
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    require(
+        output.stderr.is_empty(),
+        format!(
+            "swarm dependency-drift should not log to stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         ),
     )?;
