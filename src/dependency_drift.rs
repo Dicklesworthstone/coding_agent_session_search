@@ -225,7 +225,8 @@ fn runtime_manifest_dir() -> PathBuf {
 fn read_manifest(path: &Path) -> Option<toml::Value> {
     fs::read_to_string(path)
         .ok()
-        .and_then(|text| text.parse::<toml::Value>().ok())
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .map(toml::Value::Table)
 }
 
 fn live_observation(
@@ -794,4 +795,96 @@ fn display_path(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .display()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEPENDENCY_SPECS, DependencySpec, manifest_pin, read_manifest};
+    use std::error::Error;
+    use std::path::Path;
+
+    fn test_error(message: impl Into<String>) -> Box<dyn Error> {
+        std::io::Error::other(message.into()).into()
+    }
+
+    fn ensure(condition: bool, message: impl Into<String>) -> Result<(), Box<dyn Error>> {
+        if condition {
+            Ok(())
+        } else {
+            Err(test_error(message))
+        }
+    }
+
+    fn checked_in_manifest() -> Result<toml::Value, Box<dyn Error>> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        read_manifest(&path).ok_or_else(|| {
+            test_error(format!(
+                "checked-in Cargo.toml should parse: {}",
+                path.display()
+            ))
+        })
+    }
+
+    fn dependency_spec(name: &str) -> Result<&'static DependencySpec, Box<dyn Error>> {
+        DEPENDENCY_SPECS
+            .iter()
+            .find(|spec| spec.name == name)
+            .ok_or_else(|| test_error(format!("dependency spec missing: {name}")))
+    }
+
+    #[test]
+    fn read_manifest_parses_checked_in_cargo_toml() -> Result<(), Box<dyn Error>> {
+        let manifest = checked_in_manifest()?;
+        let dependencies = match manifest.get("dependencies").and_then(toml::Value::as_table) {
+            Some(dependencies) => dependencies,
+            None => return Err(test_error("dependencies table should exist")),
+        };
+        ensure(
+            dependencies.contains_key("frankensqlite"),
+            "dependency drift live mode must see Cargo.toml dependency pins",
+        )?;
+        ensure(
+            dependencies.contains_key("frankensearch"),
+            "dependency drift live mode must see git dependency pins",
+        )
+    }
+
+    #[test]
+    fn manifest_pin_reads_git_and_registry_dependency_specs() -> Result<(), Box<dyn Error>> {
+        let manifest = checked_in_manifest()?;
+
+        let frankensqlite_spec = dependency_spec("frankensqlite")?;
+        let frankensqlite = manifest_pin(&manifest, frankensqlite_spec);
+        ensure(
+            frankensqlite.status == "pinned",
+            format!(
+                "expected frankensqlite pinned, got {}",
+                frankensqlite.status
+            ),
+        )?;
+        ensure(
+            frankensqlite.package.as_deref() == Some(frankensqlite_spec.package),
+            "frankensqlite package should match the dependency spec",
+        )?;
+        ensure(
+            frankensqlite
+                .rev
+                .as_deref()
+                .is_some_and(|rev| rev.len() >= 7),
+            "frankensqlite should expose a pinned git rev",
+        )?;
+
+        let asupersync = manifest_pin(&manifest, dependency_spec("asupersync")?);
+        ensure(
+            asupersync.status == "version-pinned",
+            format!(
+                "expected asupersync version-pinned, got {}",
+                asupersync.status
+            ),
+        )?;
+        ensure(
+            asupersync.version.as_deref() == Some("0.3.1"),
+            "asupersync version pin should match Cargo.toml",
+        )
+    }
 }
