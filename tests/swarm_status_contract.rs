@@ -1038,6 +1038,169 @@ fn swarm_work_packet_verification_playbook_classifies_file_areas() -> Result<(),
 }
 
 #[test]
+fn swarm_work_packet_collision_simulation_classifies_assignment_risks() -> Result<(), Box<dyn Error>>
+{
+    let (_reservation_tmp, reservation_fixture) = write_swarm_evidence_fixture(
+        "collision-reservations",
+        collision_simulation_sources(
+            json!([
+                collision_simulation_bead(
+                    "cass-glob",
+                    "Overlapping robot docs glob",
+                    ["tests/golden/robot_docs/guide.txt.golden"],
+                    ["robot-json"]
+                ),
+                collision_simulation_bead(
+                    "cass-exact",
+                    "Exact source path conflict",
+                    ["src/lib.rs"],
+                    ["swarm"]
+                ),
+                collision_simulation_bead(
+                    "cass-stale",
+                    "Expired docs reservation",
+                    ["docs/plan.md"],
+                    ["docs"]
+                )
+            ]),
+            json!([
+                {
+                    "id": 501,
+                    "holder": "BrightOak",
+                    "path_pattern": "tests/golden/robot_docs/**",
+                    "exclusive": true,
+                    "reason": "cass-other",
+                    "expires_ts": "2026-05-08T17:59:00Z"
+                },
+                {
+                    "id": 502,
+                    "holder": "CopperField",
+                    "path_pattern": "src/lib.rs",
+                    "exclusive": true,
+                    "reason": "cass-other",
+                    "expires_ts": "2026-05-08T17:59:00Z"
+                },
+                {
+                    "id": 503,
+                    "holder": "OldHolder",
+                    "path_pattern": "docs/plan.md",
+                    "exclusive": true,
+                    "reason": "cass-stale",
+                    "expires_ts": "2026-05-08T14:00:00Z"
+                }
+            ]),
+            json!([]),
+            json!([]),
+        ),
+    )?;
+
+    let glob_packet = assert_collision_class(
+        &reservation_fixture,
+        "cass-glob",
+        "blocked-by-active-holder",
+    )?;
+    require_collision_advisory(
+        &glob_packet,
+        "blocked-by-active-holder",
+        Some("glob"),
+        "glob overlap advisory",
+    )?;
+    let exact_packet = assert_collision_class(
+        &reservation_fixture,
+        "cass-exact",
+        "blocked-by-active-holder",
+    )?;
+    require_collision_advisory(
+        &exact_packet,
+        "blocked-by-active-holder",
+        Some("exact"),
+        "exact overlap advisory",
+    )?;
+    assert_collision_class(&reservation_fixture, "cass-stale", "stale-holder-review")?;
+
+    let (_dirty_tmp, dirty_fixture) = write_swarm_evidence_fixture(
+        "collision-dirty-unrelated",
+        collision_simulation_sources(
+            json!([collision_simulation_bead(
+                "cass-dirty-unrelated",
+                "Peer dirty path is unrelated",
+                ["src/search/query.rs"],
+                []
+            )]),
+            json!([]),
+            json!([{ "status": "M", "path": "docs/unrelated.md" }]),
+            json!([]),
+        ),
+    )?;
+    let dirty_packet = assert_collision_class(&dirty_fixture, "cass-dirty-unrelated", "safe")?;
+    require_collision_advisory(
+        &dirty_packet,
+        "safe",
+        Some("none"),
+        "unrelated dirty advisory",
+    )?;
+    require_value_eq(
+        get_path(&dirty_packet, &["summary", "safe_to_start"]),
+        json!(true),
+        "unrelated dirty work should not block assignment",
+    )?;
+
+    let (_risk_tmp, risk_fixture) = write_swarm_evidence_fixture(
+        "collision-risk-classes",
+        collision_simulation_sources(
+            json!([
+                collision_simulation_bead(
+                    "cass-generated",
+                    "Generated target output",
+                    ["target/debug/build/cass/out/generated.rs"],
+                    []
+                ),
+                collision_simulation_bead(
+                    "cass-sibling",
+                    "Sibling dependency contract",
+                    ["Cargo.toml", "../frankensearch/src/lib.rs"],
+                    []
+                ),
+                collision_simulation_bead(
+                    "cass-recent",
+                    "Recent commit overlap",
+                    ["src/recent.rs"],
+                    []
+                ),
+                collision_simulation_bead("cass-clean", "Clean source path", ["src/clean.rs"], [])
+            ]),
+            json!([]),
+            json!([]),
+            json!([{
+                "hash": "abcdef1",
+                "subject": "test: recent source edit",
+                "authored_ts": "2026-05-08T15:55:00Z",
+                "changed_paths": ["src/recent.rs"]
+            }]),
+        ),
+    )?;
+
+    let generated_packet =
+        assert_collision_class(&risk_fixture, "cass-generated", "generated-artifact-risk")?;
+    require_value_eq(
+        get_path(&generated_packet, &["summary", "safe_to_start"]),
+        json!(true),
+        "generated artifact risk is advisory unless another collision blocks",
+    )?;
+    let sibling_packet =
+        assert_collision_class(&risk_fixture, "cass-sibling", "sibling-repo-risk")?;
+    require_value_eq(
+        get_path(&sibling_packet, &["summary", "safe_to_start"]),
+        json!(false),
+        "sibling repo risk should require coordination before assignment",
+    )?;
+    assert_collision_class(&risk_fixture, "cass-recent", "needs-coordination")?;
+    assert_collision_class(&risk_fixture, "cass-clean", "safe")?;
+
+    Ok(())
+}
+
+#[test]
 fn swarm_coordination_lint_cli_reports_clean_read_only_fixture() -> Result<(), Box<dyn Error>> {
     let fixture_path = repo_path("tests/fixtures/swarm_status/healthy.inputs.json");
     let output = run_swarm_lint_fixture(&fixture_path, None)?;
@@ -2539,6 +2702,145 @@ fn verification_playbook_bead<const P: usize, const L: usize>(
         "touched_paths": touched_paths,
         "updated_at": "2026-05-08T15:55:00Z"
     })
+}
+
+fn collision_simulation_sources(
+    ready: Value,
+    reservations: Value,
+    dirty_paths: Value,
+    recent_commits: Value,
+) -> Value {
+    let dirty = dirty_paths
+        .as_array()
+        .is_some_and(|paths| !paths.is_empty());
+    json!({
+        "beads": {
+            "ready": ready,
+            "in_progress": [],
+            "blocked": [],
+            "graph": {
+                "node_count": 1,
+                "edge_count": 0,
+                "has_cycles": false
+            }
+        },
+        "agent_mail": {
+            "agents": [],
+            "messages": [],
+            "reservations": reservations
+        },
+        "git": {
+            "branch": "main",
+            "upstream": "origin/main",
+            "ahead": 0,
+            "behind": 0,
+            "dirty": dirty,
+            "dirty_paths": dirty_paths,
+            "recent_commits": recent_commits
+        },
+        "processes": {
+            "active_rch_jobs": 0,
+            "active_cargo_jobs": 0,
+            "load_average_1m": 0.2,
+            "cpu_count": 64
+        },
+        "cass_health": {
+            "status": "healthy",
+            "healthy": true,
+            "initialized": true,
+            "recommended_action": null
+        },
+        "cass_status": {
+            "search_ready": true,
+            "semantic_fallback_mode": "lexical",
+            "active_rebuild": false
+        },
+        "evidence": {
+            "recent_threads": [],
+            "recent_proofs": [],
+            "proof_gaps": [],
+            "redaction_applied": false
+        }
+    })
+}
+
+fn collision_simulation_bead<const P: usize, const L: usize>(
+    id: &str,
+    title: &str,
+    touched_paths: [&str; P],
+    labels: [&str; L],
+) -> Value {
+    verification_playbook_bead(id, title, touched_paths, labels)
+}
+
+fn assert_collision_class(
+    fixture_path: &Path,
+    bead_id: &str,
+    expected_class: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let output = run_swarm_work_packet_fixture(fixture_path, Some(bead_id))?;
+    require(
+        get_path(&output, &["work_packet", "collision_simulation", "classes"])
+            .and_then(Value::as_array)
+            .is_some_and(|classes| {
+                classes
+                    .iter()
+                    .any(|class| class.as_str() == Some(expected_class))
+            }),
+        format!("{bead_id} missing collision class {expected_class}: {output:#}"),
+    )?;
+    require_value_eq(
+        get_path(
+            &output,
+            &[
+                "work_packet",
+                "collision_simulation",
+                "mutation_policy",
+                "reservations_mutated",
+            ],
+        ),
+        json!(false),
+        "collision simulation must not mutate reservations",
+    )?;
+    require_value_eq(
+        get_path(
+            &output,
+            &[
+                "work_packet",
+                "collision_simulation",
+                "mutation_policy",
+                "raw_session_content_inspected",
+            ],
+        ),
+        json!(false),
+        "collision simulation must not inspect raw session content",
+    )?;
+    assert_no_forbidden_fixture_leaks(&format!("collision-simulation-{bead_id}"), &output);
+    Ok(output)
+}
+
+fn require_collision_advisory(
+    output: &Value,
+    expected_class: &str,
+    expected_match_kind: Option<&str>,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    require(
+        get_path(
+            output,
+            &["work_packet", "collision_simulation", "advisories"],
+        )
+        .and_then(Value::as_array)
+        .is_some_and(|advisories| {
+            advisories.iter().any(|advisory| {
+                advisory.get("class").and_then(Value::as_str) == Some(expected_class)
+                    && expected_match_kind.is_none_or(|match_kind| {
+                        advisory.get("match_kind").and_then(Value::as_str) == Some(match_kind)
+                    })
+            })
+        }),
+        format!("missing {label}: {output:#}"),
+    )
 }
 
 fn assert_verification_playbook(
