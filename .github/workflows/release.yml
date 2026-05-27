@@ -123,6 +123,23 @@ jobs:
           "CFLAGS=/MD" >> $env:GITHUB_ENV
           "CXXFLAGS=/MD" >> $env:GITHUB_ENV
 
+      - name: Pin Windows release codegen to x86-64-v2 (Sandy/Ivy Bridge baseline)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Issue #256: cass v0.6.2's Windows binary illegal-instructions on
+          # pre-AVX2 CPUs (e.g. Ivy Bridge i7-3770K). The default Windows
+          # codegen on hosted runners pulls AVX2 intrinsics from transitive
+          # crates (or the runner CPU's native feature set), which Sandy/Ivy
+          # Bridge does not implement. Pin the distributed binary to the
+          # x86-64-v2 microarch level (SSE4.2 + POPCNT, no AVX/AVX2) so it
+          # runs on every 64-bit Windows host shipped since ~2009.
+          #
+          # If a v3 (Haswell+) variant is ever wanted we should ship it as a
+          # separate matrix entry with its own asset name — never change the
+          # default `cass-windows-amd64.zip` baseline.
+          "RUSTFLAGS=-C target-cpu=x86-64-v2" >> $env:GITHUB_ENV
+
       - name: Install OpenSSL (macOS)
         if: runner.os == 'macOS'
         run: |
