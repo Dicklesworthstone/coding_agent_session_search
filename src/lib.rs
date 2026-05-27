@@ -16176,6 +16176,18 @@ fn rebuild_progress_summary_json(state: &serde_json::Value) -> serde_json::Value
         .get("active")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let stalled = rebuild
+        .get("stalled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let last_progress_at = rebuild
+        .get("last_progress_at")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let last_progress_age_ms = rebuild
+        .get("last_progress_age_ms")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let processed = rebuild
         .get("processed_conversations")
         .and_then(|value| value.as_u64());
@@ -16197,6 +16209,11 @@ fn rebuild_progress_summary_json(state: &serde_json::Value) -> serde_json::Value
 
     serde_json::json!({
         "active": active,
+        // Issue #258: surface `stalled` distinctly so health/status
+        // consumers can tell a wedged indexer apart from a slow rebuild.
+        "stalled": stalled,
+        "last_progress_at": last_progress_at,
+        "last_progress_age_ms": last_progress_age_ms,
         "mode": value_or_null(rebuild.get("mode")),
         "phase": value_or_null(rebuild.get("phase")),
         "processed_conversations": processed,
