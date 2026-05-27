@@ -26,8 +26,10 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::expected_index_dir;
 use serde_json::{Value, json};
+use std::error::Error;
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use walkdir::WalkDir;
 
@@ -146,29 +148,43 @@ fn seed_diag_quarantine_fixture(test_home: &std::path::Path) -> PathBuf {
     data_dir
 }
 
-fn isolated_search_demo_data(test_home: &std::path::Path) -> PathBuf {
+fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> io::Result<PathBuf> {
+    let mut dst = dst_root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => dst.push(part),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fixture path escaped source root",
+                ));
+            }
+        }
+    }
+    Ok(dst)
+}
+
+fn isolated_search_demo_data(test_home: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("search_demo_data");
     let dst_root = test_home.join("search_demo_data");
     for entry in WalkDir::new(&src) {
-        let entry = entry.expect("walk search demo data");
-        let rel = entry
-            .path()
-            .strip_prefix(&src)
-            .expect("relative fixture path");
-        let dst = dst_root.join(rel);
+        let entry = entry?;
+        let rel = entry.path().strip_prefix(&src)?;
+        let dst = safe_fixture_destination(&dst_root, rel)?;
         if entry.file_type().is_dir() {
-            fs::create_dir_all(&dst).expect("create fixture dir");
+            fs::create_dir_all(&dst)?;
         } else {
             if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent).expect("create fixture parent");
+                fs::create_dir_all(parent)?;
             }
-            fs::copy(entry.path(), &dst).expect("copy fixture file");
+            fs::copy(entry.path(), &dst)?;
         }
     }
-    dst_root
+    Ok(dst_root)
 }
 
 fn json_value_schema(value: &Value) -> Value {
@@ -1341,7 +1357,7 @@ fn stats_json_missing_db_error_envelope_matches_golden() {
 }
 
 #[test]
-fn stats_json_happy_path_matches_golden() {
+fn stats_json_happy_path_matches_golden() -> Result<(), Box<dyn Error>> {
     // `coding_agent_session_search-zefv4`: the error envelope has been
     // pinned (stats_missing_db* goldens) but the success envelope had no
     // freeze — regressions to a field name or a new mandatory key on
@@ -1350,7 +1366,7 @@ fn stats_json_happy_path_matches_golden() {
     // known conversation/message count), invokes `cass stats --json`,
     // and freezes the scrubbed envelope.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path());
+    let data_dir = isolated_search_demo_data(test_home.path())?;
     let out = cass_cmd(test_home.path())
         .args([
             "stats",
@@ -1373,16 +1389,17 @@ fn stats_json_happy_path_matches_golden() {
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/stats_full_payload.json.golden", &scrubbed);
+    Ok(())
 }
 
 #[test]
-fn stats_json_happy_path_shape_matches_golden() {
+fn stats_json_happy_path_shape_matches_golden() -> Result<(), Box<dyn Error>> {
     // Shape-only pin for the happy-path envelope so a future refactor
     // of the scrubber (or drift in fixture contents) can't accidentally
     // mask structural regressions. json_value_schema diff tolerates
     // value changes; keys + types must hold.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path());
+    let data_dir = isolated_search_demo_data(test_home.path())?;
     let out = cass_cmd(test_home.path())
         .args([
             "stats",
@@ -1398,6 +1415,7 @@ fn stats_json_happy_path_shape_matches_golden() {
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
     assert_golden("robot/stats_full_payload_shape.json.golden", &canonical);
+    Ok(())
 }
 
 #[test]
@@ -1660,9 +1678,9 @@ fn pack_introspect_contract_matrix_is_current() {
 }
 
 #[test]
-fn search_robot_json_matches_golden() {
+fn search_robot_json_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path());
+    let data_dir = isolated_search_demo_data(test_home.path())?;
     let output = cass_cmd(test_home.path())
         .args([
             "search",
@@ -1688,12 +1706,13 @@ fn search_robot_json_matches_golden() {
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/search_robot.json.golden", &scrubbed);
+    Ok(())
 }
 
 #[test]
-fn search_robot_shape_matches_golden() {
+fn search_robot_shape_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path());
+    let data_dir = isolated_search_demo_data(test_home.path())?;
     let output = cass_cmd(test_home.path())
         .args([
             "search",
@@ -1718,6 +1737,7 @@ fn search_robot_shape_matches_golden() {
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
     assert_golden("robot/search_robot_shape.json.golden", &canonical);
+    Ok(())
 }
 
 // ========================================================================
