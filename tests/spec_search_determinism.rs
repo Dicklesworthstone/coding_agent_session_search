@@ -1,27 +1,27 @@
-//! INV-cass-2 — `cass search` is deterministic across repeated calls against
+//! INV-cass-2: `cass search` is deterministic across repeated calls against
 //! the same archive, and `--limit N` is a strict prefix of `--limit 2N` (the
 //! cursor-pagination correctness guarantee).
 //!
 //! Foundational invariants every cache, pager, and cursor consumer depends on:
 //!
-//!   - **Determinism**: query + filters + corpus → same `hits` array.
+//!   - **Determinism**: query + filters + corpus -> same `hits` array.
 //!     If the same call returns different orderings or scores on consecutive
 //!     invocations, then `--cursor`, prefix-warming, the BM25 ratchet, and the
 //!     two-tier semantic refinement all break in subtle ways agents see only
 //!     as flake.
 //!   - **Limit-prefix**: the first N hits of `--limit 2N` are the N hits of
 //!     `--limit N` in the same order. This is the cursor-paging soundness
-//!     property — `--cursor` token correctness depends on it.
+//!     property; `--cursor` token correctness depends on it.
 //!
 //! Verified against the checked-in `search_demo_data` fixture with a query
-//! known to return ≥2 hits ("the"). The `hits` array is the user-visible /
+//! known to return at least 2 hits ("the"). The `hits` array is the user-visible /
 //! agent-consumed payload; volatile `_meta` fields (elapsed_ms, timestamps,
-//! age_seconds, host-dependent pipeline counts) are deliberately excluded —
+//! age_seconds, host-dependent pipeline counts) are deliberately excluded;
 //! their non-determinism is by design.
 
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -42,6 +42,18 @@ fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
     }
 }
 
+fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let mut dst = dst_root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => dst.push(part),
+            _ => return Err(test_error("fixture path escaped source root")),
+        }
+    }
+    Ok(dst)
+}
+
 fn copy_search_demo_fixture(test_home: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -51,7 +63,7 @@ fn copy_search_demo_fixture(test_home: &Path) -> Result<PathBuf, Box<dyn Error>>
     for entry in WalkDir::new(&src) {
         let entry = entry?;
         let rel = entry.path().strip_prefix(&src)?;
-        let dst = dst_root.join(rel);
+        let dst = safe_fixture_destination(&dst_root, rel)?;
         if entry.file_type().is_dir() {
             fs::create_dir_all(&dst)?;
         } else {
@@ -68,7 +80,7 @@ fn copy_search_demo_fixture(test_home: &Path) -> Result<PathBuf, Box<dyn Error>>
 fn run_search(data_dir: &Path, args: &[&str]) -> Result<Value, Box<dyn Error>> {
     let output = Command::cargo_bin("cass")?
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .args(["search"])
+        .args(["--color=never", "search"])
         .args(args)
         .args(["--data-dir", data_dir.to_str().ok_or("non-utf8 path")?])
         .args(["--robot"])
@@ -113,7 +125,7 @@ fn search_returns_deterministic_hits_across_repeated_calls() -> TestResult {
 
     ensure(
         !hits_a.is_empty(),
-        format!("test query {QUERY:?} should return ≥1 hit against the fixture"),
+        format!("test query {QUERY:?} should return at least 1 hit against the fixture"),
     )?;
     ensure(
         hits_a == hits_b,
@@ -141,7 +153,7 @@ fn search_limit_n_is_strict_prefix_of_limit_2n() -> TestResult {
 
     ensure(
         !small_hits.is_empty(),
-        format!("limit=1 against {QUERY:?} should return ≥1 hit"),
+        format!("limit=1 against {QUERY:?} should return at least 1 hit"),
     )?;
     ensure(
         large_hits.len() >= small_hits.len(),
@@ -151,11 +163,15 @@ fn search_limit_n_is_strict_prefix_of_limit_2n() -> TestResult {
             small_hits.len()
         ),
     )?;
+    let large_prefix = large_hits
+        .get(..small_hits.len())
+        .ok_or_else(|| test_error("--limit 2 did not contain enough hits for prefix check"))?;
+
     // Strict prefix: hits[0..N] of the larger result equals the entire smaller result.
     ensure(
-        &large_hits[..small_hits.len()] == small_hits,
+        large_prefix == small_hits,
         format!(
-            "--limit 1 result is not a prefix of --limit 2 — cursor-paging soundness broken.\n\
+            "--limit 1 result is not a prefix of --limit 2; cursor-paging soundness broken.\n\
              limit=1: {} hit(s)\n\
              limit=2: {} hit(s) (first {} prefix should match limit=1 byte-for-byte)",
             small_hits.len(),
