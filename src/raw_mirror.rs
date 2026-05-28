@@ -666,6 +666,7 @@ fn remove_prune_target_file(path: &Path) -> Result<bool> {
 fn append_prune_audit_log(root: &Path, report: &RawMirrorPruneReport) -> Result<PathBuf> {
     ensure_private_dir(root)?;
     let audit_path = root.join("pruned.jsonl");
+    ensure_prune_audit_log_appendable(&audit_path)?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -692,6 +693,31 @@ fn append_prune_audit_log(root: &Path, report: &RawMirrorPruneReport) -> Result<
         .with_context(|| format!("sync raw mirror prune audit {}", audit_path.display()))?;
     sync_parent(&audit_path)?;
     Ok(audit_path)
+}
+
+fn ensure_prune_audit_log_appendable(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!(
+                "refusing to append raw mirror prune audit through symlink {}",
+                path.display()
+            );
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            anyhow::bail!(
+                "refusing to append raw mirror prune audit to non-file {}",
+                path.display()
+            );
+        }
+        Ok(_) => Ok(()),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "inspect raw mirror prune audit before append {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 fn merge_min_max(min: &mut Option<i64>, max: &mut Option<i64>, value: Option<i64>) {
@@ -2197,6 +2223,71 @@ mod tests {
         let audit = fs::read_to_string(audit_path).expect("read audit");
         assert!(audit.contains("\"mode\":\"dry-run\""));
         assert!(audit.contains("\"applied\":false"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_refuses_symlinked_audit_log_without_writing_target() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new()?;
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("source.jsonl");
+        let protected_audit_target = temp.path().join("protected-prune-audit.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"old\"}\n")?;
+        fs::write(&protected_audit_target, b"protected\n")?;
+
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })?;
+        let root = data_dir
+            .join(RAW_MIRROR_ROOT_DIR)
+            .join(RAW_MIRROR_VERSION_DIR);
+        let audit_path = root.join("pruned.jsonl");
+        symlink(&protected_audit_target, &audit_path)?;
+
+        let err = match prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: false,
+            },
+        ) {
+            Ok(_) => anyhow::bail!("symlinked prune audit log was accepted"),
+            Err(err) => err,
+        };
+
+        if !err.to_string().contains("prune audit through symlink") {
+            anyhow::bail!("unexpected audit symlink error: {err:#}");
+        }
+        if !fs::read(&protected_audit_target)?
+            .as_slice()
+            .eq(b"protected\n")
+        {
+            anyhow::bail!("protected audit target was modified");
+        }
+        if !fs::read_link(&audit_path)?
+            .as_os_str()
+            .eq(protected_audit_target.as_os_str())
+        {
+            anyhow::bail!("audit path did not remain a symlink to the protected target");
+        }
+        if !root.join(&captured.manifest_relative_path).exists() {
+            anyhow::bail!("failed audit append removed the captured manifest");
+        }
+        if !root.join(&captured.blob_relative_path).exists() {
+            anyhow::bail!("failed audit append removed the captured blob");
+        }
+        Ok(())
     }
 
     #[test]
