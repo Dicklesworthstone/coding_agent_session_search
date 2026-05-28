@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -42,7 +42,7 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-frankensqlite = { version = "0.1.5", package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "88c10d6d", features = ["fts5"] }
+frankensqlite = { version = "0.1.5", package = "fsqlite", features = ["fts5"] }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -160,7 +160,7 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { version = "0.1.5", package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "88c10d6d" }
+fsqlite-types = { version = "0.1.5", package = "fsqlite-types" }
 
 [[bin]]
 name = "cass"
@@ -195,12 +195,6 @@ strip = false
 inherits = "release"
 debug = "line-tables-only"
 strip = false
-
-[patch.crates-io]
-# Temporary cass#259 bridge until fsqlite 0.1.5 is on crates.io. This keeps
-# transitive users such as franken-agent-detection on the BtCursor
-# forward-progress fix instead of pulling registry fsqlite 0.1.4 back in.
-fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "88c10d6d" }
 
 # The dependency graph is pinned to the asupersync 0.3.x line. Keep
 # frankensqlite plus frankensearch and franken-agent-detection revs aligned so

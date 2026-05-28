@@ -17,6 +17,14 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## Unreleased
 
+## [v0.6.4] -- 2026-05-27
+
+**Critical fix: upstream frankensqlite BtCursor infinite-loop on multi-level B-trees (cass#259), bundled with the v0.6.3-era cass#258 stalled-status liveness work and the cass#257 quality semantic backfill telemetry that landed during the same window.**
+
+### BtCursor forward-progress on multi-level B-trees (cass#259)
+
+Bumped the `frankensqlite` / `fsqlite-types` pin from the published [`0.1.4`](https://crates.io/crates/fsqlite/0.1.4) release up to the newly published [`0.1.5`](https://crates.io/crates/fsqlite/0.1.5) crates.io release, switching back to the registry source (no more git rev pin in `Cargo.toml`; the `[patch.crates-io]` bridge that v0.6.3 carried as a temporary forward-progress hold for `fsqlite-types` is gone). `fsqlite` 0.1.5 contains the upstream [frankensqlite#95 BtCursor forward-progress fix](https://github.com/Dicklesworthstone/frankensqlite/issues/95): a `BtCursor` traversing a B-tree whose root page split into an interior + multiple leaf pages could re-enter the same leaf indefinitely because the cursor stack popped past the interior parent without advancing the parent's child-index cursor before re-descending. The visible symptom on cass was a `cass index` / `cass status --json` / `cass search` process pinning a single core at 100% with zero forward progress on any non-trivial archive (~100 MB+ SQLite DB, or ~50k+ conversations indexed) — the exact wedge profile @blueraz0r reported in #258 and that the v0.6.3 fsqlite 0.1.4 bump did *not* fully close. Reproduces deterministically on a v13 schema once the canonical conversations B-tree grows past its single-leaf-root size; reproducer notes are on the upstream issue. Operators who hit the v0.6.3 wedge should retest under v0.6.4 with no DB surgery required — the cursor fix is purely in the read path and does not require reindexing.
+
 ### Forward-progress liveness for wedged rebuilds (cass#258)
 
 @blueraz0r's v0.6.2 [#258 watcher report](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/258) exposed a structural gap in cass's liveness signaling: a wedged indexer (one CPU-bound thread, all other workers parked) was reported as `status: "rebuilding", rebuild.active: true` for 4+ hours because the background `IndexRunLockHeartbeat` thread kept refreshing `index-run.lock`'s `updated_at_ms` field independently of whether the indexing thread was actually making progress. `cass health`, `cass status`, and the maintenance coordination layer all consumed `updated_at_ms` as their liveness signal and were therefore fooled. v0.6.3's fsqlite 0.1.4 bump is the strong candidate to fix the underlying spin (same upstream root cause as #254/#255 — see the v0.6.3 release notes), but the structural liveness gap is fixed here regardless so the next indexer wedge of this shape will no longer be silent.
