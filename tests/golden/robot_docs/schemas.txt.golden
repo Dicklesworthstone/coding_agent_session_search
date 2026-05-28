@@ -2769,6 +2769,8 @@ schemas: (auto-generated from contract)
       - indexed_docs: ?
       - inflight_message_bytes: ?
       - inflight_message_bytes_headroom: ?
+      - last_progress_age_ms: ?
+      - last_progress_at: ?
       - max_message_bytes_in_flight: ?
       - mode: ?
       - pending_batch_conversations: ?
@@ -2780,6 +2782,7 @@ schemas: (auto-generated from contract)
       - queue_headroom: ?
       - remaining_conversations: ?
       - runtime_available: boolean
+      - stalled: boolean
       - total_conversations: ?
       - updated_at: ?
     - recommended_action: ?
@@ -3298,6 +3301,8 @@ schemas: (auto-generated from contract)
       - indexed_docs: ?
       - inflight_message_bytes: ?
       - inflight_message_bytes_headroom: ?
+      - last_progress_age_ms: ?
+      - last_progress_at: ?
       - max_message_bytes_in_flight: ?
       - mode: ?
       - pending_batch_conversations: ?
@@ -3309,6 +3314,7 @@ schemas: (auto-generated from contract)
       - queue_headroom: ?
       - remaining_conversations: ?
       - runtime_available: boolean
+      - stalled: boolean
       - total_conversations: ?
       - updated_at: ?
     - recommended_action: ?
@@ -3630,6 +3636,8 @@ schemas: (auto-generated from contract)
       - indexed_docs: ?
       - inflight_message_bytes: ?
       - inflight_message_bytes_headroom: ?
+      - last_progress_age_ms: ?
+      - last_progress_at: ?
       - max_message_bytes_in_flight: ?
       - mode: ?
       - pending_batch_conversations: ?
@@ -3641,6 +3649,7 @@ schemas: (auto-generated from contract)
       - queue_headroom: ?
       - remaining_conversations: ?
       - runtime_available: boolean
+      - stalled: boolean
       - total_conversations: ?
       - updated_at: ?
     - recommended_action: ?
@@ -3822,6 +3831,8 @@ schemas: (auto-generated from contract)
         - indexed_docs: ?
         - inflight_message_bytes: ?
         - inflight_message_bytes_headroom: ?
+        - last_progress_age_ms: ?
+        - last_progress_at: ?
         - max_message_bytes_in_flight: ?
         - mode: ?
         - pending_batch_conversations: ?
@@ -3833,6 +3844,7 @@ schemas: (auto-generated from contract)
         - queue_headroom: ?
         - remaining_conversations: ?
         - runtime_available: boolean
+        - stalled: boolean
         - total_conversations: ?
         - updated_at: ?
       - semantic: object

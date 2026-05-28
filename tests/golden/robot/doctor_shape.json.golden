@@ -786,6 +786,9 @@
         "rebuilding": {
           "type": "boolean"
         },
+        "stalled": {
+          "type": "boolean"
+        },
         "activity_at": {
           "type": "null"
         },
@@ -877,6 +880,12 @@
           "type": "boolean"
         },
         "progressive_ready": {
+          "type": "boolean"
+        },
+        "quality_tier_published": {
+          "type": "boolean"
+        },
+        "semantic_only_search_available": {
           "type": "boolean"
         },
         "hint": {

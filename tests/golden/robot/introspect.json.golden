@@ -2541,7 +2541,7 @@
     },
     {
       "name": "swarm",
-      "description": "Read-only swarm operations status",
+      "description": "Read-only swarm operations status, work packets, and coordination lint",
       "arguments": [],
       "has_json_output": false
     },
@@ -26127,6 +26127,21 @@
             "active": {
               "type": "boolean"
             },
+            "stalled": {
+              "type": "boolean"
+            },
+            "last_progress_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_progress_age_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "mode": {
               "type": [
                 "string",
@@ -30435,6 +30450,21 @@
             "active": {
               "type": "boolean"
             },
+            "stalled": {
+              "type": "boolean"
+            },
+            "last_progress_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_progress_age_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "mode": {
               "type": [
                 "string",
@@ -32199,6 +32229,21 @@
             "active": {
               "type": "boolean"
             },
+            "stalled": {
+              "type": "boolean"
+            },
+            "last_progress_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_progress_age_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "mode": {
               "type": [
                 "string",
@@ -33848,6 +33893,21 @@
               "properties": {
                 "active": {
                   "type": "boolean"
+                },
+                "stalled": {
+                  "type": "boolean"
+                },
+                "last_progress_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_progress_age_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "mode": {
                   "type": [

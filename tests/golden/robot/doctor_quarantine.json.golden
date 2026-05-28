@@ -685,6 +685,7 @@
     "stale": false,
     "stale_threshold_seconds": 1800,
     "rebuilding": false,
+    "stalled": false,
     "activity_at": null,
     "documents": null,
     "empty_with_messages": false,
@@ -717,6 +718,8 @@
     "hnsw_path": null,
     "hnsw_ready": false,
     "progressive_ready": false,
+    "quality_tier_published": false,
+    "semantic_only_search_available": false,
     "hint": "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic'.",
     "fast_tier": {
       "present": false,

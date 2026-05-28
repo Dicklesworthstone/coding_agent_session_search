@@ -17729,6 +17729,10 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_STREAMING_CONSUMER_COMMIT_SECS=<N>  base streaming-consumer Tantivy commit cadence (default 5)".to_string(),
             "  CASS_SEMANTIC_BATCH_SIZE=<N>             embedder batch size (default 128)".to_string(),
             "  CASS_SEMANTIC_PREP_PARALLEL=1            opt in to rayon-parallel canonicalize+hash prep (default off: serial is measurably faster on the common cheap-embedder path)".to_string(),
+            "  CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS=30000  warn when one embedder batch exceeds the cass#257-derived 30s healthy-run threshold".to_string(),
+            "  CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS=300000  abort after a returned embedder batch exceeds the cass#257-derived 5m watchdog threshold; 0 disables".to_string(),
+            "  CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT=10000 cap models backfill checkpoints at whole-conversation prefixes near 10k selected messages; 0 disables".to_string(),
+            "  CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT=8388608 cap models backfill checkpoints at whole-conversation prefixes near 8MiB selected content; 0 disables".to_string(),
             "  CASS_STREAMING_CONSUMER_COMBINE=0        DISABLE flat-combining drain in run_streaming_consumer (Card 3; DEFAULT: on). Any non-off value (unset, 1, true, yes, on) leaves combining enabled.".to_string(),
             "  CASS_STREAMING_COMBINE_MAX=<N>           max messages per combined drain (clamped 1..1024, default 64)".to_string(),
             "  CASS_STREAMING_COMBINE_MAX_BYTES=<N>     byte cap per combined drain (clamped 1MiB..STREAMING_MAX, default half)".to_string(),
@@ -71272,6 +71276,26 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Batch size for semantic embedding work.",
         ),
         env_var_capability(
+            "CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS",
+            Some("30000"),
+            "Warn when one semantic embedder batch exceeds the cass#257-derived 30s healthy-run threshold.",
+        ),
+        env_var_capability(
+            "CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS",
+            Some("300000"),
+            "Abort after a returned semantic embedder batch exceeds the cass#257-derived 5m watchdog threshold; 0 disables.",
+        ),
+        env_var_capability(
+            "CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT",
+            Some("10000"),
+            "Soft cap for cass models backfill checkpoints at whole-conversation prefixes near 10k selected messages; 0 disables.",
+        ),
+        env_var_capability(
+            "CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT",
+            Some("8388608"),
+            "Soft cap for cass models backfill checkpoints at whole-conversation prefixes near 8MiB selected content; 0 disables.",
+        ),
+        env_var_capability(
             "CASS_RESPONSIVENESS_DISABLE",
             Some("0"),
             "Set to 1 to disable the indexer responsiveness governor.",
@@ -89630,7 +89654,7 @@ fn run_models_backfill(
         indexer.embedder_id(),
     );
     let outcome = indexer
-        .run_backfill_from_storage_with_sink(
+        .run_capped_backfill_from_storage_with_sink(
             &storage,
             &data_dir,
             &mut manifest,

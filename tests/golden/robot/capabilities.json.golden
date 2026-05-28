@@ -2597,7 +2597,7 @@
     },
     {
       "name": "swarm",
-      "description": "Read-only swarm operations status",
+      "description": "Read-only swarm operations status, work packets, and coordination lint",
       "arguments": [],
       "has_json_output": false
     },
@@ -2837,6 +2837,26 @@
       "name": "CASS_SEMANTIC_BATCH_SIZE",
       "default": "128",
       "description": "Batch size for semantic embedding work."
+    },
+    {
+      "name": "CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS",
+      "default": "30000",
+      "description": "Warn when one semantic embedder batch exceeds the cass#257-derived 30s healthy-run threshold."
+    },
+    {
+      "name": "CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS",
+      "default": "300000",
+      "description": "Abort after a returned semantic embedder batch exceeds the cass#257-derived 5m watchdog threshold; 0 disables."
+    },
+    {
+      "name": "CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT",
+      "default": "10000",
+      "description": "Soft cap for cass models backfill checkpoints at whole-conversation prefixes near 10k selected messages; 0 disables."
+    },
+    {
+      "name": "CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT",
+      "default": "8388608",
+      "description": "Soft cap for cass models backfill checkpoints at whole-conversation prefixes near 8MiB selected content; 0 disables."
     },
     {
       "name": "CASS_RESPONSIVENESS_DISABLE",

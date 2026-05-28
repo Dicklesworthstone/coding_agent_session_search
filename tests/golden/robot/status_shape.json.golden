@@ -55,6 +55,9 @@
         "rebuilding": {
           "type": "boolean"
         },
+        "stalled": {
+          "type": "boolean"
+        },
         "activity_at": {
           "type": "null"
         },
@@ -157,6 +160,15 @@
       "properties": {
         "active": {
           "type": "boolean"
+        },
+        "stalled": {
+          "type": "boolean"
+        },
+        "last_progress_at": {
+          "type": "null"
+        },
+        "last_progress_age_ms": {
+          "type": "null"
         },
         "orphaned": {
           "type": "boolean"
@@ -276,6 +288,15 @@
         "active": {
           "type": "boolean"
         },
+        "stalled": {
+          "type": "boolean"
+        },
+        "last_progress_at": {
+          "type": "null"
+        },
+        "last_progress_age_ms": {
+          "type": "null"
+        },
         "mode": {
           "type": "null"
         },
@@ -375,6 +396,12 @@
           "type": "boolean"
         },
         "progressive_ready": {
+          "type": "boolean"
+        },
+        "quality_tier_published": {
+          "type": "boolean"
+        },
+        "semantic_only_search_available": {
           "type": "boolean"
         },
         "hint": {
