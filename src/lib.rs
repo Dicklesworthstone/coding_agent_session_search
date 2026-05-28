@@ -64576,7 +64576,11 @@ fn run_status(
         let topology_budget =
             serde_json::to_value(crate::topology_budget::inspect_host_topology_budget())
                 .unwrap_or(serde_json::Value::Null);
-        let status_collects_coverage = db_exists && !status_should_skip_db_open(&db_path);
+        // Commit fe3972dc deliberately dropped status_should_skip_db_open and
+        // its STATUS_COUNT_SCAN_MAX_DB_BYTES short-circuit; the policy is now
+        // "always probe via DB open" — see the commit message. This call site
+        // was missed in that cleanup; inlining the now-unconditional `true`.
+        let status_collects_coverage = db_exists;
         let (coverage_risk, coverage_source, coverage_checked) = if status_collects_coverage {
             (
                 collect_doctor_coverage_risk_summary(&data_dir, &db_path),
