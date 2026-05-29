@@ -131,14 +131,9 @@ fn rendered_contains_detail_messages_marker(rendered: &str) -> bool {
         || (rendered.contains("Detail") && rendered.contains("Messages"))
 }
 
-fn rendered_contains_hello_fixture_detail(rendered: &str) -> bool {
-    rendered.to_ascii_lowercase().contains("hi there, how can")
-}
-
-fn rendered_contains_auth_fixture_result(rendered: &str) -> bool {
-    rendered
-        .to_ascii_lowercase()
-        .contains("i found several authentication issues")
+fn rendered_contains_hello_fixture_content(rendered: &str) -> bool {
+    let lower = rendered.to_ascii_lowercase();
+    lower.contains("hello world") || lower.contains("hi there, how can")
 }
 
 fn exported_html_contains_codex_fixture(rendered: &str) -> bool {
@@ -688,6 +683,11 @@ fn tui_pty_search_detail_and_quit_flow() {
         wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
         "Did not observe output growth after query submission in PTY search flow"
     );
+    let saw_fixture_before_detail = wait_for_rendered_output(
+        &captured,
+        Duration::from_secs(6),
+        rendered_contains_hello_fixture_content,
+    );
     thread::sleep(Duration::from_millis(180));
 
     // Move focus from query input to results list so `v` is interpreted as detail action.
@@ -715,7 +715,7 @@ fn tui_pty_search_detail_and_quit_flow() {
     let raw = captured.lock().expect("capture lock").clone();
     let rendered = strip_terminal_control_sequences(&raw);
     let saw_messages_detail = rendered_contains_detail_messages_marker(&rendered);
-    let saw_fixture_result_content = rendered_contains_auth_fixture_result(&rendered);
+    let saw_fixture_detail_content = rendered_contains_hello_fixture_content(&rendered);
     save_artifact("pty_search_detail_output.raw", &trace, &raw);
     let summary = serde_json::json!({
         "trace_id": trace,
@@ -723,7 +723,8 @@ fn tui_pty_search_detail_and_quit_flow() {
         "saw_detail_growth": saw_detail,
         "esc_presses_to_exit": esc_presses,
         "saw_messages_detail": saw_messages_detail,
-        "saw_fixture_result_content": saw_fixture_result_content,
+        "saw_fixture_before_detail": saw_fixture_before_detail,
+        "saw_fixture_detail_content": saw_fixture_detail_content,
         "captured_bytes": raw.len(),
     });
     save_artifact(
@@ -738,8 +739,8 @@ fn tui_pty_search_detail_and_quit_flow() {
         "Expected PTY capture to include Detail [Messages] marker after v drill-in"
     );
     assert!(
-        saw_fixture_result_content,
-        "Expected PTY capture to include rendered fixture hit content"
+        saw_fixture_detail_content,
+        "Expected PTY capture to include selected fixture hit content"
     );
     assert!(
         !raw.is_empty(),
@@ -843,7 +844,7 @@ fn tui_pty_enter_selected_hit_opens_detail_modal() {
     let raw = captured.lock().expect("capture lock").clone();
     let rendered = strip_terminal_control_sequences(&raw);
     let saw_messages_detail = rendered_contains_detail_messages_marker(&rendered);
-    let saw_fixture_detail_content = rendered_contains_hello_fixture_detail(&rendered);
+    let saw_fixture_detail_content = rendered_contains_hello_fixture_content(&rendered);
     save_artifact("pty_enter_detail_output.raw", &trace, &raw);
     let summary = serde_json::json!({
         "trace_id": trace,

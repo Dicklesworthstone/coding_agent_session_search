@@ -167,54 +167,63 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         || updated_at_ms.is_some()
         || last_progress_at_ms.is_some();
 
-    let active = match file.try_lock_exclusive() {
-        Ok(()) => {
-            // We acquired the exclusive lock with no waiting, which is
-            // proof that no process holds it. POSIX flock (via fs2) is
-            // released automatically when the owning file description
-            // is closed — either explicitly on graceful drop, or by the
-            // kernel on process exit / crash. Therefore, if the file
-            // contains metadata but no holder is present, the previous
-            // owner is gone.
-            //
-            // Historically this produced a permanent `orphaned: true`
-            // state that callers (notably the TUI) interpreted as
-            // "rebuild in progress, keep polling" — yielding a tight
-            // CPU-bound loop that only cleared when the user manually
-            // deleted the lock file (see issue #176).
-            //
-            // Reap the stale metadata in place while we hold the lock,
-            // so that this and every subsequent reader observes a
-            // clean state.
-            //
-            // We deliberately do NOT gate this on a `kill(pid, 0)`
-            // liveness probe. Under PID reuse (the recorded pid is
-            // reassigned to an unrelated live process), such a probe
-            // would refuse to reap and the spin would reappear. Flock
-            // acquisition is the stronger and more precise signal.
-            if metadata_present {
-                if let Err(err) = file.set_len(0) {
-                    tracing::warn!(
-                        path = %lock_path.display(),
-                        error = %err,
-                        "failed to truncate stale index-run lock metadata"
-                    );
-                } else {
-                    let _ = file.sync_all();
-                    tracing::info!(
-                        path = %lock_path.display(),
-                        stale_pid = ?pid,
-                        "cleared stale index-run lock metadata (previous owner gone)"
-                    );
-                    let _ = file.unlock();
-                    return SearchMaintenanceSnapshot::default();
+    #[cfg(windows)]
+    let current_process_owns_recorded_lock = metadata_present && pid == Some(std::process::id());
+    #[cfg(not(windows))]
+    let current_process_owns_recorded_lock = false;
+
+    let active = if current_process_owns_recorded_lock {
+        true
+    } else {
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                // We acquired the exclusive lock with no waiting, which is
+                // proof that no process holds it. POSIX flock (via fs2) is
+                // released automatically when the owning file description
+                // is closed — either explicitly on graceful drop, or by the
+                // kernel on process exit / crash. Therefore, if the file
+                // contains metadata but no holder is present, the previous
+                // owner is gone.
+                //
+                // Historically this produced a permanent `orphaned: true`
+                // state that callers (notably the TUI) interpreted as
+                // "rebuild in progress, keep polling" — yielding a tight
+                // CPU-bound loop that only cleared when the user manually
+                // deleted the lock file (see issue #176).
+                //
+                // Reap the stale metadata in place while we hold the lock,
+                // so that this and every subsequent reader observes a
+                // clean state.
+                //
+                // We deliberately do NOT gate this on a `kill(pid, 0)`
+                // liveness probe. Under PID reuse (the recorded pid is
+                // reassigned to an unrelated live process), such a probe
+                // would refuse to reap and the spin would reappear. Flock
+                // acquisition is the stronger and more precise signal.
+                if metadata_present {
+                    if let Err(err) = file.set_len(0) {
+                        tracing::warn!(
+                            path = %lock_path.display(),
+                            error = %err,
+                            "failed to truncate stale index-run lock metadata"
+                        );
+                    } else {
+                        let _ = file.sync_all();
+                        tracing::info!(
+                            path = %lock_path.display(),
+                            stale_pid = ?pid,
+                            "cleared stale index-run lock metadata (previous owner gone)"
+                        );
+                        let _ = file.unlock();
+                        return SearchMaintenanceSnapshot::default();
+                    }
                 }
+                let _ = file.unlock();
+                false
             }
-            let _ = file.unlock();
-            false
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(_) => false,
         }
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
-        Err(_) => false,
     };
 
     SearchMaintenanceSnapshot {
@@ -1955,6 +1964,16 @@ pub(crate) fn unified_maintenance_view(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    fn active_lock_fixture_pid(_non_windows_pid: u32) -> u32 {
+        std::process::id()
+    }
+
+    #[cfg(not(windows))]
+    fn active_lock_fixture_pid(non_windows_pid: u32) -> u32 {
+        non_windows_pid
+    }
+
     #[test]
     fn maintenance_mode_round_trips_lock_values() {
         for mode in [
@@ -2037,42 +2056,42 @@ mod tests {
     }
 
     #[test]
-    fn live_owner_metadata_is_preserved_when_flock_is_held() {
+    fn live_owner_metadata_is_preserved_when_flock_is_held() -> std::io::Result<()> {
         // When the lock is actually held by a live owner, the snapshot
         // must report the owner faithfully and must NOT reap the file.
         use fs2::FileExt;
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = tempfile::tempdir()?;
         let lock_path = temp.path().join("index-run.lock");
+        let owner_pid = active_lock_fixture_pid(4242);
         let owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(true)
-            .open(&lock_path)
-            .expect("open owner handle");
-        owner
-            .try_lock_exclusive()
-            .expect("owner acquires exclusive lock");
+            .open(&lock_path)?;
+        owner.try_lock_exclusive()?;
         // Write metadata while holding the lock, matching acquire_index_run_lock's order.
         std::fs::write(
             &lock_path,
-            concat!(
-                "pid=4242\n",
-                "started_at_ms=1733000111000\n",
-                "updated_at_ms=1733000112000\n",
-                "db_path=/tmp/cass/agent_search.db\n",
-                "mode=index\n",
-                "job_id=lexical-refresh-1733000111000-4242\n",
-                "job_kind=lexical_refresh\n",
-                "phase=rebuilding\n"
+            format!(
+                concat!(
+                    "pid={}\n",
+                    "started_at_ms=1733000111000\n",
+                    "updated_at_ms=1733000112000\n",
+                    "db_path=/tmp/cass/agent_search.db\n",
+                    "mode=index\n",
+                    "job_id=lexical-refresh-1733000111000-4242\n",
+                    "job_kind=lexical_refresh\n",
+                    "phase=rebuilding\n"
+                ),
+                owner_pid
             ),
-        )
-        .expect("write lock metadata");
+        )?;
 
         let snapshot = read_search_maintenance_snapshot(temp.path());
         assert!(snapshot.active, "live owner must be reported active");
         assert!(!snapshot.orphaned);
-        assert_eq!(snapshot.pid, Some(4242));
+        assert_eq!(snapshot.pid, Some(owner_pid));
         assert_eq!(
             snapshot.job_id.as_deref(),
             Some("lexical-refresh-1733000111000-4242")
@@ -2085,10 +2104,11 @@ mod tests {
         assert_eq!(snapshot.updated_at_ms, Some(1_733_000_112_000));
 
         // Metadata must still be present — reaping must NOT have happened.
-        let post = std::fs::metadata(&lock_path).expect("lock file still present");
+        let post = std::fs::metadata(&lock_path)?;
         assert!(post.len() > 0, "live-owner metadata must not be truncated");
 
-        let _ = FileExt::unlock(&owner);
+        FileExt::unlock(&owner)?;
+        Ok(())
     }
 
     #[test]
@@ -3445,6 +3465,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let pid = active_lock_fixture_pid(99999);
         let owner = OpenOptions::new()
             .create(true)
             .read(true)
@@ -3456,7 +3477,7 @@ mod tests {
         std::fs::write(
             &lock_path,
             format!(
-                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-1\njob_kind=lexical_refresh\nphase=scanning\n",
+                "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-1\njob_kind=lexical_refresh\nphase=scanning\n",
                 now_ms - 1_000,
                 now_ms,
             ),
@@ -3487,6 +3508,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let pid = active_lock_fixture_pid(99999);
         let owner = OpenOptions::new()
             .create(true)
             .read(true)
@@ -3498,7 +3520,7 @@ mod tests {
         std::fs::write(
             &lock_path,
             format!(
-                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-stale\njob_kind=lexical_refresh\nphase=scanning\n",
+                "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-stale\njob_kind=lexical_refresh\nphase=scanning\n",
                 now_ms - 120_000,
                 now_ms - 120_000,
             ),
@@ -3526,6 +3548,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let pid = active_lock_fixture_pid(99999);
         let owner = OpenOptions::new()
             .create(true)
             .read(true)
@@ -3537,7 +3560,7 @@ mod tests {
         std::fs::write(
             &lock_path,
             format!(
-                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-2\njob_kind=lexical_refresh\nphase=committing\n",
+                "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-2\njob_kind=lexical_refresh\nphase=committing\n",
                 now_ms - 1_000,
                 now_ms,
             ),
@@ -3566,6 +3589,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let pid = active_lock_fixture_pid(99999);
 
         use fs2::FileExt;
         let owner = OpenOptions::new()
@@ -3579,7 +3603,7 @@ mod tests {
         std::fs::write(
             &lock_path,
             format!(
-                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=fo-job-1\njob_kind=lexical_refresh\nphase=indexing\n",
+                "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=fo-job-1\njob_kind=lexical_refresh\nphase=indexing\n",
                 now_ms - 1_000,
                 now_ms,
             ),
@@ -3614,6 +3638,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let pid = active_lock_fixture_pid(99999);
 
         use fs2::FileExt;
         let owner = OpenOptions::new()
@@ -3627,7 +3652,7 @@ mod tests {
         std::fs::write(
             &lock_path,
             format!(
-                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=fo-stale-1\njob_kind=lexical_refresh\nphase=indexing\n",
+                "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=fo-stale-1\njob_kind=lexical_refresh\nphase=indexing\n",
                 now_ms - 120_000,
                 now_ms - 120_000,
             ),
@@ -3797,6 +3822,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let pid = active_lock_fixture_pid(99999);
         let owner = OpenOptions::new()
             .create(true)
             .read(true)
@@ -3808,7 +3834,7 @@ mod tests {
         std::fs::write(
             &lock_path,
             format!(
-                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/t.db\nmode=index\njob_id=uv-1\njob_kind=lexical_refresh\nphase=indexing\n",
+                "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/t.db\nmode=index\njob_id=uv-1\njob_kind=lexical_refresh\nphase=indexing\n",
                 now_ms - 1_000,
                 now_ms,
             ),
@@ -3818,7 +3844,7 @@ mod tests {
         let event = MaintenanceEvent {
             timestamp_ms: now_ms,
             job_id: "uv-1".to_string(),
-            actor_pid: 99999,
+            actor_pid: pid,
             kind: MaintenanceEventKind::Started {
                 job_kind: "lexical_refresh".to_string(),
                 phase: "indexing".to_string(),

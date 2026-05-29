@@ -46280,13 +46280,28 @@ fn doctor_probe_mutation_lock(data_dir: &Path) -> DoctorMutationLockObservation 
             let _ = fs2::FileExt::unlock(&file);
             DoctorMutationLockObservation::Available { path, metadata }
         }
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(err) if doctor_lock_probe_error_is_active(&err) => {
             DoctorMutationLockObservation::Active { path, metadata }
         }
         Err(err) => DoctorMutationLockObservation::Unavailable {
             path,
             reason: format!("failed to probe doctor mutation lock ownership: {err}"),
         },
+    }
+}
+
+fn doctor_lock_probe_error_is_active(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        err.raw_os_error() == Some(33)
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -46323,7 +46338,7 @@ fn doctor_acquire_mutation_lock(
 
     if let Err(err) = fs2::FileExt::try_lock_exclusive(&file) {
         let metadata = doctor_read_lock_metadata(&file);
-        if err.kind() == std::io::ErrorKind::WouldBlock {
+        if doctor_lock_probe_error_is_active(&err) {
             return Err(DoctorMutationLockObservation::Active { path, metadata });
         }
         return Err(DoctorMutationLockObservation::Unavailable {
@@ -46387,7 +46402,7 @@ fn doctor_acquire_existing_mutation_lock_without_metadata(
 
     if let Err(err) = fs2::FileExt::try_lock_exclusive(&file) {
         let metadata = doctor_read_lock_metadata(&file);
-        if err.kind() == std::io::ErrorKind::WouldBlock {
+        if doctor_lock_probe_error_is_active(&err) {
             return Err(DoctorMutationLockObservation::Active { path, metadata });
         }
         return Err(DoctorMutationLockObservation::Unavailable {
@@ -52931,9 +52946,22 @@ fn sync_file(path: &Path, label: &str) -> Result<(), String> {
             path.display()
         ));
     }
-    std::fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|err| format!("failed to sync {label} {}: {err}", path.display()))
+
+    #[cfg(windows)]
+    {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| format!("failed to sync {label} {}: {err}", path.display()))
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| format!("failed to sync {label} {}: {err}", path.display()))
+    }
 }
 
 fn sync_directory(path: &Path) -> Result<(), String> {
@@ -52943,9 +52971,17 @@ fn sync_directory(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    std::fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|err| format!("failed to sync directory {}: {err}", path.display()))
+
+    #[cfg(windows)]
+    {
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| format!("failed to sync directory {}: {err}", path.display()))
+    }
 }
 
 fn doctor_rename_file(source_path: &Path, target_path: &Path) -> io::Result<()> {
@@ -66972,6 +67008,7 @@ mode=index",
     fn active_index_run_details_reads_matching_lock_metadata() {
         let (temp, db_path) = seed_cli_db();
         let lock_path = temp.path().join("index-run.lock");
+        let pid = std::process::id();
         let mut lock_file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -66983,7 +67020,7 @@ mode=index",
         writeln!(
             lock_file,
             "pid={}\nstarted_at_ms={}\ndb_path={}",
-            4242_u32,
+            pid,
             1_733_001_111_000_i64,
             db_path.display()
         )
@@ -66992,7 +67029,7 @@ mode=index",
 
         let details =
             active_index_run_details(temp.path(), &db_path).expect("matching active index run");
-        assert_eq!(details.pid, Some(4242));
+        assert_eq!(details.pid, Some(pid));
         assert_eq!(details.started_at_ms, Some(1_733_001_111_000));
         assert_eq!(details.data_dir, temp.path());
         assert_eq!(details.db_path, db_path);
@@ -67007,6 +67044,7 @@ mode=index",
         let (temp, db_path) = seed_cli_db();
         let other_db_path = temp.path().join("other-agent-search.db");
         let lock_path = temp.path().join("index-run.lock");
+        let pid = std::process::id();
         let mut lock_file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -67018,7 +67056,7 @@ mode=index",
         writeln!(
             lock_file,
             "pid={}\nstarted_at_ms={}\ndb_path={}",
-            31337_u32,
+            pid,
             1_733_001_222_000_i64,
             other_db_path.display()
         )
@@ -67027,7 +67065,7 @@ mode=index",
 
         let details = active_index_run_details(temp.path(), &db_path)
             .expect("active lock in same data dir should still be reported");
-        assert_eq!(details.pid, Some(31337));
+        assert_eq!(details.pid, Some(pid));
         assert_eq!(details.db_path, other_db_path);
     }
 
@@ -67608,6 +67646,8 @@ pub(crate) fn run_doctor_impl(
         match doctor_acquire_mutation_lock(&data_dir, &db_path) {
             Ok((guard, observation)) => {
                 _doctor_lock_guard = Some(guard);
+                _doctor_db_open_bypass_guard =
+                    Some(crate::storage::sqlite::enter_doctor_mutation_db_open_bypass());
                 observation
             }
             Err(observation) => observation,
@@ -68810,6 +68850,9 @@ pub(crate) fn run_doctor_impl(
                     match doctor_acquire_mutation_lock(&data_dir, &db_path) {
                         Ok((guard, observation)) => {
                             _doctor_lock_guard = Some(guard);
+                            _doctor_db_open_bypass_guard = Some(
+                                crate::storage::sqlite::enter_doctor_mutation_db_open_bypass(),
+                            );
                             operation_state = build_doctor_operation_state_report(
                                 &data_dir,
                                 &db_path,
@@ -79715,6 +79758,12 @@ pub fn default_data_dir() -> PathBuf {
             return PathBuf::from(trimmed);
         }
     }
+    if let Ok(dir) = dotenvy::var("XDG_DATA_HOME") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("coding-agent-search");
+        }
+    }
     directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search")
         .map(|p| p.data_dir().to_path_buf())
         .or_else(|| dirs::home_dir().map(|h| h.join(".coding-agent-search")))
@@ -81422,6 +81471,7 @@ mod clipboard_helper_tests {
     /// previous failure mode was a silent success that dropped the
     /// export on the floor.
     #[test]
+    #[cfg(not(windows))]
     fn returns_err_when_no_tool_is_available() {
         // Save and clear PATH so spawn() can't find pbcopy/wl-copy/xclip
         // /xsel/clip. Restore on exit even if the assertion panics.

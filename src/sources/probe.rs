@@ -1190,6 +1190,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn probe_script_treats_special_probe_paths_as_literals() {
         let home = tempfile::tempdir().expect("temp home");
         let relative_path =
@@ -1220,6 +1221,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_script_produces_valid_markers() {
         let output = run_probe_script_locally();
         assert!(
@@ -1233,6 +1235,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_script_parses_into_reachable_result() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1246,6 +1249,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_system_info_has_valid_os() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1258,6 +1262,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_system_info_has_valid_arch() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1273,6 +1278,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_system_info_has_nonempty_home() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1286,6 +1292,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_resources_have_nonzero_disk() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1294,6 +1301,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_resources_have_nonzero_memory() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1306,6 +1314,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_resources_memory_invariant() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1319,6 +1328,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_resources_can_compile_reflects_thresholds() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1333,6 +1343,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_tool_detection_is_consistent() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);

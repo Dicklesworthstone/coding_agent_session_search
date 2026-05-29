@@ -307,11 +307,17 @@ fn replace_crash_replay_json_from_temp(temp_path: &Path, final_path: &Path) -> i
     sync_parent_directory(final_path)
 }
 
+#[cfg(not(windows))]
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
     fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn unique_crash_replay_json_temp_path(path: &Path) -> io::Result<PathBuf> {

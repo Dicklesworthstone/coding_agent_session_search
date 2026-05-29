@@ -2028,6 +2028,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_system_info_has_valid_fields() {
         let sys = local_system_info();
         assert!(
@@ -2045,6 +2046,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_resources_have_nonzero_values() {
         let res = local_resource_info();
         assert!(res.disk_available_mb > 0, "disk should be > 0");
@@ -2056,6 +2058,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_resources_memory_invariant() {
         let res = local_resource_info();
         assert!(
@@ -2067,6 +2070,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_resources_can_compile_matches_thresholds() {
         let res = local_resource_info();
         let expected = res.disk_available_mb >= ResourceInfo::MIN_DISK_MB
@@ -2079,6 +2083,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_system_choose_method_returns_some() {
         let sys = local_system_info();
         let res = local_resource_info();

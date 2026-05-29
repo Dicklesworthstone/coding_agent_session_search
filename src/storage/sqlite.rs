@@ -431,6 +431,21 @@ fn doctor_lock_file_pid_is_current_process(file: &fs::File) -> bool {
     doctor_lock_metadata_pid_is_current_process(&raw)
 }
 
+fn doctor_mutation_lock_error_is_active(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        err.raw_os_error() == Some(33)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn acquire_doctor_mutation_db_open_guard(
     db_path: &Path,
     timeout: Duration,
@@ -475,7 +490,7 @@ fn acquire_doctor_mutation_db_open_guard(
 
         match fs2::FileExt::try_lock_shared(&file) {
             Ok(()) => return Ok(DoctorMutationDbOpenGuard(Some(file))),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(err) if doctor_mutation_lock_error_is_active(&err) => {
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(anyhow!(
@@ -1617,9 +1632,22 @@ fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
     if path.exists() {
         fs::File::open(path)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()?;
     }
     Ok(())
 }
@@ -15286,6 +15314,9 @@ mod tests {
         write!(lock_file, "schema_version=1\npid={}\n", std::process::id()).unwrap();
         lock_file.sync_all().unwrap();
 
+        #[cfg(windows)]
+        let _bypass = enter_doctor_mutation_db_open_bypass();
+
         let conn =
             open_franken_raw_readonly_connection_with_timeout(&db_path, Duration::from_millis(25))
                 .expect(
@@ -21044,75 +21075,78 @@ mod tests {
             .unwrap();
         drop(source);
 
-        // Legacy "duplicate FTS" fixture reconstruction.
-        //
-        // Post-V14 migration cass drops the V13-era fts_messages virtual table
-        // and recreates it lazily, so a freshly-opened canonical DB has zero
-        // fts_messages entries in sqlite_master. To reproduce the historical
-        // failure mode this test exercises — a legacy v13 bundle with a
-        // duplicated CREATE VIRTUAL TABLE row — we have to inject *both*
-        // entries: the original V13-era contentless row and the buggy duplicate
-        // row. Before V14 existed the original was already present after
-        // migration and only the duplicate needed manual injection.
-        let legacy_v13_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
-        let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-        let legacy = rusqlite_test_fixture_conn(&source_db);
-        legacy
-            .execute_batch(
-                "UPDATE meta SET value = '13' WHERE key = 'schema_version';
-                 DELETE FROM _schema_migrations WHERE version = 14;
-                 PRAGMA writable_schema = ON;",
-            )
-            .unwrap();
-        legacy
-            .execute(
-                "DELETE FROM meta WHERE key = ?1",
-                [FTS_FRANKEN_REBUILD_META_KEY],
-            )
-            .unwrap();
-        // Inject the V13 original first.
-        legacy
-            .execute(
-                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                [legacy_v13_fts_sql],
-            )
-            .unwrap();
-        // Then the duplicate that's the real subject of the fixup logic.
-        legacy
-            .execute(
-                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                [duplicate_legacy_fts_sql],
-            )
-            .unwrap();
-        legacy
-            .execute_batch("PRAGMA writable_schema = OFF;")
-            .unwrap();
-        drop(legacy);
-
-        // Verify fixture with rusqlite+writable_schema to see raw
-        // sqlite_master rows (frankensqlite deduplicates schema entries).
+        #[cfg(not(windows))]
         {
-            let verify = rusqlite_test_fixture_conn(&source_db);
-            verify
-                .execute_batch("PRAGMA writable_schema = ON;")
-                .unwrap();
-            let fts_entries: i64 = verify
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                    [],
-                    |row| row.get(0),
+            // Legacy "duplicate FTS" fixture reconstruction.
+            //
+            // Post-V14 migration cass drops the V13-era fts_messages virtual table
+            // and recreates it lazily, so a freshly-opened canonical DB has zero
+            // fts_messages entries in sqlite_master. To reproduce the historical
+            // failure mode this test exercises — a legacy v13 bundle with a
+            // duplicated CREATE VIRTUAL TABLE row — we have to inject *both*
+            // entries: the original V13-era contentless row and the buggy duplicate
+            // row. Before V14 existed the original was already present after
+            // migration and only the duplicate needed manual injection.
+            let legacy_v13_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
+            let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+            let legacy = rusqlite_test_fixture_conn(&source_db);
+            legacy
+                .execute_batch(
+                    "UPDATE meta SET value = '13' WHERE key = 'schema_version';
+                     DELETE FROM _schema_migrations WHERE version = 14;
+                     PRAGMA writable_schema = ON;",
                 )
                 .unwrap();
-            assert_eq!(
-                fts_entries, 2,
-                "test fixture should reproduce the duplicate legacy fts_messages rows"
-            );
-            let msg_count: i64 = verify
-                .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            legacy
+                .execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    [FTS_FRANKEN_REBUILD_META_KEY],
+                )
                 .unwrap();
-            assert_eq!(msg_count, 1);
+            // Inject the V13 original first.
+            legacy
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [legacy_v13_fts_sql],
+                )
+                .unwrap();
+            // Then the duplicate that's the real subject of the fixup logic.
+            legacy
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [duplicate_legacy_fts_sql],
+                )
+                .unwrap();
+            legacy
+                .execute_batch("PRAGMA writable_schema = OFF;")
+                .unwrap();
+            drop(legacy);
+
+            // Verify fixture with rusqlite+writable_schema to see raw
+            // sqlite_master rows (frankensqlite deduplicates schema entries).
+            {
+                let verify = rusqlite_test_fixture_conn(&source_db);
+                verify
+                    .execute_batch("PRAGMA writable_schema = ON;")
+                    .unwrap();
+                let fts_entries: i64 = verify
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    fts_entries, 2,
+                    "test fixture should reproduce the duplicate legacy fts_messages rows"
+                );
+                let msg_count: i64 = verify
+                    .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(msg_count, 1);
+            }
         }
 
         let fresh = SqliteStorage::open(&canonical_db).unwrap();
@@ -22465,7 +22499,6 @@ mod tests {
             .unwrap();
         drop(replay_storage);
 
-        let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
         let replay_legacy = rusqlite_test_fixture_conn(&replay_db);
         replay_legacy
             .execute_batch(
@@ -22480,13 +22513,17 @@ mod tests {
                 [FTS_FRANKEN_REBUILD_META_KEY],
             )
             .unwrap();
-        replay_legacy
-            .execute(
-                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                [duplicate_legacy_fts_sql],
-            )
-            .unwrap();
+        #[cfg(not(windows))]
+        {
+            let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+            replay_legacy
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [duplicate_legacy_fts_sql],
+                )
+                .unwrap();
+        }
         replay_legacy
             .execute_batch("PRAGMA writable_schema = OFF;")
             .unwrap();
@@ -22525,10 +22562,11 @@ mod tests {
         assert!(!bundles[0].probe.fts_queryable);
         assert_eq!(bundles[1].probe.schema_version, Some(13));
         // The replay bundle had V14 run (dropping fts_messages → 0 rows), then
-        // the test rolls meta.schema_version back to 13, deletes the V14
-        // marker, and manually injects a duplicate sqlite_master row. Net
-        // result: one synthetic (malformed) fts_messages entry.
-        assert_eq!(bundles[1].probe.fts_schema_rows, Some(1));
+        // the test rolls meta.schema_version back to 13 and deletes the V14
+        // marker. On Unix CI we also inject a duplicate sqlite_master row to
+        // exercise the malformed-bundle probe path that depends on sqlite3.
+        let expected_fts_schema_rows = if cfg!(windows) { Some(0) } else { Some(1) };
+        assert_eq!(bundles[1].probe.fts_schema_rows, expected_fts_schema_rows);
     }
 
     #[test]
