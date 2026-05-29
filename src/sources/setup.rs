@@ -15,7 +15,7 @@
 //! interrupted setups to continue where they left off.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -188,11 +188,16 @@ impl SetupState {
     /// Save state to disk.
     pub fn save(&self) -> Result<(), SetupError> {
         let path = Self::path();
+        self.save_to_path(&path)
+    }
+
+    fn save_to_path(&self, path: &Path) -> Result<(), SetupError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(SetupError::Io)?;
         }
-        let content = serde_json::to_string_pretty(self).map_err(SetupError::Json)?;
-        std::fs::write(&path, content).map_err(SetupError::Io)?;
+        let content = serde_json::to_vec_pretty(self).map_err(SetupError::Json)?;
+        let temp_path = write_setup_state_temp_file(path, &content).map_err(SetupError::Io)?;
+        replace_setup_state_from_temp(&temp_path, path).map_err(SetupError::Io)?;
         Ok(())
     }
 
@@ -215,6 +220,172 @@ impl SetupState {
             || self.indexing_complete
             || self.configuration_complete
     }
+}
+
+fn write_setup_state_temp_file(path: &Path, contents: &[u8]) -> Result<PathBuf, std::io::Error> {
+    for _ in 0..100 {
+        let temp_path = unique_setup_state_temp_path(path)?;
+        match write_setup_state_temp_file_at(&temp_path, contents) {
+            Ok(()) => return Ok(temp_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate unique setup state temp path for {}",
+            path.display()
+        ),
+    ))
+}
+
+fn write_setup_state_temp_file_at(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+fn unique_setup_state_temp_path(path: &Path) -> Result<PathBuf, std::io::Error> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = setup_state_temp_path_nonce()?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("setup_state.json");
+
+    Ok(path.with_file_name(format!(".{file_name}.tmp.{timestamp}.{nonce:016x}")))
+}
+
+fn setup_state_temp_path_nonce() -> Result<u64, std::io::Error> {
+    let rng = ring::rand::SystemRandom::new();
+    let mut bytes = [0u8; 8];
+    ring::rand::SecureRandom::fill(&rng, &mut bytes)
+        .map_err(|_| std::io::Error::other("secure random generation failed"))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+#[cfg(not(windows))]
+fn replace_setup_state_from_temp(
+    temp_path: &Path,
+    final_path: &Path,
+) -> Result<(), std::io::Error> {
+    std::fs::rename(temp_path, final_path)?;
+    sync_setup_state_parent_directory(final_path)
+}
+
+#[cfg(windows)]
+fn replace_setup_state_from_temp(
+    temp_path: &Path,
+    final_path: &Path,
+) -> Result<(), std::io::Error> {
+    match std::fs::rename(temp_path, final_path) {
+        Ok(()) => sync_setup_state_parent_directory(final_path),
+        Err(first_err)
+            if setup_state_path_entry_exists(final_path)
+                && matches!(
+                    first_err.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                ) =>
+        {
+            let backup_path = unique_setup_state_replace_backup_path(final_path)?;
+            std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                std::io::Error::other(format!(
+                    "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
+                    backup_path.display(),
+                    final_path.display(),
+                    first_err,
+                    backup_err
+                ))
+            })?;
+            match std::fs::rename(temp_path, final_path) {
+                Ok(()) => sync_setup_state_parent_directory(final_path),
+                Err(second_err) => {
+                    let restore_result = std::fs::rename(&backup_path, final_path);
+                    match restore_result {
+                        Ok(()) => {
+                            sync_setup_state_parent_directory(final_path).map_err(|sync_err| {
+                                std::io::Error::other(format!(
+                                    "failed replacing {} with {}: first error: {}; second error: {}; restored original file but failed syncing parent directory: {}",
+                                    final_path.display(),
+                                    temp_path.display(),
+                                    first_err,
+                                    second_err,
+                                    sync_err
+                                ))
+                            })?;
+                            Err(std::io::Error::new(
+                                second_err.kind(),
+                                format!(
+                                    "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
+                                    final_path.display(),
+                                    temp_path.display(),
+                                    first_err,
+                                    second_err
+                                ),
+                            ))
+                        }
+                        Err(restore_err) => Err(std::io::Error::other(format!(
+                            "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}",
+                            final_path.display(),
+                            temp_path.display(),
+                            first_err,
+                            second_err,
+                            restore_err,
+                            temp_path.display()
+                        ))),
+                    }
+                }
+            }
+        }
+        Err(rename_err) => Err(rename_err),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn setup_state_path_entry_exists(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+#[cfg(windows)]
+fn unique_setup_state_replace_backup_path(path: &Path) -> Result<PathBuf, std::io::Error> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = setup_state_temp_path_nonce()?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("setup_state.json");
+
+    Ok(path.with_file_name(format!(".{file_name}.bak.{timestamp}.{nonce:016x}")))
+}
+
+#[cfg(not(windows))]
+fn sync_setup_state_parent_directory(path: &Path) -> Result<(), std::io::Error> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_setup_state_parent_directory(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 /// Errors that can occur during setup.
@@ -1063,6 +1234,20 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
 mod tests {
     use super::*;
 
+    type SetupTestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn setup_test_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
+        std::io::Error::other(message.into()).into()
+    }
+
+    fn ensure_setup_test(condition: bool, message: impl Into<String>) -> SetupTestResult {
+        if condition {
+            Ok(())
+        } else {
+            Err(setup_test_error(message))
+        }
+    }
+
     #[test]
     fn test_setup_options_default() {
         let opts = SetupOptions::default();
@@ -1180,6 +1365,108 @@ mod tests {
         );
         assert_eq!(deserialized.selected_host_names, state.selected_host_names);
         assert_eq!(deserialized.started_at, state.started_at);
+    }
+
+    #[test]
+    fn test_setup_state_save_to_path_round_trips() -> SetupTestResult {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("setup_state.json");
+        let state = SetupState {
+            discovery_complete: true,
+            discovered_hosts: 2,
+            discovered_host_names: vec!["alpha".to_string(), "beta".to_string()],
+            current_operation: Some("probing".to_string()),
+            started_at: Some("2026-05-28T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+
+        state.save_to_path(&path)?;
+
+        let loaded: SetupState = serde_json::from_slice(&std::fs::read(&path)?)?;
+        ensure_setup_test(
+            loaded.discovery_complete == state.discovery_complete,
+            "discovery_complete should round-trip",
+        )?;
+        ensure_setup_test(
+            loaded.discovered_hosts == state.discovered_hosts,
+            "discovered_hosts should round-trip",
+        )?;
+        ensure_setup_test(
+            loaded.discovered_host_names == state.discovered_host_names,
+            "discovered_host_names should round-trip",
+        )?;
+        ensure_setup_test(
+            loaded.current_operation == state.current_operation,
+            "current_operation should round-trip",
+        )?;
+        ensure_setup_test(
+            loaded.started_at == state.started_at,
+            "started_at should round-trip",
+        )?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_state_save_replaces_symlink_without_following() -> SetupTestResult {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("setup_state.json");
+        let protected = temp.path().join("protected.json");
+        let state = SetupState {
+            probing_complete: true,
+            selected_host_names: vec!["remote-box".to_string()],
+            current_operation: Some("configuring".to_string()),
+            ..Default::default()
+        };
+
+        std::fs::write(&protected, b"protected")?;
+        symlink(&protected, &path)?;
+
+        state.save_to_path(&path)?;
+
+        ensure_setup_test(
+            std::fs::read(&protected)? == b"protected",
+            "protected target should not be overwritten",
+        )?;
+        ensure_setup_test(
+            !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "setup state save should replace the symlink path itself",
+        )?;
+        let loaded: SetupState = serde_json::from_slice(&std::fs::read(&path)?)?;
+        ensure_setup_test(
+            loaded.probing_complete == state.probing_complete,
+            "probing_complete should round-trip after symlink replacement",
+        )?;
+        ensure_setup_test(
+            loaded.selected_host_names == state.selected_host_names,
+            "selected_host_names should round-trip after symlink replacement",
+        )?;
+        ensure_setup_test(
+            loaded.current_operation == state.current_operation,
+            "current_operation should round-trip after symlink replacement",
+        )?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_state_path_entry_exists_detects_dangling_symlink() -> SetupTestResult {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("setup_state.json");
+        let missing_target = temp.path().join("missing.json");
+
+        symlink(&missing_target, &path)?;
+
+        ensure_setup_test(!path.exists(), "Path::exists follows the missing target")?;
+        ensure_setup_test(
+            setup_state_path_entry_exists(&path),
+            "replacement fallback must detect the symlink path entry itself",
+        )?;
+        Ok(())
     }
 
     #[test]
