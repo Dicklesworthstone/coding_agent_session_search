@@ -2387,42 +2387,60 @@ fn record_historical_bundle_import(
 }
 
 fn scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path: &Path) -> Result<()> {
-    let status = Command::new("sqlite3")
-        .arg("-batch")
-        .arg(staged_db_path)
-        .arg(
-            "PRAGMA writable_schema = ON;
-             DELETE FROM sqlite_master
-              WHERE name = 'fts_messages'
-                 OR tbl_name = 'fts_messages'
-                 OR name IN (
-                    'fts_messages_config',
-                    'fts_messages_content',
-                    'fts_messages_data',
-                    'fts_messages_docsize',
-                    'fts_messages_idx'
-                 )
-                 OR tbl_name IN (
-                    'fts_messages_config',
-                    'fts_messages_content',
-                    'fts_messages_data',
-                    'fts_messages_docsize',
-                    'fts_messages_idx'
-                 );
-             PRAGMA writable_schema = OFF;",
-        )
-        .status()
-        .with_context(|| {
+    let scrub_sql = "PRAGMA writable_schema = ON;
+         DELETE FROM sqlite_master
+          WHERE name = 'fts_messages'
+             OR tbl_name = 'fts_messages'
+             OR name IN (
+                'fts_messages_config',
+                'fts_messages_content',
+                'fts_messages_data',
+                'fts_messages_docsize',
+                'fts_messages_idx'
+             )
+             OR tbl_name IN (
+                'fts_messages_config',
+                'fts_messages_content',
+                'fts_messages_data',
+                'fts_messages_docsize',
+                'fts_messages_idx'
+             );
+         PRAGMA writable_schema = OFF;";
+
+    let run_scrub = |disable_defensive: bool| -> Result<std::process::Output> {
+        let mut command = Command::new("sqlite3");
+        command.arg("-batch").arg(staged_db_path);
+        if disable_defensive {
+            command.arg(".dbconfig defensive off");
+        }
+        command.arg(scrub_sql).output().with_context(|| {
             format!(
                 "running sqlite3 staged FTS metadata scrub for {}",
                 staged_db_path.display()
             )
-        })?;
-    if !status.success() {
+        })
+    };
+    let render_output = |output: &std::process::Output| -> String {
+        format!(
+            "status {}; stdout: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    };
+
+    let defensive_off_output = run_scrub(true)?;
+    if defensive_off_output.status.success() {
+        return Ok(());
+    }
+
+    let fallback_output = run_scrub(false)?;
+    if !fallback_output.status.success() {
         anyhow::bail!(
-            "sqlite3 staged FTS metadata scrub exited with status {} for {}",
-            status,
-            staged_db_path.display()
+            "sqlite3 staged FTS metadata scrub failed for {}; defensive-off attempt {}; fallback without .dbconfig {}",
+            staged_db_path.display(),
+            render_output(&defensive_off_output),
+            render_output(&fallback_output)
         );
     }
     Ok(())
