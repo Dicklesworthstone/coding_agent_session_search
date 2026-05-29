@@ -15039,7 +15039,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
         match std::fs::rename(temp_path, final_path) {
             Ok(()) => sync_parent_directory(final_path),
             Err(first_err)
-                if final_path.exists()
+                if path_entry_exists(final_path)
                     && matches!(
                         first_err.kind(),
                         std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
@@ -15047,7 +15047,6 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
             {
                 let backup_path = unique_atomic_sidecar_path(final_path, "bak", "tui_state.json");
                 std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
-                    let _ = std::fs::remove_file(temp_path);
                     format!(
                         "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
                         backup_path.display(),
@@ -15057,15 +15056,11 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
                     )
                 })?;
                 match std::fs::rename(temp_path, final_path) {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&backup_path);
-                        sync_parent_directory(final_path)
-                    }
+                    Ok(()) => sync_parent_directory(final_path),
                     Err(second_err) => {
                         let restore_result = std::fs::rename(&backup_path, final_path);
                         match restore_result {
                             Ok(()) => {
-                                let _ = std::fs::remove_file(temp_path);
                                 sync_parent_directory(final_path)?;
                                 Err(format!(
                                     "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
@@ -15100,6 +15095,15 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
         std::fs::rename(temp_path, final_path)
             .map_err(|e| format!("failed replacing {}: {e}", final_path.display()))?;
         sync_parent_directory(final_path)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn path_entry_exists(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => false,
+        Err(_) => true,
     }
 }
 
@@ -24912,6 +24916,69 @@ mod tests {
                 .is_symlink(),
             "failed temp write should leave the existing symlink untouched"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_replace_replaces_symlink_without_following()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new()?;
+        let final_path = tmp.path().join("tui_state.json");
+        let protected = tmp.path().join("protected-state.json");
+        let temp_path = tmp.path().join(".tui_state.json.tmp");
+
+        std::fs::write(&protected, b"protected")?;
+        symlink(&protected, &final_path)?;
+        std::fs::write(&temp_path, br#"{"version":1}"#)?;
+
+        replace_file_from_temp(&temp_path, &final_path).map_err(std::io::Error::other)?;
+
+        if !matches!(
+            std::fs::read(&protected)?.as_slice().cmp(b"protected"),
+            std::cmp::Ordering::Equal
+        ) {
+            return Err("replace modified the symlink target".into());
+        }
+        if std::fs::symlink_metadata(&final_path)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("replace followed the symlink instead of publishing at the path".into());
+        }
+        if !matches!(
+            std::fs::read(&final_path)?
+                .as_slice()
+                .cmp(br#"{"version":1}"#),
+            std::cmp::Ordering::Equal
+        ) {
+            return Err("replace did not publish the temporary state bytes".into());
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_path_entry_exists_detects_dangling_symlink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new()?;
+        let path = tmp.path().join("tui_state.json");
+        let missing_target = tmp.path().join("missing-state.json");
+
+        symlink(&missing_target, &path)?;
+
+        if path.exists() {
+            return Err("Path::exists stopped following the missing target".into());
+        }
+        if !path_entry_exists(&path) {
+            return Err("replacement fallback missed the symlink path entry itself".into());
+        }
+
+        Ok(())
     }
 
     #[test]
