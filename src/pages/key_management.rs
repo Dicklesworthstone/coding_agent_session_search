@@ -1042,49 +1042,8 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
                 sync_parent_directory(final_path)?;
                 Ok(())
             }
-            Err(first_err) if final_path.exists() => {
-                let backup_path = unique_atomic_backup_path(final_path);
-                std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
-                    let _ = std::fs::remove_file(temp_path);
-                    anyhow::anyhow!(
-                        "failed replacing {} with {}: {}; failed moving existing file to backup {}: {}",
-                        final_path.display(),
-                        temp_path.display(),
-                        first_err,
-                        backup_path.display(),
-                        backup_err
-                    )
-                })?;
-
-                match std::fs::rename(temp_path, final_path) {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&backup_path);
-                        sync_parent_directory(final_path)?;
-                        Ok(())
-                    }
-                    Err(second_err) => match std::fs::rename(&backup_path, final_path) {
-                        Ok(()) => {
-                            let _ = std::fs::remove_file(temp_path);
-                            sync_parent_directory(final_path)?;
-                            anyhow::bail!(
-                                "failed replacing {} with {}: {}; restored original file",
-                                final_path.display(),
-                                temp_path.display(),
-                                second_err
-                            );
-                        }
-                        Err(restore_err) => {
-                            anyhow::bail!(
-                                "failed replacing {} with {}: {}; restore error: {}; temp file retained at {}",
-                                final_path.display(),
-                                temp_path.display(),
-                                second_err,
-                                restore_err,
-                                temp_path.display()
-                            );
-                        }
-                    },
-                }
+            Err(first_err) if replacement_path_entry_exists(final_path)? => {
+                replace_file_from_temp_via_backup(temp_path, final_path, &first_err)
             }
             Err(err) => Err(err.into()),
         }
@@ -1092,6 +1051,64 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
         std::fs::rename(temp_path, final_path)?;
         sync_parent_directory(final_path)?;
         Ok(())
+    }
+}
+
+fn replacement_path_entry_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => Ok(false),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed inspecting replacement target {}", path.display())),
+    }
+}
+
+fn replace_file_from_temp_via_backup(
+    temp_path: &Path,
+    final_path: &Path,
+    first_err: &std::io::Error,
+) -> Result<()> {
+    let backup_path = unique_atomic_backup_path(final_path);
+    std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
+        let _ = std::fs::remove_file(temp_path);
+        anyhow::anyhow!(
+            "failed replacing {} with {}: {}; failed moving existing file to backup {}: {}",
+            final_path.display(),
+            temp_path.display(),
+            first_err,
+            backup_path.display(),
+            backup_err
+        )
+    })?;
+
+    match std::fs::rename(temp_path, final_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup_path);
+            sync_parent_directory(final_path)?;
+            Ok(())
+        }
+        Err(second_err) => match std::fs::rename(&backup_path, final_path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(temp_path);
+                sync_parent_directory(final_path)?;
+                anyhow::bail!(
+                    "failed replacing {} with {}: {}; restored original file",
+                    final_path.display(),
+                    temp_path.display(),
+                    second_err
+                );
+            }
+            Err(restore_err) => {
+                anyhow::bail!(
+                    "failed replacing {} with {}: {}; restore error: {}; temp file retained at {}",
+                    final_path.display(),
+                    temp_path.display(),
+                    second_err,
+                    restore_err,
+                    temp_path.display()
+                );
+            }
+        },
     }
 }
 
@@ -2155,6 +2172,74 @@ mod tests {
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written, value);
+    }
+
+    #[test]
+    fn test_unique_atomic_backup_path_changes_each_call() -> Result<()> {
+        use std::collections::BTreeSet;
+
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("config.json");
+
+        let first = unique_atomic_backup_path(&path);
+        let second = unique_atomic_backup_path(&path);
+        let mut seen = BTreeSet::new();
+
+        if !seen.insert(first.clone()) || !seen.insert(second.clone()) {
+            anyhow::bail!(
+                "backup sidecar names should be unique, got {} twice",
+                first.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_replacement_path_entry_exists_detects_dangling_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new()?;
+        let link_path = temp_dir.path().join("config.json");
+        let missing_target = temp_dir.path().join("missing-config.json");
+
+        symlink(&missing_target, &link_path)?;
+
+        if link_path.exists() {
+            anyhow::bail!("dangling symlink unexpectedly resolved through Path::exists");
+        }
+        if !replacement_path_entry_exists(&link_path)? {
+            anyhow::bail!(
+                "replacement path entry check missed dangling symlink {}",
+                link_path.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_replace_file_from_temp_via_backup_overwrites_existing_file() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("config.json");
+        let temp_path = temp_dir.path().join("config.tmp");
+        let first_err = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+
+        std::fs::write(&final_path, br#"{"slots":["old"]}"#)?;
+        std::fs::write(&temp_path, br#"{"slots":["new"]}"#)?;
+
+        replace_file_from_temp_via_backup(&temp_path, &final_path, &first_err)?;
+
+        let content = std::fs::read_to_string(&final_path)?;
+        if !content.contains("new") {
+            anyhow::bail!("final config did not contain replacement content: {content}");
+        }
+        if temp_path.exists() {
+            anyhow::bail!(
+                "temporary config was left behind at {}",
+                temp_path.display()
+            );
+        }
+        Ok(())
     }
 
     #[test]
