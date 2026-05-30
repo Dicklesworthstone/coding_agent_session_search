@@ -2516,6 +2516,7 @@ impl IndexRunLockGuard {
 ///    and bumping the shared progress timestamp so the heartbeat can
 ///    fold completion progress into the lock metadata.
 mod watch_startup_preflight {
+    use anyhow::Context;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
     use std::thread::{self, JoinHandle};
@@ -2804,6 +2805,33 @@ mod watch_startup_preflight {
         timeout_phase: &str,
         now_ms: i64,
     ) -> anyhow::Result<()> {
+        match rewrite_lock_phase_file_for_timeout(lock_path, timeout_phase, now_ms) {
+            Ok(payload) => crate::search::asset_state::write_index_run_lock_metadata_sidecar(
+                lock_path, &payload,
+            ),
+            Err(err) if timeout_rewrite_hit_windows_lock_conflict(&err) => {
+                let sidecar_path =
+                    crate::search::asset_state::index_run_lock_metadata_sidecar_path(lock_path);
+                let raw = std::fs::read_to_string(&sidecar_path).with_context(|| {
+                    format!(
+                        "reading index-run lock metadata sidecar for timeout rewrite {}",
+                        sidecar_path.display()
+                    )
+                })?;
+                let payload = timeout_lock_metadata_payload(&raw, timeout_phase, now_ms);
+                crate::search::asset_state::write_index_run_lock_metadata_sidecar(
+                    lock_path, &payload,
+                )
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn rewrite_lock_phase_file_for_timeout(
+        lock_path: &std::path::Path,
+        timeout_phase: &str,
+        now_ms: i64,
+    ) -> anyhow::Result<String> {
         use std::io::{Read, Seek, SeekFrom, Write};
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -2811,33 +2839,54 @@ mod watch_startup_preflight {
             .open(lock_path)?;
         let mut buf = String::new();
         file.read_to_string(&mut buf)?;
-        // Rewrite each line in place: `phase=...` -> `phase=<timeout_phase>`,
-        // `updated_at_ms=...` -> `updated_at_ms=<now_ms>`. Preserve
-        // every other line verbatim so the field order remains stable
-        // for parsers.
-        let mut new_lines = Vec::with_capacity(16);
-        for line in buf.lines() {
-            if line.strip_prefix("phase=").is_some() {
-                new_lines.push(format!("phase={timeout_phase}"));
-            } else if line.starts_with("updated_at_ms=") {
-                new_lines.push(format!("updated_at_ms={now_ms}"));
-            } else {
-                new_lines.push(line.to_string());
-            }
-        }
-        let joined = new_lines.join("\n");
-        let payload = if joined.ends_with('\n') {
-            joined
-        } else {
-            format!("{joined}\n")
-        };
+        let payload = timeout_lock_metadata_payload(&buf, timeout_phase, now_ms);
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(payload.as_bytes())?;
         file.flush()?;
         file.sync_all()?;
-        crate::search::asset_state::write_index_run_lock_metadata_sidecar(lock_path, &payload)?;
-        Ok(())
+        Ok(payload)
+    }
+
+    fn timeout_lock_metadata_payload(existing: &str, timeout_phase: &str, now_ms: i64) -> String {
+        // Rewrite each line in place: `phase=...` -> `phase=<timeout_phase>`,
+        // `updated_at_ms=...` -> `updated_at_ms=<now_ms>`. Preserve
+        // every other line verbatim so the field order remains stable
+        // for parsers.
+        let mut new_lines = Vec::with_capacity(16);
+        let mut wrote_phase = false;
+        let mut wrote_updated_at = false;
+        for line in existing.lines() {
+            if line.strip_prefix("phase=").is_some() {
+                new_lines.push(format!("phase={timeout_phase}"));
+                wrote_phase = true;
+            } else if line.starts_with("updated_at_ms=") {
+                new_lines.push(format!("updated_at_ms={now_ms}"));
+                wrote_updated_at = true;
+            } else {
+                new_lines.push(line.to_string());
+            }
+        }
+        if !wrote_updated_at {
+            new_lines.push(format!("updated_at_ms={now_ms}"));
+        }
+        if !wrote_phase {
+            new_lines.push(format!("phase={timeout_phase}"));
+        }
+        let joined = new_lines.join("\n");
+        if joined.ends_with('\n') {
+            joined
+        } else {
+            format!("{joined}\n")
+        }
+    }
+
+    fn timeout_rewrite_hit_windows_lock_conflict(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(crate::search::asset_state::windows_lock_conflict)
+        })
     }
 }
 
@@ -19471,20 +19520,45 @@ struct StalePoisonVersionAccumulator {
     stale_keys: BTreeSet<(String, i64)>,
     legacy_keys: BTreeSet<(String, i64)>,
     previous_versions: BTreeSet<String>,
+    /// Keys that have been observed with `cass_version == current_version` in
+    /// at least one storage surface (JSONL or structured).  A key here must
+    /// not be promoted to `stale_keys` even if a *second* observation from a
+    /// different surface reports it as `None` (legacy) or an older version.
+    ///
+    /// Without this, the cross-surface race where
+    /// `mark_stale_index_ingest_jsonl_retry_attempted` succeeds but
+    /// `mark_stale_index_ingest_structured_retry_attempted`'s `state.save()`
+    /// fails would leave the structured record at `None`, causing
+    /// `stale_index_ingest_quarantine_version_retry` to signal a retry every
+    /// subsequent run even though the JSONL surface already records the retry
+    /// as complete for the current version — an unbounded retry storm
+    /// (cass#261).
+    already_current_keys: BTreeSet<(String, i64)>,
 }
 
 impl StalePoisonVersionAccumulator {
     fn observe(&mut self, key: (String, i64), cass_version: Option<&str>, current_version: &str) {
         match cass_version {
-            Some(version) if version == current_version => {}
+            Some(version) if version == current_version => {
+                // This key is already marked as retried under the current
+                // binary.  Record it so that a stale observation from another
+                // storage surface cannot re-promote it to stale_keys.
+                self.stale_keys.remove(&key);
+                self.legacy_keys.remove(&key);
+                self.already_current_keys.insert(key);
+            }
             Some(version) => {
-                self.stale_keys.insert(key);
-                self.previous_versions.insert(version.to_string());
+                if !self.already_current_keys.contains(&key) {
+                    self.stale_keys.insert(key);
+                    self.previous_versions.insert(version.to_string());
+                }
             }
             None => {
-                self.legacy_keys.insert(key.clone());
-                self.stale_keys.insert(key);
-                self.previous_versions.insert("unknown".to_string());
+                if !self.already_current_keys.contains(&key) {
+                    self.legacy_keys.insert(key.clone());
+                    self.stale_keys.insert(key);
+                    self.previous_versions.insert("unknown".to_string());
+                }
             }
         }
     }
@@ -26021,6 +26095,16 @@ mod tests {
     use tempfile::TempDir;
 
     fn read_index_run_lock_metadata_for_test(lock_path: &Path) -> Result<String> {
+        #[cfg(windows)]
+        {
+            let sidecar_path =
+                crate::search::asset_state::index_run_lock_metadata_sidecar_path(lock_path);
+            if let Ok(raw) = std::fs::read_to_string(&sidecar_path)
+                && !raw.trim().is_empty()
+            {
+                return Ok(raw);
+            }
+        }
         match std::fs::read_to_string(lock_path) {
             Ok(raw) => Ok(raw),
             Err(err) if crate::search::asset_state::windows_lock_conflict(&err) => {
@@ -27559,7 +27643,7 @@ mod tests {
     /// 3. Polling for the trip with a 750 ms deadline.
     /// 4. Asserting:
     ///    - `state.tripped` is true (watchdog fired).
-    ///    - The on-disk lock-file `phase=` line was rewritten to
+    ///    - The operator-visible metadata `phase=` line was rewritten to
     ///      `watch_startup:cleanup_orphan_fk_rows_TIMEOUT`.
     ///    - The lock-file `updated_at_ms=` advanced.
     ///    - The other fields (pid, started_at_ms, db_path, mode,
@@ -27633,13 +27717,14 @@ mod tests {
             "watchdog must trip when a preflight step exceeds its timeout; otherwise the cass#265 wedge persists silently"
         );
 
-        // Verify the on-disk lock file now carries the TIMEOUT
-        // breadcrumb. This is the surface the operator's
-        // `cass health --json` reads. Add a small sleep so the
-        // watchdog's lock-file rewrite has settled — the watchdog
-        // sets `state.tripped` BEFORE writing the file, so without a
-        // bounded grace window the test can race the kernel writeback
-        // path on a heavily loaded CI runner.
+        // Verify the operator-visible metadata now carries the
+        // TIMEOUT breadcrumb. This is the surface the operator's
+        // `cass health --json` reads: the lock file on POSIX, and the
+        // sidecar on Windows when the held lock prevents same-process
+        // lock-file rewrites. The watchdog sets `state.tripped` only
+        // after this metadata path is durable, but the bounded poll
+        // keeps the test robust to reader/writer scheduling jitter on
+        // heavily loaded CI runners.
         let read_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         let post = loop {
             let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
@@ -34238,6 +34323,84 @@ mod tests {
         assert!(
             QuarantineState::load(&data_dir).is_empty(),
             "successful retry should clear the matching structured quarantine record"
+        );
+        Ok(())
+    }
+
+    /// Regression for cass#261: cross-surface storm guard.
+    ///
+    /// If `mark_stale_index_ingest_jsonl_retry_attempted` succeeds for a
+    /// conversation (JSONL stamped with current_version) but
+    /// `mark_stale_index_ingest_structured_retry_attempted`'s `state.save()`
+    /// fails (leaving the structured record at `cass_version_at_quarantine =
+    /// None`), the next call to `stale_index_ingest_quarantine_version_retry`
+    /// must NOT signal a retry for that conversation even though the structured
+    /// record still looks legacy.  Without the `already_current_keys` guard
+    /// added to `StalePoisonVersionAccumulator`, the structured `None`
+    /// observation would win and trigger a full scan on every subsequent run —
+    /// an unbounded storm.
+    #[test]
+    fn cross_surface_current_version_suppresses_legacy_structured_entry() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        let conv = norm_conv(
+            Some("cross-surface-storm-guard"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        let conversation_id = poison_conversation_id(&conv);
+        let current = current_cass_version();
+        let schema_version = crate::storage::sqlite::CURRENT_SCHEMA_VERSION;
+
+        // JSONL: already stamped with current_version (mark succeeded here)
+        let jsonl_path = quarantine_dir.join(INDEX_INGEST_POISON_FILE);
+        std::fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "conversation_id": &conversation_id,
+                    "schema_version_at_quarantine": schema_version,
+                    "reason": "index-ingest-out-of-memory",
+                    "cass_version_at_quarantine": current  // already marked
+                })
+            ),
+        )
+        .context("write JSONL fixture with current version")?;
+
+        // Structured: still None (save failed during mark — the bug scenario)
+        let schema_version_u32 =
+            u32::try_from(schema_version).context("schema_version fits in u32")?;
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new(&conversation_id, schema_version_u32),
+            "index-ingest-out-of-memory: out of memory",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .context("valid quarantine timestamp")?,
+        );
+        state
+            .entries
+            .values_mut()
+            .next()
+            .context("structured record exists")?
+            .cass_version_at_quarantine = None; // simulate save failure leaving None
+        state
+            .save(&data_dir)
+            .context("persist structured fixture")?;
+
+        // Before the fix: this would return Some(retry) because the structured
+        // None observation wins over the JSONL current-version observation.
+        // After the fix: the JSONL current-version observation sets
+        // already_current_keys, suppressing the structured None observation.
+        let retry = stale_index_ingest_quarantine_version_retry(&data_dir)
+            .context("version retry check")?;
+        assert!(
+            retry.is_none(),
+            "a conversation already marked current in JSONL must not trigger a retry \
+             even if its structured record still has cass_version_at_quarantine=None \
+             (cass#261 cross-surface storm guard)"
         );
         Ok(())
     }

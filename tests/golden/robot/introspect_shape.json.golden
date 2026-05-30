@@ -3205,6 +3205,14 @@
                             }
                           }
                         },
+                        "stalled": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "activity_at": {
                           "type": "object",
                           "properties": {
@@ -3498,6 +3506,22 @@
                           }
                         },
                         "feature_compiled_in": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "quality_tier_published": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "semantic_only_search_available": {
                           "type": "object",
                           "properties": {
                             "type": {
@@ -46272,6 +46296,22 @@
                             }
                           }
                         },
+                        "quality_tier_published": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "semantic_only_search_available": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "hint": {
                           "type": "object",
                           "properties": {
@@ -52351,6 +52391,14 @@
                                     }
                                   }
                                 },
+                                "stalled": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
                                 "activity_at": {
                                   "type": "object",
                                   "properties": {
@@ -52718,6 +52766,36 @@
                                     }
                                   }
                                 },
+                                "stalled": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "last_progress_at": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "last_progress_age_ms": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "started_at": {
                                   "type": "object",
                                   "properties": {
@@ -52920,6 +52998,22 @@
                                   }
                                 },
                                 "feature_compiled_in": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "quality_tier_published": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "semantic_only_search_available": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
@@ -57340,6 +57434,14 @@
                                             }
                                           }
                                         },
+                                        "stalled": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
                                         "activity_at": {
                                           "type": "object",
                                           "properties": {
@@ -57707,6 +57809,36 @@
                                             }
                                           }
                                         },
+                                        "stalled": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "last_progress_at": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "last_progress_age_ms": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
                                         "started_at": {
                                           "type": "object",
                                           "properties": {
@@ -57909,6 +58041,22 @@
                                           }
                                         },
                                         "feature_compiled_in": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "quality_tier_published": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "semantic_only_search_available": {
                                           "type": "object",
                                           "properties": {
                                             "type": {
@@ -59256,6 +59404,14 @@
                             }
                           }
                         },
+                        "stalled": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "activity_at": {
                           "type": "object",
                           "properties": {
@@ -59621,6 +59777,36 @@
                           }
                         },
                         "phase": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "stalled": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "last_progress_at": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "last_progress_age_ms": {
                           "type": "object",
                           "properties": {
                             "type": {
@@ -60090,6 +60276,22 @@
                           }
                         },
                         "feature_compiled_in": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "quality_tier_published": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "semantic_only_search_available": {
                           "type": "object",
                           "properties": {
                             "type": {
@@ -63071,6 +63273,14 @@
                             }
                           }
                         },
+                        "stalled": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "activity_at": {
                           "type": "object",
                           "properties": {
@@ -63436,6 +63646,36 @@
                           }
                         },
                         "phase": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "stalled": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "last_progress_at": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "last_progress_age_ms": {
                           "type": "object",
                           "properties": {
                             "type": {
@@ -63905,6 +64145,22 @@
                           }
                         },
                         "feature_compiled_in": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "quality_tier_published": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "semantic_only_search_available": {
                           "type": "object",
                           "properties": {
                             "type": {
@@ -66618,6 +66874,14 @@
                                     }
                                   }
                                 },
+                                "stalled": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
                                 "activity_at": {
                                   "type": "object",
                                   "properties": {
@@ -66975,6 +67239,36 @@
                                   }
                                 },
                                 "phase": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "stalled": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "last_progress_at": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "last_progress_age_ms": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
@@ -67444,6 +67738,22 @@
                                   }
                                 },
                                 "feature_compiled_in": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "quality_tier_published": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "semantic_only_search_available": {
                                   "type": "object",
                                   "properties": {
                                     "type": {

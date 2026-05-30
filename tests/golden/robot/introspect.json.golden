@@ -4086,6 +4086,9 @@
             "rebuilding": {
               "type": "boolean"
             },
+            "stalled": {
+              "type": "boolean"
+            },
             "activity_at": {
               "type": [
                 "string",
@@ -4225,6 +4228,12 @@
               "type": "boolean"
             },
             "feature_compiled_in": {
+              "type": "boolean"
+            },
+            "quality_tier_published": {
+              "type": "boolean"
+            },
+            "semantic_only_search_available": {
               "type": "boolean"
             },
             "hint": {
@@ -24256,6 +24265,12 @@
             "feature_compiled_in": {
               "type": "boolean"
             },
+            "quality_tier_published": {
+              "type": "boolean"
+            },
+            "semantic_only_search_available": {
+              "type": "boolean"
+            },
             "hint": {
               "type": [
                 "string",
@@ -27196,6 +27211,9 @@
                 "rebuilding": {
                   "type": "boolean"
                 },
+                "stalled": {
+                  "type": "boolean"
+                },
                 "activity_at": {
                   "type": [
                     "string",
@@ -27368,6 +27386,21 @@
                     "null"
                   ]
                 },
+                "stalled": {
+                  "type": "boolean"
+                },
+                "last_progress_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_progress_age_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "started_at": {
                   "type": [
                     "string",
@@ -27463,6 +27496,12 @@
                   "type": "boolean"
                 },
                 "feature_compiled_in": {
+                  "type": "boolean"
+                },
+                "quality_tier_published": {
+                  "type": "boolean"
+                },
+                "semantic_only_search_available": {
                   "type": "boolean"
                 },
                 "hint": {
@@ -29358,6 +29397,9 @@
                     "rebuilding": {
                       "type": "boolean"
                     },
+                    "stalled": {
+                      "type": "boolean"
+                    },
                     "activity_at": {
                       "type": [
                         "string",
@@ -29530,6 +29572,21 @@
                         "null"
                       ]
                     },
+                    "stalled": {
+                      "type": "boolean"
+                    },
+                    "last_progress_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "last_progress_age_ms": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
                     "started_at": {
                       "type": [
                         "string",
@@ -29625,6 +29682,12 @@
                       "type": "boolean"
                     },
                     "feature_compiled_in": {
+                      "type": "boolean"
+                    },
+                    "quality_tier_published": {
+                      "type": "boolean"
+                    },
+                    "semantic_only_search_available": {
                       "type": "boolean"
                     },
                     "hint": {
@@ -30244,6 +30307,9 @@
             "rebuilding": {
               "type": "boolean"
             },
+            "stalled": {
+              "type": "boolean"
+            },
             "activity_at": {
               "type": [
                 "string",
@@ -30416,6 +30482,21 @@
             "phase": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "stalled": {
+              "type": "boolean"
+            },
+            "last_progress_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_progress_age_ms": {
+              "type": [
+                "integer",
                 "null"
               ]
             },
@@ -30648,6 +30729,12 @@
               "type": "boolean"
             },
             "feature_compiled_in": {
+              "type": "boolean"
+            },
+            "quality_tier_published": {
+              "type": "boolean"
+            },
+            "semantic_only_search_available": {
               "type": "boolean"
             },
             "hint": {
@@ -32026,6 +32113,9 @@
             "rebuilding": {
               "type": "boolean"
             },
+            "stalled": {
+              "type": "boolean"
+            },
             "activity_at": {
               "type": [
                 "string",
@@ -32198,6 +32288,21 @@
             "phase": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "stalled": {
+              "type": "boolean"
+            },
+            "last_progress_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_progress_age_ms": {
+              "type": [
+                "integer",
                 "null"
               ]
             },
@@ -32430,6 +32535,12 @@
               "type": "boolean"
             },
             "feature_compiled_in": {
+              "type": "boolean"
+            },
+            "quality_tier_published": {
+              "type": "boolean"
+            },
+            "semantic_only_search_available": {
               "type": "boolean"
             },
             "hint": {
@@ -33697,6 +33808,9 @@
                 "rebuilding": {
                   "type": "boolean"
                 },
+                "stalled": {
+                  "type": "boolean"
+                },
                 "activity_at": {
                   "type": [
                     "string",
@@ -33866,6 +33980,21 @@
                 "phase": {
                   "type": [
                     "string",
+                    "null"
+                  ]
+                },
+                "stalled": {
+                  "type": "boolean"
+                },
+                "last_progress_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_progress_age_ms": {
+                  "type": [
+                    "integer",
                     "null"
                   ]
                 },
@@ -34098,6 +34227,12 @@
                   "type": "boolean"
                 },
                 "feature_compiled_in": {
+                  "type": "boolean"
+                },
+                "quality_tier_published": {
+                  "type": "boolean"
+                },
+                "semantic_only_search_available": {
                   "type": "boolean"
                 },
                 "hint": {
