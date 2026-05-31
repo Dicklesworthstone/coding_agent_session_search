@@ -10576,6 +10576,35 @@ fn active_session_source_skip_observed() -> bool {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.load(Ordering::Relaxed)
 }
 
+fn connector_scan_since_ts(connector_name: &str, default_since_ts: Option<i64>) -> Option<i64> {
+    if connector_name == "factory" {
+        None
+    } else {
+        default_since_ts
+    }
+}
+
+#[cfg(test)]
+mod connector_scan_since_tests {
+    use super::connector_scan_since_ts;
+
+    #[test]
+    fn factory_connector_uses_full_scan_to_avoid_watermark_blind_spots() {
+        assert_eq!(
+            connector_scan_since_ts("factory", Some(1_780_000_000_000)),
+            None
+        );
+    }
+
+    #[test]
+    fn other_connectors_keep_incremental_watermark() {
+        assert_eq!(
+            connector_scan_since_ts("codex", Some(1_780_000_000_000)),
+            Some(1_780_000_000_000)
+        );
+    }
+}
+
 fn scan_watermark_preservation_active() -> bool {
     scan_path_exclusions_active() || active_session_source_skip_observed()
 }
@@ -10641,6 +10670,7 @@ fn spawn_connector_producer(
         let detect = conn.detect();
         let was_detected = detect.detected;
         let mut is_discovered = false;
+        let connector_since_ts = connector_scan_since_ts(name, config.since_ts);
 
         if detect.detected {
             // Update discovered agents count immediately when detected
@@ -10652,7 +10682,7 @@ fn spawn_connector_producer(
             // Scan local sources
             let ctx = crate::connectors::ScanContext::local_default(
                 config.data_dir.clone(),
-                config.since_ts,
+                connector_since_ts,
             );
             let local_origin = Origin::local();
             let mut batch_sender =
@@ -10669,7 +10699,7 @@ fn spawn_connector_producer(
                 &config.data_dir,
                 name,
                 &fallback_roots,
-                config.since_ts,
+                connector_since_ts,
                 config.active_source_filter.as_ref(),
             );
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
@@ -10729,7 +10759,7 @@ fn spawn_connector_producer(
             let ctx = crate::connectors::ScanContext::with_roots(
                 root.path.clone(),
                 vec![root.clone()],
-                config.since_ts,
+                connector_since_ts,
             );
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
@@ -10739,7 +10769,7 @@ fn spawn_connector_producer(
                 &config.data_dir,
                 name,
                 std::slice::from_ref(root),
-                config.since_ts,
+                connector_since_ts,
                 config.active_source_filter.as_ref(),
             );
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
@@ -11543,6 +11573,7 @@ fn run_batch_index_with_connector_factories(
                 let was_detected = detect.detected;
                 let mut convs = Vec::new();
                 let mut is_discovered = false;
+                let connector_since_ts = connector_scan_since_ts(name, since_ts);
 
                 if detect.detected {
                     // Update discovered agents count immediately when detected
@@ -11553,8 +11584,10 @@ fn run_batch_index_with_connector_factories(
                     }
                     is_discovered = true;
 
-                    let ctx =
-                        crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
+                    let ctx = crate::connectors::ScanContext::local_default(
+                        data_dir.clone(),
+                        connector_since_ts,
+                    );
                     let fallback_roots: Vec<ScanRoot> = detect
                         .root_paths
                         .iter()
@@ -11567,7 +11600,7 @@ fn run_batch_index_with_connector_factories(
                         &data_dir,
                         name,
                         &fallback_roots,
-                        since_ts,
+                        connector_since_ts,
                         active_source_filter.as_ref(),
                     );
                     match conn.scan(&ctx) {
@@ -11599,7 +11632,7 @@ fn run_batch_index_with_connector_factories(
                         let ctx = crate::connectors::ScanContext::with_roots(
                             root.path.clone(),
                             vec![root.clone()],
-                            since_ts,
+                            connector_since_ts,
                         );
                         capture_connector_sources_before_parse(
                             conn.as_ref(),
@@ -11607,7 +11640,7 @@ fn run_batch_index_with_connector_factories(
                             &data_dir,
                             name,
                             std::slice::from_ref(root),
-                            since_ts,
+                            connector_since_ts,
                             active_source_filter.as_ref(),
                         );
                         match conn.scan(&ctx) {
