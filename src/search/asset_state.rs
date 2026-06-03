@@ -3167,6 +3167,7 @@ mod tests {
                 chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
                 saved_at_ms: 1_733_100_300_000,
                 last_message_id: None,
+                cursor_exhausted: false,
             }),
             ..Default::default()
         };

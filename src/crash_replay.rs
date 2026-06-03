@@ -717,6 +717,7 @@ mod tests {
             chunking_version: CHUNKING_STRATEGY_VERSION,
             saved_at_ms: 1_700_000_000_000,
             last_message_id: None,
+            cursor_exhausted: false,
         }
     }
 

@@ -65,6 +65,18 @@ fn seed_canonical_db(db_path: &Path) -> TestResult {
     Ok(())
 }
 
+fn seed_zero_doc_first_canonical_db(db_path: &Path) -> TestResult {
+    let storage = FrankenStorage::open(db_path)?;
+    let agent_id = storage.ensure_agent(&sample_agent())?;
+    storage.insert_conversation_tree(agent_id, None, &sample_conversation("empty-first", ""))?;
+    storage.insert_conversation_tree(
+        agent_id,
+        None,
+        &sample_conversation("nonempty-second", "second robot semantic backfill message"),
+    )?;
+    Ok(())
+}
+
 fn run_robot_backfill(data_dir: &Path, db_path: &Path) -> TestResult<Value> {
     let output = cargo_bin_cmd!("cass")
         .args([
@@ -455,6 +467,59 @@ fn robot_models_backfill_checkpoints_then_publishes_fast_tier() -> TestResult {
     );
     assert_eq!(manifest.backlog.total_conversations, 2);
     assert_eq!(manifest.backlog.fast_tier_processed, 2);
+
+    Ok(())
+}
+
+#[test]
+fn robot_models_backfill_zero_doc_batch_still_reports_checkpointed() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let data_dir = temp.path().join("cass-data");
+    let db_path = temp.path().join("agent_search.db");
+    seed_zero_doc_first_canonical_db(&db_path)?;
+
+    let first = run_robot_backfill(&data_dir, &db_path)?;
+    assert_eq!(first["status"], "checkpointed");
+    assert_eq!(
+        first["next_step"],
+        "rerun the same command to continue the resumable backfill"
+    );
+    assert_eq!(first["embedded_docs"], 0);
+    assert_eq!(first["conversations_processed"], 1);
+    assert_eq!(first["total_conversations"], 2);
+    assert_eq!(first["checkpoint_saved"], true);
+    assert_eq!(first["published"], false);
+    let progress_pct = first
+        .get("progress_pct")
+        .and_then(Value::as_f64)
+        .ok_or("progress_pct should be numeric")?;
+    assert!((progress_pct - 50.0).abs() < f64::EPSILON);
+
+    let manifest = SemanticManifest::load(&data_dir)?.ok_or("semantic manifest should exist")?;
+    let checkpoint = manifest.checkpoint.ok_or("checkpoint should remain")?;
+    assert_eq!(checkpoint.docs_embedded, 0);
+    assert_eq!(checkpoint.conversations_processed, 1);
+    assert!(!checkpoint.cursor_exhausted);
+
+    let second = run_robot_backfill(&data_dir, &db_path)?;
+    assert_eq!(second["status"], "published");
+    assert_eq!(second["next_step"], "semantic tier is ready");
+    assert_eq!(second["embedded_docs"], 1);
+    assert_eq!(second["conversations_processed"], 2);
+    assert_eq!(second["total_conversations"], 2);
+    assert_eq!(second["checkpoint_saved"], false);
+    assert_eq!(second["published"], true);
+
+    let manifest = SemanticManifest::load(&data_dir)?.ok_or("semantic manifest should exist")?;
+    assert!(manifest.checkpoint.is_none());
+    assert_eq!(
+        manifest.fast_tier.as_ref().map(|artifact| (
+            artifact.ready,
+            artifact.conversation_count,
+            artifact.doc_count
+        )),
+        Some((true, 2, 1))
+    );
 
     Ok(())
 }

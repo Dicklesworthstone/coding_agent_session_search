@@ -50,10 +50,11 @@ use super::policy::{
 ///   carry `last_message_id`, an inclusive canonical message PK
 ///   advanced by every batch. Resume strictly skips messages ≤ this
 ///   cursor so an interrupted bounded run never re-embeds work it
-///   already staged. The new field is `Option<i64>` with
-///   `#[serde(default)]`, so the JSON-on-disk shape only differs when
-///   at least one batch persisted the cursor — a freshly-created
-///   manifest still parses cleanly under v1 readers.
+///   already staged. Later v2 checkpoints may also carry
+///   `cursor_exhausted`, which separates durable completion from
+///   count-based progress. Both fields use `#[serde(default)]`; the
+///   JSON-on-disk shape only differs when a batch persists the cursor
+///   metadata, and older v2 readers ignore the extra field.
 ///
 /// **Compatibility:**
 /// - **Old binary reading v2 manifest:** clean `UnsupportedVersion`
@@ -630,6 +631,18 @@ pub struct BuildCheckpoint {
     /// strictly resumes past this cursor when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message_id: Option<i64>,
+    /// Whether the canonical selection cursor proved there are no more
+    /// eligible conversations after this checkpoint.
+    ///
+    /// This is distinct from count-based progress: checkpoint caps and
+    /// cursor predicates can leave more work even when processed counts
+    /// appear to have reached the DB total snapshot.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cursor_exhausted: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl BuildCheckpoint {
@@ -639,12 +652,17 @@ impl BuildCheckpoint {
             return 0;
         }
         let pct = (self.conversations_processed as f64 / self.total_conversations as f64) * 100.0;
-        (pct as u8).min(100)
+        let pct = (pct as u8).min(100);
+        if pct == 100 && !self.cursor_exhausted {
+            99
+        } else {
+            pct
+        }
     }
 
     /// Whether the build is complete (all conversations processed).
     pub fn is_complete(&self) -> bool {
-        self.conversations_processed >= self.total_conversations
+        self.cursor_exhausted && self.conversations_processed >= self.total_conversations
     }
 
     /// Whether this checkpoint is still valid against the current DB and policy.
@@ -1397,6 +1415,7 @@ mod tests {
             chunking_version: CHUNKING_STRATEGY_VERSION,
             saved_at_ms: 1_700_000_030_000,
             last_message_id: None,
+            cursor_exhausted: false,
         }
     }
 
@@ -1805,7 +1824,7 @@ mod tests {
     // ── Build checkpoint ───────────────────────────────────────────────
 
     #[test]
-    fn checkpoint_progress_and_completion() {
+    fn checkpoint_progress_and_completion() -> Result<(), String> {
         let cp = test_checkpoint(TierKind::Quality);
         assert_eq!(cp.progress_pct(), 50);
         assert!(!cp.is_complete());
@@ -1815,8 +1834,14 @@ mod tests {
         // Complete checkpoint
         let mut cp = test_checkpoint(TierKind::Quality);
         cp.conversations_processed = 1000;
+        assert_eq!(cp.progress_pct(), 99);
+        if cp.is_complete() {
+            return Err("count parity alone should not complete a checkpoint".to_string());
+        }
+        cp.cursor_exhausted = true;
         assert_eq!(cp.progress_pct(), 100);
         assert!(cp.is_complete());
+        Ok(())
     }
 
     #[test]

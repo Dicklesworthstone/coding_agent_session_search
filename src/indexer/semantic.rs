@@ -172,6 +172,7 @@ pub struct SemanticBackfillBatchPlan {
     pub total_conversations: u64,
     pub conversations_in_batch: u64,
     pub last_offset: i64,
+    pub cursor_exhausted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +195,22 @@ pub struct SemanticBackfillBatchOutcome {
     pub published: bool,
     pub index_path: PathBuf,
     pub manifest_path: PathBuf,
+}
+
+impl SemanticBackfillBatchOutcome {
+    pub fn progress_pct(&self) -> f64 {
+        if self.total_conversations == 0 {
+            return if self.published { 100.0 } else { 0.0 };
+        }
+
+        let pct = (self.conversations_processed as f64 / self.total_conversations as f64) * 100.0;
+        let pct = pct.min(100.0);
+        if pct >= 100.0 && !self.published {
+            99.0
+        } else {
+            pct
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -580,6 +597,7 @@ struct CanonicalEmbeddingBatch {
     conversations_in_batch: u64,
     last_conversation_id: i64,
     total_conversations: u64,
+    cursor_exhausted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -981,10 +999,12 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     caps: SemanticCheckpointCaps,
 ) -> Result<CanonicalEmbeddingBatch> {
     let total_conversations = total_semantic_conversations(storage)?;
-    let max_conversations_i64 = i64::try_from(max_conversations.max(1)).unwrap_or(i64::MAX);
+    let max_conversations = max_conversations.max(1);
+    let query_limit = max_conversations.saturating_add(1);
+    let query_limit_i64 = i64::try_from(query_limit).unwrap_or(i64::MAX);
     let mut params = vec![
         ParamValue::from(after_conversation_id),
-        ParamValue::from(max_conversations_i64),
+        ParamValue::from(query_limit_i64),
     ];
     let message_cursor_predicate = if let Some(after_message_id) = after_message_id {
         params.push(ParamValue::from(after_message_id));
@@ -1018,7 +1038,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
          ORDER BY c.id ASC
          LIMIT ?2"
     );
-    let conversation_ids: Vec<i64> = storage
+    let mut conversation_ids: Vec<i64> = storage
         .raw()
         .query_map_collect(&hinted_sql, &params, |row| row.get_typed(0))
         .or_else(|err| {
@@ -1042,14 +1062,24 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
             conversations_in_batch: 0,
             last_conversation_id: after_conversation_id,
             total_conversations,
+            cursor_exhausted: true,
         });
+    }
+
+    let has_more_from_sql_limit = conversation_ids.len() > max_conversations;
+    if has_more_from_sql_limit {
+        conversation_ids.truncate(max_conversations);
     }
 
     let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
 
     let mut grouped_messages =
         storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
-    let (conversations, capped_last_conversation_id) = select_checkpoint_capped_conversations(
+    let CheckpointCappedSelection {
+        conversations,
+        last_conversation_id,
+        stopped_before_candidate,
+    } = select_checkpoint_capped_conversations(
         conversations,
         &mut grouped_messages,
         after_message_id,
@@ -1062,8 +1092,10 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     );
 
     let conversations_in_batch = u64::try_from(conversations.len()).unwrap_or(u64::MAX);
+    let cursor_exhausted = !has_more_from_sql_limit && !stopped_before_candidate;
     tracing::debug!(
         conversations_in_batch,
+        cursor_exhausted,
         packet_driven = true,
         semantic_inputs = inputs.len(),
         max_messages_per_checkpoint = caps.max_messages,
@@ -1075,9 +1107,16 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     Ok(CanonicalEmbeddingBatch {
         inputs,
         conversations_in_batch,
-        last_conversation_id: capped_last_conversation_id.unwrap_or(after_conversation_id),
+        last_conversation_id: last_conversation_id.unwrap_or(after_conversation_id),
         total_conversations,
+        cursor_exhausted,
     })
+}
+
+struct CheckpointCappedSelection {
+    conversations: Vec<CanonicalEmbeddingConversationRow>,
+    last_conversation_id: Option<i64>,
+    stopped_before_candidate: bool,
 }
 
 fn select_checkpoint_capped_conversations(
@@ -1085,11 +1124,12 @@ fn select_checkpoint_capped_conversations(
     grouped_messages: &mut HashMap<i64, Vec<Message>>,
     after_message_id: Option<i64>,
     caps: SemanticCheckpointCaps,
-) -> (Vec<CanonicalEmbeddingConversationRow>, Option<i64>) {
+) -> CheckpointCappedSelection {
     let mut selected = Vec::new();
     let mut selected_messages = 0usize;
     let mut selected_bytes = 0u64;
     let mut last_conversation_id = None;
+    let mut stopped_before_candidate = false;
 
     for conversation in conversations {
         let mut messages = grouped_messages
@@ -1114,6 +1154,7 @@ fn select_checkpoint_capped_conversations(
             && !selected.is_empty()
             && selected_bytes.saturating_add(byte_count) > caps.max_bytes;
         if would_exceed_messages || would_exceed_bytes {
+            stopped_before_candidate = true;
             tracing::debug!(
                 conversation_id = conversation.conversation_id,
                 selected_conversations = selected.len(),
@@ -1135,7 +1176,11 @@ fn select_checkpoint_capped_conversations(
         selected.push(conversation);
     }
 
-    (selected, last_conversation_id)
+    CheckpointCappedSelection {
+        conversations: selected,
+        last_conversation_id,
+        stopped_before_candidate,
+    }
 }
 
 pub(crate) fn packet_embedding_inputs_from_storage(
@@ -2059,10 +2104,14 @@ impl SemanticIndexer {
                 },
             );
         }
-        let conversations_processed = prior_conversations
-            .saturating_add(plan.conversations_in_batch)
-            .min(plan.total_conversations);
-        let complete = conversations_processed >= plan.total_conversations;
+        let counted_conversations_processed =
+            prior_conversations.saturating_add(plan.conversations_in_batch);
+        let conversations_processed = if plan.cursor_exhausted {
+            plan.total_conversations
+        } else {
+            counted_conversations_processed.min(plan.total_conversations)
+        };
+        let complete = plan.cursor_exhausted;
 
         manifest.refresh_backlog(plan.total_conversations, &plan.db_fingerprint);
 
@@ -2174,6 +2223,7 @@ impl SemanticIndexer {
                 chunking_version: CHUNKING_STRATEGY_VERSION,
                 saved_at_ms: now_ms(),
                 last_message_id: last_message_id.or(prior_last_message_id),
+                cursor_exhausted: plan.cursor_exhausted,
             });
             manifest.save(data_dir)?;
             if sink.is_active() {
@@ -2401,6 +2451,7 @@ impl SemanticIndexer {
                 total_conversations: batch.total_conversations,
                 conversations_in_batch: batch.conversations_in_batch,
                 last_offset: batch.last_conversation_id,
+                cursor_exhausted: batch.cursor_exhausted,
             },
             next_last_message_id,
             sink,
@@ -3206,6 +3257,7 @@ mod tests {
                     total_conversations: 2,
                     conversations_in_batch: 1,
                     last_offset: 1,
+                    cursor_exhausted: false,
                 },
             )
             .unwrap();
@@ -3220,6 +3272,107 @@ mod tests {
         assert_eq!(checkpoint.docs_embedded, 2);
         assert_eq!(manifest.backlog.total_conversations, 2);
         assert!(SemanticManifest::path(temp.path()).exists());
+    }
+
+    #[test]
+    fn backfill_batch_does_not_publish_until_cursor_exhausted() -> Result<()> {
+        let temp = tempdir()?;
+        let mut manifest = SemanticManifest::default();
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let db_fingerprint = "db-fp-backfill-cursor-not-exhausted";
+
+        let first = vec![EmbeddingInput::new(30, "first cursor batch")];
+        let first_outcome = indexer.run_backfill_batch(
+            &first,
+            temp.path(),
+            &mut manifest,
+            SemanticBackfillBatchPlan {
+                tier: TierKind::Fast,
+                db_fingerprint: db_fingerprint.to_string(),
+                model_revision: "hash".to_string(),
+                total_conversations: 2,
+                conversations_in_batch: 1,
+                last_offset: 1,
+                cursor_exhausted: false,
+            },
+        )?;
+        anyhow::ensure!(!first_outcome.published, "first batch must not publish");
+        anyhow::ensure!(
+            first_outcome.checkpoint_saved,
+            "first batch should save a checkpoint"
+        );
+
+        let second = vec![EmbeddingInput::new(31, "second cursor batch")];
+        let second_outcome = indexer.run_backfill_batch(
+            &second,
+            temp.path(),
+            &mut manifest,
+            SemanticBackfillBatchPlan {
+                tier: TierKind::Fast,
+                db_fingerprint: db_fingerprint.to_string(),
+                model_revision: "hash".to_string(),
+                total_conversations: 2,
+                conversations_in_batch: 1,
+                last_offset: 2,
+                cursor_exhausted: false,
+            },
+        )?;
+
+        anyhow::ensure!(
+            !second_outcome.published,
+            "count-based completion would publish here; cursor state must win"
+        );
+        anyhow::ensure!(
+            second_outcome.checkpoint_saved,
+            "second batch should save a checkpoint"
+        );
+        anyhow::ensure!(
+            !vector_index_path(temp.path(), indexer.embedder_id()).exists(),
+            "non-exhausted cursor must not publish the final vector index"
+        );
+        let Some(checkpoint) = manifest.checkpoint.as_ref() else {
+            bail!("checkpoint should remain after a non-exhausted cursor");
+        };
+        anyhow::ensure!(
+            checkpoint.conversations_processed == 2,
+            "wanted 2 processed conversations, got {}",
+            checkpoint.conversations_processed
+        );
+        anyhow::ensure!(
+            checkpoint.total_conversations == 2,
+            "checkpoint should preserve the real DB total, got {}",
+            checkpoint.total_conversations
+        );
+        anyhow::ensure!(
+            !checkpoint.cursor_exhausted,
+            "saved checkpoint should preserve the non-exhausted cursor state"
+        );
+        anyhow::ensure!(
+            !checkpoint.is_complete(),
+            "non-exhausted cursor checkpoint must not be complete"
+        );
+        anyhow::ensure!(
+            checkpoint.progress_pct() == 99,
+            "non-exhausted cursor checkpoint should report 99% progress, got {}",
+            checkpoint.progress_pct()
+        );
+        anyhow::ensure!(
+            second_outcome.conversations_processed == 2,
+            "wanted outcome to report 2 processed conversations, got {}",
+            second_outcome.conversations_processed
+        );
+        anyhow::ensure!(
+            second_outcome.total_conversations == 2,
+            "wanted outcome to preserve total 2, got {}",
+            second_outcome.total_conversations
+        );
+        let progress_pct = second_outcome.progress_pct();
+        anyhow::ensure!(
+            (progress_pct - 99.0).abs() < f64::EPSILON,
+            "non-published outcome should cap progress below 100%, got {}",
+            progress_pct
+        );
+        Ok(())
     }
 
     #[test]
@@ -3248,6 +3401,7 @@ mod tests {
                     total_conversations: 2,
                     conversations_in_batch: 1,
                     last_offset: 1,
+                    cursor_exhausted: false,
                 },
             )
             .unwrap();
@@ -3267,12 +3421,14 @@ mod tests {
                     total_conversations: 2,
                     conversations_in_batch: 1,
                     last_offset: 2,
+                    cursor_exhausted: true,
                 },
             )
             .unwrap();
 
         assert!(second_outcome.published);
         assert!(!second_outcome.checkpoint_saved);
+        assert!((second_outcome.progress_pct() - 100.0).abs() < f64::EPSILON);
         assert!(!staging_path.exists());
         let final_path = vector_index_path(temp.path(), indexer.embedder_id());
         assert_eq!(second_outcome.index_path, final_path);
@@ -3311,6 +3467,7 @@ mod tests {
                     total_conversations: 2,
                     conversations_in_batch: 1,
                     last_offset: 1,
+                    cursor_exhausted: false,
                 },
             )
             .unwrap();
@@ -3329,6 +3486,7 @@ mod tests {
                     total_conversations: 2,
                     conversations_in_batch: 1,
                     last_offset: 2,
+                    cursor_exhausted: true,
                 },
             )
             .unwrap();
@@ -3516,11 +3674,63 @@ mod tests {
             "last_message_id must be pushed into candidate selection so old conversations are not counted in the batch"
         );
         assert_eq!(batch.total_conversations, 2);
+        anyhow::ensure!(
+            batch.cursor_exhausted,
+            "message-cursor selection should exhaust the remaining cursor"
+        );
         assert_eq!(batch.inputs.len(), 1);
         assert_eq!(batch.inputs[0].content, "new semantic message");
         assert!(
             i64::try_from(batch.inputs[0].message_id).unwrap_or(i64::MAX) > watermark,
             "selected semantic input must be strictly newer than the checkpoint message id"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_embedding_batch_reports_unexhausted_cursor_at_sql_limit() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("limit-first", "first limit semantic message"),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("limit-second", "second limit semantic message"),
+        )?;
+
+        let first = fetch_canonical_embedding_batch_inner(&storage, 0, 1, None)?;
+        anyhow::ensure!(
+            first.conversations_in_batch == 1,
+            "wanted first batch to select 1 conversation, got {}",
+            first.conversations_in_batch
+        );
+        anyhow::ensure!(
+            !first.cursor_exhausted,
+            "over-fetching one candidate should prove another conversation remains"
+        );
+
+        let second =
+            fetch_canonical_embedding_batch_inner(&storage, first.last_conversation_id, 1, None)?;
+        anyhow::ensure!(
+            second.conversations_in_batch == 1,
+            "wanted second batch to select 1 conversation, got {}",
+            second.conversations_in_batch
+        );
+        anyhow::ensure!(
+            second.cursor_exhausted,
+            "the final page should report cursor exhaustion even when it exactly fills the requested limit"
         );
         Ok(())
     }
@@ -3586,6 +3796,10 @@ mod tests {
         )?;
 
         assert_eq!(batch.conversations_in_batch, 1);
+        anyhow::ensure!(
+            !batch.cursor_exhausted,
+            "checkpoint caps that stop before the next whole conversation must not publish"
+        );
         assert_eq!(batch.last_conversation_id, first_conversation_id);
         assert_eq!(batch.inputs.len(), 2);
         assert!(

@@ -90048,24 +90048,20 @@ fn run_models_backfill(
             retryable: true,
         })?;
 
-    let progress_pct = if outcome.total_conversations == 0 {
-        100.0
-    } else {
-        (outcome.conversations_processed as f64 / outcome.total_conversations as f64) * 100.0
-    };
+    let progress_pct = outcome.progress_pct();
     let status = if outcome.published {
         "published"
-    } else if outcome.embedded_docs == 0 {
-        "idle"
-    } else {
+    } else if outcome.checkpoint_saved {
         "checkpointed"
+    } else {
+        "idle"
     };
     let next_step = if outcome.published {
         "semantic tier is ready"
-    } else if outcome.embedded_docs == 0 {
-        "no pending canonical conversations for this tier"
-    } else {
+    } else if outcome.checkpoint_saved {
         "rerun the same command to continue the resumable backfill"
+    } else {
+        "no pending canonical conversations for this tier"
     };
     let backlog = serde_json::json!({
         "total_conversations": manifest.backlog.total_conversations,

@@ -240,6 +240,7 @@ fn seed_semantic_progress_fixture(
         chunking_version: CHUNKING_STRATEGY_VERSION,
         saved_at_ms: 1_733_100_300_000,
         last_message_id: None,
+        cursor_exhausted: false,
     });
     manifest.save(data_dir).expect("save semantic manifest");
 }
