@@ -28,6 +28,16 @@ const UNIX_INSTALL_ASSET: &str = "install.sh";
 const WINDOWS_INSTALL_ASSET: &str = "install.ps1";
 const CHECKSUMS_ASSET: &str = "SHA256SUMS.txt";
 const CHECKSUMS_ASSET_ALT: &str = "SHA256SUMS";
+/// Standalone per-file checksum asset for the unix installer. Always published
+/// alongside the release as a single line `<hash>  install.sh`, so it is a
+/// last-resort fallback when both combined manifests omit the install.sh row
+/// (defense-in-depth for the v0.6.10 self-update regression, issue #274).
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+const UNIX_INSTALL_CHECKSUM_ASSET: &str = "install.sh.sha256";
+/// Standalone per-file checksum asset for the Windows installer. Single line
+/// `<hash>  install.ps1`. Same last-resort fallback role as the unix variant.
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_INSTALL_CHECKSUM_ASSET: &str = "install.ps1.sha256";
 
 fn updates_disabled() -> bool {
     dotenvy::var("CASS_SKIP_UPDATE").is_ok()
@@ -340,7 +350,7 @@ script="$tmp/install.sh"
 sums="$tmp/SHA256SUMS.txt"
 curl -fsSL "$1" -o "$script"
 expected=""
-for checksums_url in "$2" "$4"; do
+for checksums_url in "$2" "$4" "$5"; do
     [ -n "$checksums_url" ] || continue
     if ! curl -fsSL "$checksums_url" -o "$sums"; then
         continue
@@ -394,7 +404,7 @@ try {
     Invoke-WebRequest -Uri $InstallUrl -OutFile $Script -UseBasicParsing
 
     $Expected = $null
-    foreach ($ChecksumsCandidateUrl in @($ChecksumsUrl, $args[3])) {
+    foreach ($ChecksumsCandidateUrl in @($ChecksumsUrl, $args[3], $args[4])) {
         if (-not $ChecksumsCandidateUrl) {
             continue
         }
@@ -451,6 +461,7 @@ pub fn run_self_update(version: &str) -> ! {
         let install_url = release_asset_url(version, UNIX_INSTALL_ASSET);
         let checksums_url = release_asset_url(version, CHECKSUMS_ASSET);
         let checksums_alt_url = release_asset_url(version, CHECKSUMS_ASSET_ALT);
+        let install_checksum_url = release_asset_url(version, UNIX_INSTALL_CHECKSUM_ASSET);
         // Use positional args instead of string interpolation to prevent injection.
         let err = std::process::Command::new("bash")
             .args([
@@ -461,6 +472,7 @@ pub fn run_self_update(version: &str) -> ! {
                 &checksums_url,
                 version,
                 &checksums_alt_url,
+                &install_checksum_url,
             ])
             .exec();
         // If we get here, exec failed
@@ -473,6 +485,7 @@ pub fn run_self_update(version: &str) -> ! {
         let install_url = release_asset_url(version, WINDOWS_INSTALL_ASSET);
         let checksums_url = release_asset_url(version, CHECKSUMS_ASSET);
         let checksums_alt_url = release_asset_url(version, CHECKSUMS_ASSET_ALT);
+        let install_checksum_url = release_asset_url(version, WINDOWS_INSTALL_CHECKSUM_ASSET);
         // Windows doesn't have exec(), so we spawn and wait.
         let status = std::process::Command::new("powershell")
             .args([
@@ -485,6 +498,7 @@ pub fn run_self_update(version: &str) -> ! {
                 &checksums_url,
                 version,
                 &checksums_alt_url,
+                &install_checksum_url,
             ])
             .status();
         match status {
@@ -989,8 +1003,8 @@ mod tests {
         let script = unix_self_update_script();
         assert!(script.contains(CHECKSUMS_ASSET));
         assert!(
-            script.contains(r#"for checksums_url in "$2" "$4"; do"#),
-            "Unix self-update should try both checksum manifest URLs"
+            script.contains(r#"for checksums_url in "$2" "$4" "$5"; do"#),
+            "Unix self-update should try both combined manifests then the standalone per-file checksum"
         );
         assert!(script.contains(r#"expected="$candidate""#));
         assert!(script.contains(&format!(r#"$2 == "{UNIX_INSTALL_ASSET}""#)));
@@ -1001,12 +1015,34 @@ mod tests {
     }
 
     #[test]
+    fn test_unix_self_update_threads_standalone_checksum_asset_url() {
+        // The standalone `install.sh.sha256` asset must be wired in as the
+        // final positional arg ($5) so the loop can consult it when both
+        // combined manifests omit the install.sh row (issue #274).
+        let standalone_url = release_asset_url("v1.2.3", UNIX_INSTALL_CHECKSUM_ASSET);
+        assert_eq!(
+            standalone_url,
+            format!(
+                "https://github.com/{GITHUB_REPO}/releases/download/v1.2.3/{UNIX_INSTALL_CHECKSUM_ASSET}"
+            )
+        );
+        assert_eq!(UNIX_INSTALL_CHECKSUM_ASSET, "install.sh.sha256");
+        // The standalone manifest's second field is exactly `install.sh`, so
+        // the existing awk parse works on it unchanged.
+        let script = unix_self_update_script();
+        assert!(script.contains(&format!(r#"$2 == "{UNIX_INSTALL_ASSET}""#)));
+        assert!(script.contains(r#""$2" "$4" "$5""#));
+    }
+
+    #[test]
     fn test_windows_self_update_verifies_installer_script_before_running() {
         let script = windows_self_update_script();
         assert!(script.contains(CHECKSUMS_ASSET));
         assert!(
-            script.contains("foreach ($ChecksumsCandidateUrl in @($ChecksumsUrl, $args[3]))"),
-            "Windows self-update should try both checksum manifest URLs"
+            script.contains(
+                "foreach ($ChecksumsCandidateUrl in @($ChecksumsUrl, $args[3], $args[4]))"
+            ),
+            "Windows self-update should try both combined manifests then the standalone per-file checksum"
         );
         assert!(script.contains("Invoke-WebRequest -Uri $ChecksumsCandidateUrl -OutFile $Sums"));
         assert!(script.contains("if ($Expected)"));
@@ -1014,6 +1050,24 @@ mod tests {
         assert!(script.contains("Get-FileHash"));
         assert!(script.contains("-EasyMode -Verify -Version $Version"));
         assert!(script.contains("Remove-Item -LiteralPath $Temp"));
+    }
+
+    #[test]
+    fn test_windows_self_update_threads_standalone_checksum_asset_url() {
+        // The standalone `install.ps1.sha256` asset must be wired in as the
+        // final positional arg ($args[4]) so the loop can consult it when both
+        // combined manifests omit the install.ps1 row (issue #274).
+        let standalone_url = release_asset_url("v1.2.3", WINDOWS_INSTALL_CHECKSUM_ASSET);
+        assert_eq!(
+            standalone_url,
+            format!(
+                "https://github.com/{GITHUB_REPO}/releases/download/v1.2.3/{WINDOWS_INSTALL_CHECKSUM_ASSET}"
+            )
+        );
+        assert_eq!(WINDOWS_INSTALL_CHECKSUM_ASSET, "install.ps1.sha256");
+        let script = windows_self_update_script();
+        assert!(script.contains(&format!(r#"$Parts[1] -eq "{WINDOWS_INSTALL_ASSET}""#)));
+        assert!(script.contains("@($ChecksumsUrl, $args[3], $args[4])"));
     }
 
     #[test]
