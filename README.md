@@ -2940,7 +2940,7 @@ Update check state is stored in the data directory:
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `0.1.5` (crates.io; #95 fix) |
+| `frankensqlite` / `fsqlite-types` | `0.1.7` (crates.io; #95 + #106 + FTS5 reload fixes) |
 | `franken-agent-detection` | `a4923d4` |
 | `asupersync` | `0.3.2` |
 | `frankensearch` | `2cad158f` |
