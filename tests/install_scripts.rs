@@ -39,6 +39,20 @@ fn install_sh_command(tmp_root: &tempfile::TempDir) -> Command {
     command
 }
 
+#[test]
+fn install_sh_source_fallback_preserves_baseline_feature_flags() {
+    let script = fs::read_to_string("install.sh").expect("read install.sh");
+
+    assert!(
+        script.contains("SOURCE_CARGO_ARGS=(--no-default-features --features \"qr,encryption\")"),
+        "baseline target selection must set ONNX-free source-build flags"
+    );
+    assert!(
+        script.contains("cargo build --release \"${SOURCE_CARGO_ARGS[@]}\""),
+        "source fallback must pass baseline cargo flags through to cargo build"
+    );
+}
+
 fn file_sha256_hex(path: &std::path::Path) -> String {
     let mut file = fs::File::open(path).expect("open file for sha256");
     let mut hasher = Sha256::new();

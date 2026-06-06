@@ -375,12 +375,14 @@ host_has_avx2() {
 TARGET=""
 EXT="tar.gz"
 NO_PREBUILT_REASON=""
+SOURCE_CARGO_ARGS=()
 case "${OS}-${ARCH}" in
   linux-amd64)
     if host_has_avx2; then
       TARGET="linux-amd64"
     else
       TARGET="linux-amd64-baseline"
+      SOURCE_CARGO_ARGS=(--no-default-features --features "qr,encryption")
       info "Detected pre-AVX2 x86_64 CPU; selecting baseline artifact (no ONNX Runtime, semantic search disabled); see cass#256."
     fi
     ;;
@@ -392,6 +394,7 @@ case "${OS}-${ARCH}" in
       TARGET="windows-amd64"
     else
       TARGET="windows-amd64-baseline"
+      SOURCE_CARGO_ARGS=(--no-default-features --features "qr,encryption")
       info "Detected pre-AVX2 x86_64 CPU; selecting baseline artifact (no ONNX Runtime, semantic search disabled); see cass#256."
     fi
     EXT="zip"
@@ -470,7 +473,10 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   info "Building from source (requires git and a working Rust stable toolchain)"
   ensure_rust
   git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
-  (cd "$TMP/src" && cargo build --release)
+  if [ "${#SOURCE_CARGO_ARGS[@]}" -gt 0 ]; then
+    info "Using baseline cargo flags for source build: ${SOURCE_CARGO_ARGS[*]}"
+  fi
+  (cd "$TMP/src" && cargo build --release "${SOURCE_CARGO_ARGS[@]}")
   BIN="$TMP/src/target/release/$INSTALL_BASENAME"
   if [ ! -x "$BIN" ]; then
     BIN="$TMP/src/target/release/cass"
