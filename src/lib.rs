@@ -86927,6 +86927,19 @@ fn run_timeline(
         (start, end)
     };
 
+    // Fail loudly on an inverted range rather than silently returning 0 rows.
+    // A bad relative offset (e.g. a future `--since`) used to compute
+    // start > end and match nothing without explanation (#280).
+    if start_ts > end_ts {
+        return Err(CliError::usage(
+            "--since resolves to a time after --until (empty range)",
+            Some(format!(
+                "Computed window start ({start_ts}ms) is after end ({end_ts}ms). \
+                 Check the --since/--until values; relative offsets like `-7d` mean \"7 days ago\"."
+            )),
+        ));
+    }
+
     // LEFT JOIN + COALESCE on agents so timeline reporting doesn't silently
     // drop legacy conversations with NULL agent_id.  Agent filter becomes
     // an EXISTS guard against the agents table so it works with the
@@ -91115,15 +91128,19 @@ fn parse_datetime_flexible(s: &str) -> Option<i64> {
             local_midnight_ts(yesterday)
         }
         _ => {
+            // Both `7d` and `-7d` mean "7 days ago": a leading '-' is an
+            // offset-direction hint, not a sign to add to `now`. Using the
+            // magnitude (`.abs()`) keeps `--since -7d` in the past instead of
+            // computing `now + 7d` and inverting the timeline range (#280).
             if let Some(days_str) = s.strip_suffix('d')
                 && let Ok(days) = days_str.parse::<i64>()
             {
-                return Some((now - chrono::Duration::days(days)).timestamp_millis());
+                return Some((now - chrono::Duration::days(days.abs())).timestamp_millis());
             }
             if let Some(hours_str) = s.strip_suffix('h')
                 && let Ok(hours) = hours_str.parse::<i64>()
             {
-                return Some((now - chrono::Duration::hours(hours)).timestamp_millis());
+                return Some((now - chrono::Duration::hours(hours.abs())).timestamp_millis());
             }
             None
         }
