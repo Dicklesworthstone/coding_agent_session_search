@@ -50,4 +50,5 @@ pub mod tantivy;
 pub mod two_tier_search;
 pub mod vector_index;
 pub(crate) mod watch_exit_envelope;
+pub(crate) mod watch_recovery;
 pub(crate) mod zero_result_diagnosis;
