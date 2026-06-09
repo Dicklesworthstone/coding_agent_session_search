@@ -38,6 +38,7 @@ pub(crate) mod progress_contract;
 pub mod query;
 pub(crate) mod readiness;
 pub(crate) mod readiness_fixtures;
+pub(crate) mod semantic_readiness;
 pub mod reranker;
 pub mod reranker_registry;
 pub mod runtime_optimizations;
