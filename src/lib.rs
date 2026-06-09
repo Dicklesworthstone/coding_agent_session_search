@@ -35,6 +35,7 @@ pub mod query_cost_planner;
 pub mod raw_mirror;
 pub mod release_verify;
 pub mod resource_plan;
+pub mod robot_budget_envelope;
 pub mod root_cause_taxonomy;
 pub mod search;
 pub mod sources;
