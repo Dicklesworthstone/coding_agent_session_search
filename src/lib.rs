@@ -21,6 +21,7 @@ pub mod explainability;
 pub mod export;
 pub mod fleet_archive_coverage;
 pub mod fleet_doctor_schema;
+pub mod fleet_platform_compat;
 pub mod fleet_version_skew;
 pub mod ftui_harness;
 pub mod html_export;
