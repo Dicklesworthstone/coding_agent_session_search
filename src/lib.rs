@@ -41,6 +41,7 @@ pub mod topology_budget;
 pub mod tui_asciicast;
 pub mod ui;
 pub mod update_check;
+pub mod workflow_analytics;
 
 use anyhow::Result;
 use base64::prelude::*;
@@ -1548,6 +1549,24 @@ pub enum SwarmCommand {
     },
     /// Select the smallest useful bead-scoped context pack under a token budget.
     ContextPack {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Read provider input from a single swarm fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+
+        /// Read provider input from a swarm fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+
+        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
+        #[arg(long, default_value = "healthy")]
+        fixture_id: String,
+    },
+    /// Aggregate workflow outcome analytics (skills, commands, proof gates, closures).
+    WorkflowAnalytics {
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -7651,6 +7670,18 @@ fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
             fixture_dir.as_deref(),
             &fixture_id,
         ),
+        SwarmCommand::WorkflowAnalytics {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+        } => run_swarm_workflow_analytics(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+        ),
     }
 }
 
@@ -8231,6 +8262,66 @@ fn run_swarm_context_pack(
             .and_then(serde_json::Value::as_u64)
         {
             println!("Selected refs: {count}");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_swarm_workflow_analytics(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+) -> CliResult<()> {
+    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
+    {
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
+            |err| CliError {
+                code: 10,
+                kind: CliErrorKind::Config.kind_str(),
+                message: err.to_string(),
+                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
+                retryable: false,
+            },
+        )?;
+        let source = set
+            .input()
+            .source_value(crate::swarm_status::SwarmProviderName::WorkflowAnalytics);
+        crate::workflow_analytics::render_workflow_analytics_fixture(
+            set.input().fixture_id(),
+            source,
+        )
+    } else {
+        crate::workflow_analytics::render_workflow_analytics_live()
+    };
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!(
+            "Swarm workflow analytics: {}",
+            payload
+                .get("summary")
+                .and_then(|summary| summary.get("recommended_action"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        if let Some(count) = payload
+            .get("summary")
+            .and_then(|summary| summary.get("records_in_scope"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("Records in scope: {count}");
         }
     }
 
@@ -17660,6 +17751,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Swarm(SwarmCommand::ContextPack { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Swarm(SwarmCommand::WorkflowAnalytics { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Models(ModelsCommand::Status { json }) => {

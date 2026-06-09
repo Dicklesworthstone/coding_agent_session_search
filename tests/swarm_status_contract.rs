@@ -2953,6 +2953,78 @@ fn swarm_context_pack_tiny_budget_omits_with_accounting() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn swarm_workflow_analytics_windows_filters_and_redacts() -> Result<(), Box<dyn Error>> {
+    let now_ms: i64 = 1_749_456_000_000;
+    let day_ms: i64 = 86_400_000;
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "workflow-analytics-basic",
+        json!({
+            "workflow_analytics": {
+                "now_ms": now_ms,
+                "window_days": 30,
+                "records": [
+                    {"ts_ms": now_ms - day_ms, "agent": "cc", "source": "local", "workspace": "cass",
+                     "skill": "ubs", "command": "cargo clippy", "proof_gate": "clippy",
+                     "file_area": "/home/alice/src/swarm", "outcome": "clean_close", "duration_ms": 1000},
+                    {"ts_ms": now_ms - 2 * day_ms, "agent": "cc", "source": "local", "workspace": "cass",
+                     "skill": "ubs", "command": "cargo clippy", "proof_gate": "clippy",
+                     "file_area": "/home/alice/src/swarm", "outcome": "reopen", "duration_ms": 5000},
+                    {"ts_ms": now_ms - 50 * day_ms, "agent": "cod", "source": "local", "workspace": "cass",
+                     "skill": "rch", "command": "cargo test", "proof_gate": "tests",
+                     "file_area": "/home/bob/src/idx", "outcome": "proof_debt", "duration_ms": 9000}
+                ]
+            }
+        }),
+    )?;
+    let output = render_swarm_workflow_analytics_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.workflow_analytics.v1"),
+        "schema version",
+    )?;
+    // 3 records, 1 outside the 30-day window -> 2 in scope.
+    require_value_eq(
+        get_path(&output, &["summary", "total_records"]),
+        json!(3),
+        "total records",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "records_in_scope"]),
+        json!(2),
+        "records in scope",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    require_value_eq(
+        get_path(&output, &["privacy", "aggregate_only"]),
+        json!(true),
+        "aggregate only",
+    )?;
+    // No raw absolute path may appear (file_area redacted as a dimension key).
+    assert_no_forbidden_fixture_leaks("workflow-analytics-basic", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_workflow_analytics_missing_source_is_partial() -> Result<(), Box<dyn Error>> {
+    // Sources present but the workflow_analytics provider is absent -> partial.
+    let (_tmp, fixture_path) =
+        write_swarm_evidence_fixture("workflow-analytics-empty", json!({"git": {"clean": true}}))?;
+    let output = render_swarm_workflow_analytics_fixture(&fixture_path)?;
+    require_value_eq(get_path(&output, &["status"]), json!("partial"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("supply-analytics-fixture"),
+        "recommended action",
+    )?;
+    Ok(())
+}
+
+#[test]
 fn swarm_status_large_fixture_fast_gate_names_budget_sections() -> Result<(), Box<dyn Error>> {
     let scale = SyntheticSwarmScale {
         ready_count: 850,
@@ -3914,6 +3986,20 @@ fn render_swarm_context_pack_fixture(fixture_path: &Path) -> Result<Value, Box<d
         adapter_set.input().fixture_id(),
         source,
     ))
+}
+
+fn render_swarm_workflow_analytics_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::WorkflowAnalytics);
+    Ok(
+        coding_agent_search::workflow_analytics::render_workflow_analytics_fixture(
+            adapter_set.input().fixture_id(),
+            source,
+        ),
+    )
 }
 
 fn read_json(path: PathBuf) -> Value {
