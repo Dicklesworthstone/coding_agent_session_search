@@ -32,6 +32,7 @@ pub mod fastembed_embedder;
 pub mod fastembed_reranker;
 pub mod hash_embedder;
 pub(crate) mod incident_categories;
+pub(crate) mod incident_redaction;
 pub(crate) mod liveness_fixtures;
 pub mod model_download;
 pub mod model_manager;
