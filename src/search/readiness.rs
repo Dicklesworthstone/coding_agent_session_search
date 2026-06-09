@@ -463,6 +463,46 @@ impl SafeNextCommand {
     }
 }
 
+/// The archive-risk safety envelope every readiness surface (status,
+/// triage, doctor, index preflight) projects so that high archive risk
+/// forces backup-first guidance and marks coverage-reducing commands
+/// *unsafe until a backup or fingerprinted plan exists*, rather than
+/// emitting casual rebuild/repair advice (bead
+/// cass-fleet-resilience-20260608-uojcg.1.3).
+///
+/// This is the single shared derivation; the four surfaces serialize it
+/// into their JSON verbatim instead of each re-deciding when a rebuild is
+/// safe. It is intentionally conservative: only a *mutating* action (one
+/// that could reduce archive coverage) is ever gated, so a stale
+/// low-risk index still gets normal `RefreshLexical` guidance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ArchiveSafetyEnvelope {
+    /// The archive-loss risk level driving the envelope.
+    pub archive_risk: ArchiveRiskLevel,
+    /// Whether a backup (or explicit fingerprinted plan) is recommended
+    /// before any mutating repair. True for `Elevated` and `High`.
+    pub backup_recommended: bool,
+    /// Actions that are unsafe to run until a backup / fingerprinted plan
+    /// exists. Non-empty only under `High` risk; the hard gate that keeps
+    /// archive-only nodes from being blindly rebuilt. Sorted + de-duped
+    /// for deterministic JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsafe_until_backup: Vec<SafeNextAction>,
+    /// The canonical data dir whose archive is at risk, when known. `None`
+    /// for unreachable hosts (nothing local is trustworthy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
+    /// One-line human-facing rationale.
+    pub reason: String,
+}
+
+impl ArchiveSafetyEnvelope {
+    /// Whether `action` is currently gated as unsafe-until-backup.
+    pub(crate) fn is_gated(&self, action: SafeNextAction) -> bool {
+        self.unsafe_until_backup.contains(&action)
+    }
+}
+
 /// The canonical per-node derived-asset truth table. Every readiness
 /// surface (health, status, doctor, fleet doctor, search `--robot-meta`)
 /// projects this one shape so the stale-but-searchable, missing,
@@ -669,6 +709,88 @@ impl DerivedAssetTruthTable {
             None,
             "all derived assets converged; no action required",
         )
+    }
+
+    /// Derive the archive-risk safety envelope for this node. `data_dir` is
+    /// the canonical data directory whose archive is at risk (surfaced so
+    /// operators know exactly what to back up); pass `None` when it is not
+    /// known (e.g. an unreachable host).
+    ///
+    /// Gating rules (archive-first, conservative):
+    /// - `High` → backup is mandatory; every *mutating* next-action that
+    ///   could reduce archive coverage is marked unsafe-until-backup, so the
+    ///   surface cannot emit a casual rebuild/repair command.
+    /// - `Elevated` → backup recommended, but actions are not hard-gated
+    ///   (advisory): recovery is expensive, not irreplaceable.
+    /// - `None` / `Low` / `Unknown` → no backup gate; normal guidance
+    ///   (e.g. a stale low-risk index still gets `RefreshLexical`).
+    pub(crate) fn archive_safety_envelope(
+        &self,
+        data_dir: Option<&str>,
+    ) -> ArchiveSafetyEnvelope {
+        // The mutating actions that could reduce archive coverage; gated as
+        // a unit so no single rebuild/repair path slips through under High
+        // risk. Derived from `SafeNextAction::is_mutating` to stay in sync
+        // with the safe-next-command vocabulary.
+        const GATED: &[SafeNextAction] = &[
+            SafeNextAction::IndexFull,
+            SafeNextAction::RepairLexical,
+            SafeNextAction::RefreshLexical,
+            SafeNextAction::RebuildForCurrentBinary,
+        ];
+        debug_assert!(
+            GATED.iter().all(|a| a.is_mutating()),
+            "every gated action must be mutating"
+        );
+
+        // Unreachable hosts: nothing local is trustworthy, so surface the
+        // risk verbatim with no data_dir and no actionable gate.
+        if self.db == CanonicalDbAvailability::Unreachable {
+            return ArchiveSafetyEnvelope {
+                archive_risk: self.archive_risk,
+                backup_recommended: false,
+                unsafe_until_backup: Vec::new(),
+                data_dir: None,
+                reason: "host unreachable; archive risk cannot be assessed locally".to_string(),
+            };
+        }
+
+        let data_dir = data_dir.map(str::to_string);
+        match self.archive_risk {
+            ArchiveRiskLevel::High => ArchiveSafetyEnvelope {
+                archive_risk: ArchiveRiskLevel::High,
+                backup_recommended: true,
+                unsafe_until_backup: GATED.to_vec(),
+                data_dir,
+                reason:
+                    "high archive risk: back up the canonical archive (or produce a fingerprinted \
+                     recovery plan) before any rebuild or repair"
+                        .to_string(),
+            },
+            ArchiveRiskLevel::Elevated => ArchiveSafetyEnvelope {
+                archive_risk: ArchiveRiskLevel::Elevated,
+                backup_recommended: true,
+                unsafe_until_backup: Vec::new(),
+                data_dir,
+                reason: "elevated archive risk: a backup is recommended before any repair"
+                    .to_string(),
+            },
+            ArchiveRiskLevel::None | ArchiveRiskLevel::Low => ArchiveSafetyEnvelope {
+                archive_risk: self.archive_risk,
+                backup_recommended: false,
+                unsafe_until_backup: Vec::new(),
+                data_dir,
+                reason: "archive risk is low; derived assets are reproducible from a backed source"
+                    .to_string(),
+            },
+            ArchiveRiskLevel::Unknown => ArchiveSafetyEnvelope {
+                archive_risk: ArchiveRiskLevel::Unknown,
+                backup_recommended: false,
+                unsafe_until_backup: Vec::new(),
+                data_dir,
+                reason: "archive risk could not be evaluated".to_string(),
+            },
+        }
     }
 }
 
@@ -1438,6 +1560,94 @@ mod tests {
         assert_eq!(cmd.action, SafeNextAction::None);
         assert!(cmd.command.is_none());
         assert!(t.is_searchable());
+    }
+
+    // -----------------------------------------------------------------
+    // ArchiveSafetyEnvelope (.1.3)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn high_archive_risk_envelope_is_backup_first_and_hard_gates_mutating_actions() {
+        let t = fixture("ts1_high_archive_risk");
+        let env = t.archive_safety_envelope(Some("/data/cass"));
+        assert_eq!(env.archive_risk, ArchiveRiskLevel::High);
+        assert!(env.backup_recommended);
+        assert_eq!(env.data_dir.as_deref(), Some("/data/cass"));
+        // Every coverage-reducing rebuild/repair is gated unsafe-until-backup.
+        for gated in [
+            SafeNextAction::IndexFull,
+            SafeNextAction::RepairLexical,
+            SafeNextAction::RefreshLexical,
+            SafeNextAction::RebuildForCurrentBinary,
+        ] {
+            assert!(env.is_gated(gated), "{gated:?} must be gated under high risk");
+            assert!(gated.is_mutating());
+        }
+        // The node's own safe-next-command stays backup-first, never a
+        // casual rebuild.
+        assert_eq!(t.safe_next_command().action, SafeNextAction::BackupThenRepair);
+        assert!(env.reason.contains("back up"));
+    }
+
+    #[test]
+    fn low_risk_stale_node_is_not_gated_and_keeps_normal_refresh_guidance() {
+        for name in ["local_stale_quarantine", "css_stale_existing_index"] {
+            let t = fixture(name);
+            let env = t.archive_safety_envelope(Some("/data/cass"));
+            assert!(matches!(env.archive_risk, ArchiveRiskLevel::Low));
+            assert!(!env.backup_recommended, "{name} low risk: no backup gate");
+            assert!(env.unsafe_until_backup.is_empty(), "{name} nothing gated");
+            assert!(!env.is_gated(SafeNextAction::RefreshLexical));
+            // Normal refresh guidance is preserved.
+            assert_eq!(t.safe_next_command().action, SafeNextAction::RefreshLexical);
+        }
+    }
+
+    #[test]
+    fn elevated_risk_recommends_backup_without_hard_gating() {
+        let t = DerivedAssetTruthTable {
+            db: CanonicalDbAvailability::Available,
+            source_coverage: SourceCoverageState::Complete,
+            scan_watermark_ms: Some(1),
+            last_projection_ms: Some(1),
+            lexical_metadata: LexicalMetadata::default(),
+            readiness: ReadinessSnapshot::new(
+                LexicalReadinessState::StaleButSearchable,
+                SemanticReadinessState::HybridReady,
+            ),
+            quarantine: QuarantineSummary::default(),
+            maintenance: MaintenanceActivity::Idle,
+            archive_risk: ArchiveRiskLevel::Elevated,
+            binary: BinaryCompatibility::Current,
+        };
+        let env = t.archive_safety_envelope(Some("/data/cass"));
+        assert!(env.backup_recommended);
+        assert!(
+            env.unsafe_until_backup.is_empty(),
+            "elevated risk is advisory, not a hard gate"
+        );
+    }
+
+    #[test]
+    fn unreachable_node_envelope_has_no_data_dir_and_no_gate() {
+        let t = fixture("mac_mini_old_unreachable");
+        let env = t.archive_safety_envelope(Some("/data/cass"));
+        assert!(env.data_dir.is_none(), "unreachable host surfaces no data_dir");
+        assert!(!env.backup_recommended);
+        assert!(env.unsafe_until_backup.is_empty());
+    }
+
+    #[test]
+    fn archive_safety_envelope_round_trips_through_json_snake_case() {
+        let t = fixture("ts1_high_archive_risk");
+        let env = t.archive_safety_envelope(Some("/data/cass"));
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"archive_risk\":\"high\""));
+        assert!(json.contains("\"backup_recommended\":true"));
+        assert!(json.contains("\"unsafe_until_backup\":[\"index_full\""));
+        assert!(json.contains("\"data_dir\":\"/data/cass\""));
+        let parsed: ArchiveSafetyEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, env);
     }
 
     #[test]
