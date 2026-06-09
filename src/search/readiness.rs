@@ -724,10 +724,7 @@ impl DerivedAssetTruthTable {
     ///   (advisory): recovery is expensive, not irreplaceable.
     /// - `None` / `Low` / `Unknown` → no backup gate; normal guidance
     ///   (e.g. a stale low-risk index still gets `RefreshLexical`).
-    pub(crate) fn archive_safety_envelope(
-        &self,
-        data_dir: Option<&str>,
-    ) -> ArchiveSafetyEnvelope {
+    pub(crate) fn archive_safety_envelope(&self, data_dir: Option<&str>) -> ArchiveSafetyEnvelope {
         // The mutating actions that could reduce archive coverage; gated as
         // a unit so no single rebuild/repair path slips through under High
         // risk. Derived from `SafeNextAction::is_mutating` to stay in sync
@@ -1580,12 +1577,18 @@ mod tests {
             SafeNextAction::RefreshLexical,
             SafeNextAction::RebuildForCurrentBinary,
         ] {
-            assert!(env.is_gated(gated), "{gated:?} must be gated under high risk");
+            assert!(
+                env.is_gated(gated),
+                "{gated:?} must be gated under high risk"
+            );
             assert!(gated.is_mutating());
         }
         // The node's own safe-next-command stays backup-first, never a
         // casual rebuild.
-        assert_eq!(t.safe_next_command().action, SafeNextAction::BackupThenRepair);
+        assert_eq!(
+            t.safe_next_command().action,
+            SafeNextAction::BackupThenRepair
+        );
         assert!(env.reason.contains("back up"));
     }
 
@@ -1632,7 +1635,10 @@ mod tests {
     fn unreachable_node_envelope_has_no_data_dir_and_no_gate() {
         let t = fixture("mac_mini_old_unreachable");
         let env = t.archive_safety_envelope(Some("/data/cass"));
-        assert!(env.data_dir.is_none(), "unreachable host surfaces no data_dir");
+        assert!(
+            env.data_dir.is_none(),
+            "unreachable host surfaces no data_dir"
+        );
         assert!(!env.backup_recommended);
         assert!(env.unsafe_until_backup.is_empty());
     }

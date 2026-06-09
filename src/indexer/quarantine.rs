@@ -498,17 +498,15 @@ mod tests {
 mod compat_fixtures {
     use super::*;
     use std::collections::BTreeMap;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
     const V05X_MISSING_VERSION: &str =
         include_str!("fixtures/quarantine/v05x_missing_version.json");
     const V06X_SAME_VERSION: &str = include_str!("fixtures/quarantine/v06x_same_version.json");
     const OLD_VERSION: &str = include_str!("fixtures/quarantine/old_version.json");
     const MALFORMED: &str = include_str!("fixtures/quarantine/malformed.json");
-    const DUPLICATE_COLLAPSED: &str =
-        include_str!("fixtures/quarantine/duplicate_collapsed.json");
-    const SCHEMA_VERSION_BUMP: &str =
-        include_str!("fixtures/quarantine/schema_version_bump.json");
+    const DUPLICATE_COLLAPSED: &str = include_str!("fixtures/quarantine/duplicate_collapsed.json");
+    const SCHEMA_VERSION_BUMP: &str = include_str!("fixtures/quarantine/schema_version_bump.json");
     const GROUPING_MATRIX: &str = include_str!("fixtures/quarantine/grouping_matrix.json");
 
     /// All well-formed fixtures (everything except the deliberately
@@ -556,10 +554,7 @@ mod compat_fixtures {
     fn same_version_v06x_fixture_is_not_retry_eligible_under_same_binary() {
         let (_dir, state) = load_fixture(V06X_SAME_VERSION);
         let (_key, record) = state.iter().next().expect("one current entry");
-        assert_eq!(
-            record.cass_version_at_quarantine.as_deref(),
-            Some("0.6.13")
-        );
+        assert_eq!(record.cass_version_at_quarantine.as_deref(), Some("0.6.13"));
         // Same binary version: already tried — must NOT retry (avoid storms).
         assert!(!record.is_version_stale_for_retry("0.6.13"));
         // A later version may have fixed the bug — eligible again.
@@ -610,7 +605,11 @@ mod compat_fixtures {
         state.record_attempt(&key, "index-ingest-out-of-memory: 4.5 GiB", now);
         assert_eq!(state.len(), 1, "dedup-in-place: no unbounded growth");
         assert_eq!(
-            state.entries.get(&key.storage_key()).expect("entry").attempt_count,
+            state
+                .entries
+                .get(&key.storage_key())
+                .expect("entry")
+                .attempt_count,
             6
         );
         let _ = dir;
@@ -646,7 +645,11 @@ mod compat_fixtures {
         }
         assert_eq!(by_version.get(&Some("0.5.1".to_string())), Some(&1));
         assert_eq!(by_version.get(&Some("0.6.13".to_string())), Some(&1));
-        assert_eq!(by_version.get(&None), Some(&1), "one legacy carry-over entry");
+        assert_eq!(
+            by_version.get(&None),
+            Some(&1),
+            "one legacy carry-over entry"
+        );
 
         // Eligibility grouping under a current binary: the 0.5.1 and the
         // legacy (None) entries are retry-eligible; the 0.6.13 one is not.
@@ -665,7 +668,9 @@ mod compat_fixtures {
 
             // Save through the production atomic path, reload, and confirm
             // the entry set is preserved exactly.
-            state.save(dir.path()).unwrap_or_else(|e| panic!("save {name}: {e}"));
+            state
+                .save(dir.path())
+                .unwrap_or_else(|e| panic!("save {name}: {e}"));
             let reloaded = QuarantineState::load(dir.path());
             assert_eq!(reloaded.len(), before, "{name} entry count after roundtrip");
             assert_eq!(reloaded.entries, state.entries, "{name} entries preserved");
