@@ -92,7 +92,7 @@ fastembed = { version = "5.13.4", default-features = false, features = ["ort-dow
 # transitively (via `frankensearch-rerank`), so it must be gated by the
 # same `semantic` feature for the baseline build to be ORT-free.
 frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2cad158f4468ece7076e3fe529c8e5c20b2e020e", default-features = false, features = ["hash", "lexical", "ann"] }
-franken-agent-detection = { version = "0.1.8", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "a4923d4097899e6e9805cefe67bce70e1b04a289", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
+franken-agent-detection = { version = "0.1.8", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "8582b48fb49d2eed76b41ee4650b9afba9d4c8d2", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
