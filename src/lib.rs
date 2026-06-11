@@ -1804,6 +1804,32 @@ pub enum SourcesCommand {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
+    /// Re-ingest an already-synced mirror into the canonical archive WITHOUT
+    /// re-running the rsync transfer.
+    ///
+    /// `cass sources sync` only triggers an ingest pass when new files are
+    /// transferred, so a mirror that is already current (or whose sessions were
+    /// never promoted to canonical) has no way to reach the searchable archive
+    /// without a wasteful re-transfer. This forces an ingest pass over the
+    /// existing mirror root(s), which `cass index` discovers via the same
+    /// remote scan-root machinery used after a sync.
+    Reingest {
+        /// Re-ingest from the existing mirror without re-running rsync. This is
+        /// the default and only mode today; the flag documents intent and keeps
+        /// the `cass sources reingest --from-mirror` spelling explicit.
+        #[arg(long, default_value_t = true)]
+        from_mirror: bool,
+        /// Re-ingest only specific source(s) (defaults to all remote sources)
+        #[arg(long, short)]
+        source: Option<Vec<String>>,
+        /// Rebuild the full index from the mirror (cass index --full) instead of
+        /// an incremental ingest pass
+        #[arg(long)]
+        full: bool,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
     /// Build or write a lexical artifact evidence manifest for remote exchange
     ArtifactManifest {
         /// Exact lexical index path. Defaults to <data-dir>/index/<schema-version>.
@@ -18215,6 +18241,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Sources(SourcesCommand::Sync { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Sources(SourcesCommand::Reingest { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Sources(SourcesCommand::ArtifactManifest { json, .. }) => {
@@ -88940,6 +88969,15 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_sources_sync(source, no_index, verbose, dry_run, structured_format)
         }
+        SourcesCommand::Reingest {
+            from_mirror: _,
+            source,
+            full,
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_sources_reingest(source, full, structured_format)
+        }
         SourcesCommand::ArtifactManifest {
             index_path,
             data_dir,
@@ -90567,6 +90605,174 @@ fn run_sources_sync(
             false, // no_progress_events
             false, // robot_trace_ingest
         )?;
+    }
+
+    Ok(())
+}
+
+/// Re-ingest already-synced mirror(s) into the canonical archive without rsync.
+///
+/// #266 bug 4: `cass sources sync` only ingests when new files are transferred,
+/// so an already-current mirror (or one whose sessions never reached canonical)
+/// has no promotion path short of a wasteful re-transfer. This forces an ingest
+/// pass over the existing mirror root(s). The actual scan-root discovery is the
+/// same machinery `cass index` uses after a sync (`build_scan_roots` /
+/// `additional_scan_roots_for_scan_or_watch`), so a plain index run already
+/// scans the mirrors — we just trigger it directly, skipping the transfer.
+fn run_sources_reingest(
+    source_filter: Option<Vec<String>>,
+    full: bool,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use crate::sources::config::{SourcesConfig, source_names_equal};
+    use colored::Colorize;
+
+    let config = SourcesConfig::load().map_err(|e| CliError {
+        code: 9,
+        kind: CliErrorKind::Config.kind_str(),
+        message: format!("Failed to load sources config: {e}"),
+        hint: Some("Run 'cass sources add' to configure a source".into()),
+        retryable: false,
+    })?;
+
+    let remote_sources: Vec<_> = config.remote_sources().collect();
+    if remote_sources.is_empty() {
+        let is_robot = output_format.is_some() || robot_format_from_env().is_some();
+        if is_robot {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "no_sources",
+                    "message": "No remote sources configured"
+                })
+            );
+        } else {
+            println!(
+                "{}",
+                "No remote sources configured. Run 'cass sources add' first.".yellow()
+            );
+        }
+        return Ok(());
+    }
+
+    // Validate the filter resolves to configured remote sources so an operator
+    // typo fails loudly rather than silently no-op'ing.
+    let selected: Vec<&crate::sources::config::SourceDefinition> =
+        if let Some(ref names) = source_filter {
+            let matched: Vec<_> = remote_sources
+                .iter()
+                .copied()
+                .filter(|s| names.iter().any(|name| source_names_equal(name, &s.name)))
+                .collect();
+            if matched.is_empty() {
+                return Err(CliError {
+                    code: 2,
+                    kind: "usage",
+                    message: format!(
+                        "no configured remote source matches {names:?}; known: {}",
+                        remote_sources
+                            .iter()
+                            .map(|s| s.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    hint: Some("Run 'cass sources list' to see configured sources.".into()),
+                    retryable: false,
+                });
+            }
+            matched
+        } else {
+            remote_sources.clone()
+        };
+
+    let data_dir = default_data_dir();
+    let db_path = data_dir.join("agent_search.db");
+
+    // Surface the mirror roots that will actually be scanned so the operator
+    // can confirm the mirror is present before the (potentially long) ingest.
+    let mut mirror_roots: Vec<String> = Vec::new();
+    let mut missing_mirrors: Vec<String> = Vec::new();
+    if let Ok(storage) = crate::storage::sqlite::FrankenStorage::open(&db_path) {
+        let roots = crate::indexer::build_scan_roots(&storage, &data_dir);
+        let selected_names: std::collections::HashSet<&str> =
+            selected.iter().map(|s| s.name.as_str()).collect();
+        for root in &roots {
+            if selected_names.contains(root.origin.source_id.as_str()) {
+                mirror_roots.push(root.path.display().to_string());
+            }
+        }
+    }
+    for source in &selected {
+        if !mirror_roots
+            .iter()
+            .any(|p| p.contains(&format!("/remotes/{}/", source.name)))
+        {
+            missing_mirrors.push(source.name.clone());
+        }
+    }
+
+    let is_robot = output_format.is_some() || robot_format_from_env().is_some();
+    if !is_robot {
+        println!(
+            "{} {} source(s) from existing mirror(s) (no rsync)...",
+            "Re-ingesting".cyan().bold(),
+            selected.len()
+        );
+        for root in &mirror_roots {
+            println!("  {} {}", "mirror:".dimmed(), root);
+        }
+        if !missing_mirrors.is_empty() {
+            println!(
+                "  {} no mirror found for: {} — run 'cass sources sync' first.",
+                "warning:".yellow().bold(),
+                missing_mirrors.join(", ")
+            );
+        }
+    }
+
+    let progress = if output_format.is_some() {
+        ProgressResolved::None
+    } else if std::io::stdout().is_terminal() {
+        ProgressResolved::Bars
+    } else {
+        ProgressResolved::Plain
+    };
+
+    run_index_with_data(
+        None,                   // db_override (uses data_dir default)
+        full,                   // full rebuild if requested
+        false,                  // force_rebuild
+        false,                  // watch
+        None,                   // watch_once
+        30,                     // watch_interval (default)
+        Some(data_dir.clone()), // data_dir (existing mirror root is discovered here)
+        false,                  // semantic
+        false,                  // build_hnsw
+        "fastembed".to_string(),
+        progress,
+        output_format,
+        None,  // idempotency_key
+        2000,  // progress_interval_ms (default)
+        false, // no_progress_events
+        false, // robot_trace_ingest
+    )?;
+
+    if is_robot {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "complete",
+                "kind": "sources_reingest",
+                "from_mirror": true,
+                "full": full,
+                "sources": selected.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+                "mirror_roots": mirror_roots,
+                "missing_mirrors": missing_mirrors,
+                "data_dir": data_dir.display().to_string(),
+                "note": "Re-ingested from the existing mirror with no rsync transfer.",
+            }))
+            .unwrap_or_default()
+        );
     }
 
     Ok(())
@@ -93155,6 +93361,40 @@ mod subcommand_robot_output_tests {
                 resolve_subcommand_structured_format(&cli, json),
                 Some(RobotFormat::Jsonl)
             );
+        });
+    }
+
+    #[test]
+    fn sources_reingest_parses_from_mirror_flags() {
+        run_on_large_stack(|| {
+            // #266: `cass sources reingest` re-ingests an already-synced mirror
+            // without re-running rsync. The `--from-mirror` spelling is accepted
+            // by clap as a hidden alias-free no-op understanding; the canonical
+            // flags are --source/--full/--json.
+            let cli = Cli::try_parse_from([
+                "cass",
+                "sources",
+                "reingest",
+                "--from-mirror",
+                "--source",
+                "laptop",
+                "--full",
+                "--json",
+            ])
+            .expect("parse sources reingest");
+            let Some(Commands::Sources(SourcesCommand::Reingest {
+                from_mirror,
+                source,
+                full,
+                json,
+            })) = cli.command.as_ref()
+            else {
+                panic!("expected sources reingest command, got {:?}", cli.command);
+            };
+            assert!(*from_mirror);
+            assert_eq!(source.as_deref(), Some(["laptop".to_string()].as_slice()));
+            assert!(*full);
+            assert!(*json);
         });
     }
 
