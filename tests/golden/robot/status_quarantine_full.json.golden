@@ -819,6 +819,15 @@
     "impact": "search covers all known conversations; nothing is quarantined",
     "next_command": "cass status --json"
   },
+  "root_cause": {
+    "schema_version": 1,
+    "family": "unknown",
+    "locus": "unknown",
+    "confidence": "unknown",
+    "evidence_refs": [],
+    "summary": "no evidence signals pointed at any root-cause family",
+    "recommended_next_probe": "cass diag --json && cass doctor check --json"
+  },
   "recommended_action": "Run 'cass index --full' once to discover local sessions and build the initial archive.",
   "recommended_commands": [
     {

@@ -66192,6 +66192,152 @@ fn maybe_test_status_delay() {
     }
 }
 
+/// Build a read-only [`ProjectionSignals`](crate::root_cause_projection::ProjectionSignals)
+/// snapshot from the shared status/health `state` JSON so status/triage/doctor
+/// can emit a [`RootCauseAttribution`](crate::root_cause_taxonomy::RootCauseAttribution)
+/// in `--json` (bead cass-fleet-resilience-20260608-uojcg.9.2 / 9.5).
+///
+/// Conservative by construction: a signal is set only when the observed fact
+/// clearly implicates that family, so the projection's false-positive
+/// guardrails keep ambiguous or merely-degraded states `Unknown`. A *retryable*
+/// open error, a permission/not-found open error, or semantic assets that are
+/// simply absent-by-policy never drive an attribution. `host_disk_free_pct` is
+/// supplied by callers that cheaply measure it (doctor); status/triage pass
+/// `None` to keep the fast readiness surfaces probe-free.
+fn gather_projection_signals_from_state(
+    state: &serde_json::Value,
+    host_disk_free_pct: Option<f64>,
+) -> crate::root_cause_projection::ProjectionSignals {
+    let mut signals = crate::root_cause_projection::ProjectionSignals {
+        host_disk_free_pct,
+        ..Default::default()
+    };
+
+    // frankensqlite storage: a non-retryable open failure whose error text names
+    // a storage-engine fault (corruption / OpenRead / bad format) — not a
+    // permission/not-found/busy condition, which are host/transient, not storage
+    // corruption.
+    let open_retryable = state
+        .pointer("/database/open_retryable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !open_retryable
+        && let Some(err) = state
+            .pointer("/database/open_error")
+            .and_then(serde_json::Value::as_str)
+    {
+        let lower = err.to_ascii_lowercase();
+        let storage_fault = lower.contains("openread")
+            || lower.contains("malformed")
+            || lower.contains("corrupt")
+            || lower.contains("not a database")
+            || lower.contains("disk image")
+            || lower.contains("sqlite_");
+        if storage_fault {
+            signals.open_read_failure = true;
+        }
+    }
+
+    // cass derived state: the lexical index is empty while the canonical DB has
+    // messages — two cass-owned facts disagree. A cold/empty dir is not this.
+    if state
+        .pointer("/index/empty_with_messages")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        signals.derived_truth_table_mismatch = true;
+    }
+
+    // semantic assets: the model was present but failed to load. Absent /
+    // not-initialized is opt-in policy, not a fault.
+    if state
+        .pointer("/semantic/availability")
+        .and_then(serde_json::Value::as_str)
+        == Some("load_failed")
+    {
+        signals.semantic_requested_but_missing = true;
+    }
+
+    signals
+}
+
+#[cfg(test)]
+mod root_cause_signal_gather_tests {
+    use super::gather_projection_signals_from_state;
+    use crate::root_cause_projection::project_root_cause;
+    use crate::root_cause_taxonomy::{AttributionConfidence, RootCauseFamily};
+
+    #[test]
+    fn malformed_db_open_failure_attributes_storage() {
+        let state = serde_json::json!({
+            "database": {
+                "open_error": "OpenRead failed: database disk image is malformed",
+                "open_retryable": false
+            }
+        });
+        let s = gather_projection_signals_from_state(&state, None);
+        assert!(s.open_read_failure);
+        assert_eq!(
+            project_root_cause(&s).family,
+            RootCauseFamily::FrankensqliteStorage
+        );
+    }
+
+    #[test]
+    fn retryable_or_permission_open_error_is_not_a_storage_fault() {
+        for (err, retryable) in [
+            ("database is locked", true),
+            ("permission denied", false),
+            ("no such file or directory", false),
+        ] {
+            let state =
+                serde_json::json!({"database": {"open_error": err, "open_retryable": retryable}});
+            let s = gather_projection_signals_from_state(&state, None);
+            assert!(!s.open_read_failure, "{err} must not be a storage fault");
+            assert_eq!(project_root_cause(&s).family, RootCauseFamily::Unknown);
+        }
+    }
+
+    #[test]
+    fn empty_index_with_messages_attributes_derived_state() {
+        let state = serde_json::json!({"index": {"empty_with_messages": true}});
+        let s = gather_projection_signals_from_state(&state, None);
+        assert!(s.derived_truth_table_mismatch);
+        assert_eq!(
+            project_root_cause(&s).family,
+            RootCauseFamily::CassDerivedState
+        );
+    }
+
+    #[test]
+    fn semantic_load_failed_is_a_fault_but_absent_is_not() {
+        let failed = serde_json::json!({"semantic": {"availability": "load_failed"}});
+        assert!(gather_projection_signals_from_state(&failed, None).semantic_requested_but_missing);
+        let absent = serde_json::json!({"semantic": {"availability": "not_initialized"}});
+        assert!(!gather_projection_signals_from_state(&absent, None).semantic_requested_but_missing);
+    }
+
+    #[test]
+    fn host_disk_pct_below_threshold_attributes_host_pressure() {
+        let s = gather_projection_signals_from_state(&serde_json::json!({}), Some(2.0));
+        assert_eq!(
+            project_root_cause(&s).family,
+            RootCauseFamily::HostDiskPressure
+        );
+        // Abundant free space rules it out.
+        let plenty = gather_projection_signals_from_state(&serde_json::json!({}), Some(60.0));
+        assert_eq!(project_root_cause(&plenty).family, RootCauseFamily::Unknown);
+    }
+
+    #[test]
+    fn empty_state_is_explicit_unknown() {
+        let s = gather_projection_signals_from_state(&serde_json::json!({}), None);
+        let a = project_root_cause(&s);
+        assert_eq!(a.family, RootCauseFamily::Unknown);
+        assert_eq!(a.confidence, AttributionConfidence::Unknown);
+    }
+}
+
 fn run_status(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
@@ -66534,6 +66680,16 @@ fn run_status(
                 ),
             )
             .unwrap_or(serde_json::Value::Null),
+            // uojcg.9.2/9.5: likely root-cause family attributed from the live
+            // state signals (storage open failure, derived truth-table mismatch,
+            // semantic load failure). Conservative — Unknown when no signal
+            // implicates a family. Status is probe-free, so no host-disk signal.
+            "root_cause": serde_json::to_value(
+                crate::root_cause_projection::project_root_cause(
+                    &gather_projection_signals_from_state(&state, None),
+                ),
+            )
+            .unwrap_or(serde_json::Value::Null),
             "recommended_action": recommended_action,
             "recommended_commands": recommended_commands,
             "budget": serde_json::json!({
@@ -66844,6 +67000,14 @@ fn run_triage(
         "recommended_commands": recommended_commands,
         "next_command": next_command,
         "search_completeness": search_completeness,
+        // uojcg.9.2/9.5: same conservative root-cause attribution as status, so
+        // an agent's one-shot triage already names the likely fault family.
+        "root_cause": serde_json::to_value(
+            crate::root_cause_projection::project_root_cause(
+                &gather_projection_signals_from_state(&state, None),
+            ),
+        )
+        .unwrap_or(serde_json::Value::Null),
         "readiness": {
             "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
             "database": state.get("database").cloned().unwrap_or(serde_json::Value::Null),
@@ -71900,6 +72064,17 @@ pub(crate) fn run_doctor_impl(
         } else {
             collect_diag_quarantine_report(&data_dir, &index_path)
         };
+        // uojcg.9.2/9.5: attribute a likely root-cause family from the live
+        // doctor signals (storage open failure, derived truth-table mismatch,
+        // semantic load failure). Complements the per-incident `incidents[]`
+        // breakdown. Host disk-free % is deliberately NOT fed here: it is a live
+        // host metric that would make the doctor golden environment-dependent,
+        // and `storage_pressure` already reports low-disk state separately. The
+        // projection still supports host-disk-pressure for a future surface that
+        // can supply a deterministic/scrubbed signal.
+        let root_cause_attribution = crate::root_cause_projection::project_root_cause(
+            &gather_projection_signals_from_state(&readiness_snapshot, None),
+        );
         let mut payload = serde_json::json!({
             // Top-level envelope versioning. Bumped to 2 in world-class-doctor
             // pass-3 alongside the new per-run artifact directory + undo
@@ -71970,6 +72145,7 @@ pub(crate) fn run_doctor_impl(
             }),
             "retry_recommendation": retry_recommendation,
             "safe_auto_eligibility": safe_auto_eligibility,
+            "root_cause": root_cause_attribution,
             "primary_incident_id": primary_incident_id,
             "incidents": incidents,
             "event_log": operation_event_log,
@@ -77803,6 +77979,36 @@ fn response_schema_search_completeness() -> serde_json::Value {
     })
 }
 
+/// JSON Schema for the uojcg.9.2/9.5 root-cause attribution emitted by
+/// status/triage/doctor `--json`.
+fn response_schema_root_cause_attribution() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Likely root-cause family attributed from observed diagnostic signals. family/locus/confidence are kebab-case taxonomy values (see introspect root_cause_taxonomy); evidence_refs carry the structured signals behind the call; recommended_next_probe is the cheapest bounded confirm. family=unknown + confidence=unknown means no signal implicated a family (not a failure). Complements doctor incidents[]; branch on family/confidence, not summary prose.",
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "family": { "type": "string" },
+            "locus": { "type": "string" },
+            "confidence": { "type": "string" },
+            "evidence_refs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string" },
+                        "locator": { "type": "string" },
+                        "detail": { "type": "string" }
+                    },
+                    "required": ["kind", "locator"]
+                }
+            },
+            "summary": { "type": "string" },
+            "recommended_next_probe": { "type": ["string", "null"] }
+        },
+        "required": ["schema_version", "family", "locus", "confidence", "evidence_refs", "summary"]
+    })
+}
+
 fn response_schema_search_meta() -> serde_json::Value {
     response_schema_object([
         ("elapsed_ms", serde_json::json!({ "type": "integer" })),
@@ -78196,6 +78402,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "coverage_risk": response_schema_doctor_coverage_risk(),
                 "quarantine": response_schema_opaque_object(),
                 "search_completeness": response_schema_search_completeness(),
+                "root_cause": response_schema_root_cause_attribution(),
                 "_meta": {
                     "type": "object",
                     "properties": {
@@ -78224,6 +78431,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "recommended_commands": response_schema_recommended_commands(),
                 "next_command": { "type": ["string", "null"] },
                 "search_completeness": response_schema_search_completeness(),
+                "root_cause": response_schema_root_cause_attribution(),
                 "readiness": {
                     "type": "object",
                     "properties": {
@@ -78289,6 +78497,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "recommended_commands",
                 "next_command",
                 "search_completeness",
+                "root_cause",
                 "readiness",
                 "discovery",
                 "starter_workflows",
@@ -78910,6 +79119,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "timing_summary": response_schema_doctor_timing_summary(),
             "retry_recommendation": response_schema_doctor_retry_recommendation(),
             "safe_auto_eligibility": response_schema_opaque_object(),
+            "root_cause": response_schema_root_cause_attribution(),
             "primary_incident_id": { "type": ["string", "null"], "description": "incident_id for the highest-priority root-cause incident, or null when no incident was found." },
             "incidents": {
                 "type": "array",

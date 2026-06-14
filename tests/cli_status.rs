@@ -567,6 +567,78 @@ fn readiness_surfaces_report_complete_search_coverage_without_quarantine() {
     );
 }
 
+/// uojcg.9.2/9.5: status/triage/doctor --json carry a root_cause attribution
+/// (family/locus/confidence/evidence_refs/summary). On a clean, freshly-indexed
+/// dir no signal implicates a family, so the attribution is the explicit
+/// unknown/unknown record — the field is always present and well-shaped.
+#[test]
+fn status_triage_doctor_emit_root_cause_attribution() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+
+    let index_out = isolated_cass_cmd(test_home.path())
+        .args([
+            "index",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+            "--no-progress-events",
+        ])
+        .output()
+        .expect("run cass index --json");
+    assert!(index_out.status.success());
+
+    let assert_root_cause = |rc: &serde_json::Value, surface: &str| {
+        assert!(
+            rc.get("schema_version").and_then(serde_json::Value::as_u64).is_some(),
+            "{surface} root_cause needs schema_version: {rc}"
+        );
+        assert_eq!(
+            rc["family"].as_str(),
+            Some("unknown"),
+            "{surface} clean dir => unknown family: {rc}"
+        );
+        assert_eq!(
+            rc["confidence"].as_str(),
+            Some("unknown"),
+            "{surface} clean dir => unknown confidence: {rc}"
+        );
+        assert!(rc.get("locus").and_then(serde_json::Value::as_str).is_some());
+        assert!(rc.get("evidence_refs").map(serde_json::Value::is_array).unwrap_or(false));
+        assert!(rc.get("summary").and_then(serde_json::Value::as_str).is_some());
+    };
+
+    for surface in ["status", "triage"] {
+        let out = isolated_cass_cmd(test_home.path())
+            .args([
+                surface,
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+                "--json",
+            ])
+            .output()
+            .expect("run cass readiness surface --json");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("parse readiness surface JSON");
+        assert_root_cause(&payload["root_cause"], surface);
+    }
+
+    let doctor_out = isolated_cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "check",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+        ])
+        .output()
+        .expect("run cass doctor check --json");
+    let doctor_payload: serde_json::Value =
+        serde_json::from_slice(&doctor_out.stdout).expect("parse doctor JSON");
+    assert_root_cause(&doctor_payload["root_cause"], "doctor");
+}
+
 #[test]
 fn status_and_health_json_escalate_recent_ingest_quarantine_bursts() {
     let test_home = tempfile::tempdir().expect("tempdir");

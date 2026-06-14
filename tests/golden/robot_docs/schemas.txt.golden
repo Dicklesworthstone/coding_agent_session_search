@@ -573,6 +573,14 @@ schemas: (auto-generated from contract)
       - safe_to_retry: boolean
       - schema_version: integer
     - risk_level: string
+    - root_cause: object
+      - confidence: string
+      - evidence_refs: array
+      - family: string
+      - locus: string
+      - recommended_next_probe: ?
+      - schema_version: integer
+      - summary: string
     - safe_auto_eligibility: object
     - schema_version: integer
     - semantic: object
@@ -3712,6 +3720,14 @@ schemas: (auto-generated from contract)
       - status: string
       - sync_gap_count: integer
       - sync_staleness: string
+    - root_cause: object
+      - confidence: string
+      - evidence_refs: array
+      - family: string
+      - locus: string
+      - recommended_next_probe: ?
+      - schema_version: integer
+      - summary: string
     - search_completeness: object
       - can_search: boolean
       - complete: boolean
@@ -3938,6 +3954,14 @@ schemas: (auto-generated from contract)
         - vector_index_path: ?
     - recommended_action: ?
     - recommended_commands: array
+    - root_cause: object
+      - confidence: string
+      - evidence_refs: array
+      - family: string
+      - locus: string
+      - recommended_next_probe: ?
+      - schema_version: integer
+      - summary: string
     - schema_version: integer
     - search_completeness: object
       - can_search: boolean

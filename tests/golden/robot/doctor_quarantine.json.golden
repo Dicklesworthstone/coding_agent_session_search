@@ -262,6 +262,15 @@
     "receipts": [],
     "event_log_reference": "event_log.hash_chain_tip:doctor-event-v1-bb7337c788aba591c12b3b69e5c7eb7cfc687b8f0e671df1bcfd64b598358cb1"
   },
+  "root_cause": {
+    "schema_version": 1,
+    "family": "unknown",
+    "locus": "unknown",
+    "confidence": "unknown",
+    "evidence_refs": [],
+    "summary": "no evidence signals pointed at any root-cause family",
+    "recommended_next_probe": "cass diag --json && cass doctor check --json"
+  },
   "primary_incident_id": "doctor-incident-v1-e74b084c6b952c5cc399b1c717aca0d3c3fe5514b5e7e8bbbe0174cd6194533b",
   "incidents": [
     {

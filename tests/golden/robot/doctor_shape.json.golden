@@ -632,6 +632,35 @@
         }
       }
     },
+    "root_cause": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "family": {
+          "type": "string"
+        },
+        "locus": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "string"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "summary": {
+          "type": "string"
+        },
+        "recommended_next_probe": {
+          "type": "string"
+        }
+      }
+    },
     "primary_incident_id": {
       "type": "string"
     },

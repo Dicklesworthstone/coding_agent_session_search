@@ -3958,6 +3958,62 @@
           "type": "object",
           "additionalProperties": true
         },
+        "root_cause": {
+          "type": "object",
+          "description": "Likely root-cause family attributed from observed diagnostic signals. family/locus/confidence are kebab-case taxonomy values (see introspect root_cause_taxonomy); evidence_refs carry the structured signals behind the call; recommended_next_probe is the cheapest bounded confirm. family=unknown + confidence=unknown means no signal implicated a family (not a failure). Complements doctor incidents[]; branch on family/confidence, not summary prose.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "family": {
+              "type": "string"
+            },
+            "locus": {
+              "type": "string"
+            },
+            "confidence": {
+              "type": "string"
+            },
+            "evidence_refs": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string"
+                  },
+                  "locator": {
+                    "type": "string"
+                  },
+                  "detail": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "locator"
+                ]
+              }
+            },
+            "summary": {
+              "type": "string"
+            },
+            "recommended_next_probe": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "schema_version",
+            "family",
+            "locus",
+            "confidence",
+            "evidence_refs",
+            "summary"
+          ]
+        },
         "primary_incident_id": {
           "type": [
             "string",
@@ -33893,6 +33949,62 @@
             "next_command"
           ]
         },
+        "root_cause": {
+          "type": "object",
+          "description": "Likely root-cause family attributed from observed diagnostic signals. family/locus/confidence are kebab-case taxonomy values (see introspect root_cause_taxonomy); evidence_refs carry the structured signals behind the call; recommended_next_probe is the cheapest bounded confirm. family=unknown + confidence=unknown means no signal implicated a family (not a failure). Complements doctor incidents[]; branch on family/confidence, not summary prose.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "family": {
+              "type": "string"
+            },
+            "locus": {
+              "type": "string"
+            },
+            "confidence": {
+              "type": "string"
+            },
+            "evidence_refs": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string"
+                  },
+                  "locator": {
+                    "type": "string"
+                  },
+                  "detail": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "locator"
+                ]
+              }
+            },
+            "summary": {
+              "type": "string"
+            },
+            "recommended_next_probe": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "schema_version",
+            "family",
+            "locus",
+            "confidence",
+            "evidence_refs",
+            "summary"
+          ]
+        },
         "_meta": {
           "type": "object",
           "properties": {
@@ -34036,6 +34148,62 @@
             "coverage_suspect",
             "impact",
             "next_command"
+          ]
+        },
+        "root_cause": {
+          "type": "object",
+          "description": "Likely root-cause family attributed from observed diagnostic signals. family/locus/confidence are kebab-case taxonomy values (see introspect root_cause_taxonomy); evidence_refs carry the structured signals behind the call; recommended_next_probe is the cheapest bounded confirm. family=unknown + confidence=unknown means no signal implicated a family (not a failure). Complements doctor incidents[]; branch on family/confidence, not summary prose.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "family": {
+              "type": "string"
+            },
+            "locus": {
+              "type": "string"
+            },
+            "confidence": {
+              "type": "string"
+            },
+            "evidence_refs": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string"
+                  },
+                  "locator": {
+                    "type": "string"
+                  },
+                  "detail": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "locator"
+                ]
+              }
+            },
+            "summary": {
+              "type": "string"
+            },
+            "recommended_next_probe": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "schema_version",
+            "family",
+            "locus",
+            "confidence",
+            "evidence_refs",
+            "summary"
           ]
         },
         "readiness": {
@@ -34854,6 +35022,7 @@
         "recommended_commands",
         "next_command",
         "search_completeness",
+        "root_cause",
         "readiness",
         "discovery",
         "starter_workflows",
