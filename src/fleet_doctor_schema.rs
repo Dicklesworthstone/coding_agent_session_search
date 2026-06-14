@@ -24,6 +24,8 @@
 //! bead `9.1` so `9.2` can project a likely root cause without changing this
 //! contract.
 
+use std::collections::BTreeMap;
+
 use crate::root_cause_taxonomy::{
     AttributionConfidence, EvidenceRef, RootCauseAttribution, RootCauseFamily,
 };
@@ -534,7 +536,8 @@ pub fn classify_connection_failure(error: &str) -> (HostProbeStatus, &'static st
 }
 
 /// Fleet-wide rollup over the per-host reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// No longer `Copy`: the bead-10.4 `root_cause_distribution` BTreeMap is heap-backed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetSummary {
     /// Total hosts in the sweep.
     pub total_hosts: usize,
@@ -552,6 +555,19 @@ pub struct FleetSummary {
     pub stale_data: usize,
     /// The worst archive risk seen across all hosts.
     pub highest_archive_risk: ArchiveRisk,
+    /// Attribution-aware fleet rollup (bead 10.4): per-family host counts keyed
+    /// by kebab-case root-cause family. Hosts with no attribution are omitted.
+    /// Keeps dependency/transport dominance (`remote-transport-auth`) distinct
+    /// from cass-runtime faults (`cass-derived-state`, `frankensqlite-storage`)
+    /// and host pressure (`host-disk-pressure`) instead of flattening everything
+    /// into one generic failure count.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub root_cause_distribution: BTreeMap<RootCauseFamily, usize>,
+    /// The single most common attributed family across the fleet, or `None` when
+    /// no host carried an attribution. Ties are broken deterministically toward
+    /// the lowest family in taxonomy order so rollups are reproducible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dominant_root_cause: Option<RootCauseFamily>,
 }
 
 /// The top-level fleet-doctor report: every host plus a rollup summary.
@@ -578,8 +594,16 @@ impl FleetDoctorReport {
         let mut cancelled = 0;
         let mut stale_data = 0;
         let mut highest_archive_risk = ArchiveRisk::Unknown;
+        // bead 10.4: attribution-aware rollup over each host's likely_root_cause.
+        let mut root_cause_distribution: BTreeMap<RootCauseFamily, usize> = BTreeMap::new();
 
         for host in &hosts {
+            // Count the host's attributed family (when any). Unattributed hosts
+            // (likely_root_cause = None) are intentionally omitted so the
+            // distribution reflects only diagnosed faults.
+            if let Some(family) = host.likely_root_cause {
+                *root_cause_distribution.entry(family).or_default() += 1;
+            }
             match host.status {
                 HostProbeStatus::Ok => ok += 1,
                 HostProbeStatus::TimedOut => timed_out += 1,
@@ -605,6 +629,14 @@ impl FleetDoctorReport {
             }
         }
 
+        // Dominant family = highest host count; ties resolve toward the lowest
+        // family in taxonomy order (`then_with(|| fb.cmp(fa))` makes the smaller
+        // family compare greater) so the rollup is deterministic.
+        let dominant_root_cause = root_cause_distribution
+            .iter()
+            .max_by(|(fa, ca), (fb, cb)| ca.cmp(cb).then_with(|| fb.cmp(fa)))
+            .map(|(family, _)| *family);
+
         Self {
             schema_version: FLEET_DOCTOR_SCHEMA_VERSION,
             hosts,
@@ -617,6 +649,8 @@ impl FleetDoctorReport {
                 cancelled,
                 stale_data,
                 highest_archive_risk,
+                root_cause_distribution,
+                dominant_root_cause,
             },
         }
     }
@@ -1288,5 +1322,117 @@ mod tests {
         )];
         let report = FleetDoctorReport::from_hosts(hosts);
         assert_eq!(report.summary.unreachable, 1, "command-not-found is a hard failure");
+    }
+
+    // --- bead 10.4: attribution-aware fleet rollups over the host matrix ---
+
+    /// Build a reachable-but-faulted host whose deep state attributes a specific
+    /// non-transport family (e.g. a remote whose storage probe failed).
+    fn host_attributed(alias: &str, family: RootCauseFamily) -> HostDoctorReport {
+        let mut h = HostDoctorReport::skeleton(
+            alias,
+            Platform::linux_x86_64(),
+            HostProbeStatus::Degraded,
+            40,
+        );
+        h.likely_root_cause = Some(family);
+        h
+    }
+
+    #[test]
+    fn fleet_rollup_keeps_dependency_and_storage_dominance_distinct() {
+        // css-like dependency/transport dominance (one hard-unreachable, one
+        // connect-timeout), a csd-like storage host, and a healthy host.
+        let hosts = vec![
+            HostDoctorReport::unreachable("css1", Platform::linux_x86_64(), 100, "fix ssh"),
+            HostDoctorReport::failed(
+                "css2",
+                Platform::linux_x86_64(),
+                120,
+                "ssh: connect to host css2 port 22: Connection timed out",
+            ),
+            host_attributed("csd", RootCauseFamily::FrankensqliteStorage),
+            HostDoctorReport::skeleton("ts1", Platform::linux_x86_64(), HostProbeStatus::Ok, 20),
+        ];
+        let report = FleetDoctorReport::from_hosts(hosts);
+        let dist = &report.summary.root_cause_distribution;
+        // Dependency/transport dominance is NOT flattened into a generic cass
+        // failure, and storage dominance stays its own distinct category.
+        assert_eq!(dist.get(&RootCauseFamily::RemoteTransportAuth), Some(&2));
+        assert_eq!(dist.get(&RootCauseFamily::FrankensqliteStorage), Some(&1));
+        // The healthy host contributes no attribution.
+        assert_eq!(dist.values().sum::<usize>(), 3);
+        assert_eq!(
+            report.summary.dominant_root_cause,
+            Some(RootCauseFamily::RemoteTransportAuth)
+        );
+        // Unreachable / timed-out hosts remain explicit evidence-gap states.
+        assert_eq!(report.summary.unreachable, 1, "css1 hard-unreachable");
+        assert_eq!(report.summary.timed_out, 1, "css2 connect-timeout");
+    }
+
+    #[test]
+    fn fleet_rollup_dominant_flips_when_storage_dominates() {
+        let hosts = vec![
+            host_attributed("csd1", RootCauseFamily::FrankensqliteStorage),
+            host_attributed("csd2", RootCauseFamily::FrankensqliteStorage),
+            host_attributed("csd3", RootCauseFamily::FrankensqliteStorage),
+            HostDoctorReport::unreachable("css", Platform::linux_x86_64(), 90, "fix ssh"),
+        ];
+        let report = FleetDoctorReport::from_hosts(hosts);
+        assert_eq!(
+            report.summary.dominant_root_cause,
+            Some(RootCauseFamily::FrankensqliteStorage)
+        );
+        assert_eq!(
+            report.summary.root_cause_distribution.get(&RootCauseFamily::FrankensqliteStorage),
+            Some(&3)
+        );
+        assert_eq!(
+            report.summary.root_cause_distribution.get(&RootCauseFamily::RemoteTransportAuth),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn fleet_rollup_dominant_tie_breaks_deterministically_to_lowest_family() {
+        // One host each of two families => a tie; the lower family in taxonomy
+        // order wins deterministically (CassDerivedState < RemoteTransportAuth).
+        let hosts = vec![
+            host_attributed("a", RootCauseFamily::CassDerivedState),
+            HostDoctorReport::unreachable("b", Platform::linux_x86_64(), 50, "fix"),
+        ];
+        let report = FleetDoctorReport::from_hosts(hosts);
+        assert_eq!(
+            report.summary.dominant_root_cause,
+            Some(RootCauseFamily::CassDerivedState),
+            "ties resolve to the lowest family for reproducibility"
+        );
+    }
+
+    #[test]
+    fn fleet_rollup_unattributed_fleet_has_empty_distribution_and_no_dominant() {
+        let hosts = vec![
+            HostDoctorReport::skeleton("ts1", Platform::linux_x86_64(), HostProbeStatus::Ok, 10),
+            HostDoctorReport::skeleton("ts2", Platform::linux_x86_64(), HostProbeStatus::Partial, 12),
+        ];
+        let report = FleetDoctorReport::from_hosts(hosts);
+        assert!(report.summary.root_cause_distribution.is_empty());
+        assert_eq!(report.summary.dominant_root_cause, None);
+    }
+
+    #[test]
+    fn fleet_rollup_distribution_serializes_with_kebab_family_keys() {
+        let report = FleetDoctorReport::from_hosts(vec![HostDoctorReport::unreachable(
+            "css",
+            Platform::linux_x86_64(),
+            50,
+            "fix",
+        )]);
+        let value = serde_json::to_value(&report.summary).unwrap();
+        assert_eq!(value["root_cause_distribution"]["remote-transport-auth"], 1);
+        assert_eq!(value["dominant_root_cause"], "remote-transport-auth");
+        let back: FleetSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(back, report.summary);
     }
 }
