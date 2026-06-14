@@ -355,6 +355,218 @@ fn status_and_health_json_surface_ingest_quarantine_as_nonfatal_degraded() {
     );
 }
 
+/// uojcg.3.3: health/status/triage and search --robot-meta must carry a
+/// structured `search_completeness` verdict so agents can tell a *stale* index
+/// (still complete) from one that *excludes known conversations* (quarantined).
+#[test]
+fn readiness_surfaces_report_degraded_search_completeness_when_quarantined() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+
+    let index_out = isolated_cass_cmd(test_home.path())
+        .args([
+            "index",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+            "--no-progress-events",
+        ])
+        .output()
+        .expect("run cass index --json");
+    assert!(
+        index_out.status.success(),
+        "cass index --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&index_out.stdout),
+        String::from_utf8_lossy(&index_out.stderr)
+    );
+
+    write_ingest_quarantine_record(&data_dir);
+
+    // The degraded (but searchable) verdict every readiness surface must agree on.
+    let assert_degraded = |payload: &serde_json::Value, surface: &str| {
+        let sc = &payload["search_completeness"];
+        assert_eq!(
+            sc["quarantine_status"].as_str(),
+            Some("degraded"),
+            "{surface} search_completeness should be degraded: {payload}"
+        );
+        assert_eq!(
+            sc["quarantined_conversations"].as_u64(),
+            Some(1),
+            "{surface} should count the quarantined conversation: {payload}"
+        );
+        assert_eq!(
+            sc["complete"].as_bool(),
+            Some(false),
+            "{surface} coverage is incomplete: {payload}"
+        );
+        assert_eq!(
+            sc["can_search"].as_bool(),
+            Some(true),
+            "{surface} ordinary search still runs: {payload}"
+        );
+        assert_eq!(
+            sc["coverage_suspect"].as_bool(),
+            Some(false),
+            "{surface} a single non-burst quarantine is not suspect: {payload}"
+        );
+        assert!(
+            sc["next_command"]
+                .as_str()
+                .is_some_and(|cmd| cmd.contains("quarantine")),
+            "{surface} should point at the quarantine inspect command: {payload}"
+        );
+    };
+
+    for surface in ["status", "triage"] {
+        let out = isolated_cass_cmd(test_home.path())
+            .args([
+                surface,
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+                "--json",
+            ])
+            .output()
+            .expect("run cass readiness surface --json");
+        assert!(
+            out.status.success(),
+            "cass {surface} --json failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("parse readiness surface JSON");
+        assert_degraded(&payload, surface);
+    }
+    // triage must also surface the quarantine facts inside its readiness block.
+    let triage_out = isolated_cass_cmd(test_home.path())
+        .args([
+            "triage",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+        ])
+        .output()
+        .expect("run cass triage --json");
+    let triage_payload: serde_json::Value =
+        serde_json::from_slice(&triage_out.stdout).expect("triage JSON");
+    assert_eq!(
+        triage_payload["readiness"]["ingest_quarantine"]["quarantined_conversations"].as_u64(),
+        Some(1),
+        "triage readiness should now include ingest_quarantine: {triage_payload}"
+    );
+
+    // health (exit 0 for a single nonfatal quarantine) carries the same verdict.
+    let health_out = isolated_cass_cmd(test_home.path())
+        .args([
+            "health",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+        ])
+        .output()
+        .expect("run cass health --json");
+    assert!(
+        health_out.status.success(),
+        "cass health --json should stay exit 0 for a single nonfatal quarantine: stdout={} stderr={}",
+        String::from_utf8_lossy(&health_out.stdout),
+        String::from_utf8_lossy(&health_out.stderr)
+    );
+    let health_payload: serde_json::Value =
+        serde_json::from_slice(&health_out.stdout).expect("health JSON");
+    assert_degraded(&health_payload, "health");
+
+    // search --robot-meta carries the compact verdict in its _meta header.
+    let search_out = isolated_cass_cmd(test_home.path())
+        .args([
+            "search",
+            "anything",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--robot",
+            "--robot-meta",
+        ])
+        .output()
+        .expect("run cass search --robot --robot-meta");
+    let search_payload: serde_json::Value =
+        serde_json::from_slice(&search_out.stdout).expect("search JSON");
+    let search_meta = &search_payload["_meta"]["search_completeness"];
+    assert_eq!(
+        search_meta["quarantine_status"].as_str(),
+        Some("degraded"),
+        "search --robot-meta should carry the degraded completeness verdict: {search_payload}"
+    );
+    assert_eq!(search_meta["quarantined_conversations"].as_u64(), Some(1));
+}
+
+/// uojcg.3.3: with no quarantine, every readiness surface reports complete
+/// coverage (`ok`), and search --robot-meta omits the verdict entirely so the
+/// common payload is unchanged.
+#[test]
+fn readiness_surfaces_report_complete_search_coverage_without_quarantine() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+
+    let index_out = isolated_cass_cmd(test_home.path())
+        .args([
+            "index",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+            "--no-progress-events",
+        ])
+        .output()
+        .expect("run cass index --json");
+    assert!(index_out.status.success());
+
+    for surface in ["status", "health", "triage"] {
+        let out = isolated_cass_cmd(test_home.path())
+            .args([
+                surface,
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+                "--json",
+            ])
+            .output()
+            .expect("run cass readiness surface --json");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("parse readiness surface JSON");
+        let sc = &payload["search_completeness"];
+        assert_eq!(
+            sc["quarantine_status"].as_str(),
+            Some("ok"),
+            "{surface} should report complete coverage: {payload}"
+        );
+        assert_eq!(sc["complete"].as_bool(), Some(true), "{surface}: {payload}");
+        assert_eq!(
+            sc["quarantined_conversations"].as_u64(),
+            Some(0),
+            "{surface}: {payload}"
+        );
+    }
+
+    // No quarantine => search --robot-meta omits the verdict (no new bytes).
+    let search_out = isolated_cass_cmd(test_home.path())
+        .args([
+            "search",
+            "anything",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--robot",
+            "--robot-meta",
+        ])
+        .output()
+        .expect("run cass search --robot --robot-meta");
+    let search_payload: serde_json::Value =
+        serde_json::from_slice(&search_out.stdout).expect("search JSON");
+    assert!(
+        search_payload["_meta"].get("search_completeness").is_none(),
+        "search --robot-meta should omit search_completeness when nothing is quarantined: {search_payload}"
+    );
+}
+
 #[test]
 fn status_and_health_json_escalate_recent_ingest_quarantine_bursts() {
     let test_home = tempfile::tempdir().expect("tempdir");

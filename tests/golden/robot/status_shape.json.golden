@@ -1606,6 +1606,32 @@
         }
       }
     },
+    "search_completeness": {
+      "type": "object",
+      "properties": {
+        "quarantine_status": {
+          "type": "string"
+        },
+        "quarantined_conversations": {
+          "type": "integer"
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "can_search": {
+          "type": "boolean"
+        },
+        "coverage_suspect": {
+          "type": "boolean"
+        },
+        "impact": {
+          "type": "string"
+        },
+        "next_command": {
+          "type": "string"
+        }
+      }
+    },
     "recommended_action": {
       "type": "string"
     },
@@ -1641,6 +1667,29 @@
           "retry_after_ms": {
             "type": "null"
           }
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "elapsed_ms": {
+          "type": "integer"
+        },
+        "budget_ms": {
+          "type": "integer"
+        },
+        "timed_out": {
+          "type": "boolean"
+        },
+        "skipped_sections": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "recommended_next_probe": {
+          "type": "null"
         }
       }
     },

@@ -21656,6 +21656,25 @@ fn run_cli_search(
         meta
     });
 
+    // uojcg.3.3: with --robot-meta, attach a compact search-completeness verdict
+    // to _meta when conversations are quarantined, so agents know results exclude
+    // known content (distinct from mere staleness). Skipped entirely otherwise to
+    // keep the common complete-coverage payload unchanged.
+    let search_completeness = if robot_meta {
+        let quarantine = crate::indexer::conversation_ingest_quarantine_summary(&data_dir);
+        if quarantine.quarantined_conversations > 0 || quarantine.circuit_breaker_active {
+            serde_json::to_value(crate::search::quarantine_status::project_search_completeness(
+                quarantine.quarantined_conversations as u64,
+                quarantine.circuit_breaker_active,
+            ))
+            .ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if let Some(format) = effective_robot {
         // Robot output mode (JSON)
         output_robot_results(
@@ -21675,6 +21694,7 @@ fn run_cli_search(
             has_more_results,
             total_matches_exact,
             state_meta_with_warning,
+            search_completeness,
             index_freshness,
             warning,
             &aggregations,
@@ -23589,6 +23609,10 @@ fn output_robot_results(
     has_more_results: bool,
     total_matches_exact: bool,
     state_meta: Option<serde_json::Value>,
+    // uojcg.3.3: compact search-completeness verdict, present only with
+    // --robot-meta and only when conversations are quarantined (so the common
+    // complete-coverage case stays byte-for-byte unchanged).
+    search_completeness: Option<serde_json::Value>,
     index_freshness: Option<serde_json::Value>,
     warning: Option<String>,
     aggregations: &Aggregations,
@@ -24138,6 +24162,13 @@ fn output_robot_results(
                 {
                     m.insert("index_freshness".to_string(), freshness);
                 }
+                // uojcg.3.3: surface the quarantine search-completeness verdict in
+                // --robot-meta; only present when conversations are excluded.
+                if let Some(sc) = search_completeness.as_ref()
+                    && let serde_json::Value::Object(ref mut m) = meta
+                {
+                    m.insert("search_completeness".to_string(), sc.clone());
+                }
                 // Add timeout info to _meta if timeout was configured
                 if let Some(timeout) = timeout_ms
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -24257,6 +24288,14 @@ fn output_robot_results(
                     && let Some(serde_json::Value::Object(m)) = outer.get_mut("_meta")
                 {
                     m.insert("index_freshness".to_string(), freshness);
+                }
+                // uojcg.3.3: quarantine search-completeness verdict in the jsonl
+                // _meta header; only present when conversations are excluded.
+                if let Some(sc) = search_completeness.as_ref()
+                    && let serde_json::Value::Object(ref mut outer) = meta
+                    && let Some(serde_json::Value::Object(m)) = outer.get_mut("_meta")
+                {
+                    m.insert("search_completeness".to_string(), sc.clone());
                 }
                 // Add suggestions to meta line
                 if !result.suggestions.is_empty()
@@ -24416,6 +24455,13 @@ fn output_robot_results(
                 {
                     m.insert("index_freshness".to_string(), freshness);
                 }
+                // uojcg.3.3: surface the quarantine search-completeness verdict in
+                // --robot-meta; only present when conversations are excluded.
+                if let Some(sc) = search_completeness.as_ref()
+                    && let serde_json::Value::Object(ref mut m) = meta
+                {
+                    m.insert("search_completeness".to_string(), sc.clone());
+                }
                 // Add timeout info to _meta if timeout was configured
                 if let Some(timeout) = timeout_ms
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -24533,6 +24579,13 @@ fn output_robot_results(
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
                     m.insert("index_freshness".to_string(), freshness);
+                }
+                // uojcg.3.3: surface the quarantine search-completeness verdict in
+                // --robot-meta; only present when conversations are excluded.
+                if let Some(sc) = search_completeness.as_ref()
+                    && let serde_json::Value::Object(ref mut m) = meta
+                {
+                    m.insert("search_completeness".to_string(), sc.clone());
                 }
                 if let Some(timeout) = timeout_ms
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -66471,6 +66524,16 @@ fn run_status(
             "remote_source_sync": remote_sync_value,
             "coverage_risk": coverage_value,
             "quarantine": quarantine_value,
+            // uojcg.3.3: compact "is search missing known conversations?" verdict,
+            // derived from the cheap ingest-quarantine counts above so health and
+            // status agree. `quarantine` (above) is the deep, budget-shed scan.
+            "search_completeness": serde_json::to_value(
+                crate::search::quarantine_status::project_search_completeness(
+                    quarantined_conversations,
+                    ingest_quarantine_critical,
+                ),
+            )
+            .unwrap_or(serde_json::Value::Null),
             "recommended_action": recommended_action,
             "recommended_commands": recommended_commands,
             "budget": serde_json::json!({
@@ -66678,6 +66741,26 @@ fn run_triage(
         .and_then(|index| index.get("empty_with_messages"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // uojcg.3.3: triage previously omitted quarantine entirely; surface the same
+    // cheap counts status/health use so its readiness block and search-completeness
+    // verdict agree with the other surfaces.
+    let quarantined_conversations = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("quarantined_conversations"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let ingest_quarantine_critical = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("circuit_breaker_active"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let search_completeness = serde_json::to_value(
+        crate::search::quarantine_status::project_search_completeness(
+            quarantined_conversations,
+            ingest_quarantine_critical,
+        ),
+    )
+    .unwrap_or(serde_json::Value::Null);
     let db_available = db_opened || (db_exists && db_open_retryable);
     let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
     let not_initialized =
@@ -66760,6 +66843,7 @@ fn run_triage(
         "recommended_action": recommended_action,
         "recommended_commands": recommended_commands,
         "next_command": next_command,
+        "search_completeness": search_completeness,
         "readiness": {
             "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
             "database": state.get("database").cloned().unwrap_or(serde_json::Value::Null),
@@ -66767,6 +66851,7 @@ fn run_triage(
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild_progress": rebuild_progress_summary_json(&state),
             "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
+            "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
         },
         "discovery": {
             "capabilities_command": "cass capabilities --json",
@@ -67103,6 +67188,16 @@ fn run_health(
             "coverage_risk": coverage_risk,
             "policy_registry": policy_registry,
             "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
+            // uojcg.3.3: same compact search-completeness verdict as `cass status`
+            // so the cheap health surface never contradicts status on whether
+            // quarantine makes search incomplete.
+            "search_completeness": serde_json::to_value(
+                crate::search::quarantine_status::project_search_completeness(
+                    quarantined_conversations,
+                    ingest_quarantine_critical,
+                ),
+            )
+            .unwrap_or(serde_json::Value::Null),
             "responsiveness": responsiveness,
             "parallel_wal_shadow": parallel_wal_shadow,
             // [coding_agent_session_search-yvv7r + waijq] Runtime optimization
@@ -77689,6 +77784,25 @@ fn response_schema_explanation_cards() -> serde_json::Value {
     })
 }
 
+/// JSON Schema for the uojcg.3.3 search-completeness verdict carried by the
+/// readiness surfaces (`health`/`status`/`triage`) and search `--robot-meta`.
+fn response_schema_search_completeness() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Whether quarantined conversations make search incomplete. quarantine_status=degraded means known conversations are excluded from results (distinct from a merely stale index). Ordinary search still runs (can_search=true); coverage_suspect=true when the ingest circuit breaker tripped on a recent quarantine burst. next_command is always a safe inspect/retry pointer.",
+        "properties": {
+            "quarantine_status": { "type": "string", "enum": ["ok", "degraded"] },
+            "quarantined_conversations": { "type": "integer" },
+            "complete": { "type": "boolean" },
+            "can_search": { "type": "boolean" },
+            "coverage_suspect": { "type": "boolean" },
+            "impact": { "type": "string" },
+            "next_command": { "type": "string" }
+        },
+        "required": ["quarantine_status", "quarantined_conversations", "complete", "can_search", "coverage_suspect", "impact", "next_command"]
+    })
+}
+
 fn response_schema_search_meta() -> serde_json::Value {
     response_schema_object([
         ("elapsed_ms", serde_json::json!({ "type": "integer" })),
@@ -77743,6 +77857,7 @@ fn response_schema_search_meta() -> serde_json::Value {
         ),
         ("hits_clamped", serde_json::json!({ "type": "boolean" })),
         ("state", response_schema_state_meta()),
+        ("search_completeness", response_schema_search_completeness()),
         ("index_freshness", response_schema_index_freshness()),
         (
             "timeout_ms",
@@ -78080,6 +78195,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "remote_source_sync": response_schema_doctor_remote_source_sync_runtime_summary(),
                 "coverage_risk": response_schema_doctor_coverage_risk(),
                 "quarantine": response_schema_opaque_object(),
+                "search_completeness": response_schema_search_completeness(),
                 "_meta": {
                     "type": "object",
                     "properties": {
@@ -78107,6 +78223,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "recommended_action": { "type": ["string", "null"] },
                 "recommended_commands": response_schema_recommended_commands(),
                 "next_command": { "type": ["string", "null"] },
+                "search_completeness": response_schema_search_completeness(),
                 "readiness": {
                     "type": "object",
                     "properties": {
@@ -78115,7 +78232,8 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                         "pending": response_schema_pending_state(),
                         "rebuild": response_schema_rebuild_state(),
                         "rebuild_progress": response_schema_rebuild_progress(),
-                        "semantic": response_schema_semantic_state()
+                        "semantic": response_schema_semantic_state(),
+                        "ingest_quarantine": response_schema_ingest_quarantine()
                     }
                 },
                 "discovery": {
@@ -78170,6 +78288,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "initialized",
                 "recommended_commands",
                 "next_command",
+                "search_completeness",
                 "readiness",
                 "discovery",
                 "starter_workflows",
@@ -78621,6 +78740,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "coverage_risk": response_schema_doctor_coverage_risk(),
                 "policy_registry": response_schema_policy_registry(),
                 "ingest_quarantine": response_schema_ingest_quarantine(),
+                "search_completeness": response_schema_search_completeness(),
                 "responsiveness": {
                     "type": "object",
                     "description": "Machine-responsiveness governor telemetry. Explains why the indexer is running at reduced fan-out and what pressure triggered any recent shrinkage.",

@@ -2830,6 +2830,14 @@ schemas: (auto-generated from contract)
       - parallel_search: boolean
       - preconvert_f16: boolean
       - simd_dot: boolean
+    - search_completeness: object
+      - can_search: boolean
+      - complete: boolean
+      - coverage_suspect: boolean
+      - impact: string
+      - next_command: string
+      - quarantine_status: string
+      - quarantined_conversations: integer
     - state: object
       - _meta: object
         - data_dir: string
@@ -3095,6 +3103,14 @@ schemas: (auto-generated from contract)
         - summary: string
       - request_id: ?
       - requested_search_mode: ?
+      - search_completeness: object
+        - can_search: boolean
+        - complete: boolean
+        - coverage_suspect: boolean
+        - impact: string
+        - next_command: string
+        - quarantine_status: string
+        - quarantined_conversations: integer
       - search_mode: ?
       - semantic_refinement: ?
       - state: object
@@ -3696,6 +3712,14 @@ schemas: (auto-generated from contract)
       - status: string
       - sync_gap_count: integer
       - sync_staleness: string
+    - search_completeness: object
+      - can_search: boolean
+      - complete: boolean
+      - coverage_suspect: boolean
+      - impact: string
+      - next_command: string
+      - quarantine_status: string
+      - quarantined_conversations: integer
     - semantic: object
       - availability: string
       - available: boolean
@@ -3834,6 +3858,17 @@ schemas: (auto-generated from contract)
         - stale_threshold_seconds: integer
         - stalled: boolean
         - status: string
+      - ingest_quarantine: object
+        - circuit_breaker_active: boolean
+        - circuit_breaker_limit: integer
+        - newest_last_attempt_at_ms: ?
+        - quarantine_files: array
+        - quarantined_conversations: integer
+        - recent_quarantined_conversations: integer
+        - recent_window_seconds: integer
+        - recommended_action: ?
+        - schema_version: integer
+        - status: string
       - pending: object
         - orphaned: boolean
         - sessions: integer
@@ -3904,6 +3939,14 @@ schemas: (auto-generated from contract)
     - recommended_action: ?
     - recommended_commands: array
     - schema_version: integer
+    - search_completeness: object
+      - can_search: boolean
+      - complete: boolean
+      - coverage_suspect: boolean
+      - impact: string
+      - next_command: string
+      - quarantine_status: string
+      - quarantined_conversations: integer
     - starter_workflows: array
     - status: string
     - surface: string

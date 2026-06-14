@@ -281,6 +281,15 @@
     "newest_last_attempt_at_ms": null,
     "recommended_action": null
   },
+  "search_completeness": {
+    "quarantine_status": "ok",
+    "quarantined_conversations": 0,
+    "complete": true,
+    "can_search": true,
+    "coverage_suspect": false,
+    "impact": "search covers all known conversations; nothing is quarantined",
+    "next_command": "cass status --json"
+  },
   "responsiveness": {
     "current_capacity_pct": 100,
     "resource_policy": {

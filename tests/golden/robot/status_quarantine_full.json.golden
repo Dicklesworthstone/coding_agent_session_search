@@ -810,6 +810,15 @@
     },
     "warnings": []
   },
+  "search_completeness": {
+    "quarantine_status": "ok",
+    "quarantined_conversations": 0,
+    "complete": true,
+    "can_search": true,
+    "coverage_suspect": false,
+    "impact": "search covers all known conversations; nothing is quarantined",
+    "next_command": "cass status --json"
+  },
   "recommended_action": "Run 'cass index --full' once to discover local sessions and build the initial archive.",
   "recommended_commands": [
     {
@@ -844,6 +853,13 @@
       "retry_after_ms": null
     }
   ],
+  "budget": {
+    "elapsed_ms": "[ELAPSED_MS]",
+    "budget_ms": 8000,
+    "timed_out": false,
+    "skipped_sections": [],
+    "recommended_next_probe": null
+  },
   "_meta": {
     "timestamp": "[TIMESTAMP]",
     "data_dir": "[TEST_HOME]/cass-data",

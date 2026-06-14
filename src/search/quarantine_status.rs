@@ -190,6 +190,96 @@ pub(crate) fn quarantine_status(
     }
 }
 
+/// Whether quarantine exclusions currently degrade search completeness
+/// (bead cass-fleet-resilience-20260608-uojcg.3.3). Serializes snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SearchCompletenessStatus {
+    /// Nothing is quarantined — search covers the whole archive.
+    Ok,
+    /// Conversations are quarantined — known content is excluded from results.
+    Degraded,
+}
+
+/// Compact search-completeness verdict shared by the readiness surfaces
+/// (`cass health`/`status`/`triage`) and `cass search --robot-meta`
+/// (bead cass-fleet-resilience-20260608-uojcg.3.3).
+///
+/// Stale lexical search is still usable, but quarantine *exclusions* mean known
+/// conversations are simply absent from results — a different failure than
+/// staleness. Agents need to tell the two apart. This verdict answers the one
+/// question that matters when results look thin: *is search missing known
+/// conversations, and can it still run?* It is derived from the cheap ingest
+/// quarantine summary (counts + circuit-breaker flag) so even the <50ms health
+/// surface can carry it without a filesystem walk. All fields serialize
+/// snake_case; the `next_command` is always a safe, non-destructive pointer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SearchCompleteness {
+    /// `ok` when nothing is excluded, `degraded` when conversations are quarantined.
+    pub quarantine_status: SearchCompletenessStatus,
+    /// Conversations excluded from search because they are quarantined.
+    pub quarantined_conversations: u64,
+    /// Whether search currently covers every known conversation.
+    pub complete: bool,
+    /// Whether ordinary search can still proceed. Quarantine never blocks
+    /// search — it only narrows coverage — so this stays `true`; it exists so
+    /// agents can branch on availability vs. completeness without parsing prose.
+    pub can_search: bool,
+    /// Whether coverage is *suspect* because the ingest circuit breaker tripped
+    /// on a recent quarantine burst (vs. a stable, already-triaged backlog).
+    pub coverage_suspect: bool,
+    /// One-line impact statement agents may surface verbatim.
+    pub impact: String,
+    /// The single safe next command for inspecting or retrying quarantine.
+    pub next_command: String,
+}
+
+/// Project the search-completeness verdict from the cheap ingest-quarantine
+/// facts every readiness surface already gathers
+/// (`quarantined_conversations` + `circuit_breaker_active`). Pure: no I/O.
+pub(crate) fn project_search_completeness(
+    quarantined_conversations: u64,
+    circuit_breaker_active: bool,
+) -> SearchCompleteness {
+    // Coverage is degraded when conversations are excluded OR a recent burst
+    // tripped the breaker (the breaker implies recent exclusions in practice).
+    let degraded = quarantined_conversations > 0 || circuit_breaker_active;
+    if !degraded {
+        return SearchCompleteness {
+            quarantine_status: SearchCompletenessStatus::Ok,
+            quarantined_conversations: 0,
+            complete: true,
+            can_search: true,
+            coverage_suspect: false,
+            impact: "search covers all known conversations; nothing is quarantined".to_string(),
+            next_command: "cass status --json".to_string(),
+        };
+    }
+
+    let impact = if circuit_breaker_active {
+        format!(
+            "{quarantined_conversations} conversation(s) are quarantined and the ingest circuit breaker is active; search coverage is suspect until the watcher/source path is inspected"
+        )
+    } else {
+        format!(
+            "{quarantined_conversations} conversation(s) are excluded from search after irreducible ingest quarantine; the rest of the archive is searchable"
+        )
+    };
+
+    SearchCompleteness {
+        quarantine_status: SearchCompletenessStatus::Degraded,
+        quarantined_conversations,
+        complete: false,
+        // Quarantine narrows coverage; it does not stop ordinary search.
+        can_search: true,
+        coverage_suspect: circuit_breaker_active,
+        impact,
+        // Inspect-first pointer is always safe; eligibility-aware retry lives in
+        // `quarantine_status()` / `cass index`, which the operator runs after review.
+        next_command: "cass diag --json --quarantine".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +442,70 @@ mod tests {
         assert!(json.contains("\"next_safe_command\""));
         let parsed: QuarantineStatusReport = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, report);
+    }
+
+    // --- search-completeness verdict (uojcg.3.3) ---
+
+    #[test]
+    fn completeness_is_ok_when_nothing_is_quarantined() {
+        let c = project_search_completeness(0, false);
+        assert_eq!(c.quarantine_status, SearchCompletenessStatus::Ok);
+        assert_eq!(c.quarantined_conversations, 0);
+        assert!(c.complete);
+        assert!(c.can_search);
+        assert!(!c.coverage_suspect);
+        assert_eq!(c.next_command, "cass status --json");
+    }
+
+    #[test]
+    fn completeness_is_degraded_but_searchable_for_irreducible_backlog() {
+        // Quarantined entries exist, but no recent burst (breaker inactive):
+        // search remains usable; coverage is incomplete but not suspect.
+        let c = project_search_completeness(133, false);
+        assert_eq!(c.quarantine_status, SearchCompletenessStatus::Degraded);
+        assert_eq!(c.quarantined_conversations, 133);
+        assert!(!c.complete);
+        assert!(c.can_search, "quarantine never blocks ordinary search");
+        assert!(!c.coverage_suspect);
+        assert!(c.impact.contains("133"));
+        assert!(c.impact.contains("rest of the archive is searchable"));
+        assert_eq!(c.next_command, "cass diag --json --quarantine");
+    }
+
+    #[test]
+    fn completeness_marks_coverage_suspect_when_circuit_breaker_active() {
+        let c = project_search_completeness(7, true);
+        assert_eq!(c.quarantine_status, SearchCompletenessStatus::Degraded);
+        assert!(c.coverage_suspect, "active breaker => coverage suspect");
+        assert!(c.can_search);
+        assert!(c.impact.contains("circuit breaker is active"));
+    }
+
+    #[test]
+    fn completeness_next_command_is_never_destructive() {
+        for (count, breaker) in [(0u64, false), (5, false), (5, true)] {
+            let c = project_search_completeness(count, breaker);
+            for bad in ["rm ", "--force-clean", "delete ", "DROP ", "--purge"] {
+                assert!(
+                    !c.next_command.contains(bad),
+                    "next_command must stay safe: {}",
+                    c.next_command
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completeness_enum_serializes_snake_case_and_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&SearchCompletenessStatus::Degraded).unwrap(),
+            "\"degraded\""
+        );
+        let c = project_search_completeness(2, false);
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"quarantine_status\":\"degraded\""));
+        assert!(json.contains("\"can_search\":true"));
+        let parsed: SearchCompleteness = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, c);
     }
 }

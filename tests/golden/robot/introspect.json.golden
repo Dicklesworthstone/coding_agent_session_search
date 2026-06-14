@@ -1606,6 +1606,35 @@
           ]
         },
         {
+          "name": "recover-from-archive",
+          "description": "Rebuild the source JSONL tree from the canonical archive's preserved `extra_json`/`extra_bin` events into `<DIR>`, so a corrupt archive can be re-ingested from cass's own data with `cass index --full` (no stock-sqlite `.recover` needed). Opens the archive read-only",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "rebuild-canonical-fts",
+          "description": "Drop and rebuild the canonical FTS5 shadow tables in place. Use when the canonical messages/conversations rows are intact but a derived FTS5 structure (e.g. fts_messages_docsize) is corrupt. Requires `--yes`; never modifies canonical rows",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "cleanup-interrupted-artifacts",
+          "description": "Quarantine interrupted `raw_mirror_capture` staging artifacts that block doctor mutation, instead of forcing a manual `rm` inside the data dir. Requires `--yes`; artifacts are renamed into a quarantine dir, never deleted",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2556,6 +2585,89 @@
       "description": "Token usage, tool, and model analytics",
       "arguments": [],
       "has_json_output": false
+    },
+    {
+      "name": "release-verify",
+      "description": "Verify release distribution channels (GitHub, Homebrew, Scoop, crates.io, installer)",
+      "arguments": [
+        {
+          "name": "from",
+          "description": "Read a ReleaseVerifyRequest JSON from a file (or `-` for stdin) and evaluate it offline. Mutually exclusive with --live",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "live",
+          "description": "Gather live per-channel observations over the network (explicit opt-in)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "expected-version",
+          "description": "Expected release version under test (required for --live)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "repo",
+          "description": "GitHub owner/repo for the release channel (defaults to the cass repo)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "crate-name",
+          "description": "crates.io crate name (defaults to the cass crate)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "homebrew-formula-url",
+          "description": "Raw URL of the Homebrew formula file (enables the homebrew channel)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "scoop-manifest-url",
+          "description": "Raw URL of the Scoop manifest JSON (enables the scoop channel)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works). Default for this command",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "daemon",
@@ -27077,6 +27189,46 @@
             }
           }
         },
+        "search_completeness": {
+          "type": "object",
+          "description": "Whether quarantined conversations make search incomplete. quarantine_status=degraded means known conversations are excluded from results (distinct from a merely stale index). Ordinary search still runs (can_search=true); coverage_suspect=true when the ingest circuit breaker tripped on a recent quarantine burst. next_command is always a safe inspect/retry pointer.",
+          "properties": {
+            "quarantine_status": {
+              "type": "string",
+              "enum": [
+                "ok",
+                "degraded"
+              ]
+            },
+            "quarantined_conversations": {
+              "type": "integer"
+            },
+            "complete": {
+              "type": "boolean"
+            },
+            "can_search": {
+              "type": "boolean"
+            },
+            "coverage_suspect": {
+              "type": "boolean"
+            },
+            "impact": {
+              "type": "string"
+            },
+            "next_command": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "quarantine_status",
+            "quarantined_conversations",
+            "complete",
+            "can_search",
+            "coverage_suspect",
+            "impact",
+            "next_command"
+          ]
+        },
         "responsiveness": {
           "type": "object",
           "description": "Machine-responsiveness governor telemetry. Explains why the indexer is running at reduced fan-out and what pressure triggered any recent shrinkage.",
@@ -30020,6 +30172,46 @@
                   }
                 }
               }
+            },
+            "search_completeness": {
+              "type": "object",
+              "description": "Whether quarantined conversations make search incomplete. quarantine_status=degraded means known conversations are excluded from results (distinct from a merely stale index). Ordinary search still runs (can_search=true); coverage_suspect=true when the ingest circuit breaker tripped on a recent quarantine burst. next_command is always a safe inspect/retry pointer.",
+              "properties": {
+                "quarantine_status": {
+                  "type": "string",
+                  "enum": [
+                    "ok",
+                    "degraded"
+                  ]
+                },
+                "quarantined_conversations": {
+                  "type": "integer"
+                },
+                "complete": {
+                  "type": "boolean"
+                },
+                "can_search": {
+                  "type": "boolean"
+                },
+                "coverage_suspect": {
+                  "type": "boolean"
+                },
+                "impact": {
+                  "type": "string"
+                },
+                "next_command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "quarantine_status",
+                "quarantined_conversations",
+                "complete",
+                "can_search",
+                "coverage_suspect",
+                "impact",
+                "next_command"
+              ]
             },
             "index_freshness": {
               "type": "object",
@@ -33661,6 +33853,46 @@
           "type": "object",
           "additionalProperties": true
         },
+        "search_completeness": {
+          "type": "object",
+          "description": "Whether quarantined conversations make search incomplete. quarantine_status=degraded means known conversations are excluded from results (distinct from a merely stale index). Ordinary search still runs (can_search=true); coverage_suspect=true when the ingest circuit breaker tripped on a recent quarantine burst. next_command is always a safe inspect/retry pointer.",
+          "properties": {
+            "quarantine_status": {
+              "type": "string",
+              "enum": [
+                "ok",
+                "degraded"
+              ]
+            },
+            "quarantined_conversations": {
+              "type": "integer"
+            },
+            "complete": {
+              "type": "boolean"
+            },
+            "can_search": {
+              "type": "boolean"
+            },
+            "coverage_suspect": {
+              "type": "boolean"
+            },
+            "impact": {
+              "type": "string"
+            },
+            "next_command": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "quarantine_status",
+            "quarantined_conversations",
+            "complete",
+            "can_search",
+            "coverage_suspect",
+            "impact",
+            "next_command"
+          ]
+        },
         "_meta": {
           "type": "object",
           "properties": {
@@ -33764,6 +33996,46 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "search_completeness": {
+          "type": "object",
+          "description": "Whether quarantined conversations make search incomplete. quarantine_status=degraded means known conversations are excluded from results (distinct from a merely stale index). Ordinary search still runs (can_search=true); coverage_suspect=true when the ingest circuit breaker tripped on a recent quarantine burst. next_command is always a safe inspect/retry pointer.",
+          "properties": {
+            "quarantine_status": {
+              "type": "string",
+              "enum": [
+                "ok",
+                "degraded"
+              ]
+            },
+            "quarantined_conversations": {
+              "type": "integer"
+            },
+            "complete": {
+              "type": "boolean"
+            },
+            "can_search": {
+              "type": "boolean"
+            },
+            "coverage_suspect": {
+              "type": "boolean"
+            },
+            "impact": {
+              "type": "string"
+            },
+            "next_command": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "quarantine_status",
+            "quarantined_conversations",
+            "complete",
+            "can_search",
+            "coverage_suspect",
+            "impact",
+            "next_command"
           ]
         },
         "readiness": {
@@ -34445,6 +34717,50 @@
                   }
                 }
               }
+            },
+            "ingest_quarantine": {
+              "type": "object",
+              "properties": {
+                "schema_version": {
+                  "type": "integer"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "quarantined_conversations": {
+                  "type": "integer"
+                },
+                "recent_quarantined_conversations": {
+                  "type": "integer"
+                },
+                "recent_window_seconds": {
+                  "type": "integer"
+                },
+                "circuit_breaker_limit": {
+                  "type": "integer"
+                },
+                "circuit_breaker_active": {
+                  "type": "boolean"
+                },
+                "quarantine_files": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "newest_last_attempt_at_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "recommended_action": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
             }
           }
         },
@@ -34537,6 +34853,7 @@
         "initialized",
         "recommended_commands",
         "next_command",
+        "search_completeness",
         "readiness",
         "discovery",
         "starter_workflows",
