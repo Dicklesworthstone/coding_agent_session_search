@@ -21420,6 +21420,16 @@ pub fn conversation_ingest_quarantine_summary(
 ) -> ConversationIngestQuarantineSummary {
     let quarantine_dir = data_dir.join("quarantine");
     let mut keys = BTreeSet::<(String, i64)>::new();
+    // The circuit breaker fires on a *recent burst* of quarantines. A stable,
+    // already-triaged backlog of same-version irreducible failures recurs on
+    // every refresh (same `cass_version_at_quarantine`, `last_attempt_at` bumped)
+    // but its content is already searchable from a prior pass — surfacing that as
+    // a `critical` breaker (and thus `health_level=critical`) is a misreport
+    // (#290). So `recent_keys` counts only *fresh* recent quarantines: those that
+    // are retry-eligible (version-stale/legacy/new), i.e. NOT same-version
+    // re-skips. Same-version recurrences are still counted in the total backlog
+    // (`keys`) and reported as `degraded`, just not as a `critical` burst.
+    let current_version = current_cass_version();
     let mut recent_keys = BTreeSet::<(String, i64)>::new();
     let mut quarantine_files = Vec::new();
     let mut newest_last_attempt_at_ms: Option<i64> = None;
@@ -21436,7 +21446,9 @@ pub fn conversation_ingest_quarantine_summary(
             let last_attempt_at_ms = record.last_attempt_at.timestamp_millis();
             let summary_key = (key.conversation_id, i64::from(key.schema_version));
             keys.insert(summary_key.clone());
-            if last_attempt_at_ms >= recent_cutoff_ms {
+            if last_attempt_at_ms >= recent_cutoff_ms
+                && record.is_version_stale_for_retry(current_version)
+            {
                 recent_keys.insert(summary_key);
             }
             newest_last_attempt_at_ms = Some(
@@ -21465,6 +21477,10 @@ pub fn conversation_ingest_quarantine_summary(
                 continue;
             };
             let key = poison_record_key_from_value(&value);
+            let is_fresh_quarantine = poison_record_version_needs_retry(
+                poison_record_cass_version(&value),
+                current_version,
+            );
             if let Some(last_attempt_at_ms) = value
                 .get("last_attempt_at_ms")
                 .and_then(serde_json::Value::as_i64)
@@ -21476,6 +21492,7 @@ pub fn conversation_ingest_quarantine_summary(
             {
                 if let Some(key) = key.as_ref()
                     && last_attempt_at_ms >= recent_cutoff_ms
+                    && is_fresh_quarantine
                 {
                     recent_keys.insert(key.clone());
                 }
@@ -36917,6 +36934,99 @@ mod tests {
             assert_eq!(summary.quarantined_conversations, 1);
             assert_eq!(summary.status, "degraded");
         }
+    }
+
+    /// #290: a stable, already-triaged backlog of *same-version* irreducible
+    /// quarantines (recurs on every refresh, content already searchable from a
+    /// prior pass) must NOT trip the recent-burst circuit breaker / `critical`
+    /// health, even when its size exceeds the breaker limit. It stays a
+    /// `degraded` advisory.
+    #[test]
+    #[serial]
+    fn same_version_quarantine_backlog_does_not_trip_circuit_breaker() -> Result<()> {
+        let _limit_guard = set_env("CASS_INGEST_QUARANTINE_CIRCUIT_LIMIT", "2");
+        let _window_guard = set_env("CASS_INGEST_QUARANTINE_CIRCUIT_WINDOW_SECS", "86400");
+
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        // Five same-version irreducible quarantines, all attempted "now" (recent).
+        // record_attempt stamps the CURRENT cass version, so every entry is
+        // same-version (IrreducibleSameVersion) — the already-triaged backlog.
+        let now = chrono::Utc::now();
+        let mut state = QuarantineState::default();
+        for i in 0..5 {
+            let key = QuarantineKey::new(format!("conv-stable-{i}"), 3);
+            state.record_attempt(&key, "index-ingest-out-of-memory: out of memory", now);
+        }
+        state.save(&data_dir)?;
+
+        let summary = conversation_ingest_quarantine_summary(&data_dir);
+        anyhow::ensure!(
+            summary.quarantined_conversations == 5,
+            "all five conversations are still counted in the backlog total"
+        );
+        anyhow::ensure!(
+            summary.recent_quarantined_conversations == 0,
+            "same-version re-skips must not count toward the recent burst; got {}",
+            summary.recent_quarantined_conversations
+        );
+        anyhow::ensure!(
+            !summary.circuit_breaker_active,
+            "a stable same-version backlog must not trip the breaker / critical health"
+        );
+        anyhow::ensure!(
+            summary.status == "degraded",
+            "stable searchable backlog is a degraded advisory, not critical; got {}",
+            summary.status
+        );
+        Ok(())
+    }
+
+    /// #290 (contrapositive): a *fresh* recent burst of genuinely-new
+    /// (version-stale / never-triaged-under-this-binary) quarantines still trips
+    /// the circuit breaker / `critical` health, because those conversations'
+    /// content may be absent from the published index.
+    #[test]
+    #[serial]
+    fn fresh_version_stale_quarantine_burst_still_trips_circuit_breaker() -> Result<()> {
+        let _limit_guard = set_env("CASS_INGEST_QUARANTINE_CIRCUIT_LIMIT", "2");
+        let _window_guard = set_env("CASS_INGEST_QUARANTINE_CIRCUIT_WINDOW_SECS", "86400");
+
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        let now = chrono::Utc::now();
+        let mut state = QuarantineState::default();
+        for i in 0..3 {
+            let key = QuarantineKey::new(format!("conv-fresh-{i}"), 3);
+            state.record_attempt(&key, "index-ingest-out-of-memory: out of memory", now);
+        }
+        // Rewrite each entry's version to an OLDER one so they are retry-eligible
+        // (version-stale) — i.e. a genuinely-new burst this binary has not triaged.
+        for record in state.entries.values_mut() {
+            record.cass_version_at_quarantine = Some("0.0.1-old".to_string());
+        }
+        state.save(&data_dir)?;
+
+        let summary = conversation_ingest_quarantine_summary(&data_dir);
+        anyhow::ensure!(
+            summary.recent_quarantined_conversations == 3,
+            "fresh version-stale quarantines count toward the recent burst; got {}",
+            summary.recent_quarantined_conversations
+        );
+        anyhow::ensure!(
+            summary.circuit_breaker_active,
+            "a fresh burst exceeding the limit must still trip the breaker"
+        );
+        anyhow::ensure!(
+            summary.status == "critical",
+            "a fresh burst is critical; got {}",
+            summary.status
+        );
+        Ok(())
     }
 
     #[test]
