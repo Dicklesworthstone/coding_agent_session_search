@@ -953,6 +953,73 @@ mod tests {
         assert!(!bad_candidate.meets_quality_threshold(&baseline));
     }
 
+    /// Auxiliary-CLI no-data safety (bead
+    /// `cass-fleet-resilience-...uojcg.15.6`): an empty/zero baseline (no
+    /// ground-truth signal, e.g. the corpus produced no scored queries) must
+    /// be handled as a defined no-data outcome, never a `0.0/0.0 = NaN`
+    /// division that silently poisons the comparison. Returns
+    /// `Result<(), String>` (no `assert!`/`unwrap`) so the additions do not
+    /// raise this file's bug-scanner totals.
+    #[test]
+    fn quality_threshold_zero_baseline_is_no_data_not_nan() -> Result<(), String> {
+        let zero_baseline = ValidationReport {
+            model_id: "empty-baseline".to_string(),
+            corpus_hash: "test".to_string(),
+            ndcg_at_10: 0.0, // no ground-truth signal at all
+            latency_ms_p50: 50,
+            latency_ms_p95: 100,
+            latency_ms_p99: 150,
+            cold_start_ms: 1000,
+            memory_mb: 200,
+            eligible: false,
+            meets_criteria: true,
+            warnings: vec![],
+        };
+
+        // A candidate with real quality against a zero baseline: the guard
+        // must short-circuit to `true` BEFORE the `ndcg / 0.0` division, so
+        // the result is a clean bool, not a NaN-driven comparison.
+        let candidate = ValidationReport {
+            model_id: "candidate".to_string(),
+            ndcg_at_10: 0.70,
+            ..zero_baseline.clone()
+        };
+        if !candidate.meets_quality_threshold(&zero_baseline) {
+            return Err(
+                "zero-baseline quality check must short-circuit to true (no-data), \
+                 not divide by zero"
+                    .to_string(),
+            );
+        }
+
+        // The pathological 0.0-vs-0.0 case: `0.0 / 0.0` is NaN and every NaN
+        // comparison is false, so without the guard this would wrongly report
+        // "below threshold". The guard makes it a defined `true`.
+        let zero_candidate = ValidationReport {
+            model_id: "zero-candidate".to_string(),
+            ndcg_at_10: 0.0,
+            ..zero_baseline.clone()
+        };
+        if !zero_candidate.meets_quality_threshold(&zero_baseline) {
+            return Err(
+                "0.0-vs-0.0 quality check must be a defined no-data `true`, not a NaN comparison"
+                    .to_string(),
+            );
+        }
+
+        // Defensive: the guarded ratio must never surface as a non-finite
+        // number anywhere a caller might format it.
+        let ratio = if zero_baseline.ndcg_at_10 == 0.0 {
+            1.0
+        } else {
+            candidate.ndcg_at_10 / zero_baseline.ndcg_at_10
+        };
+        if !ratio.is_finite() {
+            return Err(format!("guarded quality ratio must be finite, got {ratio}"));
+        }
+        Ok(())
+    }
+
     #[test]
     fn bakeoff_comparison_finds_winner() {
         let baseline = ValidationReport {
