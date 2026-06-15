@@ -4,10 +4,10 @@ pub mod analytics;
 pub mod bakeoff;
 pub mod bookmarks;
 pub mod connectors;
+pub mod context_pack;
 pub mod crash_replay;
 #[cfg(unix)]
 pub mod daemon;
-pub mod context_pack;
 pub mod dependency_drift;
 pub mod dependency_pin_correlation;
 pub mod doctor;
@@ -39,6 +39,7 @@ pub mod privacy_exposure;
 pub mod proof_artifact;
 pub mod query_cost_planner;
 pub mod raw_mirror;
+pub(crate) mod recipes_robot_docs;
 pub(crate) mod recovery_support_bundle;
 pub mod release_verify;
 pub mod repro_capsule;
@@ -2334,6 +2335,9 @@ pub enum RobotTopic {
     /// `cass doctor` agent handbook (added in world-class-doctor pass-2).
     /// Body lives in `src/doctor_robot_docs.rs`.
     Doctor,
+    /// Canonical recovery + workflow recipes from the 2026-06-08 fleet report
+    /// (bead .11.3). Body lives in `src/recipes_robot_docs.rs`.
+    Recipes,
 }
 
 /// Output format for robot/automation mode
@@ -8649,10 +8653,7 @@ fn run_swarm_replay_fixture(
         let source = set
             .input()
             .source_value(crate::swarm_status::SwarmProviderName::ReplayFixture);
-        crate::swarm_replay_fixture::render_replay_fixture_fixture(
-            set.input().fixture_id(),
-            source,
-        )
+        crate::swarm_replay_fixture::render_replay_fixture_fixture(set.input().fixture_id(), source)
     } else {
         crate::swarm_replay_fixture::render_replay_fixture_live()
     };
@@ -19038,6 +19039,10 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             .lines()
             .map(|s| s.to_string())
             .collect(),
+        RobotTopic::Recipes => crate::recipes_robot_docs::recipes_robot_docs_body()
+            .lines()
+            .map(|s| s.to_string())
+            .collect(),
     };
 
     println!("{}", render_block(&lines, wrap));
@@ -20463,7 +20468,9 @@ mod search_lexical_self_heal_tests {
             false,
             true,
         )
-        .expect_err("robot search must refuse the heavyweight inline rebuild with a bounded verdict");
+        .expect_err(
+            "robot search must refuse the heavyweight inline rebuild with a bounded verdict",
+        );
         assert_eq!(err.kind, "checkpoint_incomplete");
         assert_eq!(err.code, 5);
         assert!(err.retryable);
@@ -21664,10 +21671,12 @@ fn run_cli_search(
     let search_completeness = if robot_meta {
         let quarantine = crate::indexer::conversation_ingest_quarantine_summary(&data_dir);
         if quarantine.quarantined_conversations > 0 || quarantine.circuit_breaker_active {
-            serde_json::to_value(crate::search::quarantine_status::project_search_completeness(
-                quarantine.quarantined_conversations as u64,
-                quarantine.circuit_breaker_active,
-            ))
+            serde_json::to_value(
+                crate::search::quarantine_status::project_search_completeness(
+                    quarantine.quarantined_conversations as u64,
+                    quarantine.circuit_breaker_active,
+                ),
+            )
             .ok()
         } else {
             None
@@ -62269,8 +62278,9 @@ paths = ["~/.claude/projects"]
         // status tokens, or human-readable preservation prose. They must never be a
         // raw transport/shell invocation (which could carry destructive flags) and
         // must never redirect output over a source log.
-        const RAW_INVOCATION_BINARIES: &[&str] =
-            &["rsync", "scp", "ssh", "sftp", "sh", "bash", "zsh", "rm", "rmdir", "shred"];
+        const RAW_INVOCATION_BINARIES: &[&str] = &[
+            "rsync", "scp", "ssh", "sftp", "sh", "bash", "zsh", "rm", "rmdir", "shred",
+        ];
         for advice in &advice_strings {
             let trimmed = advice.trim();
             if let Some(first_token) = trimmed.split_whitespace().next() {
@@ -66346,7 +66356,9 @@ mod root_cause_signal_gather_tests {
         let failed = serde_json::json!({"semantic": {"availability": "load_failed"}});
         assert!(gather_projection_signals_from_state(&failed, None).semantic_requested_but_missing);
         let absent = serde_json::json!({"semantic": {"availability": "not_initialized"}});
-        assert!(!gather_projection_signals_from_state(&absent, None).semantic_requested_but_missing);
+        assert!(
+            !gather_projection_signals_from_state(&absent, None).semantic_requested_but_missing
+        );
     }
 
     #[test]
@@ -66644,9 +66656,12 @@ fn run_status(
                     serde_json::to_value(&doctor_summary).unwrap_or(serde_json::Value::Null),
                 )
             } else {
-                for section in
-                    ["quarantine", "coverage_risk", "remote_source_sync", "doctor_summary"]
-                {
+                for section in [
+                    "quarantine",
+                    "coverage_risk",
+                    "remote_source_sync",
+                    "doctor_summary",
+                ] {
                     skipped_sections.push(section.to_string());
                 }
                 (
@@ -74667,13 +74682,18 @@ async fn run_release_verify(
         let version = expected_version.ok_or_else(|| {
             CliError::usage(
                 "--live requires --expected-version <v>",
-                Some("Pass the release version under test, e.g. --expected-version 0.6.13.".to_string()),
+                Some(
+                    "Pass the release version under test, e.g. --expected-version 0.6.13."
+                        .to_string(),
+                ),
             )
         })?;
         let config = LiveGatherConfig {
             expected_version: version.to_string(),
             repo: repo.unwrap_or(RELEASE_VERIFY_DEFAULT_REPO).to_string(),
-            crate_name: crate_name.unwrap_or(RELEASE_VERIFY_DEFAULT_CRATE).to_string(),
+            crate_name: crate_name
+                .unwrap_or(RELEASE_VERIFY_DEFAULT_CRATE)
+                .to_string(),
             homebrew_formula_url: homebrew_formula_url.map(str::to_string),
             scoop_manifest_url: scoop_manifest_url.map(str::to_string),
         };
@@ -74788,7 +74808,10 @@ fn gather_live_release_observations(
         probe_json_version(
             &client,
             ReleaseChannel::GithubRelease,
-            &format!("https://api.github.com/repos/{}/releases/latest", config.repo),
+            &format!(
+                "https://api.github.com/repos/{}/releases/latest",
+                config.repo
+            ),
             "tag_name",
         )
         .unwrap_or_else(|| unreachable(ReleaseChannel::GithubRelease)),
@@ -74915,7 +74938,12 @@ fn extract_formula_version(body: &str) -> Option<String> {
             let rest = rest.trim();
             let inner = rest.trim_start_matches(['=', ' ']).trim();
             let value = inner.trim_matches(['"', '\'']);
-            if !value.is_empty() && value.chars().next().is_some_and(|c| c.is_ascii_digit() || c == 'v') {
+            if !value.is_empty()
+                && value
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit() || c == 'v')
+            {
                 return Some(value.to_string());
             }
         }
@@ -78069,10 +78097,7 @@ fn response_schema_search_meta() -> serde_json::Value {
             serde_json::json!({ "type": ["boolean", "null"] }),
         ),
         // Truthful refinement level + typed fallback reason (bead .5.4).
-        (
-            "refinement_level",
-            serde_json::json!({ "type": "string" }),
-        ),
+        ("refinement_level", serde_json::json!({ "type": "string" })),
         (
             "semantic_fallback_reason",
             serde_json::json!({ "type": ["string", "null"] }),
@@ -81514,7 +81539,9 @@ impl IndexStallWatchdog {
         // slow-but-active sort/rebuild (#294) is never killed. The
         // `abort_threshold` (default 300 s of zero forward progress) remains
         // the outer safety margin on top of that.
-        let total = index_progress.total.load(std::sync::atomic::Ordering::Relaxed);
+        let total = index_progress
+            .total
+            .load(std::sync::atomic::Ordering::Relaxed);
         let finalize_wedge =
             total > 0 && current >= total && index_progress.rebuild_pipeline_is_quiescent();
         let abort_eligible = phase_code == 2 || finalize_wedge;

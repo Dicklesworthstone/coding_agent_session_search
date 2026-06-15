@@ -167,6 +167,14 @@ fn robot_docs_analytics_matches_golden() {
     );
 }
 
+#[test]
+fn robot_docs_recipes_matches_golden() {
+    // Bead .11.3: canonical recovery + workflow recipes topic. Body lives in
+    // src/recipes_robot_docs.rs; the safety/completeness invariants are pinned
+    // in tests/spec_robot_docs_topics.rs.
+    assert_golden("robot_docs/recipes.txt.golden", &capture_docs("recipes"));
+}
+
 /// Capture plain-text `--robot-help` output in an isolated home. The
 /// robot-help string is the top-level "start here" contract surface
 /// agents read on first contact; keeping it stable is load-bearing.
