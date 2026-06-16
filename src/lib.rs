@@ -56,6 +56,7 @@ pub mod source_doctor_health;
 pub mod source_onboarding;
 pub mod sources;
 pub mod storage;
+pub mod subsystem_coverage_matrix;
 pub mod swarm_replay_fixture;
 pub mod swarm_status;
 pub mod top_session_summary;
