@@ -717,16 +717,15 @@ fn git_output(repo_root: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn emit_vergen_metadata() {
-    use vergen::{BuildBuilder, CargoBuilder, Emitter};
+    use vergen::{Build, Cargo, Emitter};
 
+    // vergen 10 replaced the `XxxBuilder::all_*()` constructors (which returned a
+    // `Result`) with bon-based config structs whose `all_*()` associated fns
+    // return the value directly. `Build::all_build()` / `Cargo::all_cargo()`
+    // preserve the previous "emit every build/cargo instruction" behavior.
     let mut emitter = Emitter::default();
-
-    if let Ok(build) = BuildBuilder::all_build() {
-        let _ = emitter.add_instructions(&build);
-    }
-    if let Ok(cargo) = CargoBuilder::all_cargo() {
-        let _ = emitter.add_instructions(&cargo);
-    }
+    let _ = emitter.add_instructions(&Build::all_build());
+    let _ = emitter.add_instructions(&Cargo::all_cargo());
 
     if let Err(err) = emitter.emit() {
         eprintln!("vergen emit skipped: {err}");

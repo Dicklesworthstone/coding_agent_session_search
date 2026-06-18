@@ -991,7 +991,7 @@ dependencies = [
  "image",
  "indicatif",
  "insta",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "itoa",
  "lru 0.18.0",
  "memmap2",
@@ -1029,7 +1029,7 @@ dependencies = [
  "strsim",
  "syntect",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "toml",
  "tracing",
  "tracing-appender",
@@ -1039,7 +1039,7 @@ dependencies = [
  "unicode-width",
  "url",
  "urlencoding",
- "vergen",
+ "vergen 10.0.0",
  "wait-timeout",
  "walkdir",
  "which",
@@ -4325,6 +4325,15 @@ name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
 dependencies = [
  "either",
 ]
@@ -7839,7 +7848,20 @@ dependencies = [
  "rustc_version",
  "rustversion",
  "time",
- "vergen-lib",
+ "vergen-lib 9.1.0",
+]
+
+[[package]]
+name = "vergen"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bdf18a54cf91b4d98a8e8b67f6321606539fbcdcac02536286ad1de37b53fd2"
+dependencies = [
+ "anyhow",
+ "bon",
+ "rustversion",
+ "time",
+ "vergen-lib 10.0.0",
 ]
 
 [[package]]
@@ -7853,8 +7875,8 @@ dependencies = [
  "gix",
  "rustversion",
  "time",
- "vergen",
- "vergen-lib",
+ "vergen 9.1.0",
+ "vergen-lib 9.1.0",
 ]
 
 [[package]]
@@ -7865,6 +7887,17 @@ checksum = "b34a29ba7e9c59e62f229ae1932fb1b8fb8a6fdcc99215a641913f5f5a59a569"
 dependencies = [
  "anyhow",
  "derive_builder",
+ "rustversion",
+]
+
+[[package]]
+name = "vergen-lib"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "910e8471e27130bbc019e9bfa6bda16dfc4c6dd7c5d0793da70a9256caeae984"
+dependencies = [
+ "anyhow",
+ "bon",
  "rustversion",
 ]
 
