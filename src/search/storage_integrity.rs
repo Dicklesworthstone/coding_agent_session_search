@@ -217,15 +217,19 @@ impl StorageIntegrityReport {
 /// today — without the schema-version / WAL / busy-lock probes that `.14.2`
 /// (salvage planner) and `.14.3` (contention classifier) still owe. Every field
 /// is observed by `run_doctor_impl`'s existing database + lexical-index checks
-/// (db-open result, the bounded integrity probe, the DB-resident FTS table
-/// probe, and the Tantivy index-vs-DB drift check); nothing new is probed here.
+/// (db-open result, the bounded integrity probe, and the Tantivy index-vs-DB
+/// drift check); nothing new is probed here.
 ///
-/// The four states that need the unstarted probes — `SchemaDrift`,
-/// `LegacyInteropFailed`, `WalSidecarSuspect`, `BusyOrLocked` — are NOT derived
-/// from these signals. A doctor run that only sees a generic open/integrity
-/// failure honestly reports the coarser [`StorageState::OpenreadFailed`] /
-/// [`StorageState::IntegrityFailed`] rather than over-claiming a precise cause
-/// it cannot prove.
+/// The five states that need probes doctor does not yet run — `SchemaDrift`,
+/// `LegacyInteropFailed`, `WalSidecarSuspect`, `BusyOrLocked`, and
+/// `FtsMetadataFailed` — are NOT derived from these signals. A doctor run that
+/// only sees a generic open/integrity failure honestly reports the coarser
+/// [`StorageState::OpenreadFailed`] / [`StorageState::IntegrityFailed`] rather
+/// than over-claiming a precise cause it cannot prove. (`FtsMetadataFailed` is
+/// deferred because doctor's `fts_table` probe cannot distinguish a *benign*
+/// absent in-DB `fts_messages` shadow — which it reports as `pass`, since
+/// lexical search falls back to the Tantivy index — from a genuinely corrupt
+/// one; deriving a failure from the benign case would contradict that `pass`.)
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct DoctorStorageSignals {
     /// The canonical `agent_search.db` file is present on disk.
@@ -241,9 +245,6 @@ pub(crate) struct DoctorStorageSignals {
     /// The DB opened but its row/integrity probe could not complete (a read
     /// failed), so integrity could not be confirmed either way.
     pub integrity_unverified: bool,
-    /// The DB-resident `fts_messages` table was absent or not queryable
-    /// (canonical rows survive; only the in-DB FTS shadow is suspect).
-    pub fts_table_missing: bool,
     /// The derived lexical (Tantivy) index drifted from an intact DB — empty,
     /// missing, or unreadable while the canonical rows survive.
     pub lexical_index_drifted: bool,
@@ -274,9 +275,12 @@ impl DoctorStorageSignals {
                 (StorageState::IntegrityFailed, ArchiveReadability::Unreadable)
             } else if self.lexical_index_drifted {
                 (StorageState::DerivedOnlyDrift, ArchiveReadability::Readable)
-            } else if self.fts_table_missing {
-                (StorageState::FtsMetadataFailed, ArchiveReadability::Readable)
             } else {
+                // Canonical DB opened, integrity passed, derived assets in sync.
+                // An absent in-DB `fts_messages` shadow is intentionally NOT
+                // escalated here (see the struct docs): doctor reports it as a
+                // benign `pass` because lexical search falls back to Tantivy, so
+                // claiming `FtsMetadataFailed` would contradict that verdict.
                 (StorageState::Ok, ArchiveReadability::Readable)
             }
         } else if self.not_initialized {
@@ -570,17 +574,6 @@ mod tests {
             drift.classify(),
             (StorageState::DerivedOnlyDrift, ArchiveReadability::Readable)
         );
-
-        // Healthy DB, absent in-DB FTS shadow table.
-        let fts = DoctorStorageSignals {
-            db_file_present: true,
-            fts_table_missing: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            fts.classify(),
-            (StorageState::FtsMetadataFailed, ArchiveReadability::Readable)
-        );
     }
 
     #[test]
@@ -631,7 +624,6 @@ mod tests {
             db_open_failed: true,
             integrity_failed: true,
             lexical_index_drifted: true,
-            fts_table_missing: true,
             ..Default::default()
         };
         assert_eq!(everything.classify().0, StorageState::OpenreadFailed);
@@ -644,15 +636,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(integ_over_drift.classify().0, StorageState::IntegrityFailed);
-
-        // Derived-asset drift outranks a benign absent in-DB FTS shadow.
-        let drift_over_fts = DoctorStorageSignals {
-            db_file_present: true,
-            lexical_index_drifted: true,
-            fts_table_missing: true,
-            ..Default::default()
-        };
-        assert_eq!(drift_over_fts.classify().0, StorageState::DerivedOnlyDrift);
     }
 
     #[test]

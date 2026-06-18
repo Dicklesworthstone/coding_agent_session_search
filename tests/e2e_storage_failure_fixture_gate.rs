@@ -1626,10 +1626,12 @@ fn duplicate_label_failure(label: &str) -> String {
 // surfaces, the per-fixture checks tighten to assert it directly").
 //
 // What doctor can derive today (bead vl1cj split): `ok`, `openread_failed`,
-// `integrity_failed`, `fts_metadata_failed`, `derived_only_drift` (+ the
-// `unknown_deferred` fallback). The precise `schema_drift` / `legacy_interop_failed`
-// / `wal_sidecar_suspect` / `busy_or_locked` causes need the unstarted
-// `.14.2`/`.14.3` schema-version / WAL / busy probes, so for those fixtures the
+// `integrity_failed`, `derived_only_drift` (+ the `unknown_deferred` fallback).
+// The precise `schema_drift` / `legacy_interop_failed` / `wal_sidecar_suspect` /
+// `busy_or_locked` causes need the unstarted `.14.2`/`.14.3` schema-version / WAL
+// / busy probes; `fts_metadata_failed` is likewise deferred because doctor's
+// `fts_table` probe cannot tell a benign absent in-DB `fts_messages` shadow (it
+// reports that as `pass`) from a genuinely corrupt one. For those fixtures the
 // gate pins the coarser observed state and the precise `expected_storage_state`
 // stays forward metadata until those probes land (follow-on).
 

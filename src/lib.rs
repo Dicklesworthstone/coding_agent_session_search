@@ -70985,7 +70985,6 @@ pub(crate) fn run_doctor_impl(
     let mut storage_integrity_failed = false;
     let mut storage_integrity_unverified = false;
     let mut storage_probe_timed_out = false;
-    let mut storage_fts_table_missing = false;
     let mut storage_lexical_index_drifted = false;
     let mut auto_fix_actions: Vec<String> = Vec::new();
     let mut auto_fix_applied = false;
@@ -71312,7 +71311,11 @@ pub(crate) fn run_doctor_impl(
                                         Some(DoctorFtsTableState::Missing {
                                             frankensqlite_error,
                                         }) => {
-                                            storage_fts_table_missing = true;
+                                            // An absent in-DB FTS shadow is benign
+                                            // here (lexical search falls back to
+                                            // Tantivy), so it does NOT feed the
+                                            // storage_state derivation — doctor
+                                            // reports it as a `pass` below.
                                             add_check!(
                                                 "fts_table",
                                                 "pass",
@@ -71483,9 +71486,9 @@ pub(crate) fn run_doctor_impl(
     // `StorageState` / `SourceOfTruthRisk` / `ArchiveReadability` contract so
     // doctor robot JSON projects the same vocabulary status/search-meta will.
     // Derivable today: ok / openread_failed / integrity_failed /
-    // fts_metadata_failed / derived_only_drift (+ unknown_deferred fallback).
-    // The schema_drift / legacy_interop_failed / wal_sidecar_suspect /
-    // busy_or_locked states need the unstarted `.14.2`/`.14.3` probes and are
+    // derived_only_drift (+ unknown_deferred fallback). The schema_drift /
+    // legacy_interop_failed / wal_sidecar_suspect / busy_or_locked /
+    // fts_metadata_failed states need probes doctor does not yet run and are
     // intentionally NOT claimed here.
     let storage_integrity_report = {
         use crate::search::storage_integrity::{
@@ -71519,7 +71522,6 @@ pub(crate) fn run_doctor_impl(
             probe_timed_out: storage_probe_timed_out,
             integrity_failed: storage_integrity_failed,
             integrity_unverified: storage_integrity_unverified,
-            fts_table_missing: storage_fts_table_missing,
             lexical_index_drifted: storage_lexical_index_drifted,
         };
         build_doctor_storage_integrity(signals, storage_checks)
