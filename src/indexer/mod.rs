@@ -23258,6 +23258,50 @@ fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
     }
 }
 
+/// Collapse a Claude Code `external_id` to a single canonical rooting so that
+/// the full-rebuild and incremental/watch ingest paths agree on the dedup key
+/// `(source_id, agent_id, external_id)` for the *same* session file (gh #302).
+///
+/// The Claude connector derives `external_id` by stripping the scan root from
+/// the session path. The two ingest paths use *different* scan roots for the
+/// same corpus:
+///
+/// - Full rebuild (`ScanContext::local_default` → `source_roots` →
+///   `projects_root_candidates()`) roots at `~/.claude/projects`, yielding a
+///   bare relative id: `-Users-…-proj/<uuid>.jsonl`.
+/// - The live `--watch` daemon roots at the connector's detected root
+///   (`detect_installed_agents` reports `~/.claude` for `claude`), yielding a
+///   `projects/`-prefixed id: `projects/-Users-…-proj/<uuid>.jsonl`.
+///
+/// Because the two forms differ only by the leading `projects/` segment, the
+/// path that runs second fails to match the existing row and inserts a
+/// duplicate. Canonicalizing to the bare form (the full-rebuild rooting) at this
+/// single ingest chokepoint makes every path produce one stable key, so dedup
+/// matches an existing row instead of accumulating duplicates as the watcher
+/// runs.
+fn canonicalize_claude_external_id(connector_name: &str, conv: &mut NormalizedConversation) {
+    if connector_name != "claude" {
+        return;
+    }
+    let Some(external_id) = conv.external_id.as_ref() else {
+        return;
+    };
+    // The connector emits OS-native separators from `Path::strip_prefix`, so
+    // strip a single leading `projects/` (or `projects\` on Windows) segment.
+    let canonical = external_id
+        .strip_prefix("projects/")
+        .or_else(|| external_id.strip_prefix("projects\\"));
+    if let Some(canonical) = canonical {
+        // Never canonicalize a bare `projects/<uuid>.jsonl` (no intervening
+        // workspace segment) away into a workspace-less id; the real Claude
+        // layout always has a `<workspace-slug>/<uuid>.jsonl` tail, so a stripped
+        // form that still contains a separator is the genuine bare relative id.
+        if canonical.contains('/') || canonical.contains('\\') {
+            conv.external_id = Some(canonical.to_string());
+        }
+    }
+}
+
 fn prepare_conversation_for_ingest(
     data_dir: &Path,
     connector_name: &str,
@@ -23266,6 +23310,7 @@ fn prepare_conversation_for_ingest(
     conv: &mut NormalizedConversation,
 ) {
     inject_provenance(conv, origin);
+    canonicalize_claude_external_id(connector_name, conv);
     if let Some(root) = workspace_rewrite_root {
         apply_workspace_rewrite(conv, root);
     }
@@ -45839,6 +45884,63 @@ mod tests {
                 CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES
             ))
         );
+    }
+
+    #[test]
+    fn claude_external_id_canonicalized_so_full_and_watch_paths_dedupe() {
+        // gh #302: the full-rebuild path roots Claude at `~/.claude/projects`
+        // (bare relative id) while the live `--watch` daemon roots at
+        // `~/.claude` (detect_installed_agents reports `~/.claude`), yielding a
+        // `projects/`-prefixed id for the SAME session file. Canonicalization at
+        // the ingest chokepoint must collapse both to one stable dedup key.
+        let rel = "-Users-mrm-Developer-proj/7b85f067-dead-beef-cafe-000000000000.jsonl";
+
+        // Full-rebuild form (bare).
+        let mut bare = norm_conv(Some(rel), vec![]);
+        bare.agent_slug = "claude".into();
+        canonicalize_claude_external_id("claude", &mut bare);
+
+        // Watch-daemon form (projects/-prefixed) for the identical session.
+        let mut prefixed = norm_conv(Some(&format!("projects/{rel}")), vec![]);
+        prefixed.agent_slug = "claude".into();
+        canonicalize_claude_external_id("claude", &mut prefixed);
+
+        assert_eq!(
+            bare.external_id, prefixed.external_id,
+            "both ingest paths must produce the same external_id for the same session"
+        );
+        assert_eq!(
+            bare.external_id.as_deref(),
+            Some(rel),
+            "canonical form is the bare full-rebuild rooting"
+        );
+    }
+
+    #[test]
+    fn claude_external_id_canonicalize_is_scoped_and_conservative() {
+        // Only the `claude` connector is touched; other connectors that may
+        // legitimately carry a leading `projects/` segment are left untouched.
+        let mut codex = norm_conv(Some("projects/foo/bar.jsonl"), vec![]);
+        canonicalize_claude_external_id("codex", &mut codex);
+        assert_eq!(codex.external_id.as_deref(), Some("projects/foo/bar.jsonl"));
+
+        // A degenerate id with no workspace segment after `projects/` is left
+        // alone — stripping it would invent a bare uuid id that never collides
+        // with a real `<workspace>/<uuid>.jsonl` key, so this can only be a
+        // genuinely different id (defensive: never over-strip).
+        let mut shallow = norm_conv(Some("projects/loose.jsonl"), vec![]);
+        canonicalize_claude_external_id("claude", &mut shallow);
+        assert_eq!(shallow.external_id.as_deref(), Some("projects/loose.jsonl"));
+
+        // Already-bare ids are unchanged.
+        let mut bare = norm_conv(Some("-Users-x-proj/abc.jsonl"), vec![]);
+        canonicalize_claude_external_id("claude", &mut bare);
+        assert_eq!(bare.external_id.as_deref(), Some("-Users-x-proj/abc.jsonl"));
+
+        // None stays None.
+        let mut empty = norm_conv(None, vec![]);
+        canonicalize_claude_external_id("claude", &mut empty);
+        assert_eq!(empty.external_id, None);
     }
 
     #[test]
