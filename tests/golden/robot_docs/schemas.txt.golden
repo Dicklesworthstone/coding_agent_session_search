@@ -3145,6 +3145,11 @@ schemas: (auto-generated from contract)
         - policy_registry: object
         - rebuild: object
         - semantic: object
+      - storage_integrity: object
+        - archive_readability: string
+        - checks_attempted: array
+        - source_of_truth_risk: string
+        - storage_state: string
       - timed_out: ?
       - timeout_ms: ?
       - timing: object
@@ -3814,6 +3819,11 @@ schemas: (auto-generated from contract)
       - summary: string
       - vector_index_path: ?
     - status: string
+    - storage_integrity: object
+      - archive_readability: string
+      - checks_attempted: array
+      - source_of_truth_risk: string
+      - storage_state: string
     - topology_budget: object
       - advisory_budgets: object
         - cache_cap_bytes: integer
