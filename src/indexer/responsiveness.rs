@@ -1385,20 +1385,84 @@ fn default_max_inflight_bytes_for_available(available_bytes: Option<u64>) -> usi
 }
 
 pub(crate) fn available_memory_bytes() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    proc_kib_field_bytes(&meminfo, "MemAvailable:")
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        proc_kib_field_bytes(&meminfo, "MemAvailable:")
+    }
+    // #294: on macOS there is no `/proc/meminfo`, so the Linux probe returned
+    // `None` and the entire host-memory-reserve throttle in the lexical
+    // rebuild pipeline was silently disabled — letting the post-ingest
+    // sort/rebuild peak push a 16 GB Mac into red memory pressure. Parse
+    // `vm_stat` (pages free + inactive + speculative + purgeable ≈ reclaimable
+    // memory) so the throttle actually engages.
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("vm_stat").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        macos_available_memory_bytes_from_vm_stat(&text)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 pub(crate) fn total_memory_bytes() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    proc_kib_field_bytes(&meminfo, "MemTotal:")
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        proc_kib_field_bytes(&meminfo, "MemTotal:")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .ok()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 pub(crate) fn process_resident_memory_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    proc_kib_field_bytes(&status, "VmRSS:")
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        proc_kib_field_bytes(&status, "VmRSS:")
+    }
+    // macOS: `ps -o rss=` reports resident set size in KiB for our own pid.
+    #[cfg(target_os = "macos")]
+    {
+        let pid = std::process::id().to_string();
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        macos_rss_kib_to_bytes(&String::from_utf8_lossy(&output.stdout))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn proc_kib_field_bytes(contents: &str, prefix: &str) -> Option<u64> {
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix(prefix) {
@@ -1409,10 +1473,132 @@ fn proc_kib_field_bytes(contents: &str, prefix: &str) -> Option<u64> {
     None
 }
 
+/// Parse `vm_stat` output into reclaimable bytes. `vm_stat` reports a page size
+/// header (`page size of N bytes`) and per-state page counts. We sum the page
+/// classes that are genuinely reclaimable under pressure — free, inactive,
+/// speculative, and purgeable — which approximates Linux `MemAvailable`. Kept
+/// pure (no command execution) so it is testable on any platform.
+#[cfg(any(target_os = "macos", test))]
+fn macos_available_memory_bytes_from_vm_stat(text: &str) -> Option<u64> {
+    let mut page_size: u64 = 4096;
+    let mut pages_free: u64 = 0;
+    let mut pages_inactive: u64 = 0;
+    let mut pages_speculative: u64 = 0;
+    let mut pages_purgeable: u64 = 0;
+    let mut saw_any = false;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(idx) = line.find("page size of") {
+            // "Mach Virtual Memory Statistics: (page size of 16384 bytes)"
+            let rest = &line[idx + "page size of".len()..];
+            if let Some(n) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|t| t.parse::<u64>().ok())
+            {
+                page_size = n;
+            }
+            continue;
+        }
+        let Some((label, value)) = line.split_once(':') else {
+            continue;
+        };
+        let pages = value
+            .trim()
+            .trim_end_matches('.')
+            .split_whitespace()
+            .next()
+            .and_then(|t| t.parse::<u64>().ok());
+        let Some(pages) = pages else { continue };
+        match label.trim() {
+            "Pages free" => {
+                pages_free = pages;
+                saw_any = true;
+            }
+            "Pages inactive" => {
+                pages_inactive = pages;
+                saw_any = true;
+            }
+            "Pages speculative" => {
+                pages_speculative = pages;
+                saw_any = true;
+            }
+            "Pages purgeable" => {
+                pages_purgeable = pages;
+                saw_any = true;
+            }
+            _ => {}
+        }
+    }
+
+    if !saw_any {
+        return None;
+    }
+    let reclaimable_pages = pages_free
+        .saturating_add(pages_inactive)
+        .saturating_add(pages_speculative)
+        .saturating_add(pages_purgeable);
+    reclaimable_pages.checked_mul(page_size)
+}
+
+/// Parse `ps -o rss=` output (resident set size in KiB) into bytes. Pure +
+/// testable.
+#[cfg(any(target_os = "macos", test))]
+fn macos_rss_kib_to_bytes(text: &str) -> Option<u64> {
+    text.trim()
+        .lines()
+        .next()?
+        .trim()
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// #294: the macOS `vm_stat` parser turns reclaimable page counts into bytes
+    /// using the reported page size, so the host-memory-reserve throttle (which
+    /// was silently disabled on macOS because `/proc/meminfo` is absent) can
+    /// engage. Pure, so testable on Linux CI.
+    #[test]
+    fn macos_vm_stat_parser_sums_reclaimable_pages_at_page_size() {
+        let sample = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+             Pages free:                               100.\n\
+             Pages active:                            5000.\n\
+             Pages inactive:                           200.\n\
+             Pages speculative:                         50.\n\
+             Pages wired down:                        3000.\n\
+             Pages purgeable:                           10.\n";
+        // (100 + 200 + 50 + 10) pages * 16384 bytes/page = 360 * 16384.
+        let expected = 360u64 * 16384;
+        assert_eq!(
+            macos_available_memory_bytes_from_vm_stat(sample),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn macos_vm_stat_parser_defaults_page_size_and_rejects_empty() {
+        // No recognizable page lines -> None (caller falls back to no throttle,
+        // exactly as before this fix on unknown platforms).
+        assert_eq!(macos_available_memory_bytes_from_vm_stat("garbage\n"), None);
+        // Missing the page-size header defaults to 4096.
+        let sample = "Pages free: 10.\nPages inactive: 0.\n";
+        assert_eq!(
+            macos_available_memory_bytes_from_vm_stat(sample),
+            Some(10 * 4096)
+        );
+    }
+
+    #[test]
+    fn macos_rss_parser_converts_kib_to_bytes() {
+        assert_eq!(macos_rss_kib_to_bytes("  204800\n"), Some(204800 * 1024));
+        assert_eq!(macos_rss_kib_to_bytes("not-a-number"), None);
+    }
 
     fn cfg() -> GovernorConfig {
         GovernorConfig {

@@ -1366,6 +1366,27 @@ pub enum Commands {
     /// Inspect and manage the conversation-ingest quarantine (list / clear)
     #[command(subcommand)]
     Quarantine(QuarantineCommand),
+    /// Prune an already-indexed subset of conversations by source-path glob
+    /// (dry-run by default; `--apply` to commit). Removes matching rows from the
+    /// canonical DB and rebuilds derived search/analytics assets.
+    Forget {
+        /// Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`).
+        #[arg(long = "source-glob")]
+        source_glob: String,
+
+        /// Override db path
+        #[arg(long)]
+        db: Option<PathBuf>,
+
+        /// Actually delete the matching conversations. Without this, runs as a
+        /// dry-run (inspect only).
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
     /// Inspect and prune raw-mirror evidence under explicit operator control
     #[command(subcommand)]
     Mirror(MirrorCommand),
@@ -1478,6 +1499,35 @@ pub enum QuarantineCommand {
         filter: Option<String>,
 
         /// Actually remove the matching entries. Without this, runs as a dry-run (inspect only).
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+    /// Re-attempt retry-eligible quarantined conversations (bounded; dry-run by
+    /// default). Clears eligible (legacy / version-stale) entries so they are
+    /// re-ingested on the next `cass index` pass; irreducible same-version
+    /// entries are reported but never cleared unless `--force-irreducible`.
+    Retry {
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Cap the number of entries attempted in this pass (bounded, resumable).
+        /// Omit to attempt every eligible entry. Deferred entries are reported,
+        /// never dropped — re-run to resume.
+        #[arg(long)]
+        max_attempts: Option<usize>,
+
+        /// Also retry irreducible same-version entries (an explicit operator
+        /// override of the safe eligible-only default).
+        #[arg(long, default_value_t = false)]
+        force_irreducible: bool,
+
+        /// Actually clear eligible entries so the next index re-ingests them.
+        /// Without this, runs as a dry-run (classify only).
         #[arg(long, default_value_t = false)]
         apply: bool,
 
@@ -7674,6 +7724,15 @@ async fn execute_cli(
                 Commands::Quarantine(subcmd) => {
                     run_quarantine_command(subcmd, cli)?;
                 }
+                Commands::Forget {
+                    source_glob,
+                    db,
+                    apply,
+                    json,
+                } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_forget_command(source_glob, db, apply, cli, structured_format)?;
+                }
                 Commands::Mirror(subcmd) => {
                     run_mirror_command(subcmd, cli)?;
                 }
@@ -7766,7 +7825,115 @@ fn run_quarantine_command(cmd: QuarantineCommand, cli: &Cli) -> CliResult<()> {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_quarantine_clear(data_dir, filter, apply, structured_format)
         }
+        QuarantineCommand::Retry {
+            data_dir,
+            max_attempts,
+            force_irreducible,
+            apply,
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_quarantine_retry_command(
+                data_dir,
+                max_attempts,
+                force_irreducible,
+                apply,
+                structured_format,
+            )
+        }
     }
+}
+
+/// `cass quarantine retry`: a bounded, resumable retry of retry-eligible
+/// quarantined conversations (#292 ask #3). Dry-run by default; `--apply` clears
+/// eligible entries so the next `cass index` re-ingests them.
+fn run_quarantine_retry_command(
+    data_dir_override: Option<PathBuf>,
+    max_attempts: Option<usize>,
+    force_irreducible: bool,
+    apply: bool,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let config = crate::indexer::quarantine_retry::RetryConfig {
+        max_attempts,
+        eligible_only: !force_irreducible,
+    };
+
+    let report =
+        crate::indexer::run_quarantine_retry(&data_dir, &config, apply).map_err(|err| {
+            CliError {
+                code: 9,
+                kind: "quarantine",
+                message: format!("quarantine retry failed: {err}"),
+                hint: Some(
+                    "Run `cass quarantine list --json` to inspect entries, then retry.".to_string(),
+                ),
+                retryable: false,
+            }
+        })?;
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(fmt) = structured_format {
+        let mut payload = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("schema_version".to_string(), serde_json::json!(1));
+            obj.insert("applied".to_string(), serde_json::json!(apply));
+            obj.insert("dry_run".to_string(), serde_json::json!(!apply));
+            obj.insert(
+                "data_dir".to_string(),
+                serde_json::json!(data_dir.display().to_string()),
+            );
+        }
+        return output_structured_value(payload, fmt);
+    }
+
+    println!("CASS Quarantine Retry");
+    println!("=====================");
+    println!();
+    println!(
+        "Mode: {}",
+        if apply {
+            "APPLY (clears eligible entries for re-ingest on next index)"
+        } else {
+            "dry-run (classify only)"
+        }
+    );
+    println!();
+    println!("{}", report.summary);
+    if apply {
+        println!(
+            "  cleared (eligible): {}, remaining quarantined: {}",
+            report.cleared, report.remaining_quarantined
+        );
+    } else {
+        println!(
+            "  eligible for retry: {}, irreducible: {}, source-missing: {}",
+            report
+                .entries
+                .iter()
+                .filter(|e| matches!(
+                    e.outcome,
+                    crate::indexer::quarantine_retry::RetryOutcome::RetriedCleared
+                ))
+                .count(),
+            report.skipped_irreducible,
+            report.skipped_source_missing
+        );
+    }
+    if report.resume_recommended {
+        println!("  (budget reached — re-run to resume the remaining eligible entries)");
+    }
+    println!();
+    println!("Next: {}", report.next_safe_command);
+    Ok(())
 }
 
 /// Build the deterministic per-entry JSON view used by both `list` and the
@@ -7975,6 +8142,133 @@ fn run_quarantine_clear(
     }
     println!();
     println!("{recommended_action}");
+    Ok(())
+}
+
+/// `cass forget --source-glob <pat>`: prune an already-indexed subset of
+/// conversations by source-path glob (#292 ask #2). Dry-run by default;
+/// `--apply` deletes the matching rows from the canonical DB and rebuilds the
+/// derived search/analytics assets so search coverage stays consistent.
+fn run_forget_command(
+    source_glob: String,
+    db_override: Option<PathBuf>,
+    apply: bool,
+    cli: &Cli,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use crate::storage::sqlite::FrankenStorage;
+
+    let db_path = db_override
+        .or_else(|| cli.db.clone())
+        .unwrap_or_else(default_db_path);
+    if !db_path.is_file() {
+        return Err(CliError {
+            code: 5,
+            kind: "forget",
+            message: format!("no canonical database at {}", db_path.display()),
+            hint: Some("Run `cass index` first, or pass --db <path>.".to_string()),
+            retryable: false,
+        });
+    }
+
+    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+        code: 5,
+        kind: "forget",
+        message: format!("failed to open canonical database: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let report = storage
+        .forget_conversations_by_source_glob(&source_glob, !apply)
+        .map_err(|e| CliError {
+            code: 5,
+            kind: "forget",
+            message: format!("forget failed: {e}"),
+            hint: Some(
+                "Run `cass forget --source-glob <pat> --json` (dry-run) first to inspect matches."
+                    .to_string(),
+            ),
+            retryable: false,
+        })?;
+
+    // After an actual deletion, rebuild derived assets so search/analytics stay
+    // consistent (mirrors the agent-purge path). The lexical index also
+    // self-heals on next search, but rebuilding FTS now keeps DB-resident
+    // surfaces correct.
+    if apply && report.conversations_deleted > 0 {
+        if let Err(e) = storage.rebuild_fts() {
+            tracing::warn!(error = %e, "forget: failed to rebuild FTS after deletion");
+        }
+        if let Err(e) = storage.rebuild_analytics() {
+            tracing::warn!(error = %e, "forget: failed to rebuild analytics after deletion");
+        }
+        if let Err(e) = storage.rebuild_daily_stats() {
+            tracing::warn!(error = %e, "forget: failed to rebuild daily stats after deletion");
+        }
+    }
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(fmt) = structured_format {
+        let mut payload = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("schema_version".to_string(), serde_json::json!(1));
+            obj.insert("applied".to_string(), serde_json::json!(apply));
+            obj.insert(
+                "db_path".to_string(),
+                serde_json::json!(db_path.display().to_string()),
+            );
+        }
+        return output_structured_value(payload, fmt);
+    }
+
+    println!("CASS Forget (prune conversations by source glob)");
+    println!("================================================");
+    println!();
+    println!(
+        "Mode: {}",
+        if apply {
+            "APPLY (mutating)"
+        } else {
+            "dry-run (inspect only)"
+        }
+    );
+    println!("Pattern: {}", report.pattern);
+    println!();
+    println!(
+        "Matched conversations: {} ({} messages)",
+        report.conversations_matched, report.messages_matched
+    );
+    if !report.sample_source_paths.is_empty() {
+        println!("Sample matches:");
+        for path in &report.sample_source_paths {
+            println!("  {path}");
+        }
+        if report.conversations_matched > report.sample_source_paths.len() {
+            println!(
+                "  ... and {} more",
+                report.conversations_matched - report.sample_source_paths.len()
+            );
+        }
+    }
+    println!();
+    if apply {
+        println!(
+            "Deleted {} conversation(s) from the canonical DB and rebuilt derived assets.",
+            report.conversations_deleted
+        );
+    } else if report.conversations_matched > 0 {
+        println!("Re-run with --apply to delete these conversations.");
+    } else {
+        println!("No conversations match. Nothing to forget.");
+    }
     Ok(())
 }
 
@@ -18537,6 +18831,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Expand { .. }) => "expand".to_string(),
         Some(Commands::Timeline { .. }) => "timeline".to_string(),
         Some(Commands::Quarantine(..)) => "quarantine".to_string(),
+        Some(Commands::Forget { .. }) => "forget".to_string(),
         Some(Commands::Mirror(..)) => "mirror".to_string(),
         Some(Commands::Sources(..)) => "sources".to_string(),
         Some(Commands::Models(..)) => "models".to_string(),
@@ -18822,6 +19117,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Mirror(MirrorCommand::Prune { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Forget { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Sources(SourcesCommand::List { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -83102,6 +83398,10 @@ impl IndexStallWatchdog {
         )
     }
 
+    fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     fn with_abort_policy(
         data_dir: PathBuf,
         progress_interval: Duration,
@@ -83277,7 +83577,7 @@ fn index_stall_warning_lines(payload: &serde_json::Value) -> (String, String) {
     (summary, diagnostics)
 }
 
-fn abort_after_index_stall_if_requested(payload: &serde_json::Value) {
+fn abort_after_index_stall_if_requested(payload: &serde_json::Value, data_dir: &Path) {
     if payload
         .get("abort_process")
         .and_then(serde_json::Value::as_bool)
@@ -83286,6 +83586,11 @@ fn abort_after_index_stall_if_requested(payload: &serde_json::Value) {
         eprintln!(
             "cass index made no indexing progress past the abort threshold; exiting with code 70."
         );
+        // #296: before the bounded exit (which skips destructors), best-effort
+        // checkpoint the canonical WAL so the killed run leaves a recoverable
+        // DB instead of a multi-GB orphaned WAL. Stale locks are reaped by the
+        // next startup's flock-based recovery.
+        crate::indexer::best_effort_abort_wal_checkpoint(data_dir);
         std::process::exit(70);
     }
 }
@@ -83949,7 +84254,7 @@ fn run_index_with_data(
                 let (summary, diagnostics) = index_stall_warning_lines(&payload);
                 pb.println(summary);
                 pb.println(diagnostics);
-                abort_after_index_stall_if_requested(&payload);
+                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
             }
 
             std::thread::sleep(Duration::from_millis(50));
@@ -84024,7 +84329,7 @@ fn run_index_with_data(
                 let (summary, diagnostics) = index_stall_warning_lines(&payload);
                 eprintln!("{summary}");
                 eprintln!("{diagnostics}");
-                abort_after_index_stall_if_requested(&payload);
+                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
             }
 
             std::thread::sleep(Duration::from_millis(200));
@@ -84082,7 +84387,7 @@ fn run_index_with_data(
             if let Some(payload) = stall_watchdog.observe(&index_progress, elapsed_ms) {
                 emit_event(payload.clone());
                 emit_robot_stall_event_on_stdout(&payload);
-                abort_after_index_stall_if_requested(&payload);
+                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
             }
 
             std::thread::sleep(Duration::from_millis(100));
@@ -84103,7 +84408,7 @@ fn run_index_with_data(
                 // machine-readable stall signal on stdout before any external
                 // timeout kills the run.
                 emit_robot_stall_event_on_stdout(&payload);
-                abort_after_index_stall_if_requested(&payload);
+                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
             }
             std::thread::sleep(Duration::from_millis(100));
         }

@@ -14906,6 +14906,41 @@ fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path
     }
 }
 
+/// Best-effort canonical-WAL checkpoint before a bounded abort/exit (#296).
+///
+/// The `cass index` stall-abort path exits via `std::process::exit(70)`, which
+/// skips destructors — so the canonical WAL is never checkpointed and a killed
+/// run leaves a multi-GB orphaned `*.db-wal` behind a tiny `*.db` (the #296
+/// symptom). This opens a *fresh, independent* frankensqlite connection to the
+/// canonical DB file (the wedged storage handle's workers are parked, but the
+/// file itself is checkpointable through a new connection) and runs
+/// `wal_checkpoint(TRUNCATE)` so the post-abort DB is recoverable by stock
+/// SQLite. Everything is best-effort: any failure is logged and swallowed so
+/// the abort still proceeds. Stale index-run locks are already reaped on the
+/// next startup by `read_search_maintenance_snapshot` (flock-based), so this
+/// focuses on the WAL.
+pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
+    let db_path = data_dir.join("agent_search.db");
+    if !db_path.exists() {
+        return;
+    }
+    match run_final_wal_checkpoint(&db_path, "stall abort") {
+        Ok(()) => {
+            tracing::info!(
+                db_path = %db_path.display(),
+                "checkpointed canonical WAL before stall abort (#296)"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %err,
+                "best-effort WAL checkpoint before stall abort failed; the WAL may remain uncheckpointed until the next clean run"
+            );
+        }
+    }
+}
+
 fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<()> {
     // Run this after closing the indexing storage handle: frankensqlite flushes
     // retained autocommit writes during close, and TRUNCATE avoids leaving the
@@ -20759,9 +20794,37 @@ fn ingest_watch_batch_with_oom_split(
     defer_checkpoints: bool,
     capture_semantic_delta: bool,
 ) -> Result<WatchIngestBatchOutcome> {
+    ingest_watch_batch_with_oom_split_inner(
+        storage,
+        t_index,
+        data_dir,
+        convs,
+        progress,
+        defer_checkpoints,
+        capture_semantic_delta,
+        // Top-level batch ingest: the typed-OOM test injection is allowed to
+        // fire so batch-path tests exercise the downcast classification. The
+        // solo isolate-retry (#298) re-enters with this set to `false` so that
+        // a conversation which "fails in batch but succeeds solo" is modeled
+        // faithfully and is NOT quarantined.
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_watch_batch_with_oom_split_inner(
+    storage: &FrankenStorage,
+    t_index: &mut TantivyIndex,
+    data_dir: &Path,
+    convs: &[NormalizedConversation],
+    progress: &Option<Arc<IndexingProgress>>,
+    defer_checkpoints: bool,
+    capture_semantic_delta: bool,
+    allow_test_oom_injection: bool,
+) -> Result<WatchIngestBatchOutcome> {
     debug_assert!(!convs.is_empty());
 
-    let batch_result = if should_inject_watch_ingest_test_oom(convs) {
+    let batch_result = if allow_test_oom_injection && should_inject_watch_ingest_test_oom(convs) {
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
         // exercises the downcast path that real frankensqlite OOMs hit, instead
         // of relying on the plain-string fallback.
@@ -20796,7 +20859,7 @@ fn ingest_watch_batch_with_oom_split(
                 error = %error,
                 "watch ingest batch ran out of memory; retrying as smaller batches"
             );
-            let mut merged = ingest_watch_batch_with_oom_split(
+            let mut merged = ingest_watch_batch_with_oom_split_inner(
                 storage,
                 t_index,
                 data_dir,
@@ -20804,8 +20867,9 @@ fn ingest_watch_batch_with_oom_split(
                 progress,
                 defer_checkpoints,
                 capture_semantic_delta,
+                allow_test_oom_injection,
             )?;
-            let right = ingest_watch_batch_with_oom_split(
+            let right = ingest_watch_batch_with_oom_split_inner(
                 storage,
                 t_index,
                 data_dir,
@@ -20813,32 +20877,161 @@ fn ingest_watch_batch_with_oom_split(
                 progress,
                 defer_checkpoints,
                 capture_semantic_delta,
+                allow_test_oom_injection,
             )?;
             merged.merge(right);
             Ok(merged)
         }
         Err(error) if error_is_out_of_memory(&error) => {
             let conv = &convs[0];
-            record_watch_poison_conversation(data_dir, conv, &error)?;
-            if let Some(progress) = progress {
-                progress.current.fetch_add(1, Ordering::Relaxed);
+
+            // #298: a typed `FrankenError::OutOfMemory` (NoMem) on the batch
+            // path is NOT proof of real host memory exhaustion — frankensqlite
+            // raises the same typed error for per-statement bounded allocation
+            // guards. Before quarantining a single small conversation that may
+            // well ingest fine in isolation, retry it solo (which the reporter
+            // confirmed succeeds) and only quarantine on a genuine, repeated
+            // failure under real memory pressure or for a genuinely large
+            // conversation.
+            if allow_test_oom_injection {
+                let indexed_text_bytes = conversation_indexed_text_bytes(conv);
+                let small_conversation = indexed_text_bytes <= watch_oom_small_conversation_bytes();
+                let real_pressure = watch_oom_under_real_memory_pressure();
+
+                // Isolate-retry the single conversation solo. We disable the
+                // typed-OOM test injection on this retry so a "fails in batch,
+                // succeeds solo" conversation is reproduced faithfully. Tests
+                // that need to model a *genuinely* poisoned conversation (solo
+                // ingest also OOMs) set `CASS_TEST_WATCH_SOLO_RETRY_OOM=1`.
+                let solo_retry = if should_force_watch_solo_retry_oom() {
+                    Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
+                } else {
+                    ingest_watch_batch_with_oom_split_inner(
+                        storage,
+                        t_index,
+                        data_dir,
+                        std::slice::from_ref(conv),
+                        progress,
+                        defer_checkpoints,
+                        capture_semantic_delta,
+                        false,
+                    )
+                };
+
+                match solo_retry {
+                    Ok(outcome) => {
+                        // Solo ingest succeeded — the batch-path NoMem was a
+                        // bounded-guard false positive. Do not quarantine.
+                        tracing::info!(
+                            agent = %conv.agent_slug,
+                            external_id = conv.external_id.as_deref().unwrap_or(""),
+                            source_path = %conv.source_path.display(),
+                            indexed_text_bytes,
+                            "watch conversation hit a bounded-allocation NoMem in batch but ingested cleanly solo; not quarantining (#298)"
+                        );
+                        return Ok(outcome);
+                    }
+                    Err(solo_error) if !error_is_out_of_memory(&solo_error) => {
+                        // The solo retry surfaced a *different* (non-OOM) error
+                        // — propagate it rather than mislabel it as OOM.
+                        return Err(solo_error);
+                    }
+                    Err(solo_error) => {
+                        // Solo retry still hit OOM. Only quarantine if this is
+                        // real memory pressure or a genuinely large
+                        // conversation; otherwise keep it eligible for a later
+                        // retry instead of poisoning a small, replayable
+                        // conversation on a transient bounded-guard hit.
+                        let should_quarantine = match real_pressure {
+                            // Real host pressure: quarantine is justified.
+                            Some(true) => true,
+                            // Ample memory reported: only quarantine large
+                            // conversations; small ones stay eligible.
+                            Some(false) => !small_conversation,
+                            // Pressure unknowable (e.g. macOS): fall back to the
+                            // size gate — never quarantine a small conversation
+                            // on a typed NoMem we cannot attribute to real
+                            // pressure.
+                            None => !small_conversation,
+                        };
+                        if !should_quarantine {
+                            tracing::warn!(
+                                agent = %conv.agent_slug,
+                                external_id = conv.external_id.as_deref().unwrap_or(""),
+                                source_path = %conv.source_path.display(),
+                                indexed_text_bytes,
+                                real_memory_pressure = ?real_pressure,
+                                error = %solo_error,
+                                "watch conversation hit repeated bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) for later retry (#298)"
+                            );
+                            if let Some(progress) = progress {
+                                progress.current.fetch_add(1, Ordering::Relaxed);
+                            }
+                            return Ok(WatchIngestBatchOutcome {
+                                batch_outcome: persist::PersistBatchOutcome::default(),
+                                processed_conversations: 1,
+                                quarantined_conversations: 0,
+                                max_payload_watermark_ms: None,
+                            });
+                        }
+                        // Fall through to quarantine with the solo error so the
+                        // record reflects the genuine repeated failure.
+                        return quarantine_single_watch_conversation(
+                            data_dir,
+                            conv,
+                            &solo_error,
+                            progress,
+                            indexed_text_bytes,
+                            real_pressure,
+                        );
+                    }
+                }
             }
-            tracing::warn!(
-                agent = %conv.agent_slug,
-                external_id = conv.external_id.as_deref().unwrap_or(""),
-                source_path = %conv.source_path.display(),
-                error = %error,
-                "single watch conversation ran out of memory; quarantined and advancing watch progress"
-            );
-            Ok(WatchIngestBatchOutcome {
-                batch_outcome: persist::PersistBatchOutcome::default(),
-                processed_conversations: 1,
-                quarantined_conversations: 1,
-                max_payload_watermark_ms: None,
-            })
+
+            // Test-injection disabled (solo isolate-retry re-entry) or pressure
+            // path: record and quarantine the single conversation directly.
+            quarantine_single_watch_conversation(
+                data_dir,
+                conv,
+                &error,
+                progress,
+                conversation_indexed_text_bytes(conv),
+                watch_oom_under_real_memory_pressure(),
+            )
         }
         Err(error) => Err(error),
     }
+}
+
+/// Record a single watch conversation as poison and quarantine it, advancing
+/// watch progress so the watcher does not stall on a poison file.
+fn quarantine_single_watch_conversation(
+    data_dir: &Path,
+    conv: &NormalizedConversation,
+    error: &anyhow::Error,
+    progress: &Option<Arc<IndexingProgress>>,
+    indexed_text_bytes: usize,
+    real_memory_pressure: Option<bool>,
+) -> Result<WatchIngestBatchOutcome> {
+    record_watch_poison_conversation(data_dir, conv, error)?;
+    if let Some(progress) = progress {
+        progress.current.fetch_add(1, Ordering::Relaxed);
+    }
+    tracing::warn!(
+        agent = %conv.agent_slug,
+        external_id = conv.external_id.as_deref().unwrap_or(""),
+        source_path = %conv.source_path.display(),
+        indexed_text_bytes,
+        real_memory_pressure = ?real_memory_pressure,
+        error = %error,
+        "single watch conversation ran out of memory; quarantined and advancing watch progress"
+    );
+    Ok(WatchIngestBatchOutcome {
+        batch_outcome: persist::PersistBatchOutcome::default(),
+        processed_conversations: 1,
+        quarantined_conversations: 1,
+        max_payload_watermark_ms: None,
+    })
 }
 
 fn conversations_payload_watermark_ms(convs: &[NormalizedConversation]) -> Option<i64> {
@@ -20894,6 +21087,59 @@ fn error_is_out_of_memory(error: &anyhow::Error) -> bool {
         }
         error_message_is_exact_out_of_memory(&cause.to_string())
     })
+}
+
+/// Default ceiling, in bytes of *indexed text*, under which a watch-ingest
+/// `NoMem` is treated as a bounded-allocation-guard false positive rather than
+/// real host memory exhaustion (#298). frankensqlite raises the same typed
+/// `FrankenError::OutOfMemory` for per-statement bounded allocation limits
+/// (VDBE frame/register/pager guards) as it does for real OS pressure, so a
+/// small conversation that ingests fine solo must never be quarantined just
+/// because it tripped a bounded guard under concurrent batch load.
+const WATCH_OOM_SMALL_CONVERSATION_DEFAULT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Default host-available-memory reserve (bytes). If the OS reports *less* than
+/// this much available memory when a watch `NoMem` fires, we treat it as real
+/// pressure and allow quarantine; otherwise the `NoMem` is a bounded-guard hit.
+const WATCH_OOM_REAL_PRESSURE_RESERVE_DEFAULT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Indexed-text byte size of a single conversation — the sum of message content
+/// lengths. This is the right "size" signal for #298: the false-positive
+/// victims are multi-MB raw files (tool_result/thinking bulk) with only tens of
+/// KB of *indexed* text, so the materialized-file size is irrelevant here.
+fn conversation_indexed_text_bytes(conv: &NormalizedConversation) -> usize {
+    conv.messages
+        .iter()
+        .map(|message| message.content.len())
+        .fold(0usize, |acc, len| acc.saturating_add(len))
+}
+
+fn watch_oom_small_conversation_bytes() -> usize {
+    dotenvy::var("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(WATCH_OOM_SMALL_CONVERSATION_DEFAULT_BYTES)
+}
+
+fn watch_oom_real_pressure_reserve_bytes() -> u64 {
+    dotenvy::var("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(WATCH_OOM_REAL_PRESSURE_RESERVE_DEFAULT_BYTES)
+}
+
+/// Whether a watch-ingest `NoMem` should be treated as *real* host memory
+/// pressure. Returns:
+/// - `Some(true)`  — host reports available memory below the configured reserve
+///   (real pressure; quarantine is justified after the solo retry fails).
+/// - `Some(false)` — host reports ample available memory (the `NoMem` is a
+///   bounded-allocation-guard false positive).
+/// - `None`        — memory pressure is unknowable on this platform
+///   (e.g. macOS has no `/proc/meminfo`); callers must fall back to the size
+///   gate / solo-retry result and must NOT assume pressure.
+fn watch_oom_under_real_memory_pressure() -> Option<bool> {
+    let available = responsiveness::available_memory_bytes()?;
+    Some(available <= watch_oom_real_pressure_reserve_bytes())
 }
 
 fn error_message_is_exact_out_of_memory(message: &str) -> bool {
@@ -21676,6 +21922,189 @@ pub fn conversation_ingest_quarantine_summary(
     }
 }
 
+/// Build the set of quarantined conversation ids whose recorded source log is
+/// gone (so a retry could never succeed). The poison JSONL records carry the
+/// `source_path`; if a record has a path that no longer exists, that
+/// conversation is source-missing.
+fn quarantine_source_missing_ids(data_dir: &Path) -> BTreeSet<String> {
+    let quarantine_dir = data_dir.join("quarantine");
+    let mut missing = BTreeSet::new();
+    for file_name in [WATCH_INGEST_POISON_FILE, INDEX_INGEST_POISON_FILE] {
+        let path = quarantine_dir.join(file_name);
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                continue;
+            };
+            let Some(conversation_id) = value
+                .get("conversation_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            if let Some(source_path) = value.get("source_path").and_then(serde_json::Value::as_str)
+            {
+                if !Path::new(source_path).exists() {
+                    missing.insert(conversation_id.to_string());
+                }
+            }
+        }
+    }
+    missing
+}
+
+/// Operator-facing bounded quarantine retry (#292 ask #3, `cass quarantine
+/// retry`). Wires the internal bounded retry classifier
+/// ([`quarantine_retry::plan_retry`]) to a CLI action.
+///
+/// This is intentionally non-destructive and bounded: it classifies every
+/// quarantine entry (retry-eligible legacy/version-stale vs. irreducible
+/// same-version vs. source-missing) and, on `apply`, *clears the eligible
+/// entries' quarantine + poison records* so they are re-attempted on the next
+/// `cass index` pass — the existing, proven, batch-OOM-resilient retry trigger
+/// (which now also benefits from the #298 solo isolate-retry). It never clears
+/// irreducible same-version entries unless `eligible_only=false` is explicitly
+/// passed, and never deletes a source log.
+pub fn run_quarantine_retry(
+    data_dir: &Path,
+    config: &quarantine_retry::RetryConfig,
+    apply: bool,
+) -> Result<quarantine_retry::RetryReport> {
+    let mut state = QuarantineState::load(data_dir);
+    let current_version = current_cass_version();
+    let source_missing = quarantine_source_missing_ids(data_dir);
+    let now = chrono::Utc::now();
+
+    // Plan first (always), so the report reflects the classification even on a
+    // dry run.
+    let plan = quarantine_retry::plan_retry(&state, current_version, config, &source_missing);
+
+    if !apply {
+        // Dry run: synthesize a report from the plan without mutating anything.
+        return Ok(quarantine_retry_report_from_plan(&plan, current_version));
+    }
+
+    // Apply: clear the eligible (Retry-disposition) entries' quarantine + poison
+    // records so the next `cass index` re-ingests them. Use `execute_retry` to
+    // walk the same plan; the attempt fn clears the matching poison JSONL
+    // records (both watch and index) and reports a clean clear so
+    // `execute_retry` removes the structured state entry.
+    let eligible_ids: BTreeSet<String> = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.disposition == quarantine_retry::PlannedDisposition::Retry)
+        .map(|entry| entry.conversation_id.clone())
+        .collect();
+
+    let report = quarantine_retry::execute_retry(
+        &mut state,
+        current_version,
+        config,
+        &source_missing,
+        now,
+        |key| {
+            // Clearing the poison record makes the conversation eligible for
+            // re-ingest on the next index pass. We report `Reindexed` so the
+            // structured state entry is cleared in lockstep.
+            if eligible_ids.contains(&key.conversation_id) {
+                quarantine_retry::AttemptResult::Reindexed
+            } else {
+                // Should not happen (only Retry entries reach the attempt fn),
+                // but stay safe: leave it quarantined.
+                quarantine_retry::AttemptResult::Failed("not_eligible".to_string())
+            }
+        },
+    );
+
+    // Persist the structured state (the durable resume checkpoint) and clear the
+    // matching poison JSONL records for cleared conversations.
+    if let Err(err) = state.save(data_dir) {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            error = %err,
+            "failed to persist quarantine state after retry clear"
+        );
+    }
+    let cleared_ids: BTreeSet<String> = report
+        .entries
+        .iter()
+        .filter(|entry| entry.outcome == quarantine_retry::RetryOutcome::RetriedCleared)
+        .map(|entry| entry.conversation_id.clone())
+        .collect();
+    if !cleared_ids.is_empty() {
+        for (file_name, reason) in [
+            (WATCH_INGEST_POISON_FILE, "watch-ingest-out-of-memory"),
+            (INDEX_INGEST_POISON_FILE, "index-ingest-out-of-memory"),
+        ] {
+            if let Err(err) = clear_poison_jsonl_records(data_dir, file_name, reason, &cleared_ids)
+            {
+                tracing::warn!(
+                    data_dir = %data_dir.display(),
+                    file = file_name,
+                    error = %err,
+                    "failed to clear poison JSONL records after quarantine retry"
+                );
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// Build a dry-run [`RetryReport`] from a [`RetryPlan`] without mutating state.
+fn quarantine_retry_report_from_plan(
+    plan: &quarantine_retry::RetryPlan,
+    current_version: &str,
+) -> quarantine_retry::RetryReport {
+    use quarantine_retry::{PlannedDisposition, RetryEntryResult, RetryOutcome};
+    let entries = plan
+        .entries
+        .iter()
+        .map(|entry| {
+            let outcome = match entry.disposition {
+                // On a dry run nothing is attempted; an eligible entry maps to
+                // the action that *would* happen (cleared → re-attempted next
+                // index).
+                PlannedDisposition::Retry => RetryOutcome::RetriedCleared,
+                PlannedDisposition::SkipIrreducible => RetryOutcome::SkippedIrreducible,
+                PlannedDisposition::SkipSourceMissing => RetryOutcome::SkippedSourceMissing,
+                PlannedDisposition::SkipBudgetExhausted => RetryOutcome::SkippedBudgetExhausted,
+            };
+            RetryEntryResult {
+                conversation_id: entry.conversation_id.clone(),
+                schema_version: entry.schema_version,
+                outcome,
+                attempt_count_before: entry.attempt_count,
+                reason: entry.last_reason.clone(),
+            }
+        })
+        .collect();
+    quarantine_retry::RetryReport {
+        current_version: current_version.to_string(),
+        total_quarantined_before: plan.total_quarantined,
+        attempted: 0,
+        cleared: 0,
+        re_quarantined_oom: 0,
+        re_quarantined_failed: 0,
+        skipped_source_missing: plan.skip_source_missing,
+        skipped_irreducible: plan.skip_irreducible,
+        skipped_budget_exhausted: plan.skip_budget_exhausted,
+        remaining_quarantined: plan.total_quarantined,
+        made_progress: false,
+        stalled: false,
+        resume_recommended: plan.resume_recommended,
+        entries,
+        summary: plan.summary.clone(),
+        next_safe_command: plan.next_safe_command.clone(),
+    }
+}
+
 fn ingest_quarantine_circuit_window_seconds() -> i64 {
     dotenvy::var("CASS_INGEST_QUARANTINE_CIRCUIT_WINDOW_SECS")
         .ok()
@@ -21701,6 +22130,20 @@ fn should_inject_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool
 
 #[cfg(not(test))]
 fn should_inject_watch_ingest_test_oom(_convs: &[NormalizedConversation]) -> bool {
+    false
+}
+
+/// Force the #298 solo isolate-retry to also OOM, so tests can exercise the
+/// genuine-quarantine path (a conversation that fails even in isolation).
+#[cfg(test)]
+fn should_force_watch_solo_retry_oom() -> bool {
+    dotenvy::var("CASS_TEST_WATCH_SOLO_RETRY_OOM")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+#[cfg(not(test))]
+fn should_force_watch_solo_retry_oom() -> bool {
     false
 }
 
@@ -37217,6 +37660,103 @@ mod tests {
         Ok(())
     }
 
+    /// #292 ask #3: `cass quarantine retry` (bounded). Dry-run classifies without
+    /// mutating; `--apply` clears the version-eligible entries (so the next
+    /// index re-ingests them) while leaving irreducible same-version entries
+    /// quarantined.
+    #[test]
+    #[serial]
+    fn run_quarantine_retry_dry_run_then_apply_clears_only_eligible() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        let now = chrono::Utc::now();
+        let mut state = QuarantineState::default();
+        // One eligible (version-stale) entry + one irreducible (same-version).
+        let eligible = QuarantineKey::new("conv-eligible", 3);
+        state.record_attempt(&eligible, "index-ingest-out-of-memory: out of memory", now);
+        let irreducible = QuarantineKey::new("conv-irreducible", 3);
+        state.record_attempt(
+            &irreducible,
+            "index-ingest-out-of-memory: out of memory",
+            now,
+        );
+        // Demote the eligible entry to an older version so it is retry-eligible;
+        // the irreducible entry keeps the current version.
+        if let Some(record) = state.entries.get_mut("conv-eligible::v3") {
+            record.cass_version_at_quarantine = Some("0.0.1-old".to_string());
+        }
+        state.save(&data_dir)?;
+
+        let config = quarantine_retry::RetryConfig::default();
+
+        // Dry-run: report classification, mutate nothing.
+        let dry = run_quarantine_retry(&data_dir, &config, false)?;
+        anyhow::ensure!(dry.total_quarantined_before == 2);
+        anyhow::ensure!(
+            dry.cleared == 0,
+            "dry run must not clear anything; got {}",
+            dry.cleared
+        );
+        anyhow::ensure!(
+            dry.skipped_irreducible == 1,
+            "the same-version entry is irreducible; got {}",
+            dry.skipped_irreducible
+        );
+        // Nothing removed from disk.
+        anyhow::ensure!(QuarantineState::load(&data_dir).len() == 2);
+
+        // Apply: clear the eligible entry, keep the irreducible one.
+        let applied = run_quarantine_retry(&data_dir, &config, true)?;
+        anyhow::ensure!(
+            applied.cleared == 1,
+            "apply clears the one eligible entry; got {}",
+            applied.cleared
+        );
+        anyhow::ensure!(
+            applied.remaining_quarantined == 1,
+            "the irreducible entry remains; got {}",
+            applied.remaining_quarantined
+        );
+        let after = QuarantineState::load(&data_dir);
+        anyhow::ensure!(!after.entries.contains_key("conv-eligible::v3"));
+        anyhow::ensure!(after.entries.contains_key("conv-irreducible::v3"));
+        Ok(())
+    }
+
+    /// #296: the best-effort pre-abort WAL checkpoint runs against a real
+    /// canonical DB and leaves a DB readable by a fresh connection (no panic,
+    /// no orphaned WAL). A missing DB is a clean no-op.
+    #[test]
+    #[serial]
+    fn best_effort_abort_wal_checkpoint_truncates_and_is_noop_when_absent() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        // No DB yet -> clean no-op (must not panic).
+        best_effort_abort_wal_checkpoint(&data_dir);
+
+        // Create a canonical DB with some content and an active WAL.
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        storage.run_migrations()?;
+        drop(storage);
+
+        // Checkpoint should succeed and leave a readable DB.
+        best_effort_abort_wal_checkpoint(&data_dir);
+        anyhow::ensure!(
+            db_path.exists(),
+            "DB file should still exist after checkpoint"
+        );
+        // A fresh connection can open and query it.
+        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned())?;
+        let _ = conn.query("PRAGMA quick_check;");
+        conn.close().ok();
+        Ok(())
+    }
+
     #[test]
     #[serial]
     fn non_watch_ingest_chunk_size_defaults_and_clamps() -> Result<()> {
@@ -44682,6 +45222,13 @@ mod tests {
         .unwrap();
 
         let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        // #298: model a *genuinely* poisoned conversation — the solo isolate
+        // retry also OOMs, and the size gate is disabled so even a small
+        // conversation is allowed to quarantine. This preserves the original
+        // intent of this test (watermark preserved + poison recorded) under the
+        // new solo-retry-before-quarantine behavior.
+        let _solo_oom_guard = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
+        let _small_gate_guard = set_env("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES", "0");
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
             full: false,
@@ -44729,6 +45276,117 @@ mod tests {
                 .exists(),
             "watch OOM should still be recorded for operator visibility"
         );
+    }
+
+    /// #298 differential: a conversation that OOMs in batch ingest but ingests
+    /// cleanly when isolated solo must NOT be quarantined. This is the exact
+    /// false-positive the reporter hit — small/medium conversations that index
+    /// fine solo were poisoned on the `--watch` batch path.
+    #[test]
+    #[serial]
+    fn watch_batch_oom_that_succeeds_solo_is_not_quarantined() {
+        let tmp = TempDir::new().unwrap();
+        let xdg = tmp.path().join("xdg_watch_batch_oom_solo_ok");
+        std::fs::create_dir_all(&xdg).unwrap();
+        let prev = dotenvy::var("XDG_DATA_HOME").ok();
+        unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
+
+        // Inject a typed OOM on any batch of >= 2 conversations, but leave the
+        // solo isolate-retry untouched (it disables injection), so each
+        // conversation succeeds when re-ingested alone. Do NOT force the solo
+        // retry to OOM — that is the whole point of the differential.
+        let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "2");
+        let _chunk_guard = set_env("CASS_WATCH_INGEST_CHUNK_SIZE", "4");
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+
+        let data_dir = xdg.join("amp");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let now_u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let base_ts = i64::try_from(now_u128)
+            .unwrap_or(i64::MAX)
+            .saturating_add(10_000);
+        let mut paths = Vec::new();
+        for idx in 0..4 {
+            let path = amp_dir.join(format!("thread-batch-oom-solo-ok-{idx}.json"));
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"id":"thread-batch-oom-solo-ok-{idx}","messages":[{{"role":"user","text":"p{idx}","createdAt":{}}}]}}"#,
+                    base_ts + i64::from(idx)
+                ),
+            )
+            .unwrap();
+            paths.push(path);
+        }
+
+        let progress = Arc::new(super::IndexingProgress::default());
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: Some(progress.clone()),
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        let indexed = reindex_paths(
+            &opts,
+            paths,
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 4);
+        assert_eq!(progress.current.load(Ordering::Relaxed), 4);
+        let conversation_rows: i64 = storage
+            .lock()
+            .unwrap()
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            conversation_rows, 4,
+            "all 4 conversations must persist via the solo isolate-retry"
+        );
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "conversations that ingest fine solo must not be quarantined on a batch-path bounded NoMem (#298)"
+        );
+
+        if let Some(prev) = prev {
+            unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
+        } else {
+            unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        }
     }
 
     #[test]

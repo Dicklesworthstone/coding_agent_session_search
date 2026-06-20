@@ -7552,6 +7552,124 @@ impl FrankenStorage {
         })
     }
 
+    /// `cass forget` (#292 ask #2): prune an already-indexed subset of
+    /// conversations whose `source_path` matches a glob pattern, from the
+    /// canonical DB. Child rows (messages, snippets, tags, etc.) cascade via
+    /// `ON DELETE CASCADE`; the two non-cascading external-lookup tables are
+    /// deleted explicitly, mirroring [`purge_agent_archive_data`].
+    ///
+    /// `dry_run=true` (the CLI default) inspects only — it returns the matched
+    /// conversation/message counts and a bounded sample of matched source paths
+    /// without mutating anything. `dry_run=false` performs the deletion in a
+    /// single transaction. The caller is responsible for rebuilding derived
+    /// assets (FTS/analytics) afterward, exactly as the agent-purge path does.
+    ///
+    /// Matching is done in Rust with the `glob` crate (not a SQL `GLOB`
+    /// operator) so the semantics are portable and deterministic across the
+    /// frankensqlite backend.
+    pub fn forget_conversations_by_source_glob(
+        &self,
+        pattern: &str,
+        dry_run: bool,
+    ) -> Result<ForgetConversationsResult> {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("forget source-glob pattern cannot be empty"));
+        }
+        let glob = glob::Pattern::new(trimmed)
+            .with_context(|| format!("invalid forget source-glob pattern: {trimmed}"))?;
+
+        // Pull (id, source_path) for every conversation and match the glob in
+        // Rust. source_path may be NULL on legacy rows; those never match a
+        // path glob.
+        let rows: Vec<(i64, Option<String>)> = self.conn.query_map_collect(
+            "SELECT id, source_path FROM conversations ORDER BY id",
+            fparams![],
+            |row| {
+                Ok((
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<Option<String>>(1)?,
+                ))
+            },
+        )?;
+
+        let mut matched_ids: Vec<i64> = Vec::new();
+        let mut sample_paths: Vec<String> = Vec::new();
+        for (id, source_path) in rows {
+            let Some(path) = source_path else { continue };
+            if glob.matches(&path) {
+                matched_ids.push(id);
+                if sample_paths.len() < 20 {
+                    sample_paths.push(path);
+                }
+            }
+        }
+
+        if matched_ids.is_empty() {
+            return Ok(ForgetConversationsResult {
+                pattern: trimmed.to_string(),
+                dry_run,
+                conversations_matched: 0,
+                messages_matched: 0,
+                conversations_deleted: 0,
+                sample_source_paths: Vec::new(),
+            });
+        }
+
+        let id_list = matched_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let messages_matched: i64 = self.conn.query_row_map(
+            &format!("SELECT COUNT(*) FROM messages WHERE conversation_id IN ({id_list})"),
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+
+        if dry_run {
+            return Ok(ForgetConversationsResult {
+                pattern: trimmed.to_string(),
+                dry_run,
+                conversations_matched: matched_ids.len(),
+                messages_matched: messages_matched.max(0) as usize,
+                conversations_deleted: 0,
+                sample_source_paths: sample_paths,
+            });
+        }
+
+        let mut tx = self.conn.transaction()?;
+        // Non-cascading external-lookup tables first (mirrors agent purge).
+        tx.execute_compat(
+            &format!(
+                "DELETE FROM conversation_external_lookup WHERE conversation_id IN ({id_list})"
+            ),
+            fparams![],
+        )?;
+        tx.execute_compat(
+            &format!(
+                "DELETE FROM conversation_external_tail_lookup WHERE conversation_id IN ({id_list})"
+            ),
+            fparams![],
+        )?;
+        // The remaining child tables (messages, snippets, tags, ...) cascade.
+        tx.execute_compat(
+            &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
+            fparams![],
+        )?;
+        tx.commit()?;
+
+        Ok(ForgetConversationsResult {
+            pattern: trimmed.to_string(),
+            dry_run,
+            conversations_matched: matched_ids.len(),
+            messages_matched: messages_matched.max(0) as usize,
+            conversations_deleted: matched_ids.len(),
+            sample_source_paths: sample_paths,
+        })
+    }
+
     /// `coding_agent_session_search-uhhxy` (gh #302 ask #2): collapse
     /// PRE-EXISTING duplicate conversation rows created before the
     /// external_id `projects/` canonicalization fix. The watcher and
@@ -15851,6 +15969,20 @@ pub struct DailyStatsRebuildResult {
 pub struct AgentArchivePurgeResult {
     pub conversations_deleted: usize,
     pub messages_deleted: usize,
+}
+
+/// Result of a `cass forget` source-glob prune (#292 ask #2). On a dry run the
+/// `*_deleted` fields are zero and the `*_matched` fields report what WOULD be
+/// removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ForgetConversationsResult {
+    pub pattern: String,
+    pub dry_run: bool,
+    pub conversations_matched: usize,
+    pub messages_matched: usize,
+    pub conversations_deleted: usize,
+    /// Bounded (<= 20) sample of matched source paths, for operator review.
+    pub sample_source_paths: Vec<String>,
 }
 
 /// A single PRE-EXISTING duplicate conversation pair detected by
@@ -27353,6 +27485,114 @@ mod tests {
             )
             .unwrap();
         assert_eq!(openclaw_token_rows, 0);
+    }
+
+    /// #292 ask #2: `cass forget --source-glob` prunes the matching subset of
+    /// conversations from the canonical DB (dry-run reports, --apply deletes),
+    /// leaving non-matching conversations and their messages intact.
+    #[test]
+    fn forget_conversations_by_source_glob_dry_run_then_apply() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        fn seed(storage: &FrankenStorage, agent_slug: &str, source_path: &str, marker: &str) {
+            let agent = Agent {
+                id: None,
+                slug: agent_slug.into(),
+                name: agent_slug.into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            let conversation = Conversation {
+                id: None,
+                agent_slug: agent_slug.into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some(format!("{agent_slug}-{marker}")),
+                title: Some(format!("{agent_slug} {marker}")),
+                source_path: PathBuf::from(source_path),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_100),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_010),
+                    content: format!("{marker} content"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &conversation)
+                .unwrap();
+        }
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("forget.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        // Two subagent transcripts (match the glob) + one top-level session.
+        seed(
+            &storage,
+            "claude",
+            "/home/u/.claude/projects/p/sess-1/subagents/agent-aaa.jsonl",
+            "sub-a",
+        );
+        seed(
+            &storage,
+            "claude",
+            "/home/u/.claude/projects/p/sess-2/subagents/agent-bbb.jsonl",
+            "sub-b",
+        );
+        seed(
+            &storage,
+            "claude",
+            "/home/u/.claude/projects/p/sess-3/session.jsonl",
+            "top",
+        );
+        assert_eq!(storage.total_conversation_count().unwrap(), 3);
+
+        let glob = "**/subagents/*.jsonl";
+
+        // Dry-run: reports matches, deletes nothing.
+        let dry = storage
+            .forget_conversations_by_source_glob(glob, true)
+            .unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(dry.conversations_matched, 2);
+        assert_eq!(dry.messages_matched, 2);
+        assert_eq!(dry.conversations_deleted, 0);
+        assert_eq!(storage.total_conversation_count().unwrap(), 3);
+
+        // Apply: deletes the two subagent conversations, keeps the top-level one.
+        let applied = storage
+            .forget_conversations_by_source_glob(glob, false)
+            .unwrap();
+        assert!(!applied.dry_run);
+        assert_eq!(applied.conversations_matched, 2);
+        assert_eq!(applied.conversations_deleted, 2);
+        assert_eq!(storage.total_conversation_count().unwrap(), 1);
+        // The surviving top-level session's message is intact.
+        assert_eq!(storage.total_message_count().unwrap(), 1);
+
+        // An empty pattern is rejected; a non-matching glob is a clean no-op.
+        assert!(
+            storage
+                .forget_conversations_by_source_glob("   ", true)
+                .is_err()
+        );
+        let none = storage
+            .forget_conversations_by_source_glob("**/nope/*.jsonl", false)
+            .unwrap();
+        assert_eq!(none.conversations_matched, 0);
+        assert_eq!(none.conversations_deleted, 0);
+        assert_eq!(storage.total_conversation_count().unwrap(), 1);
     }
 
     /// Regression for cass#202: a `Connection` dropped mid-transaction can
