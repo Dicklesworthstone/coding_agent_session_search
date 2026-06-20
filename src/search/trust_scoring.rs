@@ -362,6 +362,105 @@ pub fn assess_trust(signals: &TrustSignals) -> TrustAssessment {
     }
 }
 
+/// How the backing source relates to an indexed result (drives `source_healthy`).
+/// Maps from `crate::search::source_provenance::ProvenanceKind` at projection time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceTrustKind {
+    /// A live local file currently backs the result.
+    LocalPresent,
+    /// Backed by a reachable remote mirror.
+    RemoteMirror,
+    /// Only the archive DB row survives (source pruned, deleted, or unreachable).
+    ArchiveOnly,
+}
+
+/// Metadata available about a single result at projection time, used to derive
+/// [`TrustSignals`]. All metadata-only — no raw session text. The richer
+/// `linked_*`/`outcome`/`proof`/`release_tag` fields are populated by the
+/// commit/bead correlation layer and default to "no signal" until it lands, so
+/// the recency/workspace/source/mode portion of the verdict works on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitTrustContext {
+    /// Result creation/index time (epoch ms), if known.
+    pub created_at_ms: Option<i64>,
+    /// Reference "now" (epoch ms) for age computation (injected for determinism).
+    pub now_ms: i64,
+    /// The result's workspace, if any.
+    pub workspace: Option<String>,
+    /// The active query workspace filter, if any (None = no workspace filter).
+    pub query_workspace: Option<String>,
+    /// How the backing source relates to the result.
+    pub source_kind: SourceTrustKind,
+    /// The realized search tier.
+    pub realized_mode: RealizedMode,
+    /// Linked commit sha (correlation layer; None until available).
+    pub linked_commit: Option<String>,
+    /// Linked closed bead id (correlation layer; None until available).
+    pub linked_closed_bead: Option<String>,
+    /// Outcome marker (correlation layer; Unknown until available).
+    pub outcome: OutcomeMarker,
+    /// Proof status (correlation layer; Unknown until available).
+    pub proof: ProofStatus,
+    /// Release tag containing the linked commit (correlation layer; None for now).
+    pub release_tag: Option<String>,
+}
+
+impl Default for HitTrustContext {
+    fn default() -> Self {
+        HitTrustContext {
+            created_at_ms: None,
+            now_ms: 0,
+            workspace: None,
+            query_workspace: None,
+            source_kind: SourceTrustKind::LocalPresent,
+            realized_mode: RealizedMode::Hybrid,
+            linked_commit: None,
+            linked_closed_bead: None,
+            outcome: OutcomeMarker::Unknown,
+            proof: ProofStatus::Unknown,
+            release_tag: None,
+        }
+    }
+}
+
+/// Normalize a workspace path for comparison (trim + drop a trailing slash).
+fn normalize_workspace(ws: &str) -> &str {
+    ws.trim().trim_end_matches('/')
+}
+
+/// Derive [`TrustSignals`] from the metadata available about one result. Pure
+/// and deterministic given an injected `now_ms`.
+pub fn derive_trust_signals(ctx: &HitTrustContext) -> TrustSignals {
+    let age_days = ctx.created_at_ms.map(|created| {
+        // Clamp future timestamps to 0 rather than underflowing.
+        let delta_ms = ctx.now_ms.saturating_sub(created).max(0);
+        (delta_ms / 86_400_000) as u64
+    });
+    let workspace_match = match (ctx.query_workspace.as_deref(), ctx.workspace.as_deref()) {
+        // No active workspace filter — do not penalize on workspace grounds.
+        (None, _) => true,
+        (Some(q), Some(w)) => normalize_workspace(q).eq_ignore_ascii_case(normalize_workspace(w)),
+        // A workspace filter is active but the result has none — treat as a miss.
+        (Some(_), None) => false,
+    };
+    let source_healthy = matches!(
+        ctx.source_kind,
+        SourceTrustKind::LocalPresent | SourceTrustKind::RemoteMirror
+    );
+    TrustSignals {
+        age_days,
+        workspace_match,
+        linked_commit: ctx.linked_commit.clone(),
+        linked_closed_bead: ctx.linked_closed_bead.clone(),
+        outcome: ctx.outcome,
+        proof: ctx.proof,
+        release_tag: ctx.release_tag.clone(),
+        source_healthy,
+        realized_mode: ctx.realized_mode,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,5 +669,114 @@ mod tests {
         // Ordering: more trusted sorts lower; higher confidence sorts higher.
         assert!(TrustTier::Trusted < TrustTier::Failed);
         assert!(TrustConfidence::Low < TrustConfidence::High);
+    }
+
+    // ---- derivation bridge (HitTrustContext -> TrustSignals) ----------------
+
+    const DAY_MS: i64 = 86_400_000;
+
+    #[test]
+    fn derive_age_days_handles_none_recent_and_future() {
+        let none = derive_trust_signals(&HitTrustContext {
+            created_at_ms: None,
+            now_ms: 100 * DAY_MS,
+            ..HitTrustContext::default()
+        });
+        assert_eq!(none.age_days, None);
+
+        let recent = derive_trust_signals(&HitTrustContext {
+            created_at_ms: Some(98 * DAY_MS),
+            now_ms: 100 * DAY_MS,
+            ..HitTrustContext::default()
+        });
+        assert_eq!(recent.age_days, Some(2));
+
+        // A future creation time clamps to 0 rather than underflowing.
+        let future = derive_trust_signals(&HitTrustContext {
+            created_at_ms: Some(200 * DAY_MS),
+            now_ms: 100 * DAY_MS,
+            ..HitTrustContext::default()
+        });
+        assert_eq!(future.age_days, Some(0));
+    }
+
+    #[test]
+    fn derive_workspace_match_normalizes_and_handles_no_filter() {
+        // No active filter -> always a match (no penalty).
+        let no_filter = derive_trust_signals(&HitTrustContext {
+            query_workspace: None,
+            workspace: Some("/proj/a".to_string()),
+            ..HitTrustContext::default()
+        });
+        assert!(no_filter.workspace_match);
+
+        // Trailing slash + case differences still match.
+        let normalized = derive_trust_signals(&HitTrustContext {
+            query_workspace: Some("/Proj/A/".to_string()),
+            workspace: Some("/proj/a".to_string()),
+            ..HitTrustContext::default()
+        });
+        assert!(normalized.workspace_match);
+
+        let mismatch = derive_trust_signals(&HitTrustContext {
+            query_workspace: Some("/proj/a".to_string()),
+            workspace: Some("/proj/b".to_string()),
+            ..HitTrustContext::default()
+        });
+        assert!(!mismatch.workspace_match);
+
+        // Filter active but result has no workspace -> miss.
+        let missing = derive_trust_signals(&HitTrustContext {
+            query_workspace: Some("/proj/a".to_string()),
+            workspace: None,
+            ..HitTrustContext::default()
+        });
+        assert!(!missing.workspace_match);
+    }
+
+    #[test]
+    fn derive_source_health_maps_from_kind() {
+        for (kind, healthy) in [
+            (SourceTrustKind::LocalPresent, true),
+            (SourceTrustKind::RemoteMirror, true),
+            (SourceTrustKind::ArchiveOnly, false),
+        ] {
+            let s = derive_trust_signals(&HitTrustContext {
+                source_kind: kind,
+                ..HitTrustContext::default()
+            });
+            assert_eq!(s.source_healthy, healthy, "kind {kind:?}");
+        }
+    }
+
+    #[test]
+    fn derive_then_assess_recent_unlinked_local_is_unverified() {
+        // The common case until correlation lands: a recent, healthy, local,
+        // hybrid result with no provenance links scores Unverified at <= medium.
+        let ctx = HitTrustContext {
+            created_at_ms: Some(99 * DAY_MS),
+            now_ms: 100 * DAY_MS,
+            source_kind: SourceTrustKind::LocalPresent,
+            realized_mode: RealizedMode::Hybrid,
+            ..HitTrustContext::default()
+        };
+        let a = assess_trust(&derive_trust_signals(&ctx));
+        assert_eq!(a.trust_tier, TrustTier::Unverified);
+        assert!(a.confidence <= TrustConfidence::Medium);
+        assert!(a.provenance_refs.is_empty());
+    }
+
+    #[test]
+    fn derive_then_assess_old_archive_only_is_stale() {
+        let ctx = HitTrustContext {
+            created_at_ms: Some(0),
+            now_ms: 500 * DAY_MS,
+            source_kind: SourceTrustKind::ArchiveOnly,
+            ..HitTrustContext::default()
+        };
+        let a = assess_trust(&derive_trust_signals(&ctx));
+        assert_eq!(a.trust_tier, TrustTier::Stale);
+        // source_unhealthy is the highest-priority reason.
+        assert_eq!(a.stale_reason.as_deref(), Some("source_unhealthy"));
     }
 }
