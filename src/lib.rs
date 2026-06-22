@@ -8230,6 +8230,7 @@ fn capabilities_connector_names() -> Vec<String> {
         "pi_agent",
         "factory",
         "openclaw",
+        "hermes",
     ];
 
     let mut connectors: Vec<String> = preferred.iter().map(|name| (*name).to_string()).collect();
