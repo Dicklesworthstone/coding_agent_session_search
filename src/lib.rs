@@ -54,6 +54,7 @@ pub mod robot_budget_envelope;
 pub mod root_cause_projection;
 pub mod root_cause_taxonomy;
 pub mod search;
+pub mod search_defaults;
 pub mod source_doctor_health;
 pub mod source_onboarding;
 pub mod sources;
@@ -6608,11 +6609,20 @@ async fn execute_cli(
                     // no structured format was asked for.
                     let effective_format = cli.robot_format.or_else(robot_format_from_env);
 
+                    // Resolve configurable search defaults (#303): the explicit
+                    // CLI flag wins, then the env var, then `~/.config/cass/cass.toml`
+                    // `[search]`, then the built-in default. This lets agents set a
+                    // default timeout/limit/mode once instead of appending flags to
+                    // every invocation. A broken config file or a malformed env value
+                    // is a clear usage error rather than a silent fall-through.
+                    let (eff_timeout, eff_limit, eff_mode) =
+                        resolve_search_defaults(timeout, limit, mode)?;
+
                     run_cli_search(
                         &query,
                         &agent,
                         &workspace,
-                        &limit,
+                        &eff_limit,
                         &offset,
                         &json,
                         effective_format,
@@ -6639,11 +6649,11 @@ async fn execute_cli(
                         aggregate,
                         explain,
                         dry_run,
-                        timeout,
+                        eff_timeout,
                         highlight,
                         source,
                         sessions_from,
-                        mode,
+                        eff_mode,
                         semantic_opts,
                     )?;
                 }
@@ -6679,11 +6689,16 @@ async fn execute_cli(
                     timeout,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
+                    // Apply the configurable search defaults (#303) to pack too,
+                    // so a configured default timeout/limit/mode covers the
+                    // pack path (which runs the same search underneath).
+                    let (eff_timeout, eff_limit, eff_mode) =
+                        resolve_search_defaults(timeout, limit, mode)?;
                     run_cli_pack(
                         &query,
                         &agent,
                         &workspace,
-                        limit,
+                        eff_limit,
                         structured_format,
                         fields,
                         max_tokens,
@@ -6705,13 +6720,13 @@ async fn execute_cli(
                         ),
                         source,
                         sessions_from,
-                        mode,
+                        eff_mode,
                         &freshness_policy,
                         freshness_window_seconds,
                         require_evidence,
                         explain_selection,
                         refresh,
-                        timeout,
+                        eff_timeout,
                         wrap,
                     )?;
                 }
@@ -20188,6 +20203,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_DATA_DIR                            override data dir".to_string(),
             "  CASS_DB_PATH                             override db path".to_string(),
             "  CASS_OUTPUT_FORMAT=json|jsonl|compact|sessions|toon  default structured output".to_string(),
+            "  CASS_SEARCH_TIMEOUT_MS=<N>               default `cass search`/`pack` timeout in ms (--timeout overrides; 0=none)".to_string(),
+            "  CASS_SEARCH_LIMIT=<N>                    default search/pack limit (--limit overrides; 0=no limit)".to_string(),
+            "  CASS_SEARCH_MODE=lexical|semantic|hybrid default search/pack mode (--mode overrides)".to_string(),
             "  TOON_DEFAULT_FORMAT=toon|json            fallback structured output for all tools".to_string(),
             "  TOON_INDENT=<N>                           pretty-print TOON with indent".to_string(),
             "  TOON_KEY_FOLDING=off|safe                 TOON key folding mode".to_string(),
@@ -22175,6 +22193,87 @@ mod search_lexical_self_heal_tests {
             .expect("checkpoint present");
         assert!(checkpoint.completed);
         assert_eq!(checkpoint.indexed_docs, 0);
+    }
+}
+
+/// Resolve the effective `(timeout_ms, limit, mode)` for a `cass search` /
+/// `cass pack` invocation by layering the configurable defaults (#303) under
+/// the explicit CLI flags.
+///
+/// Precedence (highest wins): CLI flag > env var > `~/.config/cass/cass.toml`
+/// `[search]` > built-in default. The config file is loaded once per
+/// invocation; a present-but-broken file or a malformed env value is surfaced
+/// as a clear usage error rather than silently ignored.
+///
+/// `cli_limit == 0` is treated as "not explicitly set" so a configured default
+/// limit engages for the common `cass search "<q>"` (no `--limit`) case; an
+/// explicit `--limit 0` is semantically identical to the unset default ("no
+/// limit", still RAM-capped downstream), so nothing surprising happens there.
+fn resolve_search_defaults(
+    cli_timeout: Option<u64>,
+    cli_limit: usize,
+    cli_mode: Option<crate::search::query::SearchMode>,
+) -> CliResult<(Option<u64>, usize, Option<crate::search::query::SearchMode>)> {
+    use crate::search_defaults as sd;
+
+    let defaults = sd::load_search_defaults().map_err(|e| {
+        CliError::usage(
+            e.to_string(),
+            Some("Fix or remove ~/.config/cass/cass.toml; expected a [search] table".to_string()),
+        )
+    })?;
+
+    let (timeout, _t_src) = sd::resolve_timeout_ms(
+        cli_timeout,
+        sd::timeout_env().as_deref(),
+        defaults.timeout_ms,
+    )
+    .map_err(|e| {
+        CliError::usage(
+            e,
+            Some("Set a non-negative integer of milliseconds".to_string()),
+        )
+    })?;
+
+    let (limit, _l_src) = sd::resolve_limit(
+        cli_limit,
+        cli_limit != 0,
+        sd::limit_env().as_deref(),
+        defaults.limit,
+    )
+    .map_err(|e| CliError::usage(e, Some("Set a non-negative integer".to_string())))?;
+
+    let cli_mode_str = cli_mode.map(search_mode_canonical_str);
+    let (mode_str, _m_src) = sd::resolve_mode(
+        cli_mode_str,
+        sd::mode_env().as_deref(),
+        defaults.mode.as_deref(),
+    )
+    .map_err(|e| CliError::usage(e, Some("Use one of: lexical, semantic, hybrid".to_string())))?;
+    let mode = mode_str.and_then(|m| search_mode_from_canonical_str(&m));
+
+    Ok((timeout, limit, mode))
+}
+
+/// Canonical lowercase name for a [`crate::search::query::SearchMode`].
+fn search_mode_canonical_str(mode: crate::search::query::SearchMode) -> &'static str {
+    use crate::search::query::SearchMode;
+    match mode {
+        SearchMode::Lexical => "lexical",
+        SearchMode::Semantic => "semantic",
+        SearchMode::Hybrid => "hybrid",
+    }
+}
+
+/// Inverse of [`search_mode_canonical_str`]; input is already validated by
+/// `search_defaults::resolve_mode`, so an unknown value is a no-op `None`.
+fn search_mode_from_canonical_str(s: &str) -> Option<crate::search::query::SearchMode> {
+    use crate::search::query::SearchMode;
+    match s {
+        "lexical" => Some(SearchMode::Lexical),
+        "semantic" => Some(SearchMode::Semantic),
+        "hybrid" => Some(SearchMode::Hybrid),
+        _ => None,
     }
 }
 
@@ -68356,8 +68455,10 @@ fn gather_onboarding_observation(
                 .into_iter()
                 .filter(|entry| entry.detected)
                 .map(|entry| {
-                    let root_readable =
-                        entry.root_paths.iter().any(|p| std::fs::read_dir(p).is_ok());
+                    let root_readable = entry
+                        .root_paths
+                        .iter()
+                        .any(|p| std::fs::read_dir(p).is_ok());
                     let estimated_sessions = entry
                         .root_paths
                         .iter()
@@ -68434,7 +68535,10 @@ fn print_onboarding_human(
         println!("{}", lines.join("\n"));
     }
     if !report.excluded_providers.is_empty() {
-        println!("  Excluded providers: {}", report.excluded_providers.join(", "));
+        println!(
+            "  Excluded providers: {}",
+            report.excluded_providers.join(", ")
+        );
     }
     println!(
         "  Estimated sessions to index: {}",
@@ -76569,6 +76673,21 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "CASS_OUTPUT_FORMAT",
             None,
             "Default structured output format: json, jsonl, compact, sessions, or toon.",
+        ),
+        env_var_capability(
+            "CASS_SEARCH_TIMEOUT_MS",
+            None,
+            "Default search/pack timeout in milliseconds (0 = no timeout). The --timeout flag overrides; also configurable via [search].timeout_ms in ~/.config/cass/cass.toml. Alias: CASS_SEARCH_TIMEOUT.",
+        ),
+        env_var_capability(
+            "CASS_SEARCH_LIMIT",
+            None,
+            "Default search/pack result limit (0 = no limit, RAM-capped). The --limit flag overrides; also [search].limit in ~/.config/cass/cass.toml.",
+        ),
+        env_var_capability(
+            "CASS_SEARCH_MODE",
+            None,
+            "Default search/pack mode: lexical, semantic, or hybrid. The --mode flag overrides; also [search].mode in ~/.config/cass/cass.toml.",
         ),
         env_var_capability(
             "TOON_DEFAULT_FORMAT",
