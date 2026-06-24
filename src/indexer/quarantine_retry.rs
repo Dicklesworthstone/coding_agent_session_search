@@ -482,7 +482,7 @@ mod tests {
     use crate::indexer::quarantine::QuarantineRecord;
     use chrono::DateTime;
 
-    const CURRENT: &str = "0.6.16";
+    const CURRENT: &str = "0.6.17";
 
     fn ts(secs: i64) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(secs, 0).expect("valid timestamp")
