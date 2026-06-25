@@ -16032,10 +16032,25 @@ pub struct DailyStatsHealth {
 // FTS5 Batch Insert (P2 Opt 2.1)
 // -------------------------------------------------------------------------
 
-/// Batch size for FTS5 inserts. With 7 columns per row (rowid + 6 cols) and
-/// SQLite's SQLITE_MAX_VARIABLE_NUMBER default of 999, max batch is ~142 rows.
-/// Using 100 for safety margin and memory efficiency.
-const FTS5_BATCH_SIZE: usize = 100;
+/// Rows per FTS5 INSERT statement during db-resident `fts_messages`
+/// maintenance/rebuild. Each row binds 7 columns (rowid + 6 cols), and
+/// frankensqlite's `MAX_VARIABLE_NUMBER` is 32766, so the hard ceiling is
+/// 32766 / 7 = 4680 rows per statement; 4096 leaves margin (28672 params).
+///
+/// This value is performance-critical, NOT just a memory knob
+/// (`coding_agent_session_search-nhqw0` / gh #301): `fts_messages` is a
+/// contentless FTS5 table (`content=''`), which routes every INSERT through
+/// frankensqlite's `persist_rootpage_zero_fts5_shadow_rows` full-table
+/// re-encode (`build_pending_hash` re-tokenizes *all* rows). The cost of one
+/// INSERT is therefore O(rows-so-far) regardless of the statement's row count,
+/// so the total rebuild cost is (number of INSERT statements) × O(table). The
+/// old value of 100 fragmented a single ~512-row flush into ~6 statements and
+/// turned a multi-MB rebuild into ~120 whole-table re-encodes (O(N²)), which
+/// wedged `cass index --full` above ~15-30 MB of content. Issuing one large
+/// param-safe statement per flush collapses that to a handful of re-encodes.
+/// The asymptotic fix (incremental contentless persistence) is tracked in
+/// frankensqlite bd-sf8dx.
+const FTS5_BATCH_SIZE: usize = 4096;
 
 #[derive(Debug, Clone)]
 struct FtsRebuildMessageRow {
@@ -16085,8 +16100,17 @@ impl FtsEntry {
     }
 }
 
-const FTS_ENTRY_BATCH_MAX_DOCS: usize = 512;
-const FTS_ENTRY_BATCH_MAX_CHARS: usize = 1024 * 1024;
+// Per-flush accumulation caps for the streaming FTS rebuild/maintenance paths.
+// A flush is emitted once either cap is hit, then handed to
+// `franken_batch_insert_fts_on_connection`, which splits it into
+// `FTS5_BATCH_SIZE`-row INSERT statements. Because each contentless-FTS INSERT
+// re-encodes the whole table (see `FTS5_BATCH_SIZE` above /
+// `coding_agent_session_search-nhqw0`), these caps must be large enough that a
+// flush is a single param-safe statement — keeping the doc cap at/under
+// `FTS5_BATCH_SIZE` means one flush == one INSERT == one re-encode. The char
+// cap bounds peak entry-buffer memory for pathologically large messages.
+const FTS_ENTRY_BATCH_MAX_DOCS: usize = 4000;
+const FTS_ENTRY_BATCH_MAX_CHARS: usize = 32 * 1024 * 1024;
 
 /// Default batch size for the FTS rebuild INSERT (Bug #168).  When
 /// `fts_messages` is empty but `messages` has 100K+ rows, a single unbounded
