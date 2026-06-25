@@ -482,7 +482,10 @@ mod tests {
     use crate::indexer::quarantine::QuarantineRecord;
     use chrono::DateTime;
 
-    const CURRENT: &str = "0.6.17";
+    // Track the live package version so this constant never goes stale on a
+    // version bump (production stamps re-quarantines via `record_attempt`,
+    // which uses `env!("CARGO_PKG_VERSION")`).
+    const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
     fn ts(secs: i64) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(secs, 0).expect("valid timestamp")

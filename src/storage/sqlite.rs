@@ -24162,6 +24162,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "blocked on frankensqlite contentless-FTS fix (y8n3i / fsqlite bd-sf8dx): reopen-mutate on a lazily-opened contentless table; un-ignore via cljkz once fsqlite publishes the fix"]
     fn ensure_fts_consistency_via_rusqlite_catches_up_missing_rows() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 
@@ -24242,6 +24243,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "blocked on frankensqlite contentless-FTS fix (y8n3i / fsqlite bd-sf8dx): open-validation demands a _content shadow for contentless fts_messages; un-ignore via cljkz once fsqlite publishes the fix"]
     fn rebuild_fts_via_rusqlite_cleans_duplicate_legacy_schema_rows() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 
@@ -26761,6 +26763,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "blocked on frankensqlite contentless-FTS fix (y8n3i / fsqlite bd-sf8dx): open-validation demands a _content shadow for contentless fts_messages; un-ignore via cljkz once fsqlite publishes the fix"]
     fn franken_storage_open_repairs_duplicate_fts_messages_schema_rows() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test_open_repairs_duplicate_fts_schema.db");
