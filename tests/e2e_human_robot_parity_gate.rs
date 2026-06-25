@@ -172,6 +172,16 @@ struct ParitySurface {
 /// The readiness journeys this gate proves parity for. Health/status/triage all
 /// derive from the same `state_meta_json_for_status` object, so the human
 /// "Recommended:" line and the robot `recommended_action` come from one source.
+///
+/// Bead 76tvn extends the set to the `doctor --check` recovery surface, which
+/// reports a top-level `status` + `healthy` + `recommended_action` from the same
+/// readiness derivation. `doctor` is treated as *terse* (`detailed: false`): in
+/// a healthy state its `recommended_action` is informational ("no immediate
+/// action…") and the multi-section human output legitimately does not echo it
+/// verbatim — exactly the `health` rule — so verbatim parity is required only
+/// when there is an actionable problem (`healthy=false`). The `sources doctor`
+/// recovery surface is *per-source* shaped (no single readiness verdict) and so
+/// gets its own dedicated parity test rather than a `ParitySurface` entry.
 fn parity_surfaces() -> Vec<ParitySurface> {
     vec![
         ParitySurface {
@@ -197,6 +207,14 @@ fn parity_surfaces() -> Vec<ParitySurface> {
             family_pointer: "/status",
             identity_keys: &["recommended_commands", "recommended_action"],
             detailed: true,
+        },
+        ParitySurface {
+            name: "doctor",
+            robot_args: &["doctor", "--check", "--json"],
+            human_args: &["doctor", "--check"],
+            family_pointer: "/status",
+            identity_keys: &["status", "healthy", "health_class", "recommended_action"],
+            detailed: false,
         },
     ]
 }
@@ -721,6 +739,160 @@ fn human_surfaces_never_surface_destructive_guidance() -> Result<(), String> {
             violations.join("\n  - ")
         ))
     }
+}
+
+/// Recovery-surface parity for `cass sources doctor` (bead 76tvn). Unlike the
+/// readiness journeys, sources doctor is a *per-source* report — there is no
+/// single top-level readiness verdict — so it gets a dedicated parity check
+/// rather than a `ParitySurface` entry. For a configured-but-unreachable source
+/// (RFC 6761 `.invalid` host → a deterministic DNS failure, no network needed):
+///   * the robot `--json` form is pure JSON, a per-source report (`sources[]` +
+///     `summary` + `mutation_free=true`) that marks the source not-reached and
+///     offers an allow-listed `safe_next_command`;
+///   * the human form names the same source and the same failing host, stays
+///     escape-free, and carries no destructive guidance; and
+///   * classifying the source never rewrites `sources.toml`.
+#[test]
+fn sources_doctor_recovery_surface_is_in_parity() -> Result<(), String> {
+    let home = tempfile::tempdir().map_err(|e| format!("create tempdir: {e}"))?;
+    let home_path = home.path().to_path_buf();
+    let config_dir = home_path.join("xdg-config").join("cass");
+    std::fs::create_dir_all(&config_dir).map_err(|e| format!("create config dir: {e}"))?;
+    let sources_toml = config_dir.join("sources.toml");
+    let toml = concat!(
+        "[[sources]]\n",
+        "name = \"parity-host\"\n",
+        "type = \"ssh\"\n",
+        "host = \"nobody@parity.invalid\"\n",
+        "paths = [\"~/.claude/projects\"]\n",
+    );
+    std::fs::write(&sources_toml, toml).map_err(|e| format!("write sources.toml: {e}"))?;
+    let before = std::fs::read(&sources_toml).map_err(|e| format!("read sources.toml: {e}"))?;
+    let robot_drift = DriftKind::RobotState.as_str();
+    let human_drift = DriftKind::HumanProjection.as_str();
+
+    // --- robot form ---
+    let robot_out = run_sources_doctor_form(
+        &home_path,
+        &["sources", "doctor", "--json"],
+        "sources_doctor_robot",
+    );
+    if robot_out.status.code() != Some(1) {
+        return Err(format!(
+            "[drift={robot_drift}] sources doctor --json should exit 1 with an unreachable source, got {:?}",
+            robot_out.status.code(),
+        ));
+    }
+    let robot_stdout = std::str::from_utf8(&robot_out.stdout)
+        .map_err(|e| format!("[drift={robot_drift}] sources doctor robot stdout not UTF-8: {e}"))?;
+    let robot: Value = serde_json::from_str(robot_stdout.trim()).map_err(|e| {
+        format!(
+            "[drift={robot_drift}] sources doctor robot stdout is not pure JSON: {e}; head: {}",
+            head(robot_stdout)
+        )
+    })?;
+    if robot.get("mutation_free").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "[drift={robot_drift}] sources doctor robot payload must mark mutation_free=true"
+        ));
+    }
+    let sources = robot.get("sources").and_then(Value::as_array).ok_or_else(|| {
+        format!(
+            "[drift={robot_drift}] sources doctor robot payload missing sources[] array; present: {:?}",
+            present_keys(&robot)
+        )
+    })?;
+    let source = sources
+        .iter()
+        .find(|s| s.get("source_id").and_then(Value::as_str) == Some("parity-host"))
+        .ok_or_else(|| {
+            format!(
+                "[drift={robot_drift}] sources doctor robot did not report the configured source"
+            )
+        })?;
+    if source.get("host_reached").and_then(Value::as_bool) != Some(false) {
+        return Err(format!(
+            "[drift={robot_drift}] sources doctor should report the .invalid host as not reached"
+        ));
+    }
+    let safe_cmd = source
+        .get("safe_next_command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("[drift={robot_drift}] sources doctor source missing safe_next_command")
+        })?;
+    if !command_is_safe(safe_cmd) {
+        return Err(format!(
+            "[drift={robot_drift}] sources doctor safe_next_command is not on the safe allow-list: {safe_cmd}"
+        ));
+    }
+
+    // --- human form ---
+    let human_out =
+        run_sources_doctor_form(&home_path, &["sources", "doctor"], "sources_doctor_human");
+    if has_escape(&human_out.stdout) {
+        return Err(format!(
+            "[drift={human_drift}] sources doctor human stdout carries an ANSI escape despite NO_COLOR"
+        ));
+    }
+    let human = std::str::from_utf8(&human_out.stdout)
+        .map_err(|e| format!("[drift={human_drift}] sources doctor human stdout not UTF-8: {e}"))?;
+    if human.trim().is_empty() {
+        return Err(format!(
+            "[drift={human_drift}] sources doctor human surface produced no output"
+        ));
+    }
+    // Parity — the human projection names the same source the robot reports.
+    if !human.contains("parity-host") {
+        return Err(format!(
+            "[drift={human_drift}] sources doctor human output does not name the source 'parity-host'; head: {}",
+            head(human)
+        ));
+    }
+    // Parity — both surfaces diagnose the same failing host (the shared evidence
+    // the robot `state`/`connection_error` and the human checks both reference).
+    if !human.contains("parity.invalid") {
+        return Err(format!(
+            "[drift={human_drift}] sources doctor human output does not reflect the failing host 'parity.invalid'; head: {}",
+            head(human)
+        ));
+    }
+    // Refusal — the human surface never carries destructive guidance.
+    if !text_is_clean(human) {
+        return Err(format!(
+            "[drift={human_drift}] sources doctor human output carries a destructive command fragment"
+        ));
+    }
+
+    // Mutation-free — classifying the source did not rewrite sources.toml.
+    let after =
+        std::fs::read(&sources_toml).map_err(|e| format!("read sources.toml after: {e}"))?;
+    if before != after {
+        return Err(format!(
+            "[drift={}] sources doctor rewrote sources.toml (must be mutation-free)",
+            DriftKind::Fixture.as_str()
+        ));
+    }
+    Ok(())
+}
+
+/// Run a `sources doctor` form against an isolated HOME/XDG with a pre-seeded
+/// `sources.toml`. `sources doctor` reads `XDG_CONFIG_HOME/cass/sources.toml` and
+/// takes no `--data-dir`, so this builds its own bounded command rather than
+/// reusing the data-dir-appending readiness harness.
+fn run_sources_doctor_form(home: &std::path::Path, args: &[&str], label: &str) -> Output {
+    let mut cmd = Command::new(cargo_bin("cass"));
+    cmd.args(args)
+        .current_dir(home)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join("xdg-data"))
+        .env("XDG_CONFIG_HOME", home.join("xdg-config"))
+        .env("XDG_CACHE_HOME", home.join("xdg-cache"))
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_SEMANTIC_EMBEDDER", "hash")
+        .env("NO_COLOR", "1")
+        .env_remove("CLAUDE_CONFIG_DIR");
+    spawn_with_timeout_or_diag(cmd, label, None, SURFACE_TIMEOUT)
 }
 
 /// The three-way outcome the gate distinguishes for a parity run. A hang is its
