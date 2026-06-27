@@ -124,12 +124,12 @@ const CORE_STYLES: &str = r#"
   --red: oklch(0.65 0.22 25);
 
   /* Typography Scale - Fluid */
-  --text-xs: clamp(0.6875rem, 0.65rem + 0.15vw, 0.75rem);
-  --text-sm: clamp(0.8125rem, 0.775rem + 0.2vw, 0.875rem);
-  --text-base: clamp(1rem, 0.95rem + 0.25vw, 1.125rem);
-  --text-lg: clamp(1.125rem, 1.05rem + 0.4vw, 1.375rem);
-  --text-xl: clamp(1.375rem, 1.25rem + 0.65vw, 1.75rem);
-  --text-2xl: clamp(1.625rem, 1.45rem + 0.9vw, 2.25rem);
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.5rem;
+  --text-2xl: 2rem;
 
   /* Spacing System */
   --space-1: 0.25rem;
@@ -178,7 +178,7 @@ const CORE_STYLES: &str = r#"
   --card-foreground: oklch(0.15 0.02 260);
   --popover: oklch(1 0 0);
   --popover-foreground: oklch(0.15 0.02 260);
-  --primary: oklch(0.55 0.2 195);
+  --primary: oklch(0.45 0.16 195);
   --primary-foreground: oklch(1 0 0);
   --secondary: oklch(0.94 0.01 260);
   --secondary-foreground: oklch(0.2 0.02 260);
@@ -191,7 +191,7 @@ const CORE_STYLES: &str = r#"
   --input: oklch(0.92 0.01 260);
   --ring: oklch(0.55 0.2 195);
 
-  --cyan: oklch(0.55 0.2 195);
+  --cyan: oklch(0.45 0.16 195);
   --green: oklch(0.5 0.18 145);
   --amber: oklch(0.6 0.18 75);
 }
@@ -1321,12 +1321,20 @@ const COMPONENT_STYLES: &str = r#"
   .message {
     padding: var(--space-3) var(--space-4);
     border-radius: var(--radius-lg);
+    max-width: 100%;
+    overflow-wrap: anywhere;
   }
 
   .message-header {
+    flex-wrap: wrap;
     gap: var(--space-1);
     margin-bottom: var(--space-2);
     padding-bottom: var(--space-1);
+  }
+
+  .message-header-right {
+    flex-shrink: 1;
+    min-width: 0;
   }
 
   .message-icon { font-size: 0.875rem; }
@@ -1336,6 +1344,7 @@ const COMPONENT_STYLES: &str = r#"
   .message-content {
     font-size: var(--text-sm);
     line-height: 1.6;
+    overflow-wrap: anywhere;
   }
 
   .message-link {
@@ -1343,6 +1352,15 @@ const COMPONENT_STYLES: &str = r#"
     right: var(--space-3);
     padding: 8px;
     opacity: 1; /* Always visible on mobile */
+  }
+
+  .message-content a {
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--touch-min);
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    vertical-align: middle;
   }
 
   .tool-call {
@@ -1379,13 +1397,18 @@ const COMPONENT_STYLES: &str = r#"
   }
 
   /* Larger tap targets */
-  button, a, summary {
+  button, summary, [role="button"] {
+    min-width: var(--touch-min);
     min-height: var(--touch-min);
   }
 
   /* Block-level code overflow */
-  pre, code {
+  pre, code, table {
     max-width: 100%;
+  }
+
+  pre, table {
+    overflow-x: auto;
   }
 
   /* Tool badges - larger touch targets on mobile */
@@ -1605,6 +1628,11 @@ const ENCRYPTION_STYLES: &str = r#"
   justify-content: center;
   background: oklch(0 0 0 / 0.85);
   backdrop-filter: blur(8px);
+}
+
+.decrypt-modal[hidden],
+.decrypt-error[hidden] {
+  display: none !important;
 }
 
 .decrypt-form {

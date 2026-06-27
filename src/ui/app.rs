@@ -15039,7 +15039,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
         match std::fs::rename(temp_path, final_path) {
             Ok(()) => sync_parent_directory(final_path),
             Err(first_err)
-                if final_path.exists()
+                if path_entry_exists(final_path)
                     && matches!(
                         first_err.kind(),
                         std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
@@ -15047,7 +15047,6 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
             {
                 let backup_path = unique_atomic_sidecar_path(final_path, "bak", "tui_state.json");
                 std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
-                    let _ = std::fs::remove_file(temp_path);
                     format!(
                         "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
                         backup_path.display(),
@@ -15057,15 +15056,11 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
                     )
                 })?;
                 match std::fs::rename(temp_path, final_path) {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&backup_path);
-                        sync_parent_directory(final_path)
-                    }
+                    Ok(()) => sync_parent_directory(final_path),
                     Err(second_err) => {
                         let restore_result = std::fs::rename(&backup_path, final_path);
                         match restore_result {
                             Ok(()) => {
-                                let _ = std::fs::remove_file(temp_path);
                                 sync_parent_directory(final_path)?;
                                 Err(format!(
                                     "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
@@ -15103,10 +15098,13 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
     }
 }
 
-fn sync_file_path(path: &Path) -> Result<(), String> {
-    std::fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| format!("failed syncing {}: {e}", path.display()))
+#[cfg(any(windows, test))]
+fn path_entry_exists(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => false,
+        Err(_) => true,
+    }
 }
 
 #[cfg(not(windows))]
@@ -15149,17 +15147,41 @@ fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) ->
     ))
 }
 
+fn write_persisted_state_temp_file(path: &Path, payload: &[u8]) -> Result<PathBuf, String> {
+    for _ in 0..100 {
+        let tmp_path = unique_atomic_temp_path(path);
+        match write_persisted_state_temp_file_at(&tmp_path, payload) {
+            Ok(()) => return Ok(tmp_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("failed writing {}: {err}", tmp_path.display())),
+        }
+    }
+
+    Err(format!(
+        "failed to allocate unique TUI state temp path for {}",
+        path.display()
+    ))
+}
+
+fn write_persisted_state_temp_file_at(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(payload)?;
+    file.sync_all()
+}
+
 fn save_persisted_state_to_path(path: &Path, state: &PersistedState) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed creating {}: {e}", parent.display()))?;
     }
-    let tmp_path = unique_atomic_temp_path(path);
     let payload = serde_json::to_vec_pretty(&persisted_state_file_from_state(state))
         .map_err(|e| format!("failed serializing state: {e}"))?;
-    std::fs::write(&tmp_path, payload)
-        .map_err(|e| format!("failed writing {}: {e}", tmp_path.display()))?;
-    sync_file_path(&tmp_path)?;
+    let tmp_path = write_persisted_state_temp_file(path, &payload)?;
     replace_file_from_temp(&tmp_path, path)?;
     Ok(())
 }
@@ -15827,6 +15849,9 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char(' ') if ctrl => CassMsg::PeekToggled,
 
                     // -- Navigation -----------------------------------------------
+                    KeyCode::BackTab => CassMsg::FocusDirectional {
+                        direction: FocusDirection::Left,
+                    },
                     KeyCode::Tab if shift => CassMsg::FocusDirectional {
                         direction: FocusDirection::Left,
                     },
@@ -16075,6 +16100,13 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     return ftui::Cmd::none();
                 }
+                CassMsg::QueryChanged(text) if text == " " => {
+                    if state.focused == ExportField::ExportButton {
+                        return self.update(CassMsg::ExportExecuted);
+                    }
+                    state.toggle_current();
+                    return ftui::Cmd::none();
+                }
                 CassMsg::QueryChanged(text) => {
                     // Non-editing mode: check for Ctrl+H (password visibility toggle).
                     if text == "\x08" {
@@ -16083,16 +16115,17 @@ impl super::ftui_adapter::Model for CassApp {
                     return ftui::Cmd::none();
                 }
                 CassMsg::QuerySubmitted | CassMsg::DetailOpened => {
-                    // Enter key: toggle text field editing, or execute export.
+                    // Enter key: commit an active text edit, advance from password
+                    // entry, or execute export when the form is valid.
                     // Note: Enter maps to DetailOpened in the key dispatch;
                     // QuerySubmitted is also handled for programmatic sends.
-                    if state.focused == ExportField::OutputDir {
+                    if state.focused == ExportField::OutputDir && state.output_dir_editing {
                         state.toggle_current();
-                    } else if state.focused == ExportField::ExportButton {
-                        return self.update(CassMsg::ExportExecuted);
                     } else if state.focused == ExportField::Password {
                         // Enter in password field = move to next.
                         state.next_field();
+                    } else if state.can_export() {
+                        return self.update(CassMsg::ExportExecuted);
                     } else {
                         state.toggle_current();
                     }
@@ -24163,6 +24196,21 @@ mod tests {
         String::from_utf8(sink.lock().map(|b| b.clone()).unwrap_or_default()).unwrap_or_default()
     }
 
+    fn captured_enter_route(
+        logs: &str,
+        route_markers: (&str, &str),
+        reason_markers: (&str, &str),
+    ) -> Option<bool> {
+        if !logs.contains("enter routing decision") {
+            return None;
+        }
+
+        Some(
+            (logs.contains(route_markers.0) || logs.contains(route_markers.1))
+                && (logs.contains(reason_markers.0) || logs.contains(reason_markers.1)),
+        )
+    }
+
     struct ActionOverrideGuard {
         prev_config: Option<SourcesConfig>,
         prev_editor_command: Option<String>,
@@ -24342,6 +24390,78 @@ mod tests {
     }
 
     #[test]
+    fn export_modal_enter_exports_when_default_focus_is_valid() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut app = app_with_hits(1);
+        app.show_export_modal = true;
+        app.export_modal_state = Some(ExportModalState {
+            output_dir: tmp.path().to_path_buf(),
+            output_dir_buffer: tmp.path().display().to_string(),
+            filename_preview: "session.html".to_string(),
+            focused: ExportField::OutputDir,
+            ..Default::default()
+        });
+
+        let cmd = app.update(CassMsg::DetailOpened);
+
+        assert!(
+            matches!(cmd, ftui::Cmd::Task(..)),
+            "Enter should execute export from the default focused field when valid"
+        );
+        assert_eq!(app.status, "Exporting HTML...");
+        assert!(matches!(
+            app.export_modal_state
+                .as_ref()
+                .expect("export modal state")
+                .progress,
+            ExportProgress::Preparing
+        ));
+    }
+
+    #[test]
+    fn export_modal_plain_space_toggles_focused_control() {
+        let mut app = app_with_hits(1);
+        app.show_export_modal = true;
+        app.export_modal_state = Some(ExportModalState {
+            focused: ExportField::IncludeTools,
+            include_tools: true,
+            ..Default::default()
+        });
+
+        let _ = app.update(CassMsg::QueryChanged(" ".to_string()));
+
+        assert!(
+            !app.export_modal_state
+                .as_ref()
+                .expect("export modal state")
+                .include_tools,
+            "plain Space should toggle the focused checkbox while the modal is not editing text"
+        );
+    }
+
+    #[test]
+    fn export_modal_space_still_types_in_active_output_dir_edit() {
+        let mut app = app_with_hits(1);
+        app.show_export_modal = true;
+        app.export_modal_state = Some(ExportModalState {
+            focused: ExportField::OutputDir,
+            output_dir_editing: true,
+            output_dir_buffer: "/tmp/cass export".to_string(),
+            ..Default::default()
+        });
+
+        let _ = app.update(CassMsg::QueryChanged(" ".to_string()));
+
+        assert_eq!(
+            app.export_modal_state
+                .as_ref()
+                .expect("export modal state")
+                .output_dir_buffer,
+            "/tmp/cass export "
+        );
+    }
+
+    #[test]
     fn all_detail_tab_variants_constructible() {
         let _msgs = DetailTab::Messages;
         let _snip = DetailTab::Snippets;
@@ -24502,6 +24622,20 @@ mod tests {
         let event = Event::Key(KeyEvent::new(KeyCode::Char(' ')).with_modifiers(Modifiers::CTRL));
 
         assert!(matches!(CassMsg::from(event), CassMsg::PeekToggled));
+    }
+
+    #[test]
+    fn event_mapping_backtab_maps_to_previous_focus() {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent};
+
+        let event = Event::Key(KeyEvent::new(KeyCode::BackTab));
+
+        assert!(matches!(
+            CassMsg::from(event),
+            CassMsg::FocusDirectional {
+                direction: FocusDirection::Left
+            }
+        ));
     }
 
     #[test]
@@ -24850,6 +24984,98 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.parent(), final_path.parent());
         assert_eq!(second.parent(), final_path.parent());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_temp_write_refuses_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let protected = tmp.path().join("protected-state.json");
+        let temp_path = tmp.path().join(".tui_state.json.tmp");
+
+        std::fs::write(&protected, b"protected").expect("write protected target");
+        symlink(&protected, &temp_path).expect("create temp symlink");
+
+        let err = write_persisted_state_temp_file_at(&temp_path, br#"{"version":1}"#)
+            .expect_err("existing temp symlink must be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&protected).expect("read protected target"),
+            b"protected"
+        );
+        assert!(
+            std::fs::symlink_metadata(&temp_path)
+                .expect("temp path metadata")
+                .file_type()
+                .is_symlink(),
+            "failed temp write should leave the existing symlink untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_replace_replaces_symlink_without_following()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new()?;
+        let final_path = tmp.path().join("tui_state.json");
+        let protected = tmp.path().join("protected-state.json");
+        let temp_path = tmp.path().join(".tui_state.json.tmp");
+
+        std::fs::write(&protected, b"protected")?;
+        symlink(&protected, &final_path)?;
+        std::fs::write(&temp_path, br#"{"version":1}"#)?;
+
+        replace_file_from_temp(&temp_path, &final_path).map_err(std::io::Error::other)?;
+
+        if !matches!(
+            std::fs::read(&protected)?.as_slice().cmp(b"protected"),
+            std::cmp::Ordering::Equal
+        ) {
+            return Err("replace modified the symlink target".into());
+        }
+        if std::fs::symlink_metadata(&final_path)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("replace followed the symlink instead of publishing at the path".into());
+        }
+        if !matches!(
+            std::fs::read(&final_path)?
+                .as_slice()
+                .cmp(br#"{"version":1}"#),
+            std::cmp::Ordering::Equal
+        ) {
+            return Err("replace did not publish the temporary state bytes".into());
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_path_entry_exists_detects_dangling_symlink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new()?;
+        let path = tmp.path().join("tui_state.json");
+        let missing_target = tmp.path().join("missing-state.json");
+
+        symlink(&missing_target, &path)?;
+
+        if path.exists() {
+            return Err("Path::exists stopped following the missing target".into());
+        }
+        if !path_entry_exists(&path) {
+            return Err("replacement fallback missed the symlink path entry itself".into());
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -26907,12 +27133,18 @@ mod tests {
             ),
             "expected query-submit fallback routing branch"
         );
-        // Tracing subscriber capture can race with unrelated parallel tests, so
-        // the routing branch above is the authoritative assertion.
-        if !logs.is_empty() {
+        // Tracing subscriber capture can miss this event or include unrelated
+        // output in full-suite runs; the routing branch above is authoritative.
+        if let Some(has_route) = captured_enter_route(
+            &logs,
+            (
+                "route=\"query_submit_fallback\"",
+                "route=query_submit_fallback",
+            ),
+            ("reason=\"no_selected_hit\"", "reason=no_selected_hit"),
+        ) {
             assert!(
-                logs.contains("route=\"query_submit_fallback\"")
-                    && logs.contains("reason=\"no_selected_hit\""),
+                has_route,
                 "expected query-submit fallback diagnostic markers, logs={logs}"
             );
         }
@@ -26943,12 +27175,15 @@ mod tests {
             ) && app.show_detail_modal,
             "expected selected hit to open detail modal through the modal-open routing branch"
         );
-        // Tracing subscriber capture can race with unrelated parallel tests, so
-        // the routing branch above is the authoritative assertion.
-        if !logs.is_empty() {
+        // Tracing subscriber capture can miss this event or include unrelated
+        // output in full-suite runs; the routing branch above is authoritative.
+        if let Some(has_route) = captured_enter_route(
+            &logs,
+            ("route=\"detail_modal_open\"", "route=detail_modal_open"),
+            ("reason=\"selected_hit\"", "reason=selected_hit"),
+        ) {
             assert!(
-                logs.contains("route=\"detail_modal_open\"")
-                    && logs.contains("reason=\"selected_hit\""),
+                has_route,
                 "expected modal-open diagnostic markers, logs={logs}"
             );
         }

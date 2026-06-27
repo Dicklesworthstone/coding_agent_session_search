@@ -34,7 +34,7 @@ use rand::Rng;
 use serde::Serialize;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use tracing::info;
 
 /// Argon2id default parameters
@@ -54,6 +54,16 @@ const ARGON2_PARALLELISM: u32 = 1;
 /// Schema version for encryption
 const SCHEMA_VERSION: u8 = 2;
 const MAX_ARCHIVE_CHUNKS: u64 = u32::MAX as u64;
+const REQUIRED_SITE_FILES: &[&str] = &[
+    "index.html",
+    "config.json",
+    "sw.js",
+    "viewer.js",
+    "auth.js",
+    "styles.css",
+    "robots.txt",
+    ".nojekyll",
+];
 
 fn max_encryptable_plaintext_bytes(chunk_size: usize) -> u64 {
     MAX_ARCHIVE_CHUNKS.saturating_mul(chunk_size as u64)
@@ -175,6 +185,7 @@ pub fn key_add_password(
     let slot_id = next_key_slot_id(&config.key_slots)?;
     let new_slot = create_password_slot(new_password, &dek, &config.export_id, slot_id)?;
 
+    materialize_safe_required_file_symlinks(&archive_dir)?;
     config.key_slots.push(new_slot);
 
     // Write updated config
@@ -209,6 +220,7 @@ pub fn key_add_recovery(
     let slot_id = next_key_slot_id(&config.key_slots)?;
     let new_slot = create_recovery_slot(secret.as_bytes(), &dek, &config.export_id, slot_id)?;
 
+    materialize_safe_required_file_symlinks(&archive_dir)?;
     config.key_slots.push(new_slot);
 
     // Write updated config
@@ -276,6 +288,8 @@ pub fn key_revoke(
         .find(|s| s.id == slot_id_to_revoke)
         .map(|s| s.slot_type == SlotType::Recovery)
         .unwrap_or(false);
+
+    materialize_safe_required_file_symlinks(&archive_dir)?;
 
     // Remove the slot (keeping IDs stable - they're part of the AAD binding)
     config.key_slots.retain(|s| s.id != slot_id_to_revoke);
@@ -911,6 +925,95 @@ fn regenerate_integrity_manifest(
     Ok(Some(integrity))
 }
 
+fn materialize_safe_required_file_symlinks(archive_dir: &Path) -> Result<()> {
+    let canonical_archive_dir = archive_dir.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve archive directory {} before key mutation",
+            archive_dir.display()
+        )
+    })?;
+
+    for rel_path in REQUIRED_SITE_FILES {
+        materialize_safe_required_file_symlink(archive_dir, &canonical_archive_dir, rel_path)?;
+    }
+
+    Ok(())
+}
+
+fn materialize_safe_required_file_symlink(
+    archive_dir: &Path,
+    canonical_archive_dir: &Path,
+    rel_path: &str,
+) -> Result<()> {
+    let path = archive_dir.join(rel_path);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to inspect required site file {} before key mutation",
+                    path.display()
+                )
+            });
+        }
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+
+    let canonical_target = path.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve symlinked required site file {} before key mutation",
+            path.display()
+        )
+    })?;
+    if !canonical_target.starts_with(canonical_archive_dir) {
+        bail!(
+            "Refusing to materialize required site file symlink outside archive root: {}",
+            path.display()
+        );
+    }
+
+    let target_metadata = std::fs::metadata(&canonical_target).with_context(|| {
+        format!(
+            "Failed to inspect symlink target {} before key mutation",
+            canonical_target.display()
+        )
+    })?;
+    if !target_metadata.file_type().is_file() {
+        bail!(
+            "Refusing to materialize required site file symlink that does not point to a regular file: {}",
+            path.display()
+        );
+    }
+
+    let temp_path = unique_atomic_sidecar_path(&path, "materialize", "site-file");
+    std::fs::copy(&canonical_target, &temp_path).with_context(|| {
+        format!(
+            "Failed copying symlink target {} into staged required site file {}",
+            canonical_target.display(),
+            temp_path.display()
+        )
+    })?;
+    File::open(&temp_path)
+        .and_then(|file| file.sync_all())
+        .with_context(|| {
+            format!(
+                "Failed syncing materialized required site file {}",
+                temp_path.display()
+            )
+        })?;
+    replace_file_from_temp(&temp_path, &path).with_context(|| {
+        format!(
+            "Failed materializing required site file symlink {} before key mutation",
+            path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
 fn write_json_pretty_atomically<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let temp_path = unique_atomic_temp_path(path);
     {
@@ -939,49 +1042,8 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
                 sync_parent_directory(final_path)?;
                 Ok(())
             }
-            Err(first_err) if final_path.exists() => {
-                let backup_path = unique_atomic_backup_path(final_path);
-                std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
-                    let _ = std::fs::remove_file(temp_path);
-                    anyhow::anyhow!(
-                        "failed replacing {} with {}: {}; failed moving existing file to backup {}: {}",
-                        final_path.display(),
-                        temp_path.display(),
-                        first_err,
-                        backup_path.display(),
-                        backup_err
-                    )
-                })?;
-
-                match std::fs::rename(temp_path, final_path) {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&backup_path);
-                        sync_parent_directory(final_path)?;
-                        Ok(())
-                    }
-                    Err(second_err) => match std::fs::rename(&backup_path, final_path) {
-                        Ok(()) => {
-                            let _ = std::fs::remove_file(temp_path);
-                            sync_parent_directory(final_path)?;
-                            anyhow::bail!(
-                                "failed replacing {} with {}: {}; restored original file",
-                                final_path.display(),
-                                temp_path.display(),
-                                second_err
-                            );
-                        }
-                        Err(restore_err) => {
-                            anyhow::bail!(
-                                "failed replacing {} with {}: {}; restore error: {}; temp file retained at {}",
-                                final_path.display(),
-                                temp_path.display(),
-                                second_err,
-                                restore_err,
-                                temp_path.display()
-                            );
-                        }
-                    },
-                }
+            Err(first_err) if replacement_path_entry_exists(final_path)? => {
+                replace_file_from_temp_via_backup(temp_path, final_path, &first_err)
             }
             Err(err) => Err(err.into()),
         }
@@ -989,6 +1051,64 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
         std::fs::rename(temp_path, final_path)?;
         sync_parent_directory(final_path)?;
         Ok(())
+    }
+}
+
+fn replacement_path_entry_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => Ok(false),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed inspecting replacement target {}", path.display())),
+    }
+}
+
+fn replace_file_from_temp_via_backup(
+    temp_path: &Path,
+    final_path: &Path,
+    first_err: &std::io::Error,
+) -> Result<()> {
+    let backup_path = unique_atomic_backup_path(final_path);
+    std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
+        let _ = std::fs::remove_file(temp_path);
+        anyhow::anyhow!(
+            "failed replacing {} with {}: {}; failed moving existing file to backup {}: {}",
+            final_path.display(),
+            temp_path.display(),
+            first_err,
+            backup_path.display(),
+            backup_err
+        )
+    })?;
+
+    match std::fs::rename(temp_path, final_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup_path);
+            sync_parent_directory(final_path)?;
+            Ok(())
+        }
+        Err(second_err) => match std::fs::rename(&backup_path, final_path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(temp_path);
+                sync_parent_directory(final_path)?;
+                anyhow::bail!(
+                    "failed replacing {} with {}: {}; restored original file",
+                    final_path.display(),
+                    temp_path.display(),
+                    second_err
+                );
+            }
+            Err(restore_err) => {
+                anyhow::bail!(
+                    "failed replacing {} with {}: {}; restore error: {}; temp file retained at {}",
+                    final_path.display(),
+                    temp_path.display(),
+                    second_err,
+                    restore_err,
+                    temp_path.display()
+                );
+            }
+        },
     }
 }
 
@@ -1172,6 +1292,21 @@ fn copy_site_except_runtime_state(src: &Path, dst: &Path) -> Result<()> {
     copy_site_except_runtime_state_recursive(src, dst, src, &canonical_base)
 }
 
+fn safe_staged_site_destination(dst_root: &Path, rel_path: &Path) -> Result<PathBuf> {
+    let mut path_parts = vec![dst_root.to_path_buf()];
+    for component in rel_path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => path_parts.push(PathBuf::from(name)),
+            _ => bail!(
+                "Refusing to stage archive entry with unsafe relative path: {}",
+                rel_path.display()
+            ),
+        }
+    }
+    Ok(path_parts.into_iter().collect())
+}
+
 fn copy_site_except_runtime_state_recursive(
     src: &Path,
     dst: &Path,
@@ -1193,7 +1328,7 @@ fn copy_site_except_runtime_state_recursive(
 
         let metadata = std::fs::symlink_metadata(&path)?;
         let file_type = metadata.file_type();
-        let dest_path = dst.join(rel_path);
+        let dest_path = safe_staged_site_destination(dst, rel_path)?;
         if file_type.is_dir() {
             std::fs::create_dir_all(&dest_path)?;
             copy_site_except_runtime_state_recursive(&path, dst, base, canonical_base)?;
@@ -1347,8 +1482,6 @@ mod tests {
 
         let manifest = crate::pages::bundle::generate_integrity_manifest(site_dir).unwrap();
         write_json_pretty(&site_dir.join("integrity.json"), &manifest).unwrap();
-
-        assert_eq!(verify_bundle(site_dir, false).unwrap().status, "valid");
     }
 
     fn setup_test_archive() -> (TempDir, std::path::PathBuf) {
@@ -1780,20 +1913,40 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_key_add_password_preserves_in_tree_symlinked_required_asset() {
+    fn test_key_add_password_materializes_in_tree_symlinked_required_asset() -> Result<()> {
         let (_temp_dir, archive_dir) = setup_test_archive();
-        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let site_dir = super::super::resolve_site_dir(&archive_dir)?;
         replace_viewer_with_in_tree_symlink(&site_dir);
 
-        key_add_password(&archive_dir, "test-password", "new-password").unwrap();
+        key_add_password(&archive_dir, "test-password", "new-password")?;
 
-        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
-        assert!(
-            std::fs::symlink_metadata(site_dir.join("viewer.js"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
+        anyhow::ensure!(verify_bundle(&archive_dir, false)?.status == "valid");
+        let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js"))?;
+        anyhow::ensure!(viewer_metadata.file_type().is_file());
+        anyhow::ensure!(!viewer_metadata.file_type().is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_key_add_password_wrong_password_preserves_in_tree_symlinked_required_asset()
+    -> Result<()> {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir)?;
+        replace_viewer_with_in_tree_symlink(&site_dir);
+
+        let err = match key_add_password(&archive_dir, "wrong-password", "new-password") {
+            Ok(_) => bail!("wrong password unexpectedly added a key slot"),
+            Err(err) => err,
+        };
+
+        anyhow::ensure!(
+            err.to_string().contains("Invalid password"),
+            "unexpected error: {err:#}"
         );
+        let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js"))?;
+        anyhow::ensure!(viewer_metadata.file_type().is_symlink());
+        Ok(())
     }
 
     #[test]
@@ -2019,6 +2172,74 @@ mod tests {
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written, value);
+    }
+
+    #[test]
+    fn test_unique_atomic_backup_path_changes_each_call() -> Result<()> {
+        use std::collections::BTreeSet;
+
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("config.json");
+
+        let first = unique_atomic_backup_path(&path);
+        let second = unique_atomic_backup_path(&path);
+        let mut seen = BTreeSet::new();
+
+        if !seen.insert(first.clone()) || !seen.insert(second.clone()) {
+            anyhow::bail!(
+                "backup sidecar names should be unique, got {} twice",
+                first.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_replacement_path_entry_exists_detects_dangling_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new()?;
+        let link_path = temp_dir.path().join("config.json");
+        let missing_target = temp_dir.path().join("missing-config.json");
+
+        symlink(&missing_target, &link_path)?;
+
+        if link_path.exists() {
+            anyhow::bail!("dangling symlink unexpectedly resolved through Path::exists");
+        }
+        if !replacement_path_entry_exists(&link_path)? {
+            anyhow::bail!(
+                "replacement path entry check missed dangling symlink {}",
+                link_path.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_replace_file_from_temp_via_backup_overwrites_existing_file() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("config.json");
+        let temp_path = temp_dir.path().join("config.tmp");
+        let first_err = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+
+        std::fs::write(&final_path, br#"{"slots":["old"]}"#)?;
+        std::fs::write(&temp_path, br#"{"slots":["new"]}"#)?;
+
+        replace_file_from_temp_via_backup(&temp_path, &final_path, &first_err)?;
+
+        let content = std::fs::read_to_string(&final_path)?;
+        if !content.contains("new") {
+            anyhow::bail!("final config did not contain replacement content: {content}");
+        }
+        if temp_path.exists() {
+            anyhow::bail!(
+                "temporary config was left behind at {}",
+                temp_path.display()
+            );
+        }
+        Ok(())
     }
 
     #[test]

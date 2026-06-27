@@ -249,12 +249,6 @@ fn check_required_files(site_dir: &Path) -> CheckResult {
                 if file_type.is_file() {
                     continue;
                 }
-                if file_type.is_symlink()
-                    && let Ok(target_meta) = fs::metadata(&path)
-                    && target_meta.file_type().is_file()
-                {
-                    continue;
-                }
                 invalid.push(format!("{file} (must be a regular file)"));
             }
             Err(_) => missing.push(*file),
@@ -1700,6 +1694,36 @@ mod tests {
             "required file directories should be rejected: {:?}",
             result.checks.required_files.details
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_required_files_reject_symlinked_regular_file() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new()?;
+        let site_dir = temp.path().join("site");
+        let outside = TempDir::new()?;
+        copy_fixture("valid", &site_dir)?;
+        fs::rename(
+            site_dir.join("viewer.js"),
+            outside.path().join("viewer-original.js"),
+        )?;
+        fs::write(outside.path().join("viewer.js"), "outside viewer")?;
+        symlink(outside.path().join("viewer.js"), site_dir.join("viewer.js"))?;
+
+        let result = check_required_files(&site_dir);
+
+        if result.passed {
+            anyhow::bail!("symlinked required file was accepted");
+        }
+        match result.details.as_deref() {
+            Some(details) if details.contains("viewer.js (must be a regular file)") => Ok(()),
+            details => anyhow::bail!(
+                "symlinked required files should be rejected; got details: {:?}",
+                details
+            ),
+        }
     }
 
     #[test]

@@ -1471,6 +1471,7 @@ fn copy_dir_recursive_inner(src: &Path, dst: &Path, canonical_base: &Path) -> Re
                 );
             }
 
+            ensure_deploy_file_destination(&dst_path)?;
             std::fs::copy(&canonical_target, &dst_path).with_context(|| {
                 format!(
                     "Failed copying symlink target {} to {} during deploy staging",
@@ -1484,6 +1485,7 @@ fn copy_dir_recursive_inner(src: &Path, dst: &Path, canonical_base: &Path) -> Re
         if file_type.is_dir() {
             copy_dir_recursive_inner(&src_path, &dst_path, canonical_base)?;
         } else if file_type.is_file() {
+            ensure_deploy_file_destination(&dst_path)?;
             std::fs::copy(&src_path, &dst_path)?;
         }
     }
@@ -1532,6 +1534,34 @@ fn ensure_deploy_staging_dir(path: &Path) -> Result<()> {
         Err(err) => Err(err).with_context(|| {
             format!(
                 "Failed inspecting deploy staging directory before copy: {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn ensure_deploy_file_destination(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "Refusing to write deploy file through symlink: {}",
+                    path.display()
+                );
+            }
+            if !file_type.is_file() {
+                bail!(
+                    "Refusing to write deploy file over non-file path: {}",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed inspecting deploy file destination before copy: {}",
                 path.display()
             )
         }),
@@ -1877,6 +1907,40 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_dir_recursive_rejects_symlinked_file_destination() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let src = TempDir::new()?;
+        let dst = TempDir::new()?;
+        let outside = TempDir::new()?;
+
+        std::fs::write(src.path().join("root.txt"), "root")?;
+        std::fs::write(outside.path().join("target.txt"), "outside")?;
+        symlink(
+            outside.path().join("target.txt"),
+            dst.path().join("root.txt"),
+        )?;
+
+        let err = match copy_dir_recursive(src.path(), dst.path()) {
+            Ok(()) => bail!("copy unexpectedly succeeded through a symlinked destination"),
+            Err(err) => err,
+        };
+        if !err
+            .to_string()
+            .contains("Refusing to write deploy file through symlink")
+        {
+            bail!("unexpected error: {err:#}");
+        }
+        let outside_contents = std::fs::read_to_string(outside.path().join("target.txt"))?;
+        if outside_contents != "outside" {
+            bail!("deploy copy overwrote symlink target outside staging directory");
+        }
+        Ok(())
     }
 
     #[test]

@@ -399,7 +399,20 @@ fn unique_timestamp_fallback_filename(dir: &Path, stem: &str, ext: &str, ts: u12
         }
     }
 
-    let suffix = format!("_{}_{}", ts, std::process::id());
+    let process_id = std::process::id();
+    for attempt in 0..1000 {
+        let suffix = if attempt == 0 {
+            format!("_{ts}_{process_id}")
+        } else {
+            format!("_{ts}_{process_id}_{attempt}")
+        };
+        let fallback = dir.join(unique_candidate_filename(stem, ext, &suffix));
+        if !filename_path_is_occupied(&fallback) {
+            return fallback;
+        }
+    }
+
+    let suffix = format!("_{ts}_{process_id}_overflow");
     dir.join(unique_candidate_filename(stem, ext, &suffix))
 }
 
@@ -1180,6 +1193,38 @@ mod tests {
         assert!(
             !filename_path_is_occupied(&path),
             "fallback helper should return an unoccupied path"
+        );
+    }
+
+    #[test]
+    fn test_unique_timestamp_fallback_checks_pid_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ts = 9_876_543_210u128;
+        for attempt in 0..1000 {
+            let suffix = if attempt == 0 {
+                format!("_{ts}")
+            } else {
+                format!("_{ts}_{attempt}")
+            };
+            let filename = unique_candidate_filename("session", ".html", &suffix);
+            std::fs::write(temp.path().join(filename), b"existing")
+                .expect("write occupied timestamp fallback");
+        }
+        let process_id = std::process::id();
+        let occupied_pid = format!("session_{ts}_{process_id}.html");
+        std::fs::write(temp.path().join(occupied_pid), b"existing")
+            .expect("write occupied pid fallback");
+
+        let path = unique_timestamp_fallback_filename(temp.path(), "session", ".html", ts);
+        let expected = format!("session_{ts}_{process_id}_1.html");
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(expected.as_str())
+        );
+        assert!(
+            !filename_path_is_occupied(&path),
+            "pid fallback helper should return an unoccupied path"
         );
     }
 

@@ -76,11 +76,9 @@ impl SizeEstimate {
                 conditions.push("1=0".to_string());
             } else {
                 let placeholders: Vec<_> = agents.iter().map(|_| "?").collect();
-                // Use a non-correlated subquery via IN instead of a correlated
-                // EXISTS. frankensqlite's current planner doesn't match the
-                // correlated `a.id = c.agent_id` join condition consistently;
-                // the non-correlated form is what the rest of the codebase
-                // uses (see src/pages/summary.rs::get_date_histogram).
+                // Keep this as a non-correlated subquery. The file-backed
+                // read-only pages path still resolves this shape reliably,
+                // while the equivalent correlated EXISTS can under-match.
                 conditions.push(format!(
                     "c.agent_id IN (SELECT a.id FROM agents a WHERE a.slug IN ({}))",
                     placeholders.join(", ")

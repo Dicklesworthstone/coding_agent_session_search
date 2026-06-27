@@ -636,8 +636,8 @@ mod tests {
 
     #[test]
     fn test_handle_request_bad_method() {
-        let site_dir = std::path::Path::new("/tmp");
-        let response = handle_request(site_dir, "POST / HTTP/1.1\r\n");
+        let temp_dir = temp_site_with_index("<html></html>");
+        let response = handle_request(temp_dir.path(), "POST / HTTP/1.1\r\n");
         let response_str = String::from_utf8_lossy(&response);
         assert!(response_str.contains("HTTP/1.1 405 Method Not Allowed"));
         assert!(response_str.contains("Method Not Allowed"));
@@ -645,8 +645,8 @@ mod tests {
 
     #[test]
     fn test_handle_request_bad_path() {
-        let site_dir = std::path::Path::new("/tmp");
-        let response = handle_request(site_dir, "GET /../etc/passwd HTTP/1.1\r\n");
+        let temp_dir = temp_site_with_index("<html></html>");
+        let response = handle_request(temp_dir.path(), "GET /../etc/passwd HTTP/1.1\r\n");
         let response_str = String::from_utf8_lossy(&response);
         assert!(response_str.contains("400") || response_str.contains("Invalid"));
     }

@@ -5,8 +5,11 @@
 //! - JSON - structured data for programmatic use
 //! - Plain Text - simple, copy-paste friendly format
 
-use crate::search::query::SearchHit;
 use chrono::{DateTime, Utc};
+use serde_json::{Map, Value};
+use std::borrow::Cow;
+
+use crate::search::query::SearchHit;
 
 /// Supported export formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -188,18 +191,19 @@ fn export_markdown(hits: &[SearchHit], options: &ExportOptions) -> String {
         }
 
         if options.include_path {
-            let path_display = if hit.source_path.chars().count() > 60 {
-                let skip = hit.source_path.chars().count() - 57;
-                format!(
+            let source_path_chars = hit.source_path.chars().count();
+            let path_display: Cow<'_, str> = if source_path_chars > 60 {
+                let skip = source_path_chars - 57;
+                Cow::Owned(format!(
                     "...{}",
                     hit.source_path.chars().skip(skip).collect::<String>()
-                )
+                ))
             } else {
-                hit.source_path.clone()
+                Cow::Borrowed(hit.source_path.as_str())
             };
             output.push_str(&format!(
                 "| Source | {} |\n",
-                escape_markdown(&path_display)
+                escape_markdown(path_display.as_ref())
             ));
 
             if let Some(line) = hit.line_number {
@@ -272,37 +276,46 @@ fn export_hit_json(hit: &SearchHit, options: &ExportOptions) -> serde_json::Valu
         } else {
             0.0
         };
-        obj["score"] = serde_json::json!(score);
+        obj.insert("score".to_string(), serde_json::json!(score));
     }
 
     if options.include_path {
-        obj["source_path"] = serde_json::json!(hit.source_path);
+        obj.insert(
+            "source_path".to_string(),
+            serde_json::json!(hit.source_path),
+        );
         if let Some(line) = hit.line_number {
-            obj["line_number"] = serde_json::json!(line);
+            obj.insert("line_number".to_string(), serde_json::json!(line));
         }
     }
 
     if let Some(ts) = hit.created_at {
-        obj["created_at"] = serde_json::json!(ts);
+        obj.insert("created_at".to_string(), serde_json::json!(ts));
         if let Some(dt) = DateTime::from_timestamp_millis(ts) {
-            obj["created_at_formatted"] = serde_json::json!(dt.to_rfc3339());
+            obj.insert(
+                "created_at_formatted".to_string(),
+                serde_json::json!(dt.to_rfc3339()),
+            );
         }
     }
 
     if options.include_content && !hit.content.is_empty() {
-        obj["content"] = serde_json::json!(hit.content);
+        obj.insert("content".to_string(), serde_json::json!(hit.content));
     }
 
-    obj
+    Value::Object(obj)
 }
 
-fn export_hit_base_json(hit: &SearchHit, options: &ExportOptions) -> serde_json::Value {
-    serde_json::json!({
-        "title": hit.title,
-        "agent": hit.agent,
-        "workspace": hit.workspace,
-        "snippet": truncate_text(&hit.snippet, options.max_snippet_len),
-    })
+fn export_hit_base_json(hit: &SearchHit, options: &ExportOptions) -> Map<String, Value> {
+    Map::from_iter([
+        ("title".to_string(), serde_json::json!(hit.title)),
+        ("agent".to_string(), serde_json::json!(hit.agent)),
+        ("workspace".to_string(), serde_json::json!(hit.workspace)),
+        (
+            "snippet".to_string(),
+            serde_json::json!(truncate_text(&hit.snippet, options.max_snippet_len)),
+        ),
+    ])
 }
 
 /// Export to plain text format

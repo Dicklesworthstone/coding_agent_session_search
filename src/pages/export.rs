@@ -600,7 +600,7 @@ fn derive_attachment_refs(extra_json: Option<&str>) -> Option<String> {
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn unique_replace_backup_path(path: &Path) -> PathBuf {
     unique_atomic_sidecar_path(path, "bak", "pages_export.db")
 }
@@ -640,6 +640,67 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!("{file_name}{suffix}"))
 }
 
+#[cfg(any(windows, test))]
+fn replacement_path_entry_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => Ok(false),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed inspecting export path {}", path.display()))
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn replace_file_from_temp_via_backup(
+    temp_path: &Path,
+    final_path: &Path,
+    first_err: &std::io::Error,
+) -> Result<()> {
+    let backup_path = unique_replace_backup_path(final_path);
+    std::fs::rename(final_path, &backup_path).with_context(|| {
+        let _ = std::fs::remove_file(temp_path);
+        format!(
+            "failed preparing backup {} before replacing {} after initial rename error: {}",
+            backup_path.display(),
+            final_path.display(),
+            first_err
+        )
+    })?;
+
+    match std::fs::rename(temp_path, final_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup_path);
+            sync_parent_directory(final_path)?;
+            Ok(())
+        }
+        Err(second_err) => match std::fs::rename(&backup_path, final_path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(temp_path);
+                sync_parent_directory(final_path)?;
+                bail!(
+                    "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
+                    final_path.display(),
+                    temp_path.display(),
+                    first_err,
+                    second_err
+                );
+            }
+            Err(restore_err) => {
+                bail!(
+                    "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}",
+                    final_path.display(),
+                    temp_path.display(),
+                    first_err,
+                    second_err,
+                    restore_err,
+                    temp_path.display()
+                );
+            }
+        },
+    }
+}
+
 fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
@@ -649,53 +710,21 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
                 Ok(())
             }
             Err(first_err)
-                if final_path.exists()
-                    && matches!(
-                        first_err.kind(),
-                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                    ) =>
+                if matches!(
+                    first_err.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                ) =>
             {
-                let backup_path = unique_replace_backup_path(final_path);
-                std::fs::rename(final_path, &backup_path).with_context(|| {
-                    let _ = std::fs::remove_file(temp_path);
-                    format!(
-                        "failed preparing backup {} before replacing {} after initial rename error: {}",
-                        backup_path.display(),
-                        final_path.display(),
-                        first_err
-                    )
-                })?;
-
-                match std::fs::rename(temp_path, final_path) {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&backup_path);
-                        sync_parent_directory(final_path)?;
-                        Ok(())
-                    }
-                    Err(second_err) => match std::fs::rename(&backup_path, final_path) {
-                        Ok(()) => {
-                            let _ = std::fs::remove_file(temp_path);
-                            sync_parent_directory(final_path)?;
-                            bail!(
-                                "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
-                                final_path.display(),
-                                temp_path.display(),
-                                first_err,
-                                second_err
-                            );
-                        }
-                        Err(restore_err) => {
-                            bail!(
-                                "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}",
-                                final_path.display(),
-                                temp_path.display(),
-                                first_err,
-                                second_err,
-                                restore_err,
-                                temp_path.display()
-                            );
-                        }
-                    },
+                if replacement_path_entry_exists(final_path)? {
+                    replace_file_from_temp_via_backup(temp_path, final_path, &first_err)
+                } else {
+                    Err(first_err).with_context(|| {
+                        format!(
+                            "failed renaming completed export {} into place at {}",
+                            temp_path.display(),
+                            final_path.display()
+                        )
+                    })
                 }
             }
             Err(rename_err) => Err(rename_err).with_context(|| {
@@ -1321,6 +1350,75 @@ mod tests {
 
         assert!(engine.source_db_path.starts_with(temp_dir.path()));
         assert!(engine.output_path.starts_with(temp_dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_path_entry_exists_detects_dangling_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new()?;
+        let link_path = temp_dir.path().join("export.db");
+        let missing_target = temp_dir.path().join("missing-export.db");
+
+        symlink(&missing_target, &link_path)?;
+
+        if link_path.exists() {
+            return Err(anyhow::anyhow!(
+                "Path::exists stopped following the missing target"
+            ));
+        }
+        if !replacement_path_entry_exists(&link_path)? {
+            return Err(anyhow::anyhow!(
+                "replacement path helper missed a dangling symlink entry"
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn unique_replace_backup_path_is_not_reused() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let first = unique_replace_backup_path(&final_path);
+        let second = unique_replace_backup_path(&final_path);
+
+        if first == second {
+            return Err(anyhow::anyhow!(
+                "export replacement backup path was reused: {}",
+                first.display()
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn replace_file_from_temp_via_backup_overwrites_existing_file() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let temp_path = temp_dir.path().join("export.tmp");
+        let first_err = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+
+        std::fs::write(&final_path, b"old export")?;
+        std::fs::write(&temp_path, b"new export")?;
+
+        replace_file_from_temp_via_backup(&temp_path, &final_path, &first_err)?;
+
+        if !matches!(
+            std::fs::read(&final_path)?.as_slice().cmp(b"new export"),
+            std::cmp::Ordering::Equal
+        ) {
+            return Err(anyhow::anyhow!(
+                "backup replacement did not publish temp bytes"
+            ));
+        }
+        if temp_path.exists() {
+            return Err(anyhow::anyhow!("export temp path was not consumed"));
+        }
+
+        Ok(())
     }
 
     #[test]
