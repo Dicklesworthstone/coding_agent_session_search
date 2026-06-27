@@ -78,8 +78,9 @@ pub mod setup;
 pub mod sync;
 
 use std::io::Read as IoRead;
-use std::process::{Child, Output};
+use std::process::{Child, Command, Output};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use wait_timeout::ChildExt;
@@ -140,21 +141,26 @@ fn shell_quote_ssh_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn drain_child_pipe<R>(mut pipe: R) -> Receiver<std::io::Result<Vec<u8>>>
+struct ChildPipeReader {
+    receiver: Receiver<std::io::Result<Vec<u8>>>,
+    handle: JoinHandle<()>,
+}
+
+fn drain_child_pipe<R>(mut pipe: R) -> ChildPipeReader
 where
     R: IoRead + Send + 'static,
 {
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let mut output = Vec::new();
         let result = pipe.read_to_end(&mut output).map(|_| output);
         let _ = sender.send(result);
     });
-    receiver
+    ChildPipeReader { receiver, handle }
 }
 
 fn finish_child_pipe(
-    pipe_reader: Option<Receiver<std::io::Result<Vec<u8>>>>,
+    pipe_reader: Option<ChildPipeReader>,
     deadline: Instant,
 ) -> std::io::Result<Option<Vec<u8>>> {
     match pipe_reader {
@@ -162,21 +168,61 @@ fn finish_child_pipe(
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .unwrap_or(Duration::ZERO);
-            match reader.recv_timeout(remaining) {
-                Ok(result) => result.map(Some),
+            match reader.receiver.recv_timeout(remaining) {
+                Ok(result) => {
+                    reader
+                        .handle
+                        .join()
+                        .map_err(|_| std::io::Error::other("child pipe reader panicked"))?;
+                    result.map(Some)
+                }
                 Err(RecvTimeoutError::Timeout) => Ok(None),
-                Err(RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "child pipe reader disconnected before sending output",
-                )),
+                Err(RecvTimeoutError::Disconnected) => {
+                    let reader_panicked = reader.handle.join().is_err();
+                    let message = if reader_panicked {
+                        "child pipe reader panicked before sending output"
+                    } else {
+                        "child pipe reader disconnected before sending output"
+                    };
+                    Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, message))
+                }
             }
         }
         None => Ok(Some(Vec::new())),
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn configure_child_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn configure_child_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_child_process_group(pid: u32) {
+    let process_group = format!("-{pid}");
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", &process_group])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn kill_child_process_group(_pid: u32) {}
+
 /// Wait for a child process while draining stdout/stderr without letting either
 /// process execution or pipe collection outlive the same wall-clock deadline.
+///
+/// Callers should pass children configured with
+/// [`configure_child_process_group`] before `spawn()`. Without that, the direct
+/// child can be killed but shell grandchildren may keep inherited pipe FDs open
+/// until they exit naturally.
 pub(crate) fn wait_for_child_output_with_timeout(
     mut child: Child,
     timeout: Duration,
@@ -188,15 +234,18 @@ pub(crate) fn wait_for_child_output_with_timeout(
     };
     let start = Instant::now();
     let deadline = start.checked_add(timeout).unwrap_or(start);
+    let child_pid = child.id();
     let stdout_reader = child.stdout.take().map(drain_child_pipe);
     let stderr_reader = child.stderr.take().map(drain_child_pipe);
 
     match child.wait_timeout(timeout)? {
         Some(status) => {
             let Some(stdout) = finish_child_pipe(stdout_reader, deadline)? else {
+                kill_child_process_group(child_pid);
                 return Ok(None);
             };
             let Some(stderr) = finish_child_pipe(stderr_reader, deadline)? else {
+                kill_child_process_group(child_pid);
                 return Ok(None);
             };
             Ok(Some(Output {
@@ -206,6 +255,7 @@ pub(crate) fn wait_for_child_output_with_timeout(
             }))
         }
         None => {
+            kill_child_process_group(child_pid);
             let _ = child.kill();
             let _ = child.wait();
             Ok(None)

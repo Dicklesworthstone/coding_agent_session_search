@@ -40,8 +40,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    config::DiscoveredHost, host_key_verification_error, is_host_key_verification_failure,
-    strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
+    config::DiscoveredHost, configure_child_process_group, host_key_verification_error,
+    is_host_key_verification_failure, strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
 };
 
 /// Default connection timeout in seconds.
@@ -401,6 +401,7 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_child_process_group(&mut cmd);
 
     // Spawn the process and write probe script to stdin
     let mut child = match cmd.spawn() {
@@ -1190,6 +1191,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn probe_script_treats_special_probe_paths_as_literals() {
         let home = tempfile::tempdir().expect("temp home");
         let relative_path =
@@ -1220,6 +1222,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_script_produces_valid_markers() {
         let output = run_probe_script_locally();
         assert!(
@@ -1233,6 +1236,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_script_parses_into_reachable_result() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1246,6 +1250,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_system_info_has_valid_os() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1258,6 +1263,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_system_info_has_valid_arch() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1273,6 +1279,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_system_info_has_nonempty_home() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1286,6 +1293,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_resources_have_nonzero_disk() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1294,6 +1302,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_resources_have_nonzero_memory() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1306,6 +1315,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_resources_memory_invariant() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1319,6 +1329,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_resources_can_compile_reflects_thresholds() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1333,6 +1344,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_tool_detection_is_consistent() {
         let output = run_probe_script_locally();
         let result = parse_probe_output("localhost", &output, 0);
@@ -1555,6 +1567,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_machine_id_present() {
         // Test that the local probe script actually collects machine_id
         let output = run_probe_script_locally();

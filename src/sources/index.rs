@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    host_key_verification_error, is_host_key_verification_failure,
+    configure_child_process_group, host_key_verification_error, is_host_key_verification_failure,
     probe::{CassStatus, HostProbeResult},
     strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
 };
@@ -823,6 +823,7 @@ fi
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_child_process_group(&mut cmd);
 
         let mut child = cmd.spawn()?;
 
@@ -1116,13 +1117,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_wait_for_command_output_with_timeout_kills_stalled_child() {
-        let child = Command::new("sh")
-            .arg("-c")
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
             .arg("sleep 2")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn sleep helper");
+            .stderr(Stdio::piped());
+        configure_child_process_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn sleep helper");
 
         let started = Instant::now();
         let err = wait_for_command_output_with_timeout(child, Duration::from_millis(50))
@@ -1134,13 +1135,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_wait_for_command_output_with_timeout_drains_large_output() {
-        let child = Command::new("sh")
-            .arg("-c")
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
             .arg("yes stdout | head -c 200000; yes stderr | head -c 200000 >&2")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn large-output helper");
+            .stderr(Stdio::piped());
+        configure_child_process_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn large-output helper");
 
         let output = wait_for_command_output_with_timeout(child, Duration::from_secs(5))
             .expect("large-output command should finish without filling pipes");
@@ -1152,19 +1153,55 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_wait_for_command_output_with_timeout_bounds_inherited_pipe_waits() {
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg("(sleep 2) & printf parent-done")
+        let temp = tempfile::TempDir::new().expect("create temp dir");
+        let pid_file = temp.path().join("grandchild.pid");
+        let mut cmd = Command::new("sh");
+        cmd.env("PID_FILE", &pid_file);
+        cmd.arg("-c")
+            .arg("(sleep 30) & printf '%s\\n' \"$!\" > \"$PID_FILE\"; printf parent-done")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn inherited-pipe helper");
+            .stderr(Stdio::piped());
+        configure_child_process_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn inherited-pipe helper");
 
         let started = Instant::now();
         let err = wait_for_command_output_with_timeout(child, Duration::from_millis(100))
             .expect_err("inherited pipe should not outlive command deadline");
         assert!(matches!(err, IndexError::Timeout(1)));
         assert!(started.elapsed() < Duration::from_secs(1));
+
+        let grandchild_pid = std::fs::read_to_string(&pid_file)
+            .expect("shell records inherited-pipe grandchild pid");
+        assert!(
+            wait_until_unix_process_stops(grandchild_pid.trim(), Duration::from_secs(1)),
+            "timeout must kill inherited-pipe grandchild process {}",
+            grandchild_pid.trim()
+        );
+    }
+
+    #[cfg(unix)]
+    fn wait_until_unix_process_stops(pid: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !unix_process_is_running(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        !unix_process_is_running(pid)
+    }
+
+    #[cfg(unix)]
+    fn unix_process_is_running(pid: &str) -> bool {
+        let Ok(output) = Command::new("ps").args(["-o", "stat=", "-p", pid]).output() else {
+            return true;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let stat = String::from_utf8_lossy(&output.stdout);
+        let stat = stat.trim();
+        !stat.is_empty() && !stat.starts_with('Z')
     }
 
     #[test]
