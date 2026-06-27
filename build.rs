@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{self, Command};
 
 use toml::Value;
 
@@ -46,9 +47,15 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "b3c841ba2655e2ee1834b6d9c8572fa3dc8f1ed6",
-        expected_version: "0.1.3",
+        // crates.io-only exact pin: fsqlite 0.1.9 carries the upstream #95
+        // BtCursor forward-progress fix plus the #106 MVCC grow fix,
+        // FTS5 reload/lazy-shadow fixes, and the latest large-index repair
+        // surface needed by cass refreshes.
+        // Empty `expected_git` signals
+        // `validate_manifest_dependency_spec` to skip git/rev checks.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.1.9",
         expected_features: &["fts5"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -63,9 +70,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "b3c841ba2655e2ee1834b6d9c8572fa3dc8f1ed6",
-        expected_version: "0.1.3",
+        // crates.io-only exact pin aligned with the frankensqlite facade at 0.1.9.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.1.9",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -81,7 +89,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "b62d859709aa6f8e772759efa2c13da9e3c088c9",
+        expected_rev: "a4923d4097899e6e9805cefe67bce70e1b04a289",
         expected_version: "0.1.8",
         expected_features: &[
             "chatgpt",
@@ -104,13 +112,13 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "asupersync",
         crate_package_name: "asupersync",
         manifest_package_field: None,
-        // crates.io-only pin after the 0.3.x migration unified every source
+        // crates.io-only exact pin after the 0.3.x migration unified every source
         // (direct dep, frankensqlite transitive, frankensearch transitive)
         // onto a single published release. Empty `expected_git` signals
         // `validate_manifest_dependency_spec` to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.1",
+        expected_version: "0.3.2",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -130,7 +138,14 @@ const CONTRACTS: &[DependencyContract] = &[
         // indexing plus the self-contained Git dependency packaging fix.
         expected_rev: "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
         expected_version: "0.3.2",
-        expected_features: &["ann", "fastembed-reranker", "hash", "lexical"],
+        // cass#256: `fastembed-reranker` no longer appears in the static
+        // `[dependencies]` table; it is enabled by the cass `semantic`
+        // feature so the baseline build (`--no-default-features --features
+        // qr,encryption`) can drop the prebuilt Microsoft ONNX Runtime
+        // binary that crashes pre-AVX2 CPUs. The contract therefore only
+        // pins the always-on features here; the conditional one is
+        // validated by Cargo's own feature graph.
+        expected_features: &["ann", "hash", "lexical"],
         expected_default_features: Some(false),
         repo_rel: "../frankensearch",
         manifest_rel: "frankensearch/Cargo.toml",
@@ -245,14 +260,24 @@ fn main() {
 
     emit_platform_link_hints();
 
-    let manifest_dir = PathBuf::from(
-        env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set by Cargo"),
-    );
+    let manifest_dir = match env::var("CARGO_MANIFEST_DIR") {
+        Ok(value) => PathBuf::from(value),
+        Err(err) => fatal(format!(
+            "CARGO_MANIFEST_DIR should be set by Cargo before running build.rs: {err}"
+        )),
+    };
     let manifest_path = manifest_dir.join("Cargo.toml");
-    let manifest_text = fs::read_to_string(&manifest_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
-    let manifest: Value = toml::from_str(&manifest_text)
-        .unwrap_or_else(|err| panic!("failed to parse {}: {err}", manifest_path.display()));
+    let manifest_text = match fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(err) => fatal(format!("failed to read {}: {err}", manifest_path.display())),
+    };
+    let manifest: Value = match toml::from_str(&manifest_text) {
+        Ok(value) => value,
+        Err(err) => fatal(format!(
+            "failed to parse {}: {err}",
+            manifest_path.display()
+        )),
+    };
 
     let packaged_manifest = manifest_dir.join("Cargo.toml.orig").is_file();
     validate_path_dependency_contracts(&manifest_dir, &manifest, packaged_manifest);
@@ -301,7 +326,7 @@ fn validate_manifest_dependency_spec(
     if contract.expected_git.is_empty() {
         // Pure crates.io dependency: lock in the registry version, which is the
         // only source identity crates.io gives us.
-        validate_manifest_dependency_version(spec, contract);
+        validate_manifest_dependency_version(spec, contract, packaged_manifest);
         if spec.contains_key("git") || spec.contains_key("rev") {
             contract_error(
                 contract,
@@ -316,7 +341,7 @@ fn validate_manifest_dependency_spec(
         // generated package manifest used by `cargo publish` verification.
         // Validate that rewritten shape against the version we expect instead
         // of requiring `git`/`rev` keys that no longer exist there.
-        validate_manifest_dependency_version(spec, contract);
+        validate_manifest_dependency_version(spec, contract, packaged_manifest);
     } else {
         let actual_git = string_value(spec, "git", contract.dep_key);
         if actual_git != contract.expected_git {
@@ -393,36 +418,57 @@ fn validate_manifest_dependency_spec(
 fn validate_manifest_dependency_version(
     spec: &toml::map::Map<String, Value>,
     contract: &DependencyContract,
+    packaged_manifest: bool,
 ) {
     let actual_version = string_value(spec, "version", contract.dep_key);
-    if actual_version != contract.expected_version {
+    let expected_manifest_version = expected_manifest_version_requirement(contract);
+    let package_manifest_may_strip_exact_operator =
+        packaged_manifest || !contract.expected_git.is_empty();
+    let version_matches = actual_version == expected_manifest_version
+        || (package_manifest_may_strip_exact_operator
+            && actual_version == contract.expected_version);
+    if !version_matches {
         contract_error(
             contract,
             format!(
                 "dependency `{}` in [{}] must pin version = `{}`, found `{}`",
-                contract.dep_key, contract.dep_table, contract.expected_version, actual_version
+                contract.dep_key, contract.dep_table, expected_manifest_version, actual_version
             ),
         );
     }
 }
 
+fn expected_manifest_version_requirement(contract: &DependencyContract) -> String {
+    if contract.expected_git.is_empty() {
+        format!("={}", contract.expected_version)
+    } else {
+        contract.expected_version.to_string()
+    }
+}
+
 fn validate_patch_path(manifest: &Value, contract: &DependencyContract) {
-    let patch_url = contract
-        .patch_url
-        .expect("active path override contracts must provide patch_url");
-    let patch_key = contract
-        .patch_key
-        .expect("active path override contracts must provide patch_key");
+    let Some(patch_url) = contract.patch_url else {
+        contract_error(
+            contract,
+            "active path override contracts must provide patch_url".to_string(),
+        );
+    };
+    let Some(patch_key) = contract.patch_key else {
+        contract_error(
+            contract,
+            "active path override contracts must provide patch_key".to_string(),
+        );
+    };
 
     let patch_tables = table(manifest, "patch", "manifest root");
     let patch_source = table_value(Some(patch_tables), patch_url, "patch source");
-    let patch_entry = inline_table(
-        patch_source
-            .as_table()
-            .unwrap_or_else(|| panic!("[patch] source `{patch_url}` must be a TOML table")),
-        patch_key,
-        "[patch] source",
-    );
+    let Some(patch_source_table) = patch_source.as_table() else {
+        contract_error(
+            contract,
+            format!("[patch] source `{patch_url}` must be a TOML table"),
+        );
+    };
+    let patch_entry = inline_table(patch_source_table, patch_key, "[patch] source");
     let actual_path = string_value(patch_entry, "path", patch_key);
     let expected_path = expected_patch_path(contract);
 
@@ -448,7 +494,7 @@ fn validate_local_contract(
     let local_manifest_text = match fs::read_to_string(&manifest_path) {
         Ok(text) => text,
         Err(err) if contract.mode == ValidationMode::StrictOptIn => {
-            // Optional sibling repo not checked out — skip validation.
+            // Optional sibling repo not checked out; skip validation.
             // Only ActivePathOverride repos are required on disk.
             println!(
                 "cargo:warning=skipping {} contract validation: sibling manifest `{}` not found: {err}",
@@ -527,18 +573,20 @@ fn validate_local_contract(
     }
 
     let features = local_manifest.get("features").and_then(Value::as_table);
-    for feature in contract.expected_features {
-        let has_feature = features.is_some_and(|table| table.contains_key(*feature));
-        if !has_feature {
-            contract_error(
-                contract,
-                format!(
-                    "sibling manifest `{}` must provide feature `{}` because cass enables it",
-                    manifest_path.display(),
-                    feature
-                ),
-            );
-        }
+    let missing_feature = contract
+        .expected_features
+        .iter()
+        .copied()
+        .find(|feature| !features.is_some_and(|table| table.contains_key(*feature)));
+    if let Some(feature) = missing_feature {
+        contract_error(
+            contract,
+            format!(
+                "sibling manifest `{}` must provide feature `{}` because cass enables it",
+                manifest_path.display(),
+                feature
+            ),
+        );
     }
 
     match (strict_enabled, contract.mode, git_state(&repo_root)) {
@@ -559,7 +607,7 @@ fn validate_local_contract(
 
 fn validate_strict_git_state(contract: &DependencyContract, repo_root: &Path, state: &GitState) {
     // Crates.io-only contracts (empty `expected_rev`) intentionally
-    // have nothing to enforce at the sibling repo level — the actual
+    // have nothing to enforce at the sibling repo level; the actual
     // pin lives in the crates.io version. A local sibling checkout
     // may be on any branch and may be dirty; that's fine because
     // we're not building against it. Skip both sub-checks.
@@ -685,9 +733,11 @@ fn emit_vergen_metadata() {
 }
 
 fn table<'a>(value: &'a Value, key: &str, context: &str) -> &'a toml::map::Map<String, Value> {
-    table_value(value.as_table(), key, context)
-        .as_table()
-        .unwrap_or_else(|| panic!("{context} key `{key}` must be a TOML table"))
+    let value = table_value(value.as_table(), key, context);
+    match value.as_table() {
+        Some(table) => table,
+        None => fatal(format!("{context} key `{key}` must be a TOML table")),
+    }
 }
 
 fn inline_table<'a>(
@@ -695,9 +745,11 @@ fn inline_table<'a>(
     key: &str,
     context: &str,
 ) -> &'a toml::map::Map<String, Value> {
-    table_value(Some(table), key, context)
-        .as_table()
-        .unwrap_or_else(|| panic!("{context} key `{key}` must be an inline table"))
+    let value = table_value(Some(table), key, context);
+    match value.as_table() {
+        Some(table) => table,
+        None => fatal(format!("{context} key `{key}` must be an inline table")),
+    }
 }
 
 fn table_value<'a>(
@@ -705,16 +757,17 @@ fn table_value<'a>(
     key: &str,
     context: &str,
 ) -> &'a Value {
-    table
-        .and_then(|table| table.get(key))
-        .unwrap_or_else(|| panic!("{context} is missing key `{key}`"))
+    match table.and_then(|table| table.get(key)) {
+        Some(value) => value,
+        None => fatal(format!("{context} is missing key `{key}`")),
+    }
 }
 
 fn string_value<'a>(table: &'a toml::map::Map<String, Value>, key: &str, context: &str) -> &'a str {
-    table
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("{context} is missing string key `{key}`"))
+    match table.get(key).and_then(Value::as_str) {
+        Some(value) => value,
+        None => fatal(format!("{context} is missing string key `{key}`")),
+    }
 }
 
 fn feature_set(value: Option<&Value>) -> BTreeSet<String> {
@@ -731,8 +784,14 @@ fn feature_set(value: Option<&Value>) -> BTreeSet<String> {
 }
 
 fn contract_error(contract: &DependencyContract, message: String) -> ! {
-    panic!(
-        "path dependency contract violation for {}: {}\nupdate Cargo.toml, build.rs, and the README sibling dependency contract together",
+    fatal(format!(
+        "dependency source contract violation for {}: {}\nupdate Cargo.toml, build.rs, and the README dependency source contract together",
         contract.label, message
-    );
+    ))
+}
+
+fn fatal(message: impl fmt::Display) -> ! {
+    eprintln!("{message}");
+    println!("cargo:error={message}");
+    process::exit(1);
 }

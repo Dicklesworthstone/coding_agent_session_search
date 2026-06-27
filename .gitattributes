@@ -1,3 +1,6 @@
 
 # Use bd merge for beads JSONL files
 .beads/beads.jsonl merge=beads
+
+# Integrity fixtures embed byte sizes and hashes; keep checkout bytes stable.
+tests/fixtures/pages_verify/** text eol=lf

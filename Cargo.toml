@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.6.2"
+version = "0.6.12"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -23,7 +23,7 @@ anyhow = "1.0.102"
 thiserror = "1.0.69"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi"] }
-asupersync = { version = "0.3.1", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "=0.3.4", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
@@ -42,7 +42,7 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-frankensqlite = { version = "0.1.3", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "b3c841ba2655e2ee1834b6d9c8572fa3dc8f1ed6", package = "fsqlite", features = ["fts5"] }
+frankensqlite = { version = "=0.1.9", package = "fsqlite", features = ["fts5"] }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -80,9 +80,18 @@ urlencoding = "2.1.3"
 half = { version = "2.7.1", features = ["bytemuck"] }
 memmap2 = "0.9.10"
 bytemuck = "1.25.0"
-fastembed = { version = "5.13.4", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
-frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2cad158f4468ece7076e3fe529c8e5c20b2e020e", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
-franken-agent-detection = { version = "0.1.8", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "b62d859709aa6f8e772759efa2c13da9e3c088c9", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
+# `fastembed` ships prebuilt Microsoft ONNX Runtime binaries via
+# `ort-download-binaries-rustls-tls` that contain AVX/AVX2 instructions
+# compiled in. RUSTFLAGS cannot reach that already-linked vendor code, so
+# pre-AVX2 CPUs (Sandy/Ivy Bridge, pre-Excavator AMD) crash at static init
+# with STATUS_ILLEGAL_INSTRUCTION (#256). The `semantic` feature gate
+# below carries this dep so we can ship a `-baseline` artifact without it.
+fastembed = { version = "5.13.4", default-features = false, features = ["ort-download-binaries-rustls-tls"], optional = true }
+# `frankensearch/fastembed-reranker` pulls in the same `fastembed` crate
+# transitively (via `frankensearch-rerank`), so it must be gated by the
+# same `semantic` feature for the baseline build to be ORT-free.
+frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2cad158f4468ece7076e3fe529c8e5c20b2e020e", default-features = false, features = ["hash", "lexical", "ann"] }
+franken-agent-detection = { version = "0.1.8", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "a4923d4097899e6e9805cefe67bce70e1b04a289", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -131,10 +140,18 @@ security-framework = "3.7.0"
 openssl = { version = "0.10.79", features = ["vendored"] }
 
 [features]
-default = ["qr", "encryption"]
+default = ["qr", "encryption", "semantic"]
 qr = ["dep:qrcode", "dep:image"]
 encryption = []  # Enables HTML export encryption (deps already included for ChatGPT)
 backtrace = []
+# `semantic` enables ONNX-runtime-backed embedding/reranking via fastembed +
+# frankensearch/fastembed-reranker. Disabling it (e.g. via `--no-default-features
+# --features qr,encryption`) builds the `-baseline` artifact that does not pull
+# in the prebuilt Microsoft ONNX Runtime binary, so pre-AVX2 CPUs no longer
+# crash with STATUS_ILLEGAL_INSTRUCTION at static init (cass#256). Semantic
+# search modes return a clear error in baseline builds; lexical search and
+# all other functionality remain fully available.
+semantic = ["dep:fastembed", "frankensearch/fastembed-reranker"]
 # Opt-in: upgrade sibling repo rev/worktree drift from warning to hard error and
 # validate the optional /data/projects path checkouts before enabling local overrides.
 strict-path-dep-validation = []
@@ -160,7 +177,7 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { version = "0.1.3", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "b3c841ba2655e2ee1834b6d9c8572fa3dc8f1ed6", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.1.9", package = "fsqlite-types" }
 
 [[bin]]
 name = "cass"
@@ -197,8 +214,8 @@ debug = "line-tables-only"
 strip = false
 
 # The dependency graph is pinned to the asupersync 0.3.x line. Keep
-# frankensqlite, frankensearch, and franken-agent-detection revs aligned
-# so Cargo.lock does not reintroduce a parallel asupersync 0.2.x stack.
+# frankensqlite plus frankensearch and franken-agent-detection revs aligned so
+# Cargo.lock does not reintroduce a parallel asupersync 0.2.x stack.
 #
 # If you need to build against a local checkout of asupersync (sibling
 # at ../asupersync) during runtime-level hacking, add the following
@@ -212,12 +229,12 @@ strip = false
 # franken-evidence = { path = "../asupersync/franken_evidence" }
 # franken-kernel = { path = "../asupersync/franken_kernel" }
 #
-# build.rs validates the committed path overrides below and can validate
-# sibling repos above when `strict-path-dep-validation` is enabled.
+# build.rs validates the committed dependency source contracts and can validate
+# sibling repos below when `strict-path-dep-validation` is enabled.
 #
 # LOCAL DEVELOPMENT: Uncomment the [patch] sections below to build against
-# local sibling repo checkouts instead of pinned git revisions. These are
-# commented out by default so that a clean clone builds without requiring
+# local sibling repo checkouts instead of committed registry/git pins. These
+# are commented out by default so that a clean clone builds without requiring
 # specific directory layout. See build.rs for validation details.
 #
 # A fresh-clone build regression guard runs in CI (.github/workflows/fresh-clone-build.yml)
