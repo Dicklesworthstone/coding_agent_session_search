@@ -182,7 +182,7 @@ class JsonlReporter implements Reporter {
 
     // Build suite name from parent titles
     const suiteParts: string[] = [];
-    let parent = test.parent;
+    let parent: Suite | undefined = test.parent;
     while (parent) {
       if (parent.title) {
         suiteParts.unshift(parent.title);

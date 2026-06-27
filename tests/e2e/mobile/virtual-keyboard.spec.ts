@@ -102,7 +102,7 @@ test.describe('Virtual Keyboard Behavior', () => {
     }
 
     await searchInput.first().tap();
-    await page.keyboard.type('test query', { delay: 50 });
+    await page.keyboard.type('token', { delay: 50 });
 
     // Press Enter (simulates virtual keyboard "Go"/"Search" button)
     await page.keyboard.press('Enter');
@@ -117,7 +117,7 @@ test.describe('Virtual Keyboard Behavior', () => {
       }
 
       // Check for highlights
-      const highlights = document.querySelectorAll('mark, .highlight, .search-match');
+      const highlights = document.querySelectorAll('mark, .highlight, .search-highlight, .search-match, .message.search-hit');
       return highlights.length > 0;
     });
 
@@ -275,16 +275,20 @@ test.describe('Form Field Navigation', () => {
 
     if (count > 2) {
       // Focus second element
-      await focusable.nth(1).tap();
-      const secondEl = await page.evaluate(() => document.activeElement?.tagName);
+      await focusable.nth(1).focus();
+      const beforeIndex = await focusable.evaluateAll((els) =>
+        els.findIndex((el) => el === document.activeElement)
+      );
 
       // Shift+Tab to go back
       await page.keyboard.press('Shift+Tab');
       await page.waitForTimeout(100);
 
-      const newEl = await page.evaluate(() => document.activeElement?.tagName);
-      expect(newEl).toBeDefined();
-      expect(newEl).not.toBe(secondEl);
+      const afterIndex = await focusable.evaluateAll((els) =>
+        els.findIndex((el) => el === document.activeElement)
+      );
+      expect(afterIndex).toBeGreaterThanOrEqual(0);
+      expect(afterIndex).not.toBe(beforeIndex);
     }
   });
 

@@ -20,11 +20,11 @@ import path from 'path';
 // Test artifact directory
 const ARTIFACT_DIR = path.join(process.cwd(), 'test-results', 'e2e', 'html-export');
 
-test.describe('HTML Export - Plain Mode', () => {
-  test.beforeAll(async () => {
-    mkdirSync(ARTIFACT_DIR, { recursive: true });
-  });
+test.beforeAll(async () => {
+  mkdirSync(ARTIFACT_DIR, { recursive: true });
+});
 
+test.describe('HTML Export - Plain Mode', () => {
   test('renders basic export with all messages visible', async ({ page, exportPath }, testInfo) => {
     await test.step('Verify export file exists', async () => {
       expect(existsSync(exportPath), `Export file should exist at ${exportPath}`).toBe(true);
@@ -228,6 +228,7 @@ test.describe('HTML Export - Encrypted Mode', () => {
     await test.step('Capture decrypted output', async () => {
       const html = await page.content();
       const artifactPath = path.join(ARTIFACT_DIR, `${testInfo.title.replace(/\s+/g, '-')}-decrypted.html`);
+      mkdirSync(path.dirname(artifactPath), { recursive: true });
       writeFileSync(artifactPath, html);
 
       await testInfo.attach('decrypted-output', {

@@ -1,4 +1,11 @@
-import { test, expect, gotoFile, waitForPageReady, countMessages } from '../setup/test-utils';
+import {
+  test,
+  expect,
+  gotoFile,
+  waitForPageReady,
+  countMessages,
+  focusFirstKeyboardReachableElement,
+} from '../setup/test-utils';
 
 /**
  * Accessibility E2E tests - Visual preferences
@@ -76,8 +83,8 @@ test.describe('High Contrast Mode', () => {
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    // Tab to a focusable element
-    await page.keyboard.press('Tab');
+    const focused = await focusFirstKeyboardReachableElement(page);
+    expect(focused).toBe(true);
 
     const hasFocus = await page.evaluate(() => {
       const el = document.activeElement;
@@ -85,7 +92,8 @@ test.describe('High Contrast Mode', () => {
 
       // In forced-colors, system focus indicators should appear
       const style = window.getComputedStyle(el);
-      return style.outline !== 'none' || el.matches(':focus-visible');
+      const outlineWidth = parseFloat(style.outlineWidth || '0');
+      return (style.outlineStyle !== 'none' && outlineWidth > 0) || el.matches(':focus-visible');
     });
 
     expect(hasFocus).toBe(true);

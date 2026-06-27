@@ -1,4 +1,10 @@
-import { test, expect, gotoFile, waitForPageReady } from '../setup/test-utils';
+import {
+  test,
+  expect,
+  gotoFile,
+  waitForPageReady,
+  grantClipboardPermissionsIfSupported,
+} from '../setup/test-utils';
 
 test.describe('Collapsible Sections', () => {
   test('tool calls are collapsible', async ({ page, toolCallsExportPath }) => {
@@ -184,11 +190,11 @@ test.describe('Copy to Clipboard', () => {
     await expect(copyBtn).toBeVisible({ timeout: 2000 });
   });
 
-  test('copy button shows feedback', async ({ page, context, exportPath }) => {
+  test('copy button shows feedback', async ({ page, context, browserName, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    // Grant clipboard permissions
-    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    const clipboardGranted = await grantClipboardPermissionsIfSupported(context, browserName);
+    test.skip(!clipboardGranted, 'Clipboard permission grant is Chromium-only in Playwright');
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -226,10 +232,11 @@ test.describe('Copy to Clipboard', () => {
     expect(hasToast || btnHasCopiedClass).toBe(true);
   });
 
-  test('clipboard contains code content', async ({ page, context, exportPath }) => {
+  test('clipboard contains code content', async ({ page, context, browserName, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    const clipboardGranted = await grantClipboardPermissionsIfSupported(context, browserName);
+    test.skip(!clipboardGranted, 'Clipboard permission grant is Chromium-only in Playwright');
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);

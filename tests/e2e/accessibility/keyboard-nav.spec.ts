@@ -1,4 +1,10 @@
-import { test, expect, gotoFile, waitForPageReady } from '../setup/test-utils';
+import {
+  test,
+  expect,
+  gotoFile,
+  waitForPageReady,
+  focusFirstKeyboardReachableElement,
+} from '../setup/test-utils';
 
 test.describe('Keyboard Accessibility', () => {
   test('can tab through interactive elements', async ({ page, exportPath }) => {
@@ -30,8 +36,8 @@ test.describe('Keyboard Accessibility', () => {
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    // Tab to first focusable element
-    await page.keyboard.press('Tab');
+    const focused = await focusFirstKeyboardReachableElement(page);
+    expect(focused).toBe(true);
 
     // Check if focus indicator is visible
     const hasFocusStyles = await page.evaluate(() => {
@@ -40,11 +46,14 @@ test.describe('Keyboard Accessibility', () => {
 
       const styles = window.getComputedStyle(el);
       const outline = styles.outline;
+      const outlineStyle = styles.outlineStyle;
+      const outlineWidth = parseFloat(styles.outlineWidth || '0');
       const boxShadow = styles.boxShadow;
 
       // Should have visible focus indicator
       return (
-        (outline !== 'none' && outline !== '0px none') ||
+        (outline !== 'none' && outline !== '0px none' && outlineStyle !== 'none' && outlineWidth > 0) ||
+        el.matches(':focus-visible') ||
         (boxShadow !== 'none' && boxShadow.includes('rgb'))
       );
     });

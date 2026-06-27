@@ -1,4 +1,11 @@
-import { test, expect, gotoFile, waitForPageReady, countMessages } from '../setup/test-utils';
+import {
+  test,
+  expect,
+  gotoFile,
+  waitForPageReady,
+  countMessages,
+  grantClipboardPermissionsIfSupported,
+} from '../setup/test-utils';
 
 /**
  * Offline mode E2E tests - Network transitions
@@ -105,7 +112,8 @@ test.describe('Online to Offline Transitions', () => {
     test.skip(browserName === 'webkit', 'WebKit offline mode not reliable');
     test.skip(!noCdnExportPath, 'No-CDN export path not available');
 
-    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    const clipboardGranted = await grantClipboardPermissionsIfSupported(context, browserName);
+    test.skip(!clipboardGranted, 'Clipboard permission grant is Chromium-only in Playwright');
 
     await gotoFile(page, noCdnExportPath);
     await waitForPageReady(page);
@@ -118,13 +126,15 @@ test.describe('Online to Offline Transitions', () => {
       await page.waitForTimeout(300);
 
       // Should not crash, clipboard might have content
-      const clipboardContent = await page.evaluate(async () => {
-        try {
-          return await navigator.clipboard.readText();
-        } catch {
-          return null;
-        }
-      });
+      const clipboardContent = clipboardGranted
+        ? await page.evaluate(async () => {
+            try {
+              return await navigator.clipboard.readText();
+            } catch {
+              return null;
+            }
+          })
+        : null;
       const feedbackVisible = await page
         .locator('.copied, .copy-success, [data-copied="true"]')
         .count();
@@ -190,7 +200,8 @@ test.describe('Offline to Online Transitions', () => {
 });
 
 test.describe('Partial Connectivity', () => {
-  test('page handles slow network gracefully', async ({ page, noCdnExportPath }) => {
+  test('page handles slow network gracefully', async ({ page, noCdnExportPath, browserName }) => {
+    test.skip(browserName !== 'chromium', 'CDP network throttling is Chromium-only');
     test.skip(!noCdnExportPath, 'No-CDN export path not available');
 
     // Simulate slow network

@@ -1,4 +1,11 @@
-import { test as base, expect, Page, ConsoleMessage, Request } from '@playwright/test';
+import {
+  test as base,
+  expect,
+  Page,
+  ConsoleMessage,
+  Request,
+  BrowserContext,
+} from '@playwright/test';
 import { readFileSync, existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -133,6 +140,7 @@ export const test = base.extend<TestFixtures>({
         pageUrl = null;
       }
       const setupLog = readJsonIfExists(process.env.TEST_EXPORT_SETUP_LOG);
+      const startTime = (testInfo as typeof testInfo & { startTime?: Date }).startTime;
       const logPayload = {
         test: {
           title: testInfo.title,
@@ -145,7 +153,7 @@ export const test = base.extend<TestFixtures>({
         runtime: {
           workerIndex: testInfo.workerIndex,
           parallelIndex: testInfo.parallelIndex,
-          startTime: testInfo.startTime?.toISOString?.() ?? testInfo.startTime,
+          startTime: startTime?.toISOString(),
           durationMs: testInfo.duration,
         },
         environment: {
@@ -230,6 +238,41 @@ export async function gotoFile(page: Page, filePath: string): Promise<void> {
   await page.goto(`file://${filePath}`, { waitUntil: 'domcontentloaded' });
 }
 
+export async function grantClipboardPermissionsIfSupported(
+  context: BrowserContext,
+  browserName: string,
+  permissions: Array<'clipboard-read' | 'clipboard-write'> = ['clipboard-read', 'clipboard-write']
+): Promise<boolean> {
+  if (browserName !== 'chromium') {
+    return false;
+  }
+
+  try {
+    await context.grantPermissions(permissions);
+    return true;
+  } catch (err) {
+    console.log(`[browser-capability] Clipboard permission grant unavailable: ${String(err)}`);
+    return false;
+  }
+}
+
+export async function focusFirstKeyboardReachableElement(
+  page: Page,
+  maxTabs = 8
+): Promise<boolean> {
+  for (let i = 0; i < maxTabs; i++) {
+    await page.keyboard.press('Tab');
+    const hasFocus = await page.evaluate(() => {
+      const el = document.activeElement;
+      return !!el && el !== document.body && el !== document.documentElement;
+    });
+    if (hasFocus) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Utility to collect console errors during test.
  */
@@ -283,5 +326,5 @@ export async function countMessages(page: Page): Promise<number> {
  * Get the current theme from the page.
  */
 export async function getCurrentTheme(page: Page): Promise<string> {
-  return page.locator('html').getAttribute('data-theme') || 'unknown';
+  return (await page.locator('html').getAttribute('data-theme')) || 'unknown';
 }

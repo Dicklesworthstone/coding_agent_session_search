@@ -36,8 +36,14 @@ async function verifyTofu(currentFingerprint, storageKey) {
 `;
 
 async function setupPageWithTofu(page: import('@playwright/test').Page) {
-  // Navigate to about:blank first so we have a window context.
-  await page.goto('about:blank');
+  await page.route('http://cass-tofu.test/**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/html',
+      body: '<!doctype html><html><head></head><body></body></html>',
+    });
+  });
+  await page.goto(`http://cass-tofu.test/${Date.now()}`);
   // Inject verifyTofu into the page.
   await page.evaluate((src: string) => {
     const script = document.createElement('script');

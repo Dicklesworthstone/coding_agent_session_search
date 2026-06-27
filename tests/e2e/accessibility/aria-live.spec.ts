@@ -1,4 +1,10 @@
-import { test, expect, gotoFile, waitForPageReady } from '../setup/test-utils';
+import {
+  test,
+  expect,
+  gotoFile,
+  waitForPageReady,
+  grantClipboardPermissionsIfSupported,
+} from '../setup/test-utils';
 
 /**
  * Accessibility E2E tests - ARIA live regions
@@ -87,10 +93,11 @@ test.describe('ARIA Live Region Announcements', () => {
     // This test documents the current behavior
   });
 
-  test('copy action announces success', async ({ page, exportPath, context }) => {
+  test('copy action announces success', async ({ page, exportPath, context, browserName }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    const clipboardGranted = await grantClipboardPermissionsIfSupported(context, browserName);
+    test.skip(!clipboardGranted, 'Clipboard permission grant is Chromium-only in Playwright');
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);

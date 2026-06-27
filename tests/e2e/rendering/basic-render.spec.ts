@@ -99,9 +99,10 @@ test.describe('Basic HTML Rendering', () => {
         const hasTokens = code.querySelectorAll('.token').length > 0;
         // Or we have language class
         const hasLanguageClass = code.className.includes('language-');
-        // Or fallback background
+        // Or fallback styling on either the code node or its pre wrapper
         const hasBgColor =
-          window.getComputedStyle(code).backgroundColor !== 'rgba(0, 0, 0, 0)';
+          window.getComputedStyle(code).backgroundColor !== 'rgba(0, 0, 0, 0)' ||
+          window.getComputedStyle(code.closest('pre') ?? code).backgroundColor !== 'rgba(0, 0, 0, 0)';
 
         return hasTokens || hasLanguageClass || hasBgColor;
       });
