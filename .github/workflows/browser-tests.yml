@@ -7,6 +7,7 @@ on:
       - 'tests/**'
       - 'src/pages/**'
       - 'src/pages_assets/**'
+      - 'src/html_export/**'
       - '.github/workflows/browser-tests.yml'
   pull_request:
     branches: [main]
@@ -14,6 +15,7 @@ on:
       - 'tests/**'
       - 'src/pages/**'
       - 'src/pages_assets/**'
+      - 'src/html_export/**'
       - '.github/workflows/browser-tests.yml'
   workflow_dispatch:
 
@@ -350,7 +352,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p test-results/e2e
-          find artifacts -type f -path "*/test-results/e2e/*.jsonl" -print0 | sort -z | xargs -0 cat > test-results/e2e/combined.jsonl || true
+          mapfile -d '' logs < <(find artifacts -type f \( -path "*/test-results/e2e/*.jsonl" -o -path "*/e2e/*.jsonl" \) -print0 | sort -z)
+          if (( ${#logs[@]} > 0 )); then
+            cat "${logs[@]}" > test-results/e2e/combined.jsonl
+          else
+            : > test-results/e2e/combined.jsonl
+          fi
 
       - name: Generate E2E summary report
         shell: bash

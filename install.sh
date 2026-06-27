@@ -301,21 +301,110 @@ case "$ARCH" in
   *) warn "Unknown arch $ARCH, using as-is" ;;
 esac
 
+# cass#256 - runtime AVX2 detection. The default release artifact links a
+# prebuilt Microsoft ONNX Runtime binary that carries AVX/AVX2 dispatch code
+# RUSTFLAGS cannot reach; pre-AVX2 amd64 CPUs (Sandy/Ivy Bridge, pre-Excavator
+# AMD) crash at static init with STATUS_ILLEGAL_INSTRUCTION on launch. When
+# we detect such a host we prefer the matching `-baseline` artifact instead.
+#
+# Returns 0 (true) when the host advertises AVX2, 1 (false) otherwise. ARM
+# and non-amd64 hosts return 0; they never hit the prebuilt-ORT crash, and
+# we keep the canonical artifact name. CASS_FORCE_BASELINE=1 forces the
+# `-baseline` selection (useful for testing on AVX2-capable hardware).
+host_has_avx2() {
+  if [ "${CASS_FORCE_BASELINE:-0}" = "1" ]; then
+    return 1
+  fi
+  if [ "$ARCH" != "amd64" ]; then
+    return 0
+  fi
+  case "$OS" in
+    linux)
+      if [ -r /proc/cpuinfo ] && grep -qE '^flags[[:space:]]*:.* avx2( |$)' /proc/cpuinfo; then
+        return 0
+      fi
+      return 1
+      ;;
+    darwin)
+      # Intel macOS pre-builts aren't published anyway (NO_PREBUILT_REASON
+      # below). Apple Silicon is non-amd64 so we won't reach this branch.
+      return 0
+      ;;
+    mingw*|msys*|cygwin*)
+      # Windows under MSYS/Cygwin: prefer real CPU flags when MSYS exposes
+      # them, then use CPU model names and .NET's explicit Avx2 intrinsic
+      # probe where available. Do not use System.Numerics.Vector here: it only
+      # reports generic SIMD acceleration and returns true on many AVX-only
+      # CPUs that still crash the ORT-linked artifact.
+      if [ -r /proc/cpuinfo ] && grep -qE '^flags[[:space:]]*:.* avx2( |$)' /proc/cpuinfo; then
+        return 0
+      fi
+      if [ -r /proc/cpuinfo ] && grep -qE '^flags[[:space:]]*:' /proc/cpuinfo; then
+        return 1
+      fi
+      if command -v wmic >/dev/null 2>&1; then
+        local cpu_name
+        cpu_name="$(wmic cpu get name 2>/dev/null | tr -d '\r' | sed -n '2p')"
+        case "$cpu_name" in
+          *"Sandy Bridge"*|*"Ivy Bridge"*|*"i3-2"*|*"i5-2"*|*"i7-2"*|*"i3-3"*|*"i5-3"*|*"i7-3"*|*"AMD FX"*|*"Phenom"*|*"Athlon"*)
+            return 1
+            ;;
+        esac
+      fi
+      if command -v powershell.exe >/dev/null 2>&1; then
+        local cpu_name
+        cpu_name="$(powershell.exe -NoProfile -Command "try { (Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1 -ExpandProperty Name) } catch { '' }" 2>/dev/null | tr -d '\r')"
+        case "$cpu_name" in
+          *"Sandy Bridge"*|*"Ivy Bridge"*|*"i3-2"*|*"i5-2"*|*"i7-2"*|*"i3-3"*|*"i5-3"*|*"i7-3"*|*"AMD FX"*|*"Phenom"*|*"Athlon"*)
+            return 1
+            ;;
+        esac
+        local has_avx2
+        has_avx2="$(powershell.exe -NoProfile -Command "try { [System.Runtime.Intrinsics.X86.Avx2]::IsSupported } catch { 'Unknown' }" 2>/dev/null | tr -d '\r')"
+        case "$has_avx2" in
+          True) return 0 ;;
+          False) return 1 ;;
+        esac
+      fi
+      return 0
+      ;;
+    *) return 0 ;;
+  esac
+}
+
 TARGET=""
 EXT="tar.gz"
 NO_PREBUILT_REASON=""
+SOURCE_CARGO_ARGS=()
 case "${OS}-${ARCH}" in
-  linux-amd64) TARGET="linux-amd64" ;;
+  linux-amd64)
+    if host_has_avx2; then
+      TARGET="linux-amd64"
+    else
+      TARGET="linux-amd64-baseline"
+      SOURCE_CARGO_ARGS=(--no-default-features --features "qr,encryption")
+      info "Detected pre-AVX2 x86_64 CPU; selecting baseline artifact (no ONNX Runtime, semantic search disabled); see cass#256."
+    fi
+    ;;
   linux-arm64) TARGET="linux-arm64" ;;
   darwin-amd64) NO_PREBUILT_REASON="Intel macOS release binaries are not published" ;;
   darwin-arm64) TARGET="darwin-arm64" ;;
-  mingw*-amd64|msys*-amd64|cygwin*-amd64) TARGET="windows-amd64"; EXT="zip" ;;
+  mingw*-amd64|msys*-amd64|cygwin*-amd64)
+    if host_has_avx2; then
+      TARGET="windows-amd64"
+    else
+      TARGET="windows-amd64-baseline"
+      SOURCE_CARGO_ARGS=(--no-default-features --features "qr,encryption")
+      info "Detected pre-AVX2 x86_64 CPU; selecting baseline artifact (no ONNX Runtime, semantic search disabled); see cass#256."
+    fi
+    EXT="zip"
+    ;;
   *) :;;
 esac
 INSTALL_BASENAME="cass"
-if [ "$TARGET" = "windows-amd64" ]; then
-  INSTALL_BASENAME="cass.exe"
-fi
+case "$TARGET" in
+  windows-amd64|windows-amd64-baseline) INSTALL_BASENAME="cass.exe" ;;
+esac
 
 # Prefer prebuilt artifact when we know the target or the caller supplied a direct URL.
 TAR=""
@@ -384,7 +473,10 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   info "Building from source (requires git and a working Rust stable toolchain)"
   ensure_rust
   git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
-  (cd "$TMP/src" && cargo build --release)
+  if [ "${#SOURCE_CARGO_ARGS[@]}" -gt 0 ]; then
+    info "Using baseline cargo flags for source build: ${SOURCE_CARGO_ARGS[*]}"
+  fi
+  (cd "$TMP/src" && cargo build --locked --release "${SOURCE_CARGO_ARGS[@]}")
   BIN="$TMP/src/target/release/$INSTALL_BASENAME"
   if [ ! -x "$BIN" ]; then
     BIN="$TMP/src/target/release/cass"

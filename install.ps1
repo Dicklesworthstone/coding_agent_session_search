@@ -229,9 +229,47 @@ function Assert-ZipLayoutSafe {
   }
 }
 
+# cass#256 - runtime AVX2 detection. The default release artifact links a
+# prebuilt Microsoft ONNX Runtime binary that carries AVX/AVX2 dispatch code
+# RUSTFLAGS cannot reach; pre-AVX2 amd64 CPUs (Sandy/Ivy Bridge, pre-Excavator
+# AMD) crash at static init with STATUS_ILLEGAL_INSTRUCTION on launch. When
+# we detect such a host we prefer the matching `-baseline` artifact instead.
+# Set $env:CASS_FORCE_BASELINE=1 to force the baseline selection regardless.
+function Test-HostHasAvx2 {
+  if ($env:CASS_FORCE_BASELINE -eq "1") { return $false }
+  try {
+    # PowerShell 7 / modern .NET expose the exact hardware intrinsic we care
+    # about. This is stronger than System.Numerics.Vector, which only means
+    # "some SIMD" and is true on AVX-only Ivy Bridge hosts.
+    return [System.Runtime.Intrinsics.X86.Avx2]::IsSupported
+  } catch {
+    # Windows PowerShell 5.1's .NET Framework does not have this type; fall
+    # back to CPU model names below.
+  }
+  try {
+    # CIM is the modern WMI surface; falls back to the legacy provider on
+    # older PowerShell hosts (pre-5.1) via Get-WmiObject.
+    $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Select-Object -First 1
+    $name = if ($cpu.Name) { $cpu.Name } else { "" }
+    # Sandy Bridge (2nd-gen i3/i5/i7) and Ivy Bridge (3rd-gen) lack AVX2.
+    # AMD FX/Phenom/Athlon families are also pre-AVX2.
+    if ($name -match "Sandy Bridge|Ivy Bridge|i[357]-2\d{3}|i[357]-3\d{3}|AMD FX|Phenom|Athlon") {
+      return $false
+    }
+  } catch {
+    # Inconclusive. Default to the canonical artifact for modern hardware.
+  }
+  return $true
+}
+
 # Map architecture to the naming convention used by release.yml
 $arch = "amd64"
-$zip = "cass-windows-${arch}.zip"
+if (Test-HostHasAvx2) {
+  $zip = "cass-windows-${arch}.zip"
+} else {
+  $zip = "cass-windows-${arch}-baseline.zip"
+  Write-Host "Detected pre-AVX2 x86_64 CPU; selecting baseline artifact (no ONNX Runtime, semantic search disabled); see cass#256."
+}
 
 if ($ArtifactUrl) {
   $url = $ArtifactUrl

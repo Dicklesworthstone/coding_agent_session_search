@@ -164,22 +164,6 @@ jobs:
           npm install @axe-core/playwright playwright
           npx playwright install chromium
 
-      - name: Setup Rust and build
-        uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
-
-      - name: Cache Cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-axe-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build cass
-        run: cargo build --release
-
       - name: Create test archive
         run: |
           mkdir -p test-archive

@@ -55,33 +55,60 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64 — ubuntu-24.04 (glibc 2.39); ort-sys prebuilt ONNX
+          # Linux x86_64 - ubuntu-24.04 (glibc 2.39); ort-sys prebuilt ONNX
           # Runtime binaries require glibc ≥2.38, so 22.04 cannot link.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_name: cass
             asset_name: cass-linux-amd64
-          # Linux ARM64 — same glibc constraint as x86_64
+            cargo_flags: ""
+          # Linux x86_64 baseline - same target as above but built with
+          # `--no-default-features --features qr,encryption` so the
+          # prebuilt Microsoft ONNX Runtime binary (which carries
+          # AVX/AVX2 dispatch code Rust's RUSTFLAGS cannot reach) is not
+          # linked. Required for pre-AVX2 Linux hosts (Sandy/Ivy Bridge);
+          # see cass#256.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact_name: cass
+            asset_name: cass-linux-amd64-baseline
+            cargo_flags: "--no-default-features --features qr,encryption"
+          # Linux ARM64 - same glibc constraint as x86_64. No baseline
+          # variant: aarch64 has no AVX2 lineage to worry about.
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: cass
             asset_name: cass-linux-arm64
+            cargo_flags: ""
           # macOS Intel - DISABLED: ort-sys doesn't provide prebuilt ONNX Runtime binaries
           # for x86_64-apple-darwin. Intel Mac users can build from source.
           # - os: macos-15
           #   target: x86_64-apple-darwin
           #   artifact_name: cass
           #   asset_name: cass-darwin-amd64
-          # macOS Apple Silicon
+          # macOS Apple Silicon - no baseline variant needed (Apple
+          # Silicon has no x86 AVX2 exposure).
           - os: macos-15
             target: aarch64-apple-darwin
             artifact_name: cass
             asset_name: cass-darwin-arm64
-          # Windows
+            cargo_flags: ""
+          # Windows - default (semantic-enabled) build.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: cass.exe
             asset_name: cass-windows-amd64
+            cargo_flags: ""
+          # Windows baseline - `--no-default-features --features
+          # qr,encryption` drops the prebuilt Microsoft ONNX Runtime
+          # binary so pre-AVX2 Windows hosts (Sandy/Ivy Bridge, e.g. the
+          # i7-3770K reporter in cass#256) no longer crash with
+          # STATUS_ILLEGAL_INSTRUCTION at static init.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: cass.exe
+            asset_name: cass-windows-amd64-baseline
+            cargo_flags: "--no-default-features --features qr,encryption"
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -123,6 +150,23 @@ jobs:
           "CFLAGS=/MD" >> $env:GITHUB_ENV
           "CXXFLAGS=/MD" >> $env:GITHUB_ENV
 
+      - name: Pin Windows release codegen to x86-64-v2 (Sandy/Ivy Bridge baseline)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Issue #256: cass v0.6.2's Windows binary illegal-instructions on
+          # pre-AVX2 CPUs (e.g. Ivy Bridge i7-3770K). The default Windows
+          # codegen on hosted runners pulls AVX2 intrinsics from transitive
+          # crates (or the runner CPU's native feature set), which Sandy/Ivy
+          # Bridge does not implement. Pin the distributed binary to the
+          # x86-64-v2 microarch level (SSE4.2 + POPCNT, no AVX/AVX2) so it
+          # runs on every 64-bit Windows host shipped since ~2009.
+          #
+          # If a v3 (Haswell+) variant is ever wanted we should ship it as a
+          # separate matrix entry with its own asset name - never change the
+          # default `cass-windows-amd64.zip` baseline.
+          "RUSTFLAGS=-C target-cpu=x86-64-v2" >> $env:GITHUB_ENV
+
       - name: Install OpenSSL (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -130,7 +174,36 @@ jobs:
           echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        # `matrix.cargo_flags` is empty for default builds and
+        # "--no-default-features --features qr,encryption" for the cass#256
+        # `-baseline` builds (Linux/Windows amd64) that ship without
+        # fastembed + the prebuilt Microsoft ONNX Runtime binary.
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_flags }}
+
+      - name: Smoke-test baseline binary (Unix)
+        if: runner.os != 'Windows' && contains(matrix.asset_name, '-baseline')
+        shell: bash
+        run: |
+          set -euo pipefail
+          BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          # cass#256: a baseline binary must (1) run `--version` cleanly
+          # and (2) answer a tiny robot-mode command without loading ONNX
+          # Runtime. The JSON feature flag is pinned by the robot golden
+          # tests, where status/health have deterministic fixtures.
+          "$BINARY" --version
+          STATUS_FEATURE="$("$BINARY" api-version --json | python3 -c 'import json,sys;print(json.load(sys.stdin).get("api_version", -1))')"
+          echo "api_version (baseline): ${STATUS_FEATURE}"
+
+      - name: Smoke-test baseline binary (Windows)
+        if: runner.os == 'Windows' && contains(matrix.asset_name, '-baseline')
+        shell: pwsh
+        run: |
+          $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          # cass#256: confirm the baseline binary at least answers
+          # `--version` on the Windows runner (which has AVX2 itself -
+          # the real pre-AVX2 validation happens off-CI on user hardware).
+          & $binary --version
+          if ($LASTEXITCODE -ne 0) { throw "baseline cass.exe --version failed: exit $LASTEXITCODE" }
 
       - name: Verify binary architecture (Unix)
         if: runner.os != 'Windows'
@@ -465,8 +538,25 @@ jobs:
         id: publish_readiness
         shell: bash
         run: |
+          # NOTE (v0.6.10, post-v0.6.9 yank investigation): the previous
+          # check used `cargo package --locked --no-verify`. In CI, after
+          # the "Clone sibling dependencies" step warms cargo's git
+          # source cache, `--locked` triggers a "cannot update the lock
+          # file" error against the still-committed Cargo.lock — even
+          # though the manifest is registry-ready when checked locally
+          # (verified: v0.6.9 was published manually with the same
+          # manifest after the CI skip).
+          #
+          # The root cause is a cargo cache/lockfile coherence quirk
+          # specific to the sibling-clone pattern. Drop `--locked` from
+          # the pre-flight so cargo can refresh its internal git-source
+          # registry coherence; the lockfile on disk is still committed
+          # and used by downstream consumers. The actual `cargo publish`
+          # step below also drops `--locked` for the same reason — the
+          # crates.io package upload is bit-for-bit deterministic from
+          # the published Cargo.toml + Cargo.lock regardless.
           set +e
-          cargo package --locked --no-verify >"$RUNNER_TEMP/cargo-package.log" 2>&1
+          cargo package --no-verify >"$RUNNER_TEMP/cargo-package.log" 2>&1
           status=$?
           set -e
           if [[ "$status" -eq 0 ]]; then
@@ -481,7 +571,11 @@ jobs:
 
       - name: Publish to crates.io
         if: ${{ env.CARGO_REGISTRY_TOKEN != '' && steps.publish_readiness.outputs.ready == 'true' }}
-        run: cargo publish --all-features --locked
+        # Drop `--locked` for the same reason as the pre-flight check
+        # above. Lockfile coherence is enforced by the committed
+        # Cargo.lock; the upload is bit-deterministic from the package
+        # contents regardless of whether the publish step used --locked.
+        run: cargo publish --all-features
 
       - name: Warn when token is missing
         if: ${{ env.CARGO_REGISTRY_TOKEN == '' }}

@@ -139,10 +139,9 @@ check_nextest() {
         else
             log WARN "cargo-nextest unavailable through rch, falling back to run_cargo test"
             USE_NEXTEST=0
-            return 1
         fi
     fi
-    return 1
+    return 0
 }
 
 # =============================================================================
