@@ -9,6 +9,7 @@ QUICKSTART (for AI agents):
   cass pack "your query" --robot --max-tokens 4000 --max-evidence 8  # Tight paste budget
   cass swarm status --json            # Read-only Beads/Agent Mail/git/rch swarm snapshot
   cass swarm work-packet --json       # Advisory claim packet; does not claim or reserve
+  cass swarm dependency-drift --json  # Read-only sibling pin/drift sentinel
   cass search "bug fix" --today --robot  # Search today's sessions only
   cass search "api" --week --agent codex --robot  # Last 7 days, codex only
   cass stats --json                    # Get index statistics

@@ -214,6 +214,32 @@ fn swarm_status_goldens_follow_contract_shape() {
             output["privacy"]["redaction_policy"], "strict",
             "{fixture_id} must default to strict redaction"
         );
+        assert_eq!(
+            output["privacy"]["exposure_preview"]["schema_version"],
+            "cass.privacy.exposure_preview.v1",
+            "{fixture_id} missing privacy exposure preview"
+        );
+        assert_eq!(
+            output["privacy"]["exposure_preview"]["read_only"],
+            Value::Bool(true),
+            "{fixture_id} privacy exposure preview must be read-only"
+        );
+        assert!(
+            output["privacy"]["exposure_preview"]["candidate_actions"]
+                .as_array()
+                .is_some_and(|actions| actions.iter().any(|action| {
+                    action.get("action").and_then(Value::as_str) == Some("support-bundle")
+                        && action
+                            .get("required_opt_in_flags")
+                            .and_then(Value::as_array)
+                            .is_some_and(|flags| {
+                                flags.iter().any(|flag| {
+                                    flag.as_str() == Some("--include-sensitive-attachments")
+                                })
+                            })
+                })),
+            "{fixture_id} privacy exposure preview should name support-bundle opt-in boundary"
+        );
         assert!(
             output["recommendations"]
                 .as_array()
@@ -338,6 +364,21 @@ fn swarm_status_scenario_invariants_are_pinned() {
                     output["evidence"]["recent_proofs"][0]["redaction_status"],
                     "redacted"
                 );
+                assert_eq!(
+                    output["privacy"]["exposure_preview"]["coverage"],
+                    "fixture_probe"
+                );
+                assert_eq!(
+                    output["privacy"]["exposure_preview"]["redacted_sample_count"],
+                    4
+                );
+                assert!(
+                    output["privacy"]["exposure_preview"]["risk_categories"]
+                        .as_array()
+                        .is_some_and(|categories| categories
+                            .iter()
+                            .any(|category| category.as_str() == Some("secret_like_values")))
+                );
             }
             other => panic!("unexpected scenario {other}"),
         }
@@ -370,12 +411,12 @@ fn assert_swarm_status_action_matrix(manifest: &Value) -> Result<(), Box<dyn Err
         require_value_eq(
             get_path(&output, &["summary", "recommended_action"]),
             json!(expected_action),
-            &format!("{fixture_id} status recommended action"),
+            "status recommended action",
         )?;
         require_value_eq(
             get_path(&output, &["privacy", "raw_session_content_included"]),
             json!(false),
-            &format!("{fixture_id} raw session privacy flag"),
+            "raw session privacy flag",
         )?;
         assert_no_forbidden_fixture_leaks(fixture_id, &output);
     }
@@ -875,6 +916,328 @@ fn swarm_work_packet_cli_reports_missing_requested_bead() -> Result<(), Box<dyn 
         "fallback command",
     )?;
     assert_no_forbidden_fixture_leaks("work-packet-missing-bead", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_work_packet_verification_playbook_classifies_file_areas() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "verification-playbook",
+        json!({
+            "beads": {
+                "ready": [
+                    verification_playbook_bead("cass-rust", "Rust source change", ["src/search/query.rs"], ["testing"]),
+                    verification_playbook_bead("cass-golden", "Robot golden change", ["tests/golden/robot/health.json.golden"], ["robot-json"]),
+                    verification_playbook_bead("cass-docs", "Docs only change", ["docs/planning/operator.md"], ["docs"]),
+                    verification_playbook_bead("cass-beads", "Beads only change", [".beads/beads.jsonl"], ["beads"]),
+                    verification_playbook_bead("cass-sibling", "Sibling dependency pin update", ["Cargo.toml", "build.rs"], []),
+                    verification_playbook_bead("cass-ui", "TUI snapshot change", ["src/ui/app.rs", "tests/snapshots/tui.snap"], []),
+                    verification_playbook_bead("cass-large-e2e", "Large e2e avoidance", ["tests/e2e_large_dataset.rs"], ["testing"])
+                ],
+                "in_progress": [],
+                "blocked": [],
+                "graph": {
+                    "node_count": 7,
+                    "edge_count": 0,
+                    "has_cycles": false
+                }
+            },
+            "agent_mail": {
+                "agents": [],
+                "messages": [],
+                "reservations": []
+            },
+            "git": {
+                "branch": "main",
+                "upstream": "origin/main",
+                "ahead": 0,
+                "behind": 0,
+                "dirty": false,
+                "dirty_paths": [],
+                "recent_commits": []
+            },
+            "processes": {
+                "active_rch_jobs": 0,
+                "active_cargo_jobs": 0,
+                "load_average_1m": 0.2,
+                "cpu_count": 64
+            },
+            "cass_health": {
+                "status": "healthy",
+                "healthy": true,
+                "initialized": true,
+                "recommended_action": null
+            },
+            "cass_status": {
+                "search_ready": true,
+                "semantic_fallback_mode": "lexical",
+                "active_rebuild": false
+            },
+            "evidence": {
+                "recent_threads": [],
+                "recent_proofs": [],
+                "proof_gaps": [],
+                "redaction_applied": false
+            }
+        }),
+    )?;
+
+    assert_verification_playbook(
+        &fixture_path,
+        "cass-rust",
+        "rust-source",
+        Some("cargo check --all-targets"),
+    )?;
+    assert_verification_playbook(
+        &fixture_path,
+        "cass-golden",
+        "golden-json",
+        Some("golden_robot_json"),
+    )?;
+    let docs_packet = assert_verification_playbook(
+        &fixture_path,
+        "cass-docs",
+        "docs",
+        Some("golden_robot_docs"),
+    )?;
+    require(
+        !verification_commands(&docs_packet)
+            .iter()
+            .any(|command| command.contains("clippy --all-targets")),
+        format!("docs-only playbook should not recommend the full Rust lint gate: {docs_packet:#}"),
+    )?;
+
+    let beads_packet =
+        assert_verification_playbook(&fixture_path, "cass-beads", "beads-only", None)?;
+    require_value_eq(
+        get_path(
+            &beads_packet,
+            &["work_packet", "verification", "rch_required"],
+        ),
+        json!(false),
+        "beads-only rch requirement",
+    )?;
+    require(
+        get_path(
+            &beads_packet,
+            &["work_packet", "verification", "manual_checks"],
+        )
+        .and_then(Value::as_array)
+        .is_some_and(|checks| {
+            checks.iter().any(|check| {
+                check
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| matches!(command, "br sync --flush-only"))
+            })
+        }),
+        "beads-only playbook should include br sync --flush-only",
+    )?;
+
+    assert_verification_playbook(
+        &fixture_path,
+        "cass-sibling",
+        "sibling-dependency",
+        Some("strict-path-dep-validation"),
+    )?;
+    assert_verification_playbook(
+        &fixture_path,
+        "cass-ui",
+        "ui-snapshot",
+        Some("cargo test --test tui_flows"),
+    )?;
+    let large_packet = assert_verification_playbook(
+        &fixture_path,
+        "cass-large-e2e",
+        "large-e2e-excluded",
+        Some("cargo check --all-targets"),
+    )?;
+    require(
+        get_path(
+            &large_packet,
+            &["work_packet", "verification", "known_exclusions"],
+        )
+        .and_then(Value::as_array)
+        .is_some_and(|exclusions| {
+            exclusions.iter().any(|exclusion| {
+                exclusion
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .is_some_and(|pattern| matches!(pattern, "e2e_large_dataset"))
+            })
+        }),
+        "large e2e playbook should report the known exclusion",
+    )?;
+    require(
+        !verification_commands(&large_packet)
+            .iter()
+            .any(|command| command.contains("e2e_large_dataset")),
+        format!("large e2e playbook must not suggest the known expensive suite: {large_packet:#}"),
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn swarm_work_packet_collision_simulation_classifies_assignment_risks() -> Result<(), Box<dyn Error>>
+{
+    let (_reservation_tmp, reservation_fixture) = write_swarm_evidence_fixture(
+        "collision-reservations",
+        collision_simulation_sources(
+            json!([
+                collision_simulation_bead(
+                    "cass-glob",
+                    "Overlapping robot docs glob",
+                    ["tests/golden/robot_docs/guide.txt.golden"],
+                    ["robot-json"]
+                ),
+                collision_simulation_bead(
+                    "cass-exact",
+                    "Exact source path conflict",
+                    ["src/lib.rs"],
+                    ["swarm"]
+                ),
+                collision_simulation_bead(
+                    "cass-stale",
+                    "Expired docs reservation",
+                    ["docs/plan.md"],
+                    ["docs"]
+                )
+            ]),
+            json!([
+                {
+                    "id": 501,
+                    "holder": "BrightOak",
+                    "path_pattern": "tests/golden/robot_docs/**",
+                    "exclusive": true,
+                    "reason": "cass-other",
+                    "expires_ts": "2026-05-08T17:59:00Z"
+                },
+                {
+                    "id": 502,
+                    "holder": "CopperField",
+                    "path_pattern": "src/lib.rs",
+                    "exclusive": true,
+                    "reason": "cass-other",
+                    "expires_ts": "2026-05-08T17:59:00Z"
+                },
+                {
+                    "id": 503,
+                    "holder": "OldHolder",
+                    "path_pattern": "docs/plan.md",
+                    "exclusive": true,
+                    "reason": "cass-stale",
+                    "expires_ts": "2026-05-08T14:00:00Z"
+                }
+            ]),
+            json!([]),
+            json!([]),
+        ),
+    )?;
+
+    let glob_packet = assert_collision_class(
+        &reservation_fixture,
+        "cass-glob",
+        "blocked-by-active-holder",
+    )?;
+    require_collision_advisory(
+        &glob_packet,
+        "blocked-by-active-holder",
+        Some("glob"),
+        "glob overlap advisory",
+    )?;
+    let exact_packet = assert_collision_class(
+        &reservation_fixture,
+        "cass-exact",
+        "blocked-by-active-holder",
+    )?;
+    require_collision_advisory(
+        &exact_packet,
+        "blocked-by-active-holder",
+        Some("exact"),
+        "exact overlap advisory",
+    )?;
+    assert_collision_class(&reservation_fixture, "cass-stale", "stale-holder-review")?;
+
+    let (_dirty_tmp, dirty_fixture) = write_swarm_evidence_fixture(
+        "collision-dirty-unrelated",
+        collision_simulation_sources(
+            json!([collision_simulation_bead(
+                "cass-dirty-unrelated",
+                "Peer dirty path is unrelated",
+                ["src/search/query.rs"],
+                []
+            )]),
+            json!([]),
+            json!([{ "status": "M", "path": "docs/unrelated.md" }]),
+            json!([]),
+        ),
+    )?;
+    let dirty_packet = assert_collision_class(&dirty_fixture, "cass-dirty-unrelated", "safe")?;
+    require_collision_advisory(
+        &dirty_packet,
+        "safe",
+        Some("none"),
+        "unrelated dirty advisory",
+    )?;
+    require_value_eq(
+        get_path(&dirty_packet, &["summary", "safe_to_start"]),
+        json!(true),
+        "unrelated dirty work should not block assignment",
+    )?;
+
+    let (_risk_tmp, risk_fixture) = write_swarm_evidence_fixture(
+        "collision-risk-classes",
+        collision_simulation_sources(
+            json!([
+                collision_simulation_bead(
+                    "cass-generated",
+                    "Generated target output",
+                    ["target/debug/build/cass/out/generated.rs"],
+                    []
+                ),
+                collision_simulation_bead(
+                    "cass-sibling",
+                    "Sibling dependency contract",
+                    ["Cargo.toml", "../frankensearch/src/lib.rs"],
+                    []
+                ),
+                collision_simulation_bead(
+                    "cass-recent",
+                    "Recent commit overlap",
+                    ["src/recent.rs"],
+                    []
+                ),
+                collision_simulation_bead("cass-clean", "Clean source path", ["src/clean.rs"], [])
+            ]),
+            json!([]),
+            json!([]),
+            json!([{
+                "hash": "abcdef1",
+                "subject": "test: recent source edit",
+                "authored_ts": "2026-05-08T15:55:00Z",
+                "changed_paths": ["src/recent.rs"]
+            }]),
+        ),
+    )?;
+
+    let generated_packet =
+        assert_collision_class(&risk_fixture, "cass-generated", "generated-artifact-risk")?;
+    require_value_eq(
+        get_path(&generated_packet, &["summary", "safe_to_start"]),
+        json!(true),
+        "generated artifact risk is advisory unless another collision blocks",
+    )?;
+    let sibling_packet =
+        assert_collision_class(&risk_fixture, "cass-sibling", "sibling-repo-risk")?;
+    require_value_eq(
+        get_path(&sibling_packet, &["summary", "safe_to_start"]),
+        json!(false),
+        "sibling repo risk should require coordination before assignment",
+    )?;
+    assert_collision_class(&risk_fixture, "cass-recent", "needs-coordination")?;
+    assert_collision_class(&risk_fixture, "cass-clean", "safe")?;
+
     Ok(())
 }
 
@@ -1929,6 +2292,188 @@ fn swarm_failure_patterns_cli_ranks_test_suggestions_and_redacts_sessions()
 }
 
 #[test]
+fn swarm_dependency_drift_cli_reports_clean_read_only_fixture() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "dependency-drift-clean",
+        json!({
+            "dependency_drift": {
+                "network": {"upstream_status": "not_checked"},
+                "dependencies": [{
+                    "name": "frankensqlite",
+                    "package": "fsqlite",
+                    "manifest_key": "frankensqlite",
+                    "source_kind": "git",
+                    "git": "https://github.com/thisismypassport/frankensqlite",
+                    "pinned_rev": "abc123",
+                    "local_head": "abc123456789",
+                    "dirty": false,
+                    "sibling_status": "clean",
+                    "required_downstream_tests": [
+                        "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation"
+                    ]
+                }]
+            }
+        }),
+    )?;
+    let output = run_swarm_dependency_drift_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.dependency_drift.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("ok"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("dependencies-clean"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "release_readiness"]),
+        json!("ready"),
+        "release readiness",
+    )?;
+    require_value_eq(
+        get_path(
+            &output,
+            &["dependencies", "0", "sibling", "revision_matches_pin"],
+        ),
+        json!(true),
+        "pin match",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "touches_network"]),
+        json!(false),
+        "network mutation contract",
+    )?;
+    assert_no_forbidden_fixture_leaks("dependency-drift-clean", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_dependency_drift_cli_flags_pin_dirty_missing_and_network_risks()
+-> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "dependency-drift-risky",
+        json!({
+            "dependency_drift": {
+                "network": {"upstream_status": "unavailable"},
+                "dependencies": [
+                    {
+                        "name": "frankensqlite",
+                        "package": "fsqlite",
+                        "manifest_key": "frankensqlite",
+                        "source_kind": "git",
+                        "git": "https://github.com/thisismypassport/frankensqlite",
+                        "pinned_rev": "abc123",
+                        "local_head": "def456789",
+                        "dirty": true,
+                        "sibling_status": "dirty"
+                    },
+                    {
+                        "name": "frankensearch",
+                        "package": "frankensearch",
+                        "manifest_key": "frankensearch",
+                        "source_kind": "git",
+                        "git": "https://github.com/thisismypassport/frankensearch",
+                        "pinned_rev": "1111111",
+                        "local_head": "2222222",
+                        "dirty": false,
+                        "sibling_status": "clean"
+                    },
+                    {
+                        "name": "fsqlite-types",
+                        "package": "fsqlite-types",
+                        "manifest_key": "fsqlite-types",
+                        "source_kind": "git",
+                        "manifest_status": "missing-rev",
+                        "dirty": false,
+                        "sibling_status": "clean"
+                    },
+                    {
+                        "name": "toon",
+                        "package": "tru",
+                        "manifest_key": "toon",
+                        "source_kind": "git",
+                        "git": "https://github.com/thisismypassport/toon",
+                        "pinned_rev": "5669b72a",
+                        "dirty": false,
+                        "sibling_status": "missing"
+                    }
+                ]
+            }
+        }),
+    )?;
+    let output = run_swarm_dependency_drift_fixture(&fixture_path)?;
+
+    require_value_eq(get_path(&output, &["status"]), json!("warning"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("restore-manifest-pin"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "release_readiness"]),
+        json!("blocked"),
+        "release readiness",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "warning_count"]),
+        json!(3),
+        "warning count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "dirty_count"]),
+        json!(1),
+        "dirty count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "local_rev_mismatch_count"]),
+        json!(2),
+        "local rev mismatch count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "missing_sibling_count"]),
+        json!(1),
+        "missing sibling count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "network_status"]),
+        json!("unavailable"),
+        "network status",
+    )?;
+
+    let recommendation_kinds = get_path(&output, &["recommendations"])
+        .and_then(Value::as_array)
+        .ok_or_else(|| test_error("recommendations missing"))?
+        .iter()
+        .filter_map(|recommendation| recommendation.get("kind").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    require(
+        recommendation_kinds.contains(&"frankensqlite-first"),
+        "frankensqlite-specific recommendation missing",
+    )?;
+    require(
+        serde_json::to_string(&output)?.contains(
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation",
+        ),
+        "strict validation command missing",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "mutates_git"]),
+        json!(false),
+        "git mutation contract",
+    )?;
+    assert_no_forbidden_fixture_leaks("dependency-drift-risky", &output);
+    Ok(())
+}
+
+#[test]
 fn swarm_status_large_fixture_fast_gate_names_budget_sections() -> Result<(), Box<dyn Error>> {
     let scale = SyntheticSwarmScale {
         ready_count: 850,
@@ -2182,6 +2727,219 @@ impl SyntheticSwarmScale {
     fn total_bead_count(self) -> usize {
         self.ready_count + self.in_progress_count + self.blocked_count
     }
+}
+
+fn verification_playbook_bead<const P: usize, const L: usize>(
+    id: &str,
+    title: &str,
+    touched_paths: [&str; P],
+    labels: [&str; L],
+) -> Value {
+    let touched_paths: Vec<&str> = touched_paths.into_iter().collect();
+    let labels: Vec<&str> = labels.into_iter().collect();
+    json!({
+        "id": id,
+        "title": title,
+        "status": "open",
+        "priority": 2,
+        "issue_type": "task",
+        "labels": labels,
+        "touched_paths": touched_paths,
+        "updated_at": "2026-05-08T15:55:00Z"
+    })
+}
+
+fn collision_simulation_sources(
+    ready: Value,
+    reservations: Value,
+    dirty_paths: Value,
+    recent_commits: Value,
+) -> Value {
+    let dirty = dirty_paths
+        .as_array()
+        .is_some_and(|paths| !paths.is_empty());
+    json!({
+        "beads": {
+            "ready": ready,
+            "in_progress": [],
+            "blocked": [],
+            "graph": {
+                "node_count": 1,
+                "edge_count": 0,
+                "has_cycles": false
+            }
+        },
+        "agent_mail": {
+            "agents": [],
+            "messages": [],
+            "reservations": reservations
+        },
+        "git": {
+            "branch": "main",
+            "upstream": "origin/main",
+            "ahead": 0,
+            "behind": 0,
+            "dirty": dirty,
+            "dirty_paths": dirty_paths,
+            "recent_commits": recent_commits
+        },
+        "processes": {
+            "active_rch_jobs": 0,
+            "active_cargo_jobs": 0,
+            "load_average_1m": 0.2,
+            "cpu_count": 64
+        },
+        "cass_health": {
+            "status": "healthy",
+            "healthy": true,
+            "initialized": true,
+            "recommended_action": null
+        },
+        "cass_status": {
+            "search_ready": true,
+            "semantic_fallback_mode": "lexical",
+            "active_rebuild": false
+        },
+        "evidence": {
+            "recent_threads": [],
+            "recent_proofs": [],
+            "proof_gaps": [],
+            "redaction_applied": false
+        }
+    })
+}
+
+fn collision_simulation_bead<const P: usize, const L: usize>(
+    id: &str,
+    title: &str,
+    touched_paths: [&str; P],
+    labels: [&str; L],
+) -> Value {
+    verification_playbook_bead(id, title, touched_paths, labels)
+}
+
+fn assert_collision_class(
+    fixture_path: &Path,
+    bead_id: &str,
+    expected_class: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let output = run_swarm_work_packet_fixture(fixture_path, Some(bead_id))?;
+    require(
+        get_path(&output, &["work_packet", "collision_simulation", "classes"])
+            .and_then(Value::as_array)
+            .is_some_and(|classes| {
+                classes
+                    .iter()
+                    .any(|class| class.as_str() == Some(expected_class))
+            }),
+        format!("{bead_id} missing collision class {expected_class}: {output:#}"),
+    )?;
+    require_value_eq(
+        get_path(
+            &output,
+            &[
+                "work_packet",
+                "collision_simulation",
+                "mutation_policy",
+                "reservations_mutated",
+            ],
+        ),
+        json!(false),
+        "collision simulation must not mutate reservations",
+    )?;
+    require_value_eq(
+        get_path(
+            &output,
+            &[
+                "work_packet",
+                "collision_simulation",
+                "mutation_policy",
+                "raw_session_content_inspected",
+            ],
+        ),
+        json!(false),
+        "collision simulation must not inspect raw session content",
+    )?;
+    assert_no_forbidden_fixture_leaks(&format!("collision-simulation-{bead_id}"), &output);
+    Ok(output)
+}
+
+fn require_collision_advisory(
+    output: &Value,
+    expected_class: &str,
+    expected_match_kind: Option<&str>,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    require(
+        get_path(
+            output,
+            &["work_packet", "collision_simulation", "advisories"],
+        )
+        .and_then(Value::as_array)
+        .is_some_and(|advisories| {
+            advisories.iter().any(|advisory| {
+                advisory.get("class").and_then(Value::as_str) == Some(expected_class)
+                    && expected_match_kind.is_none_or(|match_kind| {
+                        advisory.get("match_kind").and_then(Value::as_str) == Some(match_kind)
+                    })
+            })
+        }),
+        format!("missing {label}: {output:#}"),
+    )
+}
+
+fn assert_verification_playbook(
+    fixture_path: &Path,
+    bead_id: &str,
+    expected_class: &str,
+    expected_command_fragment: Option<&str>,
+) -> Result<Value, Box<dyn Error>> {
+    let output = run_swarm_work_packet_fixture(fixture_path, Some(bead_id))?;
+    require_value_eq(
+        get_path(&output, &["summary", "bead_id"]),
+        json!(bead_id),
+        &format!("{bead_id} selected bead"),
+    )?;
+    require(
+        get_path(&output, &["work_packet", "verification", "file_classes"])
+            .and_then(Value::as_array)
+            .is_some_and(|classes| {
+                classes.iter().any(|class| {
+                    class
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.cmp(expected_class).is_eq())
+                })
+            }),
+        format!("{bead_id} missing expected file class {expected_class}"),
+    )?;
+    if let Some(fragment) = expected_command_fragment {
+        let commands = verification_commands(&output);
+        require(
+            commands.iter().any(|command| command.contains(fragment)),
+            format!(
+                "{bead_id} missing expected verification command fragment {fragment}: {commands:?}"
+            ),
+        )?;
+        require(
+            commands
+                .iter()
+                .all(|command| command.starts_with("rch exec -- env ")),
+            format!("{bead_id} verification commands must use rch: {commands:?}"),
+        )?;
+    }
+    assert_no_forbidden_fixture_leaks(&format!("work-packet-{bead_id}"), &output);
+    Ok(output)
+}
+
+fn verification_commands(output: &Value) -> Vec<String> {
+    get_path(output, &["work_packet", "verification", "commands"])
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 fn write_synthetic_swarm_status_fixture(
@@ -2609,6 +3367,24 @@ fn run_swarm_failure_patterns_fixture(
         output.stderr.is_empty(),
         format!(
             "swarm failure-patterns should not log to stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn run_swarm_dependency_drift_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass")); // ubs:ignore - fixed test binary from assert_cmd.
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    cmd.args(["swarm", "dependency-drift", "--json", "--fixture"]);
+    cmd.arg(fixture_path);
+
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    require(
+        output.stderr.is_empty(),
+        format!(
+            "swarm dependency-drift should not log to stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         ),
     )?;

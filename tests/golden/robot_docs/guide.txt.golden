@@ -20,6 +20,7 @@ guide:
   Swarm stale review: stale_candidate_count is advisory. Coordinate through Beads and Agent Mail before reopening, force-releasing, or taking over another agent's work.
   Swarm packets: `cass swarm work-packet --json --bead ID` suggests reservations, proof commands, and closeout copy; agents must still create reservations, update Beads, run rch proofs, and summarize artifacts.
   Swarm evidence handoff: use `cass pack "query" --robot` when status points at prior sessions or proof refs; pack is a bounded cited handoff, not a replacement for Beads or Agent Mail.
+  Dependency drift: `cass swarm dependency-drift --json` checks manifest pins against optional sibling checkout state and reports strict validation commands without fetching or mutating.
   Args: accepts --robot-docs=topic and misplaced globals; detailed errors with examples on parse failure
   Source control: use `cass robot-docs sources` for remote sync/setup plus persistent agent-harness exclusions
   TUI drill-in contract: Enter on selected hit opens detail modal (Messages tab); Enter with no selected hit falls back to query submit behavior

@@ -223,6 +223,161 @@
     "mail_body_snippets_included": false,
     "redaction_policy": "strict",
     "redaction_applied": true,
-    "sensitive_paths_scrubbed": 0
+    "sensitive_paths_scrubbed": 0,
+    "exposure_preview": {
+      "schema_version": "cass.privacy.exposure_preview.v1",
+      "read_only": true,
+      "mutation_performed": false,
+      "preview_scope": "swarm_status",
+      "coverage": "policy_defaults",
+      "risk_categories": [
+        "provider_roots",
+        "session_content",
+        "derived_search_assets"
+      ],
+      "source_classes": [
+        {
+          "class": "provider_roots",
+          "would_read": true,
+          "raw_values_included": false,
+          "risk": "medium",
+          "notes": "Provider roots and source paths are reported only after path redaction."
+        },
+        {
+          "class": "session_content",
+          "would_read": true,
+          "raw_values_included": false,
+          "risk": "high",
+          "notes": "Swarm status reports metadata and proof references; raw session text is not serialized."
+        },
+        {
+          "class": "derived_search_assets",
+          "would_read": true,
+          "raw_values_included": false,
+          "risk": "medium",
+          "notes": "SQLite and search asset readiness are summarized without dumping indexed text."
+        },
+        {
+          "class": "support_artifacts",
+          "would_read": false,
+          "raw_values_included": false,
+          "risk": "high",
+          "notes": "Support bundles and repro capsules require their own explicit command path."
+        }
+      ],
+      "candidate_actions": [
+        {
+          "action": "index",
+          "command_shape": "cass index --full --json",
+          "would_read": [
+            "provider roots",
+            "session files",
+            "source metadata"
+          ],
+          "would_write": [
+            "SQLite archive",
+            "derived lexical index"
+          ],
+          "default_exclusions": [
+            "raw mirror capture is not published by swarm status"
+          ],
+          "required_opt_in_flags": []
+        },
+        {
+          "action": "export-html",
+          "command_shape": "cass export-html <session> --json",
+          "would_read": [
+            "selected session"
+          ],
+          "would_write": [
+            "self-contained HTML export"
+          ],
+          "default_exclusions": [
+            "skill content"
+          ],
+          "required_opt_in_flags": [
+            "--include-skills"
+          ]
+        },
+        {
+          "action": "support-bundle",
+          "command_shape": "cass doctor --support-bundle --json",
+          "would_read": [
+            "diagnostics",
+            "doctor run metadata",
+            "redacted manifests"
+          ],
+          "would_write": [
+            "support bundle directory"
+          ],
+          "default_exclusions": [
+            "operator-provided sensitive attachments"
+          ],
+          "required_opt_in_flags": [
+            "--include-sensitive-attachments"
+          ]
+        },
+        {
+          "action": "repro-capsule",
+          "command_shape": "not yet exposed in cass.swarm.status.v1",
+          "would_read": [
+            "selected failure metadata",
+            "selected proof references"
+          ],
+          "would_write": [
+            "none from swarm status"
+          ],
+          "default_exclusions": [
+            "raw prompts",
+            "raw session text",
+            "mail body snippets"
+          ],
+          "required_opt_in_flags": []
+        }
+      ],
+      "opt_in_boundaries": [
+        {
+          "surface": "swarm status",
+          "flag": "--include-evidence",
+          "status": "unsupported",
+          "unlocks": "mail body snippets"
+        },
+        {
+          "surface": "export-html",
+          "flag": "--include-skills",
+          "status": "available",
+          "unlocks": "skill content in HTML exports"
+        },
+        {
+          "surface": "doctor support-bundle",
+          "flag": "--include-sensitive-attachments",
+          "status": "available",
+          "unlocks": "operator-provided sensitive attachments"
+        }
+      ],
+      "redacted_sample_count": 4,
+      "redacted_samples": [
+        {
+          "kind": "sensitive_path",
+          "sample": "[REDACTED_PATH]"
+        },
+        {
+          "kind": "mail_body_snippet",
+          "sample": "[MAIL_BODY_OMITTED]"
+        },
+        {
+          "kind": "secret_like_value",
+          "sample": "[SECRET_ENV_REDACTED]"
+        },
+        {
+          "kind": "evidence_reference",
+          "sample": "pack://[REDACTED_PATH]#L44"
+        }
+      ],
+      "truth_limits": [
+        "Counts describe this status snapshot, not every future command.",
+        "No raw secrets, prompts, mail bodies, or absolute private paths are included in this preview."
+      ]
+    }
   }
 }

@@ -13,11 +13,14 @@
       "input_path": "tests/fixtures/swarm_status/healthy.inputs.json",
       "input_sha256": "05e95c99ad1712f0e2a70f2bead08b73f2158d8152fa56e8fcbe5a03f21f28e2",
       "golden_path": "tests/golden/swarm_status/healthy.json.golden",
-      "golden_sha256": "0640a90440dd9b93aa348b3083d7a3497c3e5e77e928d5be7fc2a5e9bddc3605",
+      "golden_sha256": "4e18e876510cfeedf5727951a752a6b6bf13fc24a78eb9a22f4d73ec6e6a6c43",
       "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status --fixture-id healthy",
       "stdout_capture_path": "tests/golden/swarm_status/healthy.json.golden",
       "stderr_capture": "",
-      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "redaction_report": {
+        "raw_session_content_included": false,
+        "mail_body_snippets_included": false
+      },
       "assertion_summary": "healthy ready-work fixture covers the success path"
     },
     {
@@ -25,11 +28,14 @@
       "input_path": "tests/fixtures/swarm_status/busy.inputs.json",
       "input_sha256": "50786003bfddceefa6ae2a2e0a4497bf7101b2bcd233a27b65e41ad21e067d54",
       "golden_path": "tests/golden/swarm_status/busy.json.golden",
-      "golden_sha256": "46fe9a8693e95b93a348a8912f3caadf33a86ffd14ca1f1824c43912307ea753",
+      "golden_sha256": "089e16dc4ac5a0bb7c6fa0e6176f95615890b4ded0c347febaea446e6f330439",
       "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status --fixture-id busy",
       "stdout_capture_path": "tests/golden/swarm_status/busy.json.golden",
       "stderr_capture": "",
-      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "redaction_report": {
+        "raw_session_content_included": false,
+        "mail_body_snippets_included": false
+      },
       "assertion_summary": "busy fixture covers active agents, reservations, dirty paths, and light build pressure"
     },
     {
@@ -37,11 +43,14 @@
       "input_path": "tests/fixtures/swarm_status/stale_advisory.inputs.json",
       "input_sha256": "032f067a7e631a9fafdac272bb60e0ac87004b3159b8fcb81984ada3b3f82841",
       "golden_path": "tests/golden/swarm_status/stale_advisory.json.golden",
-      "golden_sha256": "705a313c08c9c0c8c95acf1cbf3666ad3d963ff9d63d2764a4aaf48d6e3affc1",
+      "golden_sha256": "f4ac2a022959bbdf5b75aab0ff064bac69bf5789b1f09c98d47dc7d7761fdcd2",
       "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status --fixture-id stale_advisory",
       "stdout_capture_path": "tests/golden/swarm_status/stale_advisory.json.golden",
       "stderr_capture": "",
-      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "redaction_report": {
+        "raw_session_content_included": false,
+        "mail_body_snippets_included": false
+      },
       "assertion_summary": "stale fixture covers advisory stale detection without automatic takeover"
     },
     {
@@ -49,11 +58,14 @@
       "input_path": "tests/fixtures/swarm_status/reservation_conflict.inputs.json",
       "input_sha256": "6c6d70955b4b8b851caec82d189d8372700a31df2629e7030ba92e076d1a2bfc",
       "golden_path": "tests/golden/swarm_status/reservation_conflict.json.golden",
-      "golden_sha256": "b5d8e6307ba0c0e5cda8b47cc1bd2017e9bbbf000d83838ba386d4ac30f60994",
+      "golden_sha256": "29f57e859a7f4cc5fef5fa6d079d926ec83c276593e35c7ddc69cf230a77e780",
       "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status --fixture-id reservation_conflict",
       "stdout_capture_path": "tests/golden/swarm_status/reservation_conflict.json.golden",
       "stderr_capture": "",
-      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "redaction_report": {
+        "raw_session_content_included": false,
+        "mail_body_snippets_included": false
+      },
       "assertion_summary": "reservation fixture covers conflicting leases and dirty peer work"
     },
     {
@@ -61,11 +73,14 @@
       "input_path": "tests/fixtures/swarm_status/unrelated_reservation.inputs.json",
       "input_sha256": "8b09bf2c52e97229c208eb0992bee58f1784cc880fe8d0e53ea174b4b7d0f064",
       "golden_path": "tests/golden/swarm_status/unrelated_reservation.json.golden",
-      "golden_sha256": "e11f2960fcd40775cd1ab8f075766224ece2eccdd4cb95ccdda065caa036f96c",
+      "golden_sha256": "1c0d3586e565b7639ee6d3ec5d1026a1d366da4c2c27ab61830f87192c9d8014",
       "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status --fixture-id unrelated_reservation",
       "stdout_capture_path": "tests/golden/swarm_status/unrelated_reservation.json.golden",
       "stderr_capture": "",
-      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "redaction_report": {
+        "raw_session_content_included": false,
+        "mail_body_snippets_included": false
+      },
       "assertion_summary": "unrelated reservation fixture covers a dirty path that does not block safe ready work"
     },
     {
@@ -73,11 +88,14 @@
       "input_path": "tests/fixtures/swarm_status/build_pressure.inputs.json",
       "input_sha256": "9638caecf01169a6927fa178c817c67c1bdf1abc49adedb5af767e1f4f69a6b6",
       "golden_path": "tests/golden/swarm_status/build_pressure.json.golden",
-      "golden_sha256": "2601d18aee893a7944332dc27718b97a1a7871a223b9d95eff498bf51851ff22",
+      "golden_sha256": "c22fdcf2b7abf66e2f409ab4a3dcf61014810c9fd6eec39e3bd78d62808a5bb9",
       "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status --fixture-id build_pressure",
       "stdout_capture_path": "tests/golden/swarm_status/build_pressure.json.golden",
       "stderr_capture": "",
-      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "redaction_report": {
+        "raw_session_content_included": false,
+        "mail_body_snippets_included": false
+      },
       "assertion_summary": "build-pressure fixture covers rch pressure and accidental local cargo detection"
     },
     {
@@ -85,11 +103,14 @@
       "input_path": "tests/fixtures/swarm_status/no_ready_work.inputs.json",
       "input_sha256": "79b44697ff678bf6c8ad0a1bc9a1961ab8a143416f22ce13787d4fc998ddfe37",
       "golden_path": "tests/golden/swarm_status/no_ready_work.json.golden",
-      "golden_sha256": "2db1532240eacb7e18ec29b68eeaca5c4d9f604e9aa7a941f79c9bd8e421c8cd",
+      "golden_sha256": "bced194ffb5ce75097e8ab89f9526456338332ea8e383f8bd1bec12a2052e56d",
       "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status --fixture-id no_ready_work",
       "stdout_capture_path": "tests/golden/swarm_status/no_ready_work.json.golden",
       "stderr_capture": "",
-      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "redaction_report": {
+        "raw_session_content_included": false,
+        "mail_body_snippets_included": false
+      },
       "assertion_summary": "no-ready fixture covers explicit queue-dry recommendations"
     },
     {
@@ -97,7 +118,7 @@
       "input_path": "tests/fixtures/swarm_status/privacy_guardrails.inputs.json",
       "input_sha256": "75b55d8c7a9307d77baeda02a66e8d3638b4d0fa81171f5bdd040471fc400a33",
       "golden_path": "tests/golden/swarm_status/privacy_guardrails.json.golden",
-      "golden_sha256": "30044439f1c179b31ba5c5019f11c9fc38c4a246e713aa79831fab393c8312f1",
+      "golden_sha256": "af6e79b6467ddd0cddd7a59bd4474ba292e655416e1c39127698e2a460e292c5",
       "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status --fixture-id privacy_guardrails",
       "stdout_capture_path": "tests/golden/swarm_status/privacy_guardrails.json.golden",
       "stderr_capture": "",

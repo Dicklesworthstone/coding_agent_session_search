@@ -26,19 +26,35 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::expected_index_dir;
 use serde_json::{Value, json};
+use std::error::Error;
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use walkdir::WalkDir;
 
 /// Build a `cass` binary invocation with the env knobs required for
-/// deterministic test output (no update check, no ambient data-dir surprise).
+/// deterministic test output (no update check, no ambient data-dir or CWD
+/// connector-discovery surprise).
 fn cass_cmd(test_home: &std::path::Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    let codex_home = test_home.join(".codex");
+    let claude_home = test_home.join(".claude");
+    let gemini_home = test_home.join(".gemini");
+    let opencode_root = test_home.join(".opencode");
+    let aider_root = test_home.join(".aider-missing");
+    let xdg_config_home = test_home.join(".config");
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .current_dir(test_home)
         // Pin data dir so the test never touches the user's real cache.
         .env("XDG_DATA_HOME", test_home)
+        .env("XDG_CONFIG_HOME", xdg_config_home)
         .env("HOME", test_home)
+        .env("CODEX_HOME", codex_home)
+        .env("CLAUDE_HOME", claude_home)
+        .env("GEMINI_HOME", gemini_home)
+        .env("OPENCODE_STORAGE_ROOT", opencode_root)
+        .env("CASS_AIDER_DATA_ROOT", aider_root)
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         // Keep resource-policy goldens stable across hosts; dynamic default
         // scaling is covered by responsiveness unit tests.
@@ -146,29 +162,43 @@ fn seed_diag_quarantine_fixture(test_home: &std::path::Path) -> PathBuf {
     data_dir
 }
 
-fn isolated_search_demo_data(test_home: &std::path::Path) -> PathBuf {
+fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> io::Result<PathBuf> {
+    let mut dst = dst_root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => dst.push(part),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fixture path escaped source root",
+                ));
+            }
+        }
+    }
+    Ok(dst)
+}
+
+fn isolated_search_demo_data(test_home: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("search_demo_data");
     let dst_root = test_home.join("search_demo_data");
     for entry in WalkDir::new(&src) {
-        let entry = entry.expect("walk search demo data");
-        let rel = entry
-            .path()
-            .strip_prefix(&src)
-            .expect("relative fixture path");
-        let dst = dst_root.join(rel);
+        let entry = entry?;
+        let rel = entry.path().strip_prefix(&src)?;
+        let dst = safe_fixture_destination(&dst_root, rel)?;
         if entry.file_type().is_dir() {
-            fs::create_dir_all(&dst).expect("create fixture dir");
+            fs::create_dir_all(&dst)?;
         } else {
             if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent).expect("create fixture parent");
+                fs::create_dir_all(parent)?;
             }
-            fs::copy(entry.path(), &dst).expect("copy fixture file");
+            fs::copy(entry.path(), &dst)?;
         }
     }
-    dst_root
+    Ok(dst_root)
 }
 
 fn json_value_schema(value: &Value) -> Value {
@@ -538,36 +568,69 @@ fn live_value_scrubbing_normalizes_runtime_objects_with_type_fields() {
 }
 
 #[test]
-fn live_value_scrubbing_redacts_repo_paths_and_result_content() {
+fn live_value_scrubbing_redacts_repo_paths_and_result_content() -> Result<(), String> {
     let test_home = tempfile::tempdir().expect("create temp home");
     let repo_root = env!("CARGO_MANIFEST_DIR");
+    let legacy_fixture_root = "/data/projects/coding_agent_session_search";
     let input = serde_json::to_string_pretty(&json!({
-        "results": [{
-            "source_path": format!("{repo_root}/.aider.chat.history.md"),
-            "workspace": repo_root,
-            "line_number": 42,
-            "agent": "aider",
-            "snippet": "private snippet",
-            "content": "private prompt and assistant transcript"
-        }]
+        "results": [
+            {
+                "source_path": format!("{repo_root}/.aider.chat.history.md"),
+                "workspace": repo_root,
+                "line_number": 42,
+                "agent": "aider",
+                "snippet": "private snippet",
+                "content": "private prompt and assistant transcript"
+            },
+            {
+                "source_path": format!("{legacy_fixture_root}/tests/fixtures/aider/session.md"),
+                "workspace": legacy_fixture_root,
+                "line_number": 7,
+                "agent": "aider",
+                "snippet": "legacy private snippet",
+                "content": "legacy private prompt and assistant transcript"
+            }
+        ]
     }))
     .expect("serialize fixture");
 
     let scrubbed = scrub_robot_json(&input, test_home.path());
     let scrubbed: Value = serde_json::from_str(&scrubbed).expect("parse scrubbed fixture");
 
-    assert_eq!(
-        scrubbed["results"][0]["source_path"],
-        "[REPO]/.aider.chat.history.md"
-    );
-    assert_eq!(scrubbed["results"][0]["workspace"], "[REPO]");
-    assert_eq!(scrubbed["results"][0]["snippet"], "[RESULT_SNIPPET]");
-    assert_eq!(scrubbed["results"][0]["content"], "[RESULT_CONTENT]");
-    assert!(
-        !serde_json::to_string(&scrubbed)
-            .expect("serialize scrubbed fixture")
-            .contains("private prompt")
-    );
+    require_json_string_eq(
+        &scrubbed,
+        "/results/0/source_path",
+        "[REPO]/.aider.chat.history.md",
+    )?;
+    require_json_string_eq(&scrubbed, "/results/0/workspace", "[REPO]")?;
+    require_json_string_eq(&scrubbed, "/results/0/snippet", "[RESULT_SNIPPET]")?;
+    require_json_string_eq(&scrubbed, "/results/0/content", "[RESULT_CONTENT]")?;
+    require_json_string_eq(
+        &scrubbed,
+        "/results/1/source_path",
+        "[REPO]/tests/fixtures/aider/session.md",
+    )?;
+    require_json_string_eq(&scrubbed, "/results/1/workspace", "[REPO]")?;
+    require_json_string_eq(&scrubbed, "/results/1/snippet", "[RESULT_SNIPPET]")?;
+    require_json_string_eq(&scrubbed, "/results/1/content", "[RESULT_CONTENT]")?;
+    let serialized = serde_json::to_string(&scrubbed).expect("serialize scrubbed fixture");
+    if serialized.contains("private prompt") {
+        return Err("scrubbed fixture leaked private prompt text".to_string());
+    }
+    Ok(())
+}
+
+fn require_json_string_eq(value: &Value, pointer: &str, expected: &str) -> Result<(), String> {
+    let actual = value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing string at JSON pointer {pointer}"))?;
+    match actual.cmp(expected) {
+        std::cmp::Ordering::Equal => Ok(()),
+        _ => Err(format!(
+            "string at JSON pointer {pointer} was {actual:?}, expected {expected:?}"
+        )),
+    }
 }
 
 /// Strip non-deterministic values from a robot-mode JSON payload so the
@@ -612,6 +675,10 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     if !repo_root.is_empty() {
         out = out.replace(repo_root, "[REPO]");
     }
+    // The checked-in search_demo_data fixture intentionally preserves source
+    // metadata captured on the maintainer machine. CI checkouts live under
+    // /home/runner, so scrub that stable fixture root explicitly too.
+    out = out.replace("/data/projects/coding_agent_session_search", "[REPO]");
 
     // 4. UUIDs.
     let uuid_re =
@@ -1341,7 +1408,7 @@ fn stats_json_missing_db_error_envelope_matches_golden() {
 }
 
 #[test]
-fn stats_json_happy_path_matches_golden() {
+fn stats_json_happy_path_matches_golden() -> Result<(), Box<dyn Error>> {
     // `coding_agent_session_search-zefv4`: the error envelope has been
     // pinned (stats_missing_db* goldens) but the success envelope had no
     // freeze — regressions to a field name or a new mandatory key on
@@ -1350,7 +1417,7 @@ fn stats_json_happy_path_matches_golden() {
     // known conversation/message count), invokes `cass stats --json`,
     // and freezes the scrubbed envelope.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path());
+    let data_dir = isolated_search_demo_data(test_home.path())?;
     let out = cass_cmd(test_home.path())
         .args([
             "stats",
@@ -1373,16 +1440,17 @@ fn stats_json_happy_path_matches_golden() {
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/stats_full_payload.json.golden", &scrubbed);
+    Ok(())
 }
 
 #[test]
-fn stats_json_happy_path_shape_matches_golden() {
+fn stats_json_happy_path_shape_matches_golden() -> Result<(), Box<dyn Error>> {
     // Shape-only pin for the happy-path envelope so a future refactor
     // of the scrubber (or drift in fixture contents) can't accidentally
     // mask structural regressions. json_value_schema diff tolerates
     // value changes; keys + types must hold.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path());
+    let data_dir = isolated_search_demo_data(test_home.path())?;
     let out = cass_cmd(test_home.path())
         .args([
             "stats",
@@ -1398,6 +1466,7 @@ fn stats_json_happy_path_shape_matches_golden() {
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
     assert_golden("robot/stats_full_payload_shape.json.golden", &canonical);
+    Ok(())
 }
 
 #[test]
@@ -1660,9 +1729,9 @@ fn pack_introspect_contract_matrix_is_current() {
 }
 
 #[test]
-fn search_robot_json_matches_golden() {
+fn search_robot_json_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path());
+    let data_dir = isolated_search_demo_data(test_home.path())?;
     let output = cass_cmd(test_home.path())
         .args([
             "search",
@@ -1688,12 +1757,13 @@ fn search_robot_json_matches_golden() {
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/search_robot.json.golden", &scrubbed);
+    Ok(())
 }
 
 #[test]
-fn search_robot_shape_matches_golden() {
+fn search_robot_shape_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path());
+    let data_dir = isolated_search_demo_data(test_home.path())?;
     let output = cass_cmd(test_home.path())
         .args([
             "search",
@@ -1718,6 +1788,7 @@ fn search_robot_shape_matches_golden() {
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
     assert_golden("robot/search_robot_shape.json.golden", &canonical);
+    Ok(())
 }
 
 // ========================================================================

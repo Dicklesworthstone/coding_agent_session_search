@@ -4496,28 +4496,33 @@ fn doctor_json_reports_missing_upstream_source_as_coverage_risk_not_data_loss() 
     let status_payload: Value = serde_json::from_slice(&status_out.stdout).expect("status json");
     assert_eq!(
         status_payload["coverage_risk"]["status"].as_str(),
-        Some("sole_copy_risk"),
-        "status should expose concise coverage risk routing: {status_payload:#}"
+        Some("unchecked_fast_health"),
+        "status should keep coverage bounded and route deep analysis to doctor: {status_payload:#}"
     );
     assert_eq!(
         status_payload["doctor_summary"]["archive_coverage_state"].as_str(),
-        Some("sole_copy_risk"),
-        "status doctor_summary should mirror checked archive coverage risk: {status_payload:#}"
+        Some("not_checked"),
+        "status doctor_summary should not claim checked archive coverage: {status_payload:#}"
     );
     assert_eq!(
         status_payload["doctor_summary"]["coverage_source"]["status"].as_str(),
-        Some("checked"),
-        "status doctor_summary should label checked coverage provenance: {status_payload:#}"
+        Some("not_checked"),
+        "status doctor_summary should label bounded coverage provenance: {status_payload:#}"
     );
     assert_eq!(
         status_payload["doctor_summary"]["coverage_source"]["source"].as_str(),
-        Some("status-inline-small-archive"),
-        "status doctor_summary should explain the bounded inline coverage source: {status_payload:#}"
+        Some("status-fast-state"),
+        "status doctor_summary should explain that deep coverage was not collected inline: {status_payload:#}"
+    );
+    assert_eq!(
+        status_payload["doctor_summary"]["doctor_check_recommended"].as_bool(),
+        Some(true),
+        "unchecked status coverage should route operators toward doctor inspection: {status_payload:#}"
     );
     assert_eq!(
         status_payload["doctor_summary"]["repair_recommended"].as_bool(),
-        Some(true),
-        "sole-copy coverage risk should route operators toward doctor repair/readiness inspection: {status_payload:#}"
+        Some(false),
+        "status must not claim repair is needed without doctor coverage evidence: {status_payload:#}"
     );
     assert!(
         status_payload["doctor_summary"]["quarantine_summary"].is_object(),
@@ -4542,7 +4547,7 @@ fn doctor_json_reports_missing_upstream_source_as_coverage_risk_not_data_loss() 
     assert_eq!(
         health_payload["coverage_risk"]["status"].as_str(),
         Some("unchecked_fast_health"),
-        "health stays fast and points callers at doctor/status for expensive coverage analysis"
+        "health stays fast and points callers at doctor for expensive coverage analysis"
     );
     assert!(
         health_payload["coverage_risk"]["recommended_action"]

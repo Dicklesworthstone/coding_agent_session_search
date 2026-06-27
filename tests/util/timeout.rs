@@ -26,6 +26,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// How often we poll the child's exit status while waiting.
@@ -35,6 +36,21 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// timeout-diagnostic dump. Bounded so the dump stays readable and a
 /// misbehaving child that spams output doesn't blow up test memory.
 const DIAG_STREAM_TAIL_BYTES: usize = 16 * 1024;
+const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
+
+struct PipeCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl PipeCapture {
+    fn empty() -> Self {
+        Self {
+            bytes: Vec::new(),
+            truncated: false,
+        }
+    }
+}
 
 /// Spawn `cmd` and wait for it to finish, up to `timeout`. On timeout,
 /// emit a diagnostic dump, kill the child, and panic.
@@ -60,25 +76,24 @@ pub fn spawn_with_timeout_or_diag(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    configure_child_process_group(&mut cmd);
 
     let start = Instant::now();
     let mut child = cmd
         .spawn()
         .unwrap_or_else(|err| panic!("spawn_with_timeout_or_diag({label}): spawn failed: {err}"));
+    let stdout_reader = spawn_pipe_reader(child.stdout.take());
+    let stderr_reader = spawn_pipe_reader(child.stderr.take());
 
     let deadline = start + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Normal path — drain the pipes and return an Output.
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut h) = child.stdout.take() {
-                    let _ = h.read_to_end(&mut stdout);
-                }
-                if let Some(mut h) = child.stderr.take() {
-                    let _ = h.read_to_end(&mut stderr);
-                }
+                kill_child_process_group(child.id());
+                let stdout = join_pipe_reader(stdout_reader, label, "stdout");
+                let stderr = join_pipe_reader(stderr_reader, label, "stderr");
+                let stdout = full_output_or_panic(stdout, label, "stdout");
+                let stderr = full_output_or_panic(stderr, label, "stderr");
                 return Output {
                     status,
                     stdout,
@@ -89,15 +104,17 @@ pub fn spawn_with_timeout_or_diag(
                 if Instant::now() >= deadline {
                     let pid = child.id();
                     // Kill FIRST so the stdout/stderr pipe FDs close
-                    // on the child's side and our `read_to_end` below
-                    // actually returns. Draining a pipe whose writer
-                    // is still alive but idle would otherwise block
-                    // the diagnostic dump forever and defeat the
-                    // whole point of this helper.
+                    // on the child's side and the reader-thread joins
+                    // below return. Waiting on a pipe whose writer is
+                    // still alive but idle would otherwise block the
+                    // diagnostic dump forever and defeat this helper.
+                    kill_child_process_group(pid);
                     let _ = child.kill();
                     let _ = child.wait();
-                    let stdout_tail = drain_pipe_tail(child.stdout.take());
-                    let stderr_tail = drain_pipe_tail(child.stderr.take());
+                    let stdout = join_pipe_reader(stdout_reader, label, "stdout");
+                    let stderr = join_pipe_reader(stderr_reader, label, "stderr");
+                    let stdout_tail = stream_tail(&stdout.bytes);
+                    let stderr_tail = stream_tail(&stderr.bytes);
 
                     eprintln!();
                     eprintln!("================================================================");
@@ -113,12 +130,24 @@ pub fn spawn_with_timeout_or_diag(
                             eprintln!("  {entry}");
                         }
                     }
+                    if stdout.truncated {
+                        eprintln!(
+                            "--- child stdout exceeded capture cap ({} bytes); retained latest bytes only",
+                            MAX_CAPTURE_BYTES
+                        );
+                    }
                     eprintln!(
                         "--- child stdout tail ({} bytes of up to {}):",
                         stdout_tail.len(),
                         DIAG_STREAM_TAIL_BYTES
                     );
                     eprintln!("{}", String::from_utf8_lossy(&stdout_tail));
+                    if stderr.truncated {
+                        eprintln!(
+                            "--- child stderr exceeded capture cap ({} bytes); retained latest bytes only",
+                            MAX_CAPTURE_BYTES
+                        );
+                    }
                     eprintln!(
                         "--- child stderr tail ({} bytes of up to {}):",
                         stderr_tail.len(),
@@ -137,33 +166,128 @@ pub fn spawn_with_timeout_or_diag(
             }
             Err(err) => {
                 // try_wait errored — treat as a hard failure.
+                kill_child_process_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = join_pipe_reader(stdout_reader, label, "stdout");
+                let _ = join_pipe_reader(stderr_reader, label, "stderr");
                 panic!("spawn_with_timeout_or_diag({label}): try_wait errored: {err}");
             }
         }
     }
 }
 
-/// Drain as much of a pipe as is currently available without blocking
-/// long, then truncate to the configured tail size.
-fn drain_pipe_tail<R: Read>(handle: Option<R>) -> Vec<u8> {
-    let Some(mut h) = handle else {
-        return Vec::new();
-    };
-    // We don't have a portable way to set O_NONBLOCK on the pipe fd
-    // here; instead we rely on the child having produced finite output
-    // during the timeout window. `read_to_end` on a closed pipe returns
-    // what's been written so far. For the hung-child case the pipe is
-    // still open, but we're about to kill the child anyway — the
-    // subsequent read returns EOF quickly once the FD closes.
-    let mut buf = Vec::new();
-    let _ = h.read_to_end(&mut buf);
+#[cfg(unix)]
+fn configure_child_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_child_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_child_process_group(pid: u32) {
+    let process_group = format!("-{pid}");
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", &process_group])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn kill_child_process_group(_pid: u32) {}
+
+fn spawn_pipe_reader<R>(handle: Option<R>) -> JoinHandle<PipeCapture>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let Some(mut handle) = handle else {
+            return PipeCapture::empty();
+        };
+        read_pipe_to_capture(&mut handle)
+    })
+}
+
+fn join_pipe_reader(
+    reader: JoinHandle<PipeCapture>,
+    label: &str,
+    stream_name: &str,
+) -> PipeCapture {
+    match reader.join() {
+        Ok(capture) => capture,
+        Err(_) => {
+            eprintln!("{label}: {stream_name} reader thread panicked");
+            PipeCapture::empty()
+        }
+    }
+}
+
+fn full_output_or_panic(capture: PipeCapture, label: &str, stream_name: &str) -> Vec<u8> {
+    if capture.truncated {
+        panic!(
+            "spawn_with_timeout_or_diag({label}): {stream_name} exceeded capture cap of {} bytes",
+            MAX_CAPTURE_BYTES
+        );
+    }
+    capture.bytes
+}
+
+fn read_pipe_to_capture<R: Read>(handle: &mut R) -> PipeCapture {
+    let mut bytes = Vec::new();
+    let mut scratch = [0_u8; 8192];
+    let mut write_pos = 0_usize;
+    let mut truncated = false;
+
+    loop {
+        let read = match handle.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+
+        if bytes.len() < MAX_CAPTURE_BYTES {
+            let remaining = MAX_CAPTURE_BYTES - bytes.len();
+            let keep = read.min(remaining);
+            bytes.extend_from_slice(&scratch[..keep]);
+            if keep == read {
+                continue;
+            }
+            truncated = true;
+            for &byte in &scratch[keep..read] {
+                bytes[write_pos] = byte;
+                write_pos = (write_pos + 1) % MAX_CAPTURE_BYTES;
+            }
+        } else {
+            truncated = true;
+            for &byte in &scratch[..read] {
+                bytes[write_pos] = byte;
+                write_pos = (write_pos + 1) % MAX_CAPTURE_BYTES;
+            }
+        }
+    }
+
+    if truncated && write_pos != 0 {
+        let mut ordered = Vec::with_capacity(bytes.len());
+        ordered.extend_from_slice(&bytes[write_pos..]);
+        ordered.extend_from_slice(&bytes[..write_pos]);
+        bytes = ordered;
+    }
+
+    PipeCapture { bytes, truncated }
+}
+
+fn stream_tail(buf: &[u8]) -> Vec<u8> {
     if buf.len() > DIAG_STREAM_TAIL_BYTES {
         let tail_start = buf.len() - DIAG_STREAM_TAIL_BYTES;
-        buf.drain(0..tail_start);
+        buf[tail_start..].to_vec()
+    } else {
+        buf.to_vec()
     }
-    buf
 }
 
 /// Produce up to `limit` relative entries under `root`, formatted as
@@ -188,15 +312,15 @@ fn list_dir_bounded(root: &Path, limit: usize) -> Vec<String> {
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
-            match entry.file_type() {
-                Ok(ft) if ft.is_dir() => {
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    out.push(format!("{rel} (symlink)"));
+                }
+                Ok(metadata) if metadata.is_dir() => {
                     out.push(format!("{rel}/"));
                     stack.push(path);
                 }
-                Ok(_) => {
-                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    out.push(format!("{rel} ({size} bytes)"));
-                }
+                Ok(metadata) => out.push(format!("{rel} ({} bytes)", metadata.len())),
                 Err(_) => {
                     out.push(format!("{rel} (<stat failed>)"));
                 }
@@ -225,18 +349,36 @@ mod tests {
         );
     }
 
+    /// Proves stdout is drained while the child is still running. A
+    /// child that writes more than the kernel pipe buffer can otherwise
+    /// block before exit and get misdiagnosed as a timeout.
+    #[test]
+    fn large_stdout_child_can_exit_without_pipe_deadlock() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("yes x | head -c 1048576");
+        let out = spawn_with_timeout_or_diag(cmd, "large_stdout", None, Duration::from_secs(10));
+        assert!(out.status.success(), "large stdout child must exit 0");
+        assert_eq!(out.stdout.len(), 1024 * 1024);
+    }
+
     /// Proves the timeout path: a child that hangs past the deadline
     /// triggers the diagnostic-dump + kill + panic sequence.
+    ///
+    /// Use a shell wrapper on Unix so this also proves process-group
+    /// cleanup: killing only the shell would leave `sleep` holding the
+    /// stdout/stderr pipe FDs open, deadlocking the diagnostic join.
     #[test]
     #[should_panic(expected = "exceeded timeout")]
     fn hung_child_triggers_timeout_panic_with_diagnostic() {
-        // `/bin/sleep` is invoked DIRECTLY (no shell wrapper) so
-        // SIGKILL from `child.kill()` actually terminates the hanging
-        // process. Going through `/bin/sh -c 'sleep 30'` would kill
-        // only the shell, leaving the orphan sleep holding the
-        // stdout/stderr pipe FDs open and making the subsequent
-        // `read_to_end` in drain_pipe_tail block for the full 30s.
+        #[cfg(unix)]
+        let cmd = {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg("sleep 30");
+            cmd
+        };
+        #[cfg(not(unix))]
         let mut cmd = Command::new("/bin/sleep");
+        #[cfg(not(unix))]
         cmd.arg("30");
         let _ =
             spawn_with_timeout_or_diag(cmd, "intentional_hang", None, Duration::from_millis(300));
@@ -286,6 +428,35 @@ mod tests {
         assert!(
             entries.iter().any(|e| e.contains("truncated at 3")),
             "must include the truncated-at marker once limit is exceeded; got: {entries:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_dir_bounded_reports_symlinked_directories_without_following() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        std::fs::write(outside.join("outside-only.txt"), b"should not be listed")
+            .expect("write outside marker");
+        std::os::unix::fs::symlink(&outside, root.join("linked-outside"))
+            .expect("create symlinked directory");
+
+        let entries = list_dir_bounded(&root, 20);
+
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry == "linked-outside (symlink)"),
+            "diagnostic listing must identify the symlink itself: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.contains("outside-only.txt")),
+            "diagnostic listing must not follow symlinked directories outside the data dir: {entries:?}"
         );
     }
 }

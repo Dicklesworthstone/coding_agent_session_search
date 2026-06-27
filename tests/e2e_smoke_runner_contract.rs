@@ -11,13 +11,25 @@
 use std::path::PathBuf;
 
 #[test]
-fn smoke_runner_script_exists_and_is_executable() {
+fn smoke_runner_script_exists_and_is_readable() -> std::io::Result<()> {
     tracing::info!(target: "8m208_test", check = "script_present");
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
         .join("tests")
         .join("run_e2e_smoke.sh");
     assert!(path.is_file(), "scripts/tests/run_e2e_smoke.sh must exist");
+    let _body = std::fs::read_to_string(&path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn smoke_runner_script_is_executable() {
+    tracing::info!(target: "8m208_test", check = "script_executable");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("tests")
+        .join("run_e2e_smoke.sh");
     let metadata = std::fs::metadata(&path).expect("metadata");
     let permissions = metadata.permissions();
     use std::os::unix::fs::PermissionsExt;

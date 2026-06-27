@@ -10,8 +10,10 @@
 
 use assert_cmd::Command;
 use serde_json::{Map, Value, json};
+use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 #[allow(deprecated)]
@@ -32,26 +34,40 @@ fn fixture_path(parts: &[&str]) -> PathBuf {
     path
 }
 
-fn isolated_search_demo_data(test_home: &Path) -> PathBuf {
+fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> io::Result<PathBuf> {
+    let mut dst = dst_root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => dst.push(part),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fixture path escaped source root",
+                ));
+            }
+        }
+    }
+    Ok(dst)
+}
+
+fn isolated_search_demo_data(test_home: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let src = fixture_path(&["search_demo_data"]);
     let dst_root = test_home.join("search_demo_data");
     for entry in WalkDir::new(&src) {
-        let entry = entry.expect("walk search demo data");
-        let rel = entry
-            .path()
-            .strip_prefix(&src)
-            .expect("relative fixture path");
-        let dst = dst_root.join(rel);
+        let entry = entry?;
+        let rel = entry.path().strip_prefix(&src)?;
+        let dst = safe_fixture_destination(&dst_root, rel)?;
         if entry.file_type().is_dir() {
-            fs::create_dir_all(&dst).expect("create fixture dir");
+            fs::create_dir_all(&dst)?;
         } else {
             if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent).expect("create fixture parent");
+                fs::create_dir_all(parent)?;
             }
-            fs::copy(entry.path(), &dst).expect("copy fixture file");
+            fs::copy(entry.path(), &dst)?;
         }
     }
-    dst_root
+    Ok(dst_root)
 }
 
 fn json_value_schema(value: &Value) -> Value {
@@ -350,9 +366,9 @@ fn surface_command(
 }
 
 #[test]
-fn introspect_response_schemas_cover_runtime_json_shapes() {
+fn introspect_response_schemas_cover_runtime_json_shapes() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let demo_data = isolated_search_demo_data(test_home.path());
+    let demo_data = isolated_search_demo_data(test_home.path())?;
     let introspect = run_json(
         test_home.path(),
         &["introspect".to_string(), "--json".to_string()],
@@ -374,4 +390,5 @@ fn introspect_response_schemas_cover_runtime_json_shapes() {
         let runtime_schema = json_value_schema(&payload);
         assert_runtime_shape_covered(surface, "$", &runtime_schema, advertised_schema);
     }
+    Ok(())
 }

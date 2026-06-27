@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": 3,
+    "kind": "missing-index",
+    "message": "cass has not been initialized in [TEST_HOME] yet, so pack generation cannot run until the first index completes.",
+    "hint": "Run 'cass index --full' once to discover local sessions and build the initial archive.",
+    "retryable": true
+  }
+}

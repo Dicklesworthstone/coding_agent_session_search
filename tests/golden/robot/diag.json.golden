@@ -62,8 +62,8 @@
     },
     {
       "name": "aider",
-      "path": "[REPO]/.aider.chat.history.md",
-      "found": true
+      "path": "(not detected)",
+      "found": false
     },
     {
       "name": "cursor",

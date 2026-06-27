@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": 2,
+    "kind": "pack-empty-query",
+    "message": "pack query is empty after trimming whitespace",
+    "hint": "Provide a non-empty query, for example `cass pack \"checkout failure\" --robot`.",
+    "retryable": false
+  }
+}

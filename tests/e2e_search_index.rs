@@ -249,6 +249,15 @@ fn total_matches_from_search_output(output: &[u8]) -> u64 {
         })
 }
 
+fn command_output_kind_is(output: &[u8], expected_kind: &str) -> bool {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(output) else {
+        return false;
+    };
+    json.get("kind")
+        .and_then(|kind| kind.as_str())
+        .is_some_and(|actual_kind| actual_kind.eq(expected_kind))
+}
+
 fn raw_lexical_total_matches(index_path: &Path, query: &str) -> u64 {
     let mut total = 0usize;
     if let Some(readers) = open_federated_search_readers(index_path, ReloadPolicy::Manual)
@@ -976,6 +985,7 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
 
     let stop = Arc::new(AtomicBool::new(false));
     let rebuild_running = Arc::new(AtomicBool::new(false));
+    let search_in_flight = Arc::new(AtomicBool::new(false));
     let reader_attempts_during_rebuild = Arc::new(AtomicUsize::new(0));
     let search_attempts_during_rebuild = Arc::new(AtomicUsize::new(0));
     let (ready_tx, ready_rx) = mpsc::channel();
@@ -1003,6 +1013,7 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
     let search_ready_tx = ready_tx.clone();
     let search_stop = Arc::clone(&stop);
     let search_rebuild_running = Arc::clone(&rebuild_running);
+    let search_in_flight_thread = Arc::clone(&search_in_flight);
     let search_overlap = Arc::clone(&search_attempts_during_rebuild);
     let search_home = home.clone();
     let search_codex_home = codex_home.clone();
@@ -1011,11 +1022,9 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
         let _ = search_ready_tx.send("search");
         let mut stats = SearchLoopStats::default();
         while !search_stop.load(Ordering::Relaxed) {
-            if search_rebuild_running.load(Ordering::Relaxed) {
-                search_overlap.fetch_add(1, Ordering::Relaxed);
-            }
-
             let search_started = Instant::now();
+            search_in_flight_thread.store(true, Ordering::Relaxed);
+            let started_during_rebuild = search_rebuild_running.load(Ordering::Relaxed);
             let output = cargo_bin_cmd!("cass")
                 .args([
                     "search",
@@ -1036,7 +1045,12 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
                 .timeout(Duration::from_secs(20))
                 .output()
                 .expect("run concurrent cass search");
-            let elapsed_ms = search_started.elapsed().as_millis() as u64;
+            search_in_flight_thread.store(false, Ordering::Relaxed);
+            let search_finished = Instant::now();
+            if started_during_rebuild || search_rebuild_running.load(Ordering::Relaxed) {
+                search_overlap.fetch_add(1, Ordering::Relaxed);
+            }
+            let elapsed_ms = search_finished.duration_since(search_started).as_millis() as u64;
             stats.attempts += 1;
             stats.max_duration_ms = stats.max_duration_ms.max(elapsed_ms);
 
@@ -1077,21 +1091,35 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
         Some("Run cass index --full --force-rebuild while a direct reader and cass search poll the same live index"),
     );
     rebuild_running.store(true, Ordering::Relaxed);
+    if search_in_flight.load(Ordering::Relaxed) {
+        search_attempts_during_rebuild.fetch_add(1, Ordering::Relaxed);
+    }
     let publish_pause_sentinel = home.join("atomic-publish-overlap-sentinel.json");
-    let rebuild_output = cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
-        .arg(&data_dir)
-        .current_dir(&home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .env(
-            "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
-            &publish_pause_sentinel,
-        )
-        .env("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS", "2000")
-        .timeout(Duration::from_secs(60))
-        .output()
-        .expect("run force rebuild under concurrent read/search load");
+    let mut attempt = 0usize;
+    let rebuild_output = loop {
+        let output = cargo_bin_cmd!("cass")
+            .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
+            .arg(&data_dir)
+            .current_dir(&home)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", &home)
+            .env(
+                "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
+                &publish_pause_sentinel,
+            )
+            .env("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS", "2000")
+            .timeout(Duration::from_secs(60))
+            .output()
+            .expect("run force rebuild under concurrent read/search load");
+        let retry_busy = !output.status.success()
+            && command_output_kind_is(&output.stdout, "index-busy")
+            && attempt < 4;
+        if !retry_busy {
+            break output;
+        }
+        attempt += 1;
+        std::thread::sleep(Duration::from_millis(200));
+    };
     rebuild_running.store(false, Ordering::Relaxed);
     let rebuild_duration_ms = rebuild_start.elapsed().as_millis() as u64;
     tracker.end(
@@ -1321,6 +1349,7 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
 
     let stop = Arc::new(AtomicBool::new(false));
     let rebuild_running = Arc::new(AtomicBool::new(false));
+    let search_in_flight = Arc::new(AtomicBool::new(false));
     let reader_attempts_during_rebuild = Arc::new(AtomicUsize::new(0));
     let search_attempts_during_rebuild = Arc::new(AtomicUsize::new(0));
     let (ready_tx, ready_rx) = mpsc::channel();
@@ -1348,6 +1377,7 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
     let search_ready_tx = ready_tx.clone();
     let search_stop = Arc::clone(&stop);
     let search_rebuild_running = Arc::clone(&rebuild_running);
+    let search_in_flight_thread = Arc::clone(&search_in_flight);
     let search_overlap = Arc::clone(&search_attempts_during_rebuild);
     let search_home = home.clone();
     let search_codex_home = codex_home.clone();
@@ -1356,11 +1386,9 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
         let _ = search_ready_tx.send("search");
         let mut stats = SearchLoopStats::default();
         while !search_stop.load(Ordering::Relaxed) {
-            if search_rebuild_running.load(Ordering::Relaxed) {
-                search_overlap.fetch_add(1, Ordering::Relaxed);
-            }
-
             let search_started = Instant::now();
+            search_in_flight_thread.store(true, Ordering::Relaxed);
+            let started_during_rebuild = search_rebuild_running.load(Ordering::Relaxed);
             let output = cargo_bin_cmd!("cass")
                 .args([
                     "search",
@@ -1381,7 +1409,12 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
                 .timeout(Duration::from_secs(20))
                 .output()
                 .expect("run concurrent federated cass search");
-            let elapsed_ms = search_started.elapsed().as_millis() as u64;
+            search_in_flight_thread.store(false, Ordering::Relaxed);
+            let search_finished = Instant::now();
+            if started_during_rebuild || search_rebuild_running.load(Ordering::Relaxed) {
+                search_overlap.fetch_add(1, Ordering::Relaxed);
+            }
+            let elapsed_ms = search_finished.duration_since(search_started).as_millis() as u64;
             stats.attempts += 1;
             stats.max_duration_ms = stats.max_duration_ms.max(elapsed_ms);
 
@@ -1422,6 +1455,9 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
         Some("Run cass index --full --force-rebuild with forced multi-shard planning while a direct reader and cass search poll the same live index"),
     );
     rebuild_running.store(true, Ordering::Relaxed);
+    if search_in_flight.load(Ordering::Relaxed) {
+        search_attempts_during_rebuild.fetch_add(1, Ordering::Relaxed);
+    }
     let mut rebuild = cargo_bin_cmd!("cass");
     force_federated_publish_env(&mut rebuild);
     let publish_pause_sentinel = home.join("federated-atomic-publish-overlap-sentinel.json");

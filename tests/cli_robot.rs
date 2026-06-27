@@ -9,7 +9,7 @@ use std::error::Error;
 use std::fs;
 use std::io::ErrorKind;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -51,6 +51,23 @@ fn is_transient_lexical_build_path(path: &Path) -> bool {
     })
 }
 
+fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let mut dst = dst_root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => dst.push(part),
+            _ => {
+                return Err(Box::new(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "fixture path escaped source root",
+                )));
+            }
+        }
+    }
+    Ok(dst)
+}
+
 fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
     let tmp = TempDir::new()?;
     let src = Path::new(SEARCH_DEMO_DATA_DIR);
@@ -68,7 +85,7 @@ fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
             Err(err) => return Err(Box::new(err)),
         };
         let rel = entry.path().strip_prefix(src)?;
-        let dst = tmp.path().join(rel);
+        let dst = safe_fixture_destination(tmp.path(), rel)?;
         if entry.file_type().is_dir() {
             fs::create_dir_all(&dst)?;
         } else {
