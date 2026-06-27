@@ -301,7 +301,7 @@ fn is_allowed_system_symlink_ancestor(_path: &Path) -> bool {
 
 fn detect_terminal_size() -> (u16, u16) {
     fn env_dim(key: &str) -> Option<u16> {
-        std::env::var(key)
+        dotenvy::var(key)
             .ok()
             .and_then(|raw| raw.trim().parse::<u16>().ok())
             .filter(|value| *value > 0)

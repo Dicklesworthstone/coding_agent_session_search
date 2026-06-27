@@ -11,7 +11,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const CRASH_REPLAY_SCHEMA_VERSION: &str = "1";
 
@@ -259,7 +259,8 @@ impl CrashReplayReport {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_vec_pretty(self)?;
-        fs::write(path, json)?;
+        let temp_path = write_crash_replay_json_temp_file(path, &json)?;
+        replace_crash_replay_json_from_temp(&temp_path, path)?;
         Ok(())
     }
 
@@ -269,6 +270,78 @@ impl CrashReplayReport {
         report.validate()?;
         Ok(report)
     }
+}
+
+fn write_crash_replay_json_temp_file(path: &Path, contents: &[u8]) -> io::Result<PathBuf> {
+    for _ in 0..100 {
+        let temp_path = unique_crash_replay_json_temp_path(path)?;
+        match write_crash_replay_json_temp_file_at(&temp_path, contents) {
+            Ok(()) => return Ok(temp_path),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate unique crash replay temp path for {}",
+            path.display()
+        ),
+    ))
+}
+
+fn write_crash_replay_json_temp_file_at(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+fn replace_crash_replay_json_from_temp(temp_path: &Path, final_path: &Path) -> io::Result<()> {
+    fs::rename(temp_path, final_path)?;
+    sync_parent_directory(final_path)
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn unique_crash_replay_json_temp_path(path: &Path) -> io::Result<PathBuf> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = crash_replay_temp_path_nonce()?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("crash-replay-report.json");
+
+    Ok(path.with_file_name(format!(".{file_name}.tmp.{timestamp}.{nonce:016x}")))
+}
+
+fn crash_replay_temp_path_nonce() -> io::Result<u64> {
+    use ring::rand::SecureRandom;
+
+    let mut random_bytes = [0u8; 8];
+    ring::rand::SystemRandom::new()
+        .fill(&mut random_bytes)
+        .map_err(|_| io::Error::other("failed to generate crash replay temp path nonce"))?;
+    Ok(u64::from_le_bytes(random_bytes))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,6 +716,8 @@ mod tests {
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
             saved_at_ms: 1_700_000_000_000,
+            last_message_id: None,
+            cursor_exhausted: false,
         }
     }
 
@@ -1293,6 +1368,57 @@ mod tests {
         let loaded = CrashReplayReport::load_json(&path)?;
 
         assert_eq!(loaded, report);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crash_replay_report_save_json_replaces_existing_symlink_without_following()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir()?;
+        let outside_dir = tempfile::tempdir()?;
+        let report_dir = temp_dir.path().join("artifacts/crash-replay");
+        fs::create_dir_all(&report_dir)?;
+        let path = report_dir.join("crash-replay-report.json");
+        let protected_target = outside_dir.path().join("protected-report.json");
+        fs::write(&protected_target, "untouched")?;
+        symlink(&protected_target, &path)?;
+
+        let checkpoints = vec![CrashReplayCheckpoint::new(
+            1,
+            "only_checkpoint",
+            "single checkpoint for symlink replacement",
+        )];
+        let report = replay_named_checkpoints(
+            "symlink-replacement",
+            "harness",
+            checkpoints,
+            || Ok(()),
+            |_state, _checkpoint| Ok(()),
+            |_state| Ok(()),
+            |_state, checkpoint| {
+                vec![CrashReplayInvariant::passed(
+                    checkpoint,
+                    "symlink_invariant",
+                    "symlink replacement invariant passed",
+                )]
+            },
+        );
+
+        report.save_json(&path)?;
+
+        assert_eq!(
+            fs::read_to_string(&protected_target)?,
+            "untouched",
+            "save_json must replace the report-path symlink, not follow it"
+        );
+        assert!(
+            !fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "report path should become a regular JSON file"
+        );
+        assert_eq!(CrashReplayReport::load_json(&path)?, report);
         Ok(())
     }
 

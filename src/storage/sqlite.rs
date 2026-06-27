@@ -267,6 +267,7 @@ static MESSAGE_LOOKUP_EXACT_IDX_PROBES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_BOUNDED_QUERIES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_FULL_SCAN_QUERIES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_ROWS_MATERIALIZED: AtomicU64 = AtomicU64::new(0);
+static DEFAULT_DEFER_ANALYTICS_UPDATES: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct MessageLookupTraceCounters {
@@ -312,10 +313,21 @@ pub(crate) fn message_lookup_trace_snapshot() -> MessageLookupTraceCounters {
     }
 }
 
-fn record_message_lookup_exact_idx_probe() {
-    if MESSAGE_LOOKUP_TRACE_ENABLED.load(Ordering::Relaxed) {
-        MESSAGE_LOOKUP_EXACT_IDX_PROBES.fetch_add(1, Ordering::Relaxed);
+pub(crate) struct DefaultDeferAnalyticsUpdatesGuard {
+    previous: bool,
+}
+
+impl Drop for DefaultDeferAnalyticsUpdatesGuard {
+    fn drop(&mut self) {
+        DEFAULT_DEFER_ANALYTICS_UPDATES.store(self.previous, Ordering::Relaxed);
     }
+}
+
+pub(crate) fn default_defer_analytics_updates_guard(
+    enabled: bool,
+) -> DefaultDeferAnalyticsUpdatesGuard {
+    let previous = DEFAULT_DEFER_ANALYTICS_UPDATES.swap(enabled, Ordering::Relaxed);
+    DefaultDeferAnalyticsUpdatesGuard { previous }
 }
 
 fn record_message_lookup_bounded_queries(query_count: u64, rows: usize) {
@@ -431,6 +443,21 @@ fn doctor_lock_file_pid_is_current_process(file: &fs::File) -> bool {
     doctor_lock_metadata_pid_is_current_process(&raw)
 }
 
+fn doctor_mutation_lock_error_is_active(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        err.raw_os_error() == Some(33)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn acquire_doctor_mutation_db_open_guard(
     db_path: &Path,
     timeout: Duration,
@@ -475,7 +502,7 @@ fn acquire_doctor_mutation_db_open_guard(
 
         match fs2::FileExt::try_lock_shared(&file) {
             Ok(()) => return Ok(DoctorMutationDbOpenGuard(Some(file))),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(err) if doctor_mutation_lock_error_is_active(&err) => {
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(anyhow!(
@@ -1101,6 +1128,190 @@ const DAILY_STATS_HEALTH_GENERATION: i64 = 1;
 pub const FTS5_DELETE_ALL_SQL: &str =
     "INSERT INTO fts_messages(fts_messages) VALUES('delete-all');";
 
+pub const FTS_MESSAGES_REQUIRED_SHADOW_TABLES: [&str; 5] = [
+    "fts_messages_config",
+    "fts_messages_content",
+    "fts_messages_data",
+    "fts_messages_docsize",
+    "fts_messages_idx",
+];
+
+pub const FTS_MESSAGES_INTEGRITY_PROBE_SQL: &str = "SELECT * FROM fts_messages LIMIT 0";
+
+pub const FTS_MESSAGES_CORRUPTION_RECOVERY_HINT: &str = "Stop all cass index/watch processes, back up the current database, then run \
+     'cass doctor check --json' for a read-only diagnosis before using a supported \
+     repair/rebuild path.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsMessagesIntegrityError {
+    missing_shadow_tables: Vec<&'static str>,
+    failed_sql: Option<&'static str>,
+    source_error: Option<String>,
+}
+
+impl FtsMessagesIntegrityError {
+    fn new(
+        missing_shadow_tables: Vec<&'static str>,
+        failed_sql: Option<&'static str>,
+        source_error: Option<String>,
+    ) -> Self {
+        Self {
+            missing_shadow_tables,
+            failed_sql,
+            source_error,
+        }
+    }
+
+    pub fn missing_shadow_tables(&self) -> &[&'static str] {
+        &self.missing_shadow_tables
+    }
+}
+
+impl std::fmt::Display for FtsMessagesIntegrityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CASS database FTS5 index is corrupt: fts_messages exists, but required FTS5 shadow tables are missing or unreadable"
+        )?;
+        if !self.missing_shadow_tables.is_empty() {
+            write!(
+                f,
+                "; missing shadow tables: {}",
+                self.missing_shadow_tables.join(", ")
+            )?;
+        }
+        if let Some(sql) = self.failed_sql {
+            write!(f, "; failed SQL: {sql}")?;
+        }
+        if let Some(source_error) = &self.source_error {
+            write!(f, "; error: {source_error}")?;
+        }
+        write!(
+            f,
+            ". Suggested recovery: {FTS_MESSAGES_CORRUPTION_RECOVERY_HINT}"
+        )
+    }
+}
+
+impl std::error::Error for FtsMessagesIntegrityError {}
+
+pub fn fts_messages_integrity_error_from_message(
+    source_error: impl Into<String>,
+) -> Option<FtsMessagesIntegrityError> {
+    let source_error = source_error.into();
+    let lower = source_error.to_ascii_lowercase();
+    if !lower.contains("fts_messages") {
+        return None;
+    }
+
+    let mentions_structural_fts_failure = lower.contains("shadow table")
+        || lower.contains("vtable constructor failed")
+        || lower.contains("sqlite_corrupt")
+        || lower.contains("databasecorrupt")
+        || lower.contains("database corrupt")
+        || lower.contains("missing required");
+    if !mentions_structural_fts_failure {
+        return None;
+    }
+
+    let missing_shadow_tables = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
+        .iter()
+        .copied()
+        .filter(|table| lower.contains(&table.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+
+    Some(FtsMessagesIntegrityError::new(
+        missing_shadow_tables,
+        Some(FTS_MESSAGES_INTEGRITY_PROBE_SQL),
+        Some(source_error),
+    ))
+}
+
+fn fts_schema_tolerates_missing_shadow_metadata(sql: &str) -> bool {
+    let normalized = sql
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    normalized.contains("usingfts5(")
+        && normalized.contains("content=''")
+        && !normalized.contains("message_id")
+}
+
+pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) -> Result<()> {
+    let fts_schema_sql: Vec<String> = conn
+        .query_map_collect(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
+            fparams![],
+            |row: &FrankenRow| row.get_typed::<String>(0),
+        )
+        .with_context(|| "checking for fts_messages in sqlite_master")?;
+    if fts_schema_sql.is_empty() {
+        return Ok(());
+    }
+
+    let probe_error = conn.query(FTS_MESSAGES_INTEGRITY_PROBE_SQL).err();
+    if probe_error.is_none()
+        && fts_schema_sql
+            .iter()
+            .all(|sql| fts_schema_tolerates_missing_shadow_metadata(sql))
+    {
+        return Ok(());
+    }
+
+    let present_shadow_tables: HashSet<String> = conn
+        .query_map_collect(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table'
+               AND name IN (
+                 'fts_messages_config',
+                 'fts_messages_content',
+                 'fts_messages_data',
+                 'fts_messages_docsize',
+                 'fts_messages_idx'
+               )",
+            fparams![],
+            |row: &FrankenRow| row.get_typed::<String>(0),
+        )
+        .map(|rows| rows.into_iter().collect())
+        .map_err(|err| {
+            FtsMessagesIntegrityError::new(
+                Vec::new(),
+                Some(
+                    "SELECT name FROM sqlite_master WHERE name IN \
+                     ('fts_messages_config','fts_messages_content','fts_messages_data','fts_messages_docsize','fts_messages_idx')",
+                ),
+                Some(err.to_string()),
+            )
+        })?;
+    let missing_shadow_tables = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
+        .iter()
+        .copied()
+        .filter(|table| !present_shadow_tables.contains(*table))
+        .collect::<Vec<_>>();
+
+    // If every required shadow table is present, the FTS5 schema is
+    // structurally sound. A probe-SQL failure here typically reflects an
+    // incomplete FTS5 runtime emulation (e.g. frankensqlite's vtable path)
+    // rather than fixture corruption — and conflating the two would
+    // wrongly reject every database with the new message_id schema that
+    // frankensqlite happens to serve via a different code path. Returning
+    // Ok here keeps the false-positive surface narrow; the truly-missing-
+    // shadow case below still surfaces as before.
+    if missing_shadow_tables.is_empty() {
+        return Ok(());
+    }
+
+    Err(FtsMessagesIntegrityError::new(
+        missing_shadow_tables,
+        probe_error
+            .as_ref()
+            .map(|_| FTS_MESSAGES_INTEGRITY_PROBE_SQL),
+        probe_error.map(|err| err.to_string()),
+    )
+    .into())
+}
+
 #[cfg(test)]
 pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
     // Delegate to FrankenStorage: DROP TABLE IF EXISTS + CREATE VIRTUAL TABLE
@@ -1433,9 +1644,22 @@ fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
     if path.exists() {
         fs::File::open(path)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()?;
     }
     Ok(())
 }
@@ -1547,6 +1771,7 @@ impl HistoricalSalvageOutcome {
 struct HistoricalReadConnection {
     conn: FrankenConnection,
     method: &'static str,
+    root_path: PathBuf,
     _tempdir: Option<tempfile::TempDir>,
 }
 
@@ -1764,7 +1989,7 @@ pub(crate) fn discover_historical_database_bundles(
             let modified_at_ms = file_mtime_ms(&root_path);
             let total_bytes = bundle_total_bytes(&root_path);
             let supports_direct_readonly = historical_bundle_supports_direct_readonly(&root_path);
-            let probe = probe_historical_bundle(&root_path, supports_direct_readonly);
+            let probe = probe_historical_bundle(&root_path);
             HistoricalDatabaseBundle {
                 modified_at_ms,
                 total_bytes,
@@ -1862,16 +2087,9 @@ pub(crate) fn discover_historical_database_bundles(
     bundles
 }
 
-fn probe_historical_bundle(
-    root_path: &Path,
-    supports_direct_readonly: bool,
-) -> HistoricalBundleProbe {
-    if !supports_direct_readonly {
-        return HistoricalBundleProbe::default();
-    }
-
+fn probe_historical_bundle(root_path: &Path) -> HistoricalBundleProbe {
     let Ok(conn) = open_historical_bundle_readonly(root_path) else {
-        return HistoricalBundleProbe::default();
+        return probe_historical_bundle_via_sqlite3_metadata(root_path).unwrap_or_default();
     };
 
     let schema_version = read_meta_schema_version(&conn).ok().flatten();
@@ -1892,12 +2110,56 @@ fn probe_historical_bundle(
         )
         .unwrap_or(0);
 
-    HistoricalBundleProbe {
+    let probe = HistoricalBundleProbe {
         schema_version,
         fts_schema_rows,
         fts_queryable,
         max_message_id,
+    };
+
+    if probe.schema_version.is_none()
+        && probe.fts_schema_rows.is_none()
+        && probe.max_message_id == 0
+    {
+        return probe_historical_bundle_via_sqlite3_metadata(root_path).unwrap_or(probe);
     }
+
+    probe
+}
+
+fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<HistoricalBundleProbe> {
+    let bundle_uri = format!("file:{}?immutable=1", root_path.to_string_lossy());
+    let output = Command::new("sqlite3")
+        .arg("-batch")
+        .arg("-noheader")
+        .arg(&bundle_uri)
+        .arg(
+            "PRAGMA writable_schema=ON;
+             SELECT COALESCE((SELECT value FROM meta WHERE key = 'schema_version'), '');
+             SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages';
+             SELECT COALESCE(MAX(id), 0) FROM messages;",
+        )
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut lines = stdout.lines();
+    let schema_version = lines.next().and_then(|raw| raw.trim().parse::<i64>().ok());
+    let fts_schema_rows = lines.next().and_then(|raw| raw.trim().parse::<i64>().ok());
+    let max_message_id = lines
+        .next()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+
+    Some(HistoricalBundleProbe {
+        schema_version,
+        fts_schema_rows,
+        fts_queryable: false,
+        max_message_id,
+    })
 }
 
 fn historical_bundle_fts_queryable_via_frankensqlite(
@@ -1909,7 +2171,7 @@ fn historical_bundle_fts_queryable_via_frankensqlite(
             .map(|storage| {
                 storage
                     .raw()
-                    .query("SELECT rowid FROM fts_messages LIMIT 1")
+                    .query("SELECT COUNT(*) FROM fts_messages")
                     .is_ok()
             })
             .unwrap_or(false)
@@ -2047,33 +2309,44 @@ fn recover_historical_bundle_via_sqlite3(
             .context("committing recovery import transaction")?;
     }
 
-    let recover_status = recover
-        .wait()
-        .context("waiting for sqlite3 .recover process")?;
-    if !recover_status.success() {
-        anyhow::bail!(
-            "sqlite3 .recover exited with status {} for {}",
-            recover_status,
-            bundle.root_path.display()
-        );
-    }
-
     let importer_status = importer
         .wait()
         .context("waiting for sqlite3 recovery importer")?;
+    let recover_status = recover
+        .wait()
+        .context("waiting for sqlite3 .recover process")?;
     if !importer_status.success() {
         anyhow::bail!(
-            "sqlite3 recovery importer exited with status {} for {}",
+            "sqlite3 recovery importer exited with status {} for {} after sqlite3 .recover exited with status {}",
             importer_status,
-            recovered_db.display()
+            recovered_db.display(),
+            recover_status
         );
     }
 
     let conn = open_historical_bundle_readonly(&recovered_db)?;
     historical_bundle_has_queryable_core_tables(&conn)?;
+    if !recover_status.success() {
+        let (conversations, messages) = historical_bundle_counts(&conn)?;
+        if conversations == 0 && messages == 0 {
+            anyhow::bail!(
+                "sqlite3 .recover exited with status {} for {} and recovered no core rows",
+                recover_status,
+                bundle.root_path.display()
+            );
+        }
+        tracing::warn!(
+            path = %bundle.root_path.display(),
+            status = %recover_status,
+            conversations,
+            messages,
+            "sqlite3 .recover exited nonzero after emitting recoverable core rows; continuing with recovered subset"
+        );
+    }
     Ok(HistoricalReadConnection {
         conn,
         method: "sqlite3-recover",
+        root_path: recovered_db,
         _tempdir: Some(tempdir),
     })
 }
@@ -2087,6 +2360,7 @@ fn open_historical_bundle_for_salvage(
                 return Ok(HistoricalReadConnection {
                     conn,
                     method: "direct-readonly",
+                    root_path: bundle.root_path.clone(),
                     _tempdir: None,
                 });
             }
@@ -2152,19 +2426,105 @@ fn record_historical_bundle_import(
     Ok(())
 }
 
+fn scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path: &Path) -> Result<()> {
+    let scrub_sql = "PRAGMA writable_schema = ON;
+         DELETE FROM sqlite_master
+          WHERE name = 'fts_messages'
+             OR tbl_name = 'fts_messages'
+             OR name IN (
+                'fts_messages_config',
+                'fts_messages_content',
+                'fts_messages_data',
+                'fts_messages_docsize',
+                'fts_messages_idx'
+             )
+             OR tbl_name IN (
+                'fts_messages_config',
+                'fts_messages_content',
+                'fts_messages_data',
+                'fts_messages_docsize',
+                'fts_messages_idx'
+             );
+         PRAGMA writable_schema = OFF;";
+
+    let run_scrub = |disable_defensive: bool| -> Result<std::process::Output> {
+        let mut command = Command::new("sqlite3");
+        command.arg("-batch").arg(staged_db_path);
+        if disable_defensive {
+            command.arg(".dbconfig defensive off");
+        }
+        command.arg(scrub_sql).output().with_context(|| {
+            format!(
+                "running sqlite3 staged FTS metadata scrub for {}",
+                staged_db_path.display()
+            )
+        })
+    };
+    let render_output = |output: &std::process::Output| -> String {
+        format!(
+            "status {}; stdout: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    };
+
+    let defensive_off_output = run_scrub(true)?;
+    if defensive_off_output.status.success() {
+        return Ok(());
+    }
+
+    let fallback_output = run_scrub(false)?;
+    if !fallback_output.status.success() {
+        anyhow::bail!(
+            "sqlite3 staged FTS metadata scrub failed for {}; defensive-off attempt {}; fallback without .dbconfig {}",
+            staged_db_path.display(),
+            render_output(&defensive_off_output),
+            render_output(&fallback_output)
+        );
+    }
+    Ok(())
+}
+
+fn ensure_seeded_canonical_fts_consistency(staged_db_path: &Path) -> Result<FtsConsistencyRepair> {
+    match ensure_fts_consistency_via_rusqlite(staged_db_path) {
+        Ok(repair) => Ok(repair),
+        Err(err) => {
+            if fts_messages_integrity_error_from_message(format!("{err:#}")).is_none() {
+                return Err(err).with_context(|| {
+                    format!(
+                        "repairing staged canonical FTS consistency before finalization: {}",
+                        staged_db_path.display()
+                    )
+                });
+            }
+
+            tracing::warn!(
+                path = %staged_db_path.display(),
+                error = %err,
+                "staged historical seed has malformed derived FTS metadata; scrubbing and rebuilding FTS on staged copy"
+            );
+            scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path).with_context(|| {
+                format!(
+                    "scrubbing malformed staged FTS metadata before finalization: {}",
+                    staged_db_path.display()
+                )
+            })?;
+            ensure_fts_consistency_via_rusqlite(staged_db_path).with_context(|| {
+                format!(
+                    "repairing staged canonical FTS consistency after metadata scrub: {}",
+                    staged_db_path.display()
+                )
+            })
+        }
+    }
+}
+
 fn finalize_seeded_canonical_bundle_via_rusqlite(
     canonical_db_path: &Path,
     bundle: &HistoricalDatabaseBundle,
-    conversations_imported: usize,
-    messages_imported: usize,
-) -> Result<()> {
-    let _fts_repair =
-        ensure_fts_consistency_via_rusqlite(canonical_db_path).with_context(|| {
-            format!(
-                "repairing staged canonical FTS consistency before finalization: {}",
-                canonical_db_path.display()
-            )
-        })?;
+) -> Result<(usize, usize)> {
+    let _fts_repair = ensure_seeded_canonical_fts_consistency(canonical_db_path)?;
 
     let path_str = canonical_db_path.to_string_lossy();
     let conn = FrankenConnection::open(path_str.as_ref()).with_context(|| {
@@ -2192,6 +2552,7 @@ fn finalize_seeded_canonical_bundle_via_rusqlite(
     }
 
     clear_seeded_runtime_meta(&conn)?;
+    let (conversations_imported, messages_imported) = historical_bundle_counts(&conn)?;
 
     conn.execute_compat(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
@@ -2209,7 +2570,7 @@ fn finalize_seeded_canonical_bundle_via_rusqlite(
         conversations_imported,
         messages_imported,
     )?;
-    Ok(())
+    Ok((conversations_imported, messages_imported))
 }
 
 fn read_meta_schema_version(conn: &FrankenConnection) -> Result<Option<i64>> {
@@ -2235,7 +2596,7 @@ fn franken_fts_schema_rows(conn: &FrankenConnection) -> Result<i64> {
 
 #[cfg(test)]
 fn franken_fts_limit_probe(conn: &FrankenConnection) -> bool {
-    conn.query("SELECT rowid FROM fts_messages LIMIT 1").is_ok()
+    conn.query("SELECT COUNT(*) FROM fts_messages").is_ok()
 }
 
 #[cfg(test)]
@@ -2307,7 +2668,7 @@ struct StagedHistoricalSeed {
 
 fn stage_historical_bundle_for_seed(
     canonical_db_path: &Path,
-    bundle: &HistoricalDatabaseBundle,
+    source_root_path: &Path,
 ) -> Result<StagedHistoricalSeed> {
     let canonical_parent = canonical_db_path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(canonical_parent).with_context(|| {
@@ -2319,12 +2680,23 @@ fn stage_historical_bundle_for_seed(
     let tempdir = tempfile::TempDir::new_in(canonical_parent)
         .context("creating temporary baseline seed directory")?;
     let staged_seed_db = tempdir.path().join("baseline-seed-output.db");
-    copy_database_bundle(&bundle.root_path, &staged_seed_db)?;
+    copy_database_bundle(source_root_path, &staged_seed_db)?;
 
     Ok(StagedHistoricalSeed {
         tempdir,
         db_path: staged_seed_db,
     })
+}
+
+fn stage_and_finalize_historical_seed(
+    canonical_db_path: &Path,
+    bundle: &HistoricalDatabaseBundle,
+    source_root_path: &Path,
+) -> Result<(StagedHistoricalSeed, usize, usize)> {
+    let staged_seed = stage_historical_bundle_for_seed(canonical_db_path, source_root_path)?;
+    let (conversations_imported, messages_imported) =
+        finalize_seeded_canonical_bundle_via_rusqlite(&staged_seed.db_path, bundle)?;
+    Ok((staged_seed, conversations_imported, messages_imported))
 }
 
 fn promote_staged_historical_seed(
@@ -2371,10 +2743,7 @@ pub(crate) fn seed_canonical_from_best_historical_bundle(
 ) -> Result<Option<HistoricalSalvageOutcome>> {
     let ordered_bundles = discover_historical_database_bundles(canonical_db_path);
     let mut last_seed_error: Option<anyhow::Error> = None;
-    for bundle in ordered_bundles
-        .into_iter()
-        .filter(|bundle| bundle.supports_direct_readonly)
-    {
+    for bundle in ordered_bundles {
         if let Some(version) = bundle.probe.schema_version
             && version < 13
         {
@@ -2391,37 +2760,61 @@ pub(crate) fn seed_canonical_from_best_historical_bundle(
             continue;
         }
 
-        let source = open_historical_bundle_for_salvage(&bundle).with_context(|| {
-            format!(
-                "opening historical seed bundle {} for baseline import",
+        let (staged_seed, conversations_imported, messages_imported) =
+            match stage_and_finalize_historical_seed(canonical_db_path, &bundle, &bundle.root_path)
+            {
+                Ok(result) => result,
+                Err(primary_err) => {
+                    tracing::warn!(
+                        path = %bundle.root_path.display(),
+                        error = %primary_err,
+                        "direct bulk baseline seed from historical bundle failed; trying sqlite3 salvage copy"
+                    );
+                    let source = match open_historical_bundle_for_salvage(&bundle).with_context(
+                        || {
+                            format!(
+                                "opening historical seed bundle {} for baseline import",
+                                bundle.root_path.display()
+                            )
+                        },
+                    ) {
+                        Ok(source) => source,
+                        Err(salvage_err) => {
+                            last_seed_error = Some(anyhow!(
+                                "direct baseline seed from {} failed: {primary_err:#}; sqlite3 salvage open also failed: {salvage_err:#}",
+                                bundle.root_path.display()
+                            ));
+                            continue;
+                        }
+                    };
+                    match stage_and_finalize_historical_seed(
+                        canonical_db_path,
+                        &bundle,
+                        &source.root_path,
+                    ) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            tracing::warn!(
+                                path = %bundle.root_path.display(),
+                                source_path = %source.root_path.display(),
+                                error = %err,
+                                "bulk baseline seed staging from sqlite3-salvaged historical bundle failed; trying next candidate"
+                            );
+                            last_seed_error = Some(err);
+                            continue;
+                        }
+                    }
+                }
+            };
+
+        if conversations_imported == 0 && messages_imported == 0 {
+            let err = anyhow!(
+                "historical bundle {} has no core rows for baseline import",
                 bundle.root_path.display()
-            )
-        })?;
-        let (conversations_imported, messages_imported) = historical_bundle_counts(&source.conn)?;
-
-        let staged_seed = match stage_historical_bundle_for_seed(canonical_db_path, &bundle) {
-            Ok(staged_seed) => staged_seed,
-            Err(err) => {
-                tracing::warn!(
-                    path = %bundle.root_path.display(),
-                    error = %err,
-                    "bulk baseline seed staging from historical bundle failed; trying next candidate"
-                );
-                last_seed_error = Some(err);
-                continue;
-            }
-        };
-
-        if let Err(err) = finalize_seeded_canonical_bundle_via_rusqlite(
-            &staged_seed.db_path,
-            &bundle,
-            conversations_imported,
-            messages_imported,
-        ) {
+            );
             tracing::warn!(
                 path = %bundle.root_path.display(),
-                error = %err,
-                "finalizing staged historical seed import failed; trying next candidate"
+                "historical bundle has no core rows for baseline seed import"
             );
             last_seed_error = Some(err);
             continue;
@@ -3190,11 +3583,16 @@ SELECT
     CAST(c.agent_id AS TEXT) || ':' ||
     CAST(length(c.external_id) AS TEXT) || ':' || c.external_id,
     c.id,
-    ts.ended_at,
-    ts.last_message_idx,
-    ts.last_message_created_at
+    (SELECT ts.ended_at
+     FROM conversation_tail_state ts
+     WHERE ts.conversation_id = c.id),
+    (SELECT ts.last_message_idx
+     FROM conversation_tail_state ts
+     WHERE ts.conversation_id = c.id),
+    (SELECT ts.last_message_created_at
+     FROM conversation_tail_state ts
+     WHERE ts.conversation_id = c.id)
 FROM conversations c
-LEFT JOIN conversation_tail_state ts ON ts.conversation_id = c.id
 WHERE c.external_id IS NOT NULL;
 ";
 
@@ -3436,6 +3834,18 @@ where
     ))
 }
 
+pub(crate) fn error_message_indicates_populated_fts_shadow_without_rowid_reload(
+    message: &str,
+) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let mentions_populated_without_rowid_shadow = (lower
+        .contains("loading populated without rowid table")
+        || lower.contains("reloading populated without rowid table"))
+        && (lower.contains("table `fts_messages_") || lower.contains("table fts_messages_"));
+
+    mentions_populated_without_rowid_shadow && lower.contains("not yet supported")
+}
+
 impl FrankenStorage {
     fn new(conn: FrankenConnection, db_path: PathBuf) -> Self {
         Self::new_with_shared_caches(
@@ -3503,6 +3913,7 @@ impl FrankenStorage {
         storage.run_migrations()?;
         storage.repair_missing_current_schema_objects()?;
         storage.apply_config()?;
+        storage.set_fts_messages_present_cache(true);
         Ok(storage)
     }
 
@@ -3544,6 +3955,7 @@ impl FrankenStorage {
             ensured_daily_stats_keys,
         );
         storage.apply_config()?;
+        storage.set_fts_messages_present_cache(true);
         Ok(storage)
     }
 
@@ -3566,6 +3978,7 @@ impl FrankenStorage {
                 writer
                     .index_writer_busy_timeout_ms
                     .store(busy_timeout_ms, Ordering::Relaxed);
+                writer.set_fts_messages_present_cache(true);
                 Ok((writer, true))
             }
             CachedEphemeralWriter::Uninitialized => {
@@ -3855,12 +4268,25 @@ impl FrankenStorage {
         // Log at warn level so the failure is visible instead of silently
         // swallowed, and set a flag for callers that need to periodically
         // recycle the connection.
-        let autocommit_pragma =
-            disable_autocommit_retain(|pragma| self.conn.execute(pragma).map(|_| ()))?;
-        tracing::debug!(
-            pragma = autocommit_pragma,
-            "disabled frankensqlite autocommit_retain for storage connection"
-        );
+        match disable_autocommit_retain(|pragma| self.conn.execute(pragma).map(|_| ())) {
+            Ok(autocommit_pragma) => {
+                tracing::debug!(
+                    pragma = autocommit_pragma,
+                    "disabled frankensqlite autocommit_retain for storage connection"
+                );
+            }
+            Err(err) => {
+                let detail = format!("{err:#}");
+                if error_message_indicates_populated_fts_shadow_without_rowid_reload(&detail) {
+                    tracing::warn!(
+                        error = %detail,
+                        "frankensqlite could not disable autocommit_retain because a populated derived FTS shadow table cannot yet be reloaded; continuing so canonical indexing can proceed"
+                    );
+                } else {
+                    return Err(err);
+                }
+            }
+        }
 
         Ok(())
     }
@@ -5132,6 +5558,9 @@ const MIGRATION_NAMES: [(i64, &str); 20] = [
 /// - If `_schema_migrations` already exists → skip (already transitioned)
 /// - If `meta` table has `schema_version > 0` → create `_schema_migrations`
 ///   and backfill entries for versions `1..=current_version`
+/// - Legacy V10-V12 databases are represented as V13 in `_schema_migrations`
+///   because frankensqlite uses one combined V13 base migration instead of
+///   replaying the old incremental V11-V13 steps.
 /// - If `meta` table missing or `schema_version = 0` with no tables → fresh DB,
 ///   let `MigrationRunner` handle it
 /// - If `schema_version = 0` but tables exist → corrupted state, log warning
@@ -5191,8 +5620,14 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
     )
     .with_context(|| "creating _schema_migrations table for transition")?;
 
+    let backfill_through_version = if (10..13).contains(&current_version) {
+        13
+    } else {
+        current_version
+    };
+
     for &(version, name) in &MIGRATION_NAMES {
-        if version > current_version {
+        if version > backfill_through_version {
             break;
         }
         conn.execute_compat(
@@ -5204,7 +5639,8 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
 
     info!(
         current_version,
-        "schema version transition complete: backfilled entries for versions 1..={current_version}"
+        backfill_through_version,
+        "schema version transition complete: backfilled legacy meta schema versions"
     );
 
     Ok(())
@@ -5276,116 +5712,57 @@ fn error_indicates_missing_column(err: &impl std::fmt::Display) -> bool {
 const ORPHAN_FK_ID_CHUNK_SIZE: usize = 256;
 
 fn collect_orphan_message_ids(conn: &FrankenConnection) -> Result<Vec<i64>> {
-    let min_conversation_id = conn
-        .query_map_collect(
-            "SELECT conversation_id
-             FROM messages
-             ORDER BY conversation_id ASC
-             LIMIT 1",
-            fparams![],
-            |row| row.get_typed(0),
-        )
-        .context("finding minimum message conversation id for orphan FK cleanup")?
-        .into_iter()
-        .next();
-    let Some(min_conversation_id) = min_conversation_id else {
-        return Ok(Vec::new());
-    };
-    let max_conversation_id: i64 = conn
-        .query_row_map(
-            "SELECT conversation_id
-             FROM messages
-             ORDER BY conversation_id DESC
-             LIMIT 1",
-            fparams![],
-            |row| row.get_typed(0),
-        )
-        .context("finding maximum message conversation id for orphan FK cleanup")?;
-
-    let parent_conversation_ids: Vec<i64> = conn
-        .query_map_collect(
-            "SELECT id
-             FROM conversations
-             WHERE id BETWEEN ?1 AND ?2
-             ORDER BY id",
-            fparams![min_conversation_id, max_conversation_id],
-            |row| row.get_typed(0),
-        )
-        .context("listing parent conversation ids for orphan FK cleanup")?;
-
-    let mut message_ids = Vec::new();
-    let mut gap_start = min_conversation_id;
-    for parent_id in parent_conversation_ids {
-        if parent_id < gap_start {
-            continue;
-        }
-        if parent_id > max_conversation_id {
-            break;
-        }
-        if gap_start < parent_id {
-            collect_message_ids_for_conversation_gap(
-                conn,
-                gap_start,
-                parent_id.saturating_sub(1),
-                &mut message_ids,
-            )?;
-        }
-        if parent_id == i64::MAX {
-            return Ok(message_ids);
-        }
-        gap_start = parent_id + 1;
-    }
-    if gap_start <= max_conversation_id {
-        collect_message_ids_for_conversation_gap(
-            conn,
-            gap_start,
-            max_conversation_id,
-            &mut message_ids,
-        )?;
-    }
-
-    Ok(message_ids)
-}
-
-fn collect_message_ids_for_conversation_gap(
-    conn: &FrankenConnection,
-    gap_start: i64,
-    gap_end: i64,
-    message_ids: &mut Vec<i64>,
-) -> Result<()> {
-    let (sql, params) = if gap_start == gap_end {
-        (
-            "SELECT id FROM messages WHERE conversation_id = ?1",
-            vec![SqliteValue::from(gap_start)],
-        )
-    } else {
-        (
-            "SELECT id FROM messages WHERE conversation_id BETWEEN ?1 AND ?2",
-            vec![SqliteValue::from(gap_start), SqliteValue::from(gap_end)],
-        )
-    };
-    let rows = conn.query_with_params(sql, &params).with_context(|| {
-        format!("listing orphan message ids for conversation-id gap {gap_start}..={gap_end}")
-    })?;
-    message_ids.reserve(rows.len());
-    for row in rows {
-        message_ids.push(row.get_typed(0)?);
-    }
-    Ok(())
+    conn.query_map_collect(
+        "SELECT m.id
+         FROM messages AS m
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM conversations AS c
+             WHERE c.id = m.conversation_id
+         )",
+        fparams![],
+        |row| row.get_typed(0),
+    )
+    .context("listing orphan message ids for orphan FK cleanup")
 }
 
 fn delete_rows_by_i64_chunks(
     tx: &FrankenTransaction<'_>,
-    delete_sql: &'static str,
+    delete_many_sql_prefix: &'static str,
     ids: &[i64],
 ) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let full_chunk_sql = delete_rows_by_i64_sql(delete_many_sql_prefix, ORPHAN_FK_ID_CHUNK_SIZE);
+    let tail_len = ids.len() % ORPHAN_FK_ID_CHUNK_SIZE;
+    let tail_sql =
+        (tail_len != 0).then(|| delete_rows_by_i64_sql(delete_many_sql_prefix, tail_len));
+
     let mut deleted = 0;
     for chunk in ids.chunks(ORPHAN_FK_ID_CHUNK_SIZE) {
-        for id in chunk {
-            deleted += tx.execute_with_params(delete_sql, &[SqliteValue::from(*id)])?;
-        }
+        let sql = if chunk.len() == ORPHAN_FK_ID_CHUNK_SIZE {
+            &full_chunk_sql
+        } else {
+            tail_sql.as_ref().unwrap_or(&full_chunk_sql)
+        };
+        let params = chunk
+            .iter()
+            .map(|id| SqliteValue::from(*id))
+            .collect::<Vec<_>>();
+        deleted += tx.execute_with_params(sql, &params)?;
     }
     Ok(deleted)
+}
+
+fn delete_rows_by_i64_sql(delete_many_sql_prefix: &'static str, count: usize) -> String {
+    let placeholders = sql_placeholders(count);
+    format!("{delete_many_sql_prefix} ({placeholders})")
+}
+
+fn sql_placeholders(count: usize) -> String {
+    vec!["?"; count].join(", ")
 }
 
 fn delete_orphan_message_ids_bisecting_oom(conn: &FrankenConnection, ids: &[i64]) -> Result<usize> {
@@ -5425,7 +5802,7 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
     let mut tx = conn.transaction()?;
     let mut deleted = 0usize;
     for entry in ORPHAN_MESSAGE_DEPENDENT_TABLES {
-        match delete_rows_by_i64_chunks(&tx, entry.delete_sql, ids) {
+        match delete_rows_by_i64_chunks(&tx, entry.delete_many_sql_prefix, ids) {
             Ok(count) => {
                 deleted = deleted.saturating_add(count);
             }
@@ -5448,7 +5825,7 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
         }
     }
     deleted = deleted.saturating_add(
-        delete_rows_by_i64_chunks(&tx, "DELETE FROM messages WHERE id = ?1", ids)
+        delete_rows_by_i64_chunks(&tx, "DELETE FROM messages WHERE id IN", ids)
             .context("deleting orphan rows from messages")?,
     );
     tx.commit()?;
@@ -5514,30 +5891,9 @@ fn delete_direct_orphan_id_chunk_once(
     ids: &[i64],
 ) -> Result<usize> {
     let mut tx = conn.transaction()?;
-    let deleted = delete_rows_by_i64_chunk_bulk(&tx, entry.delete_many_sql_prefix, ids)?;
+    let deleted = delete_rows_by_i64_chunks(&tx, entry.delete_many_sql_prefix, ids)?;
     tx.commit()?;
     Ok(deleted)
-}
-
-fn delete_rows_by_i64_chunk_bulk(
-    tx: &FrankenTransaction<'_>,
-    delete_many_sql_prefix: &'static str,
-    ids: &[i64],
-) -> Result<usize> {
-    if ids.is_empty() {
-        return Ok(0);
-    }
-
-    let placeholders = (1..=ids.len())
-        .map(|idx| format!("?{idx}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("{delete_many_sql_prefix} ({placeholders})");
-    let params = ids
-        .iter()
-        .map(|id| SqliteValue::from(*id))
-        .collect::<Vec<_>>();
-    Ok(tx.execute_with_params(&sql, &params)?)
 }
 
 /// Tables whose FK parent rows can go missing when an index transaction is
@@ -5555,7 +5911,10 @@ const ORPHAN_DIRECT_CHILD_TABLES: &[OrphanFkTable] = &[
     OrphanFkTable {
         child_table: "message_metrics",
         orphan_id_page_sql: "SELECT message_id FROM message_metrics \
-                             WHERE message_id NOT IN (SELECT id FROM messages) \
+                             WHERE NOT EXISTS (\
+                                 SELECT 1 FROM messages \
+                                 WHERE messages.id = message_metrics.message_id\
+                             ) \
                              ORDER BY message_id \
                              LIMIT ?1",
         delete_many_sql_prefix: "DELETE FROM message_metrics WHERE message_id IN",
@@ -5563,7 +5922,10 @@ const ORPHAN_DIRECT_CHILD_TABLES: &[OrphanFkTable] = &[
     OrphanFkTable {
         child_table: "token_usage",
         orphan_id_page_sql: "SELECT message_id FROM token_usage \
-                             WHERE message_id NOT IN (SELECT id FROM messages) \
+                             WHERE NOT EXISTS (\
+                                 SELECT 1 FROM messages \
+                                 WHERE messages.id = token_usage.message_id\
+                             ) \
                              ORDER BY message_id \
                              LIMIT ?1",
         delete_many_sql_prefix: "DELETE FROM token_usage WHERE message_id IN",
@@ -5571,7 +5933,10 @@ const ORPHAN_DIRECT_CHILD_TABLES: &[OrphanFkTable] = &[
     OrphanFkTable {
         child_table: "snippets",
         orphan_id_page_sql: "SELECT message_id FROM snippets \
-                             WHERE message_id NOT IN (SELECT id FROM messages) \
+                             WHERE NOT EXISTS (\
+                                 SELECT 1 FROM messages \
+                                 WHERE messages.id = snippets.message_id\
+                             ) \
                              ORDER BY message_id \
                              LIMIT ?1",
         delete_many_sql_prefix: "DELETE FROM snippets WHERE message_id IN",
@@ -5579,7 +5944,10 @@ const ORPHAN_DIRECT_CHILD_TABLES: &[OrphanFkTable] = &[
     OrphanFkTable {
         child_table: "conversation_tags",
         orphan_id_page_sql: "SELECT conversation_id FROM conversation_tags \
-                             WHERE conversation_id NOT IN (SELECT id FROM conversations) \
+                             WHERE NOT EXISTS (\
+                                 SELECT 1 FROM conversations \
+                                 WHERE conversations.id = conversation_tags.conversation_id\
+                             ) \
                              ORDER BY conversation_id \
                              LIMIT ?1",
         delete_many_sql_prefix: "DELETE FROM conversation_tags WHERE conversation_id IN",
@@ -5588,21 +5956,21 @@ const ORPHAN_DIRECT_CHILD_TABLES: &[OrphanFkTable] = &[
 
 struct OrphanMessageDependentTable {
     child_table: &'static str,
-    delete_sql: &'static str,
+    delete_many_sql_prefix: &'static str,
 }
 
 const ORPHAN_MESSAGE_DEPENDENT_TABLES: &[OrphanMessageDependentTable] = &[
     OrphanMessageDependentTable {
         child_table: "message_metrics",
-        delete_sql: "DELETE FROM message_metrics WHERE message_id = ?1",
+        delete_many_sql_prefix: "DELETE FROM message_metrics WHERE message_id IN",
     },
     OrphanMessageDependentTable {
         child_table: "token_usage",
-        delete_sql: "DELETE FROM token_usage WHERE message_id = ?1",
+        delete_many_sql_prefix: "DELETE FROM token_usage WHERE message_id IN",
     },
     OrphanMessageDependentTable {
         child_table: "snippets",
-        delete_sql: "DELETE FROM snippets WHERE message_id = ?1",
+        delete_many_sql_prefix: "DELETE FROM snippets WHERE message_id IN",
     },
 ];
 
@@ -5818,6 +6186,23 @@ struct ExistingConversationTailState {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct ExistingConversationTailMetadata {
+    last_message_idx: Option<i64>,
+    last_message_created_at: Option<i64>,
+    ended_at: Option<i64>,
+}
+
+impl ExistingConversationTailMetadata {
+    fn complete_tail_state(self) -> Option<ExistingConversationTailState> {
+        existing_conversation_tail_state_from_cached(
+            self.last_message_idx,
+            self.last_message_created_at,
+            self.ended_at,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ExistingConversationWithTail {
     id: i64,
     tail_state: Option<ExistingConversationTailState>,
@@ -5833,6 +6218,11 @@ fn conversation_tail_state(conv: &Conversation) -> (Option<i64>, Option<i64>) {
         conv.messages.iter().map(|msg| msg.idx).max(),
         conv.messages.iter().filter_map(|msg| msg.created_at).max(),
     )
+}
+
+fn conversation_tail_ended_at_candidate(conv: &Conversation) -> Option<i64> {
+    let max_message_created_at = conv.messages.iter().filter_map(|msg| msg.created_at).max();
+    max_message_created_at.max(conv.ended_at)
 }
 
 fn borrowed_messages_tail_state(messages: &[&Message]) -> (Option<i64>, Option<i64>) {
@@ -6021,6 +6411,41 @@ fn franken_existing_conversation_append_tail_state(
         }));
     }
     Ok(None)
+}
+
+fn franken_cached_existing_conversation_tail_metadata(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<ExistingConversationTailMetadata> {
+    let cached: Option<(Option<i64>, Option<i64>, Option<i64>)> = tx
+        .query_row_map(
+            "SELECT last_message_idx, last_message_created_at, ended_at
+             FROM conversation_tail_state
+             WHERE conversation_id = ?1",
+            fparams![conversation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )
+        .optional()?;
+    if let Some(cached) = cached {
+        return Ok(ExistingConversationTailMetadata {
+            last_message_idx: cached.0,
+            last_message_created_at: cached.1,
+            ended_at: cached.2,
+        });
+    }
+
+    let legacy_cached: (Option<i64>, Option<i64>, Option<i64>) = tx.query_row_map(
+        "SELECT last_message_idx, last_message_created_at, ended_at
+         FROM conversations
+         WHERE id = ?1",
+        fparams![conversation_id],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+    )?;
+    Ok(ExistingConversationTailMetadata {
+        last_message_idx: legacy_cached.0,
+        last_message_created_at: legacy_cached.1,
+        ended_at: legacy_cached.2,
+    })
 }
 
 fn existing_conversation_tail_state_from_cached(
@@ -6270,6 +6695,9 @@ fn collect_append_only_tail_messages<'a>(
         }
     }
     let split_idx = split_idx?;
+    if split_idx != 0 {
+        return None;
+    }
 
     let mut seen_tail_idx = HashSet::new();
     let mut seen_tail_replay = HashSet::new();
@@ -6300,6 +6728,203 @@ fn collect_append_only_tail_messages<'a>(
         idx_collision_count: 0,
         first_collision_idx: None,
     })
+}
+
+fn collect_existing_conversation_noop_from_idx_tail<'a>(
+    conv: &'a Conversation,
+    _existing_max_idx: i64,
+) -> Option<ExistingConversationNewMessages<'a>> {
+    if conv.messages.is_empty() {
+        return Some(ExistingConversationNewMessages {
+            messages: Vec::new(),
+            new_chars: 0,
+            idx_collision_count: 0,
+            first_collision_idx: None,
+        });
+    }
+
+    // A max idx alone does not prove lower idx rows exist. Sparse historical
+    // imports can have idx 2..3 first and later recover idx 0..1, so non-empty
+    // no-op decisions must use the bounded message lookup.
+    None
+}
+
+fn collect_existing_conversation_noop_from_conversation_ended_at<'a>(
+    conv: &'a Conversation,
+    existing_ended_at: i64,
+) -> Option<ExistingConversationNewMessages<'a>> {
+    if conv.messages.is_empty()
+        && conv
+            .ended_at
+            .is_none_or(|ended_at| ended_at <= existing_ended_at)
+    {
+        return Some(ExistingConversationNewMessages {
+            messages: Vec::new(),
+            new_chars: 0,
+            idx_collision_count: 0,
+            first_collision_idx: None,
+        });
+    }
+
+    // A conversation-level ended_at says nothing about whether every earlier
+    // message row was archived. Defer non-empty batches to the bounded lookup.
+    None
+}
+
+fn collect_existing_conversation_tail_from_ended_at<'a>(
+    conv: &'a Conversation,
+    existing_ended_at: i64,
+) -> Option<ExistingConversationNewMessages<'a>> {
+    if conv.messages.is_empty() {
+        return Some(ExistingConversationNewMessages {
+            messages: Vec::new(),
+            new_chars: 0,
+            idx_collision_count: 0,
+            first_collision_idx: None,
+        });
+    }
+
+    let mut prev_idx = None;
+    for msg in conv.messages.iter() {
+        if prev_idx.is_some_and(|prev| msg.idx <= prev) {
+            return None;
+        }
+        prev_idx = Some(msg.idx);
+        if msg.created_at? <= existing_ended_at {
+            return None;
+        }
+    }
+
+    let mut seen_tail_replay = HashSet::new();
+    let mut new_chars = 0i64;
+    let mut messages = Vec::new();
+    for msg in &conv.messages {
+        let replay_fingerprint = message_replay_fingerprint(msg);
+        if !seen_tail_replay.insert(replay_fingerprint) {
+            return None;
+        }
+
+        new_chars += msg.content.len() as i64;
+        messages.push(msg);
+    }
+
+    Some(ExistingConversationNewMessages {
+        messages,
+        new_chars,
+        idx_collision_count: 0,
+        first_collision_idx: None,
+    })
+}
+
+fn trace_existing_conversation_lookup_fallback(
+    conversation_id: i64,
+    conv: &Conversation,
+    tail_state: Option<ExistingConversationTailState>,
+    existing_ended_at: Option<i64>,
+) {
+    if !MESSAGE_LOOKUP_TRACE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let mut prev_idx = None;
+    let mut idx_order_violations = 0usize;
+    let mut duplicate_idx_count = 0usize;
+    let mut seen_idx = HashSet::new();
+    let mut missing_created_at = 0usize;
+    let mut min_idx = None;
+    let mut max_idx = None;
+    let mut min_created_at = None;
+    let mut max_created_at = None;
+    for msg in &conv.messages {
+        if prev_idx.is_some_and(|prev| msg.idx < prev) {
+            idx_order_violations = idx_order_violations.saturating_add(1);
+        }
+        prev_idx = Some(msg.idx);
+        if !seen_idx.insert(msg.idx) {
+            duplicate_idx_count = duplicate_idx_count.saturating_add(1);
+        }
+        min_idx = Some(min_idx.map_or(msg.idx, |current: i64| current.min(msg.idx)));
+        max_idx = Some(max_idx.map_or(msg.idx, |current: i64| current.max(msg.idx)));
+        if let Some(created_at) = msg.created_at {
+            min_created_at =
+                Some(min_created_at.map_or(created_at, |current: i64| current.min(created_at)));
+            max_created_at =
+                Some(max_created_at.map_or(created_at, |current: i64| current.max(created_at)));
+        } else {
+            missing_created_at = missing_created_at.saturating_add(1);
+        }
+    }
+
+    let first_idx_after_tail = tail_state.and_then(|state| {
+        conv.messages
+            .iter()
+            .find(|msg| msg.idx > state.last_message_idx)
+            .map(|msg| msg.idx)
+    });
+    let first_created_after_tail = tail_state.and_then(|state| {
+        conv.messages
+            .iter()
+            .find(|msg| {
+                msg.created_at
+                    .is_some_and(|created_at| created_at > state.last_message_created_at)
+            })
+            .and_then(|msg| msg.created_at)
+    });
+    let first_created_after_ended_at = existing_ended_at.and_then(|ended_at| {
+        conv.messages
+            .iter()
+            .find(|msg| {
+                msg.created_at
+                    .is_some_and(|created_at| created_at > ended_at)
+            })
+            .and_then(|msg| msg.created_at)
+    });
+
+    let payload = serde_json::json!({
+        "event": "existing_conversation_message_lookup_fallback",
+        "conversation_id": conversation_id,
+        "agent_slug": conv.agent_slug,
+        "source_path": conv.source_path,
+        "external_id": conv.external_id,
+        "messages": conv.messages.len(),
+        "min_idx": min_idx,
+        "max_idx": max_idx,
+        "missing_created_at": missing_created_at,
+        "min_created_at": min_created_at,
+        "max_created_at": max_created_at,
+        "idx_order_violations": idx_order_violations,
+        "duplicate_idx_count": duplicate_idx_count,
+        "tail_state": tail_state.map(|state| {
+            serde_json::json!({
+                "last_message_idx": state.last_message_idx,
+                "last_message_created_at": state.last_message_created_at,
+                "ended_at": state.ended_at,
+            })
+        }),
+        "existing_ended_at": existing_ended_at,
+        "first_idx_after_tail": first_idx_after_tail,
+        "first_created_after_tail": first_created_after_tail,
+        "first_created_after_ended_at": first_created_after_ended_at,
+    });
+    if let Ok(line) = serde_json::to_string(&payload) {
+        eprintln!("{line}");
+    }
+}
+
+fn franken_existing_conversation_ended_at(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<Option<i64>> {
+    let ended_at: Option<Option<i64>> = tx
+        .query_row_map(
+            "SELECT ended_at
+             FROM conversations
+             WHERE id = ?1",
+            fparams![conversation_id],
+            |row| row.get_typed(0),
+        )
+        .optional()?;
+    Ok(ended_at.flatten())
 }
 
 fn start_distance_ms(left: Option<i64>, right: Option<i64>) -> i64 {
@@ -6525,6 +7150,158 @@ impl FrankenStorage {
             fparams![ts.to_string()],
         )?;
         Ok(())
+    }
+
+    fn connector_last_scan_ts_meta_key(connector_name: &str) -> String {
+        format!(
+            "last_scan_ts:connector:{}",
+            connector_name.trim().to_ascii_lowercase()
+        )
+    }
+
+    fn connector_agent_slug_candidates(connector_name: &str) -> SmallVec<[String; 3]> {
+        let normalized = connector_name.trim().to_ascii_lowercase();
+        let mut candidates = SmallVec::<[String; 3]>::new();
+        if normalized.is_empty() {
+            return candidates;
+        }
+
+        candidates.push(normalized.clone());
+        match normalized.as_str() {
+            "claude" | "claude-code" | "claude_code" => {
+                candidates.push("claude_code".to_string());
+                candidates.push("claude-code".to_string());
+            }
+            _ => {}
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+
+    /// Get the timestamp of the last successful scan for a specific connector.
+    pub fn get_connector_last_scan_ts(&self, connector_name: &str) -> Result<Option<i64>> {
+        let key = Self::connector_last_scan_ts_meta_key(connector_name);
+        let result: Result<String, _> = self.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![key.as_str()],
+            |row| row.get_typed(0),
+        );
+        match result.optional() {
+            Ok(Some(s)) => Ok(s.parse().ok()),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Set the timestamp of the last successful scan for a specific connector.
+    pub fn set_connector_last_scan_ts(&self, connector_name: &str, ts: i64) -> Result<()> {
+        let key = Self::connector_last_scan_ts_meta_key(connector_name);
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![key.as_str(), ts.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Load per-connector scan watermarks and archived-row presence in one
+    /// explicit transaction.
+    ///
+    /// These reads run during index startup. On large file-backed archives,
+    /// issuing them one-at-a-time in autocommit can force frankensqlite's
+    /// clean prepared-read path to refresh the file-backed MemDatabase before
+    /// any connector work starts. A single explicit transaction keeps the
+    /// startup path on the pager-backed read path while preserving the same
+    /// newly-enabled-connector semantics as the scalar helpers below.
+    pub fn connector_scan_states(
+        &self,
+        connector_names: &[&str],
+    ) -> Result<HashMap<String, (Option<i64>, bool)>> {
+        let requested = connector_names
+            .iter()
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect::<HashSet<_>>();
+        let mut states = requested
+            .iter()
+            .map(|name| (name.clone(), (None, false)))
+            .collect::<HashMap<_, _>>();
+        if states.is_empty() {
+            return Ok(states);
+        }
+
+        let mut tx = self.conn.transaction()?;
+        let watermark_rows: Vec<(String, String)> = tx.query_map_collect(
+            "SELECT key, value FROM meta WHERE key LIKE 'last_scan_ts:connector:%'",
+            fparams![],
+            |row| {
+                let key: String = row.get_typed(0)?;
+                let value: String = row.get_typed(1)?;
+                Ok((key, value))
+            },
+        )?;
+
+        for (key, value) in watermark_rows {
+            let Some(connector_name) = key.strip_prefix("last_scan_ts:connector:") else {
+                continue;
+            };
+            if let Some((last_scan_ts, _)) =
+                states.get_mut(connector_name.trim().to_ascii_lowercase().as_str())
+            {
+                *last_scan_ts = value.parse().ok();
+            }
+        }
+
+        let archived_agent_slugs = tx
+            .query_map_collect(
+                "SELECT DISTINCT a.slug
+                 FROM agents a
+                 JOIN conversations c ON c.agent_id = a.id",
+                fparams![],
+                |row| row.get_typed::<String>(0),
+            )?
+            .into_iter()
+            .map(|slug| slug.trim().to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+
+        for connector_name in requested {
+            if Self::connector_agent_slug_candidates(&connector_name)
+                .iter()
+                .any(|slug| archived_agent_slugs.contains(slug))
+                && let Some((_, has_conversations)) = states.get_mut(connector_name.as_str())
+            {
+                *has_conversations = true;
+            }
+        }
+
+        tx.rollback()?;
+        Ok(states)
+    }
+
+    /// Whether this connector already has archived conversations.
+    pub fn connector_has_conversations(&self, connector_name: &str) -> Result<bool> {
+        let candidate_slugs = Self::connector_agent_slug_candidates(connector_name);
+        if candidate_slugs.is_empty() {
+            return Ok(false);
+        }
+
+        for slug in candidate_slugs {
+            let exists: i64 = self.conn.query_row_map(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM conversations c
+                     JOIN agents a ON a.id = c.agent_id
+                     WHERE a.slug = ?1
+                     LIMIT 1
+                 )",
+                fparams![slug.as_str()],
+                |row| row.get_typed(0),
+            )?;
+            if exists != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Get the timestamp of the last successful index completion.
@@ -6980,32 +7757,6 @@ impl FrankenStorage {
         footprints: &mut [LexicalRebuildConversationFootprintRow],
         missing_tail_positions: &HashMap<i64, usize>,
     ) -> Result<()> {
-        if missing_tail_positions.len() <= LEXICAL_REBUILD_FOOTPRINT_POINT_TAIL_FALLBACK_LIMIT {
-            for (conversation_id, position) in missing_tail_positions {
-                let last_message_idx: Option<i64> = self
-                    .conn
-                    .query_row_map(
-                        "SELECT MAX(idx) FROM messages WHERE conversation_id = ?1",
-                        fparams![*conversation_id],
-                        |row| row.get_typed(0),
-                    )
-                    .with_context(|| {
-                        format!(
-                            "looking up missing lexical rebuild tail estimate for conversation {conversation_id}"
-                        )
-                    })?;
-                if let Some(message_count) =
-                    lexical_rebuild_message_count_from_tail_idx(last_message_idx)
-                {
-                    footprints[*position] = lexical_rebuild_conversation_footprint_from_count(
-                        *conversation_id,
-                        message_count,
-                    );
-                }
-            }
-            return Ok(());
-        }
-
         self.fill_missing_lexical_rebuild_footprint_tails_from_grouped_messages(
             footprints,
             missing_tail_positions,
@@ -8634,7 +9385,7 @@ impl FrankenStorage {
                 } = franken_existing_message_lookup(&tx, existing_id, &conv.messages)?;
                 let ExistingConversationNewMessages {
                     messages: new_messages,
-                    new_chars,
+                    new_chars: _planned_new_chars,
                     idx_collision_count,
                     first_collision_idx,
                 } = collect_new_messages_for_existing_conversation(
@@ -8650,9 +9401,13 @@ impl FrankenStorage {
                 let mut fts_entries = Vec::new();
                 let mut fts_pending_chars = 0usize;
                 let mut _fts_inserted_total = 0usize;
-                let inserted_message_ids =
+                let inserted_messages =
                     franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
-                for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
+                let inserted_chars = inserted_messages
+                    .iter()
+                    .map(|(_, msg)| msg.content.len() as i64)
+                    .sum::<i64>();
+                for (msg_id, msg) in inserted_messages {
                     franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                     if !defer_lexical_updates {
                         fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -8692,7 +9447,7 @@ impl FrankenStorage {
                     )?;
                 }
 
-                let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
+                let conv_last_ts = conversation_tail_ended_at_candidate(conv);
                 franken_update_conversation_tail_state(
                     &tx,
                     existing_id,
@@ -8721,7 +9476,7 @@ impl FrankenStorage {
                         StatsDelta {
                             session_count_delta: 0,
                             message_count_delta: inserted_indices.len() as i64,
-                            total_chars_delta: new_chars,
+                            total_chars_delta: inserted_chars,
                         },
                     )?;
                 }
@@ -9174,7 +9929,7 @@ impl FrankenStorage {
                 }
             }
         } else {
-            let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
+            let conv_last_ts = conversation_tail_ended_at_candidate(conv);
             franken_update_conversation_tail_state(
                 &tx,
                 existing_id,
@@ -9249,7 +10004,7 @@ impl FrankenStorage {
         let used_append_tail_plan = append_plan.is_some();
         let ExistingConversationNewMessages {
             messages: new_messages,
-            new_chars,
+            new_chars: _planned_new_chars,
             idx_collision_count,
             first_collision_idx,
         } = if let Some(append_plan) = append_plan {
@@ -9274,9 +10029,13 @@ impl FrankenStorage {
         let mut _fts_inserted_total = 0usize;
         let (inserted_last_idx, inserted_last_created_at) =
             borrowed_messages_tail_state(&new_messages);
-        let inserted_message_ids =
+        let inserted_messages =
             franken_append_insert_new_messages(tx, conversation_id, &new_messages)?;
-        for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
+        let inserted_chars = inserted_messages
+            .iter()
+            .map(|(_, msg)| msg.content.len() as i64)
+            .sum::<i64>();
+        for (msg_id, msg) in inserted_messages {
             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
             if !defer_lexical_updates {
                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -9341,7 +10100,7 @@ impl FrankenStorage {
                 }
             }
         } else {
-            let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
+            let conv_last_ts = conversation_tail_ended_at_candidate(conv);
             franken_update_conversation_tail_state(
                 tx,
                 conversation_id,
@@ -9371,7 +10130,7 @@ impl FrankenStorage {
                 StatsDelta {
                     session_count_delta: 0,
                     message_count_delta: message_count,
-                    total_chars_delta: new_chars,
+                    total_chars_delta: inserted_chars,
                 },
             )?;
         }
@@ -9394,6 +10153,10 @@ impl FrankenStorage {
     /// should invoke this from maintenance paths rather than ordinary opens.
     pub(crate) fn ensure_search_fallback_fts_consistency(&self) -> Result<FtsConsistencyRepair> {
         self.ensure_fts_consistency_via_frankensqlite()
+    }
+
+    pub(crate) fn validate_fts_messages_integrity(&self) -> Result<()> {
+        validate_fts_messages_integrity_for_connection(&self.conn)
     }
 
     pub(crate) fn fallback_fts_is_known_healthy_for_archive_fingerprint(
@@ -9571,10 +10334,7 @@ impl FrankenStorage {
                 |row| row.get_typed::<i64>(0),
             )?;
             let fts_queryable = fts_schema_rows == 1
-                && self
-                    .conn
-                    .query("SELECT rowid FROM fts_messages LIMIT 1")
-                    .is_ok();
+                && self.conn.query("SELECT COUNT(*) FROM fts_messages").is_ok();
             Ok((fts_schema_rows, fts_queryable))
         })();
 
@@ -10304,34 +11064,32 @@ impl FrankenStorage {
 
             let conv_id = if let Some(existing_id) = existing_conv_id {
                 session_count_delta = 0;
-                let ExistingMessageLookup {
-                    by_idx: mut existing_messages,
-                    replay: mut existing_replay_fingerprints,
-                } = franken_existing_message_lookup_with_pending(
+                let (
+                    ExistingConversationNewMessages {
+                        messages: new_messages,
+                        new_chars: _planned_new_chars,
+                        idx_collision_count,
+                        first_collision_idx,
+                    },
+                    existing_messages,
+                    existing_replay_fingerprints,
+                ) = franken_collect_batched_existing_new_messages(
                     &tx,
                     existing_id,
-                    &conv.messages,
+                    conv,
                     &mut pending_message_fingerprints,
                     &mut pending_message_replay_fingerprints,
-                )?;
-                let ExistingConversationNewMessages {
-                    messages: new_messages,
-                    new_chars,
-                    idx_collision_count,
-                    first_collision_idx,
-                } = collect_new_messages_for_existing_conversation(
-                    existing_id,
-                    conv,
-                    &mut existing_messages,
-                    &mut existing_replay_fingerprints,
                     "skipping replay-equivalent recovered message with shifted idx during batched merge",
-                );
+                )?;
                 let (inserted_last_idx, inserted_last_created_at) =
                     borrowed_messages_tail_state(&new_messages);
-                let inserted_message_ids =
+                let inserted_append_messages =
                     franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
-                total_chars += new_chars;
-                for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
+                total_chars += inserted_append_messages
+                    .iter()
+                    .map(|(_, msg)| msg.content.len() as i64)
+                    .sum::<i64>();
+                for (msg_id, msg) in inserted_append_messages {
                     franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                     if !defer_lexical_updates {
                         fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -10363,7 +11121,7 @@ impl FrankenStorage {
                     );
                 }
 
-                let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
+                let conv_last_ts = conversation_tail_ended_at_candidate(conv);
                 franken_update_conversation_tail_state(
                     &tx,
                     existing_id,
@@ -10443,34 +11201,32 @@ impl FrankenStorage {
                     ConversationInsertStatus::Existing(existing_id) => {
                         session_count_delta = 0;
                         pending_conversation_ids.insert(conversation_key.clone(), existing_id);
-                        let ExistingMessageLookup {
-                            by_idx: mut existing_messages,
-                            replay: mut existing_replay_fingerprints,
-                        } = franken_existing_message_lookup_with_pending(
+                        let (
+                            ExistingConversationNewMessages {
+                                messages: new_messages,
+                                new_chars: _planned_new_chars,
+                                idx_collision_count,
+                                first_collision_idx,
+                            },
+                            existing_messages,
+                            existing_replay_fingerprints,
+                        ) = franken_collect_batched_existing_new_messages(
                             &tx,
                             existing_id,
-                            &conv.messages,
+                            conv,
                             &mut pending_message_fingerprints,
                             &mut pending_message_replay_fingerprints,
-                        )?;
-                        let ExistingConversationNewMessages {
-                            messages: new_messages,
-                            new_chars,
-                            idx_collision_count,
-                            first_collision_idx,
-                        } = collect_new_messages_for_existing_conversation(
-                            existing_id,
-                            conv,
-                            &mut existing_messages,
-                            &mut existing_replay_fingerprints,
                             "skipping replay-equivalent recovered message with shifted idx after duplicate conversation recovery",
-                        );
+                        )?;
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
-                        let inserted_message_ids =
+                        let inserted_append_messages =
                             franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
-                        total_chars += new_chars;
-                        for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
+                        total_chars += inserted_append_messages
+                            .iter()
+                            .map(|(_, msg)| msg.content.len() as i64)
+                            .sum::<i64>();
+                        for (msg_id, msg) in inserted_append_messages {
                             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                             if !defer_lexical_updates {
                                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -10503,7 +11259,7 @@ impl FrankenStorage {
                             );
                         }
 
-                        let conv_last_ts = conv.messages.iter().filter_map(|m| m.created_at).max();
+                        let conv_last_ts = conversation_tail_ended_at_candidate(conv);
                         franken_update_conversation_tail_state(
                             &tx,
                             existing_id,
@@ -11065,9 +11821,12 @@ fn ensure_sources_in_tx(
 }
 
 fn env_flag_enabled(name: &str) -> bool {
-    dotenvy::var(name)
-        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-        .unwrap_or(false)
+    dotenvy::var(name).ok().is_some_and(|v| {
+        matches!(
+            v.trim(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        )
+    })
 }
 
 fn defer_storage_lexical_updates_enabled() -> bool {
@@ -11075,7 +11834,13 @@ fn defer_storage_lexical_updates_enabled() -> bool {
 }
 
 fn defer_analytics_updates_enabled() -> bool {
-    env_flag_enabled("CASS_DEFER_ANALYTICS_UPDATES")
+    if env_flag_enabled("CASS_DEFER_ANALYTICS_UPDATES") {
+        return true;
+    }
+    if env_flag_enabled("CASS_INLINE_ANALYTICS_UPDATES") {
+        return false;
+    }
+    DEFAULT_DEFER_ANALYTICS_UPDATES.load(Ordering::Relaxed)
 }
 
 enum ConversationInsertStatus {
@@ -11643,6 +12408,34 @@ fn franken_insert_new_message(
     franken_last_rowid(tx)
 }
 
+fn franken_insert_new_message_ignore_duplicate(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    msg: &Message,
+) -> Result<Option<i64>> {
+    let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
+    let extra_bin_bytes = extra_bin.as_deref();
+
+    let changed = tx.execute_compat(
+        "INSERT OR IGNORE INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            fparams![
+                conversation_id,
+                msg.idx,
+                role_as_str(&msg.role),
+                msg.author.as_deref(),
+                msg.created_at,
+                msg.content.as_str(),
+                extra_json_str.as_deref(),
+                extra_bin_bytes
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    franken_last_rowid(tx).map(Some)
+}
+
 type MessageInsertPayload<'a> = (Option<Cow<'a, str>>, Option<Vec<u8>>);
 
 fn franken_message_insert_payload(msg: &Message) -> Result<MessageInsertPayload<'_>> {
@@ -11727,17 +12520,20 @@ fn franken_batch_insert_new_messages(
     )
 }
 
-fn franken_append_insert_new_messages(
+fn franken_append_insert_new_messages<'a>(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
-    messages: &[&Message],
-) -> Result<Vec<i64>> {
-    franken_batch_insert_new_messages_with_batch_size(
-        tx,
-        conversation_id,
-        messages,
-        APPEND_MESSAGE_INSERT_BATCH_SIZE,
-    )
+    messages: &[&'a Message],
+) -> Result<Vec<(i64, &'a Message)>> {
+    let mut inserted = Vec::with_capacity(messages.len());
+    for msg in messages {
+        if let Some(message_id) =
+            franken_insert_new_message_ignore_duplicate(tx, conversation_id, msg)?
+        {
+            inserted.push((message_id, *msg));
+        }
+    }
+    Ok(inserted)
 }
 
 fn franken_batch_insert_new_messages_with_batch_size(
@@ -11976,137 +12772,13 @@ struct ExistingMessageLookup {
     replay: HashSet<MessageReplayFingerprint>,
 }
 
-fn franken_existing_message_lookup(
-    tx: &FrankenTransaction<'_>,
-    conversation_id: i64,
-    incoming_messages: &[Message],
+fn existing_message_lookup_from_rows(
+    rows: Vec<FrankenRow>,
+    min_idx: i64,
+    max_idx: i64,
+    created_bounds: Option<(i64, i64)>,
+    replay_full_scan: bool,
 ) -> Result<ExistingMessageLookup> {
-    if incoming_messages.is_empty() {
-        return Ok(ExistingMessageLookup {
-            by_idx: HashMap::new(),
-            replay: HashSet::new(),
-        });
-    }
-
-    let min_idx = incoming_messages
-        .iter()
-        .map(|msg| msg.idx)
-        .min()
-        .unwrap_or(0);
-    let max_idx = incoming_messages
-        .iter()
-        .map(|msg| msg.idx)
-        .max()
-        .unwrap_or(min_idx);
-    let requires_full_scan = incoming_messages.iter().any(|msg| msg.created_at.is_none());
-    let created_bounds = incoming_messages
-        .iter()
-        .filter_map(|msg| msg.created_at)
-        .fold(None, |bounds: Option<(i64, i64)>, created_at| {
-            Some(match bounds {
-                Some((min_created_at, max_created_at)) => (
-                    min_created_at.min(created_at),
-                    max_created_at.max(created_at),
-                ),
-                None => (created_at, created_at),
-            })
-        });
-
-    let mut indexed_by_idx = HashMap::with_capacity(incoming_messages.len());
-    let mut indexed_replay = HashSet::with_capacity(incoming_messages.len());
-    let mut exact_idx_match = true;
-    for msg in incoming_messages {
-        record_message_lookup_exact_idx_probe();
-        let Some((role, author, created_at, content)) = tx
-            .query_row_map(
-                "SELECT role, author, created_at, content
-                 FROM messages INDEXED BY sqlite_autoindex_messages_1
-                 WHERE conversation_id = ?1 AND idx = ?2
-                 LIMIT 1",
-                fparams![conversation_id, msg.idx],
-                |row| {
-                    Ok((
-                        row.get_typed::<String>(0)?,
-                        row.get_typed::<Option<String>>(1)?,
-                        row.get_typed::<Option<i64>>(2)?,
-                        row.get_typed::<String>(3)?,
-                    ))
-                },
-            )
-            .optional()?
-        else {
-            exact_idx_match = false;
-            break;
-        };
-        let role = role_from_str(&role);
-        let content_hash = *blake3::hash(content.as_bytes()).as_bytes();
-        let fingerprint = MessageMergeFingerprint {
-            idx: msg.idx,
-            created_at,
-            role: role.clone(),
-            author: author.clone(),
-            content_hash,
-        };
-        if fingerprint != message_merge_fingerprint(msg) {
-            exact_idx_match = false;
-            break;
-        }
-        indexed_by_idx.insert(msg.idx, fingerprint);
-        indexed_replay.insert(MessageReplayFingerprint {
-            created_at,
-            role,
-            author,
-            content_hash,
-        });
-    }
-
-    if exact_idx_match {
-        return Ok(ExistingMessageLookup {
-            by_idx: indexed_by_idx,
-            replay: indexed_replay,
-        });
-    }
-
-    let (rows, replay_full_scan) = if requires_full_scan {
-        let rows = tx.query_params(
-            "SELECT idx, role, author, created_at, content
-             FROM messages INDEXED BY sqlite_autoindex_messages_1
-             WHERE conversation_id = ?1",
-            fparams![conversation_id],
-        )?;
-        record_message_lookup_full_scan_query(rows.len());
-        (rows, true)
-    } else if let Some((min_created_at, max_created_at)) = created_bounds {
-        let mut rows = tx.query_params(
-            "SELECT idx, role, author, created_at, content
-             FROM messages INDEXED BY sqlite_autoindex_messages_1
-             WHERE conversation_id = ?1
-               AND idx >= ?2
-               AND idx <= ?3",
-            fparams![conversation_id, min_idx, max_idx],
-        )?;
-        rows.extend(tx.query_params(
-            "SELECT idx, role, author, created_at, content
-             FROM messages INDEXED BY sqlite_autoindex_messages_1
-             WHERE conversation_id = ?1
-               AND created_at IS NOT NULL
-               AND created_at >= ?2
-               AND created_at <= ?3",
-            fparams![conversation_id, min_created_at, max_created_at],
-        )?);
-        record_message_lookup_bounded_queries(2, rows.len());
-        (rows, false)
-    } else {
-        let rows = tx.query_params(
-            "SELECT idx, role, author, created_at, content
-             FROM messages INDEXED BY sqlite_autoindex_messages_1
-             WHERE conversation_id = ?1",
-            fparams![conversation_id],
-        )?;
-        record_message_lookup_full_scan_query(rows.len());
-        (rows, true)
-    };
-
     let mut by_idx = HashMap::with_capacity(rows.len());
     let mut replay = HashSet::with_capacity(rows.len());
     for row in rows {
@@ -12146,6 +12818,110 @@ fn franken_existing_message_lookup(
                 content_hash,
             });
         }
+    }
+    Ok(ExistingMessageLookup { by_idx, replay })
+}
+
+fn franken_existing_message_lookup(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    incoming_messages: &[Message],
+) -> Result<ExistingMessageLookup> {
+    if incoming_messages.is_empty() {
+        return Ok(ExistingMessageLookup {
+            by_idx: HashMap::new(),
+            replay: HashSet::new(),
+        });
+    }
+
+    let min_idx = incoming_messages
+        .iter()
+        .map(|msg| msg.idx)
+        .min()
+        .unwrap_or(0);
+    let max_idx = incoming_messages
+        .iter()
+        .map(|msg| msg.idx)
+        .max()
+        .unwrap_or(min_idx);
+    let idx_rows = tx.query_params(
+        "SELECT idx
+         FROM messages INDEXED BY sqlite_autoindex_messages_1
+         WHERE conversation_id = ?1
+           AND idx >= ?2
+           AND idx <= ?3",
+        fparams![conversation_id, min_idx, max_idx],
+    )?;
+    record_message_lookup_bounded_queries(1, idx_rows.len());
+
+    let mut existing_indices = HashSet::with_capacity(idx_rows.len());
+    for row in idx_rows {
+        let idx: i64 = row.get_typed(0)?;
+        existing_indices.insert(idx);
+    }
+
+    let mut by_idx = HashMap::with_capacity(incoming_messages.len().min(existing_indices.len()));
+    let mut missing_messages = Vec::new();
+    for msg in incoming_messages {
+        if existing_indices.contains(&msg.idx) {
+            // Same-idx messages are skipped by merge policy even when content has
+            // diverged. Use the incoming fingerprint as a lightweight presence
+            // marker so normal reprocessing does not need to read stored content.
+            by_idx.insert(msg.idx, message_merge_fingerprint(msg));
+        } else {
+            missing_messages.push(msg);
+        }
+    }
+
+    if missing_messages.is_empty() {
+        return Ok(ExistingMessageLookup {
+            by_idx,
+            replay: HashSet::new(),
+        });
+    }
+
+    let requires_full_scan = missing_messages.iter().any(|msg| msg.created_at.is_none());
+    let created_bounds = missing_messages
+        .iter()
+        .filter_map(|msg| msg.created_at)
+        .fold(None, |bounds: Option<(i64, i64)>, created_at| {
+            Some(match bounds {
+                Some((min_created_at, max_created_at)) => (
+                    min_created_at.min(created_at),
+                    max_created_at.max(created_at),
+                ),
+                None => (created_at, created_at),
+            })
+        });
+
+    let mut replay = HashSet::new();
+    if requires_full_scan {
+        let rows = tx.query_params(
+            "SELECT idx, role, author, created_at, content
+             FROM messages INDEXED BY sqlite_autoindex_messages_1
+             WHERE conversation_id = ?1",
+            fparams![conversation_id],
+        )?;
+        record_message_lookup_full_scan_query(rows.len());
+        let content_lookup =
+            existing_message_lookup_from_rows(rows, min_idx, max_idx, created_bounds, true)?;
+        by_idx.extend(content_lookup.by_idx);
+        replay.extend(content_lookup.replay);
+    } else if let Some((min_created_at, max_created_at)) = created_bounds {
+        let rows = tx.query_params(
+            "SELECT idx, role, author, created_at, content
+             FROM messages INDEXED BY sqlite_autoindex_messages_1
+             WHERE conversation_id = ?1
+               AND created_at IS NOT NULL
+               AND created_at >= ?2
+               AND created_at <= ?3",
+            fparams![conversation_id, min_created_at, max_created_at],
+        )?;
+        record_message_lookup_bounded_queries(1, rows.len());
+        let created_lookup =
+            existing_message_lookup_from_rows(rows, min_idx, max_idx, created_bounds, false)?;
+        by_idx.extend(created_lookup.by_idx);
+        replay.extend(created_lookup.replay);
     }
 
     Ok(ExistingMessageLookup { by_idx, replay })
@@ -12188,6 +12964,130 @@ fn franken_existing_message_lookup_with_pending(
     pending_message_fingerprints.insert(conversation_id, lookup.by_idx.clone());
     pending_message_replay_fingerprints.insert(conversation_id, lookup.replay.clone());
     Ok(lookup)
+}
+
+fn franken_collect_batched_existing_new_messages<'a>(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    conv: &'a Conversation,
+    pending_message_fingerprints: &mut HashMap<i64, HashMap<i64, MessageMergeFingerprint>>,
+    pending_message_replay_fingerprints: &mut HashMap<i64, HashSet<MessageReplayFingerprint>>,
+    replay_skip_log: &'static str,
+) -> Result<(
+    ExistingConversationNewMessages<'a>,
+    HashMap<i64, MessageMergeFingerprint>,
+    HashSet<MessageReplayFingerprint>,
+)> {
+    let tail_metadata = franken_cached_existing_conversation_tail_metadata(tx, conversation_id)?;
+    let tail_state = tail_metadata.complete_tail_state();
+    if let Some(tail_state) = tail_state
+        && let Some(tail_plan) = collect_append_only_tail_messages(
+            conv,
+            tail_state.last_message_idx,
+            tail_state.last_message_created_at,
+        )
+    {
+        let mut by_idx = pending_message_fingerprints
+            .remove(&conversation_id)
+            .unwrap_or_default();
+        let mut replay = pending_message_replay_fingerprints
+            .remove(&conversation_id)
+            .unwrap_or_default();
+        for msg in &tail_plan.messages {
+            let fingerprint = message_merge_fingerprint(msg);
+            by_idx.insert(msg.idx, fingerprint.clone());
+            replay.insert(replay_fingerprint_from_merge(&fingerprint));
+        }
+        return Ok((tail_plan, by_idx, replay));
+    }
+
+    let timestamp_data_incomplete = tail_metadata.last_message_created_at.is_none()
+        || conv.messages.iter().any(|msg| msg.created_at.is_none());
+    if timestamp_data_incomplete
+        && let Some(existing_ended_at) = tail_metadata.ended_at
+        && let Some(noop_plan) =
+            collect_existing_conversation_noop_from_conversation_ended_at(conv, existing_ended_at)
+    {
+        let by_idx = pending_message_fingerprints
+            .remove(&conversation_id)
+            .unwrap_or_default();
+        let replay = pending_message_replay_fingerprints
+            .remove(&conversation_id)
+            .unwrap_or_default();
+        return Ok((noop_plan, by_idx, replay));
+    }
+
+    if timestamp_data_incomplete
+        && let Some(last_message_idx) = tail_metadata.last_message_idx
+        && let Some(tail_plan) =
+            collect_existing_conversation_noop_from_idx_tail(conv, last_message_idx)
+    {
+        let mut by_idx = pending_message_fingerprints
+            .remove(&conversation_id)
+            .unwrap_or_default();
+        let mut replay = pending_message_replay_fingerprints
+            .remove(&conversation_id)
+            .unwrap_or_default();
+        for msg in &tail_plan.messages {
+            let fingerprint = message_merge_fingerprint(msg);
+            by_idx.insert(msg.idx, fingerprint.clone());
+            replay.insert(replay_fingerprint_from_merge(&fingerprint));
+        }
+        return Ok((tail_plan, by_idx, replay));
+    }
+
+    let existing_ended_at = if tail_metadata.ended_at.is_some() {
+        tail_metadata.ended_at
+    } else {
+        franken_existing_conversation_ended_at(tx, conversation_id)?
+    };
+    if let Some(existing_ended_at) = existing_ended_at
+        && let Some(tail_plan) =
+            collect_existing_conversation_tail_from_ended_at(conv, existing_ended_at)
+    {
+        let mut by_idx = pending_message_fingerprints
+            .remove(&conversation_id)
+            .unwrap_or_default();
+        let mut replay = pending_message_replay_fingerprints
+            .remove(&conversation_id)
+            .unwrap_or_default();
+        for msg in &tail_plan.messages {
+            let fingerprint = message_merge_fingerprint(msg);
+            by_idx.insert(msg.idx, fingerprint.clone());
+            replay.insert(replay_fingerprint_from_merge(&fingerprint));
+        }
+        return Ok((tail_plan, by_idx, replay));
+    }
+
+    trace_existing_conversation_lookup_fallback(
+        conversation_id,
+        conv,
+        tail_state,
+        existing_ended_at,
+    );
+
+    let ExistingMessageLookup {
+        by_idx: mut existing_messages,
+        replay: mut existing_replay_fingerprints,
+    } = franken_existing_message_lookup_with_pending(
+        tx,
+        conversation_id,
+        &conv.messages,
+        pending_message_fingerprints,
+        pending_message_replay_fingerprints,
+    )?;
+    let new_messages = collect_new_messages_for_existing_conversation(
+        conversation_id,
+        conv,
+        &mut existing_messages,
+        &mut existing_replay_fingerprints,
+        replay_skip_log,
+    );
+    Ok((
+        new_messages,
+        existing_messages,
+        existing_replay_fingerprints,
+    ))
 }
 
 /// Batch insert FTS5 entries within a frankensqlite transaction.
@@ -14812,6 +15712,292 @@ mod tests {
         EnvGuard { key, previous }
     }
 
+    fn unset_env_var(key: &'static str) -> EnvGuard {
+        let previous = dotenvy::var(key).ok();
+        // SAFETY: test helper toggles a process-local env var for isolation.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        EnvGuard { key, previous }
+    }
+
+    #[test]
+    #[serial]
+    fn storage_env_flags_are_truthy_only() {
+        for value in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] {
+            let _guard = set_env_var("CASS_DEFER_LEXICAL_UPDATES", value);
+            assert!(
+                defer_storage_lexical_updates_enabled(),
+                "{value:?} should enable the lexical defer toggle"
+            );
+        }
+
+        for value in ["0", "false", "FALSE", "no", "NO", "", "maybe"] {
+            let _guard = set_env_var("CASS_DEFER_LEXICAL_UPDATES", value);
+            assert!(
+                !defer_storage_lexical_updates_enabled(),
+                "{value:?} should not enable the lexical defer toggle"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn analytics_defer_default_can_be_overridden_explicitly() {
+        {
+            let _defer_env = unset_env_var("CASS_DEFER_ANALYTICS_UPDATES");
+            let _inline_env = unset_env_var("CASS_INLINE_ANALYTICS_UPDATES");
+            let _default_guard = default_defer_analytics_updates_guard(false);
+            assert!(
+                !defer_analytics_updates_enabled(),
+                "analytics should stay inline when neither env nor index-run default requests deferral"
+            );
+
+            let _defer = set_env_var("CASS_DEFER_ANALYTICS_UPDATES", "no");
+            assert!(
+                !defer_analytics_updates_enabled(),
+                "false-like explicit defer value must not force analytics deferral"
+            );
+        }
+
+        let _defer_env = unset_env_var("CASS_DEFER_ANALYTICS_UPDATES");
+        let _inline_env = unset_env_var("CASS_INLINE_ANALYTICS_UPDATES");
+        let _default_guard = default_defer_analytics_updates_guard(true);
+        assert!(
+            defer_analytics_updates_enabled(),
+            "index-run default should defer analytics when no explicit env override is set"
+        );
+
+        {
+            let _inline = set_env_var("CASS_INLINE_ANALYTICS_UPDATES", "1");
+            assert!(
+                !defer_analytics_updates_enabled(),
+                "truthy inline override should restore inline analytics writes"
+            );
+        }
+
+        {
+            let _inline = set_env_var("CASS_INLINE_ANALYTICS_UPDATES", "no");
+            assert!(
+                defer_analytics_updates_enabled(),
+                "false-like inline override must not accidentally force inline analytics"
+            );
+        }
+
+        {
+            let _defer = set_env_var("CASS_DEFER_ANALYTICS_UPDATES", "no");
+            assert!(
+                defer_analytics_updates_enabled(),
+                "false-like explicit defer value should leave the index-run default in effect"
+            );
+        }
+    }
+
+    fn frontier_test_conversation(idx_created_at: &[(i64, Option<i64>)]) -> Conversation {
+        Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("frontier-test".into()),
+            title: Some("Frontier test".into()),
+            source_path: PathBuf::from("/tmp/frontier-test.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: idx_created_at
+                .iter()
+                .map(|(idx, created_at)| Message {
+                    id: None,
+                    idx: *idx,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: *created_at,
+                    content: format!("message-{idx}"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                })
+                .collect(),
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        }
+    }
+
+    #[test]
+    fn conversation_tail_ended_at_candidate_uses_latest_known_end() {
+        let mut later_conversation_end =
+            frontier_test_conversation(&[(0, Some(100)), (1, Some(110))]);
+        later_conversation_end.ended_at = Some(250);
+        assert_eq!(
+            conversation_tail_ended_at_candidate(&later_conversation_end),
+            Some(250),
+            "conversation-level ended_at can be later than the final message timestamp"
+        );
+
+        let mut later_message_end = frontier_test_conversation(&[(0, Some(100)), (1, Some(300))]);
+        later_message_end.ended_at = Some(250);
+        assert_eq!(
+            conversation_tail_ended_at_candidate(&later_message_end),
+            Some(300),
+            "message timestamps can be later than a stale conversation-level ended_at"
+        );
+
+        let mut no_message_timestamps = frontier_test_conversation(&[(0, None), (1, None)]);
+        no_message_timestamps.ended_at = Some(200);
+        assert_eq!(
+            conversation_tail_ended_at_candidate(&no_message_timestamps),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn ended_at_shortcut_splits_safe_append_tail() {
+        let covered = frontier_test_conversation(&[(0, Some(100)), (1, Some(110)), (2, Some(120))]);
+        assert!(
+            collect_existing_conversation_tail_from_ended_at(&covered, 120).is_none(),
+            "ended_at coverage alone does not prove all lower idx rows exist"
+        );
+
+        let append = frontier_test_conversation(&[(0, Some(100)), (1, Some(110)), (2, Some(130))]);
+        assert!(
+            collect_existing_conversation_tail_from_ended_at(&append, 120).is_none(),
+            "mixed covered-prefix plus append-tail input needs lookup to fill possible gaps"
+        );
+
+        let pure_append = frontier_test_conversation(&[(2, Some(130)), (3, Some(140))]);
+        let plan = collect_existing_conversation_tail_from_ended_at(&pure_append, 120)
+            .expect("all-new timestamp tail can append without message lookup");
+        assert_eq!(plan.messages.len(), 2);
+        assert_eq!(
+            plan.messages.iter().map(|msg| msg.idx).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            plan.new_chars,
+            ("message-2".len() + "message-3".len()) as i64
+        );
+
+        let unsorted = frontier_test_conversation(&[(1, Some(110)), (0, Some(100))]);
+        assert!(
+            collect_existing_conversation_tail_from_ended_at(&unsorted, 120).is_none(),
+            "out-of-order input must not use the append/no-op shortcut"
+        );
+
+        let missing_timestamp = frontier_test_conversation(&[(0, Some(100)), (1, None)]);
+        assert!(
+            collect_existing_conversation_tail_from_ended_at(&missing_timestamp, 120).is_none(),
+            "missing timestamps require replay-aware lookup"
+        );
+
+        let covered_after_append =
+            frontier_test_conversation(&[(0, Some(100)), (1, Some(130)), (2, Some(110))]);
+        assert!(
+            collect_existing_conversation_tail_from_ended_at(&covered_after_append, 120).is_none(),
+            "covered messages after the append split mean the input is not a safe tail"
+        );
+
+        let duplicate_idx = frontier_test_conversation(&[(0, Some(100)), (0, Some(130))]);
+        assert!(
+            collect_existing_conversation_tail_from_ended_at(&duplicate_idx, 120).is_none(),
+            "duplicate idx values can collide with archived rows and require robust lookup"
+        );
+    }
+
+    #[test]
+    fn idx_tail_shortcut_handles_no_timestamp_legacy_sources() {
+        let covered = frontier_test_conversation(&[(0, None), (1, None)]);
+        assert!(
+            collect_existing_conversation_noop_from_idx_tail(&covered, 1).is_none(),
+            "idx tail coverage alone does not prove all lower rows exist"
+        );
+
+        let append = frontier_test_conversation(&[(0, None), (1, None), (2, None)]);
+        assert!(
+            collect_existing_conversation_noop_from_idx_tail(&append, 1).is_none(),
+            "partial timestamp tail metadata is not trusted for appends"
+        );
+
+        let unsorted = frontier_test_conversation(&[(1, None), (0, None), (2, None)]);
+        assert!(
+            collect_existing_conversation_noop_from_idx_tail(&unsorted, 1).is_none(),
+            "out-of-order legacy messages need the robust lookup"
+        );
+
+        let duplicate_tail = frontier_test_conversation(&[(0, None), (2, None), (2, None)]);
+        assert!(
+            collect_existing_conversation_noop_from_idx_tail(&duplicate_tail, 1).is_none(),
+            "duplicate tail idx values can collide and require robust lookup"
+        );
+
+        let duplicate_covered = frontier_test_conversation(&[(0, None), (1, None), (1, None)]);
+        assert!(
+            collect_existing_conversation_noop_from_idx_tail(&duplicate_covered, 1).is_none(),
+            "duplicate covered idx values still need collision-aware lookup"
+        );
+    }
+
+    #[test]
+    fn conversation_ended_at_shortcut_handles_stale_partial_idx_tail() {
+        let mut covered =
+            frontier_test_conversation(&[(0, Some(100)), (1, Some(110)), (2, Some(120))]);
+        covered.ended_at = Some(120);
+        assert!(
+            collect_existing_conversation_noop_from_conversation_ended_at(&covered, 120).is_none(),
+            "conversation ended_at coverage alone does not prove all message rows exist"
+        );
+
+        let mut missing_timestamp = frontier_test_conversation(&[(0, None), (1, None), (2, None)]);
+        missing_timestamp.ended_at = Some(120);
+        assert!(
+            collect_existing_conversation_noop_from_conversation_ended_at(&missing_timestamp, 120)
+                .is_none(),
+            "no-timestamp messages need replay-aware lookup even when conversation ended_at is unchanged"
+        );
+
+        let mut newer =
+            frontier_test_conversation(&[(0, Some(100)), (1, Some(110)), (2, Some(121))]);
+        newer.ended_at = Some(121);
+        assert!(
+            collect_existing_conversation_noop_from_conversation_ended_at(&newer, 120).is_none(),
+            "newer conversations need robust append handling"
+        );
+
+        let mut unsorted = frontier_test_conversation(&[(1, Some(110)), (0, Some(100))]);
+        unsorted.ended_at = Some(120);
+        assert!(
+            collect_existing_conversation_noop_from_conversation_ended_at(&unsorted, 120).is_none(),
+            "out-of-order unchanged conversations still use the robust path"
+        );
+
+        let mut duplicate =
+            frontier_test_conversation(&[(0, Some(100)), (1, Some(110)), (1, Some(111))]);
+        duplicate.ended_at = Some(120);
+        assert!(
+            collect_existing_conversation_noop_from_conversation_ended_at(&duplicate, 120)
+                .is_none(),
+            "duplicate covered idx values still need collision-aware lookup"
+        );
+    }
+
+    #[test]
+    fn populated_fts_shadow_without_rowid_reload_errors_are_classified() {
+        assert!(
+            error_message_indicates_populated_fts_shadow_without_rowid_reload(
+                "not implemented: reloading populated WITHOUT ROWID table `fts_messages_config` into MemDatabase is not yet supported",
+            )
+        );
+        assert!(
+            error_message_indicates_populated_fts_shadow_without_rowid_reload(
+                "not implemented: loading populated WITHOUT ROWID table fts_messages_data is not yet supported",
+            )
+        );
+        assert!(
+            !error_message_indicates_populated_fts_shadow_without_rowid_reload(
+                "not implemented: reloading populated WITHOUT ROWID table `user_table` into MemDatabase is not yet supported",
+            )
+        );
+    }
+
     #[test]
     fn doctor_mutation_open_guard_only_targets_canonical_archive_db() {
         let dir = TempDir::new().unwrap();
@@ -14842,6 +16028,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn doctor_storage_open_refuses_active_doctor_mutation_lock_from_other_process() {
         use std::io::Write as _;
 
@@ -14900,6 +16087,9 @@ mod tests {
         lock_file.set_len(0).unwrap();
         write!(lock_file, "schema_version=1\npid={}\n", std::process::id()).unwrap();
         lock_file.sync_all().unwrap();
+
+        #[cfg(windows)]
+        let _bypass = enter_doctor_mutation_db_open_bypass();
 
         let conn =
             open_franken_raw_readonly_connection_with_timeout(&db_path, Duration::from_millis(25))
@@ -15884,16 +17074,13 @@ mod tests {
 
         let result = SqliteStorage::open_or_rebuild(&db_path);
 
-        match result {
-            Err(MigrationError::Database(_)) | Err(MigrationError::Io(_)) => {}
-            Err(MigrationError::RebuildRequired { reason, .. }) => {
-                panic!("should not rebuild non-database path: {reason}")
-            }
-            Err(MigrationError::Other(msg)) => {
-                panic!("should preserve underlying open error, got Other: {msg}")
-            }
-            Ok(_) => panic!("directory path must not open as a database"),
-        }
+        assert!(
+            matches!(
+                result,
+                Err(MigrationError::Database(_)) | Err(MigrationError::Io(_))
+            ),
+            "non-database path should report the underlying open error without rebuild"
+        );
 
         assert!(
             db_path.is_dir(),
@@ -16143,20 +17330,21 @@ mod tests {
             .unwrap();
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '10')")
                 .unwrap();
-            // Apply V1-V10 so schema is correct
-            let mut tx = conn.transaction().unwrap();
-            tx.execute_batch(MIGRATION_V1).unwrap();
-            tx.execute_batch(MIGRATION_V2).unwrap();
-            tx.execute_batch(MIGRATION_V4).unwrap();
-            tx.execute_batch(MIGRATION_V5).unwrap();
-            tx.execute_batch(MIGRATION_V6).unwrap();
-            tx.execute_batch(MIGRATION_V7).unwrap();
-            tx.execute_batch(MIGRATION_V8).unwrap();
-            tx.execute_batch(MIGRATION_V9).unwrap();
-            tx.execute_batch(MIGRATION_V10).unwrap();
-            tx.execute("UPDATE meta SET value = '10' WHERE key = 'schema_version'")
+            // Apply V1-V10 so schema is correct. Keep each historical DDL batch
+            // in autocommit mode; the fixture is testing cass migration
+            // transition behavior, not frankensqlite's handling of a giant
+            // synthetic legacy-DDL transaction.
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.execute_batch(MIGRATION_V4).unwrap();
+            conn.execute_batch(MIGRATION_V5).unwrap();
+            conn.execute_batch(MIGRATION_V6).unwrap();
+            conn.execute_batch(MIGRATION_V7).unwrap();
+            conn.execute_batch(MIGRATION_V8).unwrap();
+            conn.execute_batch(MIGRATION_V9).unwrap();
+            conn.execute_batch(MIGRATION_V10).unwrap();
+            conn.execute("UPDATE meta SET value = '10' WHERE key = 'schema_version'")
                 .unwrap();
-            tx.commit().unwrap();
         }
         materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
 
@@ -18138,14 +19326,14 @@ mod tests {
         )
         .unwrap();
 
-        match resolved {
-            ConversationInsertStatus::Existing(existing_id) => {
-                assert_eq!(existing_id, inserted_id);
-            }
-            ConversationInsertStatus::Inserted(new_id) => {
-                panic!("expected existing conversation id, got freshly inserted {new_id}");
-            }
-        }
+        assert!(
+            matches!(
+                resolved,
+                ConversationInsertStatus::Existing(existing_id)
+                    if existing_id.cmp(&inserted_id).is_eq()
+            ),
+            "expected existing conversation id {inserted_id}"
+        );
 
         let conversation_count: i64 = tx
             .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
@@ -20658,75 +21846,78 @@ mod tests {
             .unwrap();
         drop(source);
 
-        // Legacy "duplicate FTS" fixture reconstruction.
-        //
-        // Post-V14 migration cass drops the V13-era fts_messages virtual table
-        // and recreates it lazily, so a freshly-opened canonical DB has zero
-        // fts_messages entries in sqlite_master. To reproduce the historical
-        // failure mode this test exercises — a legacy v13 bundle with a
-        // duplicated CREATE VIRTUAL TABLE row — we have to inject *both*
-        // entries: the original V13-era contentless row and the buggy duplicate
-        // row. Before V14 existed the original was already present after
-        // migration and only the duplicate needed manual injection.
-        let legacy_v13_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
-        let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-        let legacy = rusqlite_test_fixture_conn(&source_db);
-        legacy
-            .execute_batch(
-                "UPDATE meta SET value = '13' WHERE key = 'schema_version';
-                 DELETE FROM _schema_migrations WHERE version = 14;
-                 PRAGMA writable_schema = ON;",
-            )
-            .unwrap();
-        legacy
-            .execute(
-                "DELETE FROM meta WHERE key = ?1",
-                [FTS_FRANKEN_REBUILD_META_KEY],
-            )
-            .unwrap();
-        // Inject the V13 original first.
-        legacy
-            .execute(
-                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                [legacy_v13_fts_sql],
-            )
-            .unwrap();
-        // Then the duplicate that's the real subject of the fixup logic.
-        legacy
-            .execute(
-                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                [duplicate_legacy_fts_sql],
-            )
-            .unwrap();
-        legacy
-            .execute_batch("PRAGMA writable_schema = OFF;")
-            .unwrap();
-        drop(legacy);
-
-        // Verify fixture with rusqlite+writable_schema to see raw
-        // sqlite_master rows (frankensqlite deduplicates schema entries).
+        #[cfg(not(windows))]
         {
-            let verify = rusqlite_test_fixture_conn(&source_db);
-            verify
-                .execute_batch("PRAGMA writable_schema = ON;")
-                .unwrap();
-            let fts_entries: i64 = verify
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                    [],
-                    |row| row.get(0),
+            // Legacy "duplicate FTS" fixture reconstruction.
+            //
+            // Post-V14 migration cass drops the V13-era fts_messages virtual table
+            // and recreates it lazily, so a freshly-opened canonical DB has zero
+            // fts_messages entries in sqlite_master. To reproduce the historical
+            // failure mode this test exercises — a legacy v13 bundle with a
+            // duplicated CREATE VIRTUAL TABLE row — we have to inject *both*
+            // entries: the original V13-era contentless row and the buggy duplicate
+            // row. Before V14 existed the original was already present after
+            // migration and only the duplicate needed manual injection.
+            let legacy_v13_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
+            let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+            let legacy = rusqlite_test_fixture_conn(&source_db);
+            legacy
+                .execute_batch(
+                    "UPDATE meta SET value = '13' WHERE key = 'schema_version';
+                     DELETE FROM _schema_migrations WHERE version = 14;
+                     PRAGMA writable_schema = ON;",
                 )
                 .unwrap();
-            assert_eq!(
-                fts_entries, 2,
-                "test fixture should reproduce the duplicate legacy fts_messages rows"
-            );
-            let msg_count: i64 = verify
-                .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            legacy
+                .execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    [FTS_FRANKEN_REBUILD_META_KEY],
+                )
                 .unwrap();
-            assert_eq!(msg_count, 1);
+            // Inject the V13 original first.
+            legacy
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [legacy_v13_fts_sql],
+                )
+                .unwrap();
+            // Then the duplicate that's the real subject of the fixup logic.
+            legacy
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [duplicate_legacy_fts_sql],
+                )
+                .unwrap();
+            legacy
+                .execute_batch("PRAGMA writable_schema = OFF;")
+                .unwrap();
+            drop(legacy);
+
+            // Verify fixture with rusqlite+writable_schema to see raw
+            // sqlite_master rows (frankensqlite deduplicates schema entries).
+            {
+                let verify = rusqlite_test_fixture_conn(&source_db);
+                verify
+                    .execute_batch("PRAGMA writable_schema = ON;")
+                    .unwrap();
+                let fts_entries: i64 = verify
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    fts_entries, 2,
+                    "test fixture should reproduce the duplicate legacy fts_messages rows"
+                );
+                let msg_count: i64 = verify
+                    .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(msg_count, 1);
+            }
         }
 
         let fresh = SqliteStorage::open(&canonical_db).unwrap();
@@ -20836,11 +22027,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(post_franken_schema_rows, 1);
+        let fts_probe = franken_seeded
+            .raw()
+            .query("SELECT COUNT(*) FROM fts_messages");
         assert!(
-            franken_seeded
-                .raw()
-                .query("SELECT rowid FROM fts_messages LIMIT 1")
-                .is_ok()
+            fts_probe.is_ok(),
+            "expected post-seed FTS to be queryable, got {fts_probe:?}"
         );
     }
 
@@ -22078,7 +23270,6 @@ mod tests {
             .unwrap();
         drop(replay_storage);
 
-        let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
         let replay_legacy = rusqlite_test_fixture_conn(&replay_db);
         replay_legacy
             .execute_batch(
@@ -22093,13 +23284,17 @@ mod tests {
                 [FTS_FRANKEN_REBUILD_META_KEY],
             )
             .unwrap();
-        replay_legacy
-            .execute(
-                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                [duplicate_legacy_fts_sql],
-            )
-            .unwrap();
+        #[cfg(not(windows))]
+        {
+            let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+            replay_legacy
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [duplicate_legacy_fts_sql],
+                )
+                .unwrap();
+        }
         replay_legacy
             .execute_batch("PRAGMA writable_schema = OFF;")
             .unwrap();
@@ -22138,10 +23333,11 @@ mod tests {
         assert!(!bundles[0].probe.fts_queryable);
         assert_eq!(bundles[1].probe.schema_version, Some(13));
         // The replay bundle had V14 run (dropping fts_messages → 0 rows), then
-        // the test rolls meta.schema_version back to 13, deletes the V14
-        // marker, and manually injects a duplicate sqlite_master row. Net
-        // result: one synthetic (malformed) fts_messages entry.
-        assert_eq!(bundles[1].probe.fts_schema_rows, Some(1));
+        // the test rolls meta.schema_version back to 13 and deletes the V14
+        // marker. On Unix CI we also inject a duplicate sqlite_master row to
+        // exercise the malformed-bundle probe path that depends on sqlite3.
+        let expected_fts_schema_rows = if cfg!(windows) { Some(0) } else { Some(1) };
+        assert_eq!(bundles[1].probe.fts_schema_rows, expected_fts_schema_rows);
     }
 
     #[test]
@@ -23006,6 +24202,184 @@ mod tests {
 
         let actual_ts = storage.get_last_scan_ts().unwrap();
         assert_eq!(actual_ts, Some(expected_ts));
+    }
+
+    #[test]
+    fn connector_last_scan_ts_round_trip_normalizes_name() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path)?;
+
+        assert_eq!(storage.get_connector_last_scan_ts(" Codex ")?, None);
+
+        let expected_ts = 1_700_000_123_456_i64;
+        storage.set_connector_last_scan_ts(" Codex ", expected_ts)?;
+
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex")?,
+            Some(expected_ts)
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("CODEX")?,
+            Some(expected_ts)
+        );
+        assert_eq!(storage.get_connector_last_scan_ts("claude-code")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn connector_has_conversations_tracks_archived_agent_slug() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+
+        assert!(!storage.connector_has_conversations("codex")?);
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("connector-watermark-fixture".into()),
+            title: Some("Connector watermark fixture".into()),
+            source_path: PathBuf::from("/tmp/connector-watermark-fixture.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "per-connector watermark regression".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conversation)?;
+
+        assert!(storage.connector_has_conversations(" Codex ")?);
+        assert!(!storage.connector_has_conversations("claude-code")?);
+        assert!(!storage.connector_has_conversations(" ")?);
+        Ok(())
+    }
+
+    #[test]
+    fn connector_scan_states_loads_watermarks_and_agent_presence() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.set_connector_last_scan_ts(" Codex ", 1_700_000_123_456)?;
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("connector-scan-states-fixture".into()),
+            title: Some("Connector scan states fixture".into()),
+            source_path: PathBuf::from("/tmp/connector-scan-states-fixture.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "bulk connector scan state regression".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conversation)?;
+
+        let states = storage.connector_scan_states(&["codex", "claude", "gemini"])?;
+        assert_eq!(
+            states.get("codex").copied(),
+            Some((Some(1_700_000_123_456), false)),
+            "bulk state should preserve connector-specific watermarks"
+        );
+        assert_eq!(
+            states.get("claude").copied(),
+            Some((None, true)),
+            "bulk state should honor known connector slug aliases"
+        );
+        assert_eq!(
+            states.get("gemini").copied(),
+            Some((None, false)),
+            "bulk state should identify newly enabled connectors with no archived rows"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn connector_has_conversations_checks_known_agent_slug_aliases() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("connector-watermark-claude-fixture".into()),
+            title: Some("Claude connector watermark fixture".into()),
+            source_path: PathBuf::from("/tmp/connector-watermark-claude-fixture.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "claude connector alias regression".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conversation)?;
+
+        assert!(
+            storage.connector_has_conversations("claude")?,
+            "the claude connector factory name must recognize legacy claude_code rows"
+        );
+        assert!(storage.connector_has_conversations("claude-code")?);
+        assert!(storage.connector_has_conversations("claude_code")?);
+        assert!(!storage.connector_has_conversations("codex")?);
+        Ok(())
     }
 
     // =========================================================================
@@ -24255,15 +25629,17 @@ mod tests {
         let conn = FrankenConnection::open(db_path.to_string_lossy().to_string()).unwrap();
         transition_from_meta_version(&conn).unwrap();
 
-        // _schema_migrations should exist with entries for versions 1..=10.
+        // The frankensqlite path uses a combined V13 base migration, so a
+        // legacy V10 marker is bridged to V13 and later idempotent repair fills
+        // in any missing V11-V13 objects.
         let rows = conn
             .query("SELECT version FROM _schema_migrations ORDER BY version;")
             .unwrap();
         let versions: Vec<i64> = rows.iter().filter_map(|r| r.get_typed(0).ok()).collect();
         assert_eq!(
             versions,
-            (1..=10).collect::<Vec<i64>>(),
-            "transition should backfill versions 1..=10"
+            (1..=13).collect::<Vec<i64>>(),
+            "transition should bridge legacy V10 databases through the combined V13 base marker"
         );
     }
 
@@ -24584,6 +25960,49 @@ mod tests {
     }
 
     #[test]
+    fn fts_messages_integrity_reports_missing_shadow_tables() {
+        let dir = TempDir::new().unwrap();
+        let healthy_db_path = dir.path().join("healthy_fts.db");
+
+        {
+            let storage = FrankenStorage::open(&healthy_db_path).unwrap();
+            storage.ensure_search_fallback_fts_consistency().unwrap();
+            storage
+                .validate_fts_messages_integrity()
+                .expect("freshly materialized fts_messages should pass integrity validation");
+        }
+
+        let corrupt_db_path = dir.path().join("test_corrupt_fts_missing_shadows.db");
+        {
+            let conn = rusqlite_test_fixture_conn(&corrupt_db_path);
+            conn.execute("CREATE TABLE schema_anchor(id INTEGER PRIMARY KEY)", [])
+                .unwrap();
+            let orphaned_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+            conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
+            conn.execute(
+                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                [orphaned_fts_sql],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
+        }
+
+        let open_err = FrankenConnection::open(corrupt_db_path.to_string_lossy().to_string())
+            .expect_err("orphaned fts_messages schema should fail during connection open");
+        let integrity = fts_messages_integrity_error_from_message(open_err.to_string())
+            .expect("open-time FTS corruption should map to the typed FTS integrity kind");
+        assert_eq!(integrity.missing_shadow_tables(), &["fts_messages_content"]);
+        let rendered = integrity.to_string();
+        assert!(
+            rendered.contains("fts_messages")
+                && rendered.contains("required FTS5 shadow tables")
+                && rendered.contains("fts_messages_content"),
+            "error should be an operator-facing FTS corruption diagnosis: {rendered}"
+        );
+    }
+
+    #[test]
     fn franken_storage_open_fresh_db_keeps_single_franken_fts_schema_row() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fresh-franken-storage-open.db");
@@ -24615,7 +26034,7 @@ mod tests {
         assert!(
             storage
                 .raw()
-                .query("SELECT rowid FROM fts_messages LIMIT 1")
+                .query("SELECT COUNT(*) FROM fts_messages")
                 .is_ok(),
             "fts_messages must be queryable through frankensqlite after open"
         );

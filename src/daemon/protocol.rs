@@ -6,26 +6,31 @@
 //! Protocol uses MessagePack for efficient binary serialization over Unix Domain Sockets.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Protocol version for compatibility checks.
 /// Both cass and xf must use the same version to share a daemon.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Default socket path (shared between cass and xf).
-pub fn default_socket_path() -> std::path::PathBuf {
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-    // Sanitize: keep only alphanumeric, dash, underscore to prevent path traversal
+pub fn default_socket_path() -> PathBuf {
+    let user = dotenvy::var("USER").unwrap_or_else(|_| "unknown".into());
+    let safe_user = sanitize_socket_user(&user);
+    PathBuf::from(format!("/tmp/semantic-daemon-{safe_user}.sock"))
+}
+
+fn sanitize_socket_user(user: &str) -> String {
     let safe_user: String = user
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
         .take(64)
         .collect();
-    let safe_user = if safe_user.is_empty() {
+
+    if safe_user.is_empty() {
         "unknown".to_string()
     } else {
         safe_user
-    };
-    std::path::PathBuf::from(format!("/tmp/semantic-daemon-{}.sock", safe_user))
+    }
 }
 
 /// Request types for the daemon protocol.
@@ -243,9 +248,9 @@ impl<T> FramedMessage<T> {
 
 /// Encode a message to MessagePack bytes with length prefix.
 pub fn encode_message<T: Serialize>(msg: &FramedMessage<T>) -> Result<Vec<u8>, EncodeError> {
-    let payload = rmp_serde::to_vec(msg).map_err(|e| EncodeError(e.to_string()))?;
+    let payload = rmp_serde::to_vec(msg)?;
     let len = u32::try_from(payload.len())
-        .map_err(|_| EncodeError("payload exceeds maximum size of 4GB".to_string()))?;
+        .map_err(|_| EncodeError::Message("payload exceeds maximum size of 4GB".to_string()))?;
     let mut buf = Vec::with_capacity(4 + payload.len());
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(&payload);
@@ -256,50 +261,107 @@ pub fn encode_message<T: Serialize>(msg: &FramedMessage<T>) -> Result<Vec<u8>, E
 pub fn decode_message<T: for<'de> Deserialize<'de>>(
     data: &[u8],
 ) -> Result<FramedMessage<T>, DecodeError> {
-    rmp_serde::from_slice(data).map_err(|e| DecodeError(e.to_string()))
+    rmp_serde::from_slice(data).map_err(DecodeError::from)
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("encode error: {0}")]
-pub struct EncodeError(pub String);
+#[derive(Debug, thiserror::Error)]
+pub enum EncodeError {
+    #[error("encode error: {0}")]
+    Message(String),
+    #[error("encode error: {0}")]
+    MessagePack(#[from] rmp_serde::encode::Error),
+}
 
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("decode error: {0}")]
-pub struct DecodeError(pub String);
+#[derive(Debug, thiserror::Error)]
+pub enum DecodeError {
+    #[error("decode error: {0}")]
+    Message(String),
+    #[error("decode error: {0}")]
+    MessagePack(#[from] rmp_serde::decode::Error),
+}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        DecodeError, EmbedResponse, EncodeError, ErrorCode, ErrorResponse, FramedMessage,
+        HealthStatus, PROTOCOL_VERSION, Request, RerankResponse, Response, decode_message,
+        default_socket_path, encode_message, sanitize_socket_user,
+    };
+    use serde::de::DeserializeOwned;
+    use std::error::Error;
+    use std::fmt::Debug;
 
-    #[test]
-    fn test_encode_decode_health_request() {
-        let msg = FramedMessage::new("req-1", Request::Health);
-        let encoded = encode_message(&msg).unwrap();
+    type TestResult = Result<(), Box<dyn Error>>;
 
-        // Skip 4-byte length prefix
-        let decoded: FramedMessage<Request> = decode_message(&encoded[4..]).unwrap();
-        assert_eq!(decoded.version, PROTOCOL_VERSION);
-        assert_eq!(decoded.request_id, "req-1");
-        assert!(matches!(decoded.payload, Request::Health));
+    fn test_error(message: impl Into<String>) -> Box<dyn Error> {
+        std::io::Error::other(message.into()).into()
     }
 
-    #[test]
-    fn test_protocol_error_display_strings_are_preserved() {
-        let encode = EncodeError("bad payload".to_string());
-        let decode = DecodeError("bad frame".to_string());
-        let cases: &[(&str, &dyn std::error::Error, &str)] = &[
-            ("encode", &encode, "encode error: bad payload"),
-            ("decode", &decode, "decode error: bad frame"),
-        ];
-
-        for (label, error, expected_display) in cases {
-            assert_eq!(error.to_string(), *expected_display, "{label}");
-            assert!(error.source().is_none(), "{label}");
+    fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
+        if condition {
+            Ok(())
+        } else {
+            Err(test_error(message))
         }
     }
 
+    fn ensure_eq<T>(actual: T, expected: T, message: impl Into<String>) -> TestResult
+    where
+        T: Debug + PartialEq,
+    {
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(test_error(format!(
+                "{}: expected {expected:?}, got {actual:?}",
+                message.into()
+            )))
+        }
+    }
+
+    fn decode_framed<T>(encoded: &[u8]) -> Result<FramedMessage<T>, Box<dyn Error>>
+    where
+        T: DeserializeOwned,
+    {
+        let payload = encoded
+            .get(4..)
+            .ok_or_else(|| test_error("encoded frame should include a 4-byte length prefix"))?;
+        decode_message(payload).map_err(|err| test_error(err.to_string()))
+    }
+
     #[test]
-    fn test_encode_decode_embed_request() {
+    fn test_encode_decode_health_request() -> TestResult {
+        let msg = FramedMessage::new("req-1", Request::Health);
+        let encoded = encode_message(&msg)?;
+
+        let decoded: FramedMessage<Request> = decode_framed(&encoded)?;
+        ensure_eq(decoded.version, PROTOCOL_VERSION, "protocol version")?;
+        ensure_eq(decoded.request_id, "req-1".to_string(), "request id")?;
+        ensure(matches!(decoded.payload, Request::Health), "health payload")
+    }
+
+    #[test]
+    fn test_protocol_error_display_strings_are_preserved() -> TestResult {
+        let encode = EncodeError::Message("bad payload".to_string());
+        ensure_eq(
+            encode.to_string(),
+            "encode error: bad payload".to_string(),
+            "encode",
+        )?;
+        ensure(encode.source().is_none(), "encode")?;
+
+        let decode = DecodeError::Message("bad frame".to_string());
+        ensure_eq(
+            decode.to_string(),
+            "decode error: bad frame".to_string(),
+            "decode",
+        )?;
+        ensure(decode.source().is_none(), "decode")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_decode_embed_request() -> TestResult {
         let msg = FramedMessage::new(
             "req-2",
             Request::Embed {
@@ -308,19 +370,23 @@ mod tests {
                 dims: None,
             },
         );
-        let encoded = encode_message(&msg).unwrap();
-        let decoded: FramedMessage<Request> = decode_message(&encoded[4..]).unwrap();
+        let encoded = encode_message(&msg)?;
+        let decoded: FramedMessage<Request> = decode_framed(&encoded)?;
 
-        assert!(matches!(&decoded.payload, Request::Embed { .. }));
-        if let Request::Embed { texts, model, dims } = decoded.payload {
-            assert_eq!(texts, vec!["hello", "world"]);
-            assert_eq!(model, "all-MiniLM-L6-v2");
-            assert!(dims.is_none());
-        }
+        let Request::Embed { texts, model, dims } = decoded.payload else {
+            return Err(test_error("expected embed request payload"));
+        };
+        ensure_eq(
+            texts,
+            vec!["hello".to_string(), "world".to_string()],
+            "embed texts",
+        )?;
+        ensure_eq(model, "all-MiniLM-L6-v2".to_string(), "embed model")?;
+        ensure(dims.is_none(), "embed dims should be absent")
     }
 
     #[test]
-    fn test_encode_decode_rerank_request() {
+    fn test_encode_decode_rerank_request() -> TestResult {
         let msg = FramedMessage::new(
             "req-3",
             Request::Rerank {
@@ -329,24 +395,28 @@ mod tests {
                 model: "ms-marco-MiniLM-L-6-v2".to_string(),
             },
         );
-        let encoded = encode_message(&msg).unwrap();
-        let decoded: FramedMessage<Request> = decode_message(&encoded[4..]).unwrap();
+        let encoded = encode_message(&msg)?;
+        let decoded: FramedMessage<Request> = decode_framed(&encoded)?;
 
-        assert!(matches!(&decoded.payload, Request::Rerank { .. }));
-        if let Request::Rerank {
+        let Request::Rerank {
             query,
             documents,
             model,
         } = decoded.payload
-        {
-            assert_eq!(query, "test query");
-            assert_eq!(documents, vec!["doc1", "doc2"]);
-            assert_eq!(model, "ms-marco-MiniLM-L-6-v2");
-        }
+        else {
+            return Err(test_error("expected rerank request payload"));
+        };
+        ensure_eq(query, "test query".to_string(), "rerank query")?;
+        ensure_eq(
+            documents,
+            vec!["doc1".to_string(), "doc2".to_string()],
+            "rerank documents",
+        )?;
+        ensure_eq(model, "ms-marco-MiniLM-L-6-v2".to_string(), "rerank model")
     }
 
     #[test]
-    fn test_encode_decode_health_response() {
+    fn test_encode_decode_health_response() -> TestResult {
         let msg = FramedMessage::new(
             "resp-1",
             Response::Health(HealthStatus {
@@ -356,18 +426,18 @@ mod tests {
                 memory_bytes: 100_000_000,
             }),
         );
-        let encoded = encode_message(&msg).unwrap();
-        let decoded: FramedMessage<Response> = decode_message(&encoded[4..]).unwrap();
+        let encoded = encode_message(&msg)?;
+        let decoded: FramedMessage<Response> = decode_framed(&encoded)?;
 
-        assert!(matches!(&decoded.payload, Response::Health(_)));
-        if let Response::Health(status) = decoded.payload {
-            assert_eq!(status.uptime_secs, 120);
-            assert!(status.ready);
-        }
+        let Response::Health(status) = decoded.payload else {
+            return Err(test_error("expected health response payload"));
+        };
+        ensure_eq(status.uptime_secs, 120, "health uptime")?;
+        ensure(status.ready, "health response should be ready")
     }
 
     #[test]
-    fn test_encode_decode_error_response() {
+    fn test_encode_decode_error_response() -> TestResult {
         let msg = FramedMessage::new(
             "resp-err",
             Response::Error(ErrorResponse {
@@ -377,28 +447,49 @@ mod tests {
                 retry_after_ms: Some(1000),
             }),
         );
-        let encoded = encode_message(&msg).unwrap();
-        let decoded: FramedMessage<Response> = decode_message(&encoded[4..]).unwrap();
+        let encoded = encode_message(&msg)?;
+        let decoded: FramedMessage<Response> = decode_framed(&encoded)?;
 
-        assert!(matches!(&decoded.payload, Response::Error(_)));
-        if let Response::Error(err) = decoded.payload {
-            assert_eq!(err.code, ErrorCode::Overloaded);
-            assert!(err.retryable);
-            assert_eq!(err.retry_after_ms, Some(1000));
-        }
+        let Response::Error(err) = decoded.payload else {
+            return Err(test_error("expected error response payload"));
+        };
+        ensure_eq(err.code, ErrorCode::Overloaded, "error code")?;
+        ensure(err.retryable, "error should be retryable")?;
+        ensure_eq(err.retry_after_ms, Some(1000), "retry delay")
     }
 
     #[test]
-    fn test_default_socket_path() {
+    fn test_default_socket_path() -> TestResult {
         let path = default_socket_path();
         let path_str = path.to_string_lossy();
-        assert!(path_str.starts_with("/tmp/semantic-daemon-"));
-        assert!(path_str.ends_with(".sock"));
+        ensure(
+            path_str.starts_with("/tmp/semantic-daemon-"),
+            "socket path prefix",
+        )?;
+        ensure(path_str.ends_with(".sock"), "socket path suffix")
     }
 
     #[test]
-    fn test_wire_compatibility_embed_response() {
-        // Test that embed response can be serialized and deserialized
+    fn test_socket_user_sanitization() -> TestResult {
+        ensure_eq(
+            sanitize_socket_user("../bad user!"),
+            "baduser".to_string(),
+            "path traversal and punctuation should be removed",
+        )?;
+        ensure_eq(
+            sanitize_socket_user(""),
+            "unknown".to_string(),
+            "empty user fallback",
+        )?;
+        ensure_eq(
+            sanitize_socket_user("a".repeat(80).as_str()).len(),
+            64,
+            "socket user length cap",
+        )
+    }
+
+    #[test]
+    fn test_wire_compatibility_embed_response() -> TestResult {
         let msg = FramedMessage::new(
             "resp-embed",
             Response::Embed(EmbedResponse {
@@ -407,19 +498,23 @@ mod tests {
                 elapsed_ms: 15,
             }),
         );
-        let encoded = encode_message(&msg).unwrap();
-        let decoded: FramedMessage<Response> = decode_message(&encoded[4..]).unwrap();
+        let encoded = encode_message(&msg)?;
+        let decoded: FramedMessage<Response> = decode_framed(&encoded)?;
 
-        assert!(matches!(&decoded.payload, Response::Embed(_)));
-        if let Response::Embed(resp) = decoded.payload {
-            assert_eq!(resp.embeddings.len(), 2);
-            assert_eq!(resp.embeddings[0], vec![0.1, 0.2, 0.3]);
-            assert_eq!(resp.model, "minilm-384");
-        }
+        let Response::Embed(resp) = decoded.payload else {
+            return Err(test_error("expected embed response payload"));
+        };
+        ensure_eq(resp.embeddings.len(), 2, "embedding count")?;
+        let first = resp
+            .embeddings
+            .first()
+            .ok_or_else(|| test_error("first embedding should exist"))?;
+        ensure_eq(first.clone(), vec![0.1, 0.2, 0.3], "first embedding")?;
+        ensure_eq(resp.model, "minilm-384".to_string(), "embedding model")
     }
 
     #[test]
-    fn test_wire_compatibility_rerank_response() {
+    fn test_wire_compatibility_rerank_response() -> TestResult {
         let msg = FramedMessage::new(
             "resp-rerank",
             Response::Rerank(RerankResponse {
@@ -428,12 +523,12 @@ mod tests {
                 elapsed_ms: 8,
             }),
         );
-        let encoded = encode_message(&msg).unwrap();
-        let decoded: FramedMessage<Response> = decode_message(&encoded[4..]).unwrap();
+        let encoded = encode_message(&msg)?;
+        let decoded: FramedMessage<Response> = decode_framed(&encoded)?;
 
-        assert!(matches!(&decoded.payload, Response::Rerank(_)));
-        if let Response::Rerank(resp) = decoded.payload {
-            assert_eq!(resp.scores, vec![0.95, 0.72, 0.31]);
-        }
+        let Response::Rerank(resp) = decoded.payload else {
+            return Err(test_error("expected rerank response payload"));
+        };
+        ensure_eq(resp.scores, vec![0.95, 0.72, 0.31], "rerank scores")
     }
 }

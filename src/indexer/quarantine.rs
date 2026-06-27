@@ -73,6 +73,35 @@ pub struct QuarantineRecord {
     pub last_attempt_at: DateTime<Utc>,
     pub attempt_count: u64,
     pub last_reason: String,
+    /// Cass version that produced the quarantine entry.
+    ///
+    /// `None` means the record pre-dates v0.6.x (written by v0.5.x or
+    /// earlier), which lacked this field entirely.  The field is
+    /// `#[serde(default)]` so missing-on-disk JSON is silently treated as
+    /// `None` rather than a deserialisation error — critical for the legacy
+    /// carry-over path described in cass#258.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cass_version_at_quarantine: Option<String>,
+}
+
+impl QuarantineRecord {
+    /// Returns `true` when this record should be re-attempted on the next
+    /// broad scan under `current_version`.
+    ///
+    /// The rule is:
+    /// - `None`  → **legacy entry** (pre-v0.6.x, no version recorded) — always
+    ///   retry-eligible, because the bug that originally caused the OOM may
+    ///   already be fixed in the current binary.  Treating `None` as "same
+    ///   version" would silently orphan every v0.5.x quarantine entry forever,
+    ///   which is the cass#258 carry-over bug this method closes.
+    /// - `Some(v)` where `v == current_version` → already retried under this
+    ///   binary; **not** eligible (avoid infinite retry storms).
+    /// - `Some(v)` where `v != current_version` → **stale entry**; a version
+    ///   bump may have fixed the underlying bug, so retry once.
+    #[must_use]
+    pub fn is_version_stale_for_retry(&self, current_version: &str) -> bool {
+        !matches!(&self.cass_version_at_quarantine, Some(v) if v == current_version)
+    }
 }
 
 /// In-memory view of the quarantine state file. Use [`QuarantineState::load`]
@@ -161,6 +190,7 @@ impl QuarantineState {
             record.last_attempt_at = now;
             record.attempt_count = record.attempt_count.saturating_add(1);
             record.last_reason = reason;
+            record.cass_version_at_quarantine = Some(current_cass_version().to_string());
         } else {
             self.entries.insert(
                 storage_key,
@@ -169,6 +199,7 @@ impl QuarantineState {
                     last_attempt_at: now,
                     attempt_count: 1,
                     last_reason: reason,
+                    cass_version_at_quarantine: Some(current_cass_version().to_string()),
                 },
             );
         }
@@ -203,10 +234,29 @@ impl QuarantineState {
     }
 }
 
+fn current_cass_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
     use tempfile::tempdir;
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    fn test_error(message: impl Into<String>) -> Box<dyn Error> {
+        std::io::Error::other(message.into()).into()
+    }
+
+    fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
+        if condition {
+            Ok(())
+        } else {
+            Err(test_error(message))
+        }
+    }
 
     fn ts(seconds: i64) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(seconds, 0).expect("valid timestamp")
@@ -315,5 +365,121 @@ mod tests {
         let ids: Vec<String> = state.iter().map(|(k, _)| k.conversation_id).collect();
         // BTreeMap-backed: ordering is by storage_key, which sorts c1 before c2.
         assert_eq!(ids, vec!["c1".to_string(), "c2".to_string()]);
+    }
+
+    /// Regression for cass#258 carry-over: v0.5.x entries written without
+    /// `cass_version_at_quarantine` must deserialise cleanly (field becomes
+    /// `None` via `#[serde(default)]`) and be considered retry-eligible so
+    /// they are not silently orphaned forever.
+    ///
+    /// The fixture JSON deliberately omits the field, simulating a real
+    /// `quarantine_state.json` produced by cass ≤ 0.5.1.
+    #[test]
+    fn legacy_entry_missing_cass_version_deserialises_and_is_retry_eligible() -> TestResult {
+        let dir = tempdir()?;
+
+        // Write a minimal quarantine_state.json that looks like v0.5.x output:
+        // the `cass_version_at_quarantine` key is entirely absent.
+        let legacy_json = serde_json::json!({
+            "storage_version": 1,
+            "entries": {
+                "conv-legacy::v1": {
+                    "first_attempt_at": "2025-11-01T00:00:00Z",
+                    "last_attempt_at": "2025-11-01T00:00:00Z",
+                    "attempt_count": 1,
+                    "last_reason": "index-ingest-out-of-memory: out of memory"
+                    // cass_version_at_quarantine intentionally absent
+                }
+            }
+        });
+        std::fs::write(
+            dir.path().join(QuarantineState::FILENAME),
+            serde_json::to_string_pretty(&legacy_json)?,
+        )?;
+
+        let state = QuarantineState::load(dir.path());
+        ensure(
+            state.len() == 1,
+            format!(
+                "legacy entry must load without error; loaded {} entries",
+                state.len()
+            ),
+        )?;
+
+        let record = state
+            .entries
+            .values()
+            .next()
+            .ok_or_else(|| test_error("entry present after loading legacy fixture"))?;
+
+        ensure(
+            record.cass_version_at_quarantine.is_none(),
+            "missing field must deserialise as None, not cause an error",
+        )?;
+
+        // The critical correctness property: a legacy entry (None version) is
+        // ALWAYS retry-eligible regardless of what the current binary version is.
+        ensure(
+            record.is_version_stale_for_retry("0.6.6"),
+            "legacy entry with cass_version_at_quarantine=None must be retry-eligible \
+             (cass#258 carry-over: v0.5.x entries were silently orphaned)",
+        )?;
+        ensure(
+            record.is_version_stale_for_retry("0.5.1"),
+            "legacy entry must be retry-eligible even when version string matches a v0.5.x tag",
+        )?;
+        ensure(
+            record.is_version_stale_for_retry("99.0.0"),
+            "legacy entry must be retry-eligible for any future version string",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_entry_retry_eligibility_gates_correctly() -> TestResult {
+        let current = current_cass_version();
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new("conv-v", 1),
+            "index-ingest-out-of-memory",
+            ts(1),
+        );
+        // record_attempt always stamps cass_version_at_quarantine with the
+        // current binary version; simulate "same version" by leaving as-is.
+        let record = state
+            .entries
+            .values()
+            .next()
+            .ok_or_else(|| test_error("same-version quarantine record exists"))?;
+        // A record stamped with the current version must NOT trigger a retry
+        // (already tried under this binary).
+        ensure(
+            !record.is_version_stale_for_retry(current),
+            "record stamped with current version must not be retry-eligible",
+        )?;
+
+        // Simulate a record written by an older version.
+        let mut state2 = QuarantineState::default();
+        state2.record_attempt(
+            &QuarantineKey::new("conv-old", 1),
+            "index-ingest-out-of-memory",
+            ts(2),
+        );
+        state2
+            .entries
+            .values_mut()
+            .next()
+            .ok_or_else(|| test_error("old-version quarantine record exists"))?
+            .cass_version_at_quarantine = Some("0.5.1".to_string());
+        let old_record = state2
+            .entries
+            .values()
+            .next()
+            .ok_or_else(|| test_error("old-version quarantine record still exists"))?;
+        ensure(
+            old_record.is_version_stale_for_retry(current),
+            "record stamped with older version must be retry-eligible after a version bump",
+        )?;
+        Ok(())
     }
 }

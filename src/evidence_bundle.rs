@@ -8,9 +8,10 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const EVIDENCE_BUNDLE_MANIFEST_VERSION: u32 = 1;
 pub const EVIDENCE_BUNDLE_MANIFEST_FILE: &str = "evidence-bundle-manifest.json";
@@ -160,11 +161,9 @@ impl EvidenceBundleManifest {
         fs::create_dir_all(bundle_root)
             .with_context(|| format!("creating evidence bundle root {}", bundle_root.display()))?;
         let path = Self::path(bundle_root);
-        let tmp_path = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(self)
             .with_context(|| "serializing evidence bundle manifest")?;
-        fs::write(&tmp_path, bytes)
-            .with_context(|| format!("writing evidence bundle manifest {}", tmp_path.display()))?;
+        let tmp_path = write_evidence_bundle_manifest_temp(&path, &bytes)?;
         fs::rename(&tmp_path, &path).with_context(|| {
             format!(
                 "publishing evidence bundle manifest {} -> {}",
@@ -178,6 +177,54 @@ impl EvidenceBundleManifest {
     pub fn verify(&self, bundle_root: &Path) -> EvidenceBundleVerificationReport {
         verify_manifest(self, bundle_root)
     }
+}
+
+fn unique_evidence_bundle_manifest_temp_path(path: &Path) -> PathBuf {
+    static NEXT_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(EVIDENCE_BUNDLE_MANIFEST_FILE);
+
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.{}.tmp",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
+}
+
+fn write_evidence_bundle_manifest_temp(final_path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    for _ in 0..100 {
+        let temp_path = unique_evidence_bundle_manifest_temp_path(final_path);
+        match write_evidence_bundle_manifest_temp_at(&temp_path, bytes) {
+            Ok(()) => return Ok(temp_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("writing evidence bundle manifest {}", temp_path.display())
+                });
+            }
+        }
+    }
+
+    bail!(
+        "failed to allocate unique evidence bundle manifest temp path for {}",
+        final_path.display()
+    )
+}
+
+fn write_evidence_bundle_manifest_temp_at(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,6 +695,32 @@ mod tests {
 
     fn chunk(root: &Path, path: &str, role: EvidenceBundleChunkRole) -> EvidenceBundleChunk {
         EvidenceBundleChunk::from_file(root, path, role, true, None).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_temp_write_refuses_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let protected = tmp.path().join("protected.json");
+        let temp_path = tmp.path().join(".manifest.json.tmp");
+
+        fs::write(&protected, b"protected").unwrap();
+        symlink(&protected, &temp_path).unwrap();
+
+        let err = write_evidence_bundle_manifest_temp_at(&temp_path, br#"{"bundle":true}"#)
+            .expect_err("existing temp symlink must be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&protected).unwrap(), b"protected");
+        assert!(
+            fs::symlink_metadata(&temp_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "failed temp write should leave the existing symlink untouched"
+        );
     }
 
     #[test]

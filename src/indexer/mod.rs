@@ -6,6 +6,7 @@ pub mod redact_secrets;
 pub mod refresh_ledger;
 pub(crate) mod responsiveness;
 pub mod semantic;
+pub mod semantic_progress;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
 use self::refresh_ledger::{
@@ -25,13 +26,14 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
+use frankensearch::index::VectorIndex as FsVectorIndex;
 use frankensqlite::compat::{
     ConnectionExt, ParamValue, RowExt, Transaction as FrankenTransaction,
     TransactionExt as FrankenTransactionExt,
@@ -62,7 +64,9 @@ use crate::search::canonicalize::is_hard_message_noise;
 use crate::search::tantivy::{
     SearchableIndexSummary, TantivyIndex, index_dir, schema_hash_matches,
 };
-use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
+use crate::search::vector_index::{
+    ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, vector_index_path,
+};
 
 use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
@@ -94,6 +98,8 @@ const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 const PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT: usize = 256;
 const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
+const NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 4;
+const NON_WATCH_INGEST_CHUNK_SIZE_MAX: usize = 128;
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SESSION_SOURCE_SKIP_OBSERVED: AtomicBool = AtomicBool::new(false);
@@ -766,6 +772,21 @@ pub struct LexicalRepairStats {
     pub observed_tantivy_docs: Option<usize>,
 }
 
+/// Structured proof for `cass index --semantic --watch-once <path>`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SemanticWatchOnceStats {
+    pub published: bool,
+    pub selected_docs: usize,
+    pub embedded_docs: usize,
+    pub tier: String,
+    pub vector_index_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_before_db_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_after_db_fingerprint: Option<String>,
+    pub reason: String,
+}
+
 /// Aggregate indexing statistics for JSON output (T7.4).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IndexingStats {
@@ -792,6 +813,9 @@ pub struct IndexingStats {
     /// Automatic lexical repair/catch-up performed before normal indexing work.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lexical_repair: Option<LexicalRepairStats>,
+    /// Targeted semantic watch-once publish proof.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_watch_once: Option<SemanticWatchOnceStats>,
     /// Conversations skipped by ingest quarantine during this run.
     pub quarantined_conversations: usize,
     /// True when SQLite ingest succeeded but inline lexical updates were
@@ -822,15 +846,19 @@ impl CanonicalMutationCounts {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct NonWatchIngestOutcome {
     canonical_mutations: CanonicalMutationCounts,
     quarantined_conversations: usize,
     lexical_update_deferred: bool,
+    scanned_connectors: BTreeSet<String>,
+    scan_had_errors: bool,
 }
 
 impl NonWatchIngestOutcome {
     fn accumulate(self, other: Self) -> Self {
+        let mut scanned_connectors = self.scanned_connectors;
+        scanned_connectors.extend(other.scanned_connectors);
         Self {
             canonical_mutations: self
                 .canonical_mutations
@@ -839,6 +867,8 @@ impl NonWatchIngestOutcome {
                 .quarantined_conversations
                 .saturating_add(other.quarantined_conversations),
             lexical_update_deferred: self.lexical_update_deferred || other.lexical_update_deferred,
+            scanned_connectors,
+            scan_had_errors: self.scan_had_errors || other.scan_had_errors,
         }
     }
 }
@@ -1365,6 +1395,21 @@ pub(crate) enum LexicalPopulationStrategy {
     DeferredAuthoritativeDbRebuild,
 }
 
+const DEFAULT_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON: &str = "large_populated_incremental_index_defers_authoritative_lexical_repair_until_explicit_full_or_force_rebuild";
+const BOOTSTRAP_LARGE_INCREMENTAL_MISSING_WATERMARK_REASON: &str =
+    "large_populated_incremental_index_bootstraps_missing_scan_watermark";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeferredIncrementalCanonicalLexicalRepair {
+    canonical_conversations: usize,
+    db_size_bytes: u64,
+    max_automatic_repair_db_size_bytes: u64,
+    observed_tantivy_docs: Option<usize>,
+    reason: &'static str,
+}
+
 impl LexicalPopulationStrategy {
     fn as_str(self) -> &'static str {
         match self {
@@ -1417,6 +1462,142 @@ fn lexical_population_strategy_requires_inline_tantivy(
     )
 }
 
+fn non_watch_ingest_chunk_size() -> usize {
+    match dotenvy::var("CASS_NON_WATCH_INGEST_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        Some(0) => NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE,
+        Some(value) if value > NON_WATCH_INGEST_CHUNK_SIZE_MAX => {
+            tracing::warn!(
+                env_var = "CASS_NON_WATCH_INGEST_CHUNK_SIZE",
+                requested = value,
+                cap = NON_WATCH_INGEST_CHUNK_SIZE_MAX,
+                "non-watch ingest chunk size exceeds safe cap; clamping"
+            );
+            NON_WATCH_INGEST_CHUNK_SIZE_MAX
+        }
+        Some(value) => value,
+        None => NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE,
+    }
+}
+
+fn incremental_authoritative_lexical_repair_max_db_bytes() -> u64 {
+    dotenvy::var("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES)
+}
+
+fn force_incremental_authoritative_lexical_repair_enabled() -> bool {
+    dotenvy_truthy("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR")
+}
+
+fn incremental_missing_watermark_full_scan_max_db_bytes() -> u64 {
+    dotenvy::var("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES)
+}
+
+fn force_incremental_missing_watermark_full_scan_enabled() -> bool {
+    dotenvy_truthy("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN")
+}
+
+fn is_plain_populated_incremental_index_run(
+    opts: &IndexOptions,
+    canonical_conversations: usize,
+) -> bool {
+    canonical_conversations > 0
+        && !opts.full
+        && !opts.force_rebuild
+        && !opts.watch
+        && !opts.semantic
+        && !opts.build_hnsw
+        && opts
+            .watch_once_paths
+            .as_ref()
+            .is_none_or(|paths| paths.is_empty())
+}
+
+fn db_size_bytes_for_incremental_lexical_repair_policy(db_path: &Path) -> u64 {
+    std::fs::metadata(db_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootstrappedIncrementalScanWatermark {
+    canonical_conversations: usize,
+    db_size_bytes: u64,
+    max_automatic_full_scan_db_size_bytes: u64,
+    reason: &'static str,
+}
+
+fn should_bootstrap_missing_incremental_scan_watermark(
+    opts: &IndexOptions,
+    canonical_storage_rebuilt: bool,
+    canonical_conversations: usize,
+    needs_rebuild: bool,
+    retry_stale_index_ingest_quarantine: bool,
+    last_scan_ts: Option<i64>,
+) -> Option<BootstrappedIncrementalScanWatermark> {
+    if canonical_storage_rebuilt
+        || needs_rebuild
+        || retry_stale_index_ingest_quarantine
+        || last_scan_ts.is_some()
+        || !is_plain_populated_incremental_index_run(opts, canonical_conversations)
+        || force_incremental_missing_watermark_full_scan_enabled()
+    {
+        return None;
+    }
+
+    let db_size_bytes = db_size_bytes_for_incremental_lexical_repair_policy(&opts.db_path);
+    let max_automatic_full_scan_db_size_bytes =
+        incremental_missing_watermark_full_scan_max_db_bytes();
+    if db_size_bytes <= max_automatic_full_scan_db_size_bytes {
+        return None;
+    }
+
+    Some(BootstrappedIncrementalScanWatermark {
+        canonical_conversations,
+        db_size_bytes,
+        max_automatic_full_scan_db_size_bytes,
+        reason: BOOTSTRAP_LARGE_INCREMENTAL_MISSING_WATERMARK_REASON,
+    })
+}
+
+fn should_defer_incremental_authoritative_lexical_repair(
+    opts: &IndexOptions,
+    canonical_storage_rebuilt: bool,
+    canonical_conversations: usize,
+    authoritative_rebuild_required: bool,
+    observed_tantivy_docs: Option<usize>,
+) -> Option<DeferredIncrementalCanonicalLexicalRepair> {
+    if canonical_storage_rebuilt
+        || !authoritative_rebuild_required
+        || !is_plain_populated_incremental_index_run(opts, canonical_conversations)
+        || force_incremental_authoritative_lexical_repair_enabled()
+    {
+        return None;
+    }
+
+    let db_size_bytes = db_size_bytes_for_incremental_lexical_repair_policy(&opts.db_path);
+    let max_automatic_repair_db_size_bytes =
+        incremental_authoritative_lexical_repair_max_db_bytes();
+    if db_size_bytes <= max_automatic_repair_db_size_bytes {
+        return None;
+    }
+
+    Some(DeferredIncrementalCanonicalLexicalRepair {
+        canonical_conversations,
+        db_size_bytes,
+        max_automatic_repair_db_size_bytes,
+        observed_tantivy_docs,
+        reason: DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON,
+    })
+}
+
 fn record_lexical_population_strategy(
     progress: Option<&Arc<IndexingProgress>>,
     strategy: LexicalPopulationStrategy,
@@ -1447,6 +1628,18 @@ fn record_lexical_population_strategy_if_unset(
     }
 }
 
+fn record_semantic_watch_once_stats(
+    progress: Option<&Arc<IndexingProgress>>,
+    stats: SemanticWatchOnceStats,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut indexing_stats) = progress.stats.lock() {
+        indexing_stats.semantic_watch_once = Some(stats);
+    }
+}
+
 fn record_incremental_canonical_lexical_repair(
     progress: Option<&Arc<IndexingProgress>>,
     plan: &IncrementalCanonicalLexicalRepairPlan,
@@ -1463,6 +1656,25 @@ fn record_incremental_canonical_lexical_repair(
             canonical_messages: plan.canonical_messages,
             observed_tantivy_docs: plan.observed_tantivy_docs,
         });
+    }
+}
+
+fn record_deferred_incremental_canonical_lexical_repair(
+    progress: Option<&Arc<IndexingProgress>>,
+    deferred: &DeferredIncrementalCanonicalLexicalRepair,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut stats) = progress.stats.lock() {
+        stats.lexical_repair = Some(LexicalRepairStats {
+            kind: "deferred_authoritative_canonical_db_rebuild".to_string(),
+            reason: deferred.reason.to_string(),
+            canonical_conversations: deferred.canonical_conversations,
+            canonical_messages: 0,
+            observed_tantivy_docs: deferred.observed_tantivy_docs,
+        });
+        stats.lexical_update_deferred = true;
     }
 }
 
@@ -2067,7 +2279,10 @@ fn should_try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> bool {
         && opts.db_path.exists()
 }
 
-fn try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> Result<bool> {
+fn try_readonly_canonical_force_rebuild(
+    opts: &IndexOptions,
+    progress_bump: &Arc<AtomicI64>,
+) -> Result<bool> {
     if !should_try_readonly_canonical_force_rebuild(opts) {
         return Ok(false);
     }
@@ -2113,12 +2328,14 @@ fn try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> Result<bool> {
         "selected_lexical_population_strategy"
     );
 
+    ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
     let rebuild_start = Instant::now();
-    let rebuild = rebuild_tantivy_from_db_deferred_startup(
+    let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
         &opts.db_path,
         &opts.data_dir,
         total_conversations,
         opts.progress.clone(),
+        Arc::clone(progress_bump),
     )?;
     if let Some(p) = &opts.progress
         && let Ok(mut stats) = p.stats.lock()
@@ -2309,6 +2526,30 @@ struct IndexRunLockGuard {
     _path: PathBuf,
     started_at_ms: i64,
     updated_at_ms: i64,
+    /// Forward-progress timestamp owned exclusively by the indexing
+    /// thread (cass#258). The background `IndexRunLockHeartbeat` thread
+    /// refreshes `updated_at_ms` to prove the process is alive, but it
+    /// MUST NOT touch `last_progress_at_ms` — only real mode/phase
+    /// transitions (i.e. `write_metadata` / `set_mode`) and explicit
+    /// per-batch atomic progress bumps advance it. Readers
+    /// (`asset_state::maintenance_stall_age_ms`) compare this to
+    /// wall-clock to flip `status: "stalled"` when the indexer wedges
+    /// while the heartbeat keeps refreshing.
+    last_progress_at_ms: i64,
+    /// F4 (cass tech debt): atomic mirror of `last_progress_at_ms` that
+    /// the indexer's per-batch / per-conversation / per-shard-flush hot
+    /// loops can update with a single `Relaxed` store — no I/O, no
+    /// POSIX-advisory-lock contention with the heartbeat thread. The
+    /// heartbeat thread (which is already paying the I/O cost every ~1 s
+    /// to refresh `updated_at_ms`) consults this atomic and folds the
+    /// most-recent bump into the same on-disk rewrite. This preserves
+    /// the cass#258 ownership invariant — the indexer thread is the
+    /// sole writer of forward progress — while making the indexer
+    /// itself trivially cheap to instrument. A `0` value means
+    /// "indexer has not yet posted a per-batch progress bump"; the
+    /// heartbeat falls back to leaving `last_progress_at_ms` unchanged
+    /// in that case.
+    last_progress_at_ms_atomic: Arc<AtomicI64>,
     db_path: PathBuf,
     job_id: String,
     job_kind: SearchMaintenanceJobKind,
@@ -2320,17 +2561,55 @@ impl Drop for IndexRunLockGuard {
         let _ = self.file.set_len(0);
         let _ = self.file.rewind();
         let _ = self.file.flush();
+        let _ = crate::search::asset_state::clear_index_run_lock_metadata_sidecar(&self._path);
         let _ = self.file.unlock();
     }
 }
 
 impl IndexRunLockGuard {
     fn write_metadata(&mut self, mode: SearchMaintenanceMode) -> Result<()> {
+        self.write_metadata_with_phase(mode, mode.as_lock_value())
+    }
+
+    /// Write the full lock metadata with a caller-supplied sub-phase
+    /// string. The on-disk `mode=` field tracks the user-facing
+    /// `SearchMaintenanceMode` (`watch_startup`, `watch`, `index`,
+    /// `watch_once`, …), while the `phase=` field carries a finer-
+    /// grained breadcrumb (e.g. `watch_startup:fingerprint`,
+    /// `watch_startup:fts_validate`) so cass#265 operators can see
+    /// which preflight step wedged on a multi-GB DB.
+    ///
+    /// Phase breadcrumbs MUST satisfy two invariants so the existing
+    /// `IndexStallWatchdog` keeps resetting its `last_progress_advance`
+    /// timer at each sub-phase transition:
+    ///   1. Each call produces a strictly different `phase=` string
+    ///      than the previous call (the watchdog gates on
+    ///      `phase_code != self.last_phase` to reset).
+    ///   2. The free function `bump_index_run_lock_progress_atomic`
+    ///      is also called at each transition so the heartbeat
+    ///      thread folds a fresh `last_progress_at_ms=` into the
+    ///      on-disk payload even if the watchdog tick is rare.
+    fn write_metadata_with_phase(
+        &mut self,
+        mode: SearchMaintenanceMode,
+        phase: &str,
+    ) -> Result<()> {
         let _write_guard = self
             .metadata_write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("index-run metadata write lock poisoned"))?;
-        self.updated_at_ms = FrankenStorage::now_millis();
+        let now_ms = FrankenStorage::now_millis();
+        self.updated_at_ms = now_ms;
+        // cass#258: every `write_metadata` / `set_mode` / `set_phase`
+        // call is, by definition, the indexing thread reporting a real
+        // mode/phase transition — i.e. forward progress. Bump
+        // `last_progress_at_ms` here, while the background heartbeat
+        // thread refreshes `updated_at_ms` independently but preserves
+        // this field verbatim so a wedged indexer flips
+        // `status: "stalled"` instead of silently staying "building".
+        self.last_progress_at_ms = now_ms;
+        self.last_progress_at_ms_atomic
+            .store(now_ms, Ordering::Relaxed);
         self.file.set_len(0).with_context(|| {
             format!(
                 "truncating index-run lock file before metadata update: {}",
@@ -2343,30 +2622,580 @@ impl IndexRunLockGuard {
                 self._path.display()
             )
         })?;
-        writeln!(
-            self.file,
-            "pid={}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path={}\nmode={}\njob_id={}\njob_kind={}\nphase={}",
+        let metadata = format!(
+            "pid={}\nstarted_at_ms={}\nupdated_at_ms={}\nlast_progress_at_ms={}\ndb_path={}\nmode={}\njob_id={}\njob_kind={}\nphase={}",
             std::process::id(),
             self.started_at_ms,
             self.updated_at_ms,
+            self.last_progress_at_ms,
             self.db_path.display(),
             mode.as_lock_value(),
             self.job_id,
             self.job_kind.as_lock_value(),
-            mode.as_lock_value()
-        )
-        .with_context(|| format!("writing index-run metadata to {}", self._path.display()))?;
+            phase
+        );
+        writeln!(self.file, "{metadata}")
+            .with_context(|| format!("writing index-run metadata to {}", self._path.display()))?;
         self.file
             .flush()
             .with_context(|| format!("flushing index-run lock file {}", self._path.display()))?;
         self.file
             .sync_all()
             .with_context(|| format!("syncing index-run lock file {}", self._path.display()))?;
+        crate::search::asset_state::write_index_run_lock_metadata_sidecar(
+            &self._path,
+            &format!("{metadata}\n"),
+        )?;
         Ok(())
     }
 
     fn set_mode(&mut self, mode: SearchMaintenanceMode) -> Result<()> {
         self.write_metadata(mode)
+    }
+
+    /// Update only the `phase=` sub-phase breadcrumb without changing
+    /// the `mode=`. Use this at the entry of each watch-startup preflight
+    /// step so cass#265 operators can pinpoint which step wedged — the
+    /// previous v0.6.5 lock-file payload only reported `phase=watch_startup`,
+    /// which hid the wedge inside a multi-second-to-multi-hour preflight
+    /// block.
+    fn set_phase(&mut self, mode: SearchMaintenanceMode, phase: &str) -> Result<()> {
+        self.write_metadata_with_phase(mode, phase)
+    }
+}
+
+/// cass#265: watch_startup preflight per-op skip + timeout configuration.
+///
+/// The v0.6.6 fix `fad3f03d` shipped sub-phase breadcrumbs so operators
+/// could pinpoint which preflight step wedged, but it did NOT add a
+/// failure mode: a wedged step still hangs forever. The reporter on
+/// cass#265 confirmed `phase=watch_startup:cleanup_orphan_fk_rows` on
+/// v0.6.6 against a 3.25 GB / 7,566-conversation / 417,234-message DB
+/// — i.e. the `ORDER BY conversation_id ASC LIMIT 1` query in
+/// `collect_orphan_message_ids` descends the `messages` B-tree without
+/// a usable index and wedges in fsqlite.
+///
+/// This module turns the diagnostic infrastructure into a *self-
+/// debugging surface*:
+/// 1. Per-op atomic watchdog: every `preflight_phase!(...)` enter
+///    records `step_started_at_ms`. A dedicated watchdog thread
+///    polls it every 5 s; if a step exceeds `CASS_PREFLIGHT_OP_TIMEOUT_SECS`
+///    (default 180 s), the watchdog rewrites the lock file's
+///    `phase=` to `<step>_TIMEOUT`, logs a structured diagnostic, and
+///    aborts the process with `EX_SOFTWARE (70)` so operators get an
+///    immediate, named failure instead of staring at a stalled health
+///    JSON for hours.
+/// 2. Per-op skip env vars: `CASS_SKIP_PREFLIGHT_<NAME>=1` lets an
+///    operator bypass a single wedged step (e.g.
+///    `CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1`) so they can
+///    actually use cass while the underlying fsqlite/cass bug is
+///    being root-caused.
+/// 3. Per-op completion bump: every bounded preflight step calls the
+///    completion macro after it returns, disarming the per-op watchdog
+///    and bumping the shared progress timestamp so the heartbeat can
+///    fold completion progress into the lock metadata.
+mod watch_startup_preflight {
+    use anyhow::Context;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    /// Default per-op timeout (seconds). Chosen so a single preflight
+    /// step has 60 s of headroom over the F4 `CASS_INDEX_STALL_DETECT_SECS`
+    /// default (120 s). Operators investigating a wedge see the F4
+    /// `stall_detected` event first (so logs still flag the wedge at
+    /// 120 s), and the harder per-op kill at 180 s prevents the
+    /// indefinite hang the reporter on cass#265 observed.
+    pub(super) const DEFAULT_TIMEOUT_SECS: u64 = 180;
+
+    /// Sentinel meaning "no preflight step is currently active".
+    /// Used so the watchdog can skip its check between steps (e.g.
+    /// while a `preflight_phase!` block is between active step
+    /// boundaries).
+    pub(super) const NO_STEP: u8 = u8::MAX;
+
+    /// Read the per-op timeout once. We resolve the env var lazily on
+    /// `WatchStartupPreflightWatchdog::start` so test harnesses that
+    /// mutate the env (`set_var`) see the latest value, while
+    /// production code pays one `dotenvy::var` lookup per `run_index`
+    /// invocation.
+    pub(super) fn op_timeout() -> Duration {
+        let secs = dotenvy::var("CASS_PREFLIGHT_OP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        // Hard floor at 1 s so test harnesses can deliberately trip
+        // the watchdog inside one second. Hard ceiling at 1 hour so
+        // a wedged production process can't outlive any reasonable
+        // operator-attention window.
+        Duration::from_secs(secs.clamp(1, 3600))
+    }
+
+    /// Convert a sub-phase string (e.g. `"watch_startup:cleanup_orphan_fk_rows"`)
+    /// to the env-var name fragment (`CLEANUP_ORPHAN_FK_ROWS`).
+    ///
+    /// The mapping is intentionally lossless: an operator who sees
+    /// `phase=watch_startup:foo_bar` in the lock file knows exactly
+    /// which env var to set (`CASS_SKIP_PREFLIGHT_FOO_BAR=1`).
+    pub(super) fn skip_env_name(sub_phase: &str) -> String {
+        let bare = sub_phase
+            .strip_prefix("watch_startup:")
+            .unwrap_or(sub_phase);
+        format!("CASS_SKIP_PREFLIGHT_{}", bare.to_uppercase())
+    }
+
+    /// Returns true if the operator has opted to skip this preflight
+    /// step. Logs at WARN so the bypass is auditable.
+    pub(super) fn should_skip(sub_phase: &str) -> bool {
+        let var = skip_env_name(sub_phase);
+        let raw = dotenvy::var(&var).ok();
+        let skip = raw
+            .as_deref()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        if skip {
+            tracing::warn!(
+                target: "cass::preflight_skip",
+                sub_phase,
+                env_var = %var,
+                "cass#265: operator-requested preflight skip — bypassing this watch_startup step"
+            );
+        }
+        skip
+    }
+
+    /// Shared state the watchdog thread reads on every tick. Held by
+    /// `Arc` so the macro can clone references into nested scopes
+    /// without threading the `&mut IndexRunLockGuard` through every
+    /// preflight call site.
+    pub(super) struct WatchStartupPreflightState {
+        /// Index into the documented sub-phase taxonomy, or `NO_STEP`
+        /// when no step is currently active. `AtomicU8` because the
+        /// taxonomy is < 256 entries.
+        pub(super) current_step_idx: AtomicU8,
+        /// `FrankenStorage::now_millis()` of the most recent
+        /// `preflight_phase!` enter for `current_step_idx`. The
+        /// watchdog computes `now - step_started_at_ms` and fires if
+        /// it exceeds `op_timeout`.
+        pub(super) step_started_at_ms: AtomicI64,
+        /// Set to true by the watchdog when it fires, so the main
+        /// thread (if it ever unwedges) can't race a successful
+        /// completion ahead of the abort, and so the regression test
+        /// can observe the trip without exiting the process.
+        pub(super) tripped: AtomicBool,
+    }
+
+    impl WatchStartupPreflightState {
+        pub(super) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                current_step_idx: AtomicU8::new(NO_STEP),
+                step_started_at_ms: AtomicI64::new(0),
+                tripped: AtomicBool::new(false),
+            })
+        }
+
+        /// Called by `preflight_phase!` at the START of each step.
+        /// Records the active step so the watchdog can compute
+        /// `now - step_started_at_ms`. Must NOT be called from within
+        /// the watchdog thread.
+        ///
+        /// Memory ordering: `step_started_at_ms` is written first with
+        /// `Relaxed`, then `current_step_idx` with `Release`. The
+        /// watchdog reads `current_step_idx` with `Acquire` and
+        /// `step_started_at_ms` with `Relaxed`. The Release–Acquire pair
+        /// guarantees that once the watchdog observes the new
+        /// `current_step_idx` it also observes the `step_started_at_ms`
+        /// written before it. Without this pairing, a weakly-ordered
+        /// CPU (AArch64) could let the watchdog see the new step index
+        /// but the old (or zero) timestamp, computing a falsely enormous
+        /// `elapsed_ms` and firing a spurious timeout.
+        pub(super) fn enter(&self, step_idx: u8, started_at_ms: i64) {
+            // Write timestamp BEFORE step index so the Release on
+            // `current_step_idx` acts as the synchronisation point.
+            self.step_started_at_ms
+                .store(started_at_ms, Ordering::Relaxed);
+            self.current_step_idx.store(step_idx, Ordering::Release);
+        }
+
+        /// Documented API for explicitly quiescing the watchdog after a
+        /// bounded preflight step completes and before long-running scan
+        /// or rebuild work begins.
+        pub(super) fn exit(&self) {
+            self.current_step_idx.store(NO_STEP, Ordering::Relaxed);
+        }
+    }
+
+    /// Policy for what the watchdog does on a timeout. Production
+    /// uses `Abort`; the regression test injects `RecordOnly` so it
+    /// can observe the trip without exiting the test process.
+    #[derive(Clone, Copy)]
+    pub(super) enum TimeoutPolicy {
+        /// Rewrite lock-file phase, emit structured event, then exit
+        /// the process with status 70.
+        Abort,
+        /// Rewrite lock-file phase, emit structured event, but
+        /// DON'T exit. The watchdog still stops itself after one
+        /// trip so the test doesn't loop. Used only by
+        /// `tests::watch_startup_preflight_watchdog_fires_on_wedged_step`.
+        #[cfg_attr(not(test), allow(dead_code))]
+        RecordOnly,
+    }
+
+    /// The watchdog thread itself. Polls `WatchStartupPreflightState`
+    /// every 5 s in production (50 ms in tests, gated by the
+    /// `poll_interval` parameter). On timeout: rewrites the lock-file
+    /// `phase=` to `<step>_TIMEOUT`, logs structured diagnostics, and
+    /// applies the configured `TimeoutPolicy`.
+    pub(super) struct WatchStartupPreflightWatchdog {
+        stop: Arc<AtomicBool>,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl WatchStartupPreflightWatchdog {
+        /// `metadata_write_lock` is the same `Arc<Mutex<()>>` that the
+        /// heartbeat thread and `IndexRunLockGuard::write_metadata` take
+        /// before every lock-file write. Passing it here ensures the
+        /// watchdog's `_TIMEOUT` rewrite cannot be overwritten by a
+        /// concurrent heartbeat tick: without this lock the heartbeat
+        /// could clobber the `_TIMEOUT` breadcrumb between the watchdog's
+        /// `set_len(0)` and `write_all` (or just after), leaving
+        /// operators with an unmodified `phase=` in the lock file even
+        /// though `process::exit(70)` was called.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn start(
+            state: Arc<WatchStartupPreflightState>,
+            taxonomy: &'static [&'static str],
+            lock_path: std::path::PathBuf,
+            data_dir: std::path::PathBuf,
+            timeout: Duration,
+            poll_interval: Duration,
+            policy: TimeoutPolicy,
+            metadata_write_lock: std::sync::Arc<std::sync::Mutex<()>>,
+        ) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_flag = Arc::clone(&stop);
+            let join = thread::spawn(move || {
+                while !stop_flag.load(Ordering::Relaxed) {
+                    thread::park_timeout(poll_interval);
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // Acquire pairs with the Release in `enter()` so
+                    // that once we see the new step index we are also
+                    // guaranteed to see the `step_started_at_ms` that
+                    // was stored (Relaxed) before the Release store.
+                    let step_idx = state.current_step_idx.load(Ordering::Acquire);
+                    if step_idx == NO_STEP {
+                        continue;
+                    }
+                    let started_at_ms = state.step_started_at_ms.load(Ordering::Relaxed);
+                    let now_ms = super::FrankenStorage::now_millis();
+                    let elapsed_ms = now_ms.saturating_sub(started_at_ms).max(0);
+                    if (elapsed_ms as u128) < timeout.as_millis() {
+                        continue;
+                    }
+                    // Race guard: if the main thread has already
+                    // advanced past this step (exit -> NO_STEP -> next
+                    // enter sets a different idx) then `step_idx` here
+                    // may be stale. Re-read with Acquire so we also
+                    // observe any `step_started_at_ms` update the main
+                    // thread wrote before advancing past this step.
+                    let current_again = state.current_step_idx.load(Ordering::Acquire);
+                    if current_again != step_idx {
+                        continue;
+                    }
+                    if state.tripped.load(Ordering::SeqCst) {
+                        // Another tick already tripped; nothing to do.
+                        break;
+                    }
+                    let sub_phase = taxonomy
+                        .get(step_idx as usize)
+                        .copied()
+                        .unwrap_or("watch_startup:unknown");
+                    let timeout_phase = format!("{sub_phase}_TIMEOUT");
+                    let timeout_secs = timeout.as_secs();
+                    tracing::error!(
+                        target: "cass::preflight_timeout",
+                        sub_phase,
+                        elapsed_ms,
+                        timeout_secs,
+                        skip_env = %skip_env_name(sub_phase),
+                        "cass#265: watch_startup preflight step exceeded timeout; \
+                         the indexing process is being aborted to surface the wedge. \
+                         Re-run with the documented skip env var set to bypass this step."
+                    );
+                    // Rewrite the lock file's `phase=` to the
+                    // `_TIMEOUT` variant so any concurrent reader
+                    // (cass health --json, the operator's terminal)
+                    // sees exactly which step hung. ORDER MATTERS:
+                    // the lock-file and sidecar rewrite happen before
+                    // `tripped=true` so the test and any same-process
+                    // observer can treat the flag as "timeout metadata
+                    // is already durable".
+                    //
+                    // We hold `metadata_write_lock` across the entire
+                    // rewrite. The heartbeat thread and
+                    // `IndexRunLockGuard::write_metadata` both take the
+                    // same lock before every lock-file write, so this
+                    // prevents a concurrent heartbeat tick from
+                    // clobbering the `_TIMEOUT` breadcrumb after we
+                    // truncate but before we finish writing.
+                    let _metadata_guard = metadata_write_lock.lock().ok();
+                    if let Err(err) =
+                        rewrite_lock_phase_for_timeout(&lock_path, &timeout_phase, now_ms)
+                    {
+                        tracing::error!(
+                            target: "cass::preflight_timeout",
+                            error = %err,
+                            "failed to rewrite lock-file phase to TIMEOUT variant; aborting anyway"
+                        );
+                    }
+                    state.tripped.store(true, Ordering::SeqCst);
+                    // Also emit a JSON line on stderr so structured-
+                    // log consumers get a self-contained event.
+                    let event = serde_json::json!({
+                        "event": "watch_startup_preflight_timeout",
+                        "sub_phase": sub_phase,
+                        "elapsed_ms": elapsed_ms,
+                        "timeout_secs": timeout_secs,
+                        "skip_env": skip_env_name(sub_phase),
+                        "data_dir": data_dir.display().to_string(),
+                        "lock_path": lock_path.display().to_string(),
+                        "hint": format!(
+                            "Set {} to bypass this preflight step. The wedge \
+                             needs a root-cause fix; the skip is a temporary \
+                             workaround. See cass#265 for the running investigation.",
+                            skip_env_name(sub_phase)
+                        ),
+                    });
+                    eprintln!("{event}");
+                    match policy {
+                        TimeoutPolicy::Abort => {
+                            // EX_SOFTWARE (70): internal software
+                            // error. `std::process::exit` skips stack
+                            // destructors, so the
+                            // `IndexRunLockGuard::Drop` impl doesn't
+                            // run — it would truncate the file and
+                            // erase the `_TIMEOUT` breadcrumb we
+                            // just wrote.
+                            std::process::exit(70);
+                        }
+                        TimeoutPolicy::RecordOnly => {
+                            // Test path: stop polling and let the
+                            // main thread observe `state.tripped`
+                            // and the rewritten lock file.
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                stop,
+                join: Some(join),
+            }
+        }
+
+        /// Stop the watchdog cleanly. Called by `Drop` on the watchdog
+        /// itself so a normal `run_index` exit doesn't leak the
+        /// watchdog thread.
+        pub(super) fn shutdown(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(join) = self.join.take() {
+                join.thread().unpark();
+                let _ = join.join();
+            }
+        }
+    }
+
+    impl Drop for WatchStartupPreflightWatchdog {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    /// Direct lock-file rewrite for the TIMEOUT path. We can't go
+    /// through `IndexRunLockGuard::set_phase` from the watchdog
+    /// thread because the guard isn't `Send`. Re-open, re-write,
+    /// fsync.
+    pub(super) fn rewrite_lock_phase_for_timeout(
+        lock_path: &std::path::Path,
+        timeout_phase: &str,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        match rewrite_lock_phase_file_for_timeout(lock_path, timeout_phase, now_ms) {
+            Ok(payload) => crate::search::asset_state::write_index_run_lock_metadata_sidecar(
+                lock_path, &payload,
+            ),
+            Err(err) if timeout_rewrite_hit_windows_lock_conflict(&err) => {
+                let sidecar_path =
+                    crate::search::asset_state::index_run_lock_metadata_sidecar_path(lock_path);
+                let raw = std::fs::read_to_string(&sidecar_path).with_context(|| {
+                    format!(
+                        "reading index-run lock metadata sidecar for timeout rewrite {}",
+                        sidecar_path.display()
+                    )
+                })?;
+                let payload = timeout_lock_metadata_payload(&raw, timeout_phase, now_ms);
+                crate::search::asset_state::write_index_run_lock_metadata_sidecar(
+                    lock_path, &payload,
+                )
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn rewrite_lock_phase_file_for_timeout(
+        lock_path: &std::path::Path,
+        timeout_phase: &str,
+        now_ms: i64,
+    ) -> anyhow::Result<String> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        let payload = timeout_lock_metadata_payload(&buf, timeout_phase, now_ms);
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(payload.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(payload)
+    }
+
+    fn timeout_lock_metadata_payload(existing: &str, timeout_phase: &str, now_ms: i64) -> String {
+        // Rewrite each line in place: `phase=...` -> `phase=<timeout_phase>`,
+        // `updated_at_ms=...` -> `updated_at_ms=<now_ms>`. Preserve
+        // every other line verbatim so the field order remains stable
+        // for parsers.
+        let mut new_lines = Vec::with_capacity(16);
+        let mut wrote_phase = false;
+        let mut wrote_updated_at = false;
+        for line in existing.lines() {
+            if line.strip_prefix("phase=").is_some() {
+                new_lines.push(format!("phase={timeout_phase}"));
+                wrote_phase = true;
+            } else if line.starts_with("updated_at_ms=") {
+                new_lines.push(format!("updated_at_ms={now_ms}"));
+                wrote_updated_at = true;
+            } else {
+                new_lines.push(line.to_string());
+            }
+        }
+        if !wrote_updated_at {
+            new_lines.push(format!("updated_at_ms={now_ms}"));
+        }
+        if !wrote_phase {
+            new_lines.push(format!("phase={timeout_phase}"));
+        }
+        let joined = new_lines.join("\n");
+        if joined.ends_with('\n') {
+            joined
+        } else {
+            format!("{joined}\n")
+        }
+    }
+
+    fn timeout_rewrite_hit_windows_lock_conflict(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(crate::search::asset_state::windows_lock_conflict)
+        })
+    }
+}
+
+use watch_startup_preflight::{
+    TimeoutPolicy as PreflightTimeoutPolicy, WatchStartupPreflightState,
+    WatchStartupPreflightWatchdog,
+};
+
+/// Canonical taxonomy of watch_startup preflight sub-phase breadcrumbs,
+/// in the order they execute inside `run_index`. The watchdog uses the
+/// array index as a `u8` step id; the `watch_startup_sub_phase_taxonomy_is_documented_and_stable`
+/// regression test pins this list against the call sites; and the
+/// public docs / release notes / cass#265 triage runbook reference
+/// these strings verbatim.
+///
+/// Two invariants every entry must satisfy:
+/// 1. Starts with `watch_startup:`.
+/// 2. No whitespace, no second colon — the lock file parser splits on
+///    `=` and the sub-phase becomes a single-token value.
+const WATCH_STARTUP_SUB_PHASE_TAXONOMY: &[&str] = &[
+    "watch_startup:ensure_index_dir",
+    "watch_startup:ensure_storage_headroom",
+    "watch_startup:open_storage",
+    "watch_startup:writable_preflight",
+    "watch_startup:validate_fts_messages",
+    "watch_startup:cleanup_orphan_fk_rows",
+    "watch_startup:count_total_conversations",
+    "watch_startup:probe_lexical_checkpoint",
+    "watch_startup:repair_daily_stats",
+    "watch_startup:tantivy_reader_preflight",
+    "watch_startup:historical_salvage",
+    "watch_startup:count_total_messages",
+    "watch_startup:published_index_validate",
+    "watch_startup:scan_entry",
+];
+
+/// Lookup the taxonomy step index for a sub-phase string. Returns
+/// `None` if the string isn't documented. Stable order — adding a new
+/// preflight must append to the array (not insert) so existing call
+/// sites keep the same id.
+fn watch_startup_step_idx(sub_phase: &str) -> Option<u8> {
+    WATCH_STARTUP_SUB_PHASE_TAXONOMY
+        .iter()
+        .position(|s| *s == sub_phase)
+        .and_then(|i| u8::try_from(i).ok())
+}
+
+/// True if the operator has set `CASS_SKIP_PREFLIGHT_<NAME>=1` for the
+/// given sub-phase. Logs at WARN when it returns true so the bypass
+/// is auditable in production. Thin wrapper over
+/// `watch_startup_preflight::should_skip` so call sites in `run_index`
+/// can read as `if preflight_skip("watch_startup:cleanup_orphan_fk_rows") { ... }`.
+fn preflight_skip(sub_phase: &str) -> bool {
+    watch_startup_preflight::should_skip(sub_phase)
+}
+
+fn dotenvy_truthy(var: &str) -> bool {
+    dotenvy::var(var)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn preflight_validate_fts_messages_enabled() -> bool {
+    dotenvy_truthy("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES")
+}
+
+fn preflight_cleanup_orphan_fk_rows_enabled() -> bool {
+    dotenvy_truthy("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS")
+}
+
+fn preflight_historical_salvage_discovery_enabled() -> bool {
+    dotenvy_truthy("CASS_PREFLIGHT_HISTORICAL_SALVAGE_DISCOVERY")
+}
+
+/// Per-batch / per-conversation / per-shard-flush atomic bump that the
+/// indexer hot loops call. Single `Relaxed` store; the heartbeat folds
+/// the value into the on-disk payload on its next tick. Returns the
+/// timestamp that was stored (useful for tracing).
+///
+/// Threading the full `IndexRunLockGuard` reference down through every
+/// layer of the staged lexical rebuild pipeline is a layering
+/// nightmare; the only state the bump actually needs is the shared
+/// atomic, which is `Arc::clone`-able and trivially passable.
+fn bump_index_run_lock_progress_atomic(atomic: &Arc<AtomicI64>) -> i64 {
+    let now_ms = FrankenStorage::now_millis();
+    atomic.store(now_ms, Ordering::Relaxed);
+    now_ms
+}
+
+fn bump_index_run_lock_progress_if_present(progress_bump: Option<&Arc<AtomicI64>>) {
+    if let Some(atomic) = progress_bump {
+        bump_index_run_lock_progress_atomic(atomic);
     }
 }
 
@@ -2376,7 +3205,19 @@ struct IndexRunLockHeartbeat {
 }
 
 impl IndexRunLockHeartbeat {
-    fn start(data_dir: PathBuf, interval: Duration, metadata_write_lock: Arc<Mutex<()>>) -> Self {
+    fn start(
+        data_dir: PathBuf,
+        interval: Duration,
+        metadata_write_lock: Arc<Mutex<()>>,
+        // F4: indexer hot loops bump this atomic on each batch
+        // commit / shard flush / conversation completion. The heartbeat
+        // thread reads it on every tick and folds the latest value into
+        // the on-disk `last_progress_at_ms=` line in the same rewrite
+        // that already refreshes `updated_at_ms=`, so cass#258's
+        // stall detector flips correctly on a wedged indexer without
+        // making each batch pay the I/O cost.
+        last_progress_at_ms_atomic: Arc<AtomicI64>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
         // Use `park_timeout` instead of `thread::sleep` so `Drop` below can
@@ -2394,9 +3235,12 @@ impl IndexRunLockHeartbeat {
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Err(err) =
-                    heartbeat_index_run_lock_with_lock(&data_dir, Some(&metadata_write_lock))
-                {
+                let last_progress_at_ms = last_progress_at_ms_atomic.load(Ordering::Relaxed);
+                if let Err(err) = heartbeat_index_run_lock_with_lock_and_progress(
+                    &data_dir,
+                    Some(&metadata_write_lock),
+                    last_progress_at_ms,
+                ) {
                     tracing::debug!(
                         error = %err,
                         path = %data_dir.display(),
@@ -2430,17 +3274,53 @@ fn heartbeat_index_run_lock_with_lock(
     data_dir: &Path,
     metadata_write_lock: Option<&Arc<Mutex<()>>>,
 ) -> Result<()> {
+    // Legacy call site (test-only): when no fresh forward-progress
+    // value is supplied, do NOT touch the `last_progress_at_ms=` line.
+    // cass#258 invariant — heartbeat refreshing the progress field by
+    // itself would silently disable the stall detector.
+    heartbeat_index_run_lock_with_lock_and_progress(data_dir, metadata_write_lock, 0)
+}
+
+/// Production heartbeat that ALSO folds the indexer's most-recent
+/// `last_progress_at_ms` atomic bump into the on-disk rewrite. The
+/// indexer owns the value (it writes the atomic from its hot loops);
+/// the heartbeat thread is purely the I/O layer — it never invents
+/// progress on its own. Pass `0` (or any value ≤ the existing on-disk
+/// value) to leave the field untouched, preserving the legacy heartbeat
+/// behaviour for tests that exercise just the `updated_at_ms` path.
+fn heartbeat_index_run_lock_with_lock_and_progress(
+    data_dir: &Path,
+    metadata_write_lock: Option<&Arc<Mutex<()>>>,
+    last_progress_at_ms: i64,
+) -> Result<()> {
     let _write_guard = metadata_write_lock
         .map(|lock| {
             lock.lock()
                 .map_err(|_| anyhow::anyhow!("index-run metadata write lock poisoned"))
         })
         .transpose()?;
-    let lock_path = data_dir.join("index-run.lock");
+    let lock_path = crate::search::asset_state::index_run_lock_path(data_dir);
     let existing = match fs::read_to_string(&lock_path) {
         Ok(contents) if !contents.is_empty() => contents,
         Ok(_) => return Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if crate::search::asset_state::windows_lock_conflict(&err) => {
+            let sidecar_path =
+                crate::search::asset_state::index_run_lock_metadata_sidecar_path(&lock_path);
+            match fs::read_to_string(&sidecar_path) {
+                Ok(contents) if !contents.is_empty() => contents,
+                Ok(_) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "reading index-run lock heartbeat sidecar {}",
+                            sidecar_path.display()
+                        )
+                    });
+                }
+            }
+        }
         Err(err) => {
             return Err(err).with_context(|| {
                 format!("reading index-run lock heartbeat {}", lock_path.display())
@@ -2448,16 +3328,45 @@ fn heartbeat_index_run_lock_with_lock(
         }
     };
 
-    let mut wrote_updated_at = false;
     let now_ms = FrankenStorage::now_millis();
-    let mut itoa_buf = itoa::Buffer::new();
-    let now_ms_str = itoa_buf.format(now_ms);
-    let mut refreshed = String::with_capacity(existing.len() + 32);
+    let mut updated_at_buf = itoa::Buffer::new();
+    let now_ms_str = updated_at_buf.format(now_ms);
+
+    // Read the existing on-disk progress so we only rewrite the
+    // `last_progress_at_ms=` line if the indexer-owned atomic carries a
+    // strictly larger value. This preserves the cass#258 invariant
+    // (heartbeat never invents progress on its own) and avoids racing
+    // with a `write_metadata` call that just wrote a fresh phase
+    // transition.
+    let existing_progress = existing
+        .lines()
+        .find_map(|line| line.strip_prefix("last_progress_at_ms="))
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let should_advance_progress = last_progress_at_ms > existing_progress;
+    let mut progress_buf = itoa::Buffer::new();
+    let progress_str = if should_advance_progress {
+        progress_buf.format(last_progress_at_ms)
+    } else {
+        ""
+    };
+
+    let mut wrote_updated_at = false;
+    let mut wrote_progress = !should_advance_progress;
+    let mut refreshed = String::with_capacity(existing.len() + 64);
     for line in existing.lines() {
         if line.strip_prefix("updated_at_ms=").is_some() {
             refreshed.push_str("updated_at_ms=");
             refreshed.push_str(now_ms_str);
             wrote_updated_at = true;
+        } else if line.strip_prefix("last_progress_at_ms=").is_some() {
+            if should_advance_progress {
+                refreshed.push_str("last_progress_at_ms=");
+                refreshed.push_str(progress_str);
+            } else {
+                refreshed.push_str(line);
+            }
+            wrote_progress = true;
         } else {
             refreshed.push_str(line);
         }
@@ -2468,11 +3377,38 @@ fn heartbeat_index_run_lock_with_lock(
         refreshed.push_str(now_ms_str);
         refreshed.push('\n');
     }
+    if !wrote_progress {
+        refreshed.push_str("last_progress_at_ms=");
+        refreshed.push_str(progress_str);
+        refreshed.push('\n');
+    }
 
     write_index_run_lock_heartbeat_in_place(&lock_path, &refreshed)
 }
 
 fn write_index_run_lock_heartbeat_in_place(lock_path: &Path, refreshed: &str) -> Result<()> {
+    match write_index_run_lock_file_in_place(lock_path, refreshed) {
+        Ok(()) => {
+            crate::search::asset_state::write_index_run_lock_metadata_sidecar(lock_path, refreshed)
+        }
+        Err(err) => {
+            let lock_conflict = err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(crate::search::asset_state::windows_lock_conflict)
+            });
+            if lock_conflict {
+                crate::search::asset_state::write_index_run_lock_metadata_sidecar(
+                    lock_path, refreshed,
+                )
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn write_index_run_lock_file_in_place(lock_path: &Path, refreshed: &str) -> Result<()> {
     // Do not temp-file+rename `index-run.lock`: POSIX advisory locks attach
     // to the existing file inode/open handle, and replacing the path would
     // let another process lock a fresh inode while this process still holds
@@ -4407,6 +5343,14 @@ impl LexicalRebuildStagedShardBuildController {
     }
 }
 
+fn should_pause_staged_lexical_pipeline_handoff(
+    pipeline_backlog_paused: bool,
+    active_shard_build_jobs: usize,
+    pending_merge_jobs: usize,
+) -> bool {
+    pipeline_backlog_paused && (active_shard_build_jobs > 0 || pending_merge_jobs > 0)
+}
+
 fn apply_staged_merge_runtime_snapshot(
     latest_runtime: &mut LexicalRebuildPipelineRuntimeSnapshot,
     progress: Option<&Arc<IndexingProgress>>,
@@ -5049,11 +5993,21 @@ fn acquire_index_run_lock(
             .with_context(|| format!("acquiring index-run lock {}", lock_path.display()));
     }
 
+    let now_ms = FrankenStorage::now_millis();
     let mut guard = IndexRunLockGuard {
         file,
         _path: lock_path,
-        started_at_ms: FrankenStorage::now_millis(),
-        updated_at_ms: FrankenStorage::now_millis(),
+        started_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        // cass#258: seed with `now` so the very first `read_search_maintenance_snapshot`
+        // call after `acquire_index_run_lock` sees a populated cursor.
+        // Forward progress will refresh this on every `write_metadata`
+        // / `set_mode` call and every per-batch atomic progress bump (F4).
+        last_progress_at_ms: now_ms,
+        // F4: indexer-thread mailbox the heartbeat folds into the on-disk
+        // payload. Seed with `now_ms` so a stall-detector that fires
+        // before the first bump cannot false-positive on `0`.
+        last_progress_at_ms_atomic: Arc::new(AtomicI64::new(now_ms)),
         db_path: crate::normalize_path_identity(db_path),
         job_id: String::new(),
         job_kind: maintenance_job_kind_for_mode(mode),
@@ -7168,6 +8122,7 @@ fn maybe_persist_staged_lexical_rebuild_progress(
     progress_heartbeat_interval_conversations: usize,
     last_progress_persist: &mut Instant,
     progress_heartbeat_interval: Duration,
+    progress_bump: Option<&Arc<AtomicI64>>,
     mut perf_profile: Option<&mut LexicalRebuildPerfProfile>,
 ) -> Result<bool> {
     // Staged shard-build resume safety is restart-from-zero, so these persists
@@ -7194,6 +8149,7 @@ fn maybe_persist_staged_lexical_rebuild_progress(
         runtime,
         base_meta_fingerprint_override,
     )?;
+    bump_index_run_lock_progress_if_present(progress_bump);
     if let (Some(profile), Some(started)) = (perf_profile.as_mut(), heartbeat_progress_started) {
         profile.heartbeat_persist_count = profile.heartbeat_persist_count.saturating_add(1);
         profile.heartbeat_progress_duration += started.elapsed();
@@ -7524,6 +8480,22 @@ fn should_salvage_historical_databases(
         || has_pending_historical_bundles
 }
 
+fn should_probe_pending_historical_bundles(
+    full_rebuild: bool,
+    canonical_storage_rebuilt: bool,
+    canonical_sessions_before_salvage: usize,
+    canonical_only_full_rebuild: bool,
+    operator_requested_discovery: bool,
+) -> bool {
+    if canonical_only_full_rebuild {
+        return false;
+    }
+    full_rebuild
+        || canonical_storage_rebuilt
+        || canonical_sessions_before_salvage == 0
+        || operator_requested_discovery
+}
+
 fn should_run_targeted_watch_once_only(
     has_watch_once_paths: bool,
     watch_enabled: bool,
@@ -7691,6 +8663,7 @@ fn should_repair_fallback_fts_after_full_index_run(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FallbackFtsRepairOutcome {
     SkippedKnownHealthyForFingerprint { archive_fingerprint: String },
+    SkippedUnsupportedPopulatedShadowReload { detail: String },
     Repaired(FtsConsistencyRepair),
 }
 
@@ -7737,16 +8710,28 @@ fn repair_fallback_fts_after_full_index_run(
     // abort this fix is supposed to prevent.  The `_storage` parameter
     // is kept for API stability (callers pass the same long-running
     // connection they already have) but is not touched.
-    let fresh_storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+    let fresh_storage = match crate::storage::sqlite::open_franken_storage_with_timeout(
         db_path,
         std::time::Duration::from_secs(10),
-    )
-    .with_context(|| {
-        format!(
-            "opening fresh frankensqlite connection for fallback FTS repair at {}",
-            db_path.display()
-        )
-    })?;
+    ) {
+        Ok(storage) => storage,
+        Err(err) => {
+            let detail = format!("{err:#}");
+            if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
+                &detail,
+            ) {
+                return Ok(Some(
+                    FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail },
+                ));
+            }
+            return Err(err).with_context(|| {
+                format!(
+                    "opening fresh frankensqlite connection for fallback FTS repair at {}",
+                    db_path.display()
+                )
+            });
+        }
+    };
 
     if let Some(archive_fingerprint) = known_archive_fingerprint
         && fresh_storage
@@ -7759,7 +8744,20 @@ fn repair_fallback_fts_after_full_index_run(
         ));
     }
 
-    let repair = fresh_storage.ensure_search_fallback_fts_consistency()?;
+    let repair = match fresh_storage.ensure_search_fallback_fts_consistency() {
+        Ok(repair) => repair,
+        Err(err) => {
+            let detail = format!("{err:#}");
+            if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
+                &detail,
+            ) {
+                return Ok(Some(
+                    FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail },
+                ));
+            }
+            return Err(err);
+        }
+    };
     if let Some(archive_fingerprint) = known_archive_fingerprint {
         fresh_storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)?;
     }
@@ -9019,6 +10017,71 @@ where
     }
 }
 
+fn persist_connector_scan_watermarks(
+    storage: &FrankenStorage,
+    db_path: &Path,
+    scanned_connectors: &BTreeSet<String>,
+    scan_start_ts: i64,
+) -> Result<()> {
+    persist_connector_scan_watermarks_with_writer(
+        db_path,
+        scanned_connectors.len(),
+        scan_start_ts,
+        || {
+            persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
+                persist::with_ephemeral_writer(
+                    storage,
+                    false,
+                    "updating connector scan watermarks",
+                    |writer| {
+                        for connector_name in scanned_connectors {
+                            writer.set_connector_last_scan_ts(connector_name, scan_start_ts)?;
+                        }
+                        Ok(())
+                    },
+                )
+            })
+        },
+    )
+}
+
+fn persist_connector_scan_watermarks_with_writer<F>(
+    db_path: &Path,
+    connector_count: usize,
+    scan_start_ts: i64,
+    writer_fn: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    if connector_count == 0 {
+        return Ok(());
+    }
+
+    match writer_fn() {
+        Ok(()) => {
+            tracing::info!(
+                connector_count,
+                scan_start_ts,
+                "updated connector last_scan_ts watermarks for incremental indexing"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                connector_count,
+                scan_start_ts,
+                error = %format!("{err:#}"),
+                "deferred connector scan-watermark update after retries exhausted; \
+                 index and lexical artifacts are committed, per-connector markers \
+                 will be rewritten on the next incremental run once peer contention clears"
+            );
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn load_lexical_rebuild_snapshot(
     index_path: &Path,
@@ -9398,6 +10461,8 @@ pub enum IndexMessage {
         scan_ms: u64,
         /// Whether this connector was discovered even if it produced no batches
         is_discovered: bool,
+        /// Whether every scan scope for this connector completed without error
+        scan_succeeded: bool,
     },
 }
 
@@ -9868,6 +10933,7 @@ struct StreamingProducerConfig {
     data_dir: PathBuf,
     additional_scan_roots: Vec<ScanRoot>,
     since_ts: Option<i64>,
+    local_since_ts_by_connector: Arc<HashMap<&'static str, Option<i64>>>,
     progress: Option<Arc<IndexingProgress>>,
     active_source_filter: Arc<ActiveSessionSourceFilter>,
 }
@@ -9890,6 +10956,7 @@ fn spawn_connector_producer(
         let detect = conn.detect();
         let was_detected = detect.detected;
         let mut is_discovered = false;
+        let mut scan_succeeded = true;
 
         if detect.detected {
             // Update discovered agents count immediately when detected
@@ -9898,10 +10965,16 @@ fn spawn_connector_producer(
             }
             is_discovered = true;
 
+            let local_since_ts = config
+                .local_since_ts_by_connector
+                .get(name)
+                .copied()
+                .unwrap_or(config.since_ts);
+
             // Scan local sources
             let ctx = crate::connectors::ScanContext::local_default(
                 config.data_dir.clone(),
-                config.since_ts,
+                local_since_ts,
             );
             let local_origin = Origin::local();
             let mut batch_sender =
@@ -9918,7 +10991,7 @@ fn spawn_connector_producer(
                 &config.data_dir,
                 name,
                 &fallback_roots,
-                config.since_ts,
+                local_since_ts,
                 config.active_source_filter.as_ref(),
             );
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
@@ -9929,9 +11002,13 @@ fn spawn_connector_producer(
                 ) {
                     return Ok(());
                 }
-                inject_provenance(&mut conversation, &local_origin);
-                compact_large_connector_extras(name, &mut conversation);
-                attach_raw_mirror_capture(&config.data_dir, &mut conversation);
+                prepare_conversation_for_ingest(
+                    &config.data_dir,
+                    name,
+                    &local_origin,
+                    None,
+                    &mut conversation,
+                );
                 batch_sender.push(conversation)
             }) {
                 Ok(()) => {
@@ -9943,6 +11020,7 @@ fn spawn_connector_producer(
                             );
                             return;
                         }
+                        scan_succeeded = false;
                         tracing::warn!(connector = name, "local flush failed: {}", error);
                         let _ = tx.send(IndexMessage::ScanError {
                             connector_name: name,
@@ -9963,6 +11041,7 @@ fn spawn_connector_producer(
                         );
                         return;
                     }
+                    scan_succeeded = false;
                     tracing::warn!(connector = name, "local scan failed: {}", e);
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
@@ -9975,10 +11054,24 @@ fn spawn_connector_producer(
         // Scan explicitly configured additional roots. These may be true remote
         // mirrors or machine-local backup directories wired through sources.toml.
         for root in &config.additional_scan_roots {
+            let local_since_ts = config
+                .local_since_ts_by_connector
+                .get(name)
+                .copied()
+                .unwrap_or(config.since_ts);
+            let root_since_ts = explicit_scan_root_since_ts(root, &config.data_dir, local_since_ts);
+            if config.since_ts.is_some() && root_since_ts.is_none() {
+                tracing::debug!(
+                    connector = name,
+                    source_id = %root.origin.source_id,
+                    root = %root.path.display(),
+                    "configured scan root is using a full root scan so already-mirrored sessions can be promoted to canonical"
+                );
+            }
             let ctx = crate::connectors::ScanContext::with_roots(
                 root.path.clone(),
                 vec![root.clone()],
-                config.since_ts,
+                root_since_ts,
             );
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
@@ -9988,7 +11081,7 @@ fn spawn_connector_producer(
                 &config.data_dir,
                 name,
                 std::slice::from_ref(root),
-                config.since_ts,
+                root_since_ts,
                 config.active_source_filter.as_ref(),
             );
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
@@ -9999,10 +11092,13 @@ fn spawn_connector_producer(
                 ) {
                     return Ok(());
                 }
-                inject_provenance(&mut conversation, &root.origin);
-                apply_workspace_rewrite(&mut conversation, root);
-                compact_large_connector_extras(name, &mut conversation);
-                attach_raw_mirror_capture(&config.data_dir, &mut conversation);
+                prepare_conversation_for_ingest(
+                    &config.data_dir,
+                    name,
+                    &root.origin,
+                    Some(root),
+                    &mut conversation,
+                );
 
                 if !was_detected && !is_discovered {
                     if let Some(p) = &config.progress {
@@ -10023,6 +11119,7 @@ fn spawn_connector_producer(
                             );
                             return;
                         }
+                        scan_succeeded = false;
                         tracing::warn!(
                             connector = name,
                             root = %root.path.display(),
@@ -10057,6 +11154,7 @@ fn spawn_connector_producer(
                         );
                         return;
                     }
+                    scan_succeeded = false;
                     tracing::warn!(
                         connector = name,
                         root = %root.path.display(),
@@ -10083,6 +11181,7 @@ fn spawn_connector_producer(
             connector_name: name,
             scan_ms,
             is_discovered,
+            scan_succeeded,
         });
     })
 }
@@ -10176,6 +11275,7 @@ fn run_streaming_consumer(
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     scan_start_ts: Option<i64>,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<(Vec<String>, NonWatchIngestOutcome)> {
     use std::collections::HashMap;
 
@@ -10196,6 +11296,7 @@ fn run_streaming_consumer(
 
     // Per-connector stats tracking (T7.4)
     let mut connector_stats: HashMap<String, ConnectorStats> = HashMap::new();
+    let mut failed_scan_connectors = BTreeSet::new();
 
     // Card 3 (flat combining, §14.2): when enabled and at least one
     // additional producer is live, we opportunistically drain pending
@@ -10341,6 +11442,7 @@ fn run_streaming_consumer(
                     progress,
                     lexical_strategy,
                     defer_streaming_checkpoints,
+                    progress_bump,
                 );
                 flow_limiter.release(combined_byte_reservation);
                 ingest_outcome = ingest_outcome.accumulate(batch_outcome?);
@@ -10364,21 +11466,12 @@ fn run_streaming_consumer(
                             tracing::debug!("incremental commit completed");
                         }
                     }
-                    // Persist scan_start_ts so that if the process is killed,
-                    // the next run does a delta scan from this point instead of
-                    // a full rescan that may OOM again (infinite-OOM-loop fix).
-                    let preserve_scan_watermark = scan_watermark_preservation_active();
-                    if !preserve_scan_watermark
-                        && let Some(ts) = scan_start_ts
-                        && let Err(e) = persist::with_ephemeral_writer(
-                            storage,
-                            defer_streaming_checkpoints,
-                            "updating streaming incremental last_scan_ts",
-                            |writer| writer.set_last_scan_ts(ts),
-                        )
-                    {
-                        tracing::warn!("incremental last_scan_ts save failed: {}", e);
-                    } else if preserve_scan_watermark {
+                    // Do not advance the legacy global `last_scan_ts` from a
+                    // partial streaming run: a later connector scan error would
+                    // make that global watermark unsafe for legacy fallback.
+                    // Successful connector-specific markers are persisted when
+                    // each producer's Done message is processed.
+                    if scan_watermark_preservation_active() {
                         tracing::debug!(
                             "preserving streaming incremental last_scan_ts because scan exclusions or active source skips are active"
                         );
@@ -10397,6 +11490,8 @@ fn run_streaming_consumer(
                 connector_name,
                 error,
             }) => {
+                ingest_outcome.scan_had_errors = true;
+                failed_scan_connectors.insert(connector_name.to_string());
                 // Record error in connector stats
                 let stats = connector_stats
                     .entry(connector_name.to_string())
@@ -10417,8 +11512,11 @@ fn run_streaming_consumer(
                 connector_name,
                 scan_ms,
                 is_discovered,
+                scan_succeeded,
             }) => {
                 active_producers -= 1;
+                let effective_scan_succeeded =
+                    scan_succeeded && !failed_scan_connectors.contains(connector_name);
 
                 // Record scan timing in connector stats
                 let stats = connector_stats
@@ -10431,6 +11529,28 @@ fn run_streaming_consumer(
 
                 if is_discovered {
                     remember_discovered_connector(&mut discovered_names, connector_name);
+                }
+                if is_discovered && effective_scan_succeeded {
+                    ingest_outcome
+                        .scanned_connectors
+                        .insert(connector_name.to_string());
+                    if let Some(ts) = scan_start_ts
+                        && !scan_watermark_preservation_active()
+                        && let Err(e) = persist::with_ephemeral_writer(
+                            storage,
+                            true,
+                            "updating streaming connector scan watermark",
+                            |writer| writer.set_connector_last_scan_ts(connector_name, ts),
+                        )
+                    {
+                        tracing::warn!(
+                            connector = connector_name,
+                            "streaming connector last_scan_ts save failed: {}",
+                            e
+                        );
+                    }
+                } else if !effective_scan_succeeded {
+                    ingest_outcome.scan_had_errors = true;
                 }
 
                 // If we haven't switched to indexing phase yet, this Done message represents
@@ -10513,6 +11633,7 @@ fn run_streaming_consumer(
 /// This spawns producer threads for each connector that send batches through
 /// a bounded channel. The consumer receives and ingests batches as they arrive,
 /// providing backpressure when indexing falls behind scanning.
+#[allow(clippy::too_many_arguments)]
 fn run_streaming_index(
     storage: &FrankenStorage,
     t_index: Option<&mut TantivyIndex>,
@@ -10521,6 +11642,7 @@ fn run_streaming_index(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     scan_start_ts: i64,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     run_streaming_index_with_connector_factories(
         storage,
@@ -10531,6 +11653,7 @@ fn run_streaming_index(
         additional_scan_roots,
         configured_connector_factories(),
         scan_start_ts,
+        progress_bump,
     )
 }
 
@@ -10587,6 +11710,7 @@ fn run_streaming_index_with_connector_factories(
     additional_scan_roots: Vec<ScanRoot>,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
     scan_start_ts: i64,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     if connector_factories.is_empty() {
         tracing::warn!("no enabled connectors are configured for indexing; skipping scan");
@@ -10636,6 +11760,11 @@ fn run_streaming_index_with_connector_factories(
         data_dir: opts.data_dir.clone(),
         additional_scan_roots: additional_scan_roots.clone(),
         since_ts,
+        local_since_ts_by_connector: Arc::new(connector_local_scan_since_ts_map(
+            storage,
+            since_ts,
+            &connector_factories,
+        )?),
         progress: opts.progress.clone(),
         active_source_filter: Arc::new(ActiveSessionSourceFilter::new(
             opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
@@ -10667,6 +11796,7 @@ fn run_streaming_index_with_connector_factories(
         &opts.progress,
         lexical_strategy,
         Some(scan_start_ts),
+        progress_bump,
     );
 
     if consumer_result.is_err() {
@@ -10724,6 +11854,7 @@ fn run_streaming_index_with_connector_factories(
 /// This uses rayon's par_iter to scan all connectors in parallel, collecting
 /// all conversations into memory before ingesting. This is the fallback when
 /// streaming is disabled via CASS_STREAMING_INDEX=0.
+#[allow(clippy::too_many_arguments)]
 fn run_batch_index(
     storage: &FrankenStorage,
     t_index: Option<&mut TantivyIndex>,
@@ -10732,6 +11863,7 @@ fn run_batch_index(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     scan_start_ts: i64,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     run_batch_index_with_connector_factories(
         storage,
@@ -10742,6 +11874,7 @@ fn run_batch_index(
         additional_scan_roots,
         configured_connector_factories(),
         scan_start_ts,
+        progress_bump,
     )
 }
 
@@ -10755,6 +11888,7 @@ fn run_batch_index_with_connector_factories(
     additional_scan_roots: Vec<ScanRoot>,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
     scan_start_ts: i64,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     let scan_start = std::time::Instant::now();
 
@@ -10776,14 +11910,28 @@ fn run_batch_index_with_connector_factories(
     // by collecting names after the parallel phase instead of locking inside par_iter.
     use rayon::prelude::*;
 
+    struct PendingBatchScan {
+        name: &'static str,
+        convs: Vec<NormalizedConversation>,
+        is_discovered: bool,
+        scan_succeeded: bool,
+        scan_error: Option<String>,
+    }
+
     let progress_ref = opts.progress.as_ref();
     let data_dir = opts.data_dir.clone();
     let active_source_filter = Arc::new(ActiveSessionSourceFilter::new(
         opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
     ));
+    let local_since_ts_by_connector = Arc::new(connector_local_scan_since_ts_map(
+        storage,
+        since_ts,
+        &connector_factories,
+    )?);
 
-    // Return type includes whether agent was discovered (for post-parallel name collection)
-    let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>, bool)> =
+    // Keep scan completion state with each connector so watermarks are only
+    // advanced for connectors whose full scan scope completed successfully.
+    let pending_batches: Vec<PendingBatchScan> =
         connector_factories
             .into_par_iter()
             .filter_map(|(name, factory)| {
@@ -10792,6 +11940,8 @@ fn run_batch_index_with_connector_factories(
                 let was_detected = detect.detected;
                 let mut convs = Vec::new();
                 let mut is_discovered = false;
+                let mut scan_succeeded = true;
+                let mut scan_errors = Vec::new();
 
                 if detect.detected {
                     // Update discovered agents count immediately when detected
@@ -10802,8 +11952,14 @@ fn run_batch_index_with_connector_factories(
                     }
                     is_discovered = true;
 
-                    let ctx =
-                        crate::connectors::ScanContext::local_default(data_dir.clone(), since_ts);
+                    let local_since_ts = local_since_ts_by_connector
+                        .get(name)
+                        .copied()
+                        .unwrap_or(since_ts);
+                    let ctx = crate::connectors::ScanContext::local_default(
+                        data_dir.clone(),
+                        local_since_ts,
+                    );
                     let fallback_roots: Vec<ScanRoot> = detect
                         .root_paths
                         .iter()
@@ -10816,7 +11972,7 @@ fn run_batch_index_with_connector_factories(
                         &data_dir,
                         name,
                         &fallback_roots,
-                        since_ts,
+                        local_since_ts,
                         active_source_filter.as_ref(),
                     );
                     match conn.scan(&ctx) {
@@ -10830,14 +11986,21 @@ fn run_batch_index_with_connector_factories(
                                 )
                             });
                             for conv in &mut local_convs {
-                                inject_provenance(conv, &local_origin);
-                                attach_raw_mirror_capture(&data_dir, conv);
+                                prepare_conversation_for_ingest(
+                                    &data_dir,
+                                    name,
+                                    &local_origin,
+                                    None,
+                                    conv,
+                                );
                             }
                             convs.extend(local_convs);
                         }
                         Err(e) => {
                             // Note: agent was counted as discovered but scan failed
                             // This is acceptable as detection succeeded (agent exists)
+                            scan_succeeded = false;
+                            scan_errors.push(e.to_string());
                             tracing::warn!("scan failed for {}: {}", name, e);
                         }
                     }
@@ -10845,10 +12008,24 @@ fn run_batch_index_with_connector_factories(
 
                 if !additional_scan_roots.is_empty() {
                     for root in &additional_scan_roots {
+                        let local_since_ts = local_since_ts_by_connector
+                            .get(name)
+                            .copied()
+                            .unwrap_or(since_ts);
+                        let root_since_ts =
+                            explicit_scan_root_since_ts(root, &data_dir, local_since_ts);
+                        if since_ts.is_some() && root_since_ts.is_none() {
+                            tracing::debug!(
+                                connector = name,
+                                source_id = %root.origin.source_id,
+                                root = %root.path.display(),
+                                "configured scan root is using a full root scan so already-mirrored sessions can be promoted to canonical"
+                            );
+                        }
                         let ctx = crate::connectors::ScanContext::with_roots(
                             root.path.clone(),
                             vec![root.clone()],
-                            since_ts,
+                            root_since_ts,
                         );
                         capture_connector_sources_before_parse(
                             conn.as_ref(),
@@ -10856,7 +12033,7 @@ fn run_batch_index_with_connector_factories(
                             &data_dir,
                             name,
                             std::slice::from_ref(root),
-                            since_ts,
+                            root_since_ts,
                             active_source_filter.as_ref(),
                         );
                         match conn.scan(&ctx) {
@@ -10869,13 +12046,23 @@ fn run_batch_index_with_connector_factories(
                                     )
                                 });
                                 for conv in &mut remote_convs {
-                                    inject_provenance(conv, &root.origin);
-                                    apply_workspace_rewrite(conv, root);
-                                    attach_raw_mirror_capture(&data_dir, conv);
+                                    prepare_conversation_for_ingest(
+                                        &data_dir,
+                                        name,
+                                        &root.origin,
+                                        Some(root),
+                                        conv,
+                                    );
                                 }
                                 convs.extend(remote_convs);
                             }
                             Err(e) => {
+                                scan_succeeded = false;
+                                scan_errors.push(format!(
+                                    "remote scan failed for {}: {}",
+                                    root.path.display(),
+                                    e
+                                ));
                                 tracing::warn!(
                                     connector = name,
                                     root = %root.path.display(),
@@ -10899,7 +12086,7 @@ fn run_batch_index_with_connector_factories(
                     p.current.fetch_add(1, Ordering::Relaxed);
                 }
 
-                if convs.is_empty() && !is_discovered {
+                if convs.is_empty() && !is_discovered && scan_succeeded {
                     return None;
                 }
 
@@ -10907,9 +12094,17 @@ fn run_batch_index_with_connector_factories(
                     connector = name,
                     conversations = convs.len(),
                     discovered = is_discovered,
+                    scan_succeeded,
                     "batch_scan_complete"
                 );
-                Some((name, convs, is_discovered))
+                let scan_error = (!scan_errors.is_empty()).then(|| scan_errors.join("; "));
+                Some(PendingBatchScan {
+                    name,
+                    convs,
+                    is_discovered,
+                    scan_succeeded,
+                    scan_error,
+                })
             })
             .collect();
 
@@ -10919,29 +12114,43 @@ fn run_batch_index_with_connector_factories(
 
     let discovered_names: Vec<String> = pending_batches
         .iter()
-        .filter(|(_, _, discovered)| *discovered)
-        .map(|(name, _, _)| (*name).to_string())
+        .filter(|pending| pending.is_discovered)
+        .map(|pending| pending.name.to_string())
         .collect();
+    let scanned_connectors: BTreeSet<String> = pending_batches
+        .iter()
+        .filter(|pending| pending.is_discovered && pending.scan_succeeded)
+        .map(|pending| pending.name.to_string())
+        .collect();
+    let scan_had_errors = pending_batches
+        .iter()
+        .any(|pending| !pending.scan_succeeded);
 
     let total_conversations: usize = pending_batches
         .iter()
-        .map(|(_, convs, _)| convs.len())
+        .map(|pending| pending.convs.len())
         .sum();
     let total_messages: usize = pending_batches
         .iter()
-        .map(|(_, convs, _)| convs.iter().map(|c| c.messages.len()).sum::<usize>())
+        .map(|pending| {
+            pending
+                .convs
+                .iter()
+                .map(|c| c.messages.len())
+                .sum::<usize>()
+        })
         .sum();
     let connector_stats: Vec<ConnectorStats> = pending_batches
         .iter()
-        .filter(|(_, convs, _)| !convs.is_empty())
-        .map(|(name, convs, _)| {
-            let msgs: usize = convs.iter().map(|c| c.messages.len()).sum();
+        .filter(|pending| !pending.convs.is_empty() || pending.scan_error.is_some())
+        .map(|pending| {
+            let msgs: usize = pending.convs.iter().map(|c| c.messages.len()).sum();
             ConnectorStats {
-                name: (*name).to_string(),
-                conversations: convs.len(),
+                name: pending.name.to_string(),
+                conversations: pending.convs.len(),
                 messages: msgs,
                 scan_ms,
-                error: None,
+                error: pending.scan_error.clone(),
             }
         })
         .collect();
@@ -10959,16 +12168,17 @@ fn run_batch_index_with_connector_factories(
     let index_start = std::time::Instant::now();
     let mut last_scan_ts_save = std::time::Instant::now();
     let mut ingest_outcome = NonWatchIngestOutcome::default();
-    let preserve_scan_watermark = scan_watermark_preservation_active();
-    for (name, convs, _discovered) in pending_batches {
+    let preserve_scan_watermark = scan_watermark_preservation_active() || scan_had_errors;
+    for pending in pending_batches {
         let batch_outcome = ingest_non_watch_batch_with_oom_split(
             storage,
             t_index.as_deref_mut(),
             &opts.data_dir,
-            &convs,
+            &pending.convs,
             &opts.progress,
             lexical_strategy,
             !opts.watch,
+            progress_bump,
         )?;
         ingest_outcome = ingest_outcome.accumulate(batch_outcome);
         // Periodically persist scan_start_ts so that if the process is killed,
@@ -10991,8 +12201,8 @@ fn run_batch_index_with_connector_factories(
             last_scan_ts_save = std::time::Instant::now();
         }
         tracing::info!(
-            connector = name,
-            conversations = convs.len(),
+            connector = pending.name,
+            conversations = pending.convs.len(),
             "batch_ingest"
         );
     }
@@ -11005,7 +12215,7 @@ fn run_batch_index_with_connector_factories(
         stats.scan_ms = scan_ms;
         stats.index_ms = index_ms;
         stats.connectors = connector_stats;
-        stats.agents_discovered = discovered_names;
+        stats.agents_discovered = discovered_names.clone();
         stats.total_conversations = total_conversations;
         stats.total_messages = total_messages;
         stats.quarantined_conversations = stats
@@ -11014,7 +12224,83 @@ fn run_batch_index_with_connector_factories(
         stats.lexical_update_deferred |= ingest_outcome.lexical_update_deferred;
     }
 
+    ingest_outcome.scanned_connectors.extend(scanned_connectors);
+    ingest_outcome.scan_had_errors |= scan_had_errors;
+
     Ok(ingest_outcome)
+}
+
+fn non_watch_scan_since_ts(
+    full: bool,
+    needs_rebuild: bool,
+    retry_stale_index_ingest_quarantine: bool,
+    last_scan_ts: Option<i64>,
+) -> Option<i64> {
+    if full || needs_rebuild || retry_stale_index_ingest_quarantine {
+        None
+    } else {
+        last_scan_ts.map(|ts| ts.saturating_sub(1))
+    }
+}
+
+fn connector_local_scan_since_ts_from_state(
+    fallback_since_ts: Option<i64>,
+    connector_last_scan_ts: Option<i64>,
+    connector_has_conversations: bool,
+) -> Option<i64> {
+    if let Some(ts) = connector_last_scan_ts {
+        return Some(ts.saturating_sub(1).max(0));
+    }
+    if connector_has_conversations {
+        fallback_since_ts
+    } else {
+        None
+    }
+}
+
+fn connector_local_scan_since_ts_map(
+    storage: &FrankenStorage,
+    fallback_since_ts: Option<i64>,
+    connector_factories: &[(&'static str, ConnectorFactory)],
+) -> Result<HashMap<&'static str, Option<i64>>> {
+    let connector_names = connector_factories
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>();
+    let connector_states = storage.connector_scan_states(&connector_names)?;
+
+    connector_factories
+        .iter()
+        .map(|(name, _)| {
+            let (connector_last_scan_ts, connector_has_conversations) = connector_states
+                .get(*name)
+                .copied()
+                .unwrap_or((None, false));
+            Ok((
+                *name,
+                connector_local_scan_since_ts_from_state(
+                    fallback_since_ts,
+                    connector_last_scan_ts,
+                    connector_has_conversations,
+                ),
+            ))
+        })
+        .collect()
+}
+
+fn explicit_scan_root_since_ts(
+    root: &ScanRoot,
+    built_in_local_root: &Path,
+    fallback_since_ts: Option<i64>,
+) -> Option<i64> {
+    // Configured local roots are local history, including opt-in backup
+    // directories. They must honor the incremental cutoff; otherwise a normal
+    // `cass index` can replay multi-GB backup archives on every run.
+    if root.origin.kind == SourceKind::Local || root.path == built_in_local_root {
+        fallback_since_ts
+    } else {
+        None
+    }
 }
 
 pub fn run_index(
@@ -11023,6 +12309,12 @@ pub fn run_index(
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
+    // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
+    // flows. Keep routine indexing focused on the canonical conversation store
+    // and lexical assets; set CASS_INLINE_ANALYTICS_UPDATES=1 to restore the
+    // old inline analytics writes for targeted maintenance runs.
+    let _defer_analytics_guard =
+        crate::storage::sqlite::default_defer_analytics_updates_guard(true);
     set_progress_last_error(opts.progress.as_ref(), None);
     let initial_lock_mode = if opts.watch {
         SearchMaintenanceMode::WatchStartup
@@ -11041,7 +12333,15 @@ pub fn run_index(
         opts.data_dir.clone(),
         index_run_lock_heartbeat_interval(),
         Arc::clone(&index_run_lock.metadata_write_lock),
+        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
     );
+    // F4: clone the atomic so deeply nested batch loops can bump progress
+    // without holding a `&mut IndexRunLockGuard`. The clone is cheap
+    // (single Arc bump) and lives only inside this function.
+    let progress_bump = Arc::clone(&index_run_lock.last_progress_at_ms_atomic);
+    // The atomic-store bump runs once per "interesting" batch boundary
+    // — currently used at the per-conversation completion ingest loop
+    // and the lexical commit boundary; see `bump_index_run_lock_progress_atomic`.
 
     if can_skip_absent_explicit_watch_once_index_run(&opts) {
         let path_count = opts
@@ -11058,14 +12358,119 @@ pub fn run_index(
         return Ok(());
     }
 
+    // cass#265: each preflight step gets its own sub-phase breadcrumb so
+    // operators investigating a watch_startup wedge can see WHICH step
+    // stalled instead of an opaque `phase=watch_startup` for the entire
+    // pre-pipeline block. Each `set_phase` call also bumps
+    // `last_progress_at_ms` (in both the atomic and the on-disk field)
+    // and emits a new `phase=` string that `IndexStallWatchdog` treats
+    // as a phase transition (resets its `last_progress_advance` timer).
+    // The macro keeps the call sites compact: noop on non-watch_startup
+    // modes so plain `cass index` runs don't pay the I/O cost on the
+    // initial-state non-watch path.
+    //
+    // v0.6.7 extension: the macro also notifies the
+    // `WatchStartupPreflightState` so the watchdog thread can detect
+    // a wedge that exceeds `CASS_PREFLIGHT_OP_TIMEOUT_SECS` (default
+    // 180 s) and abort the process with a `<step>_TIMEOUT` breadcrumb
+    // instead of hanging forever.
+    let preflight_state = WatchStartupPreflightState::new();
+    let _preflight_watchdog = if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
+        Some(WatchStartupPreflightWatchdog::start(
+            Arc::clone(&preflight_state),
+            WATCH_STARTUP_SUB_PHASE_TAXONOMY,
+            index_run_lock._path.clone(),
+            opts.data_dir.clone(),
+            watch_startup_preflight::op_timeout(),
+            std::time::Duration::from_secs(5),
+            PreflightTimeoutPolicy::Abort,
+            // INV3: pass the shared write lock so the watchdog's
+            // `_TIMEOUT` rewrite is serialised with the heartbeat.
+            Arc::clone(&index_run_lock.metadata_write_lock),
+        ))
+    } else {
+        None
+    };
+    macro_rules! preflight_phase {
+        ($phase:expr) => {{
+            if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
+                // Notify the watchdog of the new active step BEFORE
+                // writing the lock-file breadcrumb. If the lock-file
+                // write itself wedges (it shouldn't, but
+                // belt-and-suspenders), the watchdog can still kill
+                // the process with the right `<step>_TIMEOUT` phase.
+                if let Some(step_idx) = watch_startup_step_idx($phase) {
+                    preflight_state
+                        .enter(step_idx, FrankenStorage::now_millis());
+                } else {
+                    // Coding error: an undocumented sub-phase reached
+                    // the macro. Fail loud in debug builds; in release
+                    // we still write the breadcrumb so the operator
+                    // gets *some* signal, just no watchdog coverage.
+                    debug_assert!(
+                        false,
+                        "undocumented watch_startup sub-phase `{}`; add it to WATCH_STARTUP_SUB_PHASE_TAXONOMY",
+                        $phase
+                    );
+                }
+                if let Err(err) = index_run_lock.set_phase(initial_lock_mode, $phase) {
+                    tracing::debug!(
+                        sub_phase = $phase,
+                        error = %err,
+                        "watch_startup preflight phase breadcrumb write failed (continuing)"
+                    );
+                }
+            }
+        }};
+    }
+    macro_rules! complete_preflight_phase {
+        () => {{
+            if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
+                preflight_state.exit();
+                bump_index_run_lock_progress_atomic(&progress_bump);
+            }
+        }};
+    }
+
+    preflight_phase!("watch_startup:ensure_index_dir");
     let index_path = index_dir(&opts.data_dir)?;
-    ensure_index_storage_headroom(&opts.data_dir, &opts.db_path)?;
+    complete_preflight_phase!();
+    preflight_phase!("watch_startup:ensure_storage_headroom");
+    ensure_index_startup_storage_headroom(&opts)?;
+    complete_preflight_phase!();
     if should_try_readonly_nonresumable_lexical_resume(&opts) {
         match nonresumable_pending_lexical_rebuild_status_from_readonly_db(
             &index_path,
             &opts.db_path,
         ) {
             Ok(Some((_status, total_conversations))) => {
+                if let Some(deferred) = should_defer_incremental_authoritative_lexical_repair(
+                    &opts,
+                    false,
+                    total_conversations,
+                    true,
+                    None,
+                ) {
+                    tracing::warn!(
+                        db_path = %opts.db_path.display(),
+                        canonical_conversations = deferred.canonical_conversations,
+                        db_size_bytes = deferred.db_size_bytes,
+                        max_automatic_repair_db_size_bytes =
+                            deferred.max_automatic_repair_db_size_bytes,
+                        reason = deferred.reason,
+                        "deferring automatic resume of a large authoritative lexical rebuild during routine incremental index"
+                    );
+                    record_lexical_population_strategy(
+                        opts.progress.as_ref(),
+                        LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                        deferred.reason,
+                    );
+                    record_deferred_incremental_canonical_lexical_repair(
+                        opts.progress.as_ref(),
+                        &deferred,
+                    );
+                    return Ok(());
+                }
                 tracing::info!(
                     db_path = %opts.db_path.display(),
                     total_conversations,
@@ -11081,11 +12486,16 @@ pub fn run_index(
                     reason = "readonly_fast_resume_incomplete_nonresumable_lexical_rebuild",
                     "selected_lexical_population_strategy"
                 );
-                let rebuild = rebuild_tantivy_from_db_deferred_startup(
+                ensure_authoritative_lexical_rebuild_storage_headroom(
+                    &opts.data_dir,
+                    &opts.db_path,
+                )?;
+                let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                     &opts.db_path,
                     &opts.data_dir,
                     total_conversations,
                     opts.progress.clone(),
+                    Arc::clone(&progress_bump),
                 )?;
                 if let Some(p) = &opts.progress
                     && let Ok(mut stats) = p.stats.lock()
@@ -11112,15 +12522,18 @@ pub fn run_index(
             }
         }
     }
-    if try_readonly_canonical_force_rebuild(&opts)? {
+    if try_readonly_canonical_force_rebuild(&opts, &progress_bump)? {
         return Ok(());
     }
 
+    preflight_phase!("watch_startup:open_storage");
     let (mut storage, canonical_storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
+    complete_preflight_phase!();
     let defer_checkpoints = !opts.watch;
     let mut reopened_after_writable_preflight = false;
 
+    preflight_phase!("watch_startup:writable_preflight");
     // CASS #162 item 2: Verify the connection is writable early, before the
     // code reaches deep batch-insert paths where a readonly failure is hard
     // to diagnose.  A benign no-op UPDATE catches "attempt to write a readonly
@@ -11155,6 +12568,86 @@ pub fn run_index(
 
     persist::apply_index_writer_busy_timeout(&storage);
     persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
+    complete_preflight_phase!();
+
+    preflight_phase!("watch_startup:validate_fts_messages");
+    // cass#265/cass#272 follow-up: this derived fallback-FTS repair
+    // probe can be multi-minute on large databases before any real
+    // indexing work starts. Routine indexing now skips it by default;
+    // operators investigating fallback FTS corruption can restore the
+    // old preflight with CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES=1, and
+    // can still bypass that explicit probe with
+    // CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES=1.
+    let validate_fts_requested = preflight_validate_fts_messages_enabled();
+    let validate_fts_skipped =
+        validate_fts_requested && preflight_skip("watch_startup:validate_fts_messages");
+    if !validate_fts_requested {
+        tracing::debug!(
+            target: "cass::indexer::preflight",
+            db_path = %opts.db_path.display(),
+            "skipping opt-in derived fallback FTS preflight validation before indexing"
+        );
+    } else if validate_fts_skipped {
+        tracing::debug!(
+            target: "cass::indexer::preflight",
+            db_path = %opts.db_path.display(),
+            "operator skip suppressed opt-in derived fallback FTS preflight validation before indexing"
+        );
+    } else if let Err(err) = storage.validate_fts_messages_integrity() {
+        let detail = format!("{err:#}");
+        if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
+            &detail,
+        ) {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                error = %detail,
+                "skipping derived fallback FTS validation repair because frankensqlite cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical indexing will continue"
+            );
+        } else {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                error = %err,
+                "derived fallback FTS metadata is inconsistent; repairing before index pipeline"
+            );
+            storage.close_best_effort_in_place();
+            let mut repair_storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+                &opts.db_path,
+                Duration::from_secs(10),
+            )
+            .with_context(|| {
+                format!(
+                    "opening fresh storage for fallback FTS repair before indexing {}",
+                    opts.db_path.display()
+                )
+            })?;
+            let repair = repair_storage.ensure_search_fallback_fts_consistency();
+            repair_storage.close_best_effort_in_place();
+            let repair = repair.with_context(|| {
+                format!(
+                    "repairing derived fallback FTS before indexing {}",
+                    opts.db_path.display()
+                )
+            })?;
+            tracing::info!(
+                db_path = %opts.db_path.display(),
+                ?repair,
+                "derived fallback FTS repair completed before index pipeline"
+            );
+            storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+                &opts.db_path,
+                Duration::from_secs(10),
+            )
+            .with_context(|| {
+                format!(
+                    "reopening storage after fallback FTS repair before indexing {}",
+                    opts.db_path.display()
+                )
+            })?;
+            persist::apply_index_writer_busy_timeout(&storage);
+            persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
+        }
+    }
+    complete_preflight_phase!();
 
     if opts.full
         && !opened_fresh_for_full
@@ -11194,13 +12687,40 @@ pub fn run_index(
         return close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run");
     }
 
-    // cass#202 self-heal: a Connection dropped mid-transaction (the
-    // `drop_close` warning) can leave child rows persisted without a matching
-    // parent. Sweep before the indexer touches the DB so one bad commit cannot
-    // poison every future run. A failed sweep is now fatal for this run:
-    // continuing after OOM/corruption can reuse a poisoned connection and make
-    // the canonical archive worse.
-    if let Err(err) = storage.cleanup_orphan_fk_rows() {
+    preflight_phase!("watch_startup:cleanup_orphan_fk_rows");
+    // cass#202 self-heal: a Connection dropped mid-transaction can
+    // leave child rows persisted without a matching parent. The sweep
+    // remains available as an explicit maintenance preflight, but it
+    // is not a safe default on large archives: it walks broad message
+    // ranges before any real indexing work starts.
+    //
+    // cass#265/cass#272 follow-up: both external reports and the
+    // local profile of the production archive show this preflight can
+    // peg CPU inside `collect_orphan_message_ids` / fsqlite page-cache
+    // eviction for minutes. Routine indexing skips it by default; run
+    // with CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1 to force the old
+    // repair behavior, or combine that with
+    // CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1 to suppress an
+    // explicit operator opt-in.
+    let cleanup_orphans_requested = preflight_cleanup_orphan_fk_rows_enabled();
+    let cleanup_orphans_skipped =
+        cleanup_orphans_requested && preflight_skip("watch_startup:cleanup_orphan_fk_rows");
+    if !cleanup_orphans_requested {
+        tracing::debug!(
+            target: "cass::fk_repair",
+            db_path = %opts.db_path.display(),
+            "skipping opt-in orphan-FK cleanup preflight before indexing"
+        );
+    } else if cleanup_orphans_skipped {
+        tracing::warn!(
+            target: "cass::fk_repair",
+            db_path = %opts.db_path.display(),
+            "cass#265: skipping cleanup_orphan_fk_rows preflight by operator request \
+             (CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1). cass#202 orphan FK \
+             self-heal is bypassed for this run only; a future run without the \
+             env var will re-attempt the sweep."
+        );
+    } else if let Err(err) = storage.cleanup_orphan_fk_rows() {
         tracing::warn!(
             target: "cass::fk_repair",
             db_path = %opts.db_path.display(),
@@ -11210,8 +12730,11 @@ pub fn run_index(
         storage.close_best_effort_in_place();
         return Err(orphan_fk_cleanup_failed_index_error(&opts.db_path, &err));
     }
+    complete_preflight_phase!();
 
+    preflight_phase!("watch_startup:count_total_conversations");
     let initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+    complete_preflight_phase!();
     if opts.full
         && !opened_fresh_for_full
         && full_rebuild_requires_historical_restart(
@@ -11241,6 +12764,7 @@ pub fn run_index(
         .watch_once_paths
         .as_ref()
         .is_some_and(|paths| !paths.is_empty());
+    let targeted_semantic_watch_once = should_run_targeted_semantic_watch_once(&opts);
     let populated_explicit_watch_once_only = has_explicit_watch_once_paths
         && !opts.watch
         && !opts.full
@@ -11248,6 +12772,7 @@ pub fn run_index(
         && !opts.semantic
         && !opts.build_hnsw
         && initial_canonical_sessions_before_salvage > 0;
+    preflight_phase!("watch_startup:probe_lexical_checkpoint");
     let mut initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus::default();
     let mut restart_pending_lexical_rebuild_from_zero = false;
     let resume_lexical_rebuild = if opts.force_rebuild {
@@ -11259,8 +12784,34 @@ pub fn run_index(
             &opts.db_path,
             initial_canonical_sessions_before_salvage,
         )? {
-            initial_matching_lexical_checkpoint = status;
-            restart_pending_lexical_rebuild_from_zero = true;
+            if let Some(deferred) = should_defer_incremental_authoritative_lexical_repair(
+                &opts,
+                canonical_storage_rebuilt,
+                initial_canonical_sessions_before_salvage,
+                true,
+                None,
+            ) {
+                tracing::warn!(
+                    db_path = %opts.db_path.display(),
+                    canonical_conversations = deferred.canonical_conversations,
+                    db_size_bytes = deferred.db_size_bytes,
+                    max_automatic_repair_db_size_bytes =
+                        deferred.max_automatic_repair_db_size_bytes,
+                    reason = deferred.reason,
+                    "deferring pending lexical rebuild resume during routine incremental index"
+                );
+                initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus {
+                    has_pending_resume: false,
+                    ..status
+                };
+                record_deferred_incremental_canonical_lexical_repair(
+                    opts.progress.as_ref(),
+                    &deferred,
+                );
+            } else {
+                initial_matching_lexical_checkpoint = status;
+                restart_pending_lexical_rebuild_from_zero = true;
+            }
         } else if populated_explicit_watch_once_only {
             if let Some(status) =
                 matching_completed_lexical_rebuild_state_status_without_fingerprint(
@@ -11313,6 +12864,7 @@ pub fn run_index(
             "preserving matching completed lexical checkpoint during full scan until canonical mutations require a rebuild"
         );
     }
+    complete_preflight_phase!();
     let pre_scan_daily_stats_archive_fingerprint =
         preserve_matching_completed_checkpoint_during_full_scan
             .then_some(
@@ -11323,6 +12875,7 @@ pub fn run_index(
             .flatten();
     let mut checked_daily_stats_pre_scan = false;
     if opts.full && !canonical_only_full_rebuild {
+        preflight_phase!("watch_startup:repair_daily_stats");
         if let DailyStatsRepairOutcome::SkippedKnownHealthyForFingerprint {
             archive_fingerprint,
         } = repair_daily_stats_if_drifted(
@@ -11336,6 +12889,7 @@ pub fn run_index(
                 "skipping pre-scan daily_stats health probe because this full run preserved an archive fingerprint already known to be healthy"
             );
         }
+        complete_preflight_phase!();
         checked_daily_stats_pre_scan = true;
     } else if canonical_only_full_rebuild {
         tracing::info!(
@@ -11347,9 +12901,13 @@ pub fn run_index(
     let mut performed_scan = false;
     let mut scan_canonical_mutations = CanonicalMutationCounts::default();
     let mut scan_lexical_update_deferred = false;
+    let mut scanned_connectors = BTreeSet::new();
+    let mut scan_had_errors = false;
+    let mut stale_index_ingest_quarantine_retry_attempted = false;
 
     let mut tantivy_requires_rebuild = false;
     let mut observed_tantivy_docs = None;
+    preflight_phase!("watch_startup:tantivy_reader_preflight");
     if should_preflight_existing_tantivy_reader(resume_lexical_rebuild, opts.full) {
         // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
         // IMPORTANT: This must stay aligned with TantivyIndex::open_or_create() rebuild triggers.
@@ -11415,8 +12973,36 @@ pub fn run_index(
     } else {
         tracing::info!(db_path = %opts.db_path.display(), "skipping live Tantivy reader preflight");
     }
+    complete_preflight_phase!();
     let mut needs_rebuild =
         should_force_authoritative_rebuild(canonical_storage_rebuilt, tantivy_requires_rebuild);
+    let large_incremental_authoritative_lexical_repair_probe_deferred =
+        should_defer_incremental_authoritative_lexical_repair(
+            &opts,
+            canonical_storage_rebuilt,
+            initial_canonical_sessions_before_salvage,
+            true,
+            observed_tantivy_docs,
+        );
+    let deferred_incremental_authoritative_lexical_repair = if tantivy_requires_rebuild {
+        large_incremental_authoritative_lexical_repair_probe_deferred
+    } else {
+        None
+    };
+    if let Some(deferred) = &deferred_incremental_authoritative_lexical_repair {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            canonical_conversations = deferred.canonical_conversations,
+            db_size_bytes = deferred.db_size_bytes,
+            max_automatic_repair_db_size_bytes =
+                deferred.max_automatic_repair_db_size_bytes,
+            observed_tantivy_docs = deferred.observed_tantivy_docs,
+            reason = deferred.reason,
+            "deferring heavyweight authoritative lexical repair during routine incremental index"
+        );
+        record_deferred_incremental_canonical_lexical_repair(opts.progress.as_ref(), deferred);
+        needs_rebuild = false;
+    }
     let initial_needs_rebuild = needs_rebuild;
 
     if needs_rebuild && let Some(p) = &opts.progress {
@@ -11487,19 +13073,22 @@ pub fn run_index(
             reason = "resume_incomplete_authoritative_db_rebuild_from_checkpoint",
             "selected_lexical_population_strategy"
         );
+        ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
         let rebuild = if restart_pending_lexical_rebuild_from_zero {
-            rebuild_tantivy_from_db_deferred_startup(
+            rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                 &opts.db_path,
                 &opts.data_dir,
                 initial_canonical_sessions_before_salvage,
                 opts.progress.clone(),
+                Arc::clone(&progress_bump),
             )?
         } else {
-            rebuild_tantivy_from_db(
+            rebuild_tantivy_from_db_with_progress_bump(
                 &opts.db_path,
                 &opts.data_dir,
                 initial_canonical_sessions_before_salvage,
                 opts.progress.clone(),
+                Arc::clone(&progress_bump),
             )?
         };
         exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
@@ -11539,10 +13128,33 @@ pub fn run_index(
         let canonical_sessions_before_salvage = initial_canonical_sessions_before_salvage;
         // See CASS #153: plain --full must always rescan the filesystem.
         // --force-rebuild with existing sessions skips rescan (fast path).
-        let mut has_pending_historical_bundles = if canonical_only_full_rebuild {
-            false
-        } else {
+        //
+        // cass#272 performance follow-up: routine incremental refreshes on a
+        // populated canonical archive should not probe historical bundles at
+        // startup. Discovery opens candidate backup/snapshot DBs and can wedge
+        // in fsqlite page-cache eviction before real indexing starts. Keep the
+        // automatic path for explicit full/rebuilt/empty recovery, and expose
+        // the old populated-incremental discovery behavior behind
+        // CASS_PREFLIGHT_HISTORICAL_SALVAGE_DISCOVERY=1.
+        let probe_pending_historical_bundles = should_probe_pending_historical_bundles(
+            opts.full,
+            canonical_storage_rebuilt,
+            canonical_sessions_before_salvage,
+            canonical_only_full_rebuild,
+            preflight_historical_salvage_discovery_enabled(),
+        );
+        let mut has_pending_historical_bundles = if probe_pending_historical_bundles {
             storage.has_pending_historical_bundles(&opts.db_path)?
+        } else {
+            tracing::debug!(
+                target: "cass::historical_salvage",
+                db_path = %opts.db_path.display(),
+                canonical_sessions_before_salvage,
+                canonical_storage_rebuilt,
+                canonical_only_full_rebuild,
+                "skipping opt-in historical bundle discovery during populated incremental index startup"
+            );
+            false
         };
         let targeted_watch_once_only = should_run_targeted_watch_once_only(
             has_explicit_watch_once_paths,
@@ -11566,11 +13178,13 @@ pub fn run_index(
             opened_fresh_for_full,
             canonical_sessions_before_salvage,
             has_pending_historical_bundles,
+            probe_pending_historical_bundles,
             canonical_only_full_rebuild,
             targeted_watch_once_only,
             should_salvage_historical,
             "historical salvage decision"
         );
+        preflight_phase!("watch_startup:historical_salvage");
         let historical_salvage: HistoricalSalvageOutcome = if targeted_watch_once_only {
             tracing::info!(
                 db_path = %opts.db_path.display(),
@@ -11609,6 +13223,7 @@ pub fn run_index(
             );
             HistoricalSalvageOutcome::default()
         };
+        complete_preflight_phase!();
         if historical_salvage.messages_imported > 0 {
             tracing::info!(
                 bundles_imported = historical_salvage.bundles_imported,
@@ -11636,8 +13251,22 @@ pub fn run_index(
         };
         let incremental_canonical_lexical_repair = if canonical_sessions_before_salvage > 0
             && should_evaluate_incremental_canonical_lexical_repair(&repair_context)
+            && large_incremental_authoritative_lexical_repair_probe_deferred.is_none()
+            // cass#265: `CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES=1`
+            // short-circuits the entire incremental-canonical-lexical-
+            // repair branch — `count_total_messages_exact` issues a
+            // `SELECT COUNT(*) FROM messages` which, on the cass#265
+            // reporter's 417k-row DB, can route through the same
+            // fsqlite full-table-scan path that wedges
+            // `cleanup_orphan_fk_rows`. Skipping leaves the planner
+            // in the "no repair plan" branch, which falls through to
+            // the normal scan loop instead of the lexical-repair
+            // shortcut.
+            && !preflight_skip("watch_startup:count_total_messages")
         {
+            preflight_phase!("watch_startup:count_total_messages");
             let canonical_messages = count_total_messages_exact(&storage)?;
+            complete_preflight_phase!();
             // #248 (coding_agent_session_search-raoug): only pay for the
             // published-index validation (a read-only DB open + fingerprint COUNT
             // scans) when the live index actually looks sparse — i.e. when it would
@@ -11647,7 +13276,16 @@ pub fn run_index(
             // tantivy_requires_rebuild), so skip the check then.
             let published_index_validated_for_current_data = !tantivy_requires_rebuild
                 && observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages)
-                && published_lexical_index_validated_for_current_data(&index_path, &opts.db_path);
+                && !preflight_skip("watch_startup:published_index_validate")
+                && {
+                    preflight_phase!("watch_startup:published_index_validate");
+                    let validated = published_lexical_index_validated_for_current_data(
+                        &index_path,
+                        &opts.db_path,
+                    );
+                    complete_preflight_phase!();
+                    validated
+                };
             choose_incremental_canonical_lexical_repair_plan(
                 IncrementalCanonicalLexicalRepairContext {
                     canonical_messages,
@@ -11688,13 +13326,15 @@ pub fn run_index(
 
         if rebuild_from_canonical_only {
             drop(t_index.take());
+            ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
             let rebuild_start = std::time::Instant::now();
             let rebuild_convs = canonical_sessions_before_salvage;
-            let rebuild = rebuild_tantivy_from_db_deferred_startup(
+            let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                 &opts.db_path,
                 &opts.data_dir,
                 rebuild_convs,
                 opts.progress.clone(),
+                Arc::clone(&progress_bump),
             )?;
             exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
             let rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
@@ -11748,12 +13388,17 @@ pub fn run_index(
                 );
 
                 drop(t_index.take());
+                ensure_authoritative_lexical_rebuild_storage_headroom(
+                    &opts.data_dir,
+                    &opts.db_path,
+                )?;
                 let rebuild_convs = count_total_conversations_exact(&storage)?;
-                let rebuild = rebuild_tantivy_from_db_deferred_startup(
+                let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                     &opts.db_path,
                     &opts.data_dir,
                     rebuild_convs,
                     opts.progress.clone(),
+                    Arc::clone(&progress_bump),
                 )?;
                 exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
                 if let Some(observed_messages) = rebuild.observed_messages {
@@ -11784,16 +13429,38 @@ pub fn run_index(
                 );
             } else {
                 let (lexical_strategy, lexical_strategy_reason) =
-                    resolve_lexical_population_strategy(
-                        needs_rebuild,
-                        opts.full,
-                        historical_salvage.messages_imported,
-                    );
+                    if let Some(deferred) = &deferred_incremental_authoritative_lexical_repair {
+                        (
+                            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                            deferred.reason,
+                        )
+                    } else {
+                        resolve_lexical_population_strategy(
+                            needs_rebuild,
+                            opts.full,
+                            historical_salvage.messages_imported,
+                        )
+                    };
                 record_lexical_population_strategy_if_unset(
                     opts.progress.as_ref(),
                     lexical_strategy,
                     lexical_strategy_reason,
                 );
+                let stale_index_ingest_quarantine_retry =
+                    if targeted_watch_once_only || canonical_only_full_rebuild {
+                        None
+                    } else {
+                        stale_index_ingest_quarantine_version_retry(&opts.data_dir)?
+                    };
+                if let Some(retry) = &stale_index_ingest_quarantine_retry {
+                    tracing::warn!(
+                        stale_records = retry.stale_records,
+                        legacy_records = retry.legacy_records,
+                        previous_versions = ?retry.previous_versions,
+                        current_version = current_cass_version(),
+                        "retrying stale index-ingest quarantine records after cass version change"
+                    );
+                }
                 if followup_scan_after_authoritative_repair {
                     tracing::info!(
                         strategy = lexical_strategy.as_str(),
@@ -11817,13 +13484,34 @@ pub fn run_index(
                 // Get last scan timestamp for incremental indexing.
                 // If full rebuild or force_rebuild, scan everything (since_ts = None).
                 // Otherwise, only scan files modified since last successful scan.
-                let since_ts = if opts.full || needs_rebuild {
-                    None
+                let last_scan_ts = storage.get_last_scan_ts().unwrap_or(None);
+                let bootstrap_missing_scan_watermark =
+                    should_bootstrap_missing_incremental_scan_watermark(
+                        &opts,
+                        canonical_storage_rebuilt,
+                        canonical_sessions_before_salvage,
+                        needs_rebuild,
+                        stale_index_ingest_quarantine_retry.is_some(),
+                        last_scan_ts,
+                    );
+                let since_ts = if let Some(bootstrap) = &bootstrap_missing_scan_watermark {
+                    tracing::warn!(
+                        db_path = %opts.db_path.display(),
+                        canonical_conversations = bootstrap.canonical_conversations,
+                        db_size_bytes = bootstrap.db_size_bytes,
+                        max_automatic_full_scan_db_size_bytes =
+                            bootstrap.max_automatic_full_scan_db_size_bytes,
+                        reason = bootstrap.reason,
+                        "bootstrapping missing incremental scan watermark on a large populated archive; use --full or CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN=1 for deliberate historical backfill"
+                    );
+                    Some(scan_start_ts.saturating_sub(1).max(0))
                 } else {
-                    storage
-                        .get_last_scan_ts()
-                        .unwrap_or(None)
-                        .map(|ts| ts.saturating_sub(1))
+                    non_watch_scan_since_ts(
+                        opts.full,
+                        needs_rebuild,
+                        stale_index_ingest_quarantine_retry.is_some(),
+                        last_scan_ts,
+                    )
                 };
 
                 if since_ts.is_some() {
@@ -11846,6 +13534,8 @@ pub fn run_index(
                         "scan phase is deferring Tantivy writer open/commit until the authoritative rebuild"
                     );
                 }
+                preflight_phase!("watch_startup:scan_entry");
+                complete_preflight_phase!();
                 if streaming_index_enabled() {
                     tracing::info!("using streaming indexing (Opt 8.2)");
                     let scan_outcome = run_streaming_index(
@@ -11856,10 +13546,20 @@ pub fn run_index(
                         lexical_strategy,
                         additional_scan_roots.clone(),
                         scan_start_ts,
+                        Some(&progress_bump),
                     )?;
+                    // F4 (cass tech debt): a completed scan is a real
+                    // forward-progress boundary; bump the atomic so the
+                    // heartbeat folds the timestamp into the lock file
+                    // on its next tick and a long single-mode scan does
+                    // not false-positive as `status: "stalled"`
+                    // (cass#258 follow-up).
+                    bump_index_run_lock_progress_atomic(&progress_bump);
                     scan_canonical_mutations =
                         scan_canonical_mutations.accumulate(scan_outcome.canonical_mutations);
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
+                    scanned_connectors.extend(scan_outcome.scanned_connectors);
+                    scan_had_errors |= scan_outcome.scan_had_errors;
                 } else {
                     tracing::info!(
                         "using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)"
@@ -11872,12 +13572,18 @@ pub fn run_index(
                         lexical_strategy,
                         additional_scan_roots.clone(),
                         scan_start_ts,
+                        Some(&progress_bump),
                     )?;
+                    bump_index_run_lock_progress_atomic(&progress_bump);
                     scan_canonical_mutations =
                         scan_canonical_mutations.accumulate(scan_outcome.canonical_mutations);
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
+                    scanned_connectors.extend(scan_outcome.scanned_connectors);
+                    scan_had_errors |= scan_outcome.scan_had_errors;
                 }
                 performed_scan = true;
+                stale_index_ingest_quarantine_retry_attempted =
+                    stale_index_ingest_quarantine_retry.is_some();
 
                 if scan_lexical_update_deferred {
                     tracing::warn!(
@@ -11887,12 +13593,17 @@ pub fn run_index(
                         "inline lexical updates were deferred during non-watch scan; rebuilding lexical assets from canonical SQLite"
                     );
                     drop(t_index.take());
+                    ensure_authoritative_lexical_rebuild_storage_headroom(
+                        &opts.data_dir,
+                        &opts.db_path,
+                    )?;
                     let rebuild_convs = count_total_conversations_exact(&storage)?;
-                    let rebuild = rebuild_tantivy_from_db_deferred_startup(
+                    let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                         &opts.db_path,
                         &opts.data_dir,
                         rebuild_convs,
                         opts.progress.clone(),
+                        Arc::clone(&progress_bump),
                     )?;
                     exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
                     if let Some(observed_messages) = rebuild.observed_messages {
@@ -11957,12 +13668,17 @@ pub fn run_index(
                         skipped_noop_full_scan_authoritative_rebuild = true;
                     } else {
                         drop(t_index.take());
+                        ensure_authoritative_lexical_rebuild_storage_headroom(
+                            &opts.data_dir,
+                            &opts.db_path,
+                        )?;
                         let rebuild_convs = count_total_conversations_exact(&storage)?;
-                        let rebuild = rebuild_tantivy_from_db_deferred_startup(
+                        let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                             &opts.db_path,
                             &opts.data_dir,
                             rebuild_convs,
                             opts.progress.clone(),
+                            Arc::clone(&progress_bump),
                         )?;
                         exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
                         // Update stats to reflect the authoritative rebuild
@@ -11987,8 +13703,35 @@ pub fn run_index(
         t_index
     };
 
+    if stale_index_ingest_quarantine_retry_attempted && scan_watermark_preservation_active() {
+        tracing::info!(
+            data_dir = %opts.data_dir.display(),
+            "leaving stale index-ingest quarantine retry records unchanged because this scan preserved the source watermark"
+        );
+    } else if stale_index_ingest_quarantine_retry_attempted {
+        match mark_stale_index_ingest_quarantine_retry_attempted(&opts.data_dir) {
+            Ok(marked) if marked > 0 => tracing::info!(
+                data_dir = %opts.data_dir.display(),
+                marked,
+                current_version = current_cass_version(),
+                "marked stale index-ingest quarantine records as retried for current cass version"
+            ),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                data_dir = %opts.data_dir.display(),
+                error = %err,
+                "failed to mark stale index-ingest quarantine records as retried"
+            ),
+        }
+    }
+
     // Semantic indexing (if enabled)
-    if opts.semantic {
+    if opts.semantic && targeted_semantic_watch_once {
+        tracing::info!(
+            embedder = %opts.embedder,
+            "deferring broad semantic indexing until targeted watch-once ingest completes"
+        );
+    } else if opts.semantic {
         // In watch mode, skip the expensive bulk re-embed if a vector index and
         // watermark already exist. The incremental path in the watch callback
         // will pick up any new messages via WAL append.
@@ -12121,20 +13864,35 @@ pub fn run_index(
     } else {
         let now_ms = FrankenStorage::now_millis();
         let preserve_scan_watermark = scan_watermark_preservation_active();
-        let performed_scan_for_watermark = performed_scan && !preserve_scan_watermark;
-        if performed_scan && !performed_scan_for_watermark {
+        let performed_scan_for_global_watermark =
+            performed_scan && !preserve_scan_watermark && !scan_had_errors;
+        let performed_scan_for_connector_watermarks = performed_scan && !preserve_scan_watermark;
+        if performed_scan && preserve_scan_watermark {
             tracing::info!(
                 db_path = %opts.db_path.display(),
                 "preserving final last_scan_ts because scan exclusions or active source skips are active"
+            );
+        } else if performed_scan && scan_had_errors {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                "preserving final global last_scan_ts because one or more connector scans failed; successful connector-specific watermarks will still be updated"
             );
         }
         persist_final_index_run_metadata(
             &storage,
             &opts.db_path,
-            performed_scan_for_watermark,
+            performed_scan_for_global_watermark,
             scan_start_ts,
             now_ms,
         )?;
+        if performed_scan_for_connector_watermarks {
+            persist_connector_scan_watermarks(
+                &storage,
+                &opts.db_path,
+                &scanned_connectors,
+                scan_start_ts,
+            )?;
+        }
     }
     let exact_total_counts = exact_total_counts_from_progress(opts.progress.as_ref());
     if exact_completed_lexical_checkpoint && exact_total_counts.is_some() {
@@ -12153,6 +13911,18 @@ pub fn run_index(
         tracing::info!(
             db_path = %opts.db_path.display(),
             "skipping final lexical checkpoint refresh because targeted watch-once startup does not need broad checkpoint maintenance"
+        );
+    } else if let Some(deferred) = &large_incremental_authoritative_lexical_repair_probe_deferred {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            canonical_conversations = deferred.canonical_conversations,
+            db_size_bytes = deferred.db_size_bytes,
+            max_automatic_repair_db_size_bytes =
+                deferred.max_automatic_repair_db_size_bytes,
+            reason = deferred.reason,
+            inserted_conversations = scan_canonical_mutations.inserted_conversations,
+            inserted_messages = scan_canonical_mutations.inserted_messages,
+            "skipping final lexical checkpoint refresh because this large incremental run deferred expensive lexical repair probes"
         );
     } else if should_skip_noop_final_lexical_checkpoint_refresh(
         opts.full,
@@ -12211,6 +13981,13 @@ pub fn run_index(
                     db_path = %opts.db_path.display(),
                     archive_fingerprint,
                     "skipping fallback FTS consistency repair because this no-op full run preserved an archive fingerprint already known to be healthy"
+                );
+            }
+            FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail } => {
+                tracing::warn!(
+                    db_path = %opts.db_path.display(),
+                    error = %detail,
+                    "skipping derived fallback FTS repair because frankensqlite cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical SQLite rows and Tantivy remain authoritative"
                 );
             }
             FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
@@ -12332,8 +14109,17 @@ pub fn run_index(
         // The initial pass already embedded everything, so we start the clock
         // from now — the cooldown must elapse before the first incremental pass.
         let semantic_enabled = opts.semantic;
+        let targeted_semantic_watch_once = targeted_semantic_watch_once && watch_once_mode;
         let embedder_id = opts.embedder.clone();
         let data_dir_for_semantic = opts.data_dir.clone();
+        let pre_watch_semantic_conversations = if targeted_semantic_watch_once {
+            let storage = storage.lock().map_err(|err| {
+                anyhow::anyhow!("storage lock poisoned before semantic watch-once: {err}")
+            })?;
+            count_total_conversations_exact(&storage)?
+        } else {
+            0
+        };
         let semantic_cooldown = Duration::from_secs(
             dotenvy::var("CASS_WATCH_SEMANTIC_COOLDOWN_SECS")
                 .ok()
@@ -12421,6 +14207,16 @@ pub fn run_index(
                     {
                         tracing::warn!(error = %e, "segment merge failed during watch");
                     }
+                    if targeted_semantic_watch_once {
+                        let stats = run_targeted_semantic_watch_once_publish(
+                            &embedder_id,
+                            &data_dir_for_semantic,
+                            &storage_for_watch,
+                            indexed,
+                            pre_watch_semantic_conversations,
+                        )?;
+                        record_semantic_watch_once_stats(opts_clone.progress.as_ref(), stats);
+                    }
                     indexed
                 } else {
                     let indexed = finalize_watch_reindex_result(
@@ -12459,7 +14255,7 @@ pub fn run_index(
                 };
 
                 // Incremental semantic embedding with cooldown
-                if semantic_enabled && indexed > 0 {
+                if semantic_enabled && indexed > 0 && !targeted_semantic_watch_once {
                     let should_embed = last_semantic_embed
                         .lock()
                         .map(|t| t.elapsed() >= semantic_cooldown)
@@ -12720,6 +14516,440 @@ impl WatchSemanticDelta {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticContentFingerprint {
+    total_conversations: usize,
+    max_conversation_id: i64,
+    max_message_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetedSemanticWatchOnceMode {
+    RebuildAll,
+    AppendToExisting,
+    AlreadyCovered,
+}
+
+#[derive(Debug)]
+struct TargetedSemanticWatchOnceSelection {
+    mode: TargetedSemanticWatchOnceMode,
+    inputs: Vec<EmbeddingInput>,
+    raw_max_message_id: Option<i64>,
+    tier: SemanticTierKind,
+    index_path: PathBuf,
+    total_conversations: u64,
+    current_db_fingerprint: String,
+    manifest_before_db_fingerprint: Option<String>,
+    reason: &'static str,
+}
+
+fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
+    opts.semantic
+        && !opts.watch
+        && !opts.full
+        && !opts.force_rebuild
+        && !opts.build_hnsw
+        && opts
+            .watch_once_paths
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty())
+}
+
+fn parse_semantic_content_fingerprint(raw: &str) -> Option<SemanticContentFingerprint> {
+    let mut parts = raw.strip_prefix("content-v1:")?.split(':');
+    let total_conversations = parts.next()?.parse::<usize>().ok()?;
+    let max_conversation_id = parts.next()?.parse::<i64>().ok()?;
+    let max_message_id = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(SemanticContentFingerprint {
+        total_conversations,
+        max_conversation_id,
+        max_message_id,
+    })
+}
+
+fn semantic_artifact_for_tier(
+    manifest: &SemanticManifest,
+    tier: SemanticTierKind,
+) -> Option<&ArtifactRecord> {
+    match tier {
+        SemanticTierKind::Fast => manifest.fast_tier.as_ref(),
+        SemanticTierKind::Quality => manifest.quality_tier.as_ref(),
+    }
+}
+
+fn semantic_artifact_index_path(data_dir: &Path, artifact: &ArtifactRecord) -> Result<PathBuf> {
+    let path = PathBuf::from(&artifact.index_path);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+
+    let mut resolved = data_dir.to_path_buf();
+    for component in path.components() {
+        let std::path::Component::Normal(part) = component else {
+            anyhow::bail!(
+                "semantic watch-once cannot use unsafe relative vector artifact path {}",
+                artifact.index_path
+            );
+        };
+        resolved.push(part);
+    }
+    Ok(resolved)
+}
+
+fn validate_semantic_watch_once_artifact(
+    data_dir: &Path,
+    artifact: &ArtifactRecord,
+    indexer: &SemanticIndexer,
+    tier: SemanticTierKind,
+) -> Result<PathBuf> {
+    if !artifact.ready {
+        anyhow::bail!("semantic watch-once cannot reuse artifact that is not ready");
+    }
+    let artifact_matches_indexer = artifact.tier.eq(&tier)
+        && artifact.embedder_id.as_str().eq(indexer.embedder_id())
+        && artifact.dimension.eq(&indexer.embedder_dimension())
+        && artifact.schema_version.eq(&SEMANTIC_SCHEMA_VERSION)
+        && artifact.chunking_version.eq(&CHUNKING_STRATEGY_VERSION);
+    if !artifact_matches_indexer {
+        anyhow::bail!(
+            "semantic watch-once cannot prove coverage from incompatible semantic artifact"
+        );
+    }
+
+    let index_path = semantic_artifact_index_path(data_dir, artifact)?;
+    let canonical_index_path = vector_index_path(data_dir, indexer.embedder_id());
+    if !index_path.eq(&canonical_index_path) {
+        anyhow::bail!(
+            "semantic watch-once cannot append to non-canonical vector path {}; expected {}",
+            index_path.display(),
+            canonical_index_path.display()
+        );
+    }
+    let index = FsVectorIndex::open(&index_path).map_err(|err| {
+        anyhow::anyhow!(
+            "semantic watch-once cannot open existing vector artifact {}: {err}",
+            index_path.display()
+        )
+    })?;
+    let observed_docs = u64::try_from(index.record_count()).unwrap_or(u64::MAX);
+    if !observed_docs.eq(&artifact.doc_count) {
+        anyhow::bail!(
+            "semantic watch-once cannot prove existing vector prefix: manifest doc_count={} but index has {} records",
+            artifact.doc_count,
+            observed_docs
+        );
+    }
+    Ok(index_path)
+}
+
+fn semantic_artifact_is_append_only_prefix(
+    storage: &FrankenStorage,
+    artifact_fingerprint: SemanticContentFingerprint,
+    current_fingerprint: SemanticContentFingerprint,
+) -> Result<bool> {
+    if artifact_fingerprint.total_conversations > current_fingerprint.total_conversations
+        || artifact_fingerprint.max_conversation_id > current_fingerprint.max_conversation_id
+        || artifact_fingerprint.max_message_id > current_fingerprint.max_message_id
+    {
+        return Ok(false);
+    }
+
+    let prefix_conversations: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*)
+             FROM conversations
+             WHERE id <= ?1",
+            &[ParamValue::from(artifact_fingerprint.max_conversation_id)],
+            |row| row.get_typed(0),
+        )
+        .context("checking semantic watch-once prefix conversation count")?;
+    let observed_prefix_conversations =
+        usize::try_from(prefix_conversations.max(0)).unwrap_or(usize::MAX);
+    Ok(observed_prefix_conversations.eq(&artifact_fingerprint.total_conversations))
+}
+
+fn filter_semantic_watch_once_inputs(inputs: &mut Vec<EmbeddingInput>) {
+    inputs.retain(|message| {
+        !is_hard_message_noise(semantic_role_name(message.role), &message.content)
+    });
+}
+
+fn select_targeted_semantic_watch_once_inputs(
+    storage: &FrankenStorage,
+    data_dir: &Path,
+    indexer: &SemanticIndexer,
+    pre_watch_conversations: usize,
+) -> Result<TargetedSemanticWatchOnceSelection> {
+    let total_conversations = count_total_conversations_exact(storage)?;
+    if total_conversations == 0 {
+        anyhow::bail!(
+            "semantic watch-once indexed zero conversations; refusing to publish semantic success"
+        );
+    }
+    let current_db_fingerprint = lexical_rebuild_content_fingerprint(storage, total_conversations)?;
+    let current_fingerprint = parse_semantic_content_fingerprint(&current_db_fingerprint)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "semantic watch-once could not parse current DB fingerprint {current_db_fingerprint}"
+            )
+        })?;
+    let tier = semantic_tier_for_embedder_id(indexer.embedder_id()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "semantic watch-once cannot publish unknown embedder tier for {}",
+            indexer.embedder_id()
+        )
+    })?;
+    let manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
+        anyhow::anyhow!("loading semantic manifest for semantic watch-once: {err}")
+    })?;
+    let artifact = semantic_artifact_for_tier(&manifest, tier)
+        .filter(|artifact| artifact.embedder_id.as_str().eq(indexer.embedder_id()))
+        .cloned();
+    let manifest_before_db_fingerprint = artifact
+        .as_ref()
+        .map(|artifact| artifact.db_fingerprint.clone());
+
+    if let Some(artifact) = artifact.as_ref()
+        && artifact.db_fingerprint.eq(&current_db_fingerprint)
+    {
+        let index_path = validate_semantic_watch_once_artifact(data_dir, artifact, indexer, tier)?;
+        return Ok(TargetedSemanticWatchOnceSelection {
+            mode: TargetedSemanticWatchOnceMode::AlreadyCovered,
+            inputs: Vec::new(),
+            raw_max_message_id: (current_fingerprint.max_message_id > 0)
+                .then_some(current_fingerprint.max_message_id),
+            tier,
+            index_path,
+            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
+            current_db_fingerprint,
+            manifest_before_db_fingerprint,
+            reason: "semantic_artifact_already_covers_db",
+        });
+    }
+
+    if pre_watch_conversations == 0 {
+        let mut inputs = packet_embedding_inputs_from_storage(storage)?;
+        let raw_max_message_id = inputs
+            .iter()
+            .filter_map(|input| i64::try_from(input.message_id).ok())
+            .max()
+            .or_else(|| {
+                (current_fingerprint.max_message_id > 0)
+                    .then_some(current_fingerprint.max_message_id)
+            });
+        filter_semantic_watch_once_inputs(&mut inputs);
+        return Ok(TargetedSemanticWatchOnceSelection {
+            mode: TargetedSemanticWatchOnceMode::RebuildAll,
+            inputs,
+            raw_max_message_id,
+            tier,
+            index_path: vector_index_path(data_dir, indexer.embedder_id()),
+            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
+            current_db_fingerprint,
+            manifest_before_db_fingerprint,
+            reason: "fresh_watch_once_db",
+        });
+    }
+
+    let artifact = artifact.ok_or_else(|| {
+        anyhow::anyhow!(
+            "semantic watch-once cannot prove bounded coverage: no existing {} artifact for populated DB",
+            tier.as_str()
+        )
+    })?;
+    let artifact_fingerprint = parse_semantic_content_fingerprint(&artifact.db_fingerprint)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "semantic watch-once cannot parse existing artifact fingerprint {}",
+                artifact.db_fingerprint
+            )
+        })?;
+    let artifact_fingerprint_conversations =
+        u64::try_from(artifact_fingerprint.total_conversations).unwrap_or(u64::MAX);
+    if !artifact
+        .conversation_count
+        .eq(&artifact_fingerprint_conversations)
+    {
+        anyhow::bail!(
+            "semantic watch-once cannot prove existing vector prefix: manifest conversation_count={} but fingerprint has {} conversations",
+            artifact.conversation_count,
+            artifact_fingerprint.total_conversations
+        );
+    }
+    let index_path = validate_semantic_watch_once_artifact(data_dir, &artifact, indexer, tier)?;
+    if !semantic_artifact_is_append_only_prefix(storage, artifact_fingerprint, current_fingerprint)?
+    {
+        anyhow::bail!(
+            "semantic watch-once cannot prove bounded coverage: existing semantic artifact is not an append-only prefix of the current DB"
+        );
+    }
+
+    let mut batch =
+        packet_embedding_inputs_from_storage_since(storage, artifact_fingerprint.max_message_id)?;
+    let raw_max_message_id = batch.raw_max_message_id.or_else(|| {
+        (current_fingerprint.max_message_id > 0).then_some(current_fingerprint.max_message_id)
+    });
+    filter_semantic_watch_once_inputs(&mut batch.inputs);
+    Ok(TargetedSemanticWatchOnceSelection {
+        mode: TargetedSemanticWatchOnceMode::AppendToExisting,
+        inputs: batch.inputs,
+        raw_max_message_id,
+        tier,
+        index_path,
+        total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
+        current_db_fingerprint,
+        manifest_before_db_fingerprint,
+        reason: "semantic_artifact_is_append_only_prefix",
+    })
+}
+
+fn publish_semantic_watch_once_artifact(
+    data_dir: &Path,
+    indexer: &SemanticIndexer,
+    selection: &TargetedSemanticWatchOnceSelection,
+    doc_count: u64,
+    build_started_at_ms: i64,
+) -> Result<()> {
+    let size_bytes = fs::metadata(&selection.index_path)
+        .with_context(|| {
+            format!(
+                "stat semantic watch-once index {}",
+                selection.index_path.display()
+            )
+        })?
+        .len();
+    let relative_index_path = selection
+        .index_path
+        .strip_prefix(data_dir)
+        .unwrap_or(selection.index_path.as_path())
+        .to_string_lossy()
+        .to_string();
+    let mut manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
+        anyhow::anyhow!("loading semantic manifest for semantic watch-once publish: {err}")
+    })?;
+    manifest.publish_artifact(ArtifactRecord {
+        tier: selection.tier,
+        embedder_id: indexer.embedder_id().to_string(),
+        model_revision: semantic_model_revision_for_embedder_id(indexer.embedder_id()),
+        schema_version: SEMANTIC_SCHEMA_VERSION,
+        chunking_version: CHUNKING_STRATEGY_VERSION,
+        dimension: indexer.embedder_dimension(),
+        doc_count,
+        conversation_count: selection.total_conversations,
+        db_fingerprint: selection.current_db_fingerprint.clone(),
+        index_path: relative_index_path,
+        size_bytes,
+        started_at_ms: build_started_at_ms,
+        completed_at_ms: semantic_indexing_now_ms(),
+        ready: true,
+    });
+    manifest.refresh_backlog(
+        selection.total_conversations,
+        &selection.current_db_fingerprint,
+    );
+    manifest
+        .save(data_dir)
+        .map_err(|err| anyhow::anyhow!("saving semantic watch-once manifest: {err}"))
+}
+
+fn run_targeted_semantic_watch_once_publish(
+    embedder: &str,
+    data_dir: &Path,
+    storage: &Mutex<FrankenStorage>,
+    indexed_conversations: usize,
+    pre_watch_conversations: usize,
+) -> Result<SemanticWatchOnceStats> {
+    if indexed_conversations == 0 {
+        anyhow::bail!(
+            "semantic watch-once indexed zero conversations; refusing to publish semantic success"
+        );
+    }
+
+    let indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
+    let selection = {
+        let storage = storage.lock().map_err(|err| {
+            anyhow::anyhow!("lock storage for semantic watch-once selection: {err}")
+        })?;
+        select_targeted_semantic_watch_once_inputs(
+            &storage,
+            data_dir,
+            &indexer,
+            pre_watch_conversations,
+        )?
+    };
+    let selected_docs = selection.inputs.len();
+    let build_started_at_ms = semantic_indexing_now_ms();
+    let embedded = if selection.inputs.is_empty() {
+        Vec::new()
+    } else {
+        indexer.embed_messages(&selection.inputs)?
+    };
+    let embedded_docs = embedded.len();
+
+    let doc_count = match selection.mode {
+        TargetedSemanticWatchOnceMode::AlreadyCovered => {
+            let index = FsVectorIndex::open(&selection.index_path).map_err(|err| {
+                anyhow::anyhow!(
+                    "open already-covered semantic watch-once index {}: {err}",
+                    selection.index_path.display()
+                )
+            })?;
+            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+        }
+        TargetedSemanticWatchOnceMode::RebuildAll => {
+            let index = indexer.build_and_save_index(embedded, data_dir)?;
+            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+        }
+        TargetedSemanticWatchOnceMode::AppendToExisting => {
+            if embedded_docs > 0 {
+                let appended = indexer.append_to_index(embedded, data_dir)?;
+                if !appended.eq(&embedded_docs) {
+                    anyhow::bail!(
+                        "semantic watch-once append count mismatch: appended {appended}, embedded {embedded_docs}"
+                    );
+                }
+            }
+            let index = FsVectorIndex::open(&selection.index_path).map_err(|err| {
+                anyhow::anyhow!(
+                    "open appended semantic watch-once index {}: {err}",
+                    selection.index_path.display()
+                )
+            })?;
+            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+        }
+    };
+
+    publish_semantic_watch_once_artifact(
+        data_dir,
+        &indexer,
+        &selection,
+        doc_count,
+        build_started_at_ms,
+    )?;
+    if let Some(raw_max_message_id) = selection.raw_max_message_id {
+        update_incremental_semantic_watermark(
+            storage,
+            raw_max_message_id,
+            "updating semantic watch-once watermark",
+        )?;
+    }
+
+    Ok(SemanticWatchOnceStats {
+        published: true,
+        selected_docs,
+        embedded_docs,
+        tier: selection.tier.as_str().to_string(),
+        vector_index_path: selection.index_path.display().to_string(),
+        manifest_before_db_fingerprint: selection.manifest_before_db_fingerprint,
+        manifest_after_db_fingerprint: Some(selection.current_db_fingerprint),
+        reason: selection.reason.to_string(),
+    })
+}
+
 fn update_incremental_semantic_watermark(
     storage: &Mutex<FrankenStorage>,
     raw_max_id: i64,
@@ -12865,7 +15095,7 @@ fn open_storage_for_index(
             Err(err) => {
                 return Err(canonical_archive_unhealthy_for_index_error(
                     db_path,
-                    &format!("{err:#}"),
+                    &index_storage_open_error_reason(&err),
                 ));
             }
         }
@@ -12896,7 +15126,7 @@ fn open_storage_for_index(
             }
             Err(err) => Err(canonical_archive_unhealthy_for_index_error(
                 db_path,
-                &format!("{err:#}"),
+                &index_storage_open_error_reason(&err),
             )),
         }
     } else {
@@ -12904,6 +15134,13 @@ fn open_storage_for_index(
             .map(|storage| (storage, false, full_index))
             .with_context(|| format!("creating frankensqlite storage at {}", db_path.display()))
     }
+}
+
+fn index_storage_open_error_reason(err: &anyhow::Error) -> String {
+    let message = format!("{err:#}");
+    crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
+        .map(|fts_err| fts_err.to_string())
+        .unwrap_or(message)
 }
 
 fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
@@ -13019,12 +15256,52 @@ fn orphan_fk_cleanup_failed_index_error(db_path: &Path, err: &anyhow::Error) -> 
 
 const INDEX_MIN_FREE_SPACE_BYTES: u64 = 512 * 1024 * 1024;
 
-fn ensure_index_storage_headroom(data_dir: &Path, db_path: &Path) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexStorageHeadroomRequirement {
+    IncrementalStartup,
+    AuthoritativeLexicalRebuild,
+}
+
+fn index_startup_storage_headroom_requirement(
+    full: bool,
+    force_rebuild: bool,
+) -> IndexStorageHeadroomRequirement {
+    if full || force_rebuild {
+        IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild
+    } else {
+        IndexStorageHeadroomRequirement::IncrementalStartup
+    }
+}
+
+fn ensure_index_startup_storage_headroom(opts: &IndexOptions) -> Result<()> {
+    ensure_index_storage_headroom(
+        &opts.data_dir,
+        &opts.db_path,
+        index_startup_storage_headroom_requirement(opts.full, opts.force_rebuild),
+    )
+}
+
+fn ensure_authoritative_lexical_rebuild_storage_headroom(
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<()> {
+    ensure_index_storage_headroom(
+        data_dir,
+        db_path,
+        IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+    )
+}
+
+fn ensure_index_storage_headroom(
+    data_dir: &Path,
+    db_path: &Path,
+    requirement: IndexStorageHeadroomRequirement,
+) -> Result<()> {
     if index_disk_headroom_check_disabled() {
         return Ok(());
     }
 
-    let required = required_index_headroom_bytes(db_path);
+    let required = required_index_headroom_bytes(db_path, requirement);
     for probe_path in existing_headroom_probe_paths(data_dir, db_path) {
         let available = fs2::available_space(&probe_path).with_context(|| {
             format!(
@@ -13111,9 +15388,17 @@ fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn required_index_headroom_bytes(db_path: &Path) -> u64 {
-    let db_bundle_bytes = database_bundle_size_bytes(db_path);
-    INDEX_MIN_FREE_SPACE_BYTES.max(db_bundle_bytes.saturating_mul(2))
+fn required_index_headroom_bytes(
+    db_path: &Path,
+    requirement: IndexStorageHeadroomRequirement,
+) -> u64 {
+    match requirement {
+        IndexStorageHeadroomRequirement::IncrementalStartup => INDEX_MIN_FREE_SPACE_BYTES,
+        IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild => {
+            let db_bundle_bytes = database_bundle_size_bytes(db_path);
+            INDEX_MIN_FREE_SPACE_BYTES.max(db_bundle_bytes.saturating_mul(2))
+        }
+    }
 }
 
 fn database_bundle_size_bytes(db_path: &Path) -> u64 {
@@ -13313,6 +15598,24 @@ pub(crate) fn rebuild_tantivy_from_db(
         total_conversations,
         progress,
         LexicalRebuildStartupOptions::default(),
+        None,
+    )
+}
+
+fn rebuild_tantivy_from_db_with_progress_bump(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<Arc<IndexingProgress>>,
+    progress_bump: Arc<AtomicI64>,
+) -> Result<LexicalRebuildOutcome> {
+    rebuild_tantivy_from_db_with_options(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress,
+        LexicalRebuildStartupOptions::default(),
+        Some(progress_bump),
     )
 }
 
@@ -13350,6 +15653,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         data_dir.to_path_buf(),
         index_run_lock_heartbeat_interval(),
         Arc::clone(&index_run_lock.metadata_write_lock),
+        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
     );
 
     let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
@@ -13402,18 +15706,56 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         )
     })?;
 
-    let rebuild =
-        rebuild_tantivy_from_db_deferred_startup(db_path, data_dir, total_conversations, progress)?;
+    let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress,
+        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
+    )?;
     Ok(SearchLexicalRepairOutcome {
         indexed_docs: rebuild.indexed_docs,
     })
 }
 
+#[cfg(test)]
 fn rebuild_tantivy_from_db_deferred_startup(
     db_path: &Path,
     data_dir: &Path,
     total_conversations: usize,
     progress: Option<Arc<IndexingProgress>>,
+) -> Result<LexicalRebuildOutcome> {
+    rebuild_tantivy_from_db_deferred_startup_with_options(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress,
+        None,
+    )
+}
+
+fn rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<Arc<IndexingProgress>>,
+    progress_bump: Arc<AtomicI64>,
+) -> Result<LexicalRebuildOutcome> {
+    rebuild_tantivy_from_db_deferred_startup_with_options(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress,
+        Some(progress_bump),
+    )
+}
+
+fn rebuild_tantivy_from_db_deferred_startup_with_options(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<Arc<IndexingProgress>>,
+    progress_bump: Option<Arc<AtomicI64>>,
 ) -> Result<LexicalRebuildOutcome> {
     rebuild_tantivy_from_db_with_options(
         db_path,
@@ -13423,6 +15765,7 @@ fn rebuild_tantivy_from_db_deferred_startup(
         LexicalRebuildStartupOptions {
             defer_initial_content_fingerprint: true,
         },
+        progress_bump,
     )
 }
 
@@ -15236,9 +17579,11 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     producer_handle: JoinHandle<()>,
     mut perf_profile: Option<LexicalRebuildPerfProfile>,
     rebuild_profile_started: Option<Instant>,
+    progress_bump: Option<Arc<AtomicI64>>,
 ) -> Result<LexicalRebuildOutcome> {
     let persist_initial_checkpoint_started = Instant::now();
     persist_lexical_rebuild_state_for_active_run_start(index_path, &rebuild_state)?;
+    bump_index_run_lock_progress_if_present(progress_bump.as_ref());
     log_lexical_rebuild_prep_profile_step(
         prep_profile_started,
         persist_initial_checkpoint_started,
@@ -15530,6 +17875,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 if let Some(p) = &progress {
                     p.current.store(*processed_conversations, Ordering::Relaxed);
                 }
+                bump_index_run_lock_progress_if_present(progress_bump.as_ref());
                 if let Some(transition) = responsiveness_controller.record_first_durable_commit() {
                     apply_lexical_rebuild_budget_transition(
                         transition,
@@ -15583,28 +17929,47 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             let pipeline_backlog_paused = pending_shard_build_message_bytes
                 >= pending_shard_build_max_message_bytes
                 || pending_shard_build_jobs.len() >= pending_shard_build_max_jobs;
-            if pipeline_backlog_paused && !pipeline_backlog_pause_logged {
+            let pending_merge_jobs = merge_coordinator.pending_merge_jobs();
+            let pause_pipeline_handoff = should_pause_staged_lexical_pipeline_handoff(
+                pipeline_backlog_paused,
+                active_shard_build_jobs,
+                pending_merge_jobs,
+            );
+            if pause_pipeline_handoff && !pipeline_backlog_pause_logged {
                 tracing::info!(
                     pending_shard_build_jobs = pending_shard_build_jobs.len(),
                     pending_shard_build_max_jobs,
                     pending_shard_build_message_bytes,
                     pending_shard_build_max_message_bytes,
                     active_shard_build_jobs,
+                    pending_merge_jobs,
                     "pausing lexical rebuild producer handoff while staged shard-build backlog drains"
                 );
                 pipeline_backlog_pause_logged = true;
-            } else if !pipeline_backlog_paused && pipeline_backlog_pause_logged {
+            } else if !pause_pipeline_handoff && pipeline_backlog_pause_logged {
                 tracing::info!(
                     pending_shard_build_jobs = pending_shard_build_jobs.len(),
                     pending_shard_build_max_jobs,
                     pending_shard_build_message_bytes,
                     pending_shard_build_max_message_bytes,
                     active_shard_build_jobs,
-                    "resuming lexical rebuild producer handoff after staged shard-build backlog drained"
+                    pending_merge_jobs,
+                    "resuming lexical rebuild producer handoff after staged backlog drained or lost its async wake source"
                 );
                 pipeline_backlog_pause_logged = false;
             }
-            let active_pipeline_rx = if pipeline_backlog_paused {
+            if pipeline_backlog_paused && !pause_pipeline_handoff {
+                tracing::debug!(
+                    pending_shard_build_jobs = pending_shard_build_jobs.len(),
+                    pending_shard_build_max_jobs,
+                    pending_shard_build_message_bytes,
+                    pending_shard_build_max_message_bytes,
+                    active_shard_build_jobs,
+                    pending_merge_jobs,
+                    "continuing to drain lexical rebuild producer handoff because no staged shard or merge job can wake the sink"
+                );
+            }
+            let active_pipeline_rx = if pause_pipeline_handoff {
                 &never_pipeline_rx
             } else {
                 &pipeline_rx
@@ -15682,6 +18047,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         progress_heartbeat_interval_conversations,
                         &mut last_progress_persist,
                         progress_heartbeat_interval,
+                        progress_bump.as_ref(),
                         perf_profile.as_mut(),
                     )?;
                 }
@@ -15689,6 +18055,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                     match message {
                         Ok(LexicalRebuildShardMergeMessage::Built(result)) => {
                             merge_coordinator.complete_merge(result, &merge_work_tx)?;
+                            bump_index_run_lock_progress_if_present(progress_bump.as_ref());
                         }
                         Ok(LexicalRebuildShardMergeMessage::Error {
                             output_level,
@@ -15739,6 +18106,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         progress_heartbeat_interval_conversations,
                         &mut last_progress_persist,
                         progress_heartbeat_interval,
+                        progress_bump.as_ref(),
                         perf_profile.as_mut(),
                     )?;
                 }
@@ -15800,6 +18168,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 packet.flow_reservation_bytes = 0;
                                 current_shard_packets.push(packet);
                             }
+                            bump_index_run_lock_progress_if_present(progress_bump.as_ref());
                             // The byte limiter covers producer-prepared pages
                             // waiting for this consumer. After packets enter
                             // the staged shard buffers, the pending-shard
@@ -15874,6 +18243,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 progress_heartbeat_interval_conversations,
                                 &mut last_progress_persist,
                                 progress_heartbeat_interval,
+                                progress_bump.as_ref(),
                                 perf_profile.as_mut(),
                             )?;
                         }
@@ -15911,6 +18281,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 progress_heartbeat_interval_conversations,
                                 &mut last_progress_persist,
                                 progress_heartbeat_interval,
+                                progress_bump.as_ref(),
                                 perf_profile.as_mut(),
                             )?;
                         }
@@ -16034,6 +18405,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         progress_heartbeat_interval_conversations,
                         &mut last_progress_persist,
                         progress_heartbeat_interval,
+                        progress_bump.as_ref(),
                         perf_profile.as_mut(),
                     )?;
                 }
@@ -16041,6 +18413,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                     match message {
                         Ok(LexicalRebuildShardMergeMessage::Built(result)) => {
                             merge_coordinator.complete_merge(result, &merge_work_tx)?;
+                            bump_index_run_lock_progress_if_present(progress_bump.as_ref());
                         }
                         Ok(LexicalRebuildShardMergeMessage::Error {
                             output_level,
@@ -16091,6 +18464,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         progress_heartbeat_interval_conversations,
                         &mut last_progress_persist,
                         progress_heartbeat_interval,
+                        progress_bump.as_ref(),
                         perf_profile.as_mut(),
                     )?;
                 }
@@ -16215,6 +18589,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         progress_heartbeat_interval_conversations,
         &mut last_progress_persist,
         progress_heartbeat_interval,
+        progress_bump.as_ref(),
         perf_profile.as_mut(),
     )?;
 
@@ -16331,6 +18706,7 @@ fn rebuild_tantivy_from_db_with_options(
     total_conversations: usize,
     progress: Option<Arc<IndexingProgress>>,
     options: LexicalRebuildStartupOptions,
+    progress_bump: Option<Arc<AtomicI64>>,
 ) -> Result<LexicalRebuildOutcome> {
     let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
     let prep_started = Instant::now();
@@ -16685,6 +19061,7 @@ fn rebuild_tantivy_from_db_with_options(
             producer_handle,
             perf_profile,
             rebuild_profile_started,
+            progress_bump,
         );
     }
 
@@ -16835,6 +19212,7 @@ fn rebuild_tantivy_from_db_with_options(
                 if let Some(p) = &progress {
                     p.current.fetch_add(1, Ordering::Relaxed);
                 }
+                bump_index_run_lock_progress_if_present(progress_bump.as_ref());
                 refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
                     &mut latest_pipeline_runtime,
                     progress.as_ref(),
@@ -17343,6 +19721,7 @@ fn ingest_batch(
         progress,
         lexical_strategy,
         defer_checkpoints,
+        None,
     )?;
     if outcome.lexical_update_deferred {
         anyhow::bail!(
@@ -17352,6 +19731,7 @@ fn ingest_batch(
     Ok(outcome.canonical_mutations)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_batch_detailed(
     storage: &FrankenStorage,
     t_index: Option<&mut TantivyIndex>,
@@ -17360,6 +19740,7 @@ fn ingest_batch_detailed(
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     let trace_span =
         robot_trace_ingest_start("ingest_batch", convs, lexical_strategy, defer_checkpoints);
@@ -17392,6 +19773,7 @@ fn ingest_batch_detailed(
     if let Some(p) = progress {
         p.current.fetch_add(convs.len(), Ordering::Relaxed);
     }
+    bump_index_run_lock_progress_if_present(progress_bump);
     robot_trace_ingest_finish(
         trace_span,
         "ok",
@@ -17406,21 +19788,43 @@ fn ingest_batch_detailed(
         },
         quarantined_conversations: 0,
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
+        scanned_connectors: BTreeSet::new(),
+        scan_had_errors: false,
     })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn ingest_non_watch_batch_with_oom_split(
     storage: &FrankenStorage,
-    t_index: Option<&mut TantivyIndex>,
+    mut t_index: Option<&mut TantivyIndex>,
     data_dir: &Path,
     convs: &[NormalizedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     if convs.is_empty() {
         return Ok(NonWatchIngestOutcome::default());
+    }
+
+    let chunk_size = non_watch_ingest_chunk_size();
+    if convs.len() > chunk_size {
+        let mut merged = NonWatchIngestOutcome::default();
+        for chunk in convs.chunks(chunk_size) {
+            let outcome = ingest_non_watch_batch_with_oom_split(
+                storage,
+                t_index.as_deref_mut(),
+                data_dir,
+                chunk,
+                progress,
+                lexical_strategy,
+                defer_checkpoints,
+                progress_bump,
+            )?;
+            merged = merged.accumulate(outcome);
+        }
+        return Ok(merged);
     }
 
     let first_attempt = ingest_non_watch_batch_once(
@@ -17431,6 +19835,7 @@ fn ingest_non_watch_batch_with_oom_split(
         progress,
         lexical_strategy,
         defer_checkpoints,
+        progress_bump,
     );
 
     match first_attempt {
@@ -17442,6 +19847,7 @@ fn ingest_non_watch_batch_with_oom_split(
             progress,
             lexical_strategy,
             defer_checkpoints,
+            progress_bump,
             error,
         ),
         Err(error) => Err(error),
@@ -17457,6 +19863,7 @@ fn ingest_non_watch_batch_once(
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
+    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     if should_inject_non_watch_ingest_test_oom(convs) {
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
@@ -17465,7 +19872,7 @@ fn ingest_non_watch_batch_once(
         return Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory));
     }
 
-    ingest_batch_detailed(
+    let outcome = ingest_batch_detailed(
         storage,
         t_index,
         data_dir,
@@ -17473,7 +19880,15 @@ fn ingest_non_watch_batch_once(
         progress,
         lexical_strategy,
         defer_checkpoints,
-    )
+        progress_bump,
+    )?;
+    clear_poison_conversations_after_successful_ingest(
+        data_dir,
+        INDEX_INGEST_POISON_FILE,
+        "index-ingest-out-of-memory",
+        convs,
+    );
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -17484,6 +19899,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
+    progress_bump: Option<&Arc<AtomicI64>>,
     error: anyhow::Error,
 ) -> Result<NonWatchIngestOutcome> {
     if lexical_population_strategy_requires_inline_tantivy(lexical_strategy) {
@@ -17500,6 +19916,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             progress,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             defer_checkpoints,
+            progress_bump,
         ) {
             Ok(mut outcome) => {
                 outcome.lexical_update_deferred = true;
@@ -17513,6 +19930,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
                     progress,
                     LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                     defer_checkpoints,
+                    progress_bump,
                     retry_error,
                 )
             }
@@ -17537,6 +19955,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             progress,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             defer_checkpoints,
+            progress_bump,
         )?;
         let right = ingest_non_watch_batch_with_oom_split(
             storage,
@@ -17546,6 +19965,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             progress,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             defer_checkpoints,
+            progress_bump,
         )?;
         left = left.accumulate(right);
         left.lexical_update_deferred = true;
@@ -17557,6 +19977,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
     if let Some(progress) = progress {
         progress.current.fetch_add(1, Ordering::Relaxed);
     }
+    bump_index_run_lock_progress_if_present(progress_bump);
     tracing::warn!(
         agent = %conv.agent_slug,
         external_id = conv.external_id.as_deref().unwrap_or(""),
@@ -17568,6 +19989,8 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         canonical_mutations: CanonicalMutationCounts::default(),
         quarantined_conversations: 1,
         lexical_update_deferred: true,
+        scanned_connectors: BTreeSet::new(),
+        scan_had_errors: false,
     })
 }
 
@@ -17614,6 +20037,13 @@ fn ingest_batch_with_semantic_delta(
             return Err(error);
         }
     };
+
+    clear_poison_conversations_after_successful_ingest(
+        data_dir,
+        WATCH_INGEST_POISON_FILE,
+        "watch-ingest-out-of-memory",
+        convs,
+    );
 
     if let Some(p) = progress {
         p.current.fetch_add(convs.len(), Ordering::Relaxed);
@@ -17936,6 +20366,7 @@ fn record_poison_conversation(
         "first_quarantined_at_ms": first_quarantined_at_ms,
         "last_attempt_at_ms": now_ms,
         "attempt_count": attempt_count,
+        "cass_version_at_quarantine": current_cass_version(),
         "reason": reason,
         "error_kind": "out-of-memory",
         "last_error": full_error_chain,
@@ -17975,6 +20406,344 @@ fn record_poison_conversation(
         now_ms,
     );
     Ok(())
+}
+
+fn current_cass_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleIndexIngestQuarantineRetry {
+    stale_records: usize,
+    legacy_records: usize,
+    previous_versions: Vec<String>,
+}
+
+#[derive(Default)]
+struct StalePoisonVersionAccumulator {
+    stale_keys: BTreeSet<(String, i64)>,
+    legacy_keys: BTreeSet<(String, i64)>,
+    previous_versions: BTreeSet<String>,
+    /// Keys that have been observed with `cass_version == current_version` in
+    /// at least one storage surface (JSONL or structured).  A key here must
+    /// not be promoted to `stale_keys` even if a *second* observation from a
+    /// different surface reports it as `None` (legacy) or an older version.
+    ///
+    /// Without this, the cross-surface race where
+    /// `mark_stale_index_ingest_jsonl_retry_attempted` succeeds but
+    /// `mark_stale_index_ingest_structured_retry_attempted`'s `state.save()`
+    /// fails would leave the structured record at `None`, causing
+    /// `stale_index_ingest_quarantine_version_retry` to signal a retry every
+    /// subsequent run even though the JSONL surface already records the retry
+    /// as complete for the current version — an unbounded retry storm
+    /// (cass#261).
+    already_current_keys: BTreeSet<(String, i64)>,
+}
+
+impl StalePoisonVersionAccumulator {
+    fn observe(&mut self, key: (String, i64), cass_version: Option<&str>, current_version: &str) {
+        match cass_version {
+            Some(version) if version == current_version => {
+                // This key is already marked as retried under the current
+                // binary.  Record it so that a stale observation from another
+                // storage surface cannot re-promote it to stale_keys.
+                self.stale_keys.remove(&key);
+                self.legacy_keys.remove(&key);
+                self.already_current_keys.insert(key);
+            }
+            Some(version) => {
+                if !self.already_current_keys.contains(&key) {
+                    self.stale_keys.insert(key);
+                    self.previous_versions.insert(version.to_string());
+                }
+            }
+            None => {
+                if !self.already_current_keys.contains(&key) {
+                    self.legacy_keys.insert(key.clone());
+                    self.stale_keys.insert(key);
+                    self.previous_versions.insert("unknown".to_string());
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> Option<StaleIndexIngestQuarantineRetry> {
+        (!self.stale_keys.is_empty()).then(|| StaleIndexIngestQuarantineRetry {
+            stale_records: self.stale_keys.len(),
+            legacy_records: self.legacy_keys.len(),
+            previous_versions: self.previous_versions.into_iter().collect(),
+        })
+    }
+}
+
+fn stale_index_ingest_quarantine_version_retry(
+    data_dir: &Path,
+) -> Result<Option<StaleIndexIngestQuarantineRetry>> {
+    let current_version = current_cass_version();
+    let mut accumulator = StalePoisonVersionAccumulator::default();
+    let path = data_dir.join("quarantine").join(INDEX_INGEST_POISON_FILE);
+    if path.exists() {
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("reading index ingest quarantine file {}", path.display()))?;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                continue;
+            };
+            if let Some(key) = poison_record_key_from_value(&value) {
+                accumulator.observe(key, poison_record_cass_version(&value), current_version);
+            }
+        }
+    }
+
+    let state = QuarantineState::load(data_dir);
+    for (key, record) in state.iter() {
+        if record.last_reason.starts_with("index-ingest-out-of-memory") {
+            accumulator.observe(
+                (key.conversation_id, i64::from(key.schema_version)),
+                record.cass_version_at_quarantine.as_deref(),
+                current_version,
+            );
+        }
+    }
+
+    Ok(accumulator.finish())
+}
+
+fn mark_stale_index_ingest_quarantine_retry_attempted(data_dir: &Path) -> Result<usize> {
+    let jsonl_marked = mark_stale_index_ingest_jsonl_retry_attempted(data_dir)?;
+    let structured_marked = mark_stale_index_ingest_structured_retry_attempted(data_dir);
+    Ok(jsonl_marked.saturating_add(structured_marked))
+}
+
+fn mark_stale_index_ingest_jsonl_retry_attempted(data_dir: &Path) -> Result<usize> {
+    let path = data_dir.join("quarantine").join(INDEX_INGEST_POISON_FILE);
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("reading index ingest quarantine file {}", path.display()))?;
+    let current_version = current_cass_version();
+    let mut retained_lines = Vec::new();
+    let mut marked = 0usize;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            retained_lines.push(trimmed.to_string());
+            continue;
+        };
+        let should_mark = poison_record_key_from_value(&value).is_some()
+            && poison_record_version_needs_retry(
+                poison_record_cass_version(&value),
+                current_version,
+            );
+        if should_mark && let Some(object) = value.as_object_mut() {
+            object.insert(
+                "cass_version_at_quarantine".to_string(),
+                serde_json::json!(current_version),
+            );
+            marked = marked.saturating_add(1);
+            retained_lines.push(value.to_string());
+        } else {
+            retained_lines.push(trimmed.to_string());
+        }
+    }
+
+    if marked == 0 {
+        return Ok(0);
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("opening ingest quarantine file {}", path.display()))?;
+    for line in retained_lines {
+        writeln!(file, "{line}")
+            .with_context(|| format!("rewriting ingest quarantine file {}", path.display()))?;
+    }
+    file.sync_all()
+        .with_context(|| format!("syncing ingest quarantine file {}", path.display()))?;
+    Ok(marked)
+}
+
+fn mark_stale_index_ingest_structured_retry_attempted(data_dir: &Path) -> usize {
+    let mut state = QuarantineState::load(data_dir);
+    if state.is_empty() {
+        return 0;
+    }
+
+    let current_version = current_cass_version();
+    let mut marked = 0usize;
+    for record in state.entries.values_mut() {
+        if record.last_reason.starts_with("index-ingest-out-of-memory")
+            && record.is_version_stale_for_retry(current_version)
+        {
+            record.cass_version_at_quarantine = Some(current_version.to_string());
+            marked = marked.saturating_add(1);
+        }
+    }
+    if marked == 0 {
+        return 0;
+    }
+    if let Err(err) = state.save(data_dir) {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            error = %err,
+            "failed to persist structured ingest quarantine retry marker"
+        );
+        return 0;
+    }
+    marked
+}
+
+fn clear_poison_conversations_after_successful_ingest(
+    data_dir: &Path,
+    file_name: &str,
+    reason: &str,
+    convs: &[NormalizedConversation],
+) {
+    if convs.is_empty() {
+        return;
+    }
+    let conversation_ids = convs
+        .iter()
+        .map(poison_conversation_id)
+        .collect::<BTreeSet<_>>();
+
+    let jsonl_cleared =
+        match clear_poison_jsonl_records(data_dir, file_name, reason, &conversation_ids) {
+            Ok(cleared) => cleared,
+            Err(err) => {
+                tracing::warn!(
+                    data_dir = %data_dir.display(),
+                    file_name,
+                    error = %err,
+                    "failed to clear successful ingest records from poison quarantine JSONL"
+                );
+                0
+            }
+        };
+    let structured_cleared =
+        clear_structured_poison_quarantine_records(data_dir, reason, &conversation_ids);
+
+    let cleared = jsonl_cleared.saturating_add(structured_cleared);
+    if cleared > 0 {
+        tracing::info!(
+            data_dir = %data_dir.display(),
+            file_name,
+            reason,
+            cleared,
+            "cleared poison quarantine records after successful ingest retry"
+        );
+    }
+}
+
+fn clear_poison_jsonl_records(
+    data_dir: &Path,
+    file_name: &str,
+    reason: &str,
+    conversation_ids: &BTreeSet<String>,
+) -> Result<usize> {
+    let path = data_dir.join("quarantine").join(file_name);
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("reading ingest quarantine file {}", path.display()))?;
+    let mut retained_lines = Vec::new();
+    let mut cleared = 0usize;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let should_clear = serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .and_then(|value| {
+                let record_reason_matches = value
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|record_reason| record_reason == reason);
+                record_reason_matches
+                    .then(|| poison_record_key_from_value(&value))
+                    .flatten()
+            })
+            .is_some_and(|(conversation_id, _)| conversation_ids.contains(&conversation_id));
+        if should_clear {
+            cleared = cleared.saturating_add(1);
+        } else {
+            retained_lines.push(trimmed.to_string());
+        }
+    }
+
+    if cleared == 0 {
+        return Ok(0);
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("opening ingest quarantine file {}", path.display()))?;
+    for line in retained_lines {
+        writeln!(file, "{line}")
+            .with_context(|| format!("rewriting ingest quarantine file {}", path.display()))?;
+    }
+    file.sync_all()
+        .with_context(|| format!("syncing ingest quarantine file {}", path.display()))?;
+    Ok(cleared)
+}
+
+fn clear_structured_poison_quarantine_records(
+    data_dir: &Path,
+    reason: &str,
+    conversation_ids: &BTreeSet<String>,
+) -> usize {
+    let mut state = QuarantineState::load(data_dir);
+    if state.is_empty() {
+        return 0;
+    }
+
+    let keys = state
+        .iter()
+        .filter(|(key, record)| {
+            conversation_ids.contains(&key.conversation_id)
+                && record.last_reason.starts_with(reason)
+        })
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return 0;
+    }
+
+    let mut cleared = 0usize;
+    for key in keys {
+        if state.clear(&key) {
+            cleared = cleared.saturating_add(1);
+        }
+    }
+    if let Err(err) = state.save(data_dir) {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            error = %err,
+            "failed to persist structured ingest quarantine cleanup"
+        );
+        return 0;
+    }
+    cleared
 }
 
 fn record_structured_poison_quarantine_state(
@@ -18077,6 +20846,18 @@ fn poison_record_key_from_value(value: &serde_json::Value) -> Option<(String, i6
         ),
         schema_version_at_quarantine,
     ))
+}
+
+fn poison_record_cass_version(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("cass_version_at_quarantine")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+}
+
+fn poison_record_version_needs_retry(cass_version: Option<&str>, current_version: &str) -> bool {
+    !matches!(cass_version, Some(version) if version == current_version)
 }
 
 fn poison_record_first_quarantined_at_ms(value: &serde_json::Value) -> Option<i64> {
@@ -18789,10 +21570,13 @@ fn reindex_paths_with_semantic_delta(
 
         // Provenance injection and path rewriting
         for conv in &mut convs {
-            inject_provenance(conv, &root.origin);
-            apply_workspace_rewrite(conv, &root);
-            compact_large_connector_extras("", conv);
-            attach_raw_mirror_capture(&opts.data_dir, conv);
+            prepare_conversation_for_ingest(
+                &opts.data_dir,
+                kind.slug(),
+                &root.origin,
+                Some(&root),
+                conv,
+            );
         }
         if !explicit_watch_once {
             sort_watch_conversations_for_watermark(&mut convs);
@@ -19772,6 +22556,9 @@ fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
         let cass = obj
             .entry("cass".to_string())
             .or_insert_with(|| serde_json::json!({}));
+        if !cass.is_object() {
+            *cass = serde_json::json!({});
+        }
         if let Some(cass_obj) = cass.as_object_mut() {
             cass_obj.insert(
                 "origin".to_string(),
@@ -19783,6 +22570,21 @@ fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
             );
         }
     }
+}
+
+fn prepare_conversation_for_ingest(
+    data_dir: &Path,
+    connector_name: &str,
+    origin: &Origin,
+    workspace_rewrite_root: Option<&ScanRoot>,
+    conv: &mut NormalizedConversation,
+) {
+    inject_provenance(conv, origin);
+    if let Some(root) = workspace_rewrite_root {
+        apply_workspace_rewrite(conv, root);
+    }
+    compact_large_connector_extras(connector_name, conv);
+    attach_raw_mirror_capture(data_dir, conv);
 }
 
 fn capture_connector_sources_before_parse(
@@ -20312,6 +23114,9 @@ pub fn apply_workspace_rewrite(conv: &mut NormalizedConversation, root: &ScanRoo
             let cass = obj
                 .entry("cass".to_string())
                 .or_insert_with(|| serde_json::json!({}));
+            if !cass.is_object() {
+                *cass = serde_json::json!({});
+            }
             if let Some(cass_obj) = cass.as_object_mut() {
                 cass_obj.insert(
                     "workspace_original".to_string(),
@@ -22716,6 +25521,318 @@ pub mod persist {
             );
         }
 
+        fn incremental_repair_policy_test_options(
+            data_dir: std::path::PathBuf,
+            db_path: std::path::PathBuf,
+        ) -> crate::indexer::IndexOptions {
+            crate::indexer::IndexOptions {
+                full: false,
+                force_rebuild: false,
+                watch: false,
+                watch_once_paths: None,
+                db_path,
+                data_dir,
+                semantic: false,
+                build_hnsw: false,
+                embedder: "fnv1a-384".to_string(),
+                progress: None,
+                watch_interval_secs: 30,
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn large_incremental_authoritative_lexical_repair_defers_by_default() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                "8",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
+            let opts =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            let deferred = crate::indexer::should_defer_incremental_authoritative_lexical_repair(
+                &opts,
+                false,
+                42,
+                true,
+                Some(7),
+            )
+            .expect("large populated incremental repair should be deferred");
+
+            assert_eq!(deferred.canonical_conversations, 42);
+            assert_eq!(deferred.db_size_bytes, 16);
+            assert_eq!(deferred.max_automatic_repair_db_size_bytes, 8);
+            assert_eq!(deferred.observed_tantivy_docs, Some(7));
+            assert_eq!(
+                deferred.reason,
+                crate::indexer::DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn small_incremental_authoritative_lexical_repair_keeps_automatic_repair() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                "1024",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"tiny").unwrap();
+            let opts =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            assert_eq!(
+                crate::indexer::should_defer_incremental_authoritative_lexical_repair(
+                    &opts, false, 42, true, None,
+                ),
+                None
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn explicit_incremental_authoritative_lexical_repair_override_keeps_automatic_repair() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                "1",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR", "1");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
+            let opts =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            assert_eq!(
+                crate::indexer::should_defer_incremental_authoritative_lexical_repair(
+                    &opts, false, 42, true, None,
+                ),
+                None
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn non_plain_incremental_modes_keep_authoritative_lexical_repair_behavior() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                "1",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
+            let base =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            let mut full = base.clone();
+            full.full = true;
+            assert_eq!(
+                crate::indexer::should_defer_incremental_authoritative_lexical_repair(
+                    &full, false, 42, true, None,
+                ),
+                None
+            );
+
+            let mut force_rebuild = base.clone();
+            force_rebuild.force_rebuild = true;
+            assert_eq!(
+                crate::indexer::should_defer_incremental_authoritative_lexical_repair(
+                    &force_rebuild,
+                    false,
+                    42,
+                    true,
+                    None,
+                ),
+                None
+            );
+
+            let mut watch_once = base;
+            watch_once.watch_once_paths = Some(vec![dir.path().join("session.jsonl")]);
+            assert_eq!(
+                crate::indexer::should_defer_incremental_authoritative_lexical_repair(
+                    &watch_once,
+                    false,
+                    42,
+                    true,
+                    None,
+                ),
+                None
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn large_missing_incremental_scan_watermark_bootstraps_by_default() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES",
+                "8",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
+            let opts =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            let bootstrap = crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                &opts, false, 42, false, false, None,
+            )
+            .expect("large populated incremental run should bootstrap missing scan watermark");
+
+            assert_eq!(bootstrap.canonical_conversations, 42);
+            assert_eq!(bootstrap.db_size_bytes, 16);
+            assert_eq!(bootstrap.max_automatic_full_scan_db_size_bytes, 8);
+            assert_eq!(
+                bootstrap.reason,
+                crate::indexer::BOOTSTRAP_LARGE_INCREMENTAL_MISSING_WATERMARK_REASON
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn existing_or_small_missing_incremental_scan_watermark_keeps_full_scan_behavior() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES",
+                "1024",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"tiny").unwrap();
+            let opts =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            assert_eq!(
+                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                    &opts, false, 42, false, false, None,
+                ),
+                None
+            );
+            assert_eq!(
+                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                    &opts,
+                    false,
+                    42,
+                    false,
+                    false,
+                    Some(1_700_000_000_000),
+                ),
+                None
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn explicit_missing_watermark_full_scan_override_keeps_historical_rescan() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES",
+                "1",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN", "1");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
+            let opts =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            assert_eq!(
+                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                    &opts, false, 42, false, false, None,
+                ),
+                None
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn non_plain_missing_watermark_modes_keep_historical_scan_behavior() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES",
+                "1",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
+            let base =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            let mut full = base.clone();
+            full.full = true;
+            assert_eq!(
+                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                    &full, false, 42, false, false, None,
+                ),
+                None
+            );
+
+            let mut force_rebuild = base.clone();
+            force_rebuild.force_rebuild = true;
+            assert_eq!(
+                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                    &force_rebuild,
+                    false,
+                    42,
+                    false,
+                    false,
+                    None,
+                ),
+                None
+            );
+
+            let mut watch_once = base;
+            watch_once.watch_once_paths = Some(vec![dir.path().join("session.jsonl")]);
+            assert_eq!(
+                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                    &watch_once,
+                    false,
+                    42,
+                    false,
+                    false,
+                    None,
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn deferred_incremental_authoritative_lexical_repair_is_reported_in_progress_stats() {
+            let progress = std::sync::Arc::new(crate::indexer::IndexingProgress::default());
+            let deferred = crate::indexer::DeferredIncrementalCanonicalLexicalRepair {
+                canonical_conversations: 42,
+                db_size_bytes: 16,
+                max_automatic_repair_db_size_bytes: 8,
+                observed_tantivy_docs: Some(7),
+                reason: crate::indexer::DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON,
+            };
+
+            crate::indexer::record_deferred_incremental_canonical_lexical_repair(
+                Some(&progress),
+                &deferred,
+            );
+
+            let stats = progress.stats.lock().unwrap();
+            assert!(stats.lexical_update_deferred);
+            assert_eq!(
+                stats.lexical_repair,
+                Some(crate::indexer::LexicalRepairStats {
+                    kind: "deferred_authoritative_canonical_db_rebuild".to_string(),
+                    reason: crate::indexer::DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON
+                        .to_string(),
+                    canonical_conversations: 42,
+                    canonical_messages: 0,
+                    observed_tantivy_docs: Some(7),
+                })
+            );
+        }
+
         #[test]
         fn incremental_canonical_lexical_repair_short_circuits_when_full_or_force_paths_apply() {
             let base = crate::indexer::IncrementalCanonicalLexicalRepairContext {
@@ -24217,6 +27334,38 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    fn read_index_run_lock_metadata_for_test(lock_path: &Path) -> Result<String> {
+        #[cfg(windows)]
+        {
+            let sidecar_path =
+                crate::search::asset_state::index_run_lock_metadata_sidecar_path(lock_path);
+            if let Ok(raw) = std::fs::read_to_string(&sidecar_path)
+                && !raw.trim().is_empty()
+            {
+                return Ok(raw);
+            }
+        }
+        match std::fs::read_to_string(lock_path) {
+            Ok(raw) => Ok(raw),
+            Err(err) if crate::search::asset_state::windows_lock_conflict(&err) => {
+                let sidecar_path =
+                    crate::search::asset_state::index_run_lock_metadata_sidecar_path(lock_path);
+                std::fs::read_to_string(&sidecar_path).with_context(|| {
+                    format!(
+                        "reading index-run lock metadata sidecar {}",
+                        sidecar_path.display()
+                    )
+                })
+            }
+            Err(err) => Err(err).with_context(|| {
+                format!(
+                    "reading index-run lock metadata for test {}",
+                    lock_path.display()
+                )
+            }),
+        }
+    }
+
     #[test]
     fn scan_path_exclusions_value_active_handles_commas_and_newlines() {
         assert!(!scan_path_exclusions_value_active(None));
@@ -25137,6 +28286,7 @@ mod tests {
             Vec::new(),
             vec![("codex", failing_explicit_file_root_connector_factory)],
             FrankenStorage::now_millis(),
+            None,
         )
         .expect("failed scan should not abort batch indexing");
         *FAILING_EXPLICIT_FILE_ROOT
@@ -25409,7 +28559,7 @@ mod tests {
         heartbeat_index_run_lock(tmp.path()).unwrap();
         heartbeat_index_run_lock(tmp.path()).unwrap();
 
-        let refreshed = std::fs::read_to_string(&lock_path).unwrap();
+        let refreshed = read_index_run_lock_metadata_for_test(&lock_path).unwrap();
         assert!(refreshed.contains("pid=123"));
         assert!(refreshed.contains("started_at_ms=111"));
         assert!(refreshed.contains("db_path=/tmp/db.sqlite"));
@@ -25441,6 +28591,749 @@ mod tests {
             temp_artifacts.is_empty(),
             "successful heartbeat refresh should not leave temp files: {temp_artifacts:?}"
         );
+    }
+
+    /// Regression for #258 (review follow-up — fix-and-test-the-writer-side).
+    ///
+    /// The original #258 fix landed the READER side
+    /// (`asset_state::maintenance_stall_age_ms` consumes
+    /// `last_progress_at_ms`) and the HEARTBEAT-PRESERVATION test below,
+    /// but the WRITER side — `IndexRunLockGuard::write_metadata`
+    /// actually emitting a `last_progress_at_ms=...` line into the
+    /// lock file — was missing in the initial commit. Without this
+    /// test, every lock file in production had
+    /// `last_progress_at_ms=None`, so the stall detector never fired
+    /// and the wedged-indexer fix was inert.
+    ///
+    /// This test exercises the REAL writer path (no string fixture):
+    /// it calls `acquire_index_run_lock` which calls `write_metadata`
+    /// on construction, then re-reads the lock file off disk and
+    /// asserts the field is populated. The same test passes through
+    /// `read_search_maintenance_snapshot` to verify the value flows
+    /// end-to-end into the same data the status JSON consumes.
+    #[test]
+    fn acquire_index_run_lock_writes_last_progress_at_ms_field() -> Result<()> {
+        use crate::search::asset_state::read_search_maintenance_snapshot;
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let before_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
+        let after_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+
+        // The on-disk lock file must include the `last_progress_at_ms`
+        // key with a fresh timestamp. Parsing it lets a future change
+        // to the field's value type surface as a precise test failure.
+        let lock_path = tmp.path().join("index-run.lock");
+        let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
+        let last_progress_lines: Vec<&str> = raw
+            .lines()
+            .filter_map(|line| line.strip_prefix("last_progress_at_ms="))
+            .collect();
+        assert_eq!(
+            last_progress_lines.len(),
+            1,
+            "lock file must contain exactly one last_progress_at_ms line; got {raw:?}",
+        );
+        let value: i64 = last_progress_lines
+            .first()
+            .context("last_progress_at_ms line missing")?
+            .parse()
+            .context("last_progress_at_ms must parse as i64")?;
+        assert!(
+            (before_ms..=after_ms).contains(&value),
+            "last_progress_at_ms ({value}) must be within [before_ms={before_ms}, after_ms={after_ms}] of the acquire_index_run_lock call",
+        );
+
+        // Cross-check via the same snapshot reader the status JSON uses:
+        // `last_progress_at_ms` must surface as Some(..) (NOT None,
+        // which is what production lock files had until this fix).
+        let snapshot = read_search_maintenance_snapshot(tmp.path());
+        assert_eq!(
+            snapshot.last_progress_at_ms,
+            Some(value),
+            "snapshot reader must surface last_progress_at_ms; #258 stall detector is inert otherwise",
+        );
+
+        drop(guard);
+        Ok(())
+    }
+
+    /// Regression for cass#265.
+    ///
+    /// Before this fix, every preflight step inside `run_index`'s
+    /// `phase=watch_startup` block ran with no progress bump and no
+    /// sub-phase breadcrumb. If any one of them wedged (e.g. a multi-
+    /// second-to-multi-hour COUNT scan against `messages` triggering a
+    /// fsqlite B-tree descent bug), operators saw only the opaque
+    /// `phase=watch_startup` for hours, with no way to tell whether
+    /// the wedge was in `cleanup_orphan_fk_rows`, the lexical-
+    /// checkpoint probe, the tantivy reader preflight, or somewhere
+    /// else. The reporter on cass#265 specifically asked: "Get a
+    /// thread-by-thread backtrace … I can produce one if the
+    /// maintainer can share … a guidance recipe for `lldb` to attach
+    /// to PID and dump symbolicated `bt all`." This sub-phase
+    /// breadcrumb is the same information, surfaced without requiring
+    /// the operator to attach `lldb` to a frozen process.
+    ///
+    /// The fix routes each preflight step through
+    /// `IndexRunLockGuard::set_phase`, which:
+    /// 1. Writes a fine-grained sub-phase string to the lock file's
+    ///    `phase=` line (e.g. `watch_startup:count_total_conversations`).
+    /// 2. Bumps `last_progress_at_ms` (both the on-disk field and the
+    ///    atomic the heartbeat folds in) so a real wedge inside ONE
+    ///    preflight surfaces at +120 s with the sub-phase pinpointed.
+    /// 3. Forces `IndexStallWatchdog` to reset its
+    ///    `last_progress_advance` timer at each sub-phase boundary so
+    ///    the watchdog scopes its stall window to a single preflight
+    ///    rather than the whole watch_startup block.
+    ///
+    /// This test exercises `set_phase` directly (without spinning up
+    /// the full indexer): acquire the lock as `WatchStartup`, call
+    /// `set_phase` with several sub-phases, and assert each call
+    /// updates the on-disk `phase=` line while leaving `mode=` at
+    /// `watch_startup` and advancing `last_progress_at_ms` strictly
+    /// monotonically.
+    #[test]
+    fn set_phase_writes_sub_phase_breadcrumb_and_bumps_progress() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let mut guard =
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::WatchStartup)?;
+        let lock_path = tmp.path().join("index-run.lock");
+
+        let initial = read_index_run_lock_metadata_for_test(&lock_path)?;
+        let initial_phase = initial
+            .lines()
+            .find_map(|line| line.strip_prefix("phase="))
+            .map(str::to_string);
+        assert_eq!(
+            initial_phase.as_deref(),
+            Some("watch_startup"),
+            "initial phase must equal the mode for the WatchStartup acquire"
+        );
+        let initial_progress: i64 = initial
+            .lines()
+            .find_map(|line| line.strip_prefix("last_progress_at_ms="))
+            .context("initial lock file must have last_progress_at_ms")?
+            .parse()?;
+
+        // Each preflight step writes a strictly different sub-phase
+        // and a strictly larger last_progress_at_ms. The sleep is
+        // tiny because `FrankenStorage::now_millis()` ticks every
+        // millisecond — production preflight steps take seconds, so
+        // monotonic strictness is the easy case.
+        let sub_phases = [
+            "watch_startup:ensure_index_dir",
+            "watch_startup:open_storage",
+            "watch_startup:validate_fts_messages",
+            "watch_startup:cleanup_orphan_fk_rows",
+            "watch_startup:count_total_conversations",
+            "watch_startup:probe_lexical_checkpoint",
+            "watch_startup:tantivy_reader_preflight",
+            "watch_startup:scan_entry",
+        ];
+        let mut prev_progress = initial_progress;
+        for sub_phase in sub_phases {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            guard.set_phase(SearchMaintenanceMode::WatchStartup, sub_phase)?;
+            let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
+            let phase_line = raw
+                .lines()
+                .find_map(|line| line.strip_prefix("phase="))
+                .map(str::to_string);
+            assert_eq!(
+                phase_line.as_deref(),
+                Some(sub_phase),
+                "set_phase must write the sub-phase string to the on-disk phase= field; got {raw:?}"
+            );
+            let mode_line = raw
+                .lines()
+                .find_map(|line| line.strip_prefix("mode="))
+                .map(str::to_string);
+            assert_eq!(
+                mode_line.as_deref(),
+                Some("watch_startup"),
+                "set_phase must leave mode= unchanged so SearchMaintenanceSnapshot.mode keeps reflecting WatchStartup; got {raw:?}"
+            );
+            let progress: i64 = raw
+                .lines()
+                .find_map(|line| line.strip_prefix("last_progress_at_ms="))
+                .context("last_progress_at_ms after set_phase")?
+                .parse()?;
+            assert!(
+                progress > prev_progress,
+                "set_phase must bump last_progress_at_ms (prev={prev_progress}, now={progress}); without this the stall detector cannot scope its window to a single sub-phase"
+            );
+            // The atomic mirror must also move; this is what the
+            // heartbeat thread reads.
+            let atomic_progress = guard.last_progress_at_ms_atomic.load(Ordering::Relaxed);
+            assert_eq!(
+                atomic_progress, progress,
+                "the atomic mirror used by the heartbeat thread must match the on-disk last_progress_at_ms after set_phase"
+            );
+            prev_progress = progress;
+        }
+
+        drop(guard);
+        Ok(())
+    }
+
+    /// Regression for cass#265.
+    ///
+    /// The `IndexStallWatchdog` resets its `last_progress_advance`
+    /// timer whenever `phase_code` changes. The new sub-phase
+    /// breadcrumbs live in the LOCK FILE's `phase=` field (a string),
+    /// not in `IndexingProgress::phase` (an atomic enum). So a
+    /// wedged preflight is detected by `last_progress_at_ms` (which
+    /// `set_phase` bumps) and surfaced to operators via the lock-file
+    /// `phase=` string. This test verifies the lock-file `phase=`
+    /// values are exactly the strings the README/issue triage docs
+    /// reference, so a future refactor that renames them will be
+    /// flagged here before it ships and silently breaks operator
+    /// runbooks.
+    ///
+    /// The taxonomy of sub-phases under `watch_startup:` is the
+    /// public contract — cass#265 hinge.
+    #[test]
+    fn watch_startup_sub_phase_taxonomy_is_documented_and_stable() -> Result<()> {
+        // This list MUST match the `preflight_phase!(...)` call sites
+        // in `run_index`. When you add or remove a preflight step,
+        // update this list AND the cass#265 release-note section so
+        // operators have a complete map of what `phase=` strings can
+        // surface in `cass health --robot`.
+        let documented_sub_phases = [
+            "watch_startup:ensure_index_dir",
+            "watch_startup:ensure_storage_headroom",
+            "watch_startup:open_storage",
+            "watch_startup:writable_preflight",
+            "watch_startup:validate_fts_messages",
+            "watch_startup:cleanup_orphan_fk_rows",
+            "watch_startup:count_total_conversations",
+            "watch_startup:probe_lexical_checkpoint",
+            "watch_startup:repair_daily_stats",
+            "watch_startup:tantivy_reader_preflight",
+            "watch_startup:historical_salvage",
+            "watch_startup:count_total_messages",
+            "watch_startup:published_index_validate",
+            "watch_startup:scan_entry",
+        ];
+        for sub_phase in documented_sub_phases {
+            assert!(
+                sub_phase.starts_with("watch_startup:"),
+                "sub-phase {sub_phase} must live under the watch_startup: namespace so health-check JSON consumers can route on prefix"
+            );
+            assert!(
+                !sub_phase.contains(char::is_whitespace),
+                "sub-phase {sub_phase} must not contain whitespace; the lock file parser splits on `=` and expects a single line value"
+            );
+            // No colons after the namespace separator: keep sub-phases
+            // simple identifiers so future structured-log consumers
+            // (e.g. Datadog facets) can treat them as enum values.
+            let after_namespace = sub_phase
+                .strip_prefix("watch_startup:")
+                .expect("namespace check above");
+            assert!(
+                !after_namespace.contains(':'),
+                "sub-phase {sub_phase} must not contain a second colon; keep the breadcrumb taxonomy flat"
+            );
+        }
+
+        // Cross-check against the source: every documented sub-phase
+        // must appear in src/indexer/mod.rs (this file). This makes
+        // a refactor that drops a preflight call fail this test
+        // before the next release ships.
+        let src = std::fs::read_to_string(file!()).context("read indexer source")?;
+        for sub_phase in documented_sub_phases {
+            assert!(
+                src.contains(sub_phase),
+                "documented sub-phase {sub_phase} is missing from src/indexer/mod.rs; if the preflight step was renamed, update the test AND the release-note operator runbook"
+            );
+        }
+
+        // v0.6.7: the taxonomy must also be consumable as a runtime
+        // const so the watchdog can map a `step_idx` -> sub_phase
+        // string without re-parsing source. Cross-check the test
+        // list against the const so a refactor that updates one but
+        // not the other fails here.
+        assert_eq!(
+            documented_sub_phases.as_slice(),
+            super::WATCH_STARTUP_SUB_PHASE_TAXONOMY,
+            "documented taxonomy and the WATCH_STARTUP_SUB_PHASE_TAXONOMY const must match \
+             — the watchdog uses the const as authority; if they diverge, the lock-file \
+             `<step>_TIMEOUT` breadcrumb will name the wrong step on a wedge"
+        );
+        Ok(())
+    }
+
+    /// Regression for cass#265 v0.6.7 hardening.
+    ///
+    /// The v0.6.6 fix shipped sub-phase breadcrumbs but didn't fail
+    /// the run on a wedge — operators still had to attach lldb or
+    /// kill the process manually after watching the lock file for
+    /// hours. The reporter on cass#265 confirmed the wedge persists
+    /// at `cleanup_orphan_fk_rows` on v0.6.6, so v0.6.7 ships a
+    /// proactive watchdog that aborts the process when any preflight
+    /// step exceeds `CASS_PREFLIGHT_OP_TIMEOUT_SECS` (default 180 s).
+    ///
+    /// This test simulates a wedged preflight by:
+    /// 1. Starting the watchdog with a 100 ms timeout and a
+    ///    `RecordOnly` policy (so the test process survives).
+    /// 2. Calling `state.enter(step_idx_for_cleanup_orphan_fk_rows, now_ms)`.
+    /// 3. Polling for the trip with a 750 ms deadline.
+    /// 4. Asserting:
+    ///    - `state.tripped` is true (watchdog fired).
+    ///    - The operator-visible metadata `phase=` line was rewritten to
+    ///      `watch_startup:cleanup_orphan_fk_rows_TIMEOUT`.
+    ///    - The lock-file `updated_at_ms=` advanced.
+    ///    - The other fields (pid, started_at_ms, db_path, mode,
+    ///      job_id, job_kind) are preserved verbatim — the watchdog
+    ///      must only touch `phase=` and `updated_at_ms=`, not the
+    ///      operator-visible job identity.
+    #[test]
+    fn watch_startup_preflight_watchdog_fires_on_wedged_step() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let guard =
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::WatchStartup)?;
+        let lock_path = tmp.path().join("index-run.lock");
+
+        // Snapshot the pre-trip lock-file fields so we can prove
+        // the watchdog preserved everything except `phase=` and
+        // `updated_at_ms=`.
+        let pre = read_index_run_lock_metadata_for_test(&lock_path)?;
+        let extract = |key: &str, raw: &str| -> Option<String> {
+            raw.lines()
+                .find_map(|line| line.strip_prefix(key))
+                .map(str::to_string)
+        };
+        let pre_pid = extract("pid=", &pre).context("pre pid=")?;
+        let pre_started = extract("started_at_ms=", &pre).context("pre started_at_ms=")?;
+        let pre_db = extract("db_path=", &pre).context("pre db_path=")?;
+        let pre_mode = extract("mode=", &pre).context("pre mode=")?;
+        let pre_job_id = extract("job_id=", &pre).context("pre job_id=")?;
+        let pre_job_kind = extract("job_kind=", &pre).context("pre job_kind=")?;
+        let pre_updated: i64 = extract("updated_at_ms=", &pre)
+            .context("pre updated_at_ms=")?
+            .parse()?;
+
+        // Locate the wedge-candidate step (the one cass#265 confirmed
+        // wedges on v0.6.6). Hard-coding the string keeps the
+        // taxonomy test as the single source of truth.
+        let wedged = "watch_startup:cleanup_orphan_fk_rows";
+        let step_idx = super::watch_startup_step_idx(wedged)
+            .context("cleanup_orphan_fk_rows must be in the taxonomy")?;
+
+        let state = super::WatchStartupPreflightState::new();
+        // Pass a dedicated write lock (matches the production call
+        // site) so the INV3 fix compiles and is exercised here.
+        let test_write_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let _watchdog = super::WatchStartupPreflightWatchdog::start(
+            Arc::clone(&state),
+            super::WATCH_STARTUP_SUB_PHASE_TAXONOMY,
+            lock_path.clone(),
+            tmp.path().to_path_buf(),
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(25),
+            super::PreflightTimeoutPolicy::RecordOnly,
+            test_write_lock,
+        );
+
+        // Simulate the wedge: claim we entered the step `now` and
+        // never exit. The watchdog will trip after ~125 ms (timeout
+        // 100 ms, poll 25 ms).
+        let started_at_ms = FrankenStorage::now_millis();
+        state.enter(step_idx, started_at_ms);
+
+        // Give the watchdog enough wall-clock to poll, decide, and
+        // rewrite the lock file. 750 ms = many poll ticks at 25 ms
+        // — even a heavily loaded CI runner finishes that.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(750);
+        while std::time::Instant::now() < deadline {
+            if state.tripped.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            state.tripped.load(Ordering::Relaxed),
+            "watchdog must trip when a preflight step exceeds its timeout; otherwise the cass#265 wedge persists silently"
+        );
+
+        // Verify the operator-visible metadata now carries the
+        // TIMEOUT breadcrumb. This is the surface the operator's
+        // `cass health --json` reads: the lock file on POSIX, and the
+        // sidecar on Windows when the held lock prevents same-process
+        // lock-file rewrites. The watchdog sets `state.tripped` only
+        // after this metadata path is durable, but the bounded poll
+        // keeps the test robust to reader/writer scheduling jitter on
+        // heavily loaded CI runners.
+        let read_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let post = loop {
+            let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
+            if raw.contains("_TIMEOUT") || std::time::Instant::now() > read_deadline {
+                break raw;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let post_phase = extract("phase=", &post).context("post phase=")?;
+        assert_eq!(
+            post_phase,
+            format!("{wedged}_TIMEOUT"),
+            "watchdog must rewrite phase= to `<step>_TIMEOUT`; got {post:?}"
+        );
+        let sidecar_path =
+            crate::search::asset_state::index_run_lock_metadata_sidecar_path(&lock_path);
+        let sidecar = std::fs::read_to_string(&sidecar_path).with_context(|| {
+            format!(
+                "reading watchdog-rewritten metadata sidecar {}",
+                sidecar_path.display()
+            )
+        })?;
+        let sidecar_phase = extract("phase=", &sidecar).context("sidecar phase=")?;
+        assert_eq!(
+            sidecar_phase,
+            format!("{wedged}_TIMEOUT"),
+            "watchdog must also rewrite the sidecar phase= for lock-blocked readers; got {sidecar:?}"
+        );
+        // Everything else preserved.
+        assert_eq!(
+            extract("pid=", &post).as_deref(),
+            Some(pre_pid.as_str()),
+            "watchdog must NOT change pid="
+        );
+        assert_eq!(
+            extract("started_at_ms=", &post).as_deref(),
+            Some(pre_started.as_str()),
+            "watchdog must NOT change started_at_ms="
+        );
+        assert_eq!(
+            extract("db_path=", &post).as_deref(),
+            Some(pre_db.as_str()),
+            "watchdog must NOT change db_path="
+        );
+        assert_eq!(
+            extract("mode=", &post).as_deref(),
+            Some(pre_mode.as_str()),
+            "watchdog must NOT change mode= — that field reflects user-facing SearchMaintenanceMode and must stay `watch_startup`"
+        );
+        assert_eq!(
+            extract("job_id=", &post).as_deref(),
+            Some(pre_job_id.as_str()),
+            "watchdog must NOT change job_id="
+        );
+        assert_eq!(
+            extract("job_kind=", &post).as_deref(),
+            Some(pre_job_kind.as_str()),
+            "watchdog must NOT change job_kind="
+        );
+        let post_updated: i64 = extract("updated_at_ms=", &post)
+            .context("post updated_at_ms=")?
+            .parse()?;
+        assert!(
+            post_updated >= pre_updated,
+            "watchdog must bump updated_at_ms= (pre={pre_updated}, post={post_updated}); without this operators can't distinguish a fresh TIMEOUT from a stale lock"
+        );
+
+        drop(guard);
+        Ok(())
+    }
+
+    /// Regression for INV3 (v0.6.9 hardening).
+    ///
+    /// When the watchdog fires it holds `metadata_write_lock` across
+    /// the full `rewrite_lock_phase_for_timeout` call. This serialises
+    /// the watchdog's `_TIMEOUT` rewrite against the heartbeat thread,
+    /// which also takes the same lock before every write. Without this
+    /// serialisation the heartbeat can read, then overwrite, the lock
+    /// file between the watchdog's `set_len(0)` and `write_all`, leaving
+    /// the lock file without the `_TIMEOUT` breadcrumb even though
+    /// `process::exit(70)` was called.
+    ///
+    /// The test simulates the race by:
+    /// 1. Pre-holding `metadata_write_lock` from the test thread.
+    /// 2. Starting the watchdog (RecordOnly) with the same lock.
+    /// 3. Entering a step and verifying the watchdog trips but cannot
+    ///    write the lock file while the lock is held.
+    /// 4. Releasing the lock and confirming the rewrite then lands.
+    #[test]
+    fn watchdog_timeout_rewrite_serialised_by_metadata_write_lock() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let guard =
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::WatchStartup)?;
+        let lock_path = tmp.path().join("index-run.lock");
+
+        let metadata_write_lock = std::sync::Arc::clone(&guard.metadata_write_lock);
+
+        // Pre-hold the lock so the watchdog's rewrite is blocked.
+        let held = metadata_write_lock
+            .lock()
+            .expect("metadata_write_lock poisoned");
+
+        let wedged = "watch_startup:cleanup_orphan_fk_rows";
+        let step_idx = super::watch_startup_step_idx(wedged)
+            .context("cleanup_orphan_fk_rows must be in taxonomy")?;
+
+        let state = super::WatchStartupPreflightState::new();
+        let _watchdog = super::WatchStartupPreflightWatchdog::start(
+            Arc::clone(&state),
+            super::WATCH_STARTUP_SUB_PHASE_TAXONOMY,
+            lock_path.clone(),
+            tmp.path().to_path_buf(),
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10),
+            super::PreflightTimeoutPolicy::RecordOnly,
+            std::sync::Arc::clone(&metadata_write_lock),
+        );
+
+        let started_at_ms = FrankenStorage::now_millis();
+        state.enter(step_idx, started_at_ms);
+
+        // Wait long enough for the watchdog to have tripped internally
+        // (it sets `tripped` after acquiring the lock, so it must wait).
+        // 400 ms >> 50 ms timeout + 10 ms poll + acquisition delay.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        // Lock file must NOT yet have _TIMEOUT because the watchdog is
+        // blocked waiting for `metadata_write_lock`.
+        let before_release = read_index_run_lock_metadata_for_test(&lock_path).unwrap_or_default();
+        assert!(
+            !before_release.contains("_TIMEOUT"),
+            "watchdog must not rewrite the lock file while metadata_write_lock is held; \
+             got: {before_release:?}"
+        );
+
+        // Release the lock. Now the watchdog can complete its write.
+        drop(held);
+
+        let read_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let after_release = loop {
+            let raw = read_index_run_lock_metadata_for_test(&lock_path).unwrap_or_default();
+            if raw.contains("_TIMEOUT") || std::time::Instant::now() > read_deadline {
+                break raw;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(
+            after_release.contains("_TIMEOUT"),
+            "watchdog must rewrite lock file to _TIMEOUT after metadata_write_lock is released; \
+             got: {after_release:?}"
+        );
+
+        drop(guard);
+        Ok(())
+    }
+
+    /// Regression for cass#265 v0.6.7 hardening.
+    ///
+    /// The skip env var lets operators bypass a single wedged
+    /// preflight step without disabling the rest of the preflight.
+    /// This test pins the env-var naming convention (lossless from
+    /// sub-phase string) and the parsing rules.
+    #[test]
+    fn preflight_skip_env_var_naming_is_lossless() {
+        // Mapping is lossless: sub-phase -> CASS_SKIP_PREFLIGHT_<UPPER>.
+        assert_eq!(
+            super::watch_startup_preflight::skip_env_name("watch_startup:cleanup_orphan_fk_rows"),
+            "CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS"
+        );
+        assert_eq!(
+            super::watch_startup_preflight::skip_env_name("watch_startup:count_total_messages"),
+            "CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES"
+        );
+        assert_eq!(
+            super::watch_startup_preflight::skip_env_name("watch_startup:validate_fts_messages"),
+            "CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES"
+        );
+
+        // Round-trip every documented sub-phase so a future renamed
+        // entry surfaces here.
+        for sub_phase in super::WATCH_STARTUP_SUB_PHASE_TAXONOMY {
+            let env_name = super::watch_startup_preflight::skip_env_name(sub_phase);
+            assert!(
+                env_name.starts_with("CASS_SKIP_PREFLIGHT_"),
+                "skip env var for {sub_phase} must follow the documented prefix; got {env_name}"
+            );
+            assert!(
+                !env_name.contains(':'),
+                "skip env var for {sub_phase} must strip the watch_startup: namespace; got {env_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_fts_messages_preflight_is_opt_in() {
+        {
+            let _guard = unset_env_var("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES");
+            assert!(
+                !super::preflight_validate_fts_messages_enabled(),
+                "routine indexing must not run the derived fallback FTS validation probe by default"
+            );
+        }
+
+        for value in ["1", "true", "TRUE", "yes", "YES"] {
+            let _guard = set_env_var("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES", value);
+            assert!(
+                super::preflight_validate_fts_messages_enabled(),
+                "{value:?} should enable the opt-in fallback FTS validation preflight"
+            );
+        }
+
+        for value in ["0", "false", "FALSE", "no", "NO", ""] {
+            let _guard = set_env_var("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES", value);
+            assert!(
+                !super::preflight_validate_fts_messages_enabled(),
+                "{value:?} should leave fallback FTS validation skipped for routine indexing"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_fts_messages_skip_does_not_imply_opt_in() {
+        let _validate_guard = unset_env_var("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES");
+        let _skip_guard = set_env_var("CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES", "1");
+
+        assert!(
+            !super::preflight_validate_fts_messages_enabled(),
+            "the legacy skip knob must not turn the expensive fallback FTS validation probe on"
+        );
+        assert!(
+            super::preflight_skip("watch_startup:validate_fts_messages"),
+            "the skip knob should still parse truthfully when an explicit opt-in path consults it"
+        );
+    }
+
+    #[test]
+    fn cleanup_orphan_fk_rows_preflight_is_opt_in() {
+        {
+            let _guard = unset_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS");
+            assert!(
+                !super::preflight_cleanup_orphan_fk_rows_enabled(),
+                "routine indexing must not run the broad orphan-FK cleanup sweep by default"
+            );
+        }
+
+        for value in ["1", "true", "TRUE", "yes", "YES"] {
+            let _guard = set_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS", value);
+            assert!(
+                super::preflight_cleanup_orphan_fk_rows_enabled(),
+                "{value:?} should enable the opt-in orphan-FK cleanup preflight"
+            );
+        }
+
+        for value in ["0", "false", "FALSE", "no", "NO", ""] {
+            let _guard = set_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS", value);
+            assert!(
+                !super::preflight_cleanup_orphan_fk_rows_enabled(),
+                "{value:?} should leave orphan-FK cleanup skipped for routine indexing"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_orphan_fk_rows_skip_does_not_imply_opt_in() {
+        let _cleanup_guard = unset_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS");
+        let _skip_guard = set_env_var("CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS", "1");
+
+        assert!(
+            !super::preflight_cleanup_orphan_fk_rows_enabled(),
+            "the legacy skip knob must not turn the expensive orphan-FK cleanup sweep on"
+        );
+        assert!(
+            super::preflight_skip("watch_startup:cleanup_orphan_fk_rows"),
+            "the skip knob should still parse truthfully when an explicit opt-in path consults it"
+        );
+    }
+
+    /// Regression for #258. The heartbeat thread must refresh
+    /// `updated_at_ms` (its job: prove the process is alive) but MUST
+    /// NOT touch `last_progress_at_ms` (which the indexing thread alone
+    /// updates on real forward progress). If the heartbeat were to
+    /// refresh both, the stall detector in
+    /// `crate::search::asset_state::maintenance_stall_age_ms` would
+    /// silently never fire, recreating the bug.
+    #[test]
+    fn heartbeat_preserves_last_progress_at_ms_field_for_stall_detection() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("index-run.lock");
+        // Note: last_progress_at_ms is set to a deliberately small
+        // value (333) representing "indexing thread last reported
+        // forward progress at t=333ms".
+        std::fs::write(
+            &lock_path,
+            "pid=123\nstarted_at_ms=111\nupdated_at_ms=222\nlast_progress_at_ms=333\ndb_path=/tmp/db.sqlite\nmode=watch_startup\njob_id=lexical_refresh-123\njob_kind=lexical_refresh\nphase=watch_startup\n",
+        )
+        .unwrap();
+
+        // Heartbeat twice — simulate ~5 s of clock advance with no
+        // indexing-thread activity.
+        heartbeat_index_run_lock(tmp.path()).unwrap();
+        heartbeat_index_run_lock(tmp.path()).unwrap();
+
+        let refreshed = read_index_run_lock_metadata_for_test(&lock_path).unwrap();
+        let last_progress_lines: Vec<&str> = refreshed
+            .lines()
+            .filter_map(|line| line.strip_prefix("last_progress_at_ms="))
+            .collect();
+        assert_eq!(
+            last_progress_lines.len(),
+            1,
+            "heartbeat must keep exactly one last_progress_at_ms line, got {refreshed:?}",
+        );
+        assert_eq!(
+            last_progress_lines.first().copied(),
+            Some("333"),
+            "heartbeat must preserve last_progress_at_ms verbatim — refreshing it would silently disable the #258 stall detector",
+        );
+        // updated_at_ms must have moved.
+        let updated_at_value: Option<i64> = refreshed
+            .lines()
+            .filter_map(|line| line.strip_prefix("updated_at_ms="))
+            .next()
+            .and_then(|raw| raw.parse().ok());
+        assert!(
+            updated_at_value.is_some_and(|value| value > 222),
+            "updated_at_ms must advance past initial 222, got {refreshed:?}",
+        );
+    }
+
+    #[test]
+    fn heartbeat_folds_indexer_progress_atomic_into_last_progress_at_ms() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder").unwrap();
+        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)
+            .expect("acquire index run lock");
+        let lock_path = tmp.path().join("index-run.lock");
+        let before = read_index_run_lock_metadata_for_test(&lock_path).unwrap();
+        let old_progress = before
+            .lines()
+            .find_map(|line| line.strip_prefix("last_progress_at_ms="))
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .expect("initial progress line");
+        let bumped_progress = old_progress.saturating_add(1_000);
+        guard
+            .last_progress_at_ms_atomic
+            .store(bumped_progress, Ordering::Relaxed);
+
+        heartbeat_index_run_lock_with_lock_and_progress(
+            tmp.path(),
+            Some(&guard.metadata_write_lock),
+            guard.last_progress_at_ms_atomic.load(Ordering::Relaxed),
+        )
+        .expect("heartbeat should persist indexer-owned progress");
+
+        let refreshed = read_index_run_lock_metadata_for_test(&lock_path).unwrap();
+        let expected_line = format!("last_progress_at_ms={bumped_progress}");
+        assert!(
+            refreshed.lines().any(|line| line == expected_line),
+            "heartbeat must persist the indexer-owned progress bump, got {refreshed:?}"
+        );
+        drop(guard);
     }
 
     #[test]
@@ -27927,6 +31820,26 @@ mod tests {
     }
 
     #[test]
+    fn staged_lexical_pipeline_handoff_pause_requires_async_wake_source() {
+        assert!(
+            !should_pause_staged_lexical_pipeline_handoff(false, 0, 0),
+            "no backlog means the producer handoff should stay open"
+        );
+        assert!(
+            !should_pause_staged_lexical_pipeline_handoff(true, 0, 0),
+            "a saturated backlog with no active shard or merge job must keep draining pipeline_rx"
+        );
+        assert!(
+            should_pause_staged_lexical_pipeline_handoff(true, 1, 0),
+            "active shard builders can wake the sink, so backlog pause is safe"
+        );
+        assert!(
+            should_pause_staged_lexical_pipeline_handoff(true, 0, 1),
+            "active merge jobs can wake the sink, so backlog pause is safe"
+        );
+    }
+
+    #[test]
     fn lexical_rebuild_staged_shard_build_controller_caps_override_fanout_by_memory_headroom() {
         const GIB: usize = 1024 * 1024 * 1024;
         let controller = LexicalRebuildStagedShardBuildController::new_with_memory_reserves(
@@ -30366,6 +34279,7 @@ mod tests {
             connector_name,
             scan_ms: 1,
             is_discovered,
+            scan_succeeded: true,
         })
         .expect("done message should send");
     }
@@ -30376,7 +34290,7 @@ mod tests {
         fn detect(&self) -> DetectionResult {
             DetectionResult {
                 detected: true,
-                evidence: vec!["fixture".to_string()],
+                evidence: vec![String::from("fixture")],
                 root_paths: Vec::new(),
             }
         }
@@ -30408,6 +34322,106 @@ mod tests {
 
     fn deferred_batch_connector_factory() -> Box<dyn Connector + Send> {
         Box::new(DeferredBatchConnector)
+    }
+
+    struct WatermarkSensitiveRemoteConnector;
+
+    impl WatermarkSensitiveRemoteConnector {
+        fn conversations_for_context(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+        ) -> Vec<NormalizedConversation> {
+            if ctx.since_ts.is_some() {
+                return Vec::new();
+            }
+            let Some(scan_root) = ctx.scan_roots.first() else {
+                return Vec::new();
+            };
+
+            let mut conversation = norm_conv(
+                Some("remote-watermark"),
+                vec![norm_msg(0, 1_700_000_000_000)],
+            );
+            conversation.source_path = scan_root.path.join("remote-watermark.jsonl");
+            vec![conversation]
+        }
+    }
+
+    impl Connector for WatermarkSensitiveRemoteConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec![String::from("fixture")],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(self.conversations_for_context(ctx))
+        }
+
+        fn scan_with_callback(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+            on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            for conversation in self.conversations_for_context(ctx) {
+                on_conversation(conversation)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn watermark_sensitive_remote_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(WatermarkSensitiveRemoteConnector)
+    }
+
+    fn configured_local_scan_root(path: PathBuf) -> ScanRoot {
+        let mut root = ScanRoot::local(path);
+        root.origin = Origin {
+            source_id: "backup-local".to_string(),
+            kind: SourceKind::Local,
+            host: None,
+        };
+        root.platform = Some(Platform::Linux);
+        root
+    }
+
+    fn ensure_since_ts_matches(
+        actual: Option<i64>,
+        expected: Option<i64>,
+        context: &str,
+    ) -> Result<()> {
+        if matches!(actual.cmp(&expected), std::cmp::Ordering::Equal) {
+            Ok(())
+        } else {
+            anyhow::bail!("{context}: expected {expected:?}, got {actual:?}")
+        }
+    }
+
+    fn ensure_canonical_mutations(
+        actual: CanonicalMutationCounts,
+        expected: CanonicalMutationCounts,
+        context: &str,
+    ) -> Result<()> {
+        let conversations_match = matches!(
+            actual
+                .inserted_conversations
+                .cmp(&expected.inserted_conversations),
+            std::cmp::Ordering::Equal
+        );
+        let messages_match = matches!(
+            actual.inserted_messages.cmp(&expected.inserted_messages),
+            std::cmp::Ordering::Equal
+        );
+        if conversations_match && messages_match {
+            Ok(())
+        } else {
+            anyhow::bail!("{context}: expected {expected:?}, got {actual:?}")
+        }
     }
 
     static FAILING_EXPLICIT_FILE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -31395,6 +35409,7 @@ mod tests {
             connector_name: "claude",
             scan_ms: 42,
             is_discovered: true,
+            scan_succeeded: true,
         })
         .unwrap();
         drop(tx);
@@ -31409,6 +35424,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             None,
+            None,
         )
         .unwrap();
 
@@ -31418,6 +35434,121 @@ mod tests {
         assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
         assert_eq!(stats.total_conversations, 0);
         assert_eq!(stats.total_messages, 0);
+        assert_eq!(
+            mutations.scanned_connectors,
+            BTreeSet::from(["claude".to_string()])
+        );
+        assert!(!mutations.scan_had_errors);
+    }
+
+    #[test]
+    fn streaming_consumer_does_not_watermark_failed_discovered_connector() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        let index_path = index_dir(&data_dir)?;
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        let progress = Arc::new(IndexingProgress::default());
+        let (tx, rx) = bounded(2);
+
+        tx.send(IndexMessage::ScanError {
+            connector_name: "claude",
+            error: "local scan failed after detection".to_string(),
+        })
+        .map_err(|_| anyhow::anyhow!("scan error message should send"))?;
+        tx.send(IndexMessage::Done {
+            connector_name: "claude",
+            scan_ms: 42,
+            is_discovered: true,
+            scan_succeeded: false,
+        })
+        .map_err(|_| anyhow::anyhow!("done message should send"))?;
+        drop(tx);
+
+        let (discovered, mutations) = run_streaming_consumer(
+            rx,
+            1,
+            &storage,
+            &data_dir,
+            Some(&mut index),
+            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+            &Some(progress.clone()),
+            LexicalPopulationStrategy::IncrementalInline,
+            None,
+            None,
+        )?;
+
+        assert_eq!(discovered, vec!["claude".to_string()]);
+        assert!(
+            mutations.scanned_connectors.is_empty(),
+            "failed scans must not advance per-connector watermarks"
+        );
+        assert!(mutations.scan_had_errors);
+        let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
+        assert_eq!(
+            stats
+                .connectors
+                .iter()
+                .find(|connector| connector.name == "claude")
+                .and_then(|connector| connector.error.as_deref()),
+            Some("local scan failed after detection")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_consumer_does_not_watermark_connector_after_prior_scan_error() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        let index_path = index_dir(&data_dir)?;
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        let progress = Arc::new(IndexingProgress::default());
+        let (tx, rx) = bounded(2);
+
+        tx.send(IndexMessage::ScanError {
+            connector_name: "claude",
+            error: "scan error must dominate done success".to_string(),
+        })
+        .map_err(|_| anyhow::anyhow!("scan error message should send"))?;
+        tx.send(IndexMessage::Done {
+            connector_name: "claude",
+            scan_ms: 42,
+            is_discovered: true,
+            scan_succeeded: true,
+        })
+        .map_err(|_| anyhow::anyhow!("done message should send"))?;
+        drop(tx);
+
+        let (discovered, mutations) = run_streaming_consumer(
+            rx,
+            1,
+            &storage,
+            &data_dir,
+            Some(&mut index),
+            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+            &Some(progress),
+            LexicalPopulationStrategy::IncrementalInline,
+            None,
+            None,
+        )?;
+
+        assert_eq!(discovered, vec!["claude".to_string()]);
+        assert!(
+            mutations.scanned_connectors.is_empty(),
+            "a prior scan error must prevent per-connector watermark advancement"
+        );
+        assert!(mutations.scan_had_errors);
+        Ok(())
     }
 
     #[test]
@@ -31457,6 +35588,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Some(FrankenStorage::now_millis()),
+            None,
         )
         .expect("deferred streaming ingest should not require a Tantivy writer");
 
@@ -31524,6 +35656,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             Some(FrankenStorage::now_millis()),
+            None,
         )
         .expect("lexical OOM after SQLite ingest should defer repair, not fail the scan");
 
@@ -31580,6 +35713,7 @@ mod tests {
                 &Some(progress.clone()),
                 LexicalPopulationStrategy::IncrementalInline,
                 Some(FrankenStorage::now_millis()),
+                None,
             )
             .expect("single deferred ingest OOM should quarantine and continue");
 
@@ -31619,6 +35753,500 @@ mod tests {
             assert_eq!(summary.quarantined_conversations, 1);
             assert_eq!(summary.status, "degraded");
         }
+    }
+
+    #[test]
+    #[serial]
+    fn non_watch_ingest_chunk_size_defaults_and_clamps() {
+        {
+            let _env = unset_env_var("CASS_NON_WATCH_INGEST_CHUNK_SIZE");
+            assert_eq!(
+                non_watch_ingest_chunk_size(),
+                NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE
+            );
+        }
+
+        {
+            let _env = set_env("CASS_NON_WATCH_INGEST_CHUNK_SIZE", "0");
+            assert_eq!(
+                non_watch_ingest_chunk_size(),
+                NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE
+            );
+        }
+
+        {
+            let _env = set_env("CASS_NON_WATCH_INGEST_CHUNK_SIZE", "2");
+            assert_eq!(non_watch_ingest_chunk_size(), 2);
+        }
+
+        {
+            let _env = set_env("CASS_NON_WATCH_INGEST_CHUNK_SIZE", "99999");
+            assert_eq!(
+                non_watch_ingest_chunk_size(),
+                NON_WATCH_INGEST_CHUNK_SIZE_MAX
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn chunked_non_watch_ingest_bumps_run_lock_progress() -> Result<()> {
+        let _chunk_guard = set_env("CASS_NON_WATCH_INGEST_CHUNK_SIZE", "2");
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        let progress_tracker = Arc::new(IndexingProgress::default());
+        let progress = Some(progress_tracker.clone());
+        let progress_bump = Arc::new(AtomicI64::new(1));
+        let conversations: Vec<_> = (0..5)
+            .map(|idx| {
+                norm_conv(
+                    Some(&format!("chunked-non-watch-{idx}")),
+                    vec![norm_msg(0, 1_700_000_000_000 + i64::from(idx))],
+                )
+            })
+            .collect();
+
+        let outcome = ingest_non_watch_batch_with_oom_split(
+            &storage,
+            None,
+            &data_dir,
+            &conversations,
+            &progress,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            true,
+            Some(&progress_bump),
+        )?;
+
+        assert_eq!(outcome.inserted_conversations, conversations.len());
+        assert_eq!(outcome.inserted_messages, conversations.len());
+        assert_eq!(
+            progress_tracker.current.load(Ordering::Relaxed),
+            conversations.len()
+        );
+        assert!(
+            progress_bump.load(Ordering::Relaxed) > 1,
+            "chunked ingest must refresh the run-lock heartbeat before the enclosing scan completes"
+        );
+        let conversation_count: i64 =
+            storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })?;
+        assert_eq!(conversation_count as usize, conversations.len());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_index_ingest_quarantine_version_retry_detects_legacy_records() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        let legacy = norm_conv(
+            Some("legacy-index-poison"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        let current = norm_conv(
+            Some("current-index-poison"),
+            vec![norm_msg(0, 1_700_000_000_001)],
+        );
+        let legacy_id = poison_conversation_id(&legacy);
+        let current_id = poison_conversation_id(&current);
+        std::fs::write(
+            quarantine_dir.join(INDEX_INGEST_POISON_FILE),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "conversation_id": legacy_id,
+                    "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                    "reason": "index-ingest-out-of-memory"
+                }),
+                serde_json::json!({
+                    "conversation_id": current_id,
+                    "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                    "cass_version_at_quarantine": current_cass_version(),
+                    "reason": "index-ingest-out-of-memory"
+                })
+            ),
+        )
+        .context("write index-ingest poison fixture")?;
+
+        let retry = stale_index_ingest_quarantine_version_retry(&data_dir)
+            .context("load index-ingest poison retry state")?
+            .context("legacy missing-version record should request one retry")?;
+        assert_eq!(retry.stale_records, 1);
+        assert_eq!(retry.legacy_records, 1);
+        assert_eq!(retry.previous_versions, vec!["unknown".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_index_ingest_quarantine_version_retry_detects_structured_legacy_records() -> Result<()>
+    {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        let schema_version = u32::try_from(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)
+            .context("current schema version fits in quarantine key")?;
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new("structured-legacy-index-poison", schema_version),
+            "index-ingest-out-of-memory: out of memory",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .context("valid quarantine timestamp")?,
+        );
+        state
+            .entries
+            .values_mut()
+            .next()
+            .context("structured quarantine record exists")?
+            .cass_version_at_quarantine = None;
+        state.save(&data_dir)?;
+
+        let retry = stale_index_ingest_quarantine_version_retry(&data_dir)
+            .context("load structured index-ingest poison retry state")?
+            .context("structured legacy record should request one retry")?;
+        assert_eq!(retry.stale_records, 1);
+        assert_eq!(retry.legacy_records, 1);
+        assert_eq!(retry.previous_versions, vec!["unknown".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn marking_stale_index_ingest_quarantine_retry_attempted_prevents_repeat() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        let conv = norm_conv(
+            Some("stale-index-poison-missing-source"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        let conversation_id = poison_conversation_id(&conv);
+        let jsonl_path = quarantine_dir.join(INDEX_INGEST_POISON_FILE);
+        std::fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                    "reason": "index-ingest-out-of-memory",
+                    "cass_version_at_quarantine": "0.0.0"
+                })
+            ),
+        )
+        .context("write stale index-ingest poison fixture")?;
+
+        let schema_version = u32::try_from(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)
+            .context("current schema version fits in quarantine key")?;
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new(conversation_id, schema_version),
+            "index-ingest-out-of-memory: out of memory",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .context("valid quarantine timestamp")?,
+        );
+        state
+            .entries
+            .values_mut()
+            .next()
+            .context("structured quarantine record exists")?
+            .cass_version_at_quarantine = None;
+        state.save(&data_dir)?;
+
+        let retry = stale_index_ingest_quarantine_version_retry(&data_dir)
+            .context("load index-ingest poison retry state")?
+            .context("stale records should request a retry before marking")?;
+        assert_eq!(retry.stale_records, 1);
+        assert_eq!(retry.legacy_records, 1);
+
+        assert_eq!(
+            mark_stale_index_ingest_quarantine_retry_attempted(&data_dir)
+                .context("mark stale retry attempted")?,
+            2,
+            "both JSONL and structured quarantine surfaces should be marked"
+        );
+        assert!(
+            stale_index_ingest_quarantine_version_retry(&data_dir)?.is_none(),
+            "marking an attempted retry must prevent repeat full scans"
+        );
+        assert!(
+            jsonl_path.exists(),
+            "marking retry attempted must rewrite the quarantine file in place, not delete it"
+        );
+        let jsonl = std::fs::read_to_string(&jsonl_path)?;
+        let record: serde_json::Value = serde_json::from_str(
+            jsonl
+                .lines()
+                .next()
+                .context("rewritten JSONL record remains")?,
+        )?;
+        assert_eq!(
+            poison_record_cass_version(&record),
+            Some(current_cass_version())
+        );
+
+        let structured_state = QuarantineState::load(&data_dir);
+        assert_eq!(structured_state.len(), 1);
+        let structured_record = structured_state
+            .entries
+            .values()
+            .next()
+            .context("structured quarantine record remains")?;
+        assert_eq!(
+            structured_record.cass_version_at_quarantine.as_deref(),
+            Some(current_cass_version())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn successful_ingest_clears_matching_index_poison_records_without_deleting_file() -> Result<()>
+    {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        let conv = norm_conv(
+            Some("stale-index-poison-cleared"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        let conversation_id = poison_conversation_id(&conv);
+        let jsonl_path = quarantine_dir.join(INDEX_INGEST_POISON_FILE);
+        std::fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                    "reason": "index-ingest-out-of-memory",
+                    "cass_version_at_quarantine": "0.0.0"
+                })
+            ),
+        )
+        .context("write index-ingest poison fixture")?;
+
+        let schema_version = u32::try_from(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)
+            .context("current schema version fits in quarantine key")?;
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new(conversation_id.clone(), schema_version),
+            "index-ingest-out-of-memory: out of memory",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .context("valid quarantine timestamp")?,
+        );
+        state.save(&data_dir)?;
+
+        clear_poison_conversations_after_successful_ingest(
+            &data_dir,
+            INDEX_INGEST_POISON_FILE,
+            "index-ingest-out-of-memory",
+            &[conv],
+        );
+
+        assert!(
+            jsonl_path.exists(),
+            "cleanup must truncate the quarantine file in place, not delete it"
+        );
+        assert!(
+            std::fs::read_to_string(&jsonl_path)?.trim().is_empty(),
+            "successful retry should remove the matching JSONL poison record"
+        );
+        assert!(
+            QuarantineState::load(&data_dir).is_empty(),
+            "successful retry should clear the matching structured quarantine record"
+        );
+        Ok(())
+    }
+
+    /// Regression for cass#261: cross-surface storm guard.
+    ///
+    /// If `mark_stale_index_ingest_jsonl_retry_attempted` succeeds for a
+    /// conversation (JSONL stamped with current_version) but
+    /// `mark_stale_index_ingest_structured_retry_attempted`'s `state.save()`
+    /// fails (leaving the structured record at `cass_version_at_quarantine =
+    /// None`), the next call to `stale_index_ingest_quarantine_version_retry`
+    /// must NOT signal a retry for that conversation even though the structured
+    /// record still looks legacy.  Without the `already_current_keys` guard
+    /// added to `StalePoisonVersionAccumulator`, the structured `None`
+    /// observation would win and trigger a full scan on every subsequent run —
+    /// an unbounded storm.
+    #[test]
+    fn cross_surface_current_version_suppresses_legacy_structured_entry() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        let conv = norm_conv(
+            Some("cross-surface-storm-guard"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        let conversation_id = poison_conversation_id(&conv);
+        let current = current_cass_version();
+        let schema_version = crate::storage::sqlite::CURRENT_SCHEMA_VERSION;
+
+        // JSONL: already stamped with current_version (mark succeeded here)
+        let jsonl_path = quarantine_dir.join(INDEX_INGEST_POISON_FILE);
+        std::fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "conversation_id": &conversation_id,
+                    "schema_version_at_quarantine": schema_version,
+                    "reason": "index-ingest-out-of-memory",
+                    "cass_version_at_quarantine": current  // already marked
+                })
+            ),
+        )
+        .context("write JSONL fixture with current version")?;
+
+        // Structured: still None (save failed during mark — the bug scenario)
+        let schema_version_u32 =
+            u32::try_from(schema_version).context("schema_version fits in u32")?;
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new(&conversation_id, schema_version_u32),
+            "index-ingest-out-of-memory: out of memory",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .context("valid quarantine timestamp")?,
+        );
+        state
+            .entries
+            .values_mut()
+            .next()
+            .context("structured record exists")?
+            .cass_version_at_quarantine = None; // simulate save failure leaving None
+        state
+            .save(&data_dir)
+            .context("persist structured fixture")?;
+
+        // Before the fix: this would return Some(retry) because the structured
+        // None observation wins over the JSONL current-version observation.
+        // After the fix: the JSONL current-version observation sets
+        // already_current_keys, suppressing the structured None observation.
+        let retry = stale_index_ingest_quarantine_version_retry(&data_dir)
+            .context("version retry check")?;
+        assert!(
+            retry.is_none(),
+            "a conversation already marked current in JSONL must not trigger a retry \
+             even if its structured record still has cass_version_at_quarantine=None \
+             (cass#261 cross-surface storm guard)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_index_ingest_quarantine_retry_forces_scan_from_start() {
+        assert_eq!(
+            non_watch_scan_since_ts(false, false, false, Some(1234)),
+            Some(1233)
+        );
+        assert_eq!(
+            non_watch_scan_since_ts(false, false, true, Some(1234)),
+            None
+        );
+        assert_eq!(
+            non_watch_scan_since_ts(true, false, false, Some(1234)),
+            None
+        );
+        assert_eq!(
+            non_watch_scan_since_ts(false, true, false, Some(1234)),
+            None
+        );
+    }
+
+    #[test]
+    fn connector_local_scan_since_ts_protects_newly_enabled_connector_backlog() {
+        let global_incremental_since_ts = Some(1233);
+
+        assert_eq!(
+            connector_local_scan_since_ts_from_state(
+                global_incremental_since_ts,
+                Some(2000),
+                false
+            ),
+            Some(1999),
+            "an explicit connector watermark wins over the legacy global watermark"
+        );
+        assert_eq!(
+            connector_local_scan_since_ts_from_state(global_incremental_since_ts, None, true),
+            global_incremental_since_ts,
+            "legacy databases keep incremental behavior for connectors that already have archived rows"
+        );
+        assert_eq!(
+            connector_local_scan_since_ts_from_state(global_incremental_since_ts, None, false),
+            None,
+            "a connector with no rows and no connector watermark must scan from the beginning"
+        );
+        assert_eq!(
+            connector_local_scan_since_ts_from_state(None, None, true),
+            None,
+            "full scans already have no cutoff"
+        );
+        assert_eq!(
+            connector_local_scan_since_ts_from_state(global_incremental_since_ts, Some(0), false),
+            Some(0),
+            "saturating subtraction must not underflow old or corrupt zero-valued markers"
+        );
+    }
+
+    #[test]
+    fn configured_scan_root_watermark_policy_matches_source_kind() -> Result<()> {
+        ensure_since_ts_matches(
+            explicit_scan_root_since_ts(
+                &ScanRoot::remote(
+                    PathBuf::from("/remote/fixture/claude"),
+                    Origin::remote("fixture-host"),
+                    Some(Platform::Linux),
+                ),
+                Path::new("/tmp/cass-data"),
+                Some(1234),
+            ),
+            None,
+            "configured remote roots may contain already-transferred files older than the global scan watermark; canonical dedupe protects repeats, but the scan must not skip never-promoted mirror sessions",
+        )?;
+        ensure_since_ts_matches(
+            explicit_scan_root_since_ts(
+                &ScanRoot::local(PathBuf::from("/tmp/cass-data")),
+                Path::new("/tmp/cass-data"),
+                Some(1234),
+            ),
+            Some(1234),
+            "the built-in local root should keep normal incremental filtering",
+        )?;
+        ensure_since_ts_matches(
+            explicit_scan_root_since_ts(
+                &ScanRoot::local(PathBuf::from("/tmp/backup-root")),
+                Path::new("/tmp/cass-data"),
+                Some(1234),
+            ),
+            Some(1234),
+            "configured local roots are local history sources and must honor the normal incremental watermark",
+        )?;
+        ensure_since_ts_matches(
+            explicit_scan_root_since_ts(
+                &ScanRoot::local(PathBuf::from("/tmp/backup-root")),
+                Path::new("/tmp/cass-data"),
+                None,
+            ),
+            None,
+            "full rebuilds still scan configured local roots from the beginning",
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -31678,6 +36306,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Some(FrankenStorage::now_millis()),
+            None,
         )
         .expect("mixed startup ingest should not violate foreign keys");
 
@@ -31916,6 +36545,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             None,
+            None,
         )
         .unwrap();
 
@@ -32020,6 +36650,7 @@ mod tests {
                 &Some(progress),
                 LexicalPopulationStrategy::IncrementalInline,
                 None,
+                None,
             )
             .unwrap();
 
@@ -32098,6 +36729,7 @@ mod tests {
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(discovered, vec!["codex".to_string()]);
@@ -32143,6 +36775,7 @@ mod tests {
             flow_limiter,
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
+            None,
             None,
         )
         .unwrap();
@@ -32266,6 +36899,7 @@ mod tests {
                     Some(crate::sources::config::Platform::Linux),
                 )],
                 since_ts: None,
+                local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: Some(progress.clone()),
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -32280,6 +36914,7 @@ mod tests {
             flow_limiter,
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
+            None,
             None,
         )
         .unwrap();
@@ -32298,6 +36933,149 @@ mod tests {
             connector.error.as_deref(),
             Some("remote scan failed for /remote/fixture/claude: remote exploded")
         );
+        assert!(
+            mutations.scanned_connectors.is_empty(),
+            "remote scan errors must prevent per-connector watermark advancement"
+        );
+        assert!(mutations.scan_had_errors);
+    }
+
+    #[test]
+    fn streaming_configured_scan_roots_ignore_global_watermark() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let remote_root_path = tmp.path().join("remote-mirror").join("claude");
+        std::fs::create_dir_all(&remote_root_path)?;
+        std::fs::write(
+            remote_root_path.join("remote-watermark.jsonl"),
+            b"{\"role\":\"user\",\"content\":\"remote\"}\n",
+        )?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        let index_path = index_dir(&data_dir)?;
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: String::from("fastembed"),
+            progress: Some(progress),
+            watch_interval_secs: 30,
+        };
+
+        let mutations = run_streaming_index_with_connector_factories(
+            &storage,
+            Some(&mut index),
+            &opts,
+            Some(i64::MAX),
+            LexicalPopulationStrategy::IncrementalInline,
+            vec![ScanRoot::remote(
+                remote_root_path,
+                Origin::remote("fixture-host"),
+                Some(Platform::Linux),
+            )],
+            vec![("claude", watermark_sensitive_remote_connector_factory)],
+            FrankenStorage::now_millis(),
+            None,
+        )
+        .context(
+            "configured remote roots should scan from the root despite the global watermark",
+        )?;
+
+        ensure_canonical_mutations(
+            mutations.canonical_mutations,
+            CanonicalMutationCounts {
+                inserted_conversations: 1,
+                inserted_messages: 1,
+            },
+            "streaming configured scan roots",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_configured_local_scan_roots_honor_connector_watermark() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let local_root_path = tmp.path().join("backup-local").join("claude");
+        std::fs::create_dir_all(&local_root_path)?;
+        std::fs::write(
+            local_root_path.join("remote-watermark.jsonl"),
+            b"{\"role\":\"user\",\"content\":\"local backup\"}\n",
+        )?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        storage.set_connector_last_scan_ts("claude", i64::MAX)?;
+        let local_since_by_connector = connector_local_scan_since_ts_map(
+            &storage,
+            Some(1234),
+            &[(
+                "claude",
+                watermark_sensitive_remote_connector_factory as ConnectorFactory,
+            )],
+        )?;
+        assert_eq!(
+            local_since_by_connector.get("claude").copied().flatten(),
+            Some(i64::MAX - 1),
+            "configured-root scan must see the connector-specific watermark"
+        );
+        assert_eq!(
+            explicit_scan_root_since_ts(
+                &configured_local_scan_root(local_root_path.clone()),
+                &data_dir,
+                local_since_by_connector.get("claude").copied().flatten(),
+            ),
+            Some(i64::MAX - 1),
+            "configured local roots must preserve the connector-specific cutoff"
+        );
+        let index_path = index_dir(&data_dir)?;
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: String::from("fastembed"),
+            progress: Some(progress),
+            watch_interval_secs: 30,
+        };
+
+        let mutations = run_streaming_index_with_connector_factories(
+            &storage,
+            Some(&mut index),
+            &opts,
+            Some(i64::MAX),
+            LexicalPopulationStrategy::IncrementalInline,
+            vec![configured_local_scan_root(local_root_path)],
+            vec![("claude", watermark_sensitive_remote_connector_factory)],
+            FrankenStorage::now_millis(),
+            None,
+        )
+        .context("configured local roots should keep the connector incremental watermark")?;
+
+        ensure_canonical_mutations(
+            mutations.canonical_mutations,
+            CanonicalMutationCounts::default(),
+            "streaming configured local scan roots",
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -32334,6 +37112,7 @@ mod tests {
             Vec::new(),
             vec![("claude", panic_connector_factory)],
             FrankenStorage::now_millis(),
+            None,
         )
         .expect_err("producer panic should abort streaming indexing");
         let message = error.to_string();
@@ -32354,6 +37133,211 @@ mod tests {
             Some(message.as_str()),
             "progress tracker should expose the real panic instead of pretending indexing succeeded"
         );
+    }
+
+    #[test]
+    fn batch_configured_scan_roots_ignore_global_watermark() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let remote_root_path = tmp.path().join("remote-mirror").join("claude");
+        std::fs::create_dir_all(&remote_root_path)?;
+        std::fs::write(
+            remote_root_path.join("remote-watermark.jsonl"),
+            b"{\"role\":\"user\",\"content\":\"remote\"}\n",
+        )?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: String::from("fastembed"),
+            progress: Some(progress),
+            watch_interval_secs: 30,
+        };
+
+        let mutations = run_batch_index_with_connector_factories(
+            &storage,
+            None,
+            &opts,
+            Some(i64::MAX),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            vec![ScanRoot::remote(
+                remote_root_path,
+                Origin::remote("fixture-host"),
+                Some(Platform::Linux),
+            )],
+            vec![("claude", watermark_sensitive_remote_connector_factory)],
+            FrankenStorage::now_millis(),
+            None,
+        )
+        .context(
+            "configured remote roots should scan from the root despite the global watermark",
+        )?;
+
+        ensure_canonical_mutations(
+            mutations.canonical_mutations,
+            CanonicalMutationCounts {
+                inserted_conversations: 1,
+                inserted_messages: 1,
+            },
+            "batch configured scan roots",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn batch_configured_local_scan_roots_honor_connector_watermark() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let local_root_path = tmp.path().join("backup-local").join("claude");
+        std::fs::create_dir_all(&local_root_path)?;
+        std::fs::write(
+            local_root_path.join("remote-watermark.jsonl"),
+            b"{\"role\":\"user\",\"content\":\"local backup\"}\n",
+        )?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        storage.set_connector_last_scan_ts("claude", i64::MAX)?;
+        let local_since_by_connector = connector_local_scan_since_ts_map(
+            &storage,
+            Some(1234),
+            &[(
+                "claude",
+                watermark_sensitive_remote_connector_factory as ConnectorFactory,
+            )],
+        )?;
+        assert_eq!(
+            local_since_by_connector.get("claude").copied().flatten(),
+            Some(i64::MAX - 1),
+            "configured-root scan must see the connector-specific watermark"
+        );
+        assert_eq!(
+            explicit_scan_root_since_ts(
+                &configured_local_scan_root(local_root_path.clone()),
+                &data_dir,
+                local_since_by_connector.get("claude").copied().flatten(),
+            ),
+            Some(i64::MAX - 1),
+            "configured local roots must preserve the connector-specific cutoff"
+        );
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: String::from("fastembed"),
+            progress: Some(progress),
+            watch_interval_secs: 30,
+        };
+
+        let mutations = run_batch_index_with_connector_factories(
+            &storage,
+            None,
+            &opts,
+            Some(i64::MAX),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            vec![configured_local_scan_root(local_root_path)],
+            vec![("claude", watermark_sensitive_remote_connector_factory)],
+            FrankenStorage::now_millis(),
+            None,
+        )
+        .context("configured local roots should keep the connector incremental watermark")?;
+
+        ensure_canonical_mutations(
+            mutations.canonical_mutations,
+            CanonicalMutationCounts::default(),
+            "batch configured local scan roots",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn batch_index_does_not_watermark_failed_discovered_connector() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let local_root = tmp.path().join("codex").join("sessions");
+        std::fs::create_dir_all(&local_root)?;
+        *FAILING_EXPLICIT_FILE_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(local_root);
+
+        let result = (|| -> Result<()> {
+            let db_path = data_dir.join("db.sqlite");
+            let storage = FrankenStorage::open(&db_path)?;
+            ensure_fts_schema(&storage);
+            let progress = Arc::new(IndexingProgress::default());
+            let opts = IndexOptions {
+                full: false,
+                force_rebuild: false,
+                watch: false,
+                watch_once_paths: None,
+                db_path,
+                data_dir,
+                semantic: false,
+                build_hnsw: false,
+                embedder: String::from("fastembed"),
+                progress: Some(progress.clone()),
+                watch_interval_secs: 30,
+            };
+
+            let mutations = run_batch_index_with_connector_factories(
+                &storage,
+                None,
+                &opts,
+                None,
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                Vec::new(),
+                vec![("codex", failing_explicit_file_root_connector_factory)],
+                FrankenStorage::now_millis(),
+                None,
+            )?;
+
+            assert_eq!(
+                mutations.canonical_mutations,
+                CanonicalMutationCounts::default()
+            );
+            assert!(
+                mutations.scanned_connectors.is_empty(),
+                "failed batch scans must not advance per-connector watermarks"
+            );
+            assert!(mutations.scan_had_errors);
+            let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(stats.agents_discovered, vec!["codex".to_string()]);
+            assert_eq!(
+                stats
+                    .connectors
+                    .iter()
+                    .find(|connector| connector.name == "codex")
+                    .and_then(|connector| connector.error.as_deref()),
+                Some("connector parse failed after source discovery")
+            );
+            Ok(())
+        })();
+
+        *FAILING_EXPLICIT_FILE_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        result
     }
 
     #[test]
@@ -32389,6 +37373,7 @@ mod tests {
             Vec::new(),
             vec![("codex", deferred_batch_connector_factory)],
             FrankenStorage::now_millis(),
+            None,
         )
         .expect("deferred batch ingest should not require a Tantivy writer");
 
@@ -32448,6 +37433,7 @@ mod tests {
                     Some(crate::sources::config::Platform::Linux),
                 )],
                 since_ts: None,
+                local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -32582,6 +37568,63 @@ mod tests {
 
         assert_eq!(wal, PathBuf::from("/tmp/cass.db-wal"));
         assert_eq!(shm, PathBuf::from("/tmp/cass.db-shm"));
+    }
+
+    #[test]
+    fn incremental_index_startup_headroom_uses_safety_floor_not_archive_clone_size() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::File::create(&db_path)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        std::fs::write(database_path_with_suffix(&db_path, "-wal"), b"wal").unwrap();
+        std::fs::write(database_path_with_suffix(&db_path, "-shm"), b"shm").unwrap();
+
+        assert_eq!(
+            index_startup_storage_headroom_requirement(false, false),
+            IndexStorageHeadroomRequirement::IncrementalStartup,
+            "plain cass index must not demand full-rebuild scratch space before it knows a full rebuild is needed"
+        );
+        assert_eq!(
+            required_index_headroom_bytes(
+                &db_path,
+                IndexStorageHeadroomRequirement::IncrementalStartup,
+            ),
+            INDEX_MIN_FREE_SPACE_BYTES,
+            "routine incremental startup should require only the safety floor"
+        );
+    }
+
+    #[test]
+    fn full_and_force_rebuild_startup_headroom_keep_archive_clone_requirement() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::File::create(&db_path)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        std::fs::write(database_path_with_suffix(&db_path, "-wal"), vec![0_u8; 256]).unwrap();
+        std::fs::write(database_path_with_suffix(&db_path, "-shm"), vec![0_u8; 512]).unwrap();
+        let clone_requirement =
+            INDEX_MIN_FREE_SPACE_BYTES.max(database_bundle_size_bytes(&db_path).saturating_mul(2));
+
+        assert_eq!(
+            index_startup_storage_headroom_requirement(true, false),
+            IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild
+        );
+        assert_eq!(
+            index_startup_storage_headroom_requirement(false, true),
+            IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild
+        );
+        assert_eq!(
+            required_index_headroom_bytes(
+                &db_path,
+                IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+            ),
+            clone_requirement,
+            "full/force rebuilds still need enough scratch for atomic publish safety"
+        );
     }
 
     #[test]
@@ -33233,6 +38276,38 @@ mod tests {
         assert!(!should_salvage_historical_databases(
             false, 43_678, true, true
         ));
+    }
+
+    #[test]
+    fn pending_historical_bundle_probe_skips_populated_incremental_by_default() {
+        assert!(
+            !should_probe_pending_historical_bundles(false, false, 43_678, false, false),
+            "routine populated incremental index must not open historical backup bundles before indexing"
+        );
+    }
+
+    #[test]
+    fn pending_historical_bundle_probe_keeps_recovery_paths() {
+        assert!(
+            should_probe_pending_historical_bundles(true, false, 43_678, false, false),
+            "--full is an explicit heavy recovery/rebuild path and keeps historical discovery"
+        );
+        assert!(
+            should_probe_pending_historical_bundles(false, true, 43_678, false, false),
+            "freshly rebuilt canonical storage keeps historical discovery"
+        );
+        assert!(
+            should_probe_pending_historical_bundles(false, false, 0, false, false),
+            "empty canonical archives keep historical discovery so seed recovery still works"
+        );
+        assert!(
+            should_probe_pending_historical_bundles(false, false, 43_678, false, true),
+            "operators can explicitly request populated-incremental historical discovery"
+        );
+        assert!(
+            !should_probe_pending_historical_bundles(true, true, 0, true, true),
+            "canonical-only full rebuilds must not broaden into historical salvage"
+        );
     }
 
     #[test]
@@ -34809,6 +39884,7 @@ mod tests {
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
                 },
+                None,
             )
         });
 
@@ -34871,6 +39947,7 @@ mod tests {
             LexicalRebuildStartupOptions {
                 defer_initial_content_fingerprint: true,
             },
+            None,
         )
         .unwrap();
         assert_eq!(rebuild.indexed_docs, 4);
@@ -34984,6 +40061,7 @@ mod tests {
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
                 },
+                None,
             )
             .unwrap();
             assert_eq!(rebuild.indexed_docs, 4);
@@ -35098,6 +40176,7 @@ mod tests {
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
                 },
+                None,
             )
             .unwrap();
             assert_eq!(rebuild.indexed_docs, 8);
@@ -35209,6 +40288,7 @@ mod tests {
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
                 },
+                None,
             )
             .unwrap();
             assert_eq!(rebuild.indexed_docs, 6);
@@ -36779,6 +41859,7 @@ mod tests {
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
                 },
+                None,
             )
             .unwrap();
             assert_eq!(rebuild.indexed_docs, 30);
@@ -36929,6 +42010,7 @@ mod tests {
                 2,
                 None,
                 LexicalRebuildStartupOptions::default(),
+                None,
             )
             .unwrap();
             assert_eq!(rebuild.indexed_docs, 4);
@@ -37450,6 +42532,296 @@ mod tests {
             .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
             .unwrap();
         assert_eq!(message_count, 2);
+    }
+
+    fn write_semantic_watch_once_codex_session(path: &Path, id: &str, marker: &str) -> Result<()> {
+        let parent = path
+            .parent()
+            .context("semantic watch-once fixture path should have a parent")?;
+        std::fs::create_dir_all(parent)?;
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"timestamp":"2026-05-28T09:00:00.000Z","type":"session_meta","payload":{{"id":"{id}","cwd":"/data/projects/coding_agent_session_search"}}}}
+{{"timestamp":"2026-05-28T09:00:01.000Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{marker} user semantic"}}]}}}}
+{{"timestamp":"2026-05-28T09:00:02.000Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"{marker} assistant semantic"}}]}}}}
+"#,
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn semantic_watch_once_opts(
+        data_dir: &Path,
+        session: &Path,
+        progress: Arc<IndexingProgress>,
+    ) -> super::IndexOptions {
+        super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![session.to_path_buf()]),
+            db_path: data_dir.join("db.sqlite"),
+            data_dir: data_dir.to_path_buf(),
+            semantic: true,
+            build_hnsw: false,
+            embedder: "hash".to_string(),
+            progress: Some(progress),
+            watch_interval_secs: 30,
+        }
+    }
+
+    fn semantic_watch_once_stats(
+        progress: &Arc<IndexingProgress>,
+    ) -> Result<SemanticWatchOnceStats> {
+        let stats = progress
+            .stats
+            .lock()
+            .map_err(|err| anyhow::anyhow!("semantic watch-once stats lock poisoned: {err}"))?;
+        stats
+            .semantic_watch_once
+            .clone()
+            .context("semantic watch-once proof")
+    }
+
+    #[test]
+    #[serial]
+    fn run_index_semantic_watch_once_publishes_targeted_manifest() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let session = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("28")
+            .join("rollout-semantic-watch-once.jsonl");
+        write_semantic_watch_once_codex_session(
+            &session,
+            "semantic-watch-once-fresh",
+            "swonce-fresh",
+        )?;
+
+        let progress = Arc::new(IndexingProgress::default());
+        run_index(
+            semantic_watch_once_opts(&data_dir, &session, Arc::clone(&progress)),
+            None,
+        )?;
+
+        let stats = semantic_watch_once_stats(&progress)?;
+        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
+        anyhow::ensure!(
+            matches!(stats.reason.as_str(), "fresh_watch_once_db"),
+            "wrong reason"
+        );
+        anyhow::ensure!(matches!(stats.tier.as_str(), "fast"), "wrong tier");
+        anyhow::ensure!(matches!(stats.selected_docs, 2), "wrong selected doc count");
+        anyhow::ensure!(matches!(stats.embedded_docs, 2), "wrong embedded doc count");
+        anyhow::ensure!(
+            matches!(
+                stats.manifest_after_db_fingerprint.as_deref(),
+                Some("content-v1:1:1:2")
+            ),
+            "wrong post-publish fingerprint"
+        );
+
+        let manifest = SemanticManifest::load_or_default(&data_dir)?;
+        let artifact = manifest.fast_tier.as_ref().context("fast artifact")?;
+        anyhow::ensure!(
+            matches!(artifact.conversation_count, 1),
+            "wrong conversation count"
+        );
+        anyhow::ensure!(matches!(artifact.doc_count, 2), "wrong doc count");
+        anyhow::ensure!(
+            matches!(artifact.db_fingerprint.as_str(), "content-v1:1:1:2"),
+            "wrong artifact fingerprint"
+        );
+        let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
+        anyhow::ensure!(
+            matches!(index.record_count(), 2),
+            "wrong vector record count"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn run_index_semantic_watch_once_catches_up_append_only_prefix_manifest() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let first = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("28")
+            .join("rollout-semantic-watch-once-first.jsonl");
+        let second = first.with_file_name("rollout-semantic-watch-once-second.jsonl");
+        write_semantic_watch_once_codex_session(&first, "semantic-watch-once-first", "swonce-one")?;
+        write_semantic_watch_once_codex_session(
+            &second,
+            "semantic-watch-once-second",
+            "swonce-two",
+        )?;
+
+        let first_progress = Arc::new(IndexingProgress::default());
+        run_index(
+            semantic_watch_once_opts(&data_dir, &first, first_progress),
+            None,
+        )?;
+
+        let second_progress = Arc::new(IndexingProgress::default());
+        run_index(
+            semantic_watch_once_opts(&data_dir, &second, Arc::clone(&second_progress)),
+            None,
+        )?;
+
+        let stats = semantic_watch_once_stats(&second_progress)?;
+        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
+        anyhow::ensure!(
+            matches!(
+                stats.reason.as_str(),
+                "semantic_artifact_is_append_only_prefix"
+            ),
+            "wrong reason"
+        );
+        anyhow::ensure!(
+            matches!(
+                stats.manifest_before_db_fingerprint.as_deref(),
+                Some("content-v1:1:1:2")
+            ),
+            "wrong pre-publish fingerprint"
+        );
+        anyhow::ensure!(
+            matches!(
+                stats.manifest_after_db_fingerprint.as_deref(),
+                Some("content-v1:2:2:4")
+            ),
+            "wrong post-publish fingerprint"
+        );
+        anyhow::ensure!(matches!(stats.selected_docs, 2), "wrong selected doc count");
+        anyhow::ensure!(matches!(stats.embedded_docs, 2), "wrong embedded doc count");
+
+        let manifest = SemanticManifest::load_or_default(&data_dir)?;
+        let artifact = manifest.fast_tier.as_ref().context("fast artifact")?;
+        anyhow::ensure!(
+            matches!(artifact.conversation_count, 2),
+            "wrong conversation count"
+        );
+        anyhow::ensure!(matches!(artifact.doc_count, 4), "wrong doc count");
+        anyhow::ensure!(
+            matches!(artifact.db_fingerprint.as_str(), "content-v1:2:2:4"),
+            "wrong artifact fingerprint"
+        );
+        let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
+        anyhow::ensure!(
+            matches!(index.record_count(), 4),
+            "wrong vector record count"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn run_index_semantic_watch_once_reports_already_covered_manifest() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let session = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("28")
+            .join("rollout-semantic-watch-once-rerun.jsonl");
+        write_semantic_watch_once_codex_session(
+            &session,
+            "semantic-watch-once-rerun",
+            "swonce-rerun",
+        )?;
+
+        let first_progress = Arc::new(IndexingProgress::default());
+        run_index(
+            semantic_watch_once_opts(&data_dir, &session, first_progress),
+            None,
+        )?;
+
+        let second_progress = Arc::new(IndexingProgress::default());
+        run_index(
+            semantic_watch_once_opts(&data_dir, &session, Arc::clone(&second_progress)),
+            None,
+        )?;
+
+        let stats = semantic_watch_once_stats(&second_progress)?;
+        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
+        anyhow::ensure!(
+            matches!(stats.reason.as_str(), "semantic_artifact_already_covers_db"),
+            "wrong reason"
+        );
+        anyhow::ensure!(
+            matches!(
+                stats.manifest_before_db_fingerprint.as_deref(),
+                Some("content-v1:1:1:2")
+            ),
+            "wrong pre-publish fingerprint"
+        );
+        anyhow::ensure!(
+            matches!(
+                stats.manifest_after_db_fingerprint.as_deref(),
+                Some("content-v1:1:1:2")
+            ),
+            "wrong post-publish fingerprint"
+        );
+        anyhow::ensure!(matches!(stats.selected_docs, 0), "wrong selected doc count");
+        anyhow::ensure!(matches!(stats.embedded_docs, 0), "wrong embedded doc count");
+
+        let manifest = SemanticManifest::load_or_default(&data_dir)?;
+        let artifact = manifest.fast_tier.as_ref().context("fast artifact")?;
+        anyhow::ensure!(
+            matches!(artifact.conversation_count, 1),
+            "wrong conversation count"
+        );
+        anyhow::ensure!(matches!(artifact.doc_count, 2), "wrong doc count");
+        anyhow::ensure!(
+            matches!(artifact.db_fingerprint.as_str(), "content-v1:1:1:2"),
+            "wrong artifact fingerprint"
+        );
+        let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
+        anyhow::ensure!(
+            matches!(index.record_count(), 2),
+            "wrong vector record count"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn run_index_semantic_watch_once_fails_when_no_conversation_is_indexed() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let session = tmp.path().join("not-a-supported-watch-once-file.jsonl");
+        std::fs::write(&session, "{}\n")?;
+
+        let progress = Arc::new(IndexingProgress::default());
+        let err = match run_index(
+            semantic_watch_once_opts(&data_dir, &session, progress),
+            None,
+        ) {
+            Ok(_) => anyhow::bail!("zero-conversation semantic watch-once unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        let rendered = err.to_string();
+        anyhow::ensure!(
+            rendered.contains("indexed zero conversations"),
+            "unexpected error: {rendered}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -38857,6 +44229,35 @@ mod tests {
     }
 
     #[test]
+    fn inject_provenance_repairs_non_object_cass_metadata() {
+        let mut conv = norm_conv(Some("test"), vec![norm_msg(0, 100)]);
+        conv.metadata = serde_json::json!({
+            "cass": "connector supplied a malformed cass metadata value",
+            "other": "preserve me"
+        });
+
+        let origin = Origin::remote_with_host("laptop", "user@laptop.local");
+        inject_provenance(&mut conv, &origin);
+
+        assert_eq!(
+            conv.metadata.pointer("/other"),
+            Some(&serde_json::json!("preserve me"))
+        );
+        assert_eq!(
+            conv.metadata.pointer("/cass/origin/source_id"),
+            Some(&serde_json::json!("laptop"))
+        );
+        assert_eq!(
+            conv.metadata.pointer("/cass/origin/kind"),
+            Some(&serde_json::json!("ssh"))
+        );
+        assert_eq!(
+            conv.metadata.pointer("/cass/origin/host"),
+            Some(&serde_json::json!("user@laptop.local"))
+        );
+    }
+
+    #[test]
     fn large_codex_extra_compaction_preserves_cass_metadata() {
         let mut conv = norm_conv(Some("codex-large"), vec![norm_msg(0, 100)]);
         conv.agent_slug = "codex".to_string();
@@ -38948,6 +44349,59 @@ mod tests {
             Some(CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES),
         );
         assert_eq!(large_claude.messages[0].extra, raw_extra);
+    }
+
+    #[test]
+    fn prepare_conversation_for_ingest_compacts_large_codex_batch_extras() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let source_path = temp.path().join("rollout-large.jsonl");
+        std::fs::File::create(&source_path)
+            .expect("create sparse source")
+            .set_len(CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES)
+            .expect("size sparse source");
+
+        let mut conv = norm_conv(Some("codex-large-batch"), vec![norm_msg(0, 100)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path;
+        conv.messages[0].extra = serde_json::json!({
+            "payload": {
+                "delta": "duplicated raw codex event payload"
+            },
+            "response": {
+                "model": "gpt-5.4"
+            },
+            "cass": {
+                "event_line": 42
+            }
+        });
+
+        prepare_conversation_for_ingest(&data_dir, "codex", &Origin::local(), None, &mut conv);
+
+        let extra = &conv.messages[0].extra;
+        assert_eq!(
+            extra
+                .pointer("/cass/model")
+                .and_then(serde_json::Value::as_str),
+            Some("gpt-5.4")
+        );
+        assert_eq!(
+            extra.pointer("/cass/event_line"),
+            Some(&serde_json::json!(42))
+        );
+        assert!(extra.get("payload").is_none());
+        assert!(extra.get("response").is_none());
+        assert_eq!(
+            conv.metadata.pointer("/cass/origin/source_id"),
+            Some(&serde_json::json!("local"))
+        );
+        assert_eq!(
+            conv.metadata.pointer("/cass/raw_mirror/blob_size_bytes"),
+            Some(&serde_json::json!(
+                CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES
+            ))
+        );
     }
 
     #[test]
@@ -39336,6 +44790,35 @@ mod tests {
         assert_eq!(
             conv.metadata["cass"]["workspace_original"].as_str(),
             Some("/home/user/app")
+        );
+    }
+
+    #[test]
+    fn apply_workspace_rewrite_repairs_non_object_cass_metadata() {
+        let mut conv = norm_conv(None, vec![norm_msg(0, 1000)]);
+        conv.workspace = Some(PathBuf::from("/home/user/app"));
+        conv.metadata = serde_json::json!({
+            "cass": ["malformed"],
+            "other": "preserve me"
+        });
+
+        let mappings = vec![crate::sources::config::PathMapping::new(
+            "/home/user",
+            "/Users/me",
+        )];
+
+        let mut root = crate::connectors::ScanRoot::local(PathBuf::from("/"));
+        root.workspace_rewrites = mappings;
+        apply_workspace_rewrite(&mut conv, &root);
+
+        assert_eq!(conv.workspace, Some(PathBuf::from("/Users/me/app")));
+        assert_eq!(
+            conv.metadata.pointer("/other"),
+            Some(&serde_json::json!("preserve me"))
+        );
+        assert_eq!(
+            conv.metadata.pointer("/cass/workspace_original"),
+            Some(&serde_json::json!("/home/user/app"))
         );
     }
 
@@ -40469,6 +45952,7 @@ mod tests {
             &mut last_progress_persist,
             Duration::from_secs(60),
             None,
+            None,
         )
         .unwrap();
 
@@ -40579,6 +46063,7 @@ mod tests {
             64,
             &mut last_progress_persist,
             Duration::from_secs(60),
+            None,
             None,
         )
         .unwrap();
