@@ -360,7 +360,9 @@ Ingests history from 20 local agents, normalizing them into a unified `Conversat
 - **Codex**: `~/.codex/sessions` (Rollout JSONL)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
-- **Claude Code**: `~/.claude/projects` (Session JSONL)
+- **Claude Code**: `~/.claude/projects` (Session JSONL), plus macOS Desktop metadata sidecars under
+  `~/Library/Application Support/Claude/claude-code-sessions` and
+  `~/Library/Application Support/Claude/local-agent-mode-sessions`
 - **Clawdbot**: `~/.clawdbot/sessions` (Session JSONL)
 - **Vibe (Mistral)**: `~/.vibe/logs/session/*/messages.jsonl` (Session JSONL)
 - **OpenCode**: `.opencode` directories (SQLite)
@@ -377,6 +379,11 @@ Ingests history from 20 local agents, normalizing them into a unified `Conversat
 - **Kimi Code**: `~/.kimi/sessions/*/*/wire.jsonl` (Session JSONL)
 - **Qwen Code**: `~/.qwen/tmp/*/chats/session-*.json` (Chat JSON)
 - **Factory (Droid)**: `~/.factory/sessions` (JSONL files organized by workspace slug)
+
+Claude Code Desktop sidecars preserve title, workspace, model, and session IDs,
+but not necessarily the full conversation body. If Claude Code has culled an old
+CLI JSONL body, cass can still index searchable sidecar metadata while reporting
+that the conversation body is unavailable.
 
 #### Connector Details
 
@@ -894,6 +901,9 @@ cass swarm work-packet --json --bead coding_agent_session_search-example
 
 # Coordination hygiene check before closeout or takeover review
 cass swarm lint --json --bead coding_agent_session_search-example
+
+# Read-only sibling dependency drift sentinel
+cass swarm dependency-drift --json
 ```
 
 `swarm status` composes Beads, Agent Mail metadata, git state, rch/build
@@ -901,6 +911,11 @@ pressure, cass health/status, and proof references. Stale candidates are
 advisory only: coordinate through Beads and Agent Mail before reopening,
 force-releasing, or taking over work. Suggested commands are robot-safe
 templates, not automatic actions.
+
+`swarm dependency-drift` reads `Cargo.toml` and optional sibling checkouts to
+report manifest pins, local HEAD/dirty state, strict validation commands, and
+release-risk recommendations. It does not fetch remotes, edit manifests, run
+builds, update Beads, send Agent Mail, delete files, or mutate git state.
 
 When status points at prior evidence, use `cass pack "query" --robot` to create
 a bounded cited handoff for another agent. Packs complement the cockpit; they do
@@ -2569,6 +2584,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `swarm status --json` | Read-only shared-repo operations snapshot across Beads, Agent Mail metadata, git, build pressure, cass readiness, and proof refs |
 | `swarm work-packet --json` | Advisory one-agent packet with readiness, suggested reservations, verification commands, and closeout checklist; it does not claim or reserve |
 | `swarm lint --json` | Read-only coordination protocol lint for missing mail, stale reservations, status mismatches, and proof gaps |
+| `swarm dependency-drift --json` | Read-only sibling dependency sentinel for Cargo.toml pins, optional local checkout HEAD/dirty state, strict validation commands, and release-risk recommendations |
 | `sessions [--workspace DIR] [--current]` | Discover recent session files for follow-up actions |
 | `context <path>` | Find related sessions by workspace, day, or agent |
 | `view <path> -n N` | View source file at specific line (follow-up on search) |
@@ -2894,6 +2910,11 @@ Update check state is stored in the data directory:
 | `CASS_DEBUG_CACHE_METRICS` | unset | Enable cache hit/miss logging |
 | **Semantic Search** | | |
 | `CASS_SEMANTIC_EMBEDDER` | auto | Force embedder: `hash` or `minilm` |
+| `CASS_SEMANTIC_PROGRESS_JSONL` | unset | Absolute path to a JSONL file the semantic backfill appends one event per transition to (`selection_*`, `packet_replay_*`, `embed_batch_*`, `staging_write_*`, `checkpoint_save_*`, `publish_*`, `error`, `cancelled`, `complete`). Each line carries timestamp, phase + sub-phase, batch/row counters, byte counts, elapsed-since-start, and a cheap RSS estimate. Silent when unset. Best-effort writes — failures log at debug and never crash a backfill. See [cass#257](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/257). |
+| `CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS` | 30000 | Warn when one embedder batch takes more than 30s. Derived from cass#257 boxed quality-corpus telemetry: 60 MiniLM batches averaged ~5.95s, so the default is about 5x the observed healthy batch. Set `0` to disable warnings. |
+| `CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS` | 300000 | Abort a semantic backfill batch after a single embedder batch returns if it exceeded 5 minutes. Derived as a conservative ~50x multiple of the cass#257 healthy 128-doc MiniLM batch average. Set `0` to disable failure. |
+| `CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT` | 10000 | Soft cap for `cass models backfill`: checkpoint after a whole-conversation prefix near 10k selected messages. Derived from cass#257 high-volume proof (7,618 docs in ~6 minutes) plus the original 10k-message workaround. Set `0` for no message cap. |
+| `CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT` | 8388608 | Soft cap for `cass models backfill`: checkpoint after a whole-conversation prefix near 8 MiB selected content. Derived from cass#257 high-volume proof (4.3 MiB selected bytes) with about 2x headroom. Set `0` for no byte cap. |
 | **TUI** | | |
 | `TUI_HEADLESS` | unset | Disable interactive features |
 | `CASS_ALLOW_DUMB_TERM` | unset | Allow TUI startup even when `TERM=dumb` |
@@ -2913,23 +2934,24 @@ Update check state is stored in the data directory:
 
 ---
 
-## Sibling Dependency Contract
+## Dependency Source Contract
 
-`cass` pins git revisions in [`Cargo.toml`](Cargo.toml) for `asupersync`, `frankensqlite`/`fsqlite-types`, `franken-agent-detection`, `frankensearch`, `frankentui`, and `toon` (`tru`). The repo also commits local `[patch]` overrides for `frankensqlite`, `franken-agent-detection`, and `frankensearch`; the remaining sibling repos can be switched to `/data/projects/*` checkouts during local development.
+`cass` pins dependency identities in [`Cargo.toml`](Cargo.toml): exact registry version requirements for crates.io-only dependencies and git revisions for source dependencies. The repo keeps local `[patch]` overrides commented out by default; enable them only for local development and never commit an active sibling path override.
 
-| Dependency | Pinned revision |
+| Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `b3c841ba` |
-| `franken-agent-detection` | `a0ce134b` |
-| `asupersync` | `0.3.1` |
-| `frankensearch` | `128d134a` |
+| `frankensqlite` / `fsqlite-types` | `=0.1.9` (crates.io; #95 BtCursor + #106 MVCC grow + FTS5 reload + MAX/MIN(rowid) leaf-seek fixes) |
+| `franken-agent-detection` | `a4923d4` |
+| `asupersync` | `=0.3.2` |
+| `frankensearch` | `2cad158f` |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 
 **Build-time validation**
-- `build.rs` validates the active local overrides against the expected package name, package version, patch path, and Cargo feature/default-features contract.
-- If an active sibling checkout has drifted away from the pinned git revision or has a dirty worktree, the build emits a warning instead of silently trusting it.
+- `build.rs` validates the committed dependency source contract against the expected package name, package version, Cargo feature/default-features contract, and git source where applicable.
+- If an active git-pinned sibling checkout has drifted away from the pinned revision or has a dirty worktree, the build emits a warning instead of silently trusting it. Crates.io-only pins are validated by package version.
 - Enable strict enforcement with `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation` or `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. Strict mode upgrades drift warnings to hard errors and also validates the optional sibling repos before you switch them to local path overrides.
+- Use `cass swarm dependency-drift --json` for a fast read-only preflight. It reports each manifest pin, optional sibling checkout HEAD/dirty state, upstream status as `not_checked`, and the exact strict-validation commands to run; it never fetches remotes or mutates files.
 
 **Expected interface contract**
 - `frankensqlite` (`fsqlite`): `Connection`, `params!`, and `compat::{ConnectionExt, RowExt}` with `row.get_typed(...)`.

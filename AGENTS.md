@@ -75,7 +75,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 ### Async Runtime: asupersync
 
-This project uses **asupersync** as its async runtime (path dep at `../asupersync`). It provides `RuntimeBuilder`, `spawn_blocking`, `fs` ops, `net`, `signal`, and structured concurrency via `Cx`.
+This project uses **asupersync** as its async runtime. It provides `RuntimeBuilder`, `spawn_blocking`, `fs` ops, `net`, `signal`, and structured concurrency via `Cx`.
 
 ### Environment Variables
 
@@ -99,18 +99,18 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 | Crate | Purpose |
 |-------|---------|
-| `asupersync` | Async runtime (multi-thread, fs, spawn_blocking, signals) — path dep |
+| `asupersync` | Async runtime (multi-thread, fs, spawn_blocking, signals) |
 | `clap` | CLI argument parsing with derive macros |
 | `serde` + `serde_json` | Serialization |
-| `frankensqlite` (`fsqlite`) | Pure-Rust SQLite reimplementation — primary storage backend (path dep) |
+| `frankensqlite` (`fsqlite`) | Pure-Rust SQLite reimplementation — primary storage backend |
 | `rusqlite` | SQLite database (bundled) — legacy, retained during frankensqlite migration |
-| `frankensearch` | Unified search engine: lexical BM25 + semantic + RRF fusion (path dep) |
-| `franken_agent_detection` | Agent session auto-detection across 15+ providers (path dep) |
+| `frankensearch` | Unified search engine: lexical BM25 + semantic + RRF fusion |
+| `franken_agent_detection` | Agent session auto-detection across 15+ providers |
 | `fastembed` | ONNX-based text embeddings |
 | `hnsw_rs` | HNSW approximate nearest neighbors |
 | `half` + `wide` + `memmap2` | f16 quantized vectors, portable SIMD, memory-mapped I/O |
-| `ftui` + `ftui-extras` | FrankenTUI terminal interface (path dep) |
-| `toon` | Terminal rendering library (path dep) |
+| `ftui` + `ftui-extras` | FrankenTUI terminal interface |
+| `toon` | Terminal rendering library |
 | `reqwest` | HTTP client (rustls-tls, blocking + async) |
 | `rayon` | Data parallelism for CPU-bound work |
 | `colored` + `indicatif` + `console` | Colorful, informative console output |
@@ -125,13 +125,24 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | `tracing` | Structured logging and diagnostics |
 | `unicode-normalization` | NFC text canonicalization |
 
-**Path dependencies** (sibling dirs under `/data/projects/`):
+**Optional local sibling checkouts** (under `/data/projects/`, via commented local patches only):
 - `frankensqlite` — Pure-Rust SQLite with BEGIN CONCURRENT (MVCC multi-writer)
 - `frankensearch` — Unified search: BM25 lexical + semantic embeddings + RRF fusion + reranking
 - `franken_agent_detection` — Auto-discovers agent sessions from 15+ providers
 - `frankentui` (`ftui` + `ftui-extras` + `ftui-runtime` + `ftui-tty`) — Terminal UI framework
 - `asupersync` — Async runtime (multi-thread, fs, spawn_blocking, signals)
 - `toon` — Token-optimized serialization
+
+**Dependency source contract:**
+
+| Dependency | Pinned source |
+|------------|-----------------|
+| `frankensqlite` / `fsqlite-types` | `=0.1.9` (crates.io; #95 BtCursor + #106 MVCC grow + FTS5 reload + MAX/MIN(rowid) leaf-seek fixes) |
+| `franken-agent-detection` | `a4923d4` |
+| `asupersync` | `=0.3.2` |
+| `frankensearch` | `2cad158f` |
+| `frankentui` | `5f78cfa0` |
+| `toon` (`tru`) | `5669b72a` |
 
 ### Release Profile
 
