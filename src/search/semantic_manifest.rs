@@ -41,7 +41,36 @@ use super::policy::{
 
 /// Current manifest format version.  Bump when the JSON schema changes in a
 /// backwards-incompatible way.
-pub const MANIFEST_FORMAT_VERSION: u32 = 1;
+/// Manifest format version.
+///
+/// History:
+/// - **v1** (pre-cass#257): `BuildCheckpoint` resume cursor is the
+///   conversation offset only.
+/// - **v2** (cass#257 sub-fix 2): `BuildCheckpoint` may additionally
+///   carry `last_message_id`, an inclusive canonical message PK
+///   advanced by every batch. Resume strictly skips messages ≤ this
+///   cursor so an interrupted bounded run never re-embeds work it
+///   already staged. Later v2 checkpoints may also carry
+///   `cursor_exhausted`, which separates durable completion from
+///   count-based progress. Both fields use `#[serde(default)]`; the
+///   JSON-on-disk shape only differs when a batch persists the cursor
+///   metadata, and older v2 readers ignore the extra field.
+///
+/// **Compatibility:**
+/// - **Old binary reading v2 manifest:** clean `UnsupportedVersion`
+///   error from `load()`; operator sees a clear "manifest version
+///   $V is newer than max-supported $MAX" message and can upgrade.
+/// - **New binary reading v1 manifest:** loads fine. `last_message_id`
+///   defaults to `None`; resume falls back to the conversation offset
+///   with a one-shot warning that resume granularity is coarser than
+///   ideal until the next checkpoint save bumps the on-disk shape.
+pub const MANIFEST_FORMAT_VERSION: u32 = 2;
+
+/// Highest manifest-version emitted by pre-cass#257 binaries; loading
+/// this is fully supported, but resume granularity will be coarser
+/// until a fresh checkpoint is saved. Kept as a named constant so the
+/// fallback warning quotes a stable number.
+pub const MANIFEST_FORMAT_VERSION_PRE_LAST_MESSAGE_CURSOR: u32 = 1;
 
 /// Filename for the durable manifest.
 pub const MANIFEST_FILENAME: &str = "semantic_manifest.json";
@@ -564,6 +593,14 @@ impl SemanticShardManifest {
 // ─── Build checkpoint ──────────────────────────────────────────────────────
 
 /// Resumable position for an interrupted semantic build.
+///
+/// Sub-fix 2 for cass#257 added the optional `last_message_id` cursor.
+/// Resume strictly advances past this cursor when present, so that a
+/// rerun of an interrupted bounded backfill never re-embeds messages
+/// that already made it into the staged index. Pre-#257 binaries wrote
+/// checkpoints without the field (it deserializes to `None` via
+/// `#[serde(default)]`), and modern binaries fall back to the
+/// conversation offset when `last_message_id` is absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildCheckpoint {
     /// Which tier is being built.
@@ -586,6 +623,26 @@ pub struct BuildCheckpoint {
     pub chunking_version: u32,
     /// Unix timestamp (ms) when this checkpoint was saved.
     pub saved_at_ms: i64,
+    /// Highest canonical message PK embedded in this run so far.
+    ///
+    /// Added in cass#257 (sub-fix 2). `None` for checkpoints written
+    /// by pre-#257 binaries; new code falls back to `last_offset`
+    /// (conversation-granularity) when this is absent. New code
+    /// strictly resumes past this cursor when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_id: Option<i64>,
+    /// Whether the canonical selection cursor proved there are no more
+    /// eligible conversations after this checkpoint.
+    ///
+    /// This is distinct from count-based progress: checkpoint caps and
+    /// cursor predicates can leave more work even when processed counts
+    /// appear to have reached the DB total snapshot.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cursor_exhausted: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl BuildCheckpoint {
@@ -595,12 +652,17 @@ impl BuildCheckpoint {
             return 0;
         }
         let pct = (self.conversations_processed as f64 / self.total_conversations as f64) * 100.0;
-        (pct as u8).min(100)
+        let pct = (pct as u8).min(100);
+        if pct == 100 && !self.cursor_exhausted {
+            99
+        } else {
+            pct
+        }
     }
 
     /// Whether the build is complete (all conversations processed).
     pub fn is_complete(&self) -> bool {
-        self.conversations_processed >= self.total_conversations
+        self.cursor_exhausted && self.conversations_processed >= self.total_conversations
     }
 
     /// Whether this checkpoint is still valid against the current DB and policy.
@@ -708,6 +770,13 @@ impl SemanticManifest {
 
     /// Load the manifest from disk.  Returns `None` if the file doesn't
     /// exist, `Err` if it exists but is corrupt.
+    ///
+    /// **Migration notes (cass#257 sub-fix 2):** a v1 manifest written
+    /// by a pre-#257 binary loads cleanly — `last_message_id` defaults
+    /// to `None` and resume falls back to the conversation offset.
+    /// A one-shot warning surfaces on first load so an operator sees
+    /// that resume granularity is coarser than ideal until the next
+    /// checkpoint save lands and the on-disk shape upgrades.
     pub fn load(data_dir: &Path) -> Result<Option<Self>, ManifestError> {
         let path = Self::path(data_dir);
         let bytes = match fs::read(&path) {
@@ -732,6 +801,25 @@ impl SemanticManifest {
                 found: manifest.manifest_version,
                 max_supported: MANIFEST_FORMAT_VERSION,
             });
+        }
+
+        // Backwards-compatible: a v1 manifest with an active checkpoint
+        // means a previous interrupted backfill saved without the
+        // `last_message_id` cursor. Warn so an operator monitoring an
+        // overnight run knows resume granularity is conversation-coarse
+        // until the next checkpoint save bumps the on-disk shape.
+        if manifest.manifest_version <= MANIFEST_FORMAT_VERSION_PRE_LAST_MESSAGE_CURSOR
+            && manifest
+                .checkpoint
+                .as_ref()
+                .is_some_and(|cp| cp.last_message_id.is_none())
+        {
+            tracing::warn!(
+                manifest_version = manifest.manifest_version,
+                supported_version = MANIFEST_FORMAT_VERSION,
+                path = %path.display(),
+                "semantic checkpoint manifest predates last_message_id cursor (cass#257 sub-fix 2); resume will fall back to conversation offset until the next checkpoint save"
+            );
         }
 
         Ok(Some(manifest))
@@ -1152,7 +1240,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Resul
         match fs::rename(temp_path, final_path) {
             Ok(()) => sync_parent_directory(final_path),
             Err(first_err)
-                if final_path.exists()
+                if replacement_path_entry_exists(final_path)?
                     && matches!(
                         first_err.kind(),
                         std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
@@ -1205,6 +1293,21 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Resul
     #[cfg(not(windows))]
     {
         fs::rename(temp_path, final_path)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn replacement_path_entry_exists(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => Ok(false),
+        Err(err) => Err(std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed inspecting semantic manifest replacement target {}: {err}",
+                path.display()
+            ),
+        )),
     }
 }
 
@@ -1311,6 +1414,8 @@ mod tests {
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
             saved_at_ms: 1_700_000_030_000,
+            last_message_id: None,
+            cursor_exhausted: false,
         }
     }
 
@@ -1419,6 +1524,34 @@ mod tests {
         assert!(loaded.fast_tier.is_none());
         assert!(loaded.quality_tier.is_some());
         assert_eq!(loaded.backlog.total_conversations, 99);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_replacement_path_entry_exists_detects_dangling_symlink() -> Result<(), String> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let link_path = SemanticManifest::path(temp.path());
+        let manifest_dir = link_path
+            .parent()
+            .ok_or_else(|| "semantic manifest path should have a parent directory".to_string())?;
+        fs::create_dir_all(manifest_dir).map_err(|e| e.to_string())?;
+        let missing_target = manifest_dir.join("missing-semantic-manifest.json");
+
+        symlink(&missing_target, &link_path).map_err(|e| e.to_string())?;
+
+        if link_path.exists() {
+            return Err("dangling manifest symlink unexpectedly resolved".to_string());
+        }
+        if !replacement_path_entry_exists(&link_path).map_err(|e| e.to_string())? {
+            return Err(format!(
+                "semantic manifest replacement entry check missed dangling symlink {}",
+                link_path.display()
+            ));
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -1691,7 +1824,7 @@ mod tests {
     // ── Build checkpoint ───────────────────────────────────────────────
 
     #[test]
-    fn checkpoint_progress_and_completion() {
+    fn checkpoint_progress_and_completion() -> Result<(), String> {
         let cp = test_checkpoint(TierKind::Quality);
         assert_eq!(cp.progress_pct(), 50);
         assert!(!cp.is_complete());
@@ -1701,8 +1834,14 @@ mod tests {
         // Complete checkpoint
         let mut cp = test_checkpoint(TierKind::Quality);
         cp.conversations_processed = 1000;
+        assert_eq!(cp.progress_pct(), 99);
+        if cp.is_complete() {
+            return Err("count parity alone should not complete a checkpoint".to_string());
+        }
+        cp.cursor_exhausted = true;
         assert_eq!(cp.progress_pct(), 100);
         assert!(cp.is_complete());
+        Ok(())
     }
 
     #[test]

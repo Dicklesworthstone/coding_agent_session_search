@@ -381,6 +381,34 @@ fn load_complete_shard_indexes(
     Ok(None)
 }
 
+fn complete_shard_generation_candidate_exists(data_dir: &Path, embedder_id: &str) -> bool {
+    let manifest = match SemanticShardManifest::load(data_dir) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return false,
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                embedder = embedder_id,
+                "semantic shard candidate probe could not load manifest"
+            );
+            return false;
+        }
+    };
+
+    let mut candidates = std::collections::HashSet::new();
+    for shard in manifest
+        .shards
+        .iter()
+        .filter(|shard| shard.embedder_id == embedder_id)
+    {
+        candidates.insert((shard.tier, shard.db_fingerprint.as_str()));
+    }
+
+    candidates
+        .into_iter()
+        .any(|(tier, db_fingerprint)| manifest.summary(tier, embedder_id, db_fingerprint).complete)
+}
+
 fn load_complete_shard_indexes_for_current_db(
     data_dir: &Path,
     db_path: &Path,
@@ -490,12 +518,18 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
     let embedder = HashEmbedder::default();
     let index_path = vector_index_path(data_dir, embedder.id());
     let monolithic_present = index_path.is_file();
-    let shard_indexes = load_complete_shard_indexes_for_current_db(
-        data_dir,
-        db_path,
-        embedder.id(),
-        "hash semantic",
-    );
+    let shard_indexes = if monolithic_present
+        || complete_shard_generation_candidate_exists(data_dir, embedder.id())
+    {
+        load_complete_shard_indexes_for_current_db(
+            data_dir,
+            db_path,
+            embedder.id(),
+            "hash semantic",
+        )
+    } else {
+        None
+    };
     if !monolithic_present && shard_indexes.is_none() {
         return SemanticSetup {
             availability: SemanticAvailability::IndexMissing { index_path },
@@ -610,12 +644,18 @@ fn load_semantic_context_inner(
 
     let index_path = vector_index_path(data_dir, &config.embedder_id);
     let monolithic_present = index_path.is_file();
-    let shard_indexes = load_complete_shard_indexes_for_current_db(
-        data_dir,
-        db_path,
-        &config.embedder_id,
-        "semantic",
-    );
+    let shard_indexes = if monolithic_present
+        || complete_shard_generation_candidate_exists(data_dir, &config.embedder_id)
+    {
+        load_complete_shard_indexes_for_current_db(
+            data_dir,
+            db_path,
+            &config.embedder_id,
+            "semantic",
+        )
+    } else {
+        None
+    };
     if !monolithic_present && shard_indexes.is_none() {
         return SemanticSetup {
             availability: SemanticAvailability::IndexMissing { index_path },
@@ -1028,6 +1068,97 @@ mod tests {
                 .expect("write hash vector record");
         }
         writer.finish().expect("finish hash vector index");
+    }
+
+    fn semantic_shard_record(
+        tier: TierKind,
+        embedder_id: &str,
+        db_fingerprint: &str,
+        shard_index: u32,
+        shard_count: u32,
+    ) -> SemanticShardRecord {
+        SemanticShardRecord {
+            tier,
+            embedder_id: embedder_id.to_string(),
+            model_revision: "test-revision".to_string(),
+            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+            dimension: 384,
+            shard_index,
+            shard_count,
+            doc_count: 1,
+            total_conversations: 1,
+            db_fingerprint: db_fingerprint.to_string(),
+            index_path: format!("vector_index/shards/{embedder_id}/shard-{shard_index}.fsvi"),
+            quantization: "f16".to_string(),
+            mmap_ready: true,
+            ann_index_path: None,
+            ann_size_bytes: 0,
+            ann_ready: false,
+            size_bytes: 128,
+            started_at_ms: 1_733_100_000_000,
+            completed_at_ms: 1_733_100_000_000 + i64::from(shard_index),
+            ready: true,
+        }
+    }
+
+    #[test]
+    fn shard_candidate_probe_is_false_without_manifest() {
+        let tmp = tempdir().unwrap();
+        assert!(
+            !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
+            "missing shard manifest must not trigger a current-DB fingerprint"
+        );
+    }
+
+    #[test]
+    fn shard_candidate_probe_is_false_for_unreadable_manifest() {
+        let tmp = tempdir().unwrap();
+        let path = SemanticShardManifest::path(tmp.path());
+        std::fs::create_dir_all(path.parent().expect("manifest parent"))
+            .expect("create shard manifest dir");
+        std::fs::write(&path, b"not json").expect("write invalid shard manifest");
+
+        assert!(
+            !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
+            "corrupt shard metadata must not trigger a query-time current-DB fingerprint"
+        );
+    }
+
+    #[test]
+    fn shard_candidate_probe_ignores_other_or_incomplete_generations() {
+        let tmp = tempdir().unwrap();
+        let mut manifest = SemanticShardManifest {
+            shards: vec![
+                semantic_shard_record(TierKind::Fast, "other-384", "fp-other", 0, 1),
+                semantic_shard_record(TierKind::Fast, "fnv1a-384", "fp-partial", 0, 2),
+            ],
+            ..Default::default()
+        };
+        manifest.save(tmp.path()).expect("save shard manifest");
+
+        assert!(
+            !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
+            "incomplete or unrelated shard generations must not trigger a current-DB fingerprint"
+        );
+    }
+
+    #[test]
+    fn shard_candidate_probe_detects_complete_generation_for_embedder() {
+        let tmp = tempdir().unwrap();
+        let mut manifest = SemanticShardManifest {
+            shards: vec![
+                semantic_shard_record(TierKind::Fast, "fnv1a-384", "fp-current", 0, 2),
+                semantic_shard_record(TierKind::Fast, "fnv1a-384", "fp-current", 1, 2),
+            ],
+            ..Default::default()
+        };
+        manifest.save(tmp.path()).expect("save shard manifest");
+
+        assert!(
+            complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
+            "complete candidate generations should allow the current-DB fingerprint check"
+        );
     }
 
     #[test]

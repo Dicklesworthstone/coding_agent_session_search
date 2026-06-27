@@ -4,9 +4,8 @@ use frankensearch::lexical::{
     BooleanQuery, CASS_SCHEMA_HASH as FS_CASS_SCHEMA_HASH, CassFields as FsCassFields,
     CassQueryFilters as FsCassQueryFilters, CassQueryToken as FsCassQueryToken,
     CassSourceFilter as FsCassSourceFilter, CassWildcardPattern as FsCassWildcardPattern, Count,
-    IndexReader, IndexRecordOption, LexicalDocHit as FsLexicalDocHit,
-    LexicalSearchResult as FsLexicalSearchResult, Occur, Query, ReloadPolicy, Searcher,
-    SnippetConfig as FsSnippetConfig, TantivyDocument, Term, TermQuery, TopDocs, Value,
+    IndexReader, IndexRecordOption, LexicalDocHit as FsLexicalDocHit, Occur, Query, ReloadPolicy,
+    Searcher, SnippetConfig as FsSnippetConfig, TantivyDocument, Term, TermQuery, TopDocs, Value,
     cass_build_tantivy_query as fs_cass_build_tantivy_query,
     cass_has_boolean_operators as fs_cass_has_boolean_operators,
     cass_open_search_reader as fs_cass_open_search_reader,
@@ -68,6 +67,16 @@ type TantivyHydratedContentMaps = (
 );
 type SqliteFtsHydratedRow = (
     i64,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+type SqliteFtsMessageRow = (
+    i64,
     String,
     String,
     String,
@@ -80,6 +89,22 @@ type SqliteFtsHydratedRow = (
     Option<String>,
     Option<String>,
 );
+type SqliteMessageScanAlternative = Vec<String>;
+type SqliteMessageScanGroup = Vec<SqliteMessageScanAlternative>;
+struct SqliteMessageScanQuery {
+    include_groups: Vec<SqliteMessageScanGroup>,
+    exclude_terms: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct SqliteMessageScanRequest<'a> {
+    raw_query: &'a str,
+    filters: &'a SearchFilters,
+    limit: usize,
+    offset: usize,
+    field_mask: FieldMask,
+    query_match_type: MatchType,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SqliteFtsMatchMode {
@@ -92,6 +117,9 @@ enum SqliteFtsMatchMode {
 // empty fallback result sets.
 const SQLITE_FTS5_HYDRATE_PARAM_CHUNK: usize = 30_000;
 const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
+const SQLITE_FTS5_POST_FILTER_SCAN_CHUNK: usize = 1_024;
+const SQLITE_FTS5_POST_FILTER_SCAN_LIMIT: usize = 30_000;
+const SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT: usize = 30_000;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
 const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
@@ -460,6 +488,48 @@ const NO_LIMIT_BYTES_FLOOR: u64 = 256 * 1024 * 1024;
 /// else on the box.
 const NO_LIMIT_RAM_DIVISOR: u64 = 16;
 
+/// Above this corpus size, exact Tantivy `Count` collection is not part of the
+/// default top-N path. Common-term counts on multi-million-document indexes can
+/// dominate the query and turn a five-hit search into a full corpus scan; robot
+/// output already reports lower-bound count precision when the exact total is
+/// not available.
+const DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS: usize = 50_000;
+const DEFAULT_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS: usize = 10_000;
+
+fn exact_total_count_max_docs() -> usize {
+    static MAX_DOCS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX_DOCS.get_or_init(|| {
+        dotenvy::var("CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS)
+    })
+}
+
+fn should_collect_exact_total_count(
+    index_doc_count: usize,
+    max_docs_for_exact_count: usize,
+) -> bool {
+    max_docs_for_exact_count > 0 && index_doc_count <= max_docs_for_exact_count
+}
+
+fn automatic_wildcard_fallback_max_docs() -> usize {
+    static MAX_DOCS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX_DOCS.get_or_init(|| {
+        dotenvy::var("CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS)
+    })
+}
+
+fn should_allow_automatic_wildcard_fallback(
+    index_doc_count: usize,
+    max_docs_for_automatic_wildcard: usize,
+) -> bool {
+    max_docs_for_automatic_wildcard > 0 && index_doc_count <= max_docs_for_automatic_wildcard
+}
+
 fn available_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
@@ -475,8 +545,8 @@ fn no_limit_result_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
         compute_no_limit_result_cap_from(
-            std::env::var("CASS_SEARCH_NO_LIMIT_CAP").ok(),
-            std::env::var("CASS_SEARCH_NO_LIMIT_BYTES").ok(),
+            dotenvy::var("CASS_SEARCH_NO_LIMIT_CAP").ok(),
+            dotenvy::var("CASS_SEARCH_NO_LIMIT_BYTES").ok(),
             available_memory_bytes(),
         )
     })
@@ -1287,12 +1357,17 @@ fn effective_field_mask(field_mask: FieldMask) -> FieldMask {
     }
 }
 
-fn execute_query_with_lazy_exact_count(
+struct CassLexicalSearchResult {
+    hits: Vec<FsLexicalDocHit>,
+    total_count: Option<usize>,
+}
+
+fn execute_query_with_bounded_exact_count(
     searcher: &Searcher,
     query: &dyn Query,
     limit: usize,
     offset: usize,
-) -> Result<FsLexicalSearchResult> {
+) -> Result<CassLexicalSearchResult> {
     let top_docs = searcher.search(
         query,
         &TopDocs::with_limit(limit)
@@ -1300,10 +1375,24 @@ fn execute_query_with_lazy_exact_count(
             .order_by_score(),
     )?;
     let page_saturated = top_docs.len() == limit;
+    let index_doc_count = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
     let total_count = if page_saturated {
-        searcher.search(query, &Count)?
+        if should_collect_exact_total_count(index_doc_count, exact_total_count_max_docs()) {
+            Some(searcher.search(query, &Count)?)
+        } else {
+            tracing::debug!(
+                index_doc_count,
+                exact_count_max_docs = exact_total_count_max_docs(),
+                limit,
+                offset,
+                "skipping exact Tantivy count on large saturated result page"
+            );
+            None
+        }
+    } else if offset > 0 && top_docs.is_empty() {
+        None
     } else {
-        offset.saturating_add(top_docs.len())
+        Some(offset.saturating_add(top_docs.len()))
     };
     let hits = top_docs
         .into_iter()
@@ -1315,7 +1404,7 @@ fn execute_query_with_lazy_exact_count(
         })
         .collect();
 
-    Ok(FsLexicalSearchResult { hits, total_count })
+    Ok(CassLexicalSearchResult { hits, total_count })
 }
 
 /// Result of a search operation with metadata about how matches were found
@@ -1331,11 +1420,10 @@ pub struct SearchResult {
     pub suggestions: Vec<QuerySuggestion>,
     /// ANN search statistics (present when --approximate was used)
     pub ann_stats: Option<crate::search::ann_index::AnnSearchStats>,
-    /// True total matching documents from the search engine (when available).
-    /// For lexical searches this comes from Tantivy's `Count` collector and
-    /// reflects the total number of documents matching the query, independent
-    /// of limit/offset pagination. `None` for semantic/hybrid/cached paths
-    /// where the true total is unknown.
+    /// True total matching documents from the search engine when that is cheap
+    /// and available. Large saturated lexical pages intentionally leave this as
+    /// `None`; robot output then reports `total_matches` as a lower bound
+    /// instead of forcing an expensive exact recount.
     pub total_count: Option<usize>,
 }
 
@@ -2450,9 +2538,10 @@ pub struct SearchClient {
     metrics: Metrics,
     cache_namespace: String,
     semantic: Mutex<Option<SemanticSearchState>>,
-    /// Total count from the most recent Tantivy query (via `Count` collector).
-    /// Populated by `search_tantivy`, read by `search_with_fallback` to report
-    /// the true total matching documents for `total_matches` in JSON output.
+    /// Exact total from the most recent Tantivy query when collecting it was
+    /// cheap enough. Large saturated pages leave this as `None` so robot output
+    /// can truthfully report lower-bound count precision without blocking the
+    /// top-N result path.
     last_tantivy_total_count: Mutex<Option<usize>>,
 }
 
@@ -3454,6 +3543,9 @@ impl SearchClient {
                     filtered.truncate(limit);
                     self.metrics.inc_cache_hits();
                     self.maybe_log_cache_metrics("hit");
+                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
+                        *tc = None;
+                    }
                     return Ok(filtered);
                 }
                 // Cache had entries but not enough to satisfy limit - shortfall, not miss
@@ -3507,7 +3599,7 @@ impl SearchClient {
                 field_mask,
             )?;
             if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                *tc = Some(tantivy_total_count);
+                *tc = tantivy_total_count;
             }
             if !hits.is_empty() {
                 let initial_hit_count = hits.len();
@@ -3542,7 +3634,7 @@ impl SearchClient {
                         field_mask,
                     )?;
                     if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = Some(retry_total_count);
+                        *tc = retry_total_count;
                     }
                     if !retry_hits.is_empty() {
                         (deduped_len, paged_hits) = page_hits(retry_hits);
@@ -3585,7 +3677,7 @@ impl SearchClient {
                 field_mask,
             )?;
             if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                *tc = Some(tantivy_total_count);
+                *tc = tantivy_total_count;
             }
             if !hits.is_empty() {
                 let initial_hit_count = hits.len();
@@ -3624,7 +3716,7 @@ impl SearchClient {
                         field_mask,
                     )?;
                     if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = Some(retry_total_count);
+                        *tc = retry_total_count;
                     }
                     if !retry_hits.is_empty() {
                         (deduped_len, paged_hits) = page_hits(retry_hits);
@@ -4813,15 +4905,66 @@ impl SearchClient {
             .as_ref()
             .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
 
-        let placeholder_capacity = results.len().saturating_mul(2).saturating_sub(1);
-        let mut placeholders = String::with_capacity(placeholder_capacity);
-        let mut params: Vec<ParamValue> = Vec::with_capacity(results.len());
-        for (idx, result) in results.iter().enumerate() {
-            if idx > 0 {
-                placeholders.push(',');
+        #[derive(Debug)]
+        struct MessageHydrationRow {
+            message_id: u64,
+            conversation_id: i64,
+            full_content: String,
+            msg_created_at: Option<i64>,
+            idx: Option<i64>,
+        }
+
+        #[derive(Debug)]
+        struct ConversationHydrationRow {
+            title: Option<String>,
+            source_path: String,
+            source_id: String,
+            origin_host: Option<String>,
+            agent: String,
+            workspace: Option<String>,
+            origin_kind: Option<String>,
+            started_at: Option<i64>,
+        }
+
+        let mut unique_message_ids = Vec::with_capacity(results.len());
+        let mut seen_message_ids = HashSet::with_capacity(results.len());
+        for result in results {
+            if seen_message_ids.insert(result.message_id) {
+                unique_message_ids.push(result.message_id);
             }
-            placeholders.push('?');
-            params.push(ParamValue::from(i64::try_from(result.message_id)?));
+        }
+
+        let message_placeholder_capacity =
+            unique_message_ids.len().saturating_mul(2).saturating_sub(1);
+        let mut message_placeholders = String::with_capacity(message_placeholder_capacity);
+        let mut message_params: Vec<ParamValue> = Vec::with_capacity(unique_message_ids.len());
+        for (idx, message_id) in unique_message_ids.iter().enumerate() {
+            if idx > 0 {
+                message_placeholders.push(',');
+            }
+            message_placeholders.push('?');
+            message_params.push(ParamValue::from(i64::try_from(*message_id)?));
+        }
+
+        let message_sql = format!(
+            "SELECT id, conversation_id, content, created_at, idx
+             FROM messages
+             WHERE id IN ({message_placeholders})"
+        );
+
+        let message_rows: Vec<MessageHydrationRow> =
+            conn.query_map_collect(&message_sql, &message_params, |row: &frankensqlite::Row| {
+                let message_id: i64 = row.get_typed(0)?;
+                Ok(MessageHydrationRow {
+                    message_id: semantic_message_id_from_db(message_id)?,
+                    conversation_id: row.get_typed(1)?,
+                    full_content: row.get_typed(2)?,
+                    msg_created_at: row.get_typed(3)?,
+                    idx: row.get_typed(4)?,
+                })
+            })?;
+        if message_rows.is_empty() {
+            return Ok(Vec::new());
         }
 
         let title_expr = if field_mask.wants_title() {
@@ -4831,89 +4974,126 @@ impl SearchClient {
         };
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+        let mut conversation_ids = Vec::with_capacity(message_rows.len());
+        let mut seen_conversation_ids = HashSet::with_capacity(message_rows.len());
+        for row in &message_rows {
+            if seen_conversation_ids.insert(row.conversation_id) {
+                conversation_ids.push(row.conversation_id);
+            }
+        }
+        let conversation_placeholder_capacity =
+            conversation_ids.len().saturating_mul(2).saturating_sub(1);
+        let mut conversation_placeholders =
+            String::with_capacity(conversation_placeholder_capacity);
+        let mut conversation_params: Vec<ParamValue> = Vec::with_capacity(conversation_ids.len());
+        for (idx, conversation_id) in conversation_ids.iter().enumerate() {
+            if idx > 0 {
+                conversation_placeholders.push(',');
+            }
+            conversation_placeholders.push('?');
+            conversation_params.push(ParamValue::from(*conversation_id));
+        }
         // LEFT JOIN + COALESCE on agents so search hits for conversations
         // with NULL agent_id (legacy V1 schema) still surface instead of
         // being silently dropped from results.  Consistent with the fts/
         // lexical rebuild paths (8a0c547c, e1c08e7c).
         let sql = format!(
-            "SELECT m.id, c.id, m.content, m.created_at, m.idx, m.role, {title_expr}, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
+            "SELECT c.id, {title_expr}, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
+             FROM conversations c
              LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              LEFT JOIN sources s ON c.source_id = s.id
-             WHERE m.id IN ({placeholders})"
+             WHERE c.id IN ({conversation_placeholders})"
         );
 
-        let rows: Vec<(u64, SearchHit)> =
-            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
-                let message_id: i64 = row.get_typed(0)?;
-                let conversation_id: i64 = row.get_typed(1)?;
-                let full_content: String = row.get_typed(2)?;
-                let msg_created_at: Option<i64> = row.get_typed(3)?;
-                let idx: Option<i64> = row.get_typed(4)?;
+        let conversation_rows: Vec<(i64, ConversationHydrationRow)> =
+            conn.query_map_collect(&sql, &conversation_params, |row: &frankensqlite::Row| {
+                let conversation_id: i64 = row.get_typed(0)?;
                 let title: Option<String> = if field_mask.wants_title() {
-                    row.get_typed(6)?
+                    row.get_typed(1)?
                 } else {
                     None
                 };
-                let source_path: String = row.get_typed(7)?;
-                let raw_source_id: String = row.get_typed(8)?;
-                let origin_host: Option<String> = row.get_typed(9)?;
-                let agent: String = row.get_typed(10)?;
-                let workspace: Option<String> = row.get_typed(11)?;
-                let raw_origin_kind: Option<String> = row.get_typed(12)?;
-                let started_at: Option<i64> = row.get_typed(13)?;
+                Ok((
+                    conversation_id,
+                    ConversationHydrationRow {
+                        title,
+                        source_path: row.get_typed(2)?,
+                        source_id: row.get_typed(3)?,
+                        origin_host: row.get_typed(4)?,
+                        agent: row.get_typed(5)?,
+                        workspace: row.get_typed(6)?,
+                        origin_kind: row.get_typed(7)?,
+                        started_at: row.get_typed(8)?,
+                    },
+                ))
+            })?;
 
-                let created_at = msg_created_at.or(started_at);
-                let line_number = idx
+        let conversations_by_id: HashMap<i64, ConversationHydrationRow> =
+            conversation_rows.into_iter().collect();
+
+        let rows: Vec<(u64, SearchHit)> = message_rows
+            .into_iter()
+            .filter_map(|message| {
+                let conversation = conversations_by_id.get(&message.conversation_id)?;
+
+                let created_at = message.msg_created_at.or(conversation.started_at);
+                let line_number = message
+                    .idx
                     .and_then(|i| usize::try_from(i).ok())
                     .map(|i| i.saturating_add(1));
                 let snippet = if field_mask.wants_snippet() {
-                    snippet_from_content(&full_content)
+                    snippet_from_content(&message.full_content)
                 } else {
                     String::new()
                 };
                 let content = if field_mask.needs_content() {
-                    full_content.clone()
+                    message.full_content.clone()
                 } else {
                     String::new()
                 };
-                let content_hash =
-                    stable_hit_hash(&full_content, &source_path, line_number, created_at);
-                let source_id = normalized_search_hit_source_id_parts(
-                    raw_source_id.as_str(),
-                    raw_origin_kind.as_deref().unwrap_or_default(),
-                    origin_host.as_deref(),
+                let content_hash = stable_hit_hash(
+                    &message.full_content,
+                    &conversation.source_path,
+                    line_number,
+                    created_at,
                 );
-                let origin_kind =
-                    normalized_search_hit_origin_kind(&source_id, raw_origin_kind.as_deref());
+                let source_id = normalized_search_hit_source_id_parts(
+                    conversation.source_id.as_str(),
+                    conversation.origin_kind.as_deref().unwrap_or_default(),
+                    conversation.origin_host.as_deref(),
+                );
+                let origin_kind = normalized_search_hit_origin_kind(
+                    &source_id,
+                    conversation.origin_kind.as_deref(),
+                );
 
                 let hit = SearchHit {
                     title: if field_mask.wants_title() {
-                        title.unwrap_or_default()
+                        conversation.title.clone().unwrap_or_default()
                     } else {
                         String::new()
                     },
                     snippet,
                     content,
                     content_hash,
-                    conversation_id: Some(conversation_id),
+                    conversation_id: Some(message.conversation_id),
                     score: 0.0,
-                    source_path,
-                    agent,
-                    workspace: workspace.unwrap_or_default(),
+                    source_path: conversation.source_path.clone(),
+                    agent: conversation.agent.clone(),
+                    workspace: conversation.workspace.clone().unwrap_or_default(),
                     workspace_original: None,
                     created_at,
                     line_number,
                     match_type: MatchType::Exact,
                     source_id,
                     origin_kind,
-                    origin_host,
+                    origin_host: conversation.origin_host.clone(),
                 };
 
-                Ok((semantic_message_id_from_db(message_id)?, hit))
-            })?;
+                Some((message.message_id, hit))
+            })
+            .collect();
 
         let mut hits_by_id = HashMap::new();
         for (id, hit) in rows {
@@ -5440,7 +5620,7 @@ impl SearchClient {
         // First, try the normal search
         let hits = self.search(query, filters.clone(), limit, offset, field_mask)?;
         let baseline_stats = self.cache_stats();
-        // Capture the true total from Tantivy's Count collector (set during search_tantivy).
+        // Capture the exact Tantivy total when the query path could collect it cheaply.
         let tantivy_total = self
             .last_tantivy_total_count
             .lock()
@@ -5451,10 +5631,29 @@ impl SearchClient {
         let query_has_wildcards = query.contains('*');
         let has_boolean_or_phrase = fs_cass_has_boolean_operators(query);
         let is_sparse = should_try_wildcard_fallback(hits.len(), limit, offset, sparse_threshold);
+        let total_docs = self.total_docs();
+        let automatic_wildcard_allowed = should_allow_automatic_wildcard_fallback(
+            total_docs,
+            automatic_wildcard_fallback_max_docs(),
+        );
 
-        if !is_sparse || query_has_wildcards || has_boolean_or_phrase || query.trim().is_empty() {
+        if !is_sparse
+            || query_has_wildcards
+            || has_boolean_or_phrase
+            || query.trim().is_empty()
+            || !automatic_wildcard_allowed
+        {
             // Either we have enough results, query already has wildcards,
             // query uses boolean/phrases, or query is empty.
+            if is_sparse && !automatic_wildcard_allowed {
+                tracing::debug!(
+                    query,
+                    returned_hits = hits.len(),
+                    total_docs,
+                    automatic_wildcard_max_docs = automatic_wildcard_fallback_max_docs(),
+                    "skipping automatic wildcard fallback on large index"
+                );
+            }
             // Generate suggestions only if truly zero hits
             let suggestions = if hits.is_empty() && !query.trim().is_empty() {
                 self.generate_suggestions(query, &filters)
@@ -5970,7 +6169,7 @@ impl SearchClient {
         limit: usize,
         offset: usize,
         field_mask: FieldMask,
-    ) -> Result<(Vec<SearchHit>, usize)> {
+    ) -> Result<(Vec<SearchHit>, Option<usize>)> {
         struct PendingTantivyHit {
             score: f32,
             doc: TantivyDocument,
@@ -6019,7 +6218,7 @@ impl SearchClient {
         let q: Box<dyn Query> = fs_cass_build_tantivy_query(raw_query, &fs_filters, fields);
 
         let prefix_only = is_prefix_only(sanitized_query);
-        let top_docs = execute_query_with_lazy_exact_count(&searcher, &*q, limit, offset)?;
+        let top_docs = execute_query_with_bounded_exact_count(&searcher, &*q, limit, offset)?;
         let tantivy_total_count = top_docs.total_count;
         let query_match_type = dominant_match_type(sanitized_query);
         let mut pending_hits = Vec::with_capacity(top_docs.hits.len());
@@ -6281,9 +6480,9 @@ impl SearchClient {
         filters: SearchFilters,
         limit: usize,
         field_mask: FieldMask,
-    ) -> Result<(Vec<SearchHit>, usize)> {
+    ) -> Result<(Vec<SearchHit>, Option<usize>)> {
         let mut ranked_hits = Vec::new();
-        let mut total_count = 0usize;
+        let mut total_count = Some(0usize);
 
         for (shard_index, shard) in readers.iter().enumerate() {
             let (shard_hits, shard_total_count) = self.search_tantivy(
@@ -6296,7 +6495,10 @@ impl SearchClient {
                 0,
                 field_mask,
             )?;
-            total_count = total_count.saturating_add(shard_total_count);
+            total_count = match (total_count, shard_total_count) {
+                (Some(total), Some(shard_total)) => Some(total.saturating_add(shard_total)),
+                _ => None,
+            };
             for (shard_rank, hit) in shard_hits.into_iter().enumerate() {
                 ranked_hits.push(FederatedRankedHit {
                     hit,
@@ -6346,7 +6548,7 @@ impl SearchClient {
         let params = [ParamValue::from("__cass_fts_probe_no_match__")];
         match franken_query_map_collect_retry(
             conn,
-            "SELECT rowid FROM fts_messages WHERE fts_messages MATCH ? LIMIT 1",
+            "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?",
             &params,
             |row: &frankensqlite::Row| row.get_typed::<i64>(0),
         ) {
@@ -6360,6 +6562,17 @@ impl SearchClient {
             }
             Err(err) => Err(anyhow!(err)),
         }
+    }
+
+    fn sqlite_fts5_rowid_projection_available(conn: &Connection) -> bool {
+        let params: [ParamValue; 0] = [];
+        franken_query_map_collect_retry(
+            conn,
+            "SELECT rowid FROM fts_messages LIMIT 1",
+            &params,
+            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+        )
+        .is_ok()
     }
 
     fn sqlite_fts5_match_clause(match_mode: SqliteFtsMatchMode) -> &'static str {
@@ -6391,109 +6604,23 @@ impl SearchClient {
 
     fn sqlite_fts5_rank_query(
         fts_query: &str,
-        filters: &SearchFilters,
+        _filters: &SearchFilters,
         limit: usize,
         offset: usize,
-        uses_message_id: bool,
+        _uses_message_id: bool,
         match_mode: SqliteFtsMatchMode,
     ) -> (String, Vec<ParamValue>) {
-        let normalized_source_sql =
-            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-        let agent_expr = "COALESCE(a.slug, fts_messages.agent, '')";
-        let workspace_expr = "COALESCE(w.path, fts_messages.workspace, '')";
-        let created_at_expr =
-            "COALESCE(CAST(m.created_at AS INTEGER), CAST(fts_messages.created_at AS INTEGER))";
-        let message_key_expr = if uses_message_id {
-            "CAST(fts_messages.message_id AS INTEGER)"
-        } else {
-            "fts_messages.rowid"
-        };
         let match_clause = Self::sqlite_fts5_match_clause(match_mode);
-        let (mut sql, rank_order_expr, rowid_order_expr) = match match_mode {
-            SqliteFtsMatchMode::Table => (
-                format!(
-                    "SELECT fts_messages.rowid,
-                            bm25(fts_messages)
-                     FROM fts_messages
-                     LEFT JOIN messages m ON {message_key_expr} = m.id
-                     LEFT JOIN conversations c ON m.conversation_id = c.id
-                     LEFT JOIN sources s ON c.source_id = s.id
-                     LEFT JOIN agents a ON c.agent_id = a.id
-                     LEFT JOIN workspaces w ON c.workspace_id = w.id
-                     WHERE {match_clause}"
-                ),
-                "bm25(fts_messages)",
-                "fts_messages.rowid",
-            ),
-            SqliteFtsMatchMode::IndexedColumns => (
-                format!(
-                    "SELECT matched_fts.rowid,
-                            matched_fts.score
-                     FROM (
-                         SELECT rowid,
-                                bm25(fts_messages) AS score
-                         FROM fts_messages
-                         WHERE {match_clause}
-                     ) matched_fts
-                     LEFT JOIN fts_messages ON matched_fts.rowid = fts_messages.rowid
-                     LEFT JOIN messages m ON {message_key_expr} = m.id
-                     LEFT JOIN conversations c ON m.conversation_id = c.id
-                     LEFT JOIN sources s ON c.source_id = s.id
-                     LEFT JOIN agents a ON c.agent_id = a.id
-                     LEFT JOIN workspaces w ON c.workspace_id = w.id
-                     WHERE 1 = 1"
-                ),
-                "matched_fts.score",
-                "matched_fts.rowid",
-            ),
-        };
-        let mut params = Vec::with_capacity(filters.agents.len() + filters.workspaces.len() + 9);
+        let mut sql = format!(
+            "SELECT rowid,
+                    bm25(fts_messages)
+             FROM fts_messages
+             WHERE {match_clause}"
+        );
+        let mut params = Vec::with_capacity(9);
         Self::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
 
-        if !filters.agents.is_empty() {
-            let placeholders = sql_placeholders(filters.agents.len());
-            sql.push_str(&format!(" AND {agent_expr} IN ({placeholders})"));
-            for agent in &filters.agents {
-                params.push(ParamValue::from(agent.as_str()));
-            }
-        }
-
-        if !filters.workspaces.is_empty() {
-            let placeholders = sql_placeholders(filters.workspaces.len());
-            sql.push_str(&format!(" AND {workspace_expr} IN ({placeholders})"));
-            for workspace in &filters.workspaces {
-                params.push(ParamValue::from(workspace.as_str()));
-            }
-        }
-
-        if let Some(created_from) = filters.created_from {
-            sql.push_str(&format!(" AND {created_at_expr} >= ?"));
-            params.push(ParamValue::from(created_from));
-        }
-        if let Some(created_to) = filters.created_to {
-            sql.push_str(&format!(" AND {created_at_expr} <= ?"));
-            params.push(ParamValue::from(created_to));
-        }
-
-        match &filters.source_filter {
-            SourceFilter::All => {}
-            SourceFilter::Local => sql.push_str(&format!(
-                " AND {normalized_source_sql} = '{local}'",
-                local = crate::sources::provenance::LOCAL_SOURCE_ID,
-            )),
-            SourceFilter::Remote => sql.push_str(&format!(
-                " AND {normalized_source_sql} != '{local}'",
-                local = crate::sources::provenance::LOCAL_SOURCE_ID,
-            )),
-            SourceFilter::SourceId(id) => {
-                sql.push_str(&format!(" AND {normalized_source_sql} = ?"));
-                params.push(ParamValue::from(normalize_search_source_filter_value(id)));
-            }
-        }
-
-        sql.push_str(&format!(
-            " ORDER BY {rank_order_expr}, {message_key_expr}, {rowid_order_expr} LIMIT ? OFFSET ?"
-        ));
+        sql.push_str(" ORDER BY bm25(fts_messages), rowid LIMIT ? OFFSET ?");
         params.push(ParamValue::from(limit as i64));
         params.push(ParamValue::from(offset as i64));
 
@@ -6506,49 +6633,70 @@ impl SearchClient {
         uses_message_id: bool,
     ) -> String {
         let title_expr = if field_mask.wants_title() {
-            "COALESCE(c.title, fts_messages.title, '')"
+            "fts_messages.title"
+        } else {
+            "NULL"
+        };
+        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
+            "fts_messages.content"
+        } else {
+            "NULL"
+        };
+        let message_key_expr = if uses_message_id {
+            "CAST(fts_messages.message_id AS INTEGER)"
+        } else {
+            "rowid"
+        };
+        let placeholders = sql_placeholders(row_count);
+
+        format!(
+            "SELECT rowid,
+                    {message_key_expr},
+                    {title_expr},
+                    {content_expr},
+                    fts_messages.agent,
+                    fts_messages.workspace,
+                    fts_messages.source_path,
+                    CAST(fts_messages.created_at AS INTEGER)
+             FROM fts_messages
+             WHERE rowid IN ({placeholders})"
+        )
+    }
+
+    fn sqlite_fts5_message_hydrate_query(row_count: usize, field_mask: FieldMask) -> String {
+        let title_expr = if field_mask.wants_title() {
+            "COALESCE(c.title, '')"
         } else {
             "''"
         };
         let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
-            "COALESCE(m.content, fts_messages.content, '')"
+            "COALESCE(m.content, '')"
         } else {
             "''"
         };
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-        let agent_expr = "COALESCE(a.slug, fts_messages.agent, '')";
-        let workspace_expr = "COALESCE(w.path, fts_messages.workspace, '')";
-        let source_path_expr = "COALESCE(c.source_path, fts_messages.source_path, '')";
-        let created_at_expr =
-            "COALESCE(CAST(m.created_at AS INTEGER), CAST(fts_messages.created_at AS INTEGER))";
-        let message_key_expr = if uses_message_id {
-            "CAST(fts_messages.message_id AS INTEGER)"
-        } else {
-            "fts_messages.rowid"
-        };
         let placeholders = sql_placeholders(row_count);
 
         format!(
-            "SELECT fts_messages.rowid,
+            "SELECT m.id,
                     {title_expr},
                     {content_expr},
-                    {agent_expr},
-                    {workspace_expr},
-                    {source_path_expr},
-                    {created_at_expr},
+                    COALESCE(a.slug, ''),
+                    COALESCE(w.path, ''),
+                    COALESCE(c.source_path, ''),
+                    CAST(m.created_at AS INTEGER),
                     m.idx,
                     c.id,
                     {normalized_source_sql},
                     c.origin_host,
                     s.kind
-             FROM fts_messages
-             LEFT JOIN messages m ON {message_key_expr} = m.id
+             FROM messages m
              LEFT JOIN conversations c ON m.conversation_id = c.id
              LEFT JOIN sources s ON c.source_id = s.id
              LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
-             WHERE fts_messages.rowid IN ({placeholders})"
+             WHERE m.id IN ({placeholders})"
         )
     }
 
@@ -6557,6 +6705,387 @@ impl SearchClient {
     ) -> impl Iterator<Item = &[(i64, f64)]> {
         const _: () = assert!(SQLITE_FTS5_HYDRATE_PARAM_CHUNK <= SQLITE_MAX_VARIABLE_NUMBER);
         ranked_rows.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK)
+    }
+
+    fn sqlite_fts5_filters_need_post_hydration(filters: &SearchFilters) -> bool {
+        !filters.agents.is_empty()
+            || !filters.workspaces.is_empty()
+            || filters.created_from.is_some()
+            || filters.created_to.is_some()
+            || !filters.source_filter.is_all()
+            || !filters.session_paths.is_empty()
+    }
+
+    fn sqlite_fts5_hit_matches_filters(hit: &SearchHit, filters: &SearchFilters) -> bool {
+        if !filters.agents.is_empty() && !filters.agents.contains(&hit.agent) {
+            return false;
+        }
+        if !filters.workspaces.is_empty() && !filters.workspaces.contains(&hit.workspace) {
+            return false;
+        }
+        if filters.created_from.is_some() || filters.created_to.is_some() {
+            let Some(created_at) = hit.created_at else {
+                return false;
+            };
+            if let Some(created_from) = filters.created_from
+                && created_at < created_from
+            {
+                return false;
+            }
+            if let Some(created_to) = filters.created_to
+                && created_at > created_to
+            {
+                return false;
+            }
+        }
+        if !filters.session_paths.is_empty() && !filters.session_paths.contains(&hit.source_path) {
+            return false;
+        }
+
+        match &filters.source_filter {
+            SourceFilter::All => true,
+            SourceFilter::Local => matches!(
+                hit.source_id
+                    .as_str()
+                    .cmp(crate::sources::provenance::LOCAL_SOURCE_ID),
+                CmpOrdering::Equal
+            ),
+            SourceFilter::Remote => !matches!(
+                hit.source_id
+                    .as_str()
+                    .cmp(crate::sources::provenance::LOCAL_SOURCE_ID),
+                CmpOrdering::Equal
+            ),
+            SourceFilter::SourceId(id) => {
+                let normalized = normalize_search_source_filter_value(id);
+                matches!(
+                    hit.source_id.as_str().cmp(normalized.as_str()),
+                    CmpOrdering::Equal
+                )
+            }
+        }
+    }
+
+    fn sqlite_message_scan_query(raw_query: &str) -> Option<SqliteMessageScanQuery> {
+        fn scan_parts(parts: Vec<String>) -> Vec<String> {
+            parts
+                .into_iter()
+                .map(|part| part.trim_end_matches('*').to_lowercase())
+                .filter(|part| !part.is_empty())
+                .collect()
+        }
+
+        let tokens = fs_cass_parse_boolean_query(raw_query);
+        if tokens.is_empty() {
+            return None;
+        }
+
+        let mut include_groups = Vec::new();
+        let mut pending_or_group: SqliteMessageScanGroup = Vec::new();
+        let mut exclude_terms = Vec::new();
+        let mut negated = false;
+        let mut in_or_sequence = false;
+        for token in tokens {
+            match token {
+                FsCassQueryToken::And => {
+                    if !pending_or_group.is_empty() {
+                        include_groups.push(std::mem::take(&mut pending_or_group));
+                    }
+                    in_or_sequence = false;
+                    negated = false;
+                }
+                FsCassQueryToken::Or => {
+                    if include_groups.is_empty() && pending_or_group.is_empty() {
+                        continue;
+                    }
+                    if negated {
+                        return None;
+                    }
+                    in_or_sequence = true;
+                }
+                FsCassQueryToken::Not => {
+                    if in_or_sequence {
+                        return None;
+                    }
+                    if !pending_or_group.is_empty() {
+                        include_groups.push(std::mem::take(&mut pending_or_group));
+                    }
+                    negated = true;
+                    in_or_sequence = false;
+                }
+                FsCassQueryToken::Term(term) => {
+                    let parts = scan_parts(normalize_term_parts(&term));
+                    if parts.is_empty() {
+                        continue;
+                    }
+                    if negated {
+                        exclude_terms.extend(parts);
+                    } else if in_or_sequence {
+                        if pending_or_group.is_empty() {
+                            let previous = include_groups.pop()?;
+                            pending_or_group.extend(previous);
+                        }
+                        pending_or_group.push(parts);
+                    } else {
+                        include_groups.push(vec![parts]);
+                    }
+                    negated = false;
+                }
+                FsCassQueryToken::Phrase(phrase) => {
+                    let parts = normalize_phrase_terms(&phrase);
+                    if parts.is_empty() {
+                        continue;
+                    }
+                    if negated {
+                        exclude_terms.extend(parts);
+                    } else if in_or_sequence {
+                        if pending_or_group.is_empty() {
+                            let previous = include_groups.pop()?;
+                            pending_or_group.extend(previous);
+                        }
+                        pending_or_group.push(parts);
+                    } else {
+                        include_groups.push(vec![parts]);
+                    }
+                    negated = false;
+                }
+            }
+        }
+
+        if !pending_or_group.is_empty() {
+            include_groups.push(pending_or_group);
+        }
+
+        for group in &mut include_groups {
+            for alternative in group.iter_mut() {
+                alternative.sort();
+                alternative.dedup();
+            }
+            group.retain(|alternative| !alternative.is_empty());
+            group.sort();
+            group.dedup();
+        }
+        include_groups.retain(|group| !group.is_empty());
+        exclude_terms.sort();
+        exclude_terms.dedup();
+        if include_groups.is_empty() {
+            return None;
+        }
+
+        Some(SqliteMessageScanQuery {
+            include_groups,
+            exclude_terms,
+        })
+    }
+
+    fn sqlite_message_scan_score(haystack: &str, scan_query: &SqliteMessageScanQuery) -> f32 {
+        for term in &scan_query.exclude_terms {
+            if haystack.contains(term) {
+                return 0.0;
+            }
+        }
+
+        let mut score = 0.0f32;
+        for group in &scan_query.include_groups {
+            let mut group_score = 0.0f32;
+            for alternative in group {
+                let mut alternative_score = 0.0f32;
+                for term in alternative {
+                    let matches = haystack.matches(term).count();
+                    if matches < 1 {
+                        alternative_score = 0.0;
+                        break;
+                    }
+                    alternative_score += matches as f32;
+                }
+                group_score = group_score.max(alternative_score);
+            }
+            if group_score <= 0.0 {
+                return 0.0;
+            }
+            score += group_score;
+        }
+        score
+    }
+
+    fn sqlite_message_scan_query_sql(field_mask: FieldMask) -> String {
+        let title_expr = if field_mask.wants_title() {
+            "COALESCE(c.title, '')"
+        } else {
+            "''"
+        };
+        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
+            "COALESCE(m.content, '')"
+        } else {
+            "''"
+        };
+        let normalized_source_sql =
+            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+
+        format!(
+            "SELECT m.id,
+                    {title_expr},
+                    {content_expr},
+                    COALESCE(a.slug, ''),
+                    COALESCE(w.path, ''),
+                    COALESCE(c.source_path, ''),
+                    CAST(m.created_at AS INTEGER),
+                    m.idx,
+                    c.id,
+                    {normalized_source_sql},
+                    c.origin_host,
+                    s.kind,
+                    COALESCE(m.content, ''),
+                    COALESCE(c.title, '')
+             FROM messages m
+             LEFT JOIN conversations c ON m.conversation_id = c.id
+             LEFT JOIN sources s ON c.source_id = s.id
+             LEFT JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             ORDER BY m.id
+             LIMIT ?"
+        )
+    }
+
+    fn search_sqlite_message_scan(
+        &self,
+        conn: &Connection,
+        request: SqliteMessageScanRequest<'_>,
+    ) -> Result<Vec<SearchHit>> {
+        let Some(scan_query) = Self::sqlite_message_scan_query(request.raw_query) else {
+            return Ok(Vec::new());
+        };
+
+        let sql = Self::sqlite_message_scan_query_sql(request.field_mask);
+        let params = [ParamValue::from(SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT as i64)];
+        let rows: Vec<(SqliteFtsMessageRow, String, String)> =
+            franken_query_map_collect_retry(conn, &sql, &params, |row| {
+                Ok((
+                    (
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
+                        row.get_typed(6)?,
+                        row.get_typed(7)?,
+                        row.get_typed(8)?,
+                        row.get_typed::<Option<String>>(9)?,
+                        row.get_typed(10)?,
+                        row.get_typed(11)?,
+                    ),
+                    row.get_typed(12)?,
+                    row.get_typed(13)?,
+                ))
+            })?;
+
+        let mut scored_hits = Vec::new();
+        for (
+            (
+                _message_id,
+                title,
+                raw_content,
+                agent,
+                workspace,
+                source_path,
+                created_at,
+                idx,
+                conversation_id,
+                raw_source_id,
+                origin_host,
+                raw_origin_kind,
+            ),
+            scan_content,
+            scan_title,
+        ) in rows
+        {
+            let mut haystack = String::with_capacity(
+                scan_content.len()
+                    + scan_title.len()
+                    + agent.len()
+                    + workspace.len()
+                    + source_path.len()
+                    + 4,
+            );
+            haystack.push_str(&scan_content);
+            haystack.push(' ');
+            haystack.push_str(&scan_title);
+            haystack.push(' ');
+            haystack.push_str(&agent);
+            haystack.push(' ');
+            haystack.push_str(&workspace);
+            haystack.push(' ');
+            haystack.push_str(&source_path);
+            let haystack = haystack.to_lowercase();
+            let score = Self::sqlite_message_scan_score(&haystack, &scan_query);
+            if score <= 0.0 {
+                continue;
+            }
+
+            let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
+            let source_id = normalized_search_hit_source_id_parts(
+                raw_source_id.as_str(),
+                raw_origin_kind.as_deref().unwrap_or_default(),
+                origin_host.as_deref(),
+            );
+            let origin_kind =
+                normalized_search_hit_origin_kind(source_id.as_str(), raw_origin_kind.as_deref());
+            let line_number = idx
+                .and_then(|i| usize::try_from(i).ok())
+                .map(|i| i.saturating_add(1));
+            let snippet = if request.field_mask.wants_snippet() {
+                snippet_from_content(&scan_content)
+            } else {
+                String::new()
+            };
+            let content = if request.field_mask.needs_content() {
+                raw_content
+            } else {
+                String::new()
+            };
+            let content_hash = if content.is_empty() {
+                stable_hit_hash(&snippet, &source_path, line_number, created_at)
+            } else {
+                stable_hit_hash(&content, &source_path, line_number, created_at)
+            };
+
+            let hit = SearchHit {
+                title,
+                snippet,
+                content,
+                content_hash,
+                conversation_id,
+                score,
+                source_path,
+                agent,
+                workspace,
+                workspace_original: None,
+                created_at,
+                line_number,
+                match_type: request.query_match_type,
+                source_id,
+                origin_kind,
+                origin_host,
+            };
+
+            if Self::sqlite_fts5_hit_matches_filters(&hit, request.filters) {
+                scored_hits.push(hit);
+            }
+        }
+
+        scored_hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(CmpOrdering::Equal)
+        });
+
+        Ok(scored_hits
+            .into_iter()
+            .skip(request.offset)
+            .take(request.limit)
+            .collect())
     }
 
     fn search_sqlite_fts5(
@@ -6568,6 +7097,10 @@ impl SearchClient {
         offset: usize,
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
+        if limit < 1 {
+            return Ok(Vec::new());
+        }
+
         let fts_query = match transpile_to_fts5(raw_query) {
             Some(q) if !q.trim().is_empty() => q,
             _ => return Ok(Vec::new()),
@@ -6592,6 +7125,23 @@ impl SearchClient {
         }
 
         let query_match_type = dominant_match_type(raw_query);
+        let scan_request = SqliteMessageScanRequest {
+            raw_query,
+            filters: &filters,
+            limit,
+            offset,
+            field_mask,
+            query_match_type,
+        };
+        if let Err(err) =
+            crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
+        {
+            tracing::warn!(
+                error = %err,
+                "sqlite FTS fallback integrity check failed; using source-table scan fallback"
+            );
+            return self.search_sqlite_message_scan(conn, scan_request);
+        }
         let uses_message_id =
             if let Ok(uses_message_id) = Self::sqlite_fts_uses_message_id_column(conn) {
                 uses_message_id
@@ -6599,7 +7149,7 @@ impl SearchClient {
                 tracing::warn!(
                     "sqlite FTS fallback is present but not queryable; skipping fallback search"
                 );
-                return Ok(Vec::new());
+                return self.search_sqlite_message_scan(conn, scan_request);
             };
         let match_mode = match Self::sqlite_fts_match_mode(conn) {
             Ok(match_mode) => match_mode,
@@ -6608,88 +7158,237 @@ impl SearchClient {
                     error = %err,
                     "sqlite FTS fallback is present but not queryable; skipping fallback search"
                 );
-                return Ok(Vec::new());
+                return self.search_sqlite_message_scan(conn, scan_request);
             }
         };
-        let (rank_sql, rank_params) = Self::sqlite_fts5_rank_query(
-            fts_query.as_str(),
-            &filters,
-            limit,
-            offset,
-            uses_message_id,
-            match_mode,
-        );
-        let ranked_rows: Vec<(i64, f64)> =
-            match franken_query_map_collect_retry(conn, &rank_sql, &rank_params, |row| {
-                Ok((row.get_typed(0)?, row.get_typed(1)?))
-            }) {
-                Ok(rows) => rows,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "sqlite FTS fallback rank query failed; returning no fallback hits"
-                    );
-                    return Ok(Vec::new());
-                }
-            };
-        if ranked_rows.is_empty() {
-            return Ok(Vec::new());
+        if !Self::sqlite_fts5_rowid_projection_available(conn) {
+            tracing::warn!(
+                "sqlite FTS fallback cannot project rowid through frankensqlite; using source-table scan fallback"
+            );
+            return self.search_sqlite_message_scan(conn, scan_request);
         }
 
-        let bm25_by_rowid: HashMap<i64, f64> = ranked_rows.iter().copied().collect();
-        let mut hits_by_rowid = HashMap::with_capacity(ranked_rows.len());
-        for rank_chunk in Self::sqlite_fts5_hydrate_row_chunks(&ranked_rows) {
-            let hydrate_sql =
-                Self::sqlite_fts5_hydrate_query(rank_chunk.len(), field_mask, uses_message_id);
-            let hydrate_params = rank_chunk
-                .iter()
-                .map(|(fts_rowid, _)| ParamValue::from(*fts_rowid))
-                .collect::<Vec<_>>();
-            let rows: Vec<SqliteFtsHydratedRow> =
-                match franken_query_map_collect_retry(conn, &hydrate_sql, &hydrate_params, |row| {
-                    Ok((
-                        row.get_typed(0)?,
-                        row.get_typed(1)?,
-                        row.get_typed(2)?,
-                        row.get_typed(3)?,
-                        row.get_typed(4)?,
-                        row.get_typed(5)?,
-                        row.get_typed(6)?,
-                        row.get_typed(7)?,
-                        row.get_typed(8)?,
-                        row.get_typed::<Option<String>>(9)?,
-                        row.get_typed(10)?,
-                        row.get_typed(11)?,
-                    ))
+        let post_filter = Self::sqlite_fts5_filters_need_post_hydration(&filters);
+        let target_hits = if post_filter {
+            offset.saturating_add(limit)
+        } else {
+            limit
+        };
+        let rank_batch_limit = if post_filter {
+            target_hits.clamp(1, SQLITE_FTS5_POST_FILTER_SCAN_CHUNK)
+        } else {
+            limit
+        };
+        let mut rank_offset = if post_filter { 0 } else { offset };
+        let mut scanned_rows = 0usize;
+        let mut hits = Vec::with_capacity(target_hits.min(rank_batch_limit));
+
+        loop {
+            let (rank_sql, rank_params) = Self::sqlite_fts5_rank_query(
+                fts_query.as_str(),
+                &filters,
+                rank_batch_limit,
+                rank_offset,
+                uses_message_id,
+                match_mode,
+            );
+            let ranked_rows: Vec<(i64, f64)> =
+                match franken_query_map_collect_retry(conn, &rank_sql, &rank_params, |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?))
                 }) {
                     Ok(rows) => rows,
                     Err(err) => {
                         tracing::warn!(
                             error = %err,
-                            "sqlite FTS fallback hydration query failed; returning no fallback hits"
+                            "sqlite FTS fallback rank query failed; returning no fallback hits"
                         );
-                        return Ok(Vec::new());
+                        return self.search_sqlite_message_scan(conn, scan_request);
                     }
                 };
+            if ranked_rows.is_empty() {
+                break;
+            }
+
+            scanned_rows = scanned_rows.saturating_add(ranked_rows.len());
+            let bm25_by_rowid: HashMap<i64, f64> = ranked_rows.iter().copied().collect();
+            let mut fts_rows_by_rowid = HashMap::with_capacity(ranked_rows.len());
+            let mut message_ids = Vec::with_capacity(ranked_rows.len());
+            let mut seen_message_ids = HashSet::with_capacity(ranked_rows.len());
+
+            for rank_chunk in Self::sqlite_fts5_hydrate_row_chunks(&ranked_rows) {
+                let hydrate_sql =
+                    Self::sqlite_fts5_hydrate_query(rank_chunk.len(), field_mask, uses_message_id);
+                let hydrate_params = rank_chunk
+                    .iter()
+                    .map(|(fts_rowid, _)| ParamValue::from(*fts_rowid))
+                    .collect::<Vec<_>>();
+                let rows: Vec<SqliteFtsHydratedRow> = match franken_query_map_collect_retry(
+                    conn,
+                    &hydrate_sql,
+                    &hydrate_params,
+                    |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                            row.get_typed(4)?,
+                            row.get_typed(5)?,
+                            row.get_typed(6)?,
+                            row.get_typed(7)?,
+                        ))
+                    },
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "sqlite FTS fallback rowid hydration query failed; returning no fallback hits"
+                        );
+                        return self.search_sqlite_message_scan(conn, scan_request);
+                    }
+                };
+
+                for row in rows {
+                    let fts_rowid = row.0;
+                    let message_id = row.1.unwrap_or(fts_rowid);
+                    if seen_message_ids.insert(message_id) {
+                        message_ids.push(message_id);
+                    }
+                    fts_rows_by_rowid.insert(fts_rowid, row);
+                }
+            }
+
+            let mut metadata_by_message_id = HashMap::with_capacity(message_ids.len());
+            for message_chunk in message_ids.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK) {
+                let metadata_sql =
+                    Self::sqlite_fts5_message_hydrate_query(message_chunk.len(), field_mask);
+                let metadata_params = message_chunk
+                    .iter()
+                    .map(|message_id| ParamValue::from(*message_id))
+                    .collect::<Vec<_>>();
+                let metadata_rows: Vec<SqliteFtsMessageRow> = match franken_query_map_collect_retry(
+                    conn,
+                    &metadata_sql,
+                    &metadata_params,
+                    |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                            row.get_typed(4)?,
+                            row.get_typed(5)?,
+                            row.get_typed(6)?,
+                            row.get_typed(7)?,
+                            row.get_typed(8)?,
+                            row.get_typed::<Option<String>>(9)?,
+                            row.get_typed(10)?,
+                            row.get_typed(11)?,
+                        ))
+                    },
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "sqlite FTS fallback message hydration query failed; returning no fallback hits"
+                        );
+                        return self.search_sqlite_message_scan(conn, scan_request);
+                    }
+                };
+                metadata_by_message_id.extend(metadata_rows.into_iter().map(|row| (row.0, row)));
+            }
+
+            let mut hits_by_rowid = HashMap::with_capacity(ranked_rows.len());
             for (
                 fts_rowid,
-                title,
-                raw_content,
-                agent,
-                workspace,
-                source_path,
-                created_at,
-                idx,
-                conversation_id,
-                raw_source_id,
-                origin_host,
-                raw_origin_kind,
-            ) in rows
+                fts_message_id,
+                fts_title,
+                fts_content,
+                fts_agent,
+                fts_workspace,
+                fts_source_path,
+                fts_created_at,
+            ) in fts_rows_by_rowid.into_values()
             {
                 let Some(&bm25_score) = bm25_by_rowid.get(&fts_rowid) else {
                     continue;
                 };
-                let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
+                let message_id = fts_message_id.unwrap_or(fts_rowid);
+                let (
+                    title,
+                    raw_content,
+                    agent,
+                    workspace,
+                    source_path,
+                    created_at,
+                    idx,
+                    conversation_id,
+                    raw_source_id,
+                    origin_host,
+                    raw_origin_kind,
+                ) = match metadata_by_message_id.remove(&message_id) {
+                    Some((
+                        _,
+                        metadata_title,
+                        metadata_content,
+                        metadata_agent,
+                        metadata_workspace,
+                        metadata_source_path,
+                        metadata_created_at,
+                        metadata_idx,
+                        metadata_conversation_id,
+                        metadata_raw_source_id,
+                        metadata_origin_host,
+                        metadata_raw_origin_kind,
+                    )) => (
+                        if metadata_title.is_empty() {
+                            fts_title.unwrap_or_default()
+                        } else {
+                            metadata_title
+                        },
+                        if metadata_content.is_empty() {
+                            fts_content.unwrap_or_default()
+                        } else {
+                            metadata_content
+                        },
+                        if metadata_agent.is_empty() {
+                            fts_agent.unwrap_or_default()
+                        } else {
+                            metadata_agent
+                        },
+                        if metadata_workspace.is_empty() {
+                            fts_workspace.unwrap_or_default()
+                        } else {
+                            metadata_workspace
+                        },
+                        if metadata_source_path.is_empty() {
+                            fts_source_path.unwrap_or_default()
+                        } else {
+                            metadata_source_path
+                        },
+                        metadata_created_at.or(fts_created_at),
+                        metadata_idx,
+                        metadata_conversation_id,
+                        metadata_raw_source_id.unwrap_or_else(default_source_id),
+                        metadata_origin_host,
+                        metadata_raw_origin_kind,
+                    ),
+                    None => (
+                        fts_title.unwrap_or_default(),
+                        fts_content.unwrap_or_default(),
+                        fts_agent.unwrap_or_default(),
+                        fts_workspace.unwrap_or_default(),
+                        fts_source_path.unwrap_or_default(),
+                        fts_created_at,
+                        None,
+                        None,
+                        default_source_id(),
+                        None,
+                        None,
+                    ),
+                };
 
                 let source_id = normalized_search_hit_source_id_parts(
                     raw_source_id.as_str(),
@@ -6699,8 +7398,7 @@ impl SearchClient {
                 let origin_kind = normalized_search_hit_origin_kind(
                     source_id.as_str(),
                     raw_origin_kind.as_deref(),
-                )
-                .to_string();
+                );
                 let line_number = idx
                     .and_then(|i| usize::try_from(i).ok())
                     .map(|i| i.saturating_add(1));
@@ -6740,15 +7438,44 @@ impl SearchClient {
                 };
                 hits_by_rowid.insert(fts_rowid, hit);
             }
+
+            for (fts_rowid, _) in &ranked_rows {
+                if let Some(hit) = hits_by_rowid.remove(fts_rowid)
+                    && Self::sqlite_fts5_hit_matches_filters(&hit, &filters)
+                {
+                    hits.push(hit);
+                    if hits.len() >= target_hits {
+                        break;
+                    }
+                }
+            }
+
+            if hits.len() >= target_hits
+                || !post_filter
+                || ranked_rows.len() < rank_batch_limit
+                || scanned_rows >= SQLITE_FTS5_POST_FILTER_SCAN_LIMIT
+            {
+                break;
+            }
+            rank_offset = rank_offset.saturating_add(ranked_rows.len());
         }
 
-        let mut hits = Vec::with_capacity(ranked_rows.len());
-        for (fts_rowid, _) in ranked_rows {
-            if let Some(hit) = hits_by_rowid.remove(&fts_rowid) {
-                hits.push(hit);
+        if post_filter {
+            let hits = hits
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect::<Vec<_>>();
+            if hits.is_empty() {
+                self.search_sqlite_message_scan(conn, scan_request)
+            } else {
+                Ok(hits)
             }
+        } else if hits.is_empty() {
+            self.search_sqlite_message_scan(conn, scan_request)
+        } else {
+            Ok(hits)
         }
-        Ok(hits)
     }
 
     /// Browse messages ordered by date, without any text query.
@@ -7833,7 +8560,7 @@ mod tests {
     use crate::search::tantivy::TantivyIndex;
     use crate::storage::sqlite::FrankenStorage;
     use frankensqlite::Connection as FrankenConnection;
-    use frankensqlite::compat::{ParamValue, params_from_iter};
+    use frankensqlite::compat::ParamValue;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -10789,17 +11516,22 @@ mod tests {
 
     #[test]
     fn sqlite_path_rusqlite_fallback_matches_hyphenated_ids_with_workspace_filter() -> Result<()> {
-        fn fts_match_count(conn: &FrankenConnection, fts_query: &str) -> Result<usize> {
+        fn fts_match_count(conn: &FrankenConnection, fts_query: &str) -> Result<Option<usize>> {
             let match_mode = SearchClient::sqlite_fts_match_mode(conn)?;
             let sql = format!(
-                "SELECT rowid FROM fts_messages WHERE {}",
+                "SELECT COUNT(*) FROM fts_messages WHERE {}",
                 SearchClient::sqlite_fts5_match_clause(match_mode)
             );
             let mut params = Vec::new();
             SearchClient::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
-            Ok(conn
-                .query_with_params(&sql, &params_from_iter(params))?
-                .len())
+            match franken_query_map_collect_retry(conn, &sql, &params, |row| row.get_typed(0)) {
+                Ok(rows) => {
+                    let count: i64 = rows.into_iter().next().unwrap_or(0);
+                    Ok(Some(usize::try_from(count.max(0)).unwrap_or(usize::MAX)))
+                }
+                Err(err) if err.to_string().contains("no such function: MATCH/2") => Ok(None),
+                Err(err) => Err(err.into()),
+            }
         }
 
         let temp_dir = TempDir::new()?;
@@ -10859,18 +11591,21 @@ mod tests {
                     ParamValue::from(101_i64),
                 ],
             )?;
-            let preclose_total_rows = conn.query("SELECT rowid FROM fts_messages")?;
+            let preclose_total_rows: i64 =
+                conn.query_row_map("SELECT COUNT(*) FROM fts_messages", params![], |row| {
+                    row.get_typed(0)
+                })?;
             assert_eq!(
-                preclose_total_rows.len(),
-                2,
+                preclose_total_rows, 2,
                 "freshly seeded file-backed FTS should retain the inserted rows"
             );
             let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-            assert_eq!(
-                fts_match_count(conn, transpiled.as_str())?,
-                2,
-                "freshly seeded file-backed FTS should match the transpiled hyphenated query before reopen"
-            );
+            if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
+                assert_eq!(
+                    match_count, 2,
+                    "freshly seeded file-backed FTS should match the transpiled hyphenated query before reopen"
+                );
+            }
         }
 
         let client = SearchClient {
@@ -10892,18 +11627,21 @@ mod tests {
 
         let guard = client.sqlite_guard()?;
         let conn = guard.as_ref().expect("sqlite guard should reopen file db");
-        let reopened_total_rows = conn.query("SELECT rowid FROM fts_messages")?;
+        let reopened_total_rows: i64 =
+            conn.query_row_map("SELECT COUNT(*) FROM fts_messages", params![], |row| {
+                row.get_typed(0)
+            })?;
         assert_eq!(
-            reopened_total_rows.len(),
-            2,
+            reopened_total_rows, 2,
             "reopened file-backed FTS should still contain the seeded rows"
         );
         let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-        assert_eq!(
-            fts_match_count(conn, transpiled.as_str())?,
-            2,
-            "reopened file-backed FTS should still match the transpiled hyphenated query"
-        );
+        if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
+            assert_eq!(
+                match_count, 2,
+                "reopened file-backed FTS should still match the transpiled hyphenated query"
+            );
+        }
         drop(guard);
 
         let all_hits = client.search("br-123", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
@@ -11658,6 +12396,56 @@ mod tests {
         assert_eq!(hits[0].source_path, "/tmp/null-workspace.jsonl");
 
         Ok(())
+    }
+
+    #[test]
+    fn sqlite_message_scan_preserves_boolean_or_precedence() {
+        let simple_or =
+            SearchClient::sqlite_message_scan_query("alpha OR beta").expect("simple OR scan query");
+        assert!(SearchClient::sqlite_message_scan_score("alpha", &simple_or) > 0.0);
+        assert!(SearchClient::sqlite_message_scan_score("beta", &simple_or) > 0.0);
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("gamma", &simple_or),
+            0.0
+        );
+
+        let and_then_or = SearchClient::sqlite_message_scan_query("alpha AND beta OR gamma")
+            .expect("AND followed by OR scan query");
+        assert!(
+            SearchClient::sqlite_message_scan_score("alpha gamma", &and_then_or) > 0.0,
+            "alpha AND (beta OR gamma) should accept the gamma branch"
+        );
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("alpha", &and_then_or),
+            0.0
+        );
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("beta gamma", &and_then_or),
+            0.0
+        );
+
+        let or_then_and = SearchClient::sqlite_message_scan_query("alpha OR beta AND gamma")
+            .expect("OR followed by AND scan query");
+        assert!(
+            SearchClient::sqlite_message_scan_score("alpha gamma", &or_then_and) > 0.0,
+            "(alpha OR beta) AND gamma should accept the alpha branch"
+        );
+        assert!(
+            SearchClient::sqlite_message_scan_score("beta gamma", &or_then_and) > 0.0,
+            "(alpha OR beta) AND gamma should accept the beta branch"
+        );
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("alpha", &or_then_and),
+            0.0
+        );
+
+        let binary_not =
+            SearchClient::sqlite_message_scan_query("alpha NOT beta").expect("NOT scan query");
+        assert!(SearchClient::sqlite_message_scan_score("alpha", &binary_not) > 0.0);
+        assert_eq!(
+            SearchClient::sqlite_message_scan_score("alpha beta", &binary_not),
+            0.0
+        );
     }
 
     #[test]
@@ -14262,6 +15050,7 @@ mod tests {
 
         assert!(!result.wildcard_fallback);
         assert!(result.hits.len() >= 3); // has enough results
+        assert_eq!(result.total_count, Some(5));
 
         Ok(())
     }
@@ -17752,6 +18541,34 @@ mod tests {
         // Mirror case: an explicit override under the floor is lifted.
         let cap = compute_no_limit_result_cap_from(Some("1".to_string()), None, None);
         assert_eq!(cap, NO_LIMIT_RESULT_MIN);
+    }
+
+    #[test]
+    fn exact_total_count_policy_allows_small_indexes_only() {
+        assert!(should_collect_exact_total_count(49_999, 50_000));
+        assert!(should_collect_exact_total_count(50_000, 50_000));
+        assert!(!should_collect_exact_total_count(50_001, 50_000));
+    }
+
+    #[test]
+    fn exact_total_count_policy_zero_limit_disables_recount() {
+        assert!(!should_collect_exact_total_count(0, 0));
+        assert!(!should_collect_exact_total_count(1, 0));
+        assert!(!should_collect_exact_total_count(usize::MAX, 0));
+    }
+
+    #[test]
+    fn automatic_wildcard_fallback_policy_allows_small_indexes_only() {
+        assert!(should_allow_automatic_wildcard_fallback(9_999, 10_000));
+        assert!(should_allow_automatic_wildcard_fallback(10_000, 10_000));
+        assert!(!should_allow_automatic_wildcard_fallback(10_001, 10_000));
+    }
+
+    #[test]
+    fn automatic_wildcard_fallback_policy_zero_limit_disables_fallback() {
+        assert!(!should_allow_automatic_wildcard_fallback(0, 0));
+        assert!(!should_allow_automatic_wildcard_fallback(1, 0));
+        assert!(!should_allow_automatic_wildcard_fallback(usize::MAX, 0));
     }
 
     #[test]

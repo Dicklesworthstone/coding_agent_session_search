@@ -1030,6 +1030,17 @@ where
     })
 }
 
+const MODEL_HTTP_BODY_SIZE_FLOOR_BYTES: u64 = 500 * 1024 * 1024;
+const MODEL_HTTP_BODY_SIZE_MARGIN_BYTES: u64 = 32 * 1024 * 1024;
+
+fn model_http_max_body_size(expected_size: u64) -> usize {
+    let size_with_margin = expected_size.saturating_add(MODEL_HTTP_BODY_SIZE_MARGIN_BYTES);
+    let desired = size_with_margin.max(MODEL_HTTP_BODY_SIZE_FLOOR_BYTES);
+    let usize_max = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
+    let capped = desired.min(usize_max);
+    usize::try_from(capped).unwrap_or(usize::MAX)
+}
+
 /// Model downloader with resumption and verification.
 pub struct ModelDownloader {
     /// Target directory for model files.
@@ -1298,20 +1309,16 @@ impl ModelDownloader {
         let progress_callback = on_progress.cloned();
         let connect_timeout = self.connect_timeout;
         let file_timeout = self.file_timeout;
+        let max_body_size = model_http_max_body_size(expected_size);
 
         run_download_with_cx(move |cx| async move {
-            // Allow up to 500 MB for model downloads. The default 16 MiB
-            // limit in asupersync's HTTP client is too small for embedding
-            // models (e.g., all-MiniLM-L6-v2 is ~86 MB).
-            const MODEL_MAX_BODY_SIZE: usize = 500 * 1024 * 1024;
-
             let client = asupersync::http::h1::HttpClient::builder()
                 .user_agent(concat!(
                     "cass/",
                     env!("CARGO_PKG_VERSION"),
                     " (model-download)"
                 ))
-                .max_body_size(MODEL_MAX_BODY_SIZE)
+                .max_body_size(max_body_size)
                 .build();
             let mut headers = vec![("Accept".to_string(), "application/octet-stream".to_string())];
 
@@ -2124,6 +2131,31 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn model_http_body_size_keeps_floor_for_small_models() {
+        assert_eq!(
+            model_http_max_body_size(86 * 1024 * 1024),
+            MODEL_HTTP_BODY_SIZE_FLOOR_BYTES as usize
+        );
+    }
+
+    #[test]
+    fn model_http_body_size_covers_nomic_onnx_manifest() {
+        let manifest = ModelManifest::nomic_embed();
+        let onnx_file = manifest
+            .files
+            .iter()
+            .find(|file| file.name == "onnx/model.onnx")
+            .expect("nomic manifest should include onnx/model.onnx");
+        let max_body_size = model_http_max_body_size(onnx_file.size);
+        let max_body_size_u64 = u64::try_from(max_body_size).unwrap_or(u64::MAX);
+        assert!(
+            max_body_size_u64 >= onnx_file.size + MODEL_HTTP_BODY_SIZE_MARGIN_BYTES,
+            "transport cap {max_body_size} must cover nomic ONNX size {} plus margin",
+            onnx_file.size
+        );
     }
 
     #[derive(Clone, Debug)]

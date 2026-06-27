@@ -10,7 +10,7 @@
 //! for repair/acquisition work and never duplicate basic maintenance jobs.
 
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -110,7 +110,95 @@ pub(crate) struct SearchMaintenanceSnapshot {
     pub job_kind: Option<SearchMaintenanceJobKind>,
     pub phase: Option<String>,
     pub updated_at_ms: Option<i64>,
+    pub last_progress_at_ms: Option<i64>,
     pub orphaned: bool,
+}
+
+pub(crate) fn index_run_lock_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("index-run.lock")
+}
+
+pub(crate) fn index_run_lock_metadata_sidecar_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_file_name("index-run.lock.meta")
+}
+
+pub(crate) fn write_index_run_lock_metadata_sidecar(
+    lock_path: &Path,
+    contents: &str,
+) -> Result<()> {
+    let sidecar_path = index_run_lock_metadata_sidecar_path(lock_path);
+    let mut sidecar = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&sidecar_path)
+        .with_context(|| {
+            format!(
+                "opening index-run lock metadata sidecar {}",
+                sidecar_path.display()
+            )
+        })?;
+    sidecar.write_all(contents.as_bytes()).with_context(|| {
+        format!(
+            "writing index-run lock metadata sidecar {}",
+            sidecar_path.display()
+        )
+    })?;
+    sidecar.flush().with_context(|| {
+        format!(
+            "flushing index-run lock metadata sidecar {}",
+            sidecar_path.display()
+        )
+    })?;
+    sidecar.sync_all().with_context(|| {
+        format!(
+            "syncing index-run lock metadata sidecar {}",
+            sidecar_path.display()
+        )
+    })
+}
+
+pub(crate) fn clear_index_run_lock_metadata_sidecar(lock_path: &Path) -> Result<()> {
+    let sidecar_path = index_run_lock_metadata_sidecar_path(lock_path);
+    let sidecar = match OpenOptions::new()
+        .truncate(true)
+        .write(true)
+        .open(&sidecar_path)
+    {
+        Ok(sidecar) => sidecar,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "opening index-run lock metadata sidecar {}",
+                    sidecar_path.display()
+                )
+            });
+        }
+    };
+    sidecar.sync_all().with_context(|| {
+        format!(
+            "syncing cleared index-run lock metadata sidecar {}",
+            sidecar_path.display()
+        )
+    })
+}
+
+fn read_capped_metadata_from_path(path: &Path, max_len: u64) -> std::io::Result<String> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    let mut raw = String::new();
+    (&file).take(max_len).read_to_string(&mut raw)?;
+    Ok(raw)
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_lock_conflict(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(32 | 33))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn windows_lock_conflict(_err: &std::io::Error) -> bool {
+    false
 }
 
 pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMaintenanceSnapshot {
@@ -120,15 +208,113 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
     // allocate arbitrary memory just to inspect its metadata.
     const MAX_LOCK_FILE_READ: u64 = 64 * 1024;
 
-    let lock_path = data_dir.join("index-run.lock");
+    let lock_path = index_run_lock_path(data_dir);
+    let sidecar_path = index_run_lock_metadata_sidecar_path(&lock_path);
     let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
         Ok(file) => file,
+        Err(err) if windows_lock_conflict(&err) => {
+            let raw = read_capped_metadata_from_path(&sidecar_path, MAX_LOCK_FILE_READ)
+                .unwrap_or_default();
+            return parse_search_maintenance_snapshot(raw, true);
+        }
         Err(_) => return SearchMaintenanceSnapshot::default(),
     };
 
     let mut raw = String::new();
-    let _ = (&file).take(MAX_LOCK_FILE_READ).read_to_string(&mut raw);
+    let mut read_blocked_by_lock = false;
+    if let Err(err) = (&file).take(MAX_LOCK_FILE_READ).read_to_string(&mut raw)
+        && windows_lock_conflict(&err)
+    {
+        read_blocked_by_lock = true;
+    }
+    if raw.trim().is_empty() {
+        raw = read_capped_metadata_from_path(&sidecar_path, MAX_LOCK_FILE_READ).unwrap_or_default();
+    }
 
+    let mut snapshot = parse_search_maintenance_snapshot(raw, read_blocked_by_lock);
+    if read_blocked_by_lock {
+        return snapshot;
+    }
+
+    let metadata_present = snapshot.pid.is_some()
+        || snapshot.started_at_ms.is_some()
+        || snapshot.db_path.is_some()
+        || snapshot.mode.is_some()
+        || snapshot.job_id.is_some()
+        || snapshot.job_kind.is_some()
+        || snapshot.phase.is_some()
+        || snapshot.updated_at_ms.is_some()
+        || snapshot.last_progress_at_ms.is_some();
+
+    #[cfg(windows)]
+    let current_process_owns_recorded_lock =
+        metadata_present && snapshot.pid == Some(std::process::id());
+    #[cfg(not(windows))]
+    let current_process_owns_recorded_lock = false;
+
+    snapshot.active = if current_process_owns_recorded_lock {
+        true
+    } else {
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                // We acquired the exclusive lock with no waiting, which is
+                // proof that no process holds it. POSIX flock (via fs2) is
+                // released automatically when the owning file description
+                // is closed — either explicitly on graceful drop, or by the
+                // kernel on process exit / crash. Therefore, if the file
+                // contains metadata but no holder is present, the previous
+                // owner is gone.
+                //
+                // Historically this produced a permanent `orphaned: true`
+                // state that callers (notably the TUI) interpreted as
+                // "rebuild in progress, keep polling" — yielding a tight
+                // CPU-bound loop that only cleared when the user manually
+                // deleted the lock file (see issue #176).
+                //
+                // Reap the stale metadata in place while we hold the lock,
+                // so that this and every subsequent reader observes a
+                // clean state.
+                //
+                // We deliberately do NOT gate this on a `kill(pid, 0)`
+                // liveness probe. Under PID reuse (the recorded pid is
+                // reassigned to an unrelated live process), such a probe
+                // would refuse to reap and the spin would reappear. Flock
+                // acquisition is the stronger and more precise signal.
+                if metadata_present {
+                    if let Err(err) = file.set_len(0) {
+                        tracing::warn!(
+                            path = %lock_path.display(),
+                            error = %err,
+                            "failed to truncate stale index-run lock metadata"
+                        );
+                    } else {
+                        let _ = clear_index_run_lock_metadata_sidecar(&lock_path);
+                        let _ = file.sync_all();
+                        tracing::info!(
+                            path = %lock_path.display(),
+                            stale_pid = ?snapshot.pid,
+                            "cleared stale index-run lock metadata (previous owner gone)"
+                        );
+                        let _ = file.unlock();
+                        return SearchMaintenanceSnapshot::default();
+                    }
+                }
+                let _ = file.unlock();
+                false
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(err) if windows_lock_conflict(&err) => true,
+            Err(_) => false,
+        }
+    };
+    snapshot.orphaned = metadata_present && !snapshot.active;
+    snapshot
+}
+
+fn parse_search_maintenance_snapshot(
+    raw: String,
+    active_when_metadata_unreadable: bool,
+) -> SearchMaintenanceSnapshot {
     let mut pid = None;
     let mut started_at_ms = None;
     let mut lock_db_path = None::<PathBuf>;
@@ -137,6 +323,7 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
     let mut job_kind = None;
     let mut phase = None;
     let mut updated_at_ms = None;
+    let mut last_progress_at_ms = None;
     for line in raw.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -150,6 +337,7 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
             "job_kind" => job_kind = SearchMaintenanceJobKind::parse_lock_value(value),
             "phase" => phase = Some(value.trim().to_string()).filter(|value| !value.is_empty()),
             "updated_at_ms" => updated_at_ms = value.trim().parse::<i64>().ok(),
+            "last_progress_at_ms" => last_progress_at_ms = value.trim().parse::<i64>().ok(),
             _ => {}
         }
     }
@@ -161,60 +349,11 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         || job_id.is_some()
         || job_kind.is_some()
         || phase.is_some()
-        || updated_at_ms.is_some();
-
-    let active = match file.try_lock_exclusive() {
-        Ok(()) => {
-            // We acquired the exclusive lock with no waiting, which is
-            // proof that no process holds it. POSIX flock (via fs2) is
-            // released automatically when the owning file description
-            // is closed — either explicitly on graceful drop, or by the
-            // kernel on process exit / crash. Therefore, if the file
-            // contains metadata but no holder is present, the previous
-            // owner is gone.
-            //
-            // Historically this produced a permanent `orphaned: true`
-            // state that callers (notably the TUI) interpreted as
-            // "rebuild in progress, keep polling" — yielding a tight
-            // CPU-bound loop that only cleared when the user manually
-            // deleted the lock file (see issue #176).
-            //
-            // Reap the stale metadata in place while we hold the lock,
-            // so that this and every subsequent reader observes a
-            // clean state.
-            //
-            // We deliberately do NOT gate this on a `kill(pid, 0)`
-            // liveness probe. Under PID reuse (the recorded pid is
-            // reassigned to an unrelated live process), such a probe
-            // would refuse to reap and the spin would reappear. Flock
-            // acquisition is the stronger and more precise signal.
-            if metadata_present {
-                if let Err(err) = file.set_len(0) {
-                    tracing::warn!(
-                        path = %lock_path.display(),
-                        error = %err,
-                        "failed to truncate stale index-run lock metadata"
-                    );
-                } else {
-                    let _ = file.sync_all();
-                    tracing::info!(
-                        path = %lock_path.display(),
-                        stale_pid = ?pid,
-                        "cleared stale index-run lock metadata (previous owner gone)"
-                    );
-                    let _ = file.unlock();
-                    return SearchMaintenanceSnapshot::default();
-                }
-            }
-            let _ = file.unlock();
-            false
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
-        Err(_) => false,
-    };
+        || updated_at_ms.is_some()
+        || last_progress_at_ms.is_some();
 
     SearchMaintenanceSnapshot {
-        active,
+        active: active_when_metadata_unreadable,
         pid,
         started_at_ms,
         db_path: lock_db_path,
@@ -223,8 +362,40 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         job_kind,
         phase,
         updated_at_ms,
-        orphaned: metadata_present && !active,
+        last_progress_at_ms,
+        orphaned: metadata_present && !active_when_metadata_unreadable,
     }
+}
+
+pub(crate) const REBUILD_STALL_DETECT_SECS_DEFAULT: u64 = 120;
+
+pub(crate) fn rebuild_stall_detect_threshold_ms() -> Option<i64> {
+    let threshold_secs = dotenvy::var("CASS_REBUILD_STALL_DETECT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(REBUILD_STALL_DETECT_SECS_DEFAULT);
+    if threshold_secs == 0 {
+        return None;
+    }
+    let threshold_ms = threshold_secs.saturating_mul(1000);
+    Some(i64::try_from(threshold_ms).unwrap_or(i64::MAX))
+}
+
+pub(crate) fn maintenance_stall_age_ms(
+    snapshot: &SearchMaintenanceSnapshot,
+    now_ms: i64,
+) -> Option<i64> {
+    if !snapshot.active
+        || !snapshot
+            .mode
+            .is_some_and(SearchMaintenanceMode::rebuild_active)
+    {
+        return None;
+    }
+    let last_progress_at_ms = snapshot.last_progress_at_ms?;
+    let age_ms = now_ms.saturating_sub(last_progress_at_ms);
+    let threshold_ms = rebuild_stall_detect_threshold_ms()?;
+    (age_ms >= threshold_ms).then_some(age_ms)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -247,6 +418,19 @@ pub(crate) struct LexicalAssetState {
     pub fresh: bool,
     pub stale: bool,
     pub rebuilding: bool,
+    /// `true` when the rebuild is nominally active but the indexing
+    /// thread has not posted forward progress within the configured
+    /// stall threshold. Driven by `last_progress_at_ms` on the lock
+    /// file, NOT by `updated_at_ms` (which the heartbeat thread
+    /// refreshes unconditionally). See issue #258 for the regression
+    /// this guards against.
+    pub stalled: bool,
+    /// Wall-clock age of the most recent forward-progress event, when
+    /// the indexer thread has posted one. `None` when no
+    /// `last_progress_at_ms` is available (legacy lock file, or the
+    /// rebuild is not active).
+    pub last_progress_age_ms: Option<i64>,
+    pub last_progress_at_ms: Option<i64>,
     pub watch_active: bool,
     pub last_indexed_at_ms: Option<i64>,
     pub age_seconds: Option<u64>,
@@ -293,6 +477,23 @@ pub(crate) struct SemanticAssetState {
     pub hnsw_path: Option<PathBuf>,
     pub hnsw_ready: bool,
     pub progressive_ready: bool,
+    /// Sub-fix 3 for cass#257: true when a quality-tier vector index is
+    /// published, matches the current DB fingerprint, and could serve a
+    /// `--mode semantic` search even if the progressive/hybrid stack is
+    /// still building (e.g. the fast tier hasn't been backfilled yet).
+    ///
+    /// Distinct from `progressive_ready`, which only returns true when
+    /// BOTH the fast and quality tier index files exist on disk —
+    /// useful for the "hybrid stack is good to go" surface but
+    /// misleading for operators who only run `--mode semantic`.
+    pub quality_tier_published: bool,
+    /// Sub-fix 3 for cass#257: true when at least one tier (fast OR
+    /// quality) is queryable against the current DB. This collapses
+    /// the per-tier readiness into a single flag suitable for the
+    /// operator question "can I run `cass search --mode semantic`
+    /// right now?". Mirrors `can_search` but is named so it survives
+    /// future refactors of the can_search semantics.
+    pub semantic_only_search_available: bool,
     pub hint: Option<String>,
     pub fast_tier: SemanticTierAssetState,
     pub quality_tier: SemanticTierAssetState,
@@ -377,7 +578,14 @@ pub(crate) struct InspectSearchAssetsInput<'a> {
     pub db_path: &'a Path,
     pub stale_threshold: u64,
     pub last_indexed_at_ms: Option<i64>,
-    pub now_secs: u64,
+    /// Full-precision (millisecond) wall clock used for stall-detection
+    /// math against `last_progress_at_ms`. Callers should pass
+    /// `FrankenStorage::now_millis()` here. F4 (cass tech debt): the
+    /// previous shape only carried `now_secs`, which quantised the
+    /// comparison to second resolution while `last_progress_at_ms` is
+    /// stored at full ms. Down-stream `now_secs` is now derived from
+    /// this value so the two clocks remain consistent.
+    pub now_ms: i64,
     pub maintenance: SearchMaintenanceSnapshot,
     pub semantic_preference: SemanticPreference,
     pub db_available: bool,
@@ -436,7 +644,7 @@ pub(crate) fn inspect_search_assets(
         db_path,
         stale_threshold,
         last_indexed_at_ms,
-        now_secs,
+        now_ms,
         maintenance,
         semantic_preference,
         db_available,
@@ -449,7 +657,7 @@ pub(crate) fn inspect_search_assets(
         db_path,
         stale_threshold,
         last_indexed_at_ms,
-        now_secs,
+        now_ms,
         maintenance,
         db_available,
         compute_lexical_fingerprint,
@@ -493,6 +701,13 @@ fn semantic_state_not_inspected(
         hnsw_path: None,
         hnsw_ready: false,
         progressive_ready: semantic_progressive_assets_ready(data_dir),
+        // The fast-path skip-DB-open lane doesn't have an
+        // `availability` to consult, so we can't honestly call the
+        // tiers queryable here — leave the sub-fix-3 flags false. The
+        // caller upgrades to `semantic_state_from_availability` when
+        // it needs an answer.
+        quality_tier_published: false,
+        semantic_only_search_available: false,
         hint: Some(
             "Use 'cass status --json' or 'cass models status --json' for semantic readiness."
                 .to_string(),
@@ -597,6 +812,14 @@ pub(crate) fn semantic_state_from_availability(
     let hnsw_ready = hnsw_path.as_ref().is_some_and(|path| path.is_file());
     let progressive_ready = semantic_progressive_assets_ready(data_dir);
 
+    // Sub-fix 3 for cass#257: report quality-tier readiness as a
+    // first-class flag so operators querying `--mode semantic` can
+    // tell when the quality index is usable even while the
+    // progressive/hybrid stack remains incomplete.
+    let quality_tier_published = semantic_tier_queryable(availability, &quality_tier);
+    let fast_tier_queryable = semantic_tier_queryable(availability, &fast_tier);
+    let semantic_only_search_available = quality_tier_published || fast_tier_queryable;
+
     SemanticAssetState {
         status: runtime.status,
         availability: runtime.availability,
@@ -611,6 +834,8 @@ pub(crate) fn semantic_state_from_availability(
         hnsw_path,
         hnsw_ready,
         progressive_ready,
+        quality_tier_published,
+        semantic_only_search_available,
         hint: runtime.hint,
         fast_tier,
         quality_tier,
@@ -814,7 +1039,7 @@ fn semantic_tier_queryable(
     availability: &SemanticAvailability,
     tier: &SemanticTierAssetState,
 ) -> bool {
-    if !tier.ready || tier.current_db_matches != Some(true) {
+    if !tier.ready || tier.current_db_matches == Some(false) {
         return false;
     }
     let Some(embedder_id) = tier.embedder_id.as_deref() else {
@@ -1024,7 +1249,11 @@ struct InspectLexicalAssetsInput<'a> {
     db_path: &'a Path,
     stale_threshold: u64,
     last_indexed_at_ms: Option<i64>,
-    now_secs: u64,
+    /// F4 (cass tech debt): full-precision wall clock; the legacy
+    /// `now_secs` field was widening the second-precision comparison
+    /// against ms-precision `last_progress_at_ms`. Derive `now_secs`
+    /// locally from this when needed for age math.
+    now_ms: i64,
     maintenance: SearchMaintenanceSnapshot,
     db_available: bool,
     compute_lexical_fingerprint: bool,
@@ -1036,7 +1265,7 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         db_path,
         stale_threshold,
         last_indexed_at_ms,
-        now_secs,
+        now_ms,
         maintenance,
         db_available,
         compute_lexical_fingerprint,
@@ -1062,7 +1291,7 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         db_path,
         stale_threshold,
         last_indexed_at_ms,
-        now_secs,
+        now_ms,
         maintenance,
         checkpoint: checkpoint.as_ref(),
         current_db_fingerprint: current_db_fingerprint.as_deref(),
@@ -1074,7 +1303,8 @@ struct LexicalObservationInput<'a> {
     db_path: &'a Path,
     stale_threshold: u64,
     last_indexed_at_ms: Option<i64>,
-    now_secs: u64,
+    /// Full-precision wall clock (F4); see [`InspectSearchAssetsInput::now_ms`].
+    now_ms: i64,
     maintenance: SearchMaintenanceSnapshot,
     checkpoint: Option<&'a LexicalRebuildCheckpoint>,
     current_db_fingerprint: Option<&'a str>,
@@ -1086,7 +1316,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         db_path,
         stale_threshold,
         last_indexed_at_ms,
-        now_secs,
+        now_ms,
         maintenance,
         checkpoint,
         current_db_fingerprint,
@@ -1108,6 +1338,12 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let checkpoint_db_mismatch = checkpoint_db_matches == Some(false);
     let contract_mismatch = schema_matches == Some(false) || page_size_compatible == Some(false);
     let fingerprint_mismatch = fingerprint_matches == Some(false);
+    // F4 (cass tech debt): derive the (legacy) second-resolution clock
+    // from `now_ms` rather than the other way around so the comparison
+    // against ms-precision `last_progress_at_ms` below is no longer
+    // forced into second-bin alignment. `as u64` is correct because
+    // wall-clock millis fits well inside i63 (until year ~292477).
+    let now_secs: u64 = now_ms.div_euclid(1000).max(0) as u64;
     let age_seconds = last_indexed_at_ms
         .and_then(|ts| (ts > 0).then(|| now_secs.saturating_sub((ts / 1000) as u64)));
     let age_stale = match age_seconds {
@@ -1129,7 +1365,32 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
             .mode
             .is_some_and(SearchMaintenanceMode::rebuild_active);
     let active_rebuild_progress = rebuilding;
+    // Forward-progress liveness check (issue #258): when a rebuild is
+    // active but the indexing thread has not posted progress within
+    // `CASS_REBUILD_STALL_DETECT_SECS` (default 120 s), report
+    // `stalled` rather than `rebuilding`. The lock file's
+    // `updated_at_ms` is heartbeat-refreshed every ~1 s by a separate
+    // thread, so it cannot be used as a "work is happening" signal —
+    // only the indexer-thread-owned `last_progress_at_ms` can.
+    //
+    // `now_ms` is now passed in at full ms precision (F4); the old
+    // shape derived it from `now_secs` and quantised the comparison.
+    let stall_age_ms = if rebuilding && maintenance_targets_current_db {
+        maintenance_stall_age_ms(&maintenance, now_ms)
+    } else {
+        None
+    };
+    let stalled = stall_age_ms.is_some();
+    let last_progress_at_ms = maintenance
+        .last_progress_at_ms
+        .filter(|_| maintenance_targets_current_db);
+    let last_progress_age_ms = last_progress_at_ms
+        .filter(|_| rebuilding)
+        .map(|ts| now_ms.saturating_sub(ts));
     let stale = if rebuilding {
+        // A stalled rebuild leaves the on-disk index unchanged; if it
+        // existed before the stall it is still searchable, so treat
+        // `stalled` like the indexer just hadn't gotten there yet.
         !exists || contract_mismatch
     } else {
         exists
@@ -1140,7 +1401,9 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
                 || fingerprint_mismatch)
     };
     let fresh = exists && !stale && !rebuilding;
-    let status = if rebuilding {
+    let status = if stalled {
+        "stalled"
+    } else if rebuilding {
         "building"
     } else if !exists {
         "missing"
@@ -1149,7 +1412,12 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     } else {
         "ready"
     };
-    let status_reason = if rebuilding {
+    let status_reason = if stalled {
+        let secs = stall_age_ms.unwrap_or(0) / 1000;
+        Some(format!(
+            "indexing thread has not posted forward progress for {secs}s while the lock heartbeat keeps refreshing — see issue #258 for diagnostics (run `cass doctor check --json` and capture a stack trace)"
+        ))
+    } else if rebuilding {
         Some("lexical rebuild is in progress".to_string())
     } else if !exists {
         Some("lexical Tantivy metadata missing".to_string())
@@ -1202,6 +1470,9 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         fresh,
         stale,
         rebuilding,
+        stalled,
+        last_progress_age_ms,
+        last_progress_at_ms,
         watch_active,
         last_indexed_at_ms,
         age_seconds,
@@ -1420,6 +1691,21 @@ pub(crate) fn evaluate_maintenance_coordination_from_snapshot(
                 ),
             };
         }
+    }
+    // Forward-progress liveness check (issue #258). Even if the
+    // heartbeat is fresh, treat the job as `Stale` when the indexing
+    // thread itself has not posted progress for longer than the stall
+    // threshold. Coordination consumers (search fail-open, attach-or-
+    // wait) then route around the wedged worker instead of waiting on
+    // it indefinitely.
+    if let Some(stall_age_ms) = maintenance_stall_age_ms(snapshot, now_ms) {
+        let threshold_ms = rebuild_stall_detect_threshold_ms().unwrap_or(0);
+        return MaintenanceCoordinationOutcome::Stale {
+            job_id,
+            reason: format!(
+                "indexing thread has not posted forward progress for {stall_age_ms}ms while the heartbeat keeps refreshing (stall threshold {threshold_ms}ms) — see issue #258"
+            ),
+        };
     }
     MaintenanceCoordinationOutcome::Active {
         job_id,
@@ -1804,6 +2090,33 @@ pub(crate) fn unified_maintenance_view(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    fn active_lock_fixture_pid(_non_windows_pid: u32) -> u32 {
+        std::process::id()
+    }
+
+    #[cfg(not(windows))]
+    fn active_lock_fixture_pid(non_windows_pid: u32) -> u32 {
+        non_windows_pid
+    }
+
+    fn write_locked_metadata(
+        lock_path: &Path,
+        owner: &mut std::fs::File,
+        contents: &str,
+    ) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        owner.set_len(0)?;
+        owner.seek(SeekFrom::Start(0))?;
+        owner.write_all(contents.as_bytes())?;
+        owner.flush()?;
+        owner.sync_all()?;
+        write_index_run_lock_metadata_sidecar(lock_path, contents)
+            .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
     #[test]
     fn maintenance_mode_round_trips_lock_values() {
         for mode in [
@@ -1886,42 +2199,44 @@ mod tests {
     }
 
     #[test]
-    fn live_owner_metadata_is_preserved_when_flock_is_held() {
+    fn live_owner_metadata_is_preserved_when_flock_is_held() -> std::io::Result<()> {
         // When the lock is actually held by a live owner, the snapshot
         // must report the owner faithfully and must NOT reap the file.
         use fs2::FileExt;
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = tempfile::tempdir()?;
         let lock_path = temp.path().join("index-run.lock");
-        let owner = OpenOptions::new()
+        let owner_pid = active_lock_fixture_pid(4242);
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(true)
-            .open(&lock_path)
-            .expect("open owner handle");
-        owner
-            .try_lock_exclusive()
-            .expect("owner acquires exclusive lock");
+            .open(&lock_path)?;
+        owner.try_lock_exclusive()?;
         // Write metadata while holding the lock, matching acquire_index_run_lock's order.
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
-            concat!(
-                "pid=4242\n",
-                "started_at_ms=1733000111000\n",
-                "updated_at_ms=1733000112000\n",
-                "db_path=/tmp/cass/agent_search.db\n",
-                "mode=index\n",
-                "job_id=lexical-refresh-1733000111000-4242\n",
-                "job_kind=lexical_refresh\n",
-                "phase=rebuilding\n"
-            ),
-        )
-        .expect("write lock metadata");
+            &mut owner,
+            format!(
+                concat!(
+                    "pid={}\n",
+                    "started_at_ms=1733000111000\n",
+                    "updated_at_ms=1733000112000\n",
+                    "db_path=/tmp/cass/agent_search.db\n",
+                    "mode=index\n",
+                    "job_id=lexical-refresh-1733000111000-4242\n",
+                    "job_kind=lexical_refresh\n",
+                    "phase=rebuilding\n"
+                ),
+                owner_pid
+            )
+            .as_str(),
+        )?;
 
         let snapshot = read_search_maintenance_snapshot(temp.path());
         assert!(snapshot.active, "live owner must be reported active");
         assert!(!snapshot.orphaned);
-        assert_eq!(snapshot.pid, Some(4242));
+        assert_eq!(snapshot.pid, Some(owner_pid));
         assert_eq!(
             snapshot.job_id.as_deref(),
             Some("lexical-refresh-1733000111000-4242")
@@ -1934,10 +2249,11 @@ mod tests {
         assert_eq!(snapshot.updated_at_ms, Some(1_733_000_112_000));
 
         // Metadata must still be present — reaping must NOT have happened.
-        let post = std::fs::metadata(&lock_path).expect("lock file still present");
+        let post = std::fs::metadata(&lock_path)?;
         assert!(post.len() > 0, "live-owner metadata must not be truncated");
 
-        let _ = FileExt::unlock(&owner);
+        FileExt::unlock(&owner)?;
+        Ok(())
     }
 
     #[test]
@@ -1997,7 +2313,7 @@ mod tests {
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
-            now_secs: 1_733_000_001,
+            now_ms: 1_733_000_001_000,
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
@@ -2050,7 +2366,7 @@ mod tests {
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
-            now_secs: 1_733_000_001,
+            now_ms: 1_733_000_001_000,
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: None,
@@ -2086,7 +2402,7 @@ mod tests {
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: None,
-            now_secs: 1_733_000_001,
+            now_ms: 1_733_000_001_000,
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: None,
             current_db_fingerprint: None,
@@ -2130,7 +2446,7 @@ mod tests {
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
-            now_secs: 1_733_000_001,
+            now_ms: 1_733_000_001_000,
             maintenance: SearchMaintenanceSnapshot {
                 active: true,
                 pid: Some(std::process::id()),
@@ -2141,6 +2457,7 @@ mod tests {
                 job_kind: None,
                 phase: None,
                 updated_at_ms: None,
+                last_progress_at_ms: None,
                 orphaned: false,
             },
             checkpoint: Some(&checkpoint),
@@ -2190,7 +2507,7 @@ mod tests {
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
-            now_secs: 1_733_000_001,
+            now_ms: 1_733_000_001_000,
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("before"),
@@ -2239,7 +2556,7 @@ mod tests {
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
-            now_secs: 1_733_000_001,
+            now_ms: 1_733_000_001_000,
             maintenance: SearchMaintenanceSnapshot {
                 active: true,
                 pid: Some(std::process::id()),
@@ -2250,6 +2567,7 @@ mod tests {
                 job_kind: None,
                 phase: None,
                 updated_at_ms: Some(1_733_000_456_000),
+                last_progress_at_ms: None,
                 orphaned: false,
             },
             checkpoint: Some(&checkpoint),
@@ -2290,7 +2608,7 @@ mod tests {
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
-            now_secs: 1_733_000_001,
+            now_ms: 1_733_000_001_000,
             maintenance: SearchMaintenanceSnapshot {
                 active: true,
                 pid: Some(std::process::id()),
@@ -2301,6 +2619,7 @@ mod tests {
                 job_kind: None,
                 phase: None,
                 updated_at_ms: None,
+                last_progress_at_ms: None,
                 orphaned: false,
             },
             checkpoint: Some(&checkpoint),
@@ -2341,7 +2660,7 @@ mod tests {
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
-            now_secs: 1_733_000_020,
+            now_ms: 1_733_000_020_000,
             maintenance: SearchMaintenanceSnapshot {
                 active: true,
                 pid: Some(std::process::id()),
@@ -2352,6 +2671,7 @@ mod tests {
                 job_kind: None,
                 phase: None,
                 updated_at_ms: None,
+                last_progress_at_ms: None,
                 orphaned: false,
             },
             checkpoint: None,
@@ -2364,6 +2684,278 @@ mod tests {
         assert!(!state.rebuilding);
         assert!(!state.watch_active);
         assert_eq!(state.activity_at_ms, None);
+    }
+
+    // ---- Forward-progress liveness / stall detection (issue #258) ----
+
+    /// `last_progress_at_ms` is older than the default 120 s stall
+    /// threshold; the heartbeat `updated_at_ms` is fresh (the heartbeat
+    /// thread kept refreshing it independently). Status must flip to
+    /// `stalled`, NOT remain `building` — this is the regression #258
+    /// guards against.
+    #[test]
+    fn lexical_state_reports_stalled_when_progress_is_stale_despite_fresh_heartbeat() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        // now = 1_733_000_300 s (= 1_733_000_300_000 ms).
+        // heartbeat updated 500 ms ago: fresh.
+        // forward progress posted 300 s ago: well past the 120 s default stall threshold.
+        // F4 (cass tech debt): the input now carries full-precision
+        // `now_ms` end-to-end. Tests that previously needed
+        // `now_secs as i64 * 1000` no longer have to round-trip.
+        let now_ms: i64 = 1_733_000_300_000;
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms,
+            maintenance: SearchMaintenanceSnapshot {
+                active: true,
+                pid: Some(std::process::id()),
+                started_at_ms: Some(now_ms - 600_000),
+                db_path: Some(db_path.clone()),
+                mode: Some(SearchMaintenanceMode::WatchStartup),
+                job_id: Some("lexical_refresh-1-1".to_string()),
+                job_kind: Some(SearchMaintenanceJobKind::LexicalRefresh),
+                phase: Some("watch_startup".to_string()),
+                updated_at_ms: Some(now_ms - 500),
+                last_progress_at_ms: Some(now_ms - 300_000),
+                orphaned: false,
+            },
+            checkpoint: None,
+            current_db_fingerprint: None,
+        });
+
+        assert!(state.rebuilding, "active rebuild lock must still register");
+        assert!(
+            state.stalled,
+            "stale forward-progress timestamp must flip stalled=true",
+        );
+        assert_eq!(state.status, "stalled");
+        assert_eq!(
+            state.last_progress_at_ms,
+            Some(now_ms - 300_000),
+            "last_progress_at_ms must be surfaced to status callers",
+        );
+        let age = state
+            .last_progress_age_ms
+            .expect("last_progress_age_ms must be computed");
+        assert!(
+            (299_900..=300_100).contains(&age),
+            "computed last_progress_age_ms ({age}ms) should equal now - last_progress_at_ms (300_000ms)",
+        );
+        let reason = state
+            .status_reason
+            .as_deref()
+            .expect("stalled state should populate status_reason");
+        assert!(
+            reason.contains("forward progress")
+                && (reason.contains("#258") || reason.contains("issue #258")),
+            "status_reason should mention forward progress and reference #258 ({reason})",
+        );
+    }
+
+    /// Heartbeat is fresh AND forward-progress is fresh: no stall.
+    /// Status remains `building`. Ensures the new gate does not regress
+    /// the happy path.
+    #[test]
+    fn lexical_state_stays_building_when_progress_is_recent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        // F4 (cass tech debt): the input now carries full-precision
+        // `now_ms` end-to-end. Tests that previously needed
+        // `now_secs as i64 * 1000` no longer have to round-trip.
+        let now_ms: i64 = 1_733_000_300_000;
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms,
+            maintenance: SearchMaintenanceSnapshot {
+                active: true,
+                pid: Some(std::process::id()),
+                started_at_ms: Some(now_ms - 30_000),
+                db_path: Some(db_path.clone()),
+                mode: Some(SearchMaintenanceMode::Index),
+                job_id: Some("lexical_refresh-1-1".to_string()),
+                job_kind: Some(SearchMaintenanceJobKind::LexicalRefresh),
+                phase: Some("scanning".to_string()),
+                updated_at_ms: Some(now_ms - 500),
+                last_progress_at_ms: Some(now_ms - 1_000),
+                orphaned: false,
+            },
+            checkpoint: None,
+            current_db_fingerprint: None,
+        });
+
+        assert!(state.rebuilding);
+        assert!(!state.stalled, "fresh progress must not flip stalled");
+        assert_eq!(state.status, "building");
+    }
+
+    /// Legacy lock files (older cass that didn't write
+    /// `last_progress_at_ms`) must not be misreported as stalled. The
+    /// stall check only fires when an explicit `last_progress_at_ms`
+    /// is present; absent that, we fall back to the previous behavior.
+    #[test]
+    fn lexical_state_does_not_stall_when_legacy_lock_omits_progress_field() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        // F4 (cass tech debt): the input now carries full-precision
+        // `now_ms` end-to-end. Tests that previously needed
+        // `now_secs as i64 * 1000` no longer have to round-trip.
+        let now_ms: i64 = 1_733_000_300_000;
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms,
+            maintenance: SearchMaintenanceSnapshot {
+                active: true,
+                pid: Some(std::process::id()),
+                started_at_ms: Some(now_ms - 30_000),
+                db_path: Some(db_path.clone()),
+                mode: Some(SearchMaintenanceMode::Index),
+                job_id: None,
+                job_kind: None,
+                phase: None,
+                updated_at_ms: Some(now_ms - 500),
+                last_progress_at_ms: None,
+                orphaned: false,
+            },
+            checkpoint: None,
+            current_db_fingerprint: None,
+        });
+
+        assert!(state.rebuilding);
+        assert!(
+            !state.stalled,
+            "legacy lock without last_progress_at_ms must NOT be misreported as stalled",
+        );
+        assert_eq!(state.status, "building");
+        assert!(state.last_progress_age_ms.is_none());
+    }
+
+    /// F4 (cass tech debt): the stall-age comparison must operate at
+    /// full millisecond precision. Pre-fix, `now_ms` was derived from
+    /// `now_secs * 1000` inside `lexical_state_from_observations`, which
+    /// quantised the comparison to second resolution and made a
+    /// 119_900 ms-old progress timestamp indistinguishable from a 119
+    /// 000 ms-old one. This test pins a 119_500 ms age so that the only
+    /// way it surfaces correctly as a `last_progress_age_ms` close to
+    /// 119_500 (and NOT 119_000 or 120_000) is full-ms plumbing.
+    #[test]
+    fn lexical_state_progress_age_is_ms_precision_not_seconds_quantised() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        // `now_ms` deliberately lands at .700 of a second so any
+        // second-quantisation upstream would shave 700 ms off the diff.
+        let now_ms: i64 = 1_733_000_300_700;
+        let last_progress_at_ms = now_ms - 119_500;
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms,
+            maintenance: SearchMaintenanceSnapshot {
+                active: true,
+                pid: Some(std::process::id()),
+                started_at_ms: Some(now_ms - 600_000),
+                db_path: Some(db_path.clone()),
+                mode: Some(SearchMaintenanceMode::WatchStartup),
+                job_id: Some("lexical_refresh-1-1".to_string()),
+                job_kind: Some(SearchMaintenanceJobKind::LexicalRefresh),
+                phase: Some("watch_startup".to_string()),
+                updated_at_ms: Some(now_ms - 500),
+                last_progress_at_ms: Some(last_progress_at_ms),
+                orphaned: false,
+            },
+            checkpoint: None,
+            current_db_fingerprint: None,
+        });
+
+        let age = state
+            .last_progress_age_ms
+            .expect("forward-progress age must be computed");
+        assert_eq!(
+            age, 119_500,
+            "ms-precision plumbing must surface the exact diff (no second-quantisation)"
+        );
+        // 119_500 ms is still under the default 120 s stall threshold,
+        // so we should be `building`, not `stalled`. Pre-F4, a
+        // second-quantised clock could either floor the diff to 119_000
+        // (still building, OK) OR — on different `.fff` ms suffixes —
+        // round it to 120_000 (false-positive stall). Pinning the
+        // expected status here protects both edges.
+        assert!(
+            !state.stalled,
+            "119.5 s lag must remain `building`, not flip to `stalled`",
+        );
+        assert_eq!(state.status, "building");
+    }
+
+    /// Coordination outcome layer must also degrade to `Stale` when
+    /// forward progress is stuck — search-side single-flight callers
+    /// then route around the wedged worker instead of attaching to it.
+    #[test]
+    fn coordination_reports_stale_when_forward_progress_is_stuck() {
+        let now_ms: i64 = 1_733_000_300_000;
+        let snapshot = SearchMaintenanceSnapshot {
+            active: true,
+            pid: Some(12345),
+            started_at_ms: Some(now_ms - 600_000),
+            db_path: Some(PathBuf::from("/tmp/cass/agent_search.db")),
+            mode: Some(SearchMaintenanceMode::WatchStartup),
+            job_id: Some("lexical_refresh-1-12345".to_string()),
+            job_kind: Some(SearchMaintenanceJobKind::LexicalRefresh),
+            phase: Some("watch_startup".to_string()),
+            updated_at_ms: Some(now_ms - 500),
+            last_progress_at_ms: Some(now_ms - 300_000),
+            orphaned: false,
+        };
+
+        let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms);
+        match outcome {
+            MaintenanceCoordinationOutcome::Stale { ref reason, .. } => {
+                assert!(
+                    reason.contains("forward progress")
+                        && (reason.contains("#258") || reason.contains("issue #258")),
+                    "stalled coordination reason should mention forward progress and #258: {reason}",
+                );
+            }
+            other => assert!(
+                matches!(other, MaintenanceCoordinationOutcome::Stale { .. }),
+                "stalled forward-progress snapshot must coordinate as Stale, got {other:?}",
+            ),
+        }
     }
 
     #[test]
@@ -2386,7 +2978,7 @@ mod tests {
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
-            now_secs: 1_733_000_001,
+            now_ms: 1_733_000_001_000,
             maintenance: SearchMaintenanceSnapshot::default(),
             semantic_preference: SemanticPreference::HashFallback,
             db_available: false,
@@ -2422,7 +3014,7 @@ mod tests {
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
-            now_secs: 1_733_000_001,
+            now_ms: 1_733_000_001_000,
             maintenance: SearchMaintenanceSnapshot::default(),
             semantic_preference: SemanticPreference::HashFallback,
             db_available: false,
@@ -2457,7 +3049,7 @@ mod tests {
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
-            now_secs: 1_733_000_001,
+            now_ms: 1_733_000_001_000,
             maintenance: SearchMaintenanceSnapshot::default(),
             semantic_preference: SemanticPreference::HashFallback,
             db_available: true,
@@ -2574,6 +3166,8 @@ mod tests {
                 schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
                 chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
                 saved_at_ms: 1_733_100_300_000,
+                last_message_id: None,
+                cursor_exhausted: false,
             }),
             ..Default::default()
         };
@@ -2648,6 +3242,50 @@ mod tests {
             Some(vector_path.as_path())
         );
         assert_eq!(state.hint, None);
+    }
+
+    #[test]
+    fn semantic_state_treats_ready_quality_tier_with_unknown_db_match_as_queryable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut manifest = SemanticManifest {
+            quality_tier: Some(ArtifactRecord {
+                tier: crate::search::semantic_manifest::TierKind::Quality,
+                embedder_id: HashEmbedder::default().id().to_string(),
+                model_revision: "hash".to_string(),
+                schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+                chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                dimension: 256,
+                doc_count: 249,
+                conversation_count: 21,
+                db_fingerprint: "boxed-db".to_string(),
+                index_path: "vector_index/vector.quality.idx".to_string(),
+                size_bytes: 221_824,
+                started_at_ms: 1_733_100_000_000,
+                completed_at_ms: 1_733_100_100_000,
+                ready: true,
+            }),
+            ..Default::default()
+        };
+        manifest.save(temp.path()).expect("save semantic manifest");
+
+        let state = semantic_state_from_availability(
+            temp.path(),
+            &SemanticAvailability::NeedsConsent,
+            SemanticPreference::DefaultModel,
+            None,
+        );
+
+        assert_eq!(state.quality_tier.current_db_matches, None);
+        assert!(
+            state.quality_tier_published,
+            "a ready quality tier with unknown DB match should remain visible as published in boxed data-dir status"
+        );
+        assert!(
+            state.semantic_only_search_available,
+            "semantic-only search can still run when the quality tier is ready and DB match is unknown"
+        );
+        assert!(state.can_search);
+        assert_eq!(state.fallback_mode, None);
     }
 
     #[test]
@@ -2786,6 +3424,7 @@ mod tests {
             job_kind: Some(SearchMaintenanceJobKind::LexicalRefresh),
             phase: Some("scanning".to_string()),
             updated_at_ms: Some(now_ms - 500),
+            last_progress_at_ms: Some(now_ms - 500),
             orphaned: false,
         }
     }
@@ -2973,7 +3612,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
-        let owner = OpenOptions::new()
+        let pid = active_lock_fixture_pid(99999);
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -2981,13 +3621,15 @@ mod tests {
             .open(&lock_path)
             .expect("open owner handle");
         owner.try_lock_exclusive().expect("acquire lock");
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
-                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-1\njob_kind=lexical_refresh\nphase=scanning\n",
+                "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-1\njob_kind=lexical_refresh\nphase=scanning\n",
                 now_ms - 1_000,
                 now_ms,
-            ),
+            )
+            .as_str(),
         )
         .expect("write lock metadata");
 
@@ -3015,7 +3657,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
-        let owner = OpenOptions::new()
+        let pid = active_lock_fixture_pid(99999);
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -3023,13 +3666,15 @@ mod tests {
             .open(&lock_path)
             .expect("open owner handle");
         owner.try_lock_exclusive().expect("acquire lock");
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
-                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-stale\njob_kind=lexical_refresh\nphase=scanning\n",
+                "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-stale\njob_kind=lexical_refresh\nphase=scanning\n",
                 now_ms - 120_000,
                 now_ms - 120_000,
-            ),
+            )
+            .as_str(),
         )
         .expect("write lock metadata");
 
@@ -3054,7 +3699,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
-        let owner = OpenOptions::new()
+        let pid = active_lock_fixture_pid(99999);
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -3062,20 +3708,24 @@ mod tests {
             .open(&lock_path)
             .expect("open owner handle");
         owner.try_lock_exclusive().expect("acquire lock");
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
-                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-2\njob_kind=lexical_refresh\nphase=committing\n",
+                "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-2\njob_kind=lexical_refresh\nphase=committing\n",
                 now_ms - 1_000,
                 now_ms,
-            ),
+            )
+            .as_str(),
         )
         .expect("write lock metadata");
 
         let temp_path = temp.path().to_path_buf();
+        let lock_path_for_release = lock_path.clone();
         let release_thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
             let _ = owner.set_len(0);
+            let _ = clear_index_run_lock_metadata_sidecar(&lock_path_for_release);
             let _ = FileExt::unlock(&owner);
             drop(owner);
         });
@@ -3094,9 +3744,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let pid = active_lock_fixture_pid(99999);
 
         use fs2::FileExt;
-        let owner = OpenOptions::new()
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -3104,13 +3755,15 @@ mod tests {
             .open(&lock_path)
             .expect("open owner handle");
         owner.try_lock_exclusive().expect("acquire lock");
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
-                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=fo-job-1\njob_kind=lexical_refresh\nphase=indexing\n",
+                "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=fo-job-1\njob_kind=lexical_refresh\nphase=indexing\n",
                 now_ms - 1_000,
                 now_ms,
-            ),
+            )
+            .as_str(),
         )
         .expect("write lock metadata");
 
@@ -3142,9 +3795,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let pid = active_lock_fixture_pid(99999);
 
         use fs2::FileExt;
-        let owner = OpenOptions::new()
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -3152,13 +3806,15 @@ mod tests {
             .open(&lock_path)
             .expect("open owner handle");
         owner.try_lock_exclusive().expect("acquire lock");
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
-                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=fo-stale-1\njob_kind=lexical_refresh\nphase=indexing\n",
+                "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=fo-stale-1\njob_kind=lexical_refresh\nphase=indexing\n",
                 now_ms - 120_000,
                 now_ms - 120_000,
-            ),
+            )
+            .as_str(),
         )
         .expect("write lock metadata");
 
@@ -3325,7 +3981,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
-        let owner = OpenOptions::new()
+        let pid = active_lock_fixture_pid(99999);
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -3333,20 +3990,22 @@ mod tests {
             .open(&lock_path)
             .expect("open");
         owner.try_lock_exclusive().expect("lock");
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
-                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/t.db\nmode=index\njob_id=uv-1\njob_kind=lexical_refresh\nphase=indexing\n",
+                "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/t.db\nmode=index\njob_id=uv-1\njob_kind=lexical_refresh\nphase=indexing\n",
                 now_ms - 1_000,
                 now_ms,
-            ),
+            )
+            .as_str(),
         )
         .expect("write metadata");
 
         let event = MaintenanceEvent {
             timestamp_ms: now_ms,
             job_id: "uv-1".to_string(),
-            actor_pid: 99999,
+            actor_pid: pid,
             kind: MaintenanceEventKind::Started {
                 job_kind: "lexical_refresh".to_string(),
                 phase: "indexing".to_string(),
