@@ -89,7 +89,7 @@ bytemuck = "1.25.0"
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
 frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2eaf753955f58d8ce0f6203224d1ee2759b7cc49", default-features = false, features = ["hash", "lexical", "ann", "native"] }
-franken-agent-detection = { version = "0.1.8", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "476cfce42d85d32d676398d3205739fa67454ffe", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
+franken-agent-detection = { version = "0.1.9", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "a2a190cbfe04c7266102484443701c4834a162c6", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
