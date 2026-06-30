@@ -2083,11 +2083,17 @@ mod tests {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models");
         fs::create_dir_all(target_dir)?;
 
-        // Copy model.onnx fixture
+        // Copy model.onnx fixture (legacy placeholder, retained for tests that
+        // assert NotInstalled when only the old ONNX file is present).
         fs::copy(
             fixture_dir.join("model.onnx"),
             target_dir.join("model.onnx"),
         )?;
+        // cass #308: the native backend (and the manifest's REQUIRED file set)
+        // now expects `model.safetensors`. The fixture ships no real weights, so
+        // write a small placeholder — check_model_installed only verifies file
+        // presence + the `.verified` marker, never hashing fixture content.
+        fs::write(target_dir.join("model.safetensors"), b"placeholder-safetensors")?;
 
         // Copy config files
         for file in &[
@@ -2365,7 +2371,7 @@ mod tests {
         let url = manifest.download_url(&manifest.files[0]);
         assert!(url.contains("huggingface.co"));
         assert!(url.contains("sentence-transformers/all-MiniLM-L6-v2"));
-        assert!(url.contains("model.onnx"));
+        assert!(url.contains("model.safetensors"));
     }
 
     #[test]
@@ -3016,7 +3022,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let downloader = ModelDownloader::new(tmp.path().join("model"));
         fs::create_dir_all(&downloader.temp_dir).unwrap();
-        fs::write(downloader.temp_dir.join("model.onnx"), b"partial").unwrap();
+        // model.safetensors is in the manifest → must be kept as a partial resume.
+        fs::write(downloader.temp_dir.join("model.safetensors"), b"partial").unwrap();
+        // model.onnx is no longer in the manifest (cass #308) → must be pruned.
+        fs::write(downloader.temp_dir.join("model.onnx"), b"stale-onnx").unwrap();
         fs::write(downloader.temp_dir.join("stale.bin"), b"stale").unwrap();
         fs::create_dir_all(downloader.temp_dir.join("nested")).unwrap();
         fs::write(
@@ -3029,7 +3038,8 @@ mod tests {
             .prepare_temp_dir(&ModelManifest::minilm_v2())
             .unwrap();
 
-        assert!(downloader.temp_dir.join("model.onnx").exists());
+        assert!(downloader.temp_dir.join("model.safetensors").exists());
+        assert!(!downloader.temp_dir.join("model.onnx").exists());
         assert!(!downloader.temp_dir.join("stale.bin").exists());
         assert!(!downloader.temp_dir.join("nested").exists());
     }

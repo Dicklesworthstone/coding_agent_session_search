@@ -94,12 +94,21 @@ mod tests {
             .join("tests/fixtures/models/xenova-ms-marco-minilm-l6-v2-int8")
     }
 
+    // cass #308: the pure-Rust native reranker loads f32 `model.safetensors` of the
+    // ms-marco-MiniLM-L6 topology; it cannot load the small committed int8 ONNX
+    // fixture. Tests using this helper are `#[ignore]`d by default and run against a
+    // real model supplied via `FRANKENSEARCH_MODEL_DIR` (`cargo test -- --ignored`).
     fn load_fastembed_fixture() -> FastEmbedReranker {
-        FastEmbedReranker::load_from_dir(&fastembed_fixture_dir())
-            .expect("fastembed reranker fixture should load")
+        let dir = dotenvy::var("FRANKENSEARCH_MODEL_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(fastembed_fixture_dir);
+        FastEmbedReranker::load_from_dir(&dir).expect("fastembed reranker fixture should load")
     }
 
     #[test]
+    #[ignore = "needs a real safetensors ms-marco-MiniLM model via FRANKENSEARCH_MODEL_DIR; the int8 ONNX fixture is incompatible with the native backend — cass #308"]
     fn test_reranker_trait_basic() {
         let reranker = load_fastembed_fixture();
         let scores = rerank_texts(
@@ -131,6 +140,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a real safetensors ms-marco-MiniLM model via FRANKENSEARCH_MODEL_DIR; the int8 ONNX fixture is incompatible with the native backend — cass #308"]
     fn test_reranker_empty_query_error() {
         let reranker = load_fastembed_fixture();
         let result = rerank_texts(&reranker, "", &["doc"]);
@@ -138,6 +148,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a real safetensors ms-marco-MiniLM model via FRANKENSEARCH_MODEL_DIR; the int8 ONNX fixture is incompatible with the native backend — cass #308"]
     fn test_reranker_empty_documents_error() {
         let reranker = load_fastembed_fixture();
         let result = rerank_texts(&reranker, "query", &[]);
@@ -145,6 +156,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a real safetensors ms-marco-MiniLM model via FRANKENSEARCH_MODEL_DIR; the int8 ONNX fixture is incompatible with the native backend — cass #308"]
     fn test_reranker_info() {
         let reranker = load_fastembed_fixture();
         let info = RerankerInfo::from_reranker(&reranker);
