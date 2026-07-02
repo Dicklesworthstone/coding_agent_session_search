@@ -8774,6 +8774,68 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
     Ok(usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX))
 }
 
+/// Reachable (live-conversation) message total and the hard-noise subset the
+/// authoritative lexical rebuild drops, computed in a single pass.
+struct ReachableMessageNoiseCounts {
+    /// Messages reachable via a live `conversations` row — exactly the population
+    /// the rebuild sink visits. Orphaned `messages` rows (no live conversation,
+    /// possible after a dropped transaction; orphan cleanup is skipped by
+    /// default) are excluded, matching the sink. May be < `COUNT(*) FROM messages`.
+    reachable_messages: usize,
+    /// Reachable messages the sink drops as hard-noise (empty / tool-acks).
+    hard_noise_count: usize,
+}
+
+fn count_reachable_messages_and_hard_noise(
+    storage: &FrankenStorage,
+) -> Result<ReachableMessageNoiseCounts> {
+    use crate::model::types::MessageRole;
+    use crate::search::canonicalize::is_hard_message_noise;
+
+    // Count exactly what the authoritative rebuild sink sees by reusing its OWN
+    // per-conversation fetch and predicate rather than a SQL approximation:
+    //   - iterate live conversations only (the sink never indexes orphaned
+    //     messages), so `reachable_messages` is the correct denominator for the
+    //     expected doc count — using raw `COUNT(*) FROM messages` would count
+    //     orphans the sink drops and permanently overestimate `expected`.
+    //   - `fetch_messages_for_lexical_rebuild` applies the #290 per-conversation
+    //     content cap (`truncate_lexical_rebuild_conversation_content`), so a
+    //     conversation whose trailing content is cleared to empty is seen exactly
+    //     as the sink sees it (cleared bodies become hard-noise).
+    //   - `is_hard_message_noise` is applied to that (post-truncation) content
+    //     with the SAME precise tool-role mapping the sink uses
+    //     (`MessageRole::Tool` <=> raw role == "tool", per the sqlite.rs role
+    //     mapping and mod.rs prebuilt_docs).
+    // Exact by construction: no SQL prefilter that could drift from Rust trim
+    // semantics (Unicode whitespace, byte vs char lengths), and no separate
+    // truncation handling to keep in sync. Content is read one conversation at a
+    // time, so peak memory is bounded to a single conversation regardless of
+    // corpus size. Only called on the sparse-looking branch, so it is paid lazily.
+    let conversation_ids: Vec<i64> = storage
+        .raw()
+        .query_map_collect(
+            "SELECT id FROM conversations",
+            &[] as &[ParamValue],
+            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+        )
+        .context("listing conversations for sparse-repair noise count")?;
+    let mut reachable_messages = 0usize;
+    let mut hard_noise_count = 0usize;
+    for conversation_id in conversation_ids {
+        for message in storage.fetch_messages_for_lexical_rebuild(conversation_id)? {
+            reachable_messages += 1;
+            let is_tool_role = matches!(message.role, MessageRole::Tool);
+            if is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
+                hard_noise_count += 1;
+            }
+        }
+    }
+    Ok(ReachableMessageNoiseCounts {
+        reachable_messages,
+        hard_noise_count,
+    })
+}
+
 fn max_conversation_id_exact(storage: &FrankenStorage) -> Result<Option<i64>> {
     let max_conversation_id: i64 = storage
         .raw()
@@ -8808,6 +8870,23 @@ struct IncrementalCanonicalLexicalRepairContext {
     /// context only: SQLite remains authoritative, and a fresh sparse live-doc
     /// observation must still repair the derived lexical index.
     published_index_validated_for_current_data: bool,
+    /// Messages reachable via a live conversation — the population the rebuild
+    /// sink actually indexes. Orphaned `messages` rows (no live conversation) are
+    /// excluded, so this is the correct denominator for the expected doc count;
+    /// using raw `canonical_messages` (`COUNT(*)`) would count orphans the sink
+    /// drops and permanently overestimate `expected`. Equals `canonical_messages`
+    /// when there are no orphans (and when the count was not computed because the
+    /// index was not raw-sparse). Always `>= hard_noise_count`.
+    reachable_messages: usize,
+    /// Reachable messages the lexical sink legitimately drops as hard-noise
+    /// (empty / tool-acks — see `is_hard_message_noise`). The live tantivy index
+    /// has exactly `reachable_messages - hard_noise_count` docs when healthy, so
+    /// this is subtracted from `reachable_messages` to form the expected doc
+    /// count. Comparing the live doc count against the raw message count instead
+    /// made a healthy index look permanently sparse and triggered a deferred
+    /// authoritative rebuild every run (#248 residual). `0` when not yet computed
+    /// (only computed lazily on the sparse-looking branch).
+    hard_noise_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8858,12 +8937,46 @@ fn choose_incremental_canonical_lexical_repair_plan(
     }
 
     let observed_tantivy_docs = context.observed_tantivy_docs?;
-    if observed_tantivy_docs < context.canonical_messages {
+
+    // Expected live lexical docs = reachable messages minus the hard-noise the
+    // sink legitimately drops (empty / tool-acks). The tantivy doc grain is pure
+    // per-non-noise-message (cass_document_for_message / prebuilt_docs return no
+    // doc for is_hard_message_noise), so a healthy index has
+    // observed == reachable_messages - hard_noise_count. `reachable_messages`
+    // (not raw canonical_messages) is the denominator so orphaned messages the
+    // sink never indexes cannot inflate expected. Comparing against the raw
+    // message count made a healthy index look permanently sparse and triggered a
+    // deferred authoritative rebuild every run (#248 residual).
+    //
+    // fail-CLOSED: hard_noise_count > reachable_messages is impossible (noise is a
+    // subset of reachable, both counted in the same pass) unless the count is
+    // buggy; do NOT clamp expected to 0 (saturating_sub) — that would make every
+    // index look healthy and hide real doc loss. Treat as sparse and repair so
+    // the discrepancy is corrected and surfaced.
+    let Some(expected_lexical_docs) =
+        context.reachable_messages.checked_sub(context.hard_noise_count)
+    else {
+        tracing::error!(
+            reachable_messages = context.reachable_messages,
+            hard_noise_count = context.hard_noise_count,
+            "hard_noise_count exceeds reachable_messages — count is buggy; failing closed to repair"
+        );
+        return Some(IncrementalCanonicalLexicalRepairPlan {
+            canonical_messages: context.canonical_messages,
+            observed_tantivy_docs: Some(observed_tantivy_docs),
+            reason: "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan",
+        });
+    };
+
+    if observed_tantivy_docs < expected_lexical_docs {
         if context.published_index_validated_for_current_data {
             tracing::warn!(
                 canonical_messages = context.canonical_messages,
+                reachable_messages = context.reachable_messages,
+                hard_noise_count = context.hard_noise_count,
+                expected_lexical_docs,
                 observed_tantivy_docs,
-                "completed lexical checkpoint matches the canonical DB, but the live lexical index is sparse; repairing derived search assets from SQLite"
+                "completed lexical checkpoint matches the canonical DB, but the live lexical index is sparse below the noise-adjusted expectation; repairing derived search assets from SQLite"
             );
         }
         return Some(IncrementalCanonicalLexicalRepairPlan {
@@ -13776,6 +13889,11 @@ pub fn run_index(
             // live index actually looks sparse — to keep normal index/watch runs
             // cheap (#248, coding_agent_session_search-raoug).
             published_index_validated_for_current_data: false,
+            // Placeholders: computed lazily below (one per-conversation content
+            // scan) only when the live index looks sparse against the raw message
+            // count.
+            reachable_messages: 0,
+            hard_noise_count: 0,
         };
         let incremental_canonical_lexical_repair = if canonical_sessions_before_salvage > 0
             && should_evaluate_incremental_canonical_lexical_repair(&repair_context)
@@ -13795,15 +13913,36 @@ pub fn run_index(
             preflight_phase!("watch_startup:count_total_messages");
             let canonical_messages = count_total_messages_exact(&storage)?;
             complete_preflight_phase!();
+            // Only compute the reachable/hard-noise counts when the live index
+            // looks sparse against the RAW message count (the cheap upper bound).
+            // If observed already covers every message it certainly covers
+            // reachable - noise, so no repair and no need to pay the scan.
+            let (reachable_messages, hard_noise_count) = if observed_tantivy_docs
+                .is_some_and(|docs| docs < canonical_messages)
+            {
+                let counts = count_reachable_messages_and_hard_noise(&storage)?;
+                (counts.reachable_messages, counts.hard_noise_count)
+            } else {
+                (canonical_messages, 0)
+            };
+            if reachable_messages != canonical_messages {
+                tracing::warn!(
+                    canonical_messages,
+                    reachable_messages,
+                    orphaned_messages = canonical_messages.saturating_sub(reachable_messages),
+                    "orphaned messages (rows without a live conversation) are excluded from the sparse-repair expectation; the rebuild sink never indexes them"
+                );
+            }
+            let expected_lexical_docs = reachable_messages.saturating_sub(hard_noise_count);
             // #248 (coding_agent_session_search-raoug): only pay for the
             // published-index validation (a read-only DB open + fingerprint COUNT
-            // scans) when the live index actually looks sparse — i.e. when it would
-            // otherwise trigger a from-scratch rebuild. A genuinely missing/invalid
-            // index rebuilds regardless (handled in
-            // choose_incremental_canonical_lexical_repair_plan via
-            // tantivy_requires_rebuild), so skip the check then.
+            // scans) when the live index actually looks sparse — i.e. below the
+            // noise-adjusted expectation, when it would otherwise trigger a
+            // from-scratch rebuild. A genuinely missing/invalid index rebuilds
+            // regardless (handled in choose_incremental_canonical_lexical_repair_plan
+            // via tantivy_requires_rebuild), so skip the check then.
             let published_index_validated_for_current_data = !tantivy_requires_rebuild
-                && observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages)
+                && observed_tantivy_docs.is_some_and(|docs| docs < expected_lexical_docs)
                 && !preflight_skip("watch_startup:published_index_validate")
                 && {
                     preflight_phase!("watch_startup:published_index_validate");
@@ -13818,6 +13957,8 @@ pub fn run_index(
                 IncrementalCanonicalLexicalRepairContext {
                     canonical_messages,
                     published_index_validated_for_current_data,
+                    reachable_messages,
+                    hard_noise_count,
                     ..repair_context
                 },
             )
@@ -26113,6 +26254,104 @@ pub mod persist {
             assert_eq!(fingerprint, "content-v1:2:9:11");
         }
 
+        #[test]
+        #[serial]
+        fn count_hard_noise_matches_rebuild_sink_including_truncation() {
+            // Small per-conversation cap so truncation/clearing is exercised
+            // cheaply. Content byte budget = 20.
+            let _cap_guard = set_env("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "20");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("hard-noise.db");
+            let storage = create_franken_db(&db_path);
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "codex".into(),
+                    name: "Codex".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let workspace_id = storage
+                .ensure_workspace(std::path::Path::new("/tmp/hard-noise"), None)
+                .unwrap();
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO conversations(
+                         id, agent_id, workspace_id, source_id, title, source_path, metadata_json
+                     ) VALUES
+                         (1, ?1, ?2, 'local', 'within', '/tmp/hard-noise/a.jsonl', '{}'),
+                         (2, ?1, ?2, 'local', 'overcap', '/tmp/hard-noise/b.jsonl', '{}')",
+                    &[ParamValue::from(agent_id), ParamValue::from(workspace_id)],
+                )
+                .unwrap();
+            // Conversation 1 (14 content bytes, within the 20-byte cap → no
+            // truncation): a short-ack (noise), a real message (doc), and a
+            // tab-only body (Rust-trim-empty noise the raw SQLite trim() misses).
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(id, conversation_id, idx, role, content, extra_json)
+                     VALUES
+                         (10, 1, 0, 'user', 'ok', '{}'),
+                         (11, 1, 1, 'agent', 'hi there', '{}'),
+                         (12, 1, 2, 'agent', char(9)||char(9)||char(9)||char(9), '{}')",
+                    &[],
+                )
+                .unwrap();
+            // Conversation 2 (42 content bytes > cap → truncation clears the
+            // trailing message): a 24-byte body truncated to 20 (still a doc),
+            // then a real message whose content gets cleared to empty → the sink
+            // drops it as hard-noise even though its raw content is non-noise.
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(id, conversation_id, idx, role, content, extra_json)
+                     VALUES
+                         (20, 2, 0, 'agent', 'AAAAAAAAAAAAAAAAAAAAAAAA', '{}'),
+                         (21, 2, 1, 'agent', 'genuine second msg', '{}')",
+                    &[],
+                )
+                .unwrap();
+
+            // Orphaned message: a row whose conversation_id has no live
+            // conversation (possible after a dropped transaction; orphan cleanup
+            // is skipped by default). The rebuild sink never indexes it, so the
+            // count must exclude it from BOTH reachable and noise — otherwise it
+            // would inflate the denominator and re-introduce the loop.
+            storage
+                .raw()
+                .execute_compat("PRAGMA foreign_keys=OFF", &[])
+                .unwrap();
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(id, conversation_id, idx, role, content, extra_json)
+                     VALUES (30, 999, 0, 'agent', 'orphaned real message', '{}')",
+                    &[],
+                )
+                .unwrap();
+
+            // reachable = 5 live messages (conv1: 3, conv2: 2), excluding the
+            // orphan even though COUNT(*) FROM messages is now 6.
+            // hard-noise = 'ok' (conv1) + tab-only (conv1) + cleared trailing
+            // message (conv2) = 3. A raw scan that ignored truncation would return
+            // 2; one that counted the orphan would inflate reachable to 6.
+            let counts = crate::indexer::count_reachable_messages_and_hard_noise(&storage).unwrap();
+            assert_eq!(
+                counts.reachable_messages, 5,
+                "reachable must exclude the orphaned message (got {})",
+                counts.reachable_messages
+            );
+            assert_eq!(
+                counts.hard_noise_count, 3,
+                "expected 3 hard-noise (short-ack + tab-only + truncation-cleared); \
+                 got {} — truncation or whitespace handling is off",
+                counts.hard_noise_count
+            );
+        }
+
         fn tantivy_doc_count(index: &mut crate::search::tantivy::TantivyIndex) -> u64 {
             index.commit().expect("commit tantivy");
             let reader = index.reader().expect("reader");
@@ -27061,6 +27300,8 @@ pub mod persist {
                 tantivy_requires_rebuild: true,
                 observed_tantivy_docs: None,
                 published_index_validated_for_current_data: false,
+                reachable_messages: 0,
+                hard_noise_count: 0,
             };
 
             assert!(crate::indexer::should_evaluate_incremental_canonical_lexical_repair(&base));
@@ -27121,6 +27362,8 @@ pub mod persist {
                         tantivy_requires_rebuild: true,
                         observed_tantivy_docs: None,
                         published_index_validated_for_current_data: false,
+                        reachable_messages: 42,
+                        hard_noise_count: 0,
                     },
                 ),
                 Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
@@ -27145,6 +27388,8 @@ pub mod persist {
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(3),
                         published_index_validated_for_current_data: false,
+                        reachable_messages: 42,
+                        hard_noise_count: 0,
                     },
                 ),
                 Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
@@ -27212,6 +27457,8 @@ pub mod persist {
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(42),
                         published_index_validated_for_current_data: false,
+                        reachable_messages: 42,
+                        hard_noise_count: 0,
                     },
                 ),
                 None
@@ -27233,6 +27480,8 @@ pub mod persist {
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(3),
                         published_index_validated_for_current_data: true,
+                        reachable_messages: 42,
+                        hard_noise_count: 0,
                     },
                 ),
                 Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
@@ -27257,10 +27506,89 @@ pub mod persist {
                         tantivy_requires_rebuild: true,
                         observed_tantivy_docs: None,
                         published_index_validated_for_current_data: true,
+                        reachable_messages: 42,
+                        hard_noise_count: 0,
                     },
                 )
                 .is_some(),
                 "a missing/invalid tantivy index must still rebuild even when the validation flag is set"
+            );
+        }
+
+        #[test]
+        fn sparse_decision_subtracts_hard_noise_but_still_repairs_real_loss() {
+            // Synthetic numbers: canonical=5 messages, 2 of them hard-noise,
+            // so a healthy index has exactly 3 docs.
+            let base = crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                full_refresh: false,
+                force_rebuild: false,
+                resume_lexical_rebuild: false,
+                targeted_watch_once_only: false,
+                salvage_messages_imported: 0,
+                canonical_messages: 5,
+                tantivy_requires_rebuild: false,
+                observed_tantivy_docs: Some(3),
+                published_index_validated_for_current_data: false,
+                reachable_messages: 5,
+                hard_noise_count: 2,
+            };
+            // Healthy: observed == messages - noise → NOT sparse, must not repair.
+            assert_eq!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(base),
+                None,
+                "observed(3) == messages(5) - noise(2): healthy, must NOT repair"
+            );
+            // Real loss: observed below (messages - noise) → still repair.
+            assert!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        observed_tantivy_docs: Some(0),
+                        ..base
+                    },
+                )
+                .is_some(),
+                "observed(0) << expected(3): real loss, MUST still repair"
+            );
+            // Off-by-one below expected → still repair (noise subtraction is exact,
+            // not a fuzzy tolerance).
+            assert!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        observed_tantivy_docs: Some(2),
+                        ..base
+                    },
+                )
+                .is_some(),
+                "observed(2) < expected(3): one doc short, MUST repair"
+            );
+            // fail-closed: a buggy count exceeding reachable_messages must repair,
+            // not clamp expected to 0 and declare every index healthy.
+            let overflow = crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                    hard_noise_count: 6,
+                    ..base
+                },
+            )
+            .expect("hard_noise_count > reachable_messages: fail closed to repair, not clamp to 0");
+            assert_eq!(
+                overflow.reason,
+                "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan"
+            );
+
+            // Orphaned messages inflate raw canonical_messages but not
+            // reachable_messages; expected must use reachable so a healthy index
+            // (observed == reachable - noise) is not judged sparse by the orphans.
+            assert_eq!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        canonical_messages: 7, // 5 reachable + 2 orphaned
+                        reachable_messages: 5,
+                        observed_tantivy_docs: Some(3),
+                        ..base
+                    },
+                ),
+                None,
+                "observed(3) == reachable(5) - noise(2): healthy; the 2 orphans in canonical must NOT force repair"
             );
         }
 
