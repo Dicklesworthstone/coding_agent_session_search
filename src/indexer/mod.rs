@@ -15953,25 +15953,77 @@ fn anyhow_chain_indicates_retryable_storage_contention(err: &anyhow::Error) -> b
         .any(|cause| crate::storage::sqlite::retryable_storage_error_message(&cause.to_string()))
 }
 
+/// Maximum canonical-archive size (in bytes) for which the pre-rebuild
+/// `PRAGMA quick_check` integrity walk runs. That walk visits every b-tree page
+/// of the archive to validate page headers, cell pointers, and freeblock chains,
+/// so it is O(database size): on a multi-GB archive it takes many minutes
+/// (measured at >150s on both frankensqlite and stock SQLite 3.45 for an ~9GB
+/// store) and runs in the pre-index "preparing" phase with no progress
+/// heartbeat, which makes `cass index --full` look wedged for the whole walk
+/// (phase stays at 0 with current=0; the stall watchdog logs `stall_detected`
+/// but never aborts a phase-0 preflight). Above this bound cass skips the
+/// whole-database walk and relies on the per-table canaries below (which catch
+/// the "core tables unreadable" corruption that would actually break indexing);
+/// a full integrity scan stays available out-of-band via `cass doctor`.
+///
+/// Override with `CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES` (`0` = always run
+/// the full walk regardless of size). Default: 2 GiB.
+fn integrity_preflight_full_check_max_bytes() -> u64 {
+    const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    dotenvy::var("CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_BYTES)
+}
+
+/// Whether the full `PRAGMA quick_check` walk should run for an archive of
+/// `db_bytes`, given the `max_bytes` gate. `max_bytes == 0` disables the gate
+/// (always walk); otherwise the walk runs only at or below the threshold.
+fn integrity_preflight_should_run_full_check(db_bytes: u64, max_bytes: u64) -> bool {
+    max_bytes == 0 || db_bytes <= max_bytes
+}
+
 fn full_rebuild_existing_storage_integrity_problem(
     storage: &FrankenStorage,
 ) -> Result<Option<String>> {
-    let quick_check = match storage.raw().query_row_map(
-        "PRAGMA quick_check(1)",
-        &[] as &[ParamValue],
-        |row| row.get_typed::<String>(0),
-    ) {
-        Ok(status) => status,
-        Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
-            return Err(anyhow::anyhow!(
-                "full rebuild archive integrity preflight hit transient storage contention: {err}"
-            ));
-        }
-        Err(err) => return Ok(Some(format!("quick_check failed: {err}"))),
-    };
+    // The whole-database `PRAGMA quick_check` below is O(database size) and, on a
+    // large archive, blocks the pre-index phase for minutes with no progress
+    // signal (see `integrity_preflight_full_check_max_bytes`). Size-gate it: run
+    // the full walk only for archives at or below the threshold, and otherwise
+    // rely on the per-table canaries that follow.
+    let db_bytes = storage
+        .database_path()
+        .ok()
+        .map(|path| file_size_bytes(&path))
+        .unwrap_or(0);
+    let max_bytes = integrity_preflight_full_check_max_bytes();
+    if integrity_preflight_should_run_full_check(db_bytes, max_bytes) {
+        let quick_check = match storage.raw().query_row_map(
+            "PRAGMA quick_check(1)",
+            &[] as &[ParamValue],
+            |row| row.get_typed::<String>(0),
+        ) {
+            Ok(status) => status,
+            Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+                return Err(anyhow::anyhow!(
+                    "full rebuild archive integrity preflight hit transient storage contention: {err}"
+                ));
+            }
+            Err(err) => return Ok(Some(format!("quick_check failed: {err}"))),
+        };
 
-    if !quick_check.trim().eq_ignore_ascii_case("ok") {
-        return Ok(Some(format!("quick_check reported {quick_check:?}")));
+        if !quick_check.trim().eq_ignore_ascii_case("ok") {
+            return Ok(Some(format!("quick_check reported {quick_check:?}")));
+        }
+    } else {
+        tracing::warn!(
+            db_bytes,
+            max_bytes,
+            "skipping the whole-database PRAGMA quick_check integrity preflight for a large \
+             archive: the walk is O(database size) and would block indexing for minutes. \
+             Relying on per-table canaries. Run 'cass doctor check --json' for a full integrity \
+             scan, or set CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES=0 to always run the full check."
+        );
     }
 
     for (table, sql) in [
@@ -40098,6 +40150,19 @@ mod tests {
                 "expected {falsy:?} to keep the headroom check enabled"
             );
         }
+    }
+
+    #[test]
+    fn integrity_preflight_size_gate_controls_full_quick_check() {
+        let gib = 1024_u64 * 1024 * 1024;
+        // max_bytes == 0 disables the gate: the full O(DB-size) walk always runs.
+        assert!(integrity_preflight_should_run_full_check(64 * gib, 0));
+        // At or below the threshold the full walk runs...
+        assert!(integrity_preflight_should_run_full_check(gib, 2 * gib));
+        assert!(integrity_preflight_should_run_full_check(2 * gib, 2 * gib));
+        // ...and above it the walk is skipped (the per-table canaries still run).
+        assert!(!integrity_preflight_should_run_full_check(2 * gib + 1, 2 * gib));
+        assert!(!integrity_preflight_should_run_full_check(9 * gib, 2 * gib));
     }
 
     #[test]
