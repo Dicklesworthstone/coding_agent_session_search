@@ -15990,11 +15990,16 @@ fn full_rebuild_existing_storage_integrity_problem(
     // large archive, blocks the pre-index phase for minutes with no progress
     // signal (see `integrity_preflight_full_check_max_bytes`). Size-gate it: run
     // the full walk only for archives at or below the threshold, and otherwise
-    // rely on the per-table canaries that follow.
+    // rely on the per-table canaries that follow. Measure the whole archive
+    // bundle (main db + `-wal`/`-shm`) via `database_bundle_size_bytes`, not the
+    // main file alone: indexing deliberately runs with large deferred-checkpoint
+    // WALs, and quick_check walks the merged main+WAL view, so a WAL-heavy
+    // archive with a small main file must not slip under the gate and hit the
+    // exact stall this guards against.
     let db_bytes = storage
         .database_path()
         .ok()
-        .map(|path| file_size_bytes(&path))
+        .map(|path| database_bundle_size_bytes(&path))
         .unwrap_or(0);
     let max_bytes = integrity_preflight_full_check_max_bytes();
     if integrity_preflight_should_run_full_check(db_bytes, max_bytes) {
