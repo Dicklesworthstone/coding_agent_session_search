@@ -37,7 +37,8 @@ use crate::search::tantivy::{
     normalized_index_origin_host, normalized_index_origin_kind, normalized_index_source_id,
 };
 use crate::search::vector_index::{
-    ROLE_USER, SemanticDocId, VECTOR_INDEX_DIR, role_code_from_str, vector_index_path,
+    ROLE_USER, SemanticDocId, VECTOR_INDEX_DIR, parse_semantic_doc_id, role_code_from_str,
+    vector_index_path,
 };
 use crate::storage::sqlite::FrankenStorage;
 
@@ -2068,6 +2069,131 @@ impl SemanticIndexer {
         Ok(count)
     }
 
+    /// Rebuild the canonical FSVI artifact by reusing every still-current
+    /// vector and replacing only the supplied messages.
+    ///
+    /// The replacement is written to a staging artifact and atomically
+    /// published only after every retained and newly embedded record has been
+    /// validated. The live semantic artifact therefore remains usable if the
+    /// selective rewrite fails before publication.
+    pub fn reconcile_index_with_current_messages(
+        &self,
+        embedded_messages: Vec<EmbeddedMessage>,
+        data_dir: &Path,
+        tier: TierKind,
+        db_fingerprint: &str,
+        current_message_ids: &HashSet<u64>,
+    ) -> Result<FsVectorIndex> {
+        let index_path = vector_index_path(data_dir, self.embedder_id());
+        let staging_path =
+            semantic_staging_index_path(data_dir, tier, self.embedder_id(), db_fingerprint);
+        let mut current_index = FsVectorIndex::open(&index_path).map_err(|err| {
+            anyhow::anyhow!(
+                "open semantic index for selective reconciliation {}: {err}",
+                index_path.display()
+            )
+        })?;
+        if current_index.wal_record_count() > 0 {
+            current_index.compact().map_err(|err| {
+                anyhow::anyhow!("compact semantic index before selective reconciliation: {err}")
+            })?;
+        }
+
+        if let Some(parent) = staging_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let replacement_message_ids: HashSet<u64> = embedded_messages
+            .iter()
+            .map(|message| message.message_id)
+            .collect();
+        let mut writer = FsVectorIndex::create_with_revision(
+            &staging_path,
+            self.embedder_id(),
+            "1.0",
+            self.embedder_dimension(),
+            FsQuantization::F16,
+        )
+        .map_err(|err| anyhow::anyhow!("create reconciled fsvi staging index: {err}"))?;
+
+        let mut retained_docs = 0usize;
+        let mut removed_docs = 0usize;
+        for record_index in 0..current_index.record_count() {
+            if current_index.is_deleted(record_index) {
+                removed_docs = removed_docs.saturating_add(1);
+                continue;
+            }
+            let doc_id = current_index.doc_id_at(record_index).map_err(|err| {
+                anyhow::anyhow!("read semantic doc id during reconciliation: {err}")
+            })?;
+            let semantic_id = parse_semantic_doc_id(doc_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "semantic reconciliation found an invalid cass document id: {doc_id}"
+                )
+            })?;
+            if !current_message_ids.contains(&semantic_id.message_id)
+                || replacement_message_ids.contains(&semantic_id.message_id)
+            {
+                removed_docs = removed_docs.saturating_add(1);
+                continue;
+            }
+            let vector = current_index.vector_at_f32(record_index).map_err(|err| {
+                anyhow::anyhow!("read semantic vector during reconciliation: {err}")
+            })?;
+            writer
+                .write_record(doc_id, &vector)
+                .map_err(|err| anyhow::anyhow!("write retained semantic vector: {err}"))?;
+            retained_docs = retained_docs.saturating_add(1);
+        }
+
+        let embedded_docs = embedded_messages.len();
+        for embedded in embedded_messages {
+            if embedded.embedding.len() != self.embedder_dimension() {
+                bail!(
+                    "embedding dimension mismatch: expected {}, got {}",
+                    self.embedder_dimension(),
+                    embedded.embedding.len()
+                );
+            }
+            let doc_id = semantic_doc_id_for_embedded(&embedded);
+            writer
+                .write_record(&doc_id, &embedded.embedding)
+                .map_err(|err| anyhow::anyhow!("write replacement semantic vector: {err}"))?;
+        }
+        writer
+            .finish()
+            .map_err(|err| anyhow::anyhow!("finish reconciled fsvi staging index: {err}"))?;
+        let expected_docs = retained_docs.saturating_add(embedded_docs);
+        let staged = FsVectorIndex::open(&staging_path)
+            .map_err(|err| anyhow::anyhow!("open reconciled semantic staging index: {err}"))?;
+        if !staged.record_count().eq(&expected_docs) {
+            bail!(
+                "reconciled semantic staging count mismatch: expected {expected_docs}, observed {}",
+                staged.record_count()
+            );
+        }
+        drop(staged);
+        drop(current_index);
+
+        fs::rename(&staging_path, &index_path).with_context(|| {
+            format!(
+                "publish reconciled semantic index {} to {}",
+                staging_path.display(),
+                index_path.display()
+            )
+        })?;
+        sync_parent_directory(&index_path)?;
+        let published = FsVectorIndex::open(&index_path)
+            .map_err(|err| anyhow::anyhow!("open reconciled semantic index: {err}"))?;
+        tracing::info!(
+            retained_docs,
+            removed_docs,
+            embedded_docs,
+            published_docs = published.record_count(),
+            "published selectively reconciled semantic index"
+        );
+        Ok(published)
+    }
+
     fn write_backfill_staging_index(
         &self,
         embedded_messages: Vec<EmbeddedMessage>,
@@ -2966,6 +3092,46 @@ mod tests {
         assert_eq!(index.embedder_id(), indexer.embedder_id());
         assert_eq!(index.dimension(), indexer.embedder_dimension());
         assert_eq!(index.record_count(), 2);
+    }
+
+    #[test]
+    fn semantic_reconciliation_failure_preserves_live_artifact() -> Result<()> {
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let initial = indexer.embed_messages(&[
+            EmbeddingInput::new(1, "retained semantic one"),
+            EmbeddingInput::new(2, "retained semantic two"),
+        ])?;
+        let tmp = tempdir()?;
+        indexer.build_and_save_index(initial, tmp.path())?;
+
+        let mut invalid_replacement =
+            indexer.embed_messages(&[EmbeddingInput::new(3, "invalid replacement")])?;
+        invalid_replacement[0].embedding.pop();
+        let err = match indexer.reconcile_index_with_current_messages(
+            invalid_replacement,
+            tmp.path(),
+            TierKind::Fast,
+            "content-v1:3:3:3",
+            &HashSet::from([1, 2, 3]),
+        ) {
+            Ok(_) => bail!("invalid semantic replacement unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("embedding dimension mismatch"));
+
+        let live = FsVectorIndex::open(&vector_index_path(tmp.path(), indexer.embedder_id()))?;
+        assert_eq!(live.record_count(), 2);
+        let mut live_message_ids = HashSet::new();
+        for record_index in 0..live.record_count() {
+            let doc_id = live
+                .doc_id_at(record_index)
+                .with_context(|| format!("missing semantic doc id at record {record_index}"))?;
+            let parsed = parse_semantic_doc_id(doc_id)
+                .with_context(|| format!("invalid semantic doc id {doc_id}"))?;
+            live_message_ids.insert(parsed.message_id);
+        }
+        assert_eq!(live_message_ids, HashSet::from([1, 2]));
+        Ok(())
     }
 
     #[test]

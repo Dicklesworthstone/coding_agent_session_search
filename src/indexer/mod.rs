@@ -15312,6 +15312,7 @@ struct SemanticContentFingerprint {
 enum TargetedSemanticWatchOnceMode {
     RebuildAll,
     AppendToExisting,
+    ReconcileExisting,
     AlreadyCovered,
 }
 
@@ -15325,6 +15326,7 @@ struct TargetedSemanticWatchOnceSelection {
     total_conversations: u64,
     current_db_fingerprint: String,
     manifest_before_db_fingerprint: Option<String>,
+    current_message_ids: Option<HashSet<u64>>,
     reason: &'static str,
 }
 
@@ -15457,6 +15459,52 @@ fn semantic_artifact_is_append_only_prefix(
     Ok(observed_prefix_conversations.eq(&artifact_fingerprint.total_conversations))
 }
 
+fn current_semantic_message_ids(storage: &FrankenStorage) -> Result<HashSet<u64>> {
+    let raw_message_ids: Vec<i64> = storage
+        .raw()
+        .query_map_collect(
+            "SELECT m.id
+             FROM messages AS m
+             INNER JOIN conversations AS c ON c.id = m.conversation_id",
+            &[],
+            |row| row.get_typed(0),
+        )
+        .context("loading current canonical message ids for semantic reconciliation")?;
+    Ok(raw_message_ids
+        .into_iter()
+        .filter_map(|message_id| u64::try_from(message_id).ok())
+        .collect())
+}
+
+fn semantic_index_contains_only_current_messages(
+    index_path: &Path,
+    current_message_ids: &HashSet<u64>,
+) -> Result<bool> {
+    let index = FsVectorIndex::open(index_path).map_err(|err| {
+        anyhow::anyhow!(
+            "open semantic artifact for current-message validation {}: {err}",
+            index_path.display()
+        )
+    })?;
+    if index.wal_record_count() > 0 {
+        return Ok(false);
+    }
+    for record_index in 0..index.record_count() {
+        if index.is_deleted(record_index) {
+            return Ok(false);
+        }
+        let doc_id = index.doc_id_at(record_index).map_err(|err| {
+            anyhow::anyhow!("read semantic document id during current-message validation: {err}")
+        })?;
+        let semantic_id = crate::search::vector_index::parse_semantic_doc_id(doc_id)
+            .ok_or_else(|| anyhow::anyhow!("invalid cass semantic document id: {doc_id}"))?;
+        if !current_message_ids.contains(&semantic_id.message_id) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn filter_semantic_watch_once_inputs(inputs: &mut Vec<EmbeddingInput>) {
     inputs.retain(|message| {
         !is_hard_message_noise(semantic_role_name(message.role), &message.content)
@@ -15502,17 +15550,37 @@ fn select_targeted_semantic_watch_once_inputs(
         && artifact.db_fingerprint.eq(&current_db_fingerprint)
     {
         let index_path = validate_semantic_watch_once_artifact(data_dir, artifact, indexer, tier)?;
-        return Ok(TargetedSemanticWatchOnceSelection {
-            mode: TargetedSemanticWatchOnceMode::AlreadyCovered,
-            inputs: Vec::new(),
-            raw_max_message_id: (current_fingerprint.max_message_id > 0)
-                .then_some(current_fingerprint.max_message_id),
-            tier,
-            index_path,
-            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
-            current_db_fingerprint,
-            manifest_before_db_fingerprint,
-            reason: "semantic_artifact_already_covers_db",
+        let current_message_ids = current_semantic_message_ids(storage)?;
+        let artifact_is_current =
+            semantic_index_contains_only_current_messages(&index_path, &current_message_ids)?;
+        return Ok(if artifact_is_current {
+            TargetedSemanticWatchOnceSelection {
+                mode: TargetedSemanticWatchOnceMode::AlreadyCovered,
+                inputs: Vec::new(),
+                raw_max_message_id: (current_fingerprint.max_message_id > 0)
+                    .then_some(current_fingerprint.max_message_id),
+                tier,
+                index_path,
+                total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
+                current_db_fingerprint,
+                manifest_before_db_fingerprint,
+                current_message_ids: None,
+                reason: "semantic_artifact_already_covers_db",
+            }
+        } else {
+            TargetedSemanticWatchOnceSelection {
+                mode: TargetedSemanticWatchOnceMode::ReconcileExisting,
+                inputs: Vec::new(),
+                raw_max_message_id: (current_fingerprint.max_message_id > 0)
+                    .then_some(current_fingerprint.max_message_id),
+                tier,
+                index_path,
+                total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
+                current_db_fingerprint,
+                manifest_before_db_fingerprint,
+                current_message_ids: Some(current_message_ids),
+                reason: "semantic_artifact_reconciled_with_current_db",
+            }
         });
     }
 
@@ -15536,6 +15604,7 @@ fn select_targeted_semantic_watch_once_inputs(
             total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
             current_db_fingerprint,
             manifest_before_db_fingerprint,
+            current_message_ids: None,
             reason: "fresh_watch_once_db",
         });
     }
@@ -15566,21 +15635,34 @@ fn select_targeted_semantic_watch_once_inputs(
         );
     }
     let index_path = validate_semantic_watch_once_artifact(data_dir, &artifact, indexer, tier)?;
-    if !semantic_artifact_is_append_only_prefix(storage, artifact_fingerprint, current_fingerprint)?
-    {
-        anyhow::bail!(
-            "semantic watch-once cannot prove bounded coverage: existing semantic artifact is not an append-only prefix of the current DB"
-        );
-    }
-
+    let current_message_ids = current_semantic_message_ids(storage)?;
+    let append_only_prefix =
+        semantic_artifact_is_append_only_prefix(
+            storage,
+            artifact_fingerprint,
+            current_fingerprint,
+        )? && semantic_index_contains_only_current_messages(&index_path, &current_message_ids)?;
     let mut batch =
         packet_embedding_inputs_from_storage_since(storage, artifact_fingerprint.max_message_id)?;
     let raw_max_message_id = batch.raw_max_message_id.or_else(|| {
         (current_fingerprint.max_message_id > 0).then_some(current_fingerprint.max_message_id)
     });
     filter_semantic_watch_once_inputs(&mut batch.inputs);
+    let (mode, current_message_ids, reason) = if append_only_prefix {
+        (
+            TargetedSemanticWatchOnceMode::AppendToExisting,
+            None,
+            "semantic_artifact_is_append_only_prefix",
+        )
+    } else {
+        (
+            TargetedSemanticWatchOnceMode::ReconcileExisting,
+            Some(current_message_ids),
+            "semantic_artifact_reconciled_with_current_db",
+        )
+    };
     Ok(TargetedSemanticWatchOnceSelection {
-        mode: TargetedSemanticWatchOnceMode::AppendToExisting,
+        mode,
         inputs: batch.inputs,
         raw_max_message_id,
         tier,
@@ -15588,7 +15670,8 @@ fn select_targeted_semantic_watch_once_inputs(
         total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
         current_db_fingerprint,
         manifest_before_db_fingerprint,
-        reason: "semantic_artifact_is_append_only_prefix",
+        current_message_ids,
+        reason,
     })
 }
 
@@ -15704,6 +15787,21 @@ fn run_targeted_semantic_watch_once_publish(
                     selection.index_path.display()
                 )
             })?;
+            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+        }
+        TargetedSemanticWatchOnceMode::ReconcileExisting => {
+            let current_message_ids = selection.current_message_ids.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "semantic reconciliation selection omitted current canonical message ids"
+                )
+            })?;
+            let index = indexer.reconcile_index_with_current_messages(
+                embedded,
+                data_dir,
+                selection.tier,
+                &selection.current_db_fingerprint,
+                current_message_ids,
+            )?;
             u64::try_from(index.record_count()).unwrap_or(u64::MAX)
         }
     };
@@ -45400,6 +45498,122 @@ mod tests {
             matches!(index.record_count(), 4),
             "wrong vector record count"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn run_index_semantic_watch_once_repairs_deleted_prefix_conversation() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let first = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("28")
+            .join("rollout-semantic-watch-once-repair-first.jsonl");
+        let second = first.with_file_name("rollout-semantic-watch-once-repair-second.jsonl");
+        let third = first.with_file_name("rollout-semantic-watch-once-repair-third.jsonl");
+        write_semantic_watch_once_codex_session(
+            &first,
+            "semantic-watch-once-repair-first",
+            "swonce-repair-one",
+        )?;
+        write_semantic_watch_once_codex_session(
+            &second,
+            "semantic-watch-once-repair-second",
+            "swonce-repair-two",
+        )?;
+        write_semantic_watch_once_codex_session(
+            &third,
+            "semantic-watch-once-repair-third",
+            "swonce-repair-three",
+        )?;
+
+        run_index(
+            semantic_watch_once_opts(&data_dir, &first, Arc::new(IndexingProgress::default())),
+            None,
+        )?;
+        run_index(
+            semantic_watch_once_opts(&data_dir, &second, Arc::new(IndexingProgress::default())),
+            None,
+        )?;
+
+        let storage = FrankenStorage::open(&data_dir.join("db.sqlite"))?;
+        let removed_conversation_id: i64 = storage.raw().query_row_map(
+            "SELECT id FROM conversations ORDER BY id ASC LIMIT 1",
+            &[],
+            |row| row.get_typed(0),
+        )?;
+        for statement in [
+            "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
+            "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
+            "DELETE FROM messages WHERE conversation_id = ?1",
+            "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+            "DELETE FROM conversations WHERE id = ?1",
+        ] {
+            storage
+                .raw()
+                .execute_compat(statement, &[ParamValue::from(removed_conversation_id)])?;
+        }
+        drop(storage);
+
+        let progress = Arc::new(IndexingProgress::default());
+        run_index(
+            semantic_watch_once_opts(&data_dir, &third, Arc::clone(&progress)),
+            None,
+        )?;
+
+        let stats = semantic_watch_once_stats(&progress)?;
+        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
+        anyhow::ensure!(
+            matches!(
+                stats.reason.as_str(),
+                "semantic_artifact_reconciled_with_current_db"
+            ),
+            "wrong reason: {}",
+            stats.reason
+        );
+        anyhow::ensure!(matches!(stats.selected_docs, 2), "wrong selected doc count");
+        anyhow::ensure!(matches!(stats.embedded_docs, 2), "wrong embedded doc count");
+
+        let manifest = SemanticManifest::load_or_default(&data_dir)?;
+        let artifact = manifest.fast_tier.as_ref().context("fast artifact")?;
+        anyhow::ensure!(matches!(artifact.conversation_count, 2));
+        anyhow::ensure!(matches!(artifact.doc_count, 4));
+        anyhow::ensure!(matches!(
+            artifact.db_fingerprint.as_str(),
+            "content-v1:2:3:6"
+        ));
+
+        let storage = FrankenStorage::open(&data_dir.join("db.sqlite"))?;
+        let current_message_ids: HashSet<u64> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT m.id
+                 FROM messages AS m
+                 INNER JOIN conversations AS c ON c.id = m.conversation_id",
+                &[],
+                |row| row.get_typed::<i64>(0),
+            )?
+            .into_iter()
+            .filter_map(message_id_from_db)
+            .collect();
+        let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
+        anyhow::ensure!(matches!(index.record_count(), 4));
+        for record_index in 0..index.record_count() {
+            let doc_id = index.doc_id_at(record_index)?;
+            let parsed = crate::search::vector_index::parse_semantic_doc_id(doc_id)
+                .with_context(|| format!("parse semantic doc id {doc_id}"))?;
+            anyhow::ensure!(
+                current_message_ids.contains(&parsed.message_id),
+                "stale semantic message {} survived reconciliation",
+                parsed.message_id
+            );
+        }
         Ok(())
     }
 
