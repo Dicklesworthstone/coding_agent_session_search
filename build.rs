@@ -56,7 +56,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // `validate_manifest_dependency_spec` to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.1.18",
+        expected_version: "0.1.19",
         expected_features: &["fts5"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -71,10 +71,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // crates.io-only exact pin aligned with the frankensqlite facade at 0.1.18.
+        // crates.io-only exact pin aligned with the frankensqlite facade at 0.1.19.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.1.18",
+        expected_version: "0.1.19",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
