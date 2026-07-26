@@ -97185,22 +97185,32 @@ fn run_sources_doctor(
     let mut all_diagnostics = Vec::new();
     let mut observations = Vec::new();
 
+    let fleet_budget_cfg = configured_fleet_probe_budget();
+    let total_budget =
+        crate::robot_budget_envelope::RobotBudget::new(fleet_budget_cfg.total_ms);
+
     for source in sources_to_check {
         let source_start = std::time::Instant::now();
+        let host_budget = crate::robot_budget_envelope::RobotBudget::with_start(
+            fleet_budget_cfg.per_host_ms,
+            source_start,
+        );
         let mut checks = Vec::new();
 
         // Check 1: SSH connectivity
         let host = source.host.as_deref().unwrap_or("unknown");
         let fixture_probe = load_source_doctor_fixture_probe(host)?;
-        let ssh_check = fixture_probe
-            .as_ref()
-            .map_or_else(|| check_ssh_connectivity(host), |probe| probe.ssh_check());
+        let ssh_check = fixture_probe.as_ref().map_or_else(
+            || check_ssh_connectivity(host, remaining_probe_timeout(&host_budget, &total_budget)),
+            |probe| probe.ssh_check(),
+        );
         checks.push(ssh_check);
 
         // Check 2: rsync availability on remote
-        let rsync_check = fixture_probe
-            .as_ref()
-            .map_or_else(|| check_rsync_available(host), |probe| probe.rsync_check());
+        let rsync_check = fixture_probe.as_ref().map_or_else(
+            || check_rsync_available(host, remaining_probe_timeout(&host_budget, &total_budget)),
+            |probe| probe.rsync_check(),
+        );
         checks.push(rsync_check);
 
         // Check 3: Remote paths exist
@@ -97214,7 +97224,13 @@ fn run_sources_doctor(
                 });
             } else {
                 checks.push(fixture_probe.as_ref().map_or_else(
-                    || check_remote_path(host, path),
+                    || {
+                        check_remote_path(
+                            host,
+                            path,
+                            remaining_probe_timeout(&host_budget, &total_budget),
+                        )
+                    },
                     |probe| probe.remote_path_check(path),
                 ));
             }
@@ -97266,7 +97282,12 @@ fn run_sources_doctor(
         if observation.host_reachable {
             if source.host.is_some() {
                 let probe = fixture_probe.as_ref().map_or_else(
-                    || check_remote_cass(host),
+                    || {
+                        check_remote_cass(
+                            host,
+                            remaining_probe_timeout(&host_budget, &total_budget),
+                        )
+                    },
                     SourceDoctorFixtureProbe::remote_cass_probe,
                 );
                 if let Some(uname) = probe.os.as_deref() {
@@ -97354,9 +97375,15 @@ fn run_sources_doctor(
     });
 
     if let Some(_fmt) = structured_format {
+        let budget_block = crate::robot_budget_envelope::BudgetBlock::from_budget(
+            &total_budget,
+            Vec::new(),
+            None,
+        );
         let output = SourcesDoctorOutput {
             health: &health_report,
             diagnostics: &all_diagnostics,
+            budget: &budget_block,
         };
         println!(
             "{}",
@@ -99138,7 +99165,17 @@ fn probe_remote_host_for_rehearsal(
 ) {
     use crate::fleet_doctor_schema::{HostDoctorReport, HostProbeStatus, Platform};
     let start = std::time::Instant::now();
-    let probe = check_remote_cass(host);
+    let rehearsal_budget_cfg = configured_fleet_probe_budget();
+    let rehearsal_total_budget =
+        crate::robot_budget_envelope::RobotBudget::new(rehearsal_budget_cfg.total_ms);
+    let rehearsal_host_budget = crate::robot_budget_envelope::RobotBudget::with_start(
+        rehearsal_budget_cfg.per_host_ms,
+        start,
+    );
+    let probe = check_remote_cass(
+        host,
+        remaining_probe_timeout(&rehearsal_host_budget, &rehearsal_total_budget),
+    );
     let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let platform = probe
         .os
