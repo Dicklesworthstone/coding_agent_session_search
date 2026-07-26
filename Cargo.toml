@@ -316,3 +316,10 @@ path = "tests/upgrade/mod.rs"
 [[test]]
 name = "recovery"
 path = "tests/recovery/mod.rs"
+
+# fsqlite/fsqlite-types 0.1.19 are not available on crates.io (yanked or never
+# published); Cargo.lock already pins them to this git rev. Patch crates.io
+# resolution to match the lockfile so fresh builds succeed.
+[patch.crates-io]
+fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "f9cc3294" }
+fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "f9cc3294" }
