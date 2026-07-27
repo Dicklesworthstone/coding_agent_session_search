@@ -2191,11 +2191,19 @@ fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<Hist
         .arg("-batch")
         .arg("-noheader")
         .arg(&bundle_uri)
+        // `writable_schema=ON` is deliberate: it relaxes schema-integrity
+        // enforcement so this probe can still read `schema_version` out of a
+        // bundle whose sqlite_master is damaged. Nothing here writes, and the
+        // connection is opened `?immutable=1`, so the relaxed setting cannot
+        // corrupt anything — but it is bracketed with an explicit OFF so a
+        // future edit that adds a statement here does not silently inherit an
+        // unprotected connection.
         .arg(
             "PRAGMA writable_schema=ON;
              SELECT COALESCE((SELECT value FROM meta WHERE key = 'schema_version'), '');
              SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages';
-             SELECT COALESCE(MAX(id), 0) FROM messages;",
+             SELECT COALESCE(MAX(id), 0) FROM messages;
+             PRAGMA writable_schema=OFF;",
         )
         .output()
         .ok()?;
