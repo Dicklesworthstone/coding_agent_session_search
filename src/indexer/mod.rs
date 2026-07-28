@@ -16662,7 +16662,7 @@ fn ensure_index_storage_headroom(
         return Ok(());
     }
 
-    let required = required_index_headroom_bytes(db_path, requirement);
+    let required = required_index_headroom_bytes(data_dir, db_path, requirement);
     for probe_path in existing_headroom_probe_paths(data_dir, db_path) {
         let available = fs2::available_space(&probe_path).with_context(|| {
             format!(
@@ -16749,17 +16749,63 @@ fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Directory holding the lexical (Tantivy) index, relative to the data dir.
+const LEXICAL_INDEX_ROOT_DIR: &str = "index";
+
 fn required_index_headroom_bytes(
+    data_dir: &Path,
     db_path: &Path,
     requirement: IndexStorageHeadroomRequirement,
 ) -> u64 {
     match requirement {
         IndexStorageHeadroomRequirement::IncrementalStartup => INDEX_MIN_FREE_SPACE_BYTES,
         IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild => {
+            // An authoritative rebuild writes a *second* full lexical index (plus
+            // staged shard/merge scratch) while the existing one is still on
+            // disk, so the db bundle alone badly under-projects the requirement.
+            //
+            // Sizing this as `db_bundle * 2` (the pre-2026-07 formula) let a real
+            // rebuild run a filesystem to 0 bytes: on a host with a 25 GB db and a
+            // 57 GB lexical index the check required 50 GB, passed against 113 GB
+            // free, then consumed ~115 GB and died on `disk I/O error (10)`.
+            // Counting the lexical index makes that case fail the preflight
+            // instead of failing mid-commit.
             let db_bundle_bytes = database_bundle_size_bytes(db_path);
-            INDEX_MIN_FREE_SPACE_BYTES.max(db_bundle_bytes.saturating_mul(2))
+            let lexical_bytes = lexical_index_size_bytes(data_dir);
+            let projected = db_bundle_bytes
+                .saturating_mul(2)
+                .saturating_add(lexical_bytes.saturating_mul(2));
+            INDEX_MIN_FREE_SPACE_BYTES.max(projected)
         }
     }
+}
+
+/// Total bytes of the on-disk lexical index, or 0 when it does not exist yet.
+///
+/// Walks explicitly (rather than following symlinks) so a symlinked index dir
+/// cannot make the projection wander outside the data dir.
+fn lexical_index_size_bytes(data_dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![data_dir.join(LEXICAL_INDEX_ROOT_DIR)];
+    while let Some(path) = stack.pop() {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        } else if metadata.is_dir() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    total
 }
 
 fn database_bundle_size_bytes(db_path: &Path) -> u64 {
@@ -41259,6 +41305,60 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_rebuild_headroom_counts_existing_lexical_index() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, vec![0u8; 4096]).unwrap();
+
+        let without_index = required_index_headroom_bytes(
+            &data_dir,
+            &db_path,
+            IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+        );
+
+        // A rebuild must also make room for a second copy of the lexical index.
+        let index_dir = data_dir.join(LEXICAL_INDEX_ROOT_DIR).join("seg");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(index_dir.join("0.store"), vec![0u8; 64 * 1024]).unwrap();
+
+        let with_index = required_index_headroom_bytes(
+            &data_dir,
+            &db_path,
+            IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+        );
+
+        assert!(
+            with_index > without_index,
+            "lexical index size must raise the rebuild headroom requirement \
+             (without={without_index}, with={with_index})"
+        );
+        assert_eq!(with_index - without_index, 2 * 64 * 1024);
+    }
+
+    #[test]
+    fn incremental_headroom_ignores_lexical_index_size() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, vec![0u8; 4096]).unwrap();
+        let index_dir = data_dir.join(LEXICAL_INDEX_ROOT_DIR);
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(index_dir.join("big.store"), vec![0u8; 1024 * 1024]).unwrap();
+
+        // Incremental startup does not rewrite the lexical index, so its floor
+        // stays the flat minimum.
+        assert_eq!(
+            required_index_headroom_bytes(
+                &data_dir,
+                &db_path,
+                IndexStorageHeadroomRequirement::IncrementalStartup
+            ),
+            INDEX_MIN_FREE_SPACE_BYTES
+        );
+    }
+
+    #[test]
     fn headroom_probe_checks_data_dir_and_custom_db_parent_when_distinct() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("cass-data");
@@ -41299,6 +41399,7 @@ mod tests {
         );
         assert_eq!(
             required_index_headroom_bytes(
+                tmp.path(),
                 &db_path,
                 IndexStorageHeadroomRequirement::IncrementalStartup,
             ),
@@ -41317,6 +41418,8 @@ mod tests {
             .unwrap();
         std::fs::write(database_path_with_suffix(&db_path, "-wal"), vec![0_u8; 256]).unwrap();
         std::fs::write(database_path_with_suffix(&db_path, "-shm"), vec![0_u8; 512]).unwrap();
+        // No lexical index exists in this fixture, so the rebuild projection is
+        // still just the archive-clone requirement.
         let clone_requirement =
             INDEX_MIN_FREE_SPACE_BYTES.max(database_bundle_size_bytes(&db_path).saturating_mul(2));
 
@@ -41330,6 +41433,7 @@ mod tests {
         );
         assert_eq!(
             required_index_headroom_bytes(
+                tmp.path(),
                 &db_path,
                 IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
             ),
