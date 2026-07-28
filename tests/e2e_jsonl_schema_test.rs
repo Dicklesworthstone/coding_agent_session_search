@@ -25,6 +25,12 @@ fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_jsonl_schema_test", test_name)
 }
 
+fn selected_e2e_root() -> Option<PathBuf> {
+    std::env::var("CASS_E2E_RUN_ID")
+        .ok()
+        .map(|run_id| PathBuf::from("test-results/e2e/runs").join(run_id))
+}
+
 /// Required fields per event type.
 /// Common fields (ts, event, run_id, runner) are checked separately.
 const EVENT_SPECIFIC_FIELDS: &[(&str, &[&str])] = &[
@@ -423,15 +429,19 @@ fn shell_validator_enforces_the_semantic_trace_aggregate_budget() -> SchemaTestR
 }
 
 #[test]
-fn shell_validator_default_discovery_skips_archived_logs() -> SchemaTestResult {
-    let tracker = tracker_for("shell_validator_default_discovery_skips_archived_logs");
+fn shell_validator_default_discovery_is_scoped_to_one_explicit_run() -> SchemaTestResult {
+    let tracker = tracker_for("shell_validator_default_discovery_is_scoped_to_one_explicit_run");
 
     let repo_root = std::env::current_dir()?;
     let validator = repo_root.join("scripts/validate-e2e-jsonl.sh");
     let temp = tempfile::TempDir::new()?;
-    let current_dir = temp.path().join("test-results/e2e");
-    let archived_dir = current_dir.join(".previous/old-run");
-    fs::create_dir_all(&archived_dir)?;
+    let run_id = "selected-run-20260728";
+    let current_dir = temp.path().join("test-results/e2e/runs").join(run_id);
+    let unrelated_dir = temp
+        .path()
+        .join("test-results/e2e/runs/unrelated-run-20260728");
+    fs::create_dir_all(&current_dir)?;
+    fs::create_dir_all(&unrelated_dir)?;
 
     fs::write(
         current_dir.join("current.jsonl"),
@@ -442,7 +452,7 @@ fn shell_validator_default_discovery_skips_archived_logs() -> SchemaTestResult {
 "#,
     )?;
     fs::write(
-        archived_dir.join("stale.jsonl"),
+        unrelated_dir.join("stale.jsonl"),
         r#"{"ts":"2026-01-01T00:00:00Z","event":"run_start","run_id":"stale","runner":"rust","env":{}}
 {"ts":"2026-01-01T00:00:01Z","event":"test_start","run_id":"stale","runner":"rust","test":{"name":"stale"}}
 {"ts":"2026-01-01T00:00:02Z","event":"test_end","run_id":"stale","runner":"rust","test":{"name":"stale"}}
@@ -452,22 +462,52 @@ fn shell_validator_default_discovery_skips_archived_logs() -> SchemaTestResult {
 
     let output = Command::new("bash")
         .arg(&validator)
+        .env("CASS_E2E_RUN_ID", run_id)
         .current_dir(temp.path())
         .output()?;
 
     assert!(
         output.status.success(),
-        "shell validator no-arg discovery validated archived .previous logs\nstdout:\n{}\nstderr:\n{}",
+        "shell validator did not isolate the selected run\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !stdout.contains(".previous"),
-        "shell validator should not list archived .previous logs in no-arg mode:\n{stdout}"
+        !stdout.contains("unrelated-run"),
+        "shell validator consumed another run's evidence:\n{stdout}"
     );
 
+    tracker.complete();
+    Ok(())
+}
+
+#[test]
+fn shell_validator_refuses_implicit_process_global_discovery() -> SchemaTestResult {
+    let tracker = tracker_for("shell_validator_refuses_implicit_process_global_discovery");
+    let repo_root = std::env::current_dir()?;
+    let validator = repo_root.join("scripts/validate-e2e-jsonl.sh");
+    let temp = tempfile::TempDir::new()?;
+    fs::create_dir_all(temp.path().join("test-results/e2e"))?;
+    let output = Command::new("bash")
+        .arg(&validator)
+        .env_remove("CASS_E2E_RUN_ID")
+        .current_dir(temp.path())
+        .output()?;
+    schema_test_require!(
+        !output.status.success(),
+        "validator accepted process-global no-argument discovery"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    schema_test_require!(
+        combined.contains("requires a valid CASS_E2E_RUN_ID"),
+        "missing fail-closed diagnostic:\n{combined}"
+    );
     tracker.complete();
     Ok(())
 }
@@ -476,7 +516,11 @@ fn shell_validator_default_discovery_skips_archived_logs() -> SchemaTestResult {
 fn jsonl_files_valid_schema() {
     let tracker = tracker_for("jsonl_files_valid_schema");
 
-    let e2e_dir = Path::new("test-results/e2e");
+    let Some(e2e_dir) = selected_e2e_root() else {
+        eprintln!("No CASS_E2E_RUN_ID — skipping run-artifact validation");
+        tracker.complete();
+        return;
+    };
     if !e2e_dir.exists() {
         eprintln!("No test-results/e2e directory — skipping JSONL validation");
         tracker.complete();
@@ -484,7 +528,11 @@ fn jsonl_files_valid_schema() {
     }
 
     let phase_start = tracker.start("discover_files", Some("Find JSONL files"));
-    let jsonl_files = collect_jsonl_logs(e2e_dir);
+    let active_log = tracker.artifacts().cass_log_path.clone();
+    let jsonl_files = collect_jsonl_logs(&e2e_dir)
+        .into_iter()
+        .filter(|path| path != &active_log)
+        .collect::<Vec<_>>();
     tracker.end("discover_files", Some("Find JSONL files"), phase_start);
 
     if jsonl_files.is_empty() {
@@ -573,13 +621,17 @@ fn jsonl_files_valid_schema() {
 fn trace_jsonl_files_are_valid_correlated_and_bounded() -> SchemaTestResult {
     let tracker = tracker_for("trace_jsonl_files_are_valid_correlated_and_bounded");
 
-    let e2e_dir = Path::new("test-results/e2e");
+    let Some(e2e_dir) = selected_e2e_root() else {
+        eprintln!("No CASS_E2E_RUN_ID — skipping run-trace validation");
+        tracker.complete();
+        return Ok(());
+    };
     if !e2e_dir.exists() {
         tracker.complete();
         return Ok(());
     }
 
-    let trace_files = collect_trace_logs(e2e_dir);
+    let trace_files = collect_trace_logs(&e2e_dir);
     if trace_files.is_empty() {
         eprintln!("No per-test trace.jsonl artifacts — skipping trace validation");
         tracker.complete();
@@ -956,7 +1008,10 @@ fn concurrent_children_keep_home_codex_home_and_trace_artifacts_disjoint() -> Sc
 fn jsonl_timestamps_are_rfc3339() {
     let tracker = tracker_for("jsonl_timestamps_are_rfc3339");
 
-    let e2e_dir = Path::new("test-results/e2e");
+    let Some(e2e_dir) = selected_e2e_root() else {
+        tracker.complete();
+        return;
+    };
     if !e2e_dir.exists() {
         tracker.complete();
         return;
@@ -966,7 +1021,7 @@ fn jsonl_timestamps_are_rfc3339() {
     let mut checked = 0usize;
     let mut bad = Vec::new();
 
-    for path in collect_jsonl_logs(e2e_dir) {
+    for path in collect_jsonl_logs(&e2e_dir) {
         let content = fs::read_to_string(&path).unwrap();
         for (line_num, line) in content.lines().enumerate() {
             if line.trim().is_empty() {
@@ -1007,19 +1062,23 @@ fn jsonl_timestamps_are_rfc3339() {
 }
 
 #[test]
-fn jsonl_run_ids_consistent_within_file() {
+fn jsonl_run_ids_consistent_within_file() -> SchemaTestResult {
     let tracker = tracker_for("jsonl_run_ids_consistent_within_file");
 
-    let e2e_dir = Path::new("test-results/e2e");
+    let Some(e2e_dir) = selected_e2e_root() else {
+        tracker.complete();
+        return Ok(());
+    };
+    let expected_run_id = std::env::var("CASS_E2E_RUN_ID")?;
     if !e2e_dir.exists() {
         tracker.complete();
-        return;
+        return Ok(());
     }
 
     let phase_start = tracker.start("check_run_ids", Some("Check run_id consistency"));
     let mut errors = Vec::new();
 
-    for path in collect_jsonl_logs(e2e_dir) {
+    for path in collect_jsonl_logs(&e2e_dir) {
         let content = fs::read_to_string(&path).unwrap();
         let mut run_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1034,11 +1093,11 @@ fn jsonl_run_ids_consistent_within_file() {
             }
         }
 
-        // A single file should have at most one run_id (one run per file)
-        if run_ids.len() > 1 {
+        if run_ids.len() != 1 || !run_ids.contains(&expected_run_id) {
             errors.push(format!(
-                "{}: Multiple run_ids found: {:?}",
+                "{}: expected only run_id {:?}, found {:?}",
                 path.display(),
+                expected_run_id,
                 run_ids
             ));
         }
@@ -1049,15 +1108,14 @@ fn jsonl_run_ids_consistent_within_file() {
         phase_start,
     );
 
-    // Multiple run_ids per file is a warning, not necessarily an error.
-    // Some files may accumulate from multiple runs.
-    if !errors.is_empty() {
-        eprintln!(
-            "Warning: {} files have multiple run_ids (may be accumulated):\n{}",
-            errors.len(),
-            errors.join("\n")
-        );
-    }
+    // A selected immutable run must never mix run IDs within one file.
+    schema_test_require!(
+        errors.is_empty(),
+        "{} files do not carry the selected immutable run ID:\n{}",
+        errors.len(),
+        errors.join("\n")
+    );
 
     tracker.complete();
+    Ok(())
 }

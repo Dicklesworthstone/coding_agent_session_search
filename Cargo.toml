@@ -203,6 +203,11 @@ name = "cass-pages-perf-bundle"
 path = "src/bin/cass-pages-perf-bundle.rs"
 test = false
 
+[[bin]]
+name = "e2e-run-bundle"
+path = "src/bin/e2e-run-bundle.rs"
+test = false
+
 [profile.release]
 lto = true
 codegen-units = 1

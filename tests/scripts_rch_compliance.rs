@@ -358,6 +358,135 @@ fn scripts_rch_compliance_helper_module_exists() {
     );
 }
 
+fn missing_contract_token(path: &std::path::Path, required: &str) -> String {
+    format!(
+        "{} is missing strict run-bundle token {required:?}",
+        path.display()
+    )
+}
+
+#[test]
+fn e2e_acceptance_is_exact_worker_run_scoped_and_publish_last() -> Result<(), String> {
+    let canonical_path = project_root()
+        .join("scripts")
+        .join("e2e_logging_acceptance_test.sh");
+    let canonical = std::fs::read_to_string(&canonical_path)
+        .map_err(|error| format!("could not read {}: {error}", canonical_path.display()))?;
+    for required in [
+        "RCH_WORKER=\"$WORKER_ID\"",
+        "RCH_REQUIRE_REMOTE=1",
+        "RCH_NO_SELF_HEALING=1",
+        "--no-self-healing exec -- cargo",
+        "CASS_E2E_HANDOFF_TIMEOUT_SECONDS",
+        "ServerAliveInterval=15",
+        "timeout --signal=TERM --kill-after=10",
+        "--bin e2e-run-bundle",
+        "FINAL_RUN_ROOT=\"$E2E_RESULTS_ROOT/runs/$RUN_ID\"",
+        "\"$RCH_BIN\" --json workers list",
+        "\"$RCH_BIN\" --json workers discover",
+        "SSH_TARGET=\"$worker_user@$ssh_host\"",
+        "SSH_OPTIONS+=(-i \"$identity_file\")",
+        "expected one versioned runner receipt",
+        "e2e-run-started",
+        "e2e-run-finalized",
+        "Incomplete remote run retained for diagnosis",
+        "REMOTE_MANIFEST=$(jq -er '.manifest'",
+        "verify_bundle_locally",
+        "cass-e2e-command-v1",
+        "command SHA-256 does not match",
+        "bundle contains undeclared artifact",
+        "--concurrency-contract",
+        "contract-stale-",
+        "remote_stale_root",
+        "contradictory remote stale evidence was not durably staged",
+        "remote stale witness disappeared during concurrent exact-worker runs",
+        "worker_ssh",
+        "worker_rsync",
+        "parallel_cass_children_keep_corpus_and_trace_artifacts_isolated",
+        "rsync -a --protect-args",
+        "SOURCE_DIFF_SHA256",
+        "manifest.json",
+        "complete.json",
+    ] {
+        if !canonical.contains(required) {
+            return Err(missing_contract_token(&canonical_path, required));
+        }
+    }
+    if canonical.contains("archive_prior_logs") {
+        return Err(
+            "acceptance must preserve prior immutable bundles instead of moving process-global logs"
+                .to_string(),
+        );
+    }
+    if canonical.contains("REMOTE_BASE=")
+        || canonical.contains("ssh -o BatchMode=yes \"$WORKER_ID\"")
+    {
+        return Err(
+            "acceptance must resolve the exact SSH endpoint and emitted manifest from versioned RCH data"
+                .to_string(),
+        );
+    }
+    let final_blocking_gate = canonical
+        .find("# Step 6: Check metrics event coverage")
+        .ok_or_else(|| "missing final blocking gate marker".to_string())?;
+    let publish = canonical
+        .find("mv \"$TEST_RESULTS_DIR\" \"$FINAL_RUN_ROOT\"")
+        .ok_or_else(|| "missing publish move".to_string())?;
+    if publish <= final_blocking_gate {
+        return Err("run bundle was published before the aggregate acceptance gates".to_string());
+    }
+    let remote_stale_stage = canonical
+        .find("worker_rsync \"$stale_root/\"")
+        .ok_or_else(|| "remote stale witness is not transferred".to_string())?;
+    let left_contract_launch = canonical
+        .find("\"$SCRIPT_DIR/e2e_logging_acceptance_test.sh\"")
+        .ok_or_else(|| "concurrent contract child launch is missing".to_string())?;
+    let remote_stale_recheck = canonical
+        .find("remote stale witness disappeared during concurrent exact-worker runs")
+        .ok_or_else(|| "remote stale witness is not rechecked".to_string())?;
+    if remote_stale_stage >= left_contract_launch || remote_stale_recheck <= left_contract_launch {
+        return Err(
+            "remote stale evidence must exist before and survive both concurrent contract runs"
+                .to_string(),
+        );
+    }
+
+    let historical_path = project_root()
+        .join("scripts")
+        .join("e2e")
+        .join("e2e_logging_acceptance_test.sh");
+    let historical = std::fs::read_to_string(&historical_path)
+        .map_err(|error| format!("could not read {}: {error}", historical_path.display()))?;
+    let delegation = historical
+        .find("exec \"$PROJECT_ROOT/scripts/e2e_logging_acceptance_test.sh\" \"$@\"")
+        .ok_or_else(|| "historical entry point does not delegate".to_string())?;
+    let legacy_body = historical
+        .find("source \"$PROJECT_ROOT/scripts/lib/e2e_log.sh\"")
+        .ok_or_else(|| "historical body marker is missing".to_string())?;
+    if delegation >= legacy_body {
+        return Err(
+            "historical entry point can execute independently of the canonical contract"
+                .to_string(),
+        );
+    }
+    if historical.contains("archive_prior_logs") {
+        return Err(
+            "historical entry point retains a stale process-global archive path".to_string(),
+        );
+    }
+
+    let validator_path = project_root().join("scripts").join("validate-e2e-jsonl.sh");
+    let validator = std::fs::read_to_string(&validator_path)
+        .map_err(|error| format!("could not read {}: {error}", validator_path.display()))?;
+    if !validator.contains("CASS_E2E_RUN_ID")
+        || !validator.contains("test-results/e2e/runs/$CASS_E2E_RUN_ID")
+        || !validator.contains("No JSONL files found in selected run.")
+    {
+        return Err("no-argument validator discovery is not bound to one explicit run".to_string());
+    }
+    Ok(())
+}
+
 // ---------------- Synthetic-fixture tests for scanner correctness ----------------
 
 #[test]

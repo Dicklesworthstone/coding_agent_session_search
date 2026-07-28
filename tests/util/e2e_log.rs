@@ -588,7 +588,7 @@ impl E2eArtifactManifest {
 
 impl E2eArtifactPaths {
     pub fn prepare(suite: &str, test_name: &str, trace_id: &str) -> std::io::Result<Self> {
-        let dir = artifact_dir(suite, test_name);
+        let dir = artifact_dir(suite, test_name)?;
         fs::create_dir_all(&dir)?;
 
         let stdout_path = dir.join("stdout");
@@ -613,15 +613,46 @@ impl E2eArtifactPaths {
     }
 }
 
-fn artifact_dir(suite: &str, test_name: &str) -> PathBuf {
+const E2E_RUN_ID_ENV: &str = "CASS_E2E_RUN_ID";
+
+fn validated_external_run_id() -> std::io::Result<Option<String>> {
+    let Ok(run_id) = std::env::var(E2E_RUN_ID_ENV) else {
+        return Ok(None);
+    };
+    let valid = (8..=128).contains(&run_id.len())
+        && run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && run_id
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && run_id
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric);
+    if !valid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{E2E_RUN_ID_ENV} must be 8-128 ASCII alphanumeric, `_`, or `-` bytes"),
+        ));
+    }
+    Ok(Some(run_id))
+}
+
+fn e2e_output_root() -> std::io::Result<PathBuf> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    manifest_dir
-        .join("test-results")
-        .join("e2e")
-        .join(suite)
-        .join(test_name)
+    let root = manifest_dir.join("test-results").join("e2e");
+    Ok(match validated_external_run_id()? {
+        Some(run_id) => root.join("runs").join(run_id),
+        None => root,
+    })
+}
+
+fn artifact_dir(suite: &str, test_name: &str) -> std::io::Result<PathBuf> {
+    Ok(e2e_output_root()?.join(suite).join(test_name))
 }
 
 fn truncate_file(path: &Path) -> std::io::Result<()> {
@@ -672,12 +703,18 @@ impl E2eLogger {
     /// * `runner` - The runner type ("rust", "shell", or "playwright")
     ///
     /// # Returns
-    /// A new logger that writes to `test-results/e2e/{runner}_{timestamp}.jsonl`
+    /// A new logger that writes to the selected run root with a unique suffix.
     pub fn new(runner: &str) -> std::io::Result<Self> {
         let timestamp = Self::timestamp_id();
-        let run_id = format!("{}_{}", timestamp, Self::random_suffix());
+        let run_id = validated_external_run_id()?
+            .unwrap_or_else(|| format!("{}_{}", timestamp, Self::random_suffix()));
         let output_dir = Self::output_dir()?;
-        let output_path = output_dir.join(format!("{}_{}.jsonl", runner, timestamp));
+        let output_path = output_dir.join(format!(
+            "{}_{}_{}.jsonl",
+            runner,
+            timestamp,
+            Self::random_suffix()
+        ));
 
         let file = OpenOptions::new()
             .create(true)
@@ -697,7 +734,8 @@ impl E2eLogger {
     /// Create a logger with a specific output path (for testing).
     pub fn with_path(runner: &str, output_path: PathBuf) -> std::io::Result<Self> {
         let timestamp = Self::timestamp_id();
-        let run_id = format!("{}_{}", timestamp, Self::random_suffix());
+        let run_id = validated_external_run_id()?
+            .unwrap_or_else(|| format!("{}_{}", timestamp, Self::random_suffix()));
 
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)?;
@@ -1063,10 +1101,7 @@ impl E2eLogger {
     }
 
     fn output_dir() -> std::io::Result<PathBuf> {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let output_dir = manifest_dir.join("test-results").join("e2e");
+        let output_dir = e2e_output_root()?;
         fs::create_dir_all(&output_dir)?;
         Ok(output_dir)
     }

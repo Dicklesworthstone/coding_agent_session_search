@@ -19,6 +19,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RCH_BIN="${RCH_BIN:-rch}"
 
+# The repository-root entry point owns the single run-bundle contract. Keep this
+# historical path as an exact alias so the two paths cannot drift back into
+# independently globbing process-global evidence.
+exec "$PROJECT_ROOT/scripts/e2e_logging_acceptance_test.sh" "$@"
+
 # Source the E2E logging library
 # shellcheck disable=SC1091
 source "$PROJECT_ROOT/scripts/lib/e2e_log.sh"
@@ -54,39 +59,6 @@ run_cargo() {
         "$RCH_BIN" --no-self-healing exec -- cargo "$@"
 }
 
-archive_prior_logs() {
-    local run_id="$1"
-    local results_dir="$PROJECT_ROOT/test-results/e2e"
-    local archive_dir="$results_dir/.previous/$run_id"
-    local current_output
-    local moved=0
-
-    current_output="$(e2e_output_file)"
-    mkdir -p "$results_dir"
-    while IFS= read -r -d '' file; do
-        if [[ "$file" == "$current_output" ]]; then
-            continue
-        fi
-        local rel="${file#"$results_dir"/}"
-        local dest="$archive_dir/$rel"
-        if [[ -e "$dest" ]]; then
-            echo "  [FAIL] refusing to overwrite archived log: $dest"
-            exit 1
-        fi
-        mkdir -p "$(dirname "$dest")"
-        mv "$file" "$dest"
-        moved=$((moved + 1))
-    done < <(
-        find "$results_dir" \
-            -type f \( -name "*.jsonl" -o -name "cass.log" -o -name "acceptance_test_output_*.txt" \) \
-            ! -name "combined.jsonl" \
-            ! -path "$results_dir/.previous/*" \
-            -print0 2>/dev/null
-    )
-
-    echo "  Archived $moved existing log file(s) under $archive_dir"
-}
-
 check_pass() {
     local name="$1"
     ((TOTAL_CHECKS += 1))
@@ -110,8 +82,6 @@ PHASE_START=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
 
 echo ""
 echo "Step 1: Archiving previous results..."
-archive_prior_logs "$(e2e_run_id)"
-
 PHASE_END=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
 e2e_phase_end "archive" "$((PHASE_END - PHASE_START))"
 

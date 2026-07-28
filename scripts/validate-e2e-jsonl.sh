@@ -210,7 +210,7 @@ validate_file() {
             errors+=("$file: $trace_bytes bytes exceeds the 524288-byte E2E trace budget")
             file_valid=false
         fi
-        if [[ "$file" == *"test-results/e2e/e2e_semantic_search/"* ]]; then
+        if [[ "$file" == *"/e2e_semantic_search/"* ]]; then
             semantic_trace_bytes=$((semantic_trace_bytes + trace_bytes))
             semantic_trace_files=$((semantic_trace_files + 1))
         fi
@@ -314,24 +314,31 @@ main() {
     # Get files to validate
     local files=("$@")
     if [[ ${#files[@]} -eq 0 ]]; then
-        # Default: validate E2E event logs plus separately-versioned per-test traces.
-        if [[ -d "test-results/e2e" ]]; then
+        if [[ -z "${CASS_E2E_RUN_ID:-}" ]] \
+            || [[ ! "$CASS_E2E_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*[A-Za-z0-9]$ ]] \
+            || [[ ${#CASS_E2E_RUN_ID} -lt 8 || ${#CASS_E2E_RUN_ID} -gt 128 ]]; then
+            echo "Error: no-argument validation requires a valid CASS_E2E_RUN_ID"
+            echo "Pass explicit files or select one immutable run."
+            exit 2
+        fi
+        local run_root="test-results/e2e/runs/$CASS_E2E_RUN_ID"
+        # Default: validate only the selected run's event logs and traces.
+        if [[ -d "$run_root" ]]; then
             while IFS= read -r -d '' file; do
                 files+=("$file")
             done < <(
-                find test-results/e2e \
+                find "$run_root" \
                     -type f \( -name "*.jsonl" -o -name "cass.log" \) \
                     ! -name "combined.jsonl" \
-                    ! -path "test-results/e2e/.previous/*" \
                     -print0 | sort -z
             )
         fi
     fi
 
     if [[ ${#files[@]} -eq 0 ]]; then
-        echo "No JSONL files found to validate."
+        echo "No JSONL files found in selected run."
         echo "Usage: $0 [file.jsonl ...]"
-        exit 0
+        exit 1
     fi
 
     # Validate each file

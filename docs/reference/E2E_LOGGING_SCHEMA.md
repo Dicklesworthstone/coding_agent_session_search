@@ -4,23 +4,126 @@ Unified JSONL schema for all E2E test runs across Rust, Shell scripts, and Playw
 
 ## Overview
 
-All E2E test infrastructure emits structured JSONL logs to `test-results/e2e/`.
-Each line is a self-contained JSON object representing a single event.
+All acceptance evidence is scoped to one validated run ID under
+`test-results/e2e/runs/<run_id>/`. Each JSONL line is a self-contained event.
+No acceptance command searches the process-global results tree, and a stale
+file from another run can never satisfy the current run's gates.
 
 ## Output Files
 
-| Runner | Output File |
+| Runner | Run-scoped output |
 |--------|-------------|
-| Rust E2E tests | `test-results/e2e/rust_e2e_<timestamp>.jsonl` |
-| Shell scripts | `test-results/e2e/shell_<script>_<timestamp>.jsonl` |
-| Playwright | `test-results/e2e/playwright_<timestamp>.jsonl` |
+| Run executor | `test-results/e2e/runs/<run_id>/run.jsonl` |
+| Rust E2E tests | `test-results/e2e/runs/<run_id>/rust_<timestamp>_<nonce>.jsonl` or a per-test `cass.log` |
+| Shell scripts | `test-results/e2e/runs/<run_id>/shell_<script>_<timestamp>_<nonce>.jsonl` |
+| CLI traces | `test-results/e2e/runs/<run_id>/<suite>/<test>/trace.jsonl` |
+
+The external `CASS_E2E_RUN_ID` is accepted only when it is 8-128 ASCII
+alphanumeric, `_`, or `-` bytes, begins and ends alphanumerically, and names a
+previously absent directory. Without that variable, developer-focused tests
+retain their ordinary non-acceptance output paths.
+
+## Immutable strict-RCH run bundles
+
+`e2e-run-bundle` executes explicit Cargo test targets, captures bounded
+stdout/stderr, validates the selected run's JSONL, and writes:
+
+- `manifest.json`: source SHA and diff digest, exact worker ID and hostname,
+  complete Cargo command and command digest, timestamps, exit status, every
+  file's relative path/SHA-256/byte count/event count/schema, deterministic
+  aggregates, and named gate outcomes.
+- `complete.json`: a completion receipt binding the exact manifest bytes.
+
+Both control files are created without overwrite and fsynced. Verification
+walks the directory again and rejects missing or extra files, changed bytes,
+path traversal, symlinks, hard links, duplicate declarations, receipt
+tampering, source drift, worker drift, failed tests, failed schema validation,
+truncated command capture, empty artifacts, empty traces, or missing aggregate
+`run_start`, `test_start`, `test_end`, and `run_end` coverage.
+
+The repository acceptance entry point requires an explicit RCH worker and runs
+and finalizes the bundle on that same worker and source. It resolves that
+worker's SSH user and host from
+`rch --json workers list` and joins that exact host to the unique identity
+reported by `rch --json workers discover`; the opaque worker ID is never assumed
+to be an SSH alias. It takes the remote manifest path only from the runner's
+versioned JSON receipt rather than inferring a project directory from
+`remote_base` or searching for whichever artifact happens to exist. It copies
+exactly that named remote run into a fresh local staging directory. The
+committed acceptance script then independently recomputes the receipt, command
+digest, exact file set, regular-file/link policy, every file
+hash/size/event count/schema, aggregate counts, and event histogram without
+invoking local Cargo. It performs the remaining aggregate gates and only then
+publishes the run at
+`test-results/e2e/runs/<run_id>/`.
+Failed or incomplete staging directories are retained for diagnosis and cannot
+be mistaken for published passes.
+
+SSH discovery, probes, and rsync handoff are bounded by a validated
+`CASS_E2E_HANDOFF_TIMEOUT_SECONDS` value (900 seconds by default), an SSH
+connect timeout, and server-alive failure detection. A timeout is a failed
+handoff, never permission to inspect an older local bundle.
+
+The concurrency contract creates the same uniquely named contradictory stale
+witness locally and on the explicitly resolved worker before launching either
+child run. Both stale copies remain present after the two no-mock runs, while
+both independently verified reports and manifests prove they consumed neither
+copy. The test never deletes a previous local or remote witness.
+
+The runner emits one flushed `e2e-run-started` JSON receipt after creating its
+absent run directory, then one `e2e-run-finalized` receipt only after the
+manifest and completion receipt are durable. If execution fails between those
+points, the acceptance script uses only the validated started-receipt path to
+retrieve and retain the unfinalized directory; it never publishes it.
+
+Before execution, the worker independently recomputes `git rev-parse HEAD`, the
+binary diff digest excluding tracker-only `.beads` state, and the untracked path
+set. A caller-supplied SHA/diff mismatch or any unreceipted source path outside
+`.beads/` and `test-results/` fails before the test command begins.
+
+The command digest has a language-neutral framing so Rust and shell verification
+cannot accidentally hash different argument boundaries:
+
+```text
+cass-e2e-command-v1\n
+<argument-0-byte-count>:<argument-0>\n
+<argument-1-byte-count>:<argument-1>\n
+...
+```
+
+This verifier deliberately remains a small shell/jq/SHA-256 handoff rather
+than copying the remote debug runner: the application facade can make that
+binary enormous, while the run's raw evidence is small and bounded. Failed
+remote jobs therefore remain inspectable even when RCH does not perform its
+ordinary successful-build artifact retrieval.
+
+```bash
+RCH_WORKER=ovh-a ./scripts/e2e_logging_acceptance_test.sh
+
+# Prove two simultaneous no-mock semantic runs remain isolated from one another
+# and from retained contradictory stale runs on both the caller and worker.
+RCH_WORKER=ovh-a ./scripts/e2e_logging_acceptance_test.sh \
+  --concurrency-contract
+
+# Exercise one explicit target/filter while developing the bundle contract.
+RCH_WORKER=ovh-a ./scripts/e2e_logging_acceptance_test.sh \
+  --contract-only \
+  --contract-target e2e_semantic_search \
+  --contract-filter parallel_cass_children_keep_corpus_and_trace_artifacts_isolated
+
+# Re-verify one already-published immutable run; current checkout drift is not
+# substituted for the provenance sealed in that run.
+./scripts/e2e_logging_acceptance_test.sh \
+  --quick \
+  --run-id acceptance-20260728T120000Z-a1b2c3
+```
 
 ### Per-test CLI trace artifacts
 
 Rust E2E tests that use `PhaseTracker::trace_env_guard()` also route child
 `cass` processes to:
 
-`test-results/e2e/<suite>/<test>/trace.jsonl`
+`test-results/e2e/runs/<run_id>/<suite>/<test>/trace.jsonl`
 
 This file is valid JSONL. It is a CLI diagnostic stream rather than an E2E
 runner-event stream, so every record has the tracing envelope
@@ -123,17 +226,14 @@ paths, emails, and hostnames are redacted. Arguments, correlation values, and
 error text are length-bounded; if the detailed summary cannot fit its reserved
 tail, a compact `summary_truncated=true` outcome record is written instead.
 
-Both E2E logging acceptance entry points enumerate every `tests/e2e_*.rs`
-target explicitly and execute Cargo through fail-closed remote compilation.
-They validate only artifacts actually present in the checkout; because RCH does
-not currently retrieve arbitrary `test-results/e2e/**` output, a remote full
-run without an explicit artifact handoff fails the local nonempty-artifact gate
-instead of accepting stale evidence. Run-scoped exact-worker transfer and
-manifest verification are tracked by
-`coding_agent_session_search-k13gt`. Reports include trace files, bytes, events,
-target histograms, receipts, and command outcomes. A failed test target,
-malformed line, missing command outcome, empty full-run trace set, per-test
-overflow, or semantic aggregate overflow makes acceptance fail.
+Both E2E logging acceptance paths execute the same canonical run-bundle entry
+point. Reports live outside the immutable bytes under
+`test-results/e2e/reports/<run_id>.txt` and include source/worker/command
+identity, manifest and receipt hashes, trace files/bytes/events, target
+histograms, receipts, command outcomes, and every manifest gate. A failed test
+target, malformed line, missing command outcome, incomplete event lifecycle,
+empty full-run trace set, per-test overflow, semantic aggregate overflow,
+handoff ambiguity, or digest mismatch makes acceptance fail.
 
 ## Common Fields (All Events)
 
@@ -351,13 +451,16 @@ The `scripts/tests/run_all.sh` runner (P6.14j) aggregates all JSONL files:
 
 ```bash
 # Count failures
-jq -s '[.[] | select(.event == "test_end" and .result.status == "fail")] | length' test-results/e2e/*.jsonl
+find test-results/e2e/runs/<run_id> -type f -name '*.jsonl' \
+  -exec jq -s '[.[] | select(.event == "test_end" and .result.status == "fail")] | length' {} +
 
 # Get failed test names
-jq -r 'select(.event == "test_end" and .result.status == "fail") | .test.name' test-results/e2e/*.jsonl
+find test-results/e2e/runs/<run_id> -type f -name '*.jsonl' \
+  -exec jq -r 'select(.event == "test_end" and .result.status == "fail") | .test.name' {} +
 
 # Total duration by runner
-jq -s 'group_by(.runner) | map({runner: .[0].runner, total_ms: [.[] | select(.event == "run_end") | .summary.duration_ms] | add})' test-results/e2e/*.jsonl
+find test-results/e2e/runs/<run_id> -type f -name '*.jsonl' \
+  -exec jq -s 'group_by(.runner) | map({runner: .[0].runner, total_ms: [.[] | select(.event == "run_end") | .summary.duration_ms] | add})' {} +
 ```
 
 ## Backward Compatibility

@@ -49,6 +49,15 @@ _e2e_random_suffix() {
     printf '%06x' $((RANDOM * RANDOM % 16777216))
 }
 
+_e2e_validate_run_id() {
+    local run_id="$1"
+    if [[ ${#run_id} -lt 8 || ${#run_id} -gt 128 ]] \
+        || [[ ! "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*[A-Za-z0-9]$ ]]; then
+        echo "Error: CASS_E2E_RUN_ID must be 8-128 ASCII alphanumeric, '_' or '-' bytes" >&2
+        return 2
+    fi
+}
+
 _e2e_json_escape() {
     # Escape a string for JSON
     local s="$1"
@@ -142,9 +151,15 @@ e2e_init() {
     E2E_RUNNER="$runner"
     E2E_SCRIPT_NAME="$script_name"
 
-    local timestamp_id
+    local timestamp_id random_suffix
     timestamp_id=$(_e2e_timestamp_id)
-    E2E_RUN_ID="${timestamp_id}_$(_e2e_random_suffix)"
+    random_suffix=$(_e2e_random_suffix)
+    if [[ -n "${CASS_E2E_RUN_ID:-}" ]]; then
+        _e2e_validate_run_id "$CASS_E2E_RUN_ID" || return
+        E2E_RUN_ID="$CASS_E2E_RUN_ID"
+    else
+        E2E_RUN_ID="${timestamp_id}_${random_suffix}"
+    fi
 
     # Determine output directory (relative to project root)
     local script_dir
@@ -153,9 +168,12 @@ e2e_init() {
     project_root="$(cd "$script_dir/../.." && pwd)"
 
     E2E_OUTPUT_DIR="${project_root}/test-results/e2e"
+    if [[ -n "${CASS_E2E_RUN_ID:-}" ]]; then
+        E2E_OUTPUT_DIR="${E2E_OUTPUT_DIR}/runs/${E2E_RUN_ID}"
+    fi
     mkdir -p "$E2E_OUTPUT_DIR"
 
-    E2E_OUTPUT_FILE="${E2E_OUTPUT_DIR}/${runner}_${script_name}_${timestamp_id}.jsonl"
+    E2E_OUTPUT_FILE="${E2E_OUTPUT_DIR}/${runner}_${script_name}_${timestamp_id}_${random_suffix}.jsonl"
     E2E_START_TIME=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
 
     if [[ -n "${E2E_VERBOSE:-}" ]]; then
