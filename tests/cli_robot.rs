@@ -395,7 +395,14 @@ fn capabilities_are_self_describing_for_agents() {
     );
 
     let env_vars = json["env_vars"].as_array().expect("env_vars array");
-    for expected in ["CASS_DATA_DIR", "CASS_OUTPUT_FORMAT", "CASS_TRACE_FILE"] {
+    for expected in [
+        "CASS_DATA_DIR",
+        "CASS_OUTPUT_FORMAT",
+        "CASS_TRACE_FILE",
+        "CASS_TRACE_FILTER",
+        "CASS_TRACE_MAX_BYTES",
+        "CASS_TRACE_MAX_EVENTS",
+    ] {
         assert!(
             env_vars.iter().any(|env_var| env_var["name"] == expected),
             "capabilities should include env var {expected}"
@@ -1701,15 +1708,37 @@ fn state_matches_status() -> Result<(), Box<dyn Error>> {
     let state_out = state.assert().success().get_output().clone();
     let state_json: Value = serde_json::from_slice(&state_out.stdout).expect("valid state json");
 
-    // Core assertion: status and state report the same health
-    assert_eq!(status_json["healthy"], state_json["healthy"]);
+    let status_healthy = status_json.pointer("/healthy").ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "status response missing /healthy")
+    })?;
+    let state_healthy = state_json.pointer("/healthy").ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "state response missing /healthy")
+    })?;
+    let status_pending_sessions = status_json.pointer("/pending/sessions").ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "status response missing /pending/sessions",
+        )
+    })?;
+    let state_pending_sessions = state_json.pointer("/pending/sessions").ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "state response missing /pending/sessions",
+        )
+    })?;
+    let status_semantic = status_json.pointer("/semantic").ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "status response missing /semantic")
+    })?;
+    let state_semantic = state_json.pointer("/semantic").ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "state response missing /semantic")
+    })?;
+
+    // Core assertion: status and state report the same health.
+    assert_eq!(status_healthy, state_healthy);
     // Pending sessions should match between the two commands, regardless of the
     // rebuild/watch state observed in the fixture dataset.
-    assert_eq!(
-        status_json["pending"]["sessions"],
-        state_json["pending"]["sessions"]
-    );
-    assert_eq!(status_json["semantic"], state_json["semantic"]);
+    assert_eq!(status_pending_sessions, state_pending_sessions);
+    assert_eq!(status_semantic, state_semantic);
     Ok(())
 }
 
@@ -2389,9 +2418,14 @@ fn search_error_writes_trace() {
     let trace = fs::read_to_string(&trace_path).expect("trace file exists");
     let last_line = trace.lines().last().expect("trace line present");
     let json: Value = serde_json::from_str(last_line).expect("valid trace json");
-    let exit_code = json["exit_code"].as_i64().expect("exit_code present");
-    assert_eq!(exit_code, code as i64);
-    assert_eq!(json["contract_version"], "1");
+    let exit_code = json["fields"]["exit_code"]
+        .as_i64()
+        .expect("exit_code present");
+    assert_eq!(
+        (json["schema_version"].as_str(), exit_code),
+        (Some("cass-trace-v1"), code as i64)
+    );
+    assert_eq!(json["fields"]["contract_version"], "1");
 }
 
 // ============================================================
@@ -2698,10 +2732,14 @@ fn search_writes_trace_on_success() {
     let last_line = trace.lines().last().expect("trace has lines");
     let json: Value = serde_json::from_str(last_line).expect("valid trace JSON");
     assert_eq!(
-        json["exit_code"], 0,
+        (
+            json["schema_version"].as_str(),
+            json["fields"]["exit_code"].as_i64()
+        ),
+        (Some("cass-trace-v1"), Some(0)),
         "Successful search should have exit_code 0"
     );
-    assert_eq!(json["contract_version"], "1");
+    assert_eq!(json["fields"]["contract_version"], "1");
 }
 
 #[test]
@@ -6341,18 +6379,25 @@ fn trace_includes_contract_fields_on_success() {
     let json: Value = serde_json::from_str(last_line).expect("valid trace JSON");
 
     // Required contract fields
-    assert_eq!(json["exit_code"], 0, "exit_code should be 0 for success");
     assert_eq!(
-        json["contract_version"], "1",
+        (
+            json["schema_version"].as_str(),
+            json["fields"]["exit_code"].as_i64()
+        ),
+        (Some("cass-trace-v1"), Some(0)),
+        "exit_code should be 0 for success"
+    );
+    assert_eq!(
+        json["fields"]["contract_version"], "1",
         "contract_version should be 1"
     );
     // Trace uses start_ts and end_ts for timestamps
     assert!(
-        json["start_ts"].is_string() || json["end_ts"].is_string(),
+        json["fields"]["start_ts"].is_string() || json["fields"]["end_ts"].is_string(),
         "timestamp (start_ts/end_ts) should be present"
     );
     assert!(
-        json["duration_ms"].is_number(),
+        json["fields"]["duration_ms"].is_number(),
         "duration_ms should be present"
     );
 }
@@ -6381,9 +6426,15 @@ fn trace_includes_error_on_failure() {
     let json: Value = serde_json::from_str(last_line).expect("valid trace JSON");
 
     // Error case should have non-zero exit code
-    let exit_code = json["exit_code"].as_i64().expect("exit_code");
+    let exit_code = json["fields"]["exit_code"].as_i64().expect("exit_code");
     assert_ne!(exit_code, 0, "exit_code should be non-zero for failure");
-    assert_eq!(json["contract_version"], "1");
+    assert_eq!(
+        (
+            json["schema_version"].as_str(),
+            json["fields"]["contract_version"].as_str()
+        ),
+        (Some("cass-trace-v1"), Some("1"))
+    );
 }
 
 // =============================================================================
@@ -7452,12 +7503,12 @@ fn search_with_intact_db_but_wiped_lexical_degrades_with_truthful_warning() {
         "stdout must not be empty in degraded mode; warning belongs on stderr. \
          stderr: {stderr}"
     );
-    let _: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
-        panic!(
-            "stdout must be valid JSON in degraded mode; got parse error {err}; \
-             stdout: {stdout}"
-        )
-    });
+    let parse_error = serde_json::from_str::<Value>(stdout.trim()).err();
+    assert!(
+        parse_error.is_none(),
+        "stdout must be valid JSON in degraded mode; got parse error {parse_error:?}; \
+         stdout: {stdout}"
+    );
 }
 
 // ========================================================================

@@ -84,11 +84,11 @@ use frankensqlite::compat::{
 use indexer::IndexOptions;
 use model::cli_error_kind::ErrorKind as CliErrorKind;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::OpenOptions;
-use std::io::{self, IsTerminal, Read, Write};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -20190,16 +20190,879 @@ fn build_robot_aware_log_filter(robot_mode: bool, verbose: bool, quiet: bool) ->
     }
 }
 
-/// Tracing directive for the explicit `--trace-file` surface
-/// (coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.5).
+/// Default filter for the explicit `--trace-file` surface.
 ///
-/// When an operator opts into `--trace-file`, dependency-level diagnostics
-/// (frankensqlite / frankensearch / asupersync, etc.) are captured at `debug`
-/// into that file as a deliberate trace artifact, while the stderr layer stays
-/// pinned to its robot-aware level so machine output is never corrupted. This is
-/// the "explicit trace surface" the bead requires: deep logs are available on
-/// demand, never by default.
-const TRACE_FILE_LOG_DIRECTIVE: &str = "debug";
+/// CASS-owned targets retain DEBUG detail. Dependencies retain every WARN/ERROR
+/// event, but their DEBUG/INFO chatter is excluded by default. The redaction
+/// memo target is also pinned to WARN because trace serialization itself invokes
+/// redaction; retaining its routine hit/miss DEBUG events would amplify the
+/// artifact with diagnostics about producing diagnostics. Memo invalidation and
+/// quarantine warnings remain visible.
+const DEFAULT_TRACE_FILE_LOG_DIRECTIVE: &str =
+    "warn,coding_agent_search=debug,cass=debug,cass::redact::memo=warn";
+
+/// Default hard ceiling for one trace artifact. Operators may lower or raise it
+/// with `CASS_TRACE_MAX_BYTES`; values are clamped to a safe 4 KiB..1 GiB range.
+const TRACE_SCHEMA_VERSION: &str = "cass-trace-v1";
+const DEFAULT_TRACE_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const MIN_TRACE_FILE_MAX_BYTES: u64 = 4 * 1024;
+const MAX_TRACE_FILE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_TRACE_FILE_MAX_EVENTS: u64 = 50_000;
+const MIN_TRACE_FILE_MAX_EVENTS: u64 = 16;
+const MAX_TRACE_FILE_MAX_EVENTS: u64 = 10_000_000;
+const TRACE_SUMMARY_RESERVE_MAX_BYTES: u64 = 64 * 1024;
+const TRACE_TRUNCATION_RESERVE_MAX_BYTES: u64 = 8 * 1024;
+const TRACE_FAILURE_TAIL_RESERVE_MAX_BYTES: u64 = 32 * 1024;
+const TRACE_EVENT_BUFFER_MAX_BYTES: usize = 256 * 1024;
+const TRACE_FILTER_TARGET_LIMIT: usize = 8;
+const TRACE_CORRELATION_MAX_CHARS: usize = 256;
+const TRACE_SUMMARY_ARG_LIMIT: usize = 16;
+const TRACE_SUMMARY_ARG_MAX_CHARS: usize = 256;
+const TRACE_SUMMARY_ERROR_MAX_CHARS: usize = 1024;
+const TRACE_RECEIPT_TARGET_MAX_CHARS: usize = 128;
+
+fn trace_file_log_filter_override() -> Option<EnvFilter> {
+    let directive = dotenvy::var("CASS_TRACE_FILTER").ok()?;
+    let directive = directive.trim();
+    if directive.is_empty() || directive.eq(DEFAULT_TRACE_FILE_LOG_DIRECTIVE) {
+        return None;
+    }
+    match EnvFilter::try_new(directive) {
+        Ok(filter) => Some(filter),
+        Err(error) => {
+            eprintln!("invalid CASS_TRACE_FILTER; using the bounded default policy: {error}");
+            None
+        }
+    }
+}
+
+fn trace_file_max_bytes() -> u64 {
+    dotenvy::var("CASS_TRACE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(MIN_TRACE_FILE_MAX_BYTES, MAX_TRACE_FILE_MAX_BYTES))
+        .unwrap_or(DEFAULT_TRACE_FILE_MAX_BYTES)
+}
+
+fn trace_file_max_events() -> u64 {
+    dotenvy::var("CASS_TRACE_MAX_EVENTS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(MIN_TRACE_FILE_MAX_EVENTS, MAX_TRACE_FILE_MAX_EVENTS))
+        .unwrap_or(DEFAULT_TRACE_FILE_MAX_EVENTS)
+}
+
+fn trace_target_is_cass_owned(target: &str) -> bool {
+    target.eq("cass")
+        || target.starts_with("cass::")
+        || target.eq("coding_agent_search")
+        || target.starts_with("coding_agent_search::")
+}
+
+fn default_trace_metadata_enabled(metadata: &tracing::Metadata<'_>) -> bool {
+    if metadata.target().eq("cass::redact::memo") {
+        return matches!(
+            *metadata.level(),
+            tracing::Level::ERROR | tracing::Level::WARN
+        );
+    }
+    matches!(
+        *metadata.level(),
+        tracing::Level::ERROR | tracing::Level::WARN
+    ) || (trace_target_is_cass_owned(metadata.target())
+        && matches!(
+            *metadata.level(),
+            tracing::Level::INFO | tracing::Level::DEBUG
+        ))
+}
+
+fn trace_field_is_sensitive(field: &str) -> bool {
+    let normalized = field.to_ascii_lowercase().replace('-', "_");
+    matches!(
+        normalized.as_str(),
+        "password"
+            | "passwd"
+            | "secret"
+            | "client_secret"
+            | "token"
+            | "access_token"
+            | "refresh_token"
+            | "api_key"
+            | "apikey"
+            | "authorization"
+            | "credential"
+            | "credentials"
+            | "cookie"
+            | "set_cookie"
+            | "private_key"
+    ) || normalized.ends_with("_password")
+        || normalized.ends_with("_secret")
+        || normalized.ends_with("_token")
+        || normalized.ends_with("_api_key")
+        || normalized.ends_with("_credential")
+}
+
+static TRACE_REDACTION_ENGINE: once_cell::sync::Lazy<crate::pages::redact::RedactionEngine> =
+    once_cell::sync::Lazy::new(|| {
+        crate::pages::redact::RedactionEngine::new(
+            crate::pages::redact::swarm_evidence_redaction_config(),
+        )
+    });
+
+fn redact_trace_text(text: &str) -> String {
+    let secret_redacted = crate::indexer::redact_secrets::redact_text(text).into_owned();
+    TRACE_REDACTION_ENGINE.redact_text(&secret_redacted).output
+}
+
+fn truncate_trace_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        truncated.push_str("...[TRUNCATED]");
+    }
+    truncated
+}
+
+fn redact_bounded_trace_text(text: &str, max_chars: usize) -> String {
+    truncate_trace_text(&redact_trace_text(text), max_chars)
+}
+
+fn enrich_trace_json(value: &serde_json::Value) -> serde_json::Value {
+    let mut enriched = value.clone();
+    if let Some(root) = enriched.as_object_mut() {
+        root.entry("schema_version")
+            .or_insert_with(|| serde_json::Value::String(TRACE_SCHEMA_VERSION.to_string()));
+        root.entry("trace_id").or_insert_with(|| {
+            dotenvy::var("CASS_TRACE_ID")
+                .map(|value| {
+                    serde_json::Value::String(redact_bounded_trace_text(
+                        &value,
+                        TRACE_CORRELATION_MAX_CHARS,
+                    ))
+                })
+                .unwrap_or(serde_json::Value::Null)
+        });
+        root.entry("test_id").or_insert_with(|| {
+            dotenvy::var("CASS_TRACE_TEST_ID")
+                .map(|value| {
+                    serde_json::Value::String(redact_bounded_trace_text(
+                        &value,
+                        TRACE_CORRELATION_MAX_CHARS,
+                    ))
+                })
+                .unwrap_or(serde_json::Value::Null)
+        });
+        if let Some(fields) = root
+            .get_mut("fields")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            let has_event_identity = ["event", "message"].into_iter().any(|field| {
+                fields
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            });
+            if !has_event_identity {
+                fields.insert(
+                    "event".to_string(),
+                    serde_json::Value::String("diagnostic".to_string()),
+                );
+            }
+        }
+    }
+    enriched
+}
+
+fn redact_trace_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(redact_trace_text(text)),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(redact_trace_json).collect())
+        }
+        serde_json::Value::Object(fields) => {
+            let mut redacted = serde_json::Map::with_capacity(fields.len());
+            for (field, value) in fields {
+                let sanitized_trace_value = if trace_field_is_sensitive(field) {
+                    serde_json::Value::String("[REDACTED]".to_string())
+                } else {
+                    redact_trace_json(value)
+                };
+                let field = redact_trace_text(field);
+                redacted.insert(field, sanitized_trace_value);
+            }
+            serde_json::Value::Object(redacted)
+        }
+        other => other.clone(),
+    }
+}
+
+fn redact_trace_args(args: &[String]) -> Vec<String> {
+    let retained = args.len().min(TRACE_SUMMARY_ARG_LIMIT);
+    let mut redacted = Vec::with_capacity(retained.saturating_add(1));
+    let mut redact_next = false;
+
+    for arg in args.iter().take(TRACE_SUMMARY_ARG_LIMIT) {
+        if redact_next {
+            redacted.push("[REDACTED]".to_string());
+            redact_next = false;
+            continue;
+        }
+
+        if let Some((flag, _value)) = arg.split_once('=')
+            && flag.starts_with('-')
+            && trace_field_is_sensitive(flag.trim_start_matches('-'))
+        {
+            redacted.push(truncate_trace_text(
+                &format!("{flag}=[REDACTED]"),
+                TRACE_SUMMARY_ARG_MAX_CHARS,
+            ));
+            continue;
+        }
+
+        if arg.starts_with('-') && trace_field_is_sensitive(arg.trim_start_matches('-')) {
+            redacted.push(truncate_trace_text(arg, TRACE_SUMMARY_ARG_MAX_CHARS));
+            redact_next = true;
+            continue;
+        }
+
+        redacted.push(truncate_trace_text(
+            &redact_trace_text(arg),
+            TRACE_SUMMARY_ARG_MAX_CHARS,
+        ));
+    }
+
+    if args.len() > retained {
+        redacted.push(format!(
+            "[{} ARGUMENTS OMITTED]",
+            args.len().saturating_sub(retained)
+        ));
+    }
+
+    redacted
+}
+
+fn trace_json_has_valid_envelope(value: &serde_json::Value) -> bool {
+    value.is_object()
+        && value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|schema| schema.eq(TRACE_SCHEMA_VERSION))
+        && value["timestamp"].as_str().is_some_and(|timestamp| {
+            !timestamp.is_empty() && chrono::DateTime::parse_from_rfc3339(timestamp).is_ok()
+        })
+        && value["level"]
+            .as_str()
+            .is_some_and(|level| !level.is_empty())
+        && value["target"]
+            .as_str()
+            .is_some_and(|target| !target.is_empty())
+        && value.get("trace_id").is_some()
+        && value.get("test_id").is_some()
+        && value["fields"].as_object().is_some_and(|fields| {
+            ["event", "message"].into_iter().any(|field| {
+                fields
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|identity| !identity.is_empty())
+            })
+        })
+}
+
+fn encode_trace_line(value: &serde_json::Value) -> io::Result<Vec<u8>> {
+    let enriched = enrich_trace_json(value);
+    let redacted = redact_trace_json(&enriched);
+    let mut encoded = serde_json::to_vec(&redacted).map_err(io::Error::other)?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn trace_summary_reserve(max_bytes: u64) -> u64 {
+    TRACE_SUMMARY_RESERVE_MAX_BYTES.min(max_bytes / 4)
+}
+
+fn trace_truncation_reserve(max_bytes: u64) -> u64 {
+    TRACE_TRUNCATION_RESERVE_MAX_BYTES.min(max_bytes / 4)
+}
+
+fn trace_failure_tail_reserve(max_bytes: u64) -> u64 {
+    TRACE_FAILURE_TAIL_RESERVE_MAX_BYTES.min(max_bytes / 8)
+}
+
+fn open_trace_append_file(path: &Path, max_bytes: u64) -> io::Result<(File, u64, u64, bool)> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
+    fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("trace artifact already has an active writer: {error}"),
+        )
+    })?;
+    let mut bytes_written = file.metadata()?.len();
+    let mut events_written = 0_u64;
+    let mut diagnostic_head_closed = false;
+
+    if bytes_written > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "existing trace is {bytes_written} bytes, exceeding the configured {max_bytes}-byte ceiling"
+            ),
+        ));
+    }
+
+    if bytes_written > 0 {
+        file.seek(SeekFrom::Start(0))?;
+        {
+            let mut reader = BufReader::new(&mut file);
+            let mut line = Vec::new();
+            let mut line_number = 0_u64;
+            loop {
+                line.clear();
+                if reader.read_until(b'\n', &mut line)?.eq(&0) {
+                    break;
+                }
+                line_number = line_number.saturating_add(1);
+                let record = line.strip_suffix(b"\n").unwrap_or(&line);
+                let record = record.strip_suffix(b"\r").unwrap_or(record);
+                if record.is_empty() {
+                    continue;
+                }
+                let value =
+                    serde_json::from_slice::<serde_json::Value>(record).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("existing trace line {line_number} is not valid JSON: {error}"),
+                        )
+                    })?;
+                if !trace_json_has_valid_envelope(&value) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "existing trace line {line_number} is not a valid {TRACE_SCHEMA_VERSION} envelope"
+                        ),
+                    ));
+                }
+                let event = value["fields"]["event"].as_str();
+                if matches!(event, Some("trace_truncated")) {
+                    diagnostic_head_closed = true;
+                }
+                if !matches!(
+                    event,
+                    Some("command_summary" | "trace_filter_summary" | "trace_truncated")
+                ) {
+                    events_written = events_written.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    if bytes_written > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)?;
+        if !last.first().is_some_and(|byte| byte.eq(&b'\n')) {
+            if bytes_written >= max_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "existing trace is a valid JSON record but lacks its final newline and already consumes the configured {max_bytes}-byte ceiling"
+                    ),
+                ));
+            }
+            file.write_all(b"\n")?;
+            bytes_written += 1;
+        }
+    }
+
+    Ok((file, bytes_written, events_written, diagnostic_head_closed))
+}
+
+struct BoundedTraceState {
+    file: File,
+    max_bytes: u64,
+    max_events: u64,
+    bytes_written: u64,
+    events_written: u64,
+    diagnostic_head_closed: bool,
+    suppressed_events: u64,
+    suppressed_bytes: u64,
+    byte_budget_suppressed_events: u64,
+    event_budget_suppressed_events: u64,
+    oversize_suppressed_events: u64,
+    filtered_events: u64,
+    filtered_by_target: BTreeMap<String, u64>,
+    suppressed_by_target: BTreeMap<String, u64>,
+    failure_tail: VecDeque<(serde_json::Value, u64)>,
+    failure_tail_bytes: u64,
+    failure_tail_dropped_events: u64,
+    finalized: bool,
+    last_error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum TraceSuppressionReason {
+    ByteBudget,
+    EventBudget,
+    OversizeEvent,
+}
+
+fn increment_trace_target_count(counts: &mut BTreeMap<String, u64>, target: &str) {
+    if let Some(count) = counts.get_mut(target) {
+        *count = count.saturating_add(1);
+    } else {
+        counts.insert(target.to_string(), 1);
+    }
+}
+
+fn trace_receipt_target_limit(max_bytes: u64) -> usize {
+    if max_bytes < 16 * 1024 {
+        2
+    } else {
+        TRACE_FILTER_TARGET_LIMIT
+    }
+}
+
+fn ranked_trace_targets(
+    counts: &BTreeMap<String, u64>,
+    limit: usize,
+) -> (Vec<serde_json::Value>, u64) {
+    let mut ranked = counts
+        .iter()
+        .map(|(target, count)| (target.as_str(), *count))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    let overflow_events = ranked
+        .iter()
+        .skip(limit)
+        .fold(0_u64, |total, (_, count)| total.saturating_add(*count));
+    ranked.truncate(limit);
+    let targets = ranked
+        .into_iter()
+        .map(|(target, count)| {
+            serde_json::json!({
+                "target": truncate_trace_text(target, TRACE_RECEIPT_TARGET_MAX_CHARS),
+                "count": count,
+            })
+        })
+        .collect();
+    (targets, overflow_events)
+}
+
+impl BoundedTraceState {
+    fn diagnostic_limit(&self) -> u64 {
+        self.max_bytes
+            .saturating_sub(trace_summary_reserve(self.max_bytes))
+            .saturating_sub(trace_truncation_reserve(self.max_bytes))
+            .saturating_sub(trace_failure_tail_reserve(self.max_bytes))
+    }
+
+    fn failure_tail_limit(&self) -> u64 {
+        self.max_bytes
+            .saturating_sub(trace_summary_reserve(self.max_bytes))
+            .saturating_sub(trace_truncation_reserve(self.max_bytes))
+    }
+
+    fn receipt_limit(&self) -> u64 {
+        self.max_bytes
+            .saturating_sub(trace_summary_reserve(self.max_bytes))
+    }
+
+    fn record_suppressed(&mut self, target: &str, bytes: u64, reason: TraceSuppressionReason) {
+        self.suppressed_events = self.suppressed_events.saturating_add(1);
+        self.suppressed_bytes = self.suppressed_bytes.saturating_add(bytes);
+        let reason_count = match reason {
+            TraceSuppressionReason::ByteBudget => &mut self.byte_budget_suppressed_events,
+            TraceSuppressionReason::EventBudget => &mut self.event_budget_suppressed_events,
+            TraceSuppressionReason::OversizeEvent => &mut self.oversize_suppressed_events,
+        };
+        *reason_count = reason_count.saturating_add(1);
+        increment_trace_target_count(&mut self.suppressed_by_target, target);
+    }
+
+    fn record_filtered(&mut self, target: &str) {
+        self.filtered_events = self.filtered_events.saturating_add(1);
+        increment_trace_target_count(&mut self.filtered_by_target, target);
+    }
+
+    fn record_failure_tail(&mut self, value: &serde_json::Value) {
+        let reserve = trace_failure_tail_reserve(self.max_bytes);
+        if reserve.eq(&0) {
+            self.failure_tail_dropped_events = self.failure_tail_dropped_events.saturating_add(1);
+            return;
+        }
+
+        let value = redact_trace_json(&enrich_trace_json(value));
+        let encoded_len = serde_json::to_vec(&value)
+            .map(|encoded| u64::try_from(encoded.len() + 1).unwrap_or(u64::MAX))
+            .unwrap_or(u64::MAX);
+        if encoded_len > reserve {
+            self.failure_tail_dropped_events = self.failure_tail_dropped_events.saturating_add(1);
+            return;
+        }
+        while self.failure_tail_bytes.saturating_add(encoded_len) > reserve {
+            let Some((_discarded, discarded_len)) = self.failure_tail.pop_front() else {
+                break;
+            };
+            self.failure_tail_bytes = self.failure_tail_bytes.saturating_sub(discarded_len);
+            self.failure_tail_dropped_events = self.failure_tail_dropped_events.saturating_add(1);
+        }
+        self.failure_tail.push_back((value, encoded_len));
+        self.failure_tail_bytes = self.failure_tail_bytes.saturating_add(encoded_len);
+    }
+
+    fn write_line_with_limit(&mut self, value: &serde_json::Value, limit: u64) -> io::Result<bool> {
+        let encoded = encode_trace_line(value)?;
+        self.write_encoded_line_with_limit(&encoded, limit)
+    }
+
+    fn write_encoded_line_with_limit(&mut self, encoded: &[u8], limit: u64) -> io::Result<bool> {
+        let encoded_len = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+        if self.bytes_written.saturating_add(encoded_len) > limit {
+            return Ok(false);
+        }
+        self.file.write_all(encoded)?;
+        self.bytes_written = self.bytes_written.saturating_add(encoded_len);
+        Ok(true)
+    }
+
+    fn write_event(&mut self, bytes: &[u8], overflow_bytes: u64) -> io::Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        if overflow_bytes > 0 {
+            self.record_suppressed(
+                "oversize_event",
+                u64::try_from(bytes.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(overflow_bytes),
+                TraceSuppressionReason::OversizeEvent,
+            );
+            return Ok(());
+        }
+
+        let trimmed = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+        let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+
+        let value = serde_json::from_slice::<serde_json::Value>(trimmed).unwrap_or_else(|error| {
+            serde_json::json!({
+                "timestamp": Utc::now().to_rfc3339(),
+                "level": "ERROR",
+                "target": "cass::trace",
+                "fields": {
+                    "event": "trace_format_error",
+                    "message": error.to_string(),
+                },
+            })
+        });
+        let trace_target_name = value
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let is_failure_context = value
+            .get("level")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|level| matches!(level, "WARN" | "ERROR"));
+        let encoded = encode_trace_line(&value)?;
+        let encoded_len = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+        if self.events_written >= self.max_events {
+            self.diagnostic_head_closed = true;
+            self.record_suppressed(
+                trace_target_name,
+                encoded_len,
+                TraceSuppressionReason::EventBudget,
+            );
+            if is_failure_context {
+                self.record_failure_tail(&value);
+            }
+        } else if self.diagnostic_head_closed {
+            self.record_suppressed(
+                trace_target_name,
+                encoded_len,
+                TraceSuppressionReason::ByteBudget,
+            );
+            if is_failure_context {
+                self.record_failure_tail(&value);
+            }
+        } else if self.write_encoded_line_with_limit(&encoded, self.diagnostic_limit())? {
+            self.events_written = self.events_written.saturating_add(1);
+        } else {
+            self.diagnostic_head_closed = true;
+            self.record_suppressed(
+                trace_target_name,
+                encoded_len,
+                TraceSuppressionReason::ByteBudget,
+            );
+            if is_failure_context {
+                self.record_failure_tail(&value);
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> io::Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+
+        let mut failure_tail_written_events = 0_u64;
+        let mut failure_tail_written_bytes = 0_u64;
+        let mut tail_result = Ok(());
+        while let Some((value, encoded_len)) = self.failure_tail.pop_front() {
+            match self.write_line_with_limit(&value, self.failure_tail_limit()) {
+                Ok(true) => {
+                    failure_tail_written_events = failure_tail_written_events.saturating_add(1);
+                    failure_tail_written_bytes =
+                        failure_tail_written_bytes.saturating_add(encoded_len);
+                    self.events_written = self.events_written.saturating_add(1);
+                    self.failure_tail_bytes = self.failure_tail_bytes.saturating_sub(encoded_len);
+                }
+                Ok(false) => {
+                    self.failure_tail_dropped_events = self
+                        .failure_tail_dropped_events
+                        .saturating_add(1)
+                        .saturating_add(u64::try_from(self.failure_tail.len()).unwrap_or(u64::MAX));
+                    self.failure_tail.clear();
+                    self.failure_tail_bytes = 0;
+                    tail_result = Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "trace failure-tail reserve could not fit buffered WARN/ERROR events",
+                    ));
+                    break;
+                }
+                Err(error) => {
+                    self.failure_tail_dropped_events = self
+                        .failure_tail_dropped_events
+                        .saturating_add(1)
+                        .saturating_add(u64::try_from(self.failure_tail.len()).unwrap_or(u64::MAX));
+                    self.failure_tail.clear();
+                    self.failure_tail_bytes = 0;
+                    tail_result = Err(error);
+                    break;
+                }
+            }
+        }
+
+        let receipt_result = if self.suppressed_events.eq(&0) && self.filtered_events.eq(&0) {
+            Ok(())
+        } else {
+            let target_limit = trace_receipt_target_limit(self.max_bytes);
+            let (filtered_targets, filtered_target_overflow_events) =
+                ranked_trace_targets(&self.filtered_by_target, target_limit);
+            let (suppressed_targets, suppressed_target_overflow_events) =
+                ranked_trace_targets(&self.suppressed_by_target, target_limit);
+            let event = if self.suppressed_events > 0 {
+                "trace_truncated"
+            } else {
+                "trace_filter_summary"
+            };
+            let active_suppression_reasons = [
+                self.byte_budget_suppressed_events,
+                self.event_budget_suppressed_events,
+                self.oversize_suppressed_events,
+            ]
+            .into_iter()
+            .filter(|count| *count > 0)
+            .count();
+            let reason = match active_suppression_reasons {
+                0 => "default_filter_policy",
+                1 if self.byte_budget_suppressed_events > 0 => "byte_budget",
+                1 if self.event_budget_suppressed_events > 0 => "event_budget",
+                1 => "oversize_event",
+                _ => "multiple_limits",
+            };
+            let receipt = serde_json::json!({
+                "timestamp": Utc::now().to_rfc3339(),
+                "level": if self.suppressed_events > 0 { "WARN" } else { "INFO" },
+                "target": "cass::trace",
+                "fields": {
+                    "event": event,
+                    "reason": reason,
+                    "artifact_complete": self.suppressed_events.eq(&0),
+                    "max_bytes": self.max_bytes,
+                    "max_events": self.max_events,
+                    "bytes_written_before_receipt": self.bytes_written,
+                    "events_written_before_receipt": self.events_written,
+                    "suppressed_events": self.suppressed_events,
+                    "suppressed_bytes": self.suppressed_bytes,
+                    "suppression_reasons": {
+                        "byte_budget": self.byte_budget_suppressed_events,
+                        "event_budget": self.event_budget_suppressed_events,
+                        "oversize_event": self.oversize_suppressed_events,
+                    },
+                    "suppressed_targets": suppressed_targets,
+                    "suppressed_target_overflow_events": suppressed_target_overflow_events,
+                    "failure_tail_events": failure_tail_written_events,
+                    "failure_tail_bytes": failure_tail_written_bytes,
+                    "failure_tail_dropped_events": self.failure_tail_dropped_events,
+                    "filtered_events": self.filtered_events,
+                    "filtered_targets": filtered_targets,
+                    "filtered_target_overflow_events": filtered_target_overflow_events,
+                },
+            });
+            let receipt_limit = self.receipt_limit();
+            match self.write_line_with_limit(&receipt, receipt_limit) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    let compact_receipt = serde_json::json!({
+                        "timestamp": Utc::now().to_rfc3339(),
+                        "level": if self.suppressed_events > 0 { "WARN" } else { "INFO" },
+                        "target": "cass::trace",
+                        "fields": {
+                            "event": event,
+                            "receipt_compact": true,
+                            "reason": reason,
+                            "artifact_complete": self.suppressed_events.eq(&0),
+                            "max_bytes": self.max_bytes,
+                            "max_events": self.max_events,
+                            "bytes_written_before_receipt": self.bytes_written,
+                            "events_written_before_receipt": self.events_written,
+                            "suppressed_events": self.suppressed_events,
+                            "suppressed_bytes": self.suppressed_bytes,
+                            "suppression_reasons": {
+                                "byte_budget": self.byte_budget_suppressed_events,
+                                "event_budget": self.event_budget_suppressed_events,
+                                "oversize_event": self.oversize_suppressed_events,
+                            },
+                            "suppressed_target_overflow_events": self.suppressed_events,
+                            "failure_tail_events": failure_tail_written_events,
+                            "failure_tail_bytes": failure_tail_written_bytes,
+                            "failure_tail_dropped_events": self.failure_tail_dropped_events,
+                            "filtered_events": self.filtered_events,
+                            "filtered_target_overflow_events": self.filtered_events,
+                        },
+                    });
+                    match self.write_line_with_limit(&compact_receipt, receipt_limit) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "trace tail reserve could not fit even the compact filter/truncation receipt",
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let unlock_result = fs2::FileExt::unlock(&self.file);
+        tail_result.and(receipt_result).and(unlock_result)
+    }
+}
+
+#[derive(Clone)]
+struct BoundedTraceMakeWriter {
+    state: Arc<Mutex<BoundedTraceState>>,
+}
+
+impl BoundedTraceMakeWriter {
+    fn open(path: &Path, max_bytes: u64, max_events: u64) -> io::Result<(Self, CliTraceGuard)> {
+        let (file, bytes_written, events_written, prior_head_closed) =
+            open_trace_append_file(path, max_bytes)?;
+        let diagnostic_limit = max_bytes
+            .saturating_sub(trace_summary_reserve(max_bytes))
+            .saturating_sub(trace_truncation_reserve(max_bytes))
+            .saturating_sub(trace_failure_tail_reserve(max_bytes));
+        let diagnostic_head_closed =
+            prior_head_closed || events_written >= max_events || bytes_written >= diagnostic_limit;
+        let state = Arc::new(Mutex::new(BoundedTraceState {
+            file,
+            max_bytes,
+            max_events,
+            bytes_written,
+            events_written,
+            diagnostic_head_closed,
+            suppressed_events: 0,
+            suppressed_bytes: 0,
+            byte_budget_suppressed_events: 0,
+            event_budget_suppressed_events: 0,
+            oversize_suppressed_events: 0,
+            filtered_events: 0,
+            filtered_by_target: BTreeMap::new(),
+            suppressed_by_target: BTreeMap::new(),
+            failure_tail: VecDeque::new(),
+            failure_tail_bytes: 0,
+            failure_tail_dropped_events: 0,
+            finalized: false,
+            last_error: None,
+        }));
+        Ok((
+            Self {
+                state: Arc::clone(&state),
+            },
+            CliTraceGuard { state },
+        ))
+    }
+}
+
+struct BoundedTraceEventWriter {
+    state: Arc<Mutex<BoundedTraceState>>,
+    buffer: Vec<u8>,
+    overflow_bytes: u64,
+}
+
+impl Write for BoundedTraceEventWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let available = TRACE_EVENT_BUFFER_MAX_BYTES.saturating_sub(self.buffer.len());
+        let accepted = available.min(bytes.len());
+        self.buffer.extend_from_slice(&bytes[..accepted]);
+        self.overflow_bytes = self
+            .overflow_bytes
+            .saturating_add(u64::try_from(bytes.len() - accepted).unwrap_or(u64::MAX));
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for BoundedTraceEventWriter {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let Err(error) = state.write_event(&self.buffer, self.overflow_bytes) {
+            state.last_error.get_or_insert_with(|| error.to_string());
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BoundedTraceMakeWriter {
+    type Writer = BoundedTraceEventWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        BoundedTraceEventWriter {
+            state: Arc::clone(&self.state),
+            buffer: Vec::with_capacity(1024),
+            overflow_bytes: 0,
+        }
+    }
+}
+
+struct CliTraceGuard {
+    state: Arc<Mutex<BoundedTraceState>>,
+}
+
+impl Drop for CliTraceGuard {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.state.lock() else {
+            eprintln!("trace-write error: trace state lock poisoned");
+            return;
+        };
+        if let Err(error) = state.finalize() {
+            state.last_error.get_or_insert_with(|| error.to_string());
+        }
+        if let Some(error) = state.last_error.take() {
+            eprintln!("trace-write error: {error}");
+        }
+    }
+}
 
 /// Initialize the tracing subscriber for non-TUI commands with robot-safe
 /// stdout/stderr hygiene plus an optional explicit `--trace-file` sink.
@@ -20207,18 +21070,17 @@ const TRACE_FILE_LOG_DIRECTIVE: &str = "debug";
 /// The stderr layer carries the robot-aware `filter` (pinned to `error` in
 /// robot/quiet mode by [`build_robot_aware_log_filter`], per uojcg.2.1), so
 /// dependency INFO/WARN logging can never interleave with a JSON stream. When
-/// `trace_file` is `Some`, a second layer captures dependency diagnostics at
-/// [`TRACE_FILE_LOG_DIRECTIVE`] into that file (uojcg.2.5) — gating deep logs
-/// behind an explicit surface rather than emitting them by default.
+/// `trace_file` is `Some`, a second layer writes valid JSONL, retains CASS DEBUG
+/// plus global WARN/ERROR events, redacts secret-bearing fields, and stops at a
+/// hard byte/event budget with a structured `trace_truncated` receipt.
 ///
-/// Returns the appender [`WorkerGuard`](tracing_appender::non_blocking::WorkerGuard)
-/// when a trace file is active; the caller MUST keep it alive for the duration of
-/// the command so buffered trace lines are flushed.
+/// The returned guard finalizes the truncation receipt before the command summary
+/// is appended. The caller MUST keep it alive for the duration of the command.
 fn init_cli_tracing(
     filter: EnvFilter,
     trace_file: Option<&Path>,
     ansi: bool,
-) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+) -> Option<CliTraceGuard> {
     use tracing_subscriber::Layer;
 
     let stderr_layer = tracing_subscriber::fmt::layer()
@@ -20229,15 +21091,45 @@ fn init_cli_tracing(
         .with_filter(filter);
 
     let (trace_layer, guard) = match trace_file {
-        Some(path) => match OpenOptions::new().create(true).append(true).open(path) {
-            Ok(file) => {
-                let (non_blocking, guard) = tracing_appender::non_blocking(file);
-                let layer = tracing_subscriber::fmt::layer()
-                    .with_writer(non_blocking)
-                    .with_ansi(false)
-                    .compact()
-                    .with_filter(EnvFilter::new(TRACE_FILE_LOG_DIRECTIVE))
-                    .boxed();
+        Some(path) => match BoundedTraceMakeWriter::open(
+            path,
+            trace_file_max_bytes(),
+            trace_file_max_events(),
+        ) {
+            Ok((writer, guard)) => {
+                let layer = if let Some(filter) = trace_file_log_filter_override() {
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(writer)
+                        .with_ansi(false)
+                        .with_filter(filter)
+                        .boxed()
+                } else {
+                    let filter_state = Arc::clone(&writer.state);
+                    // The policy never enables TRACE. Publishing that ceiling is
+                    // essential: without it a dynamic filter marks TRACE
+                    // callsites "sometimes", so per-character tokenizer
+                    // instrumentation still invokes this closure for every
+                    // character even though every record is rejected.
+                    let filter =
+                        tracing_subscriber::filter::dynamic_filter_fn(move |metadata, _context| {
+                            let enabled = default_trace_metadata_enabled(metadata);
+                            if !enabled
+                                && metadata.is_event()
+                                && let Ok(mut state) = filter_state.lock()
+                            {
+                                state.record_filtered(metadata.target());
+                            }
+                            enabled
+                        })
+                        .with_max_level_hint(tracing_subscriber::filter::LevelFilter::DEBUG);
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(writer)
+                        .with_ansi(false)
+                        .with_filter(filter)
+                        .boxed()
+                };
                 (Some(layer), Some(guard))
             }
             Err(e) => {
@@ -20257,7 +21149,51 @@ fn init_cli_tracing(
 
 #[cfg(test)]
 mod log_hygiene_tests {
-    use super::{DEFAULT_DEP_LOG_SUPPRESSION, robot_aware_log_directive};
+    use super::{
+        BoundedTraceMakeWriter, DEFAULT_DEP_LOG_SUPPRESSION, DEFAULT_TRACE_FILE_LOG_DIRECTIVE,
+        MIN_TRACE_FILE_MAX_BYTES, TraceSuppressionReason, default_trace_metadata_enabled,
+        enrich_trace_json, redact_bounded_trace_text, redact_trace_args, robot_aware_log_directive,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+    type TraceTestResult = Result<(), Box<dyn std::error::Error>>;
+
+    macro_rules! trace_test_require {
+        ($condition:expr, $($message:tt)+) => {
+            if !$condition {
+                return Err(format_args!($($message)+).to_string().into());
+            }
+        };
+    }
+
+    fn trace_json_text_is(value: &serde_json::Value, pointer: &str, expected: &str) -> bool {
+        value
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|actual| actual.eq(expected))
+    }
+
+    fn trace_json_bool_is(value: &serde_json::Value, pointer: &str, expected: bool) -> bool {
+        value
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_bool)
+            .is_some_and(|actual| actual.eq(&expected))
+    }
+
+    fn trace_json_count_is_positive(value: &serde_json::Value, pointer: &str) -> bool {
+        value
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0)
+    }
+
+    fn trace_json_fields_match(value: &serde_json::Value, left: &str, right: &str) -> bool {
+        value.pointer(left).eq(&value.pointer(right))
+    }
 
     #[test]
     fn robot_mode_pins_filter_to_error() {
@@ -20297,6 +21233,596 @@ mod log_hygiene_tests {
         assert!(DEFAULT_DEP_LOG_SUPPRESSION.starts_with("info"));
         assert!(DEFAULT_DEP_LOG_SUPPRESSION.contains("fsqlite=warn"));
         assert!(DEFAULT_DEP_LOG_SUPPRESSION.contains("fsqlite_core=warn"));
+    }
+
+    #[test]
+    fn trace_filter_keeps_cass_debug_and_only_dependency_warnings() -> TraceTestResult {
+        trace_test_require!(
+            DEFAULT_TRACE_FILE_LOG_DIRECTIVE.starts_with("warn"),
+            "default trace policy must start at global WARN"
+        );
+        trace_test_require!(
+            DEFAULT_TRACE_FILE_LOG_DIRECTIVE.contains("coding_agent_search=debug"),
+            "default trace policy must retain coding_agent_search DEBUG"
+        );
+        trace_test_require!(
+            DEFAULT_TRACE_FILE_LOG_DIRECTIVE.contains("cass=debug"),
+            "default trace policy must retain cass DEBUG"
+        );
+        trace_test_require!(
+            DEFAULT_TRACE_FILE_LOG_DIRECTIVE.contains("cass::redact::memo=warn"),
+            "default trace policy must quarantine routine redaction memo events"
+        );
+        trace_test_require!(
+            !DEFAULT_TRACE_FILE_LOG_DIRECTIVE.contains("fsqlite=debug"),
+            "default trace policy must reject frankensqlite DEBUG"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn trace_args_redact_sensitive_flags_and_secret_patterns() -> TraceTestResult {
+        let raw_secret = format!("sk-{}", "a".repeat(24));
+        let args = vec![
+            "cass".to_string(),
+            "--api-key".to_string(),
+            "short-secret".to_string(),
+            "--password=hunter2".to_string(),
+            raw_secret.clone(),
+        ];
+        let masked_args = redact_trace_args(&args);
+        trace_test_require!(
+            matches!(masked_args.get(1).map(String::as_str), Some("--api-key")),
+            "sensitive flag name was lost"
+        );
+        trace_test_require!(
+            matches!(masked_args.get(2).map(String::as_str), Some("[REDACTED]")),
+            "flag value was not redacted"
+        );
+        trace_test_require!(
+            matches!(
+                masked_args.get(3).map(String::as_str),
+                Some("--password=[REDACTED]")
+            ),
+            "inline password was not redacted"
+        );
+        trace_test_require!(
+            matches!(masked_args.get(4).map(String::as_str), Some("[REDACTED]")),
+            "secret-pattern argument was not redacted"
+        );
+        trace_test_require!(
+            !masked_args.join(" ").contains(&raw_secret),
+            "redacted argv retained the raw secret"
+        );
+        trace_test_require!(
+            redact_bounded_trace_text(&raw_secret, 16).eq("[REDACTED]"),
+            "correlation values must be redacted before their length bound is applied"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn trace_enrichment_names_field_only_diagnostics() -> TraceTestResult {
+        let enriched = enrich_trace_json(&serde_json::json!({
+            "timestamp": "2026-07-28T00:00:00Z",
+            "level": "DEBUG",
+            "target": "cass::semantic",
+            "fields": {"phase": "exact-search"},
+        }));
+        trace_test_require!(
+            trace_json_text_is(&enriched, "/schema_version", "cass-trace-v1"),
+            "trace enrichment omitted its schema version"
+        );
+        trace_test_require!(
+            trace_json_text_is(&enriched, "/fields/event", "diagnostic"),
+            "field-only trace event lacked its diagnostic identity"
+        );
+        trace_test_require!(
+            enriched.get("trace_id").is_some(),
+            "trace enrichment omitted trace_id"
+        );
+        trace_test_require!(
+            enriched.get("test_id").is_some(),
+            "trace enrichment omitted test_id"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_trace_is_valid_redacted_jsonl_with_truncation_receipt() -> TraceTestResult {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("trace.jsonl");
+        let max_bytes = MIN_TRACE_FILE_MAX_BYTES;
+        let (writer, guard) = BoundedTraceMakeWriter::open(&path, max_bytes, 24)?;
+        let filter_state = Arc::clone(&writer.state);
+        let trace_filter_calls = Arc::new(AtomicU64::new(0));
+        let trace_filter_calls_for_filter = Arc::clone(&trace_filter_calls);
+        let filter = tracing_subscriber::filter::dynamic_filter_fn(move |metadata, _context| {
+            if matches!(*metadata.level(), tracing::Level::TRACE) {
+                trace_filter_calls_for_filter.fetch_add(1, Ordering::Relaxed);
+            }
+            let enabled = default_trace_metadata_enabled(metadata);
+            if !enabled
+                && metadata.is_event()
+                && let Ok(mut state) = filter_state.lock()
+            {
+                state.record_filtered(metadata.target());
+            }
+            enabled
+        })
+        .with_max_level_hint(tracing_subscriber::filter::LevelFilter::DEBUG);
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_filter(filter);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let raw_secret = format!("sk-{}", "z".repeat(24));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(
+                target: "tokenizers::normalizer",
+                character = "x",
+                "per-character tokenizer trace must be statically disabled"
+            );
+            tracing::debug!(
+                target: "fsqlite.parse",
+                parser_token = "dependency-debug-must-not-survive",
+                "dependency debug"
+            );
+            tracing::warn!(
+                target: "fsqlite.parse",
+                warning_code = "dependency-warning-survives",
+                "dependency warning"
+            );
+            tracing::debug!(
+                target: "cass::redact::memo",
+                memo_marker = "redaction-memo-debug-must-not-survive",
+                "routine redaction memo bookkeeping"
+            );
+            tracing::warn!(
+                target: "cass::redact::memo",
+                memo_marker = "redaction-memo-warning-survives",
+                "redaction memo quarantine"
+            );
+            tracing::debug!(
+                target: "cass::semantic",
+                api_key = %raw_secret,
+                phase = "exact-search",
+                source_path = "/home/alice/private-project/session.jsonl",
+                "CASS debug survives"
+            );
+            for index in 0..200 {
+                tracing::debug!(
+                    target: "cass::semantic",
+                    index,
+                    payload = %"x".repeat(256),
+                    "bounded diagnostic"
+                );
+            }
+            tracing::debug!(
+                target: "cass::semantic",
+                phase = "late-small-debug-must-not-survive",
+                "diagnostic after the bounded head closed"
+            );
+            tracing::error!(
+                target: "cass::semantic",
+                reason_code = "late-failure-tail-survives",
+                source_path = "/data/projects/private/failing-session.jsonl",
+                "late failure context"
+            );
+        });
+        drop(guard);
+        trace_test_require!(
+            trace_filter_calls.load(Ordering::Relaxed).eq(&0),
+            "TRACE callsites reached the dynamic filter despite its DEBUG max-level hint"
+        );
+
+        let bytes = std::fs::read(&path)?;
+        trace_test_require!(
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= max_bytes,
+            "trace exceeded hard byte budget: {} > {max_bytes}",
+            bytes.len()
+        );
+        let trace = String::from_utf8(bytes)?;
+        trace_test_require!(!trace.contains(&raw_secret), "trace leaked raw secret");
+        trace_test_require!(
+            !trace.contains("/home/alice/private-project"),
+            "trace leaked a private absolute path"
+        );
+        trace_test_require!(
+            !trace.contains("dependency-debug-must-not-survive"),
+            "dependency DEBUG event bypassed the trace filter"
+        );
+        trace_test_require!(
+            trace.contains("dependency-warning-survives"),
+            "dependency WARN event was lost"
+        );
+        trace_test_require!(
+            !trace.contains("redaction-memo-debug-must-not-survive"),
+            "routine redaction-memo DEBUG event bypassed the trace filter"
+        );
+        trace_test_require!(
+            trace.contains("redaction-memo-warning-survives"),
+            "redaction-memo WARN event was lost"
+        );
+        trace_test_require!(
+            trace.contains("exact-search"),
+            "CASS-owned DEBUG event was lost"
+        );
+        trace_test_require!(
+            trace.contains("late-failure-tail-survives"),
+            "the reserved failure tail lost a late ERROR event"
+        );
+        trace_test_require!(
+            !trace.contains("late-small-debug-must-not-survive"),
+            "the diagnostic head reopened after reaching its byte ceiling"
+        );
+        trace_test_require!(
+            !trace.contains("/data/projects/private"),
+            "the reserved failure tail leaked a private path"
+        );
+
+        let events = trace
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        trace_test_require!(
+            events.iter().all(|event| trace_json_text_is(
+                event,
+                "/schema_version",
+                "cass-trace-v1"
+            )),
+            "every trace line must carry the versioned schema"
+        );
+        let receipt = events
+            .iter()
+            .find(|event| trace_json_text_is(event, "/fields/event", "trace_truncated"))
+            .ok_or("trace must carry a truncation receipt")?;
+        trace_test_require!(
+            trace_json_bool_is(receipt, "/fields/artifact_complete", false),
+            "truncation receipt claimed the artifact was complete"
+        );
+        trace_test_require!(
+            trace_json_count_is_positive(receipt, "/fields/suppressed_events"),
+            "truncation receipt omitted its suppressed event count"
+        );
+        trace_test_require!(
+            trace_json_count_is_positive(receipt, "/fields/suppression_reasons/byte_budget"),
+            "truncation receipt must identify the exhausted limit: {receipt}"
+        );
+        trace_test_require!(
+            receipt
+                .pointer("/fields/suppressed_targets")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|targets| targets.iter().any(|target| trace_json_text_is(
+                    target,
+                    "/target",
+                    "cass::semantic"
+                )
+                    && trace_json_count_is_positive(target, "/count"))),
+            "truncation receipt must identify the budget-suppressed target: {receipt}"
+        );
+        trace_test_require!(
+            trace_json_count_is_positive(receipt, "/fields/failure_tail_events"),
+            "truncation receipt must attest the bounded WARN/ERROR tail: {receipt}"
+        );
+        trace_test_require!(
+            trace_json_count_is_positive(receipt, "/fields/filtered_events"),
+            "filter receipt omitted its rejected-event count"
+        );
+        trace_test_require!(
+            receipt
+                .pointer("/fields/filtered_targets")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|targets| targets.iter().any(|target| trace_json_text_is(
+                    target,
+                    "/target",
+                    "fsqlite.parse"
+                )
+                    && trace_json_count_is_positive(target, "/count"))),
+            "filter receipt must count the rejected fsqlite.parse DEBUG event: {receipt}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_trace_uses_a_compact_receipt_when_detailed_targets_do_not_fit() -> TraceTestResult {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("compact-receipt-trace.jsonl");
+        let max_bytes = MIN_TRACE_FILE_MAX_BYTES;
+        let (writer, guard) = BoundedTraceMakeWriter::open(&path, max_bytes, 24)?;
+        {
+            let mut state = writer
+                .state
+                .lock()
+                .map_err(|_| "trace state lock poisoned")?;
+            let diagnostic_limit = state.diagnostic_limit();
+            let filler = serde_json::json!({
+                "timestamp": "2026-07-28T00:00:00Z",
+                "level": "DEBUG",
+                "target": "cass::semantic",
+                "fields": {
+                    "event": "diagnostic",
+                    "payload": "x".repeat(1_250),
+                },
+            });
+            trace_test_require!(
+                state.write_line_with_limit(&filler, diagnostic_limit)?,
+                "fixture must consume most of the diagnostic head"
+            );
+            for index in 0..12 {
+                let target = format!("cass::semantic::target_{index:02}_{}", "y".repeat(160));
+                state.record_suppressed(&target, 512, TraceSuppressionReason::ByteBudget);
+                state.record_filtered(&target);
+            }
+            state.record_failure_tail(&serde_json::json!({
+                "timestamp": "2026-07-28T00:00:01Z",
+                "level": "ERROR",
+                "target": "cass::semantic",
+                "fields": {
+                    "event": "late_failure",
+                    "payload": "z".repeat(220),
+                },
+            }));
+        }
+        drop(guard);
+
+        let trace = std::fs::read_to_string(&path)?;
+        trace_test_require!(
+            u64::try_from(trace.len()).unwrap_or(u64::MAX) <= max_bytes,
+            "compact receipt path exceeded the hard byte ceiling"
+        );
+        let receipt = trace
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| trace_json_text_is(event, "/fields/event", "trace_truncated"))
+            .ok_or("trace must retain a truncation receipt")?;
+        trace_test_require!(
+            trace_json_bool_is(&receipt, "/fields/receipt_compact", true),
+            "truncation receipt did not select the compact schema"
+        );
+        trace_test_require!(
+            trace_json_bool_is(&receipt, "/fields/artifact_complete", false),
+            "compact receipt claimed the artifact was complete"
+        );
+        trace_test_require!(
+            trace_json_fields_match(
+                &receipt,
+                "/fields/suppressed_target_overflow_events",
+                "/fields/suppressed_events",
+            ),
+            "compact receipt lost suppressed-target overflow accounting"
+        );
+        trace_test_require!(
+            trace_json_fields_match(
+                &receipt,
+                "/fields/filtered_target_overflow_events",
+                "/fields/filtered_events",
+            ),
+            "compact receipt lost filtered-target overflow accounting"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_trace_reopen_preserves_a_closed_diagnostic_head() -> TraceTestResult {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("reopened-truncated-trace.jsonl");
+        let max_bytes = 8 * 1024;
+        let (writer, guard) = BoundedTraceMakeWriter::open(&path, max_bytes, 64)?;
+        {
+            let mut state = writer
+                .state
+                .lock()
+                .map_err(|_| "trace state lock poisoned")?;
+            state.diagnostic_head_closed = true;
+            state.record_suppressed("cass::semantic", 2048, TraceSuppressionReason::ByteBudget);
+        }
+        drop(guard);
+
+        let (writer, guard) = BoundedTraceMakeWriter::open(&path, max_bytes, 64)?;
+        let diagnostic_head_closed = writer
+            .state
+            .lock()
+            .map_err(|_| "trace state lock poisoned")?
+            .diagnostic_head_closed;
+        trace_test_require!(
+            diagnostic_head_closed,
+            "a prior truncation receipt must keep the diagnostic head closed"
+        );
+        let late_debug = serde_json::to_vec(&serde_json::json!({
+            "timestamp": "2026-07-28T00:00:01Z",
+            "level": "DEBUG",
+            "target": "cass::semantic",
+            "fields": {
+                "event": "late-debug-after-reopen-must-not-survive",
+            },
+        }))?;
+        let late_warning = serde_json::to_vec(&serde_json::json!({
+            "timestamp": "2026-07-28T00:00:02Z",
+            "level": "WARN",
+            "target": "cass::semantic",
+            "fields": {
+                "event": "late-warning-after-reopen-survives",
+            },
+        }))?;
+        {
+            let mut state = writer
+                .state
+                .lock()
+                .map_err(|_| "trace state lock poisoned")?;
+            state.write_event(&late_debug, 0)?;
+            state.write_event(&late_warning, 0)?;
+        }
+        drop(guard);
+
+        let trace = std::fs::read_to_string(&path)?;
+        trace_test_require!(
+            !trace.contains("late-debug-after-reopen-must-not-survive"),
+            "a reopened writer admitted a DEBUG event after prior truncation"
+        );
+        trace_test_require!(
+            trace.contains("late-warning-after-reopen-survives"),
+            "a reopened writer lost the reserved WARN/ERROR tail"
+        );
+        trace_test_require!(
+            trace
+                .lines()
+                .filter(|line| line.contains("\"event\":\"trace_truncated\""))
+                .count()
+                .eq(&2),
+            "each truncated writer invocation must leave an explicit receipt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_trace_rejects_legacy_text_without_overwriting_it() -> TraceTestResult {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("legacy-trace.jsonl");
+        let legacy = b"2026-07-28 DEBUG legacy plain-text trace\n";
+        std::fs::write(&path, legacy)?;
+
+        let error = if let Err(error) = BoundedTraceMakeWriter::open(&path, 8 * 1024, 24) {
+            error
+        } else {
+            return Err("legacy plain text was mixed with versioned JSONL".into());
+        };
+        trace_test_require!(
+            error.kind().eq(&std::io::ErrorKind::InvalidData),
+            "legacy trace returned unexpected error kind: {error}"
+        );
+        trace_test_require!(
+            error.to_string().contains("not valid JSON"),
+            "failure should tell the operator why a new path is required: {error}"
+        );
+        trace_test_require!(
+            std::fs::read(&path)?.as_slice().eq(legacy),
+            "rejecting a legacy trace must not truncate or overwrite it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_trace_rejects_a_malformed_versioned_envelope_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("malformed-versioned-trace.jsonl");
+        let malformed = br#"{"schema_version":"cass-trace-v1","fields":{}}
+"#;
+        std::fs::write(&path, malformed)?;
+
+        let error = match BoundedTraceMakeWriter::open(&path, 8 * 1024, 24) {
+            Ok(_) => return Err("malformed versioned envelope was accepted".into()),
+            Err(error) => error,
+        };
+        if !error.kind().eq(&std::io::ErrorKind::InvalidData)
+            || !error
+                .to_string()
+                .contains("is not a valid cass-trace-v1 envelope")
+        {
+            return Err(format!("unexpected malformed-envelope error: {error}").into());
+        }
+        if !std::fs::read(&path)?.as_slice().eq(malformed) {
+            return Err("rejecting a malformed envelope mutated the source artifact".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_trace_repairs_a_missing_final_newline_without_double_counting() -> TraceTestResult {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("missing-newline-trace.jsonl");
+        let existing = serde_json::json!({
+            "schema_version": "cass-trace-v1",
+            "timestamp": "2026-07-28T00:00:00Z",
+            "level": "INFO",
+            "target": "cass::trace",
+            "trace_id": "trace-1",
+            "test_id": "suite/test",
+            "fields": {"event": "existing_event"},
+        })
+        .to_string();
+        std::fs::write(&path, existing)?;
+
+        let (writer, guard) = BoundedTraceMakeWriter::open(&path, 8 * 1024, 24)?;
+        let events_written = writer
+            .state
+            .lock()
+            .map_err(|_| "trace state lock poisoned")?
+            .events_written;
+        trace_test_require!(
+            events_written.eq(&1),
+            "repairing the line terminator must not count a second event"
+        );
+        drop(guard);
+        trace_test_require!(
+            std::fs::read(&path)?.ends_with(b"\n"),
+            "a valid appendable JSONL artifact must end in a newline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_trace_rejects_an_unrepairable_final_newline_without_mutation() -> TraceTestResult {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("full-missing-newline-trace.jsonl");
+        let existing = serde_json::json!({
+            "schema_version": "cass-trace-v1",
+            "timestamp": "2026-07-28T00:00:00Z",
+            "level": "INFO",
+            "target": "cass::trace",
+            "trace_id": "trace-1",
+            "test_id": "suite/test",
+            "fields": {"event": "existing_event"},
+        })
+        .to_string()
+        .into_bytes();
+        std::fs::write(&path, &existing)?;
+
+        let result = BoundedTraceMakeWriter::open(&path, u64::try_from(existing.len())?, 24);
+        let error = if let Err(error) = result {
+            error
+        } else {
+            return Err("a full trace without a final newline was accepted".into());
+        };
+        trace_test_require!(
+            error.kind().eq(&std::io::ErrorKind::InvalidData),
+            "unrepairable trace returned unexpected error kind: {error}"
+        );
+        trace_test_require!(
+            error.to_string().contains("lacks its final newline"),
+            "failure should identify the exact appendability defect: {error}"
+        );
+        trace_test_require!(
+            std::fs::read(&path)?.as_slice().eq(existing.as_slice()),
+            "rejecting an unrepairable trace must not truncate or overwrite it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_trace_rejects_a_second_writer_until_finalized() -> TraceTestResult {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("single-writer-trace.jsonl");
+        let (_writer, guard) = BoundedTraceMakeWriter::open(&path, 8 * 1024, 24)?;
+
+        let error = if let Err(error) = BoundedTraceMakeWriter::open(&path, 8 * 1024, 24) {
+            error
+        } else {
+            return Err("a concurrent trace writer was accepted".into());
+        };
+        trace_test_require!(
+            error
+                .to_string()
+                .contains("trace artifact already has an active writer"),
+            "contention failure should be actionable: {error}"
+        );
+
+        drop(guard);
+        BoundedTraceMakeWriter::open(&path, 8 * 1024, 24)?;
+        Ok(())
     }
 }
 
@@ -20862,7 +22388,10 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  TOON_KEY_FOLDING=off|safe                 TOON key folding mode".to_string(),
             "  CASS_NO_COLOR                            force monochrome".to_string(),
             "  CASS_RESPECT_NO_COLOR=1                  honor global NO_COLOR".to_string(),
-            "  CASS_TRACE_FILE                          default trace path".to_string(),
+            "  CASS_TRACE_FILE                          default cass-trace-v1 JSONL path".to_string(),
+            "  CASS_TRACE_FILTER                        trace-file EnvFilter (CASS DEBUG + global WARN/ERROR; redaction memo WARN)".to_string(),
+            "  CASS_TRACE_MAX_BYTES=<N>                 hard trace-file byte ceiling (default 16777216; clamped 4096..1073741824)".to_string(),
+            "  CASS_TRACE_MAX_EVENTS=<N>                hard diagnostic-event ceiling (default 50000; clamped 16..10000000)".to_string(),
             "  CASS_INDEX_NO_PROGRESS_EVENTS=1          suppress NDJSON events from `cass index --json`".to_string(),
             "  CASS_RESPONSIVENESS_DISABLE=1            pin indexer fan-out at 100% (skip governor)".to_string(),
             "  CASS_RESPONSIVENESS_MIN_CAPACITY_PCT=<N> floor for governor shrink (default 25, range 10..100)".to_string(),
@@ -21397,7 +22926,7 @@ fn extract_request_id(cli: &Cli) -> Option<String> {
 }
 
 fn write_trace_line(
-    path: &PathBuf,
+    path: &Path,
     label: &str,
     cli: &Cli,
     start_ts: &chrono::DateTime<Utc>,
@@ -21406,33 +22935,87 @@ fn write_trace_line(
     error: Option<&CliError>,
 ) -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let request_id = extract_request_id(cli);
-    let trace_id = dotenvy::var("CASS_TRACE_ID").ok();
+    let request_id = extract_request_id(cli)
+        .map(|request_id| redact_bounded_trace_text(&request_id, TRACE_CORRELATION_MAX_CHARS));
+    let trace_id = dotenvy::var("CASS_TRACE_ID")
+        .ok()
+        .map(|trace_id| redact_bounded_trace_text(&trace_id, TRACE_CORRELATION_MAX_CHARS));
+    let error_message = error.map(|error| {
+        truncate_trace_text(
+            &redact_trace_text(&error.message),
+            TRACE_SUMMARY_ERROR_MAX_CHARS,
+        )
+    });
+    let error_hint = error.and_then(|error| {
+        error.hint.as_deref().map(|hint| {
+            truncate_trace_text(&redact_trace_text(hint), TRACE_SUMMARY_ERROR_MAX_CHARS)
+        })
+    });
     let payload = serde_json::json!({
-        "start_ts": start_ts.to_rfc3339(),
-        "end_ts": (*start_ts
-            + chrono::Duration::from_std(Duration::from_millis(duration_ms as u64)).unwrap_or_default())
-        .to_rfc3339(),
-        "duration_ms": duration_ms,
-        "cmd": label,
-        "args": args,
-        "exit_code": exit_code,
-        "error": error.map(|e| serde_json::json!({
-            "code": e.code,
-            "kind": e.kind,
-            "message": e.message,
-            "hint": e.hint,
-            "retryable": e.retryable,
-        })),
-        "request_id": request_id,
-        "trace_id": trace_id,
-        "contract_version": CONTRACT_VERSION,
-        "crate_version": env!("CARGO_PKG_VERSION"),
+        "timestamp": Utc::now().to_rfc3339(),
+        "level": "INFO",
+        "target": "cass::trace",
+        "fields": {
+            "event": "command_summary",
+            "start_ts": start_ts.to_rfc3339(),
+            "end_ts": (*start_ts
+                + chrono::Duration::from_std(Duration::from_millis(duration_ms as u64)).unwrap_or_default())
+            .to_rfc3339(),
+            "duration_ms": duration_ms,
+            "cmd": label,
+            "args": redact_trace_args(&args),
+            "exit_code": exit_code,
+            "error": error.map(|e| serde_json::json!({
+                "code": e.code,
+                "kind": e.kind,
+                "message": error_message,
+                "hint": error_hint,
+                "retryable": e.retryable,
+            })),
+            "request_id": request_id,
+            "trace_id": trace_id,
+            "contract_version": CONTRACT_VERSION,
+            "crate_version": env!("CARGO_PKG_VERSION"),
+        },
     });
 
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{payload}")?;
-    Ok(())
+    let max_bytes = trace_file_max_bytes();
+    let (mut file, bytes_written, _events_written, _prior_head_closed) =
+        open_trace_append_file(path, max_bytes)?;
+    let enriched = enrich_trace_json(&payload);
+    let redacted = redact_trace_json(&enriched);
+    let mut encoded = serde_json::to_vec(&redacted).map_err(io::Error::other)?;
+    encoded.push(b'\n');
+    let encoded_len = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+    if bytes_written.saturating_add(encoded_len) <= max_bytes {
+        file.write_all(&encoded)?;
+        return Ok(());
+    }
+
+    let fallback = serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "level": "WARN",
+        "target": "cass::trace",
+        "fields": {
+            "event": "command_summary",
+            "summary_truncated": true,
+            "duration_ms": duration_ms,
+            "cmd": truncate_trace_text(label, 128),
+            "exit_code": exit_code,
+            "error_kind": error.map(|error| error.kind),
+        },
+    });
+    let fallback = redact_trace_json(&enrich_trace_json(&fallback));
+    let mut fallback_encoded = serde_json::to_vec(&fallback).map_err(io::Error::other)?;
+    fallback_encoded.push(b'\n');
+    let fallback_len = u64::try_from(fallback_encoded.len()).unwrap_or(u64::MAX);
+    if bytes_written.saturating_add(fallback_len) > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "trace tail reserve could not fit the compact command summary",
+        ));
+    }
+    file.write_all(&fallback_encoded)
 }
 
 /// Time filter helper for search commands
@@ -78691,7 +80274,22 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
         env_var_capability(
             "CASS_TRACE_FILE",
             None,
-            "Default JSONL trace path for command execution spans.",
+            "Default cass-trace-v1 JSONL path for bounded diagnostics and command summaries.",
+        ),
+        env_var_capability(
+            "CASS_TRACE_FILTER",
+            Some(DEFAULT_TRACE_FILE_LOG_DIRECTIVE),
+            "Trace-file EnvFilter. The default retains CASS DEBUG plus global WARN/ERROR events, while suppressing routine redaction-memo DEBUG churn.",
+        ),
+        env_var_capability(
+            "CASS_TRACE_MAX_BYTES",
+            Some("16777216"),
+            "Hard trace-file byte ceiling, clamped to 4096..1073741824 bytes.",
+        ),
+        env_var_capability(
+            "CASS_TRACE_MAX_EVENTS",
+            Some("50000"),
+            "Hard trace-file diagnostic-event ceiling, clamped to 16..10000000 events.",
         ),
         env_var_capability(
             "CASS_INDEX_NO_PROGRESS_EVENTS",

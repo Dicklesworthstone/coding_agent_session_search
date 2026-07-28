@@ -11,6 +11,16 @@ use std::process::Command;
 mod util;
 use util::e2e_log::{E2eError, E2ePerformanceMetrics, PhaseTracker};
 
+type SchemaTestResult = Result<(), Box<dyn std::error::Error>>;
+
+macro_rules! schema_test_require {
+    ($condition:expr, $($message:tt)+) => {
+        if !$condition {
+            return Err(format_args!($($message)+).to_string().into());
+        }
+    };
+}
+
 fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_jsonl_schema_test", test_name)
 }
@@ -29,10 +39,13 @@ const EVENT_SPECIFIC_FIELDS: &[(&str, &[&str])] = &[
 ];
 
 const COMMON_FIELDS: &[&str] = &["ts", "event", "run_id", "runner"];
+const TRACE_SCHEMA_VERSION: &str = "cass-trace-v1";
+const E2E_TRACE_MAX_BYTES: u64 = 512 * 1024;
+const SEMANTIC_TRACE_AGGREGATE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 fn is_log_file(path: &Path) -> bool {
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        // Exclude trace/combined files (internal aggregates)
+        // Trace files use the separate cass-trace-v1 schema below.
         if name == "trace.jsonl" || name == "combined.jsonl" {
             return false;
         }
@@ -49,24 +62,37 @@ fn is_log_file(path: &Path) -> bool {
     false
 }
 
-fn collect_jsonl_logs(root: &Path) -> Vec<PathBuf> {
-    fn visit(dir: &Path, out: &mut Vec<PathBuf>) {
+fn collect_matching_files(root: &Path, predicate: fn(&Path) -> bool) -> Vec<PathBuf> {
+    fn visit(dir: &Path, predicate: fn(&Path) -> bool, out: &mut Vec<PathBuf>) {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    visit(&path, out);
-                } else if is_log_file(&path) {
+                    visit(&path, predicate, out);
+                } else if predicate(&path) {
                     out.push(path);
                 }
             }
         }
     }
 
-    let mut logs = Vec::new();
-    visit(root, &mut logs);
-    logs.sort();
-    logs
+    let mut files = Vec::new();
+    visit(root, predicate, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_jsonl_logs(root: &Path) -> Vec<PathBuf> {
+    collect_matching_files(root, is_log_file)
+}
+
+fn collect_trace_logs(root: &Path) -> Vec<PathBuf> {
+    collect_matching_files(root, |path| {
+        !path
+            .components()
+            .any(|component| component.as_os_str() == ".previous")
+            && path.file_name().and_then(|name| name.to_str()) == Some("trace.jsonl")
+    })
 }
 
 /// Validate a single JSONL event object.
@@ -134,6 +160,46 @@ fn validate_event(json: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_trace_event(json: &Value) -> Result<(), String> {
+    if !json.is_object() {
+        return Err("Trace record is not a JSON object".to_string());
+    }
+    if json["schema_version"] != TRACE_SCHEMA_VERSION {
+        return Err(format!(
+            "Trace record schema_version must be '{TRACE_SCHEMA_VERSION}'"
+        ));
+    }
+    let timestamp = json["timestamp"]
+        .as_str()
+        .ok_or("Trace record timestamp is not a string")?;
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map_err(|error| format!("Invalid trace timestamp '{timestamp}': {error}"))?;
+    for field in ["level", "target"] {
+        if json[field].as_str().is_none_or(|value| value.is_empty()) {
+            return Err(format!("Trace record '{field}' must be a non-empty string"));
+        }
+    }
+    for field in ["trace_id", "test_id"] {
+        if json.get(field).is_none() {
+            return Err(format!(
+                "Trace record is missing correlation field '{field}'"
+            ));
+        }
+    }
+    let fields = json["fields"]
+        .as_object()
+        .ok_or("Trace record 'fields' is not an object")?;
+    if fields
+        .get("event")
+        .or_else(|| fields.get("message"))
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err("Trace fields require a non-empty event or message".to_string());
+    }
+    Ok(())
+}
+
 /// Validate structural consistency within a single JSONL file.
 fn validate_file_structure(events: &[Value]) -> Vec<String> {
     let mut warnings = Vec::new();
@@ -158,11 +224,47 @@ fn validate_file_structure(events: &[Value]) -> Vec<String> {
 }
 
 #[test]
-fn shell_validator_rejects_test_end_without_result_status() {
+fn trace_schema_validator_rejects_unversioned_records() -> SchemaTestResult {
+    let unversioned = serde_json::json!({
+        "timestamp": "2026-01-01T00:00:00Z",
+        "level": "INFO",
+        "target": "cass::trace",
+        "trace_id": "trace-1",
+        "test_id": "suite/test",
+        "fields": {"event": "command_summary"},
+    });
+    let error = match validate_trace_event(&unversioned) {
+        Ok(()) => return Err("an unversioned trace record passed the schema gate".into()),
+        Err(error) => error,
+    };
+    schema_test_require!(error.contains("schema_version"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn trace_collection_excludes_archived_evidence() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::TempDir::new()?;
+    let active = temp.path().join("suite/active/trace.jsonl");
+    let archived = temp.path().join("suite/.previous/old-run/trace.jsonl");
+    fs::create_dir_all(active.parent().ok_or("active trace has no parent")?)?;
+    fs::create_dir_all(archived.parent().ok_or("archived trace has no parent")?)?;
+    fs::write(&active, b"")?;
+    fs::write(&archived, b"")?;
+
+    let traces = collect_trace_logs(temp.path());
+    if traces != vec![active] {
+        return Err(format!("archive exclusion returned unexpected traces: {traces:?}").into());
+    }
+    Ok(())
+}
+
+#[test]
+#[serial_test::serial]
+fn shell_validator_rejects_test_end_without_result_status() -> SchemaTestResult {
     let tracker = tracker_for("shell_validator_rejects_test_end_without_result_status");
     let _trace_guard = tracker.trace_env_guard();
 
-    let temp = tempfile::TempDir::new().expect("tempdir");
+    let temp = tempfile::TempDir::new()?;
     let log_path = temp.path().join("missing_status.jsonl");
     fs::write(
         &log_path,
@@ -171,14 +273,12 @@ fn shell_validator_rejects_test_end_without_result_status() {
 {"ts":"2026-01-01T00:00:02Z","event":"test_end","run_id":"r1","runner":"rust","test":{"name":"status_required"}}
 {"ts":"2026-01-01T00:00:03Z","event":"run_end","run_id":"r1","runner":"rust","summary":{}}
 "#,
-    )
-    .expect("write malformed jsonl fixture");
+    )?;
 
     let output = Command::new("bash")
         .arg("scripts/validate-e2e-jsonl.sh")
         .arg(&log_path)
-        .output()
-        .expect("run shell JSONL validator");
+        .output()?;
 
     assert!(
         !output.status.success(),
@@ -198,19 +298,150 @@ fn shell_validator_rejects_test_end_without_result_status() {
     );
 
     tracker.complete();
+    Ok(())
 }
 
 #[test]
-fn shell_validator_default_discovery_skips_archived_logs() {
+#[serial_test::serial]
+fn shell_validator_rejects_unversioned_trace_jsonl() -> SchemaTestResult {
+    let tracker = tracker_for("shell_validator_rejects_unversioned_trace_jsonl");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let temp = tempfile::TempDir::new()?;
+    let trace_path = temp.path().join("trace.jsonl");
+    fs::write(
+        &trace_path,
+        r#"{"timestamp":"2026-01-01T00:00:00Z","level":"INFO","target":"cass::trace","trace_id":"trace-1","test_id":"suite/test","fields":{"event":"command_summary","duration_ms":1,"exit_code":0}}
+"#,
+    )?;
+
+    let output = Command::new("bash")
+        .arg("scripts/validate-e2e-jsonl.sh")
+        .arg(&trace_path)
+        .output()?;
+    schema_test_require!(
+        !output.status.success(),
+        "shell validator accepted an unversioned trace artifact"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    schema_test_require!(
+        combined.contains("Invalid cass-trace-v1 JSONL envelope"),
+        "shell validator failed without the versioned-trace diagnostic:\n{combined}"
+    );
+
+    tracker.complete();
+    Ok(())
+}
+
+#[test]
+#[serial_test::serial]
+fn shell_validator_rejects_trace_without_command_outcome() -> SchemaTestResult {
+    let tracker = tracker_for("shell_validator_rejects_trace_without_command_outcome");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let temp = tempfile::TempDir::new()?;
+    let trace_path = temp.path().join("trace.jsonl");
+    fs::write(
+        &trace_path,
+        r#"{"schema_version":"cass-trace-v1","timestamp":"2026-01-01T00:00:00Z","level":"DEBUG","target":"cass::semantic","trace_id":"trace-1","test_id":"suite/test","fields":{"event":"diagnostic","phase":"search"}}
+"#,
+    )?;
+
+    let output = Command::new("bash")
+        .arg("scripts/validate-e2e-jsonl.sh")
+        .arg(&trace_path)
+        .output()?;
+    schema_test_require!(
+        !output.status.success(),
+        "shell validator accepted a trace without its command outcome"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    schema_test_require!(
+        combined.contains("trace has no command_summary outcome record"),
+        "shell validator failed without the missing-outcome diagnostic:\n{combined}"
+    );
+
+    tracker.complete();
+    Ok(())
+}
+
+#[test]
+#[serial_test::serial]
+fn shell_validator_enforces_the_semantic_trace_aggregate_budget() -> SchemaTestResult {
+    let tracker = tracker_for("shell_validator_enforces_the_semantic_trace_aggregate_budget");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let temp = tempfile::TempDir::new()?;
+    let semantic_root = temp.path().join("test-results/e2e/e2e_semantic_search");
+    fs::create_dir_all(&semantic_root)?;
+    let payload = "x".repeat(480_000);
+    let record = serde_json::json!({
+        "schema_version": "cass-trace-v1",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "level": "INFO",
+        "target": "cass::trace",
+        "trace_id": "trace-1",
+        "test_id": "e2e_semantic_search/aggregate-budget",
+        "fields": {
+            "event": "command_summary",
+            "duration_ms": 1,
+            "exit_code": 0,
+            "padding": payload,
+        },
+    })
+    .to_string();
+    let mut trace_paths = Vec::new();
+    for index in 0..22 {
+        let case_dir = semantic_root.join(format!("case-{index:02}"));
+        fs::create_dir_all(&case_dir)?;
+        let trace_path = case_dir.join("trace.jsonl");
+        fs::write(&trace_path, format!("{record}\n"))?;
+        trace_paths.push(trace_path);
+    }
+
+    let output = Command::new("bash")
+        .arg("scripts/validate-e2e-jsonl.sh")
+        .args(&trace_paths)
+        .output()?;
+    schema_test_require!(
+        !output.status.success(),
+        "shell validator accepted an over-budget semantic trace aggregate"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    schema_test_require!(
+        combined.contains("semantic trace aggregate")
+            && combined.contains("exceeding the 10485760-byte campaign gate"),
+        "shell validator failed without the aggregate-budget diagnostic:\n{combined}"
+    );
+
+    tracker.complete();
+    Ok(())
+}
+
+#[test]
+#[serial_test::serial]
+fn shell_validator_default_discovery_skips_archived_logs() -> SchemaTestResult {
     let tracker = tracker_for("shell_validator_default_discovery_skips_archived_logs");
     let _trace_guard = tracker.trace_env_guard();
 
-    let repo_root = std::env::current_dir().expect("repo root");
+    let repo_root = std::env::current_dir()?;
     let validator = repo_root.join("scripts/validate-e2e-jsonl.sh");
-    let temp = tempfile::TempDir::new().expect("tempdir");
+    let temp = tempfile::TempDir::new()?;
     let current_dir = temp.path().join("test-results/e2e");
     let archived_dir = current_dir.join(".previous/old-run");
-    fs::create_dir_all(&archived_dir).expect("create archived log dir");
+    fs::create_dir_all(&archived_dir)?;
 
     fs::write(
         current_dir.join("current.jsonl"),
@@ -219,8 +450,7 @@ fn shell_validator_default_discovery_skips_archived_logs() {
 {"ts":"2026-01-01T00:00:02Z","event":"test_end","run_id":"current","runner":"rust","test":{"name":"current"},"result":{"status":"pass"}}
 {"ts":"2026-01-01T00:00:03Z","event":"run_end","run_id":"current","runner":"rust","summary":{}}
 "#,
-    )
-    .expect("write current jsonl fixture");
+    )?;
     fs::write(
         archived_dir.join("stale.jsonl"),
         r#"{"ts":"2026-01-01T00:00:00Z","event":"run_start","run_id":"stale","runner":"rust","env":{}}
@@ -228,14 +458,12 @@ fn shell_validator_default_discovery_skips_archived_logs() {
 {"ts":"2026-01-01T00:00:02Z","event":"test_end","run_id":"stale","runner":"rust","test":{"name":"stale"}}
 {"ts":"2026-01-01T00:00:03Z","event":"run_end","run_id":"stale","runner":"rust","summary":{}}
 "#,
-    )
-    .expect("write archived jsonl fixture");
+    )?;
 
     let output = Command::new("bash")
         .arg(&validator)
         .current_dir(temp.path())
-        .output()
-        .expect("run shell JSONL validator");
+        .output()?;
 
     assert!(
         output.status.success(),
@@ -251,9 +479,11 @@ fn shell_validator_default_discovery_skips_archived_logs() {
     );
 
     tracker.complete();
+    Ok(())
 }
 
 #[test]
+#[serial_test::serial]
 fn jsonl_files_valid_schema() {
     let tracker = tracker_for("jsonl_files_valid_schema");
     let _trace_guard = tracker.trace_env_guard();
@@ -352,6 +582,210 @@ fn jsonl_files_valid_schema() {
 }
 
 #[test]
+#[serial_test::serial]
+fn trace_jsonl_files_are_valid_correlated_and_bounded() -> SchemaTestResult {
+    let tracker = tracker_for("trace_jsonl_files_are_valid_correlated_and_bounded");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let e2e_dir = Path::new("test-results/e2e");
+    if !e2e_dir.exists() {
+        tracker.complete();
+        return Ok(());
+    }
+
+    let trace_files = collect_trace_logs(e2e_dir);
+    if trace_files.is_empty() {
+        eprintln!("No per-test trace.jsonl artifacts — skipping trace validation");
+        tracker.complete();
+        return Ok(());
+    }
+
+    let semantic_root = e2e_dir.join("e2e_semantic_search");
+    let mut semantic_bytes = 0_u64;
+    let mut nonempty_files = 0_u64;
+    let mut total_events = 0_u64;
+    let mut truncation_receipts = 0_u64;
+    let mut filter_receipts = 0_u64;
+    let mut errors = Vec::new();
+
+    for path in &trace_files {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                errors.push(format!("{}: metadata failed: {error}", path.display()));
+                continue;
+            }
+        };
+        if metadata.len() > E2E_TRACE_MAX_BYTES {
+            errors.push(format!(
+                "{}: {} bytes exceeds the declared per-test {}-byte budget",
+                path.display(),
+                metadata.len(),
+                E2E_TRACE_MAX_BYTES
+            ));
+        }
+        if path.starts_with(&semantic_root) {
+            semantic_bytes = semantic_bytes.saturating_add(metadata.len());
+        }
+        if metadata.len() == 0 {
+            continue;
+        }
+        nonempty_files = nonempty_files.saturating_add(1);
+
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) => {
+                errors.push(format!("{}: read failed: {error}", path.display()));
+                continue;
+            }
+        };
+        if content.contains("/home/") || content.contains("/data/projects/") {
+            errors.push(format!(
+                "{}: trace contains an unredacted private path",
+                path.display()
+            ));
+        }
+
+        let mut command_summaries = 0_u64;
+        for (line_index, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            total_events = total_events.saturating_add(1);
+            let event = match serde_json::from_str::<Value>(line) {
+                Ok(event) => event,
+                Err(error) => {
+                    errors.push(format!(
+                        "{}:{}: invalid JSON: {error}",
+                        path.display(),
+                        line_index + 1
+                    ));
+                    continue;
+                }
+            };
+            if let Err(error) = validate_trace_event(&event) {
+                errors.push(format!("{}:{}: {error}", path.display(), line_index + 1));
+                continue;
+            }
+            if event["trace_id"]
+                .as_str()
+                .is_none_or(|value| value.is_empty())
+                || event["test_id"]
+                    .as_str()
+                    .is_none_or(|value| value.is_empty())
+            {
+                errors.push(format!(
+                    "{}:{}: E2E trace correlation IDs must be non-empty strings",
+                    path.display(),
+                    line_index + 1
+                ));
+            }
+
+            match event["fields"]["event"].as_str() {
+                Some("trace_truncated") => {
+                    truncation_receipts = truncation_receipts.saturating_add(1);
+                    let suppressed_events = event["fields"]["suppressed_events"].as_u64();
+                    let suppression_reason_total =
+                        ["byte_budget", "event_budget", "oversize_event"]
+                            .into_iter()
+                            .try_fold(0_u64, |total, reason| {
+                                event["fields"]["suppression_reasons"][reason]
+                                    .as_u64()
+                                    .map(|count| total.saturating_add(count))
+                            });
+                    let failure_tail_fields_are_valid = [
+                        "failure_tail_events",
+                        "failure_tail_bytes",
+                        "failure_tail_dropped_events",
+                    ]
+                    .into_iter()
+                    .all(|field| event["fields"][field].as_u64().is_some());
+                    if event["fields"]["artifact_complete"] != Value::Bool(false)
+                        || event["fields"]["reason"].as_str().is_none_or(str::is_empty)
+                        || suppressed_events.is_none_or(|count| count == 0)
+                        || suppression_reason_total != suppressed_events
+                        || !failure_tail_fields_are_valid
+                    {
+                        errors.push(format!(
+                            "{}:{}: invalid truncation receipt",
+                            path.display(),
+                            line_index + 1
+                        ));
+                    }
+                }
+                Some("trace_filter_summary") => {
+                    filter_receipts = filter_receipts.saturating_add(1);
+                    if event["fields"]["artifact_complete"] != Value::Bool(true)
+                        || event["fields"]["filtered_events"]
+                            .as_u64()
+                            .is_none_or(|count| count == 0)
+                    {
+                        errors.push(format!(
+                            "{}:{}: invalid filter receipt",
+                            path.display(),
+                            line_index + 1
+                        ));
+                    }
+                }
+                Some("command_summary") => {
+                    command_summaries = command_summaries.saturating_add(1);
+                    if event["fields"]["duration_ms"].as_u64().is_none()
+                        || event["fields"]["exit_code"].as_i64().is_none()
+                    {
+                        errors.push(format!(
+                            "{}:{}: command summary lacks duration or outcome",
+                            path.display(),
+                            line_index + 1
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if command_summaries == 0 {
+            errors.push(format!(
+                "{}: trace has no command_summary outcome record",
+                path.display()
+            ));
+        }
+    }
+
+    if semantic_bytes > SEMANTIC_TRACE_AGGREGATE_MAX_BYTES {
+        errors.push(format!(
+            "semantic trace aggregate is {semantic_bytes} bytes, exceeding the {}-byte campaign gate",
+            SEMANTIC_TRACE_AGGREGATE_MAX_BYTES
+        ));
+    }
+
+    tracker.metrics(
+        "trace_jsonl_validation",
+        &E2ePerformanceMetrics::new()
+            .with_custom("files_checked", serde_json::json!(trace_files.len()))
+            .with_custom("nonempty_files", serde_json::json!(nonempty_files))
+            .with_custom("events_checked", serde_json::json!(total_events))
+            .with_custom("semantic_bytes", serde_json::json!(semantic_bytes))
+            .with_custom(
+                "truncation_receipts",
+                serde_json::json!(truncation_receipts),
+            )
+            .with_custom("filter_receipts", serde_json::json!(filter_receipts))
+            .with_custom("error_count", serde_json::json!(errors.len())),
+    );
+
+    schema_test_require!(
+        errors.is_empty(),
+        "Trace JSONL gate failed ({} errors across {} files):\n{}",
+        errors.len(),
+        trace_files.len(),
+        errors.join("\n")
+    );
+    tracker.complete();
+    Ok(())
+}
+
+#[test]
+#[serial_test::serial]
 fn jsonl_timestamps_are_rfc3339() {
     let tracker = tracker_for("jsonl_timestamps_are_rfc3339");
     let _trace_guard = tracker.trace_env_guard();
@@ -407,6 +841,7 @@ fn jsonl_timestamps_are_rfc3339() {
 }
 
 #[test]
+#[serial_test::serial]
 fn jsonl_run_ids_consistent_within_file() {
     let tracker = tracker_for("jsonl_run_ids_consistent_within_file");
     let _trace_guard = tracker.trace_env_guard();

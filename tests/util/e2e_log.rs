@@ -1318,15 +1318,36 @@ impl PhaseTracker {
 pub struct E2eTraceGuard {
     _trace_file: EnvGuard,
     _trace_id: EnvGuard,
+    _trace_test_id: EnvGuard,
+    _trace_filter: EnvGuard,
+    _trace_max_bytes: EnvGuard,
+    _trace_max_events: EnvGuard,
 }
 
 impl E2eTraceGuard {
     fn new(artifacts: &E2eArtifactPaths) -> Self {
         let trace_file = artifacts.trace_path.to_string_lossy().to_string();
         let trace_id = artifacts.trace_id.clone();
+        let trace_test_id = artifacts
+            .dir
+            .strip_prefix(
+                dotenvy::var("CARGO_MANIFEST_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from(".")),
+            )
+            .unwrap_or(&artifacts.dir)
+            .to_string_lossy()
+            .to_string();
         Self {
             _trace_file: EnvGuard::set("CASS_TRACE_FILE", trace_file),
             _trace_id: EnvGuard::set("CASS_TRACE_ID", trace_id),
+            _trace_test_id: EnvGuard::set("CASS_TRACE_TEST_ID", trace_test_id),
+            _trace_filter: EnvGuard::set(
+                "CASS_TRACE_FILTER",
+                "warn,coding_agent_search=debug,cass=debug,cass::redact::memo=warn",
+            ),
+            _trace_max_bytes: EnvGuard::set("CASS_TRACE_MAX_BYTES", "524288"),
+            _trace_max_events: EnvGuard::set("CASS_TRACE_MAX_EVENTS", "4096"),
         }
     }
 }

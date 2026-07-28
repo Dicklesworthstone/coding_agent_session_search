@@ -10,8 +10,8 @@
 #   --quick    Run quick validation only (skip full test run, use existing logs)
 #
 # Environment:
-#   RCH_BIN         rch executable (default: rch)
-#   RCH_TARGET_DIR  cargo target dir for offloaded test runs
+#   RCH_BIN               rch executable (default: rch)
+#   RCH_TEST_TIMEOUT_SEC  strict remote test timeout (default: 7200)
 #
 # Exit codes:
 #   0 - Acceptance test passed
@@ -23,7 +23,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 RCH_BIN="${RCH_BIN:-rch}"
-RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_root_e2e_logging_acceptance}"
 
 # Configuration
 TEST_RESULTS_DIR="test-results/e2e"
@@ -66,7 +65,11 @@ ensure_rch() {
 }
 
 run_cargo() {
-    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+    RCH_REQUIRE_REMOTE=1 \
+        RCH_NO_SELF_HEALING=1 \
+        RCH_TEST_TIMEOUT_SEC="${RCH_TEST_TIMEOUT_SEC:-7200}" \
+        env -u CARGO_TARGET_DIR \
+        "$RCH_BIN" --no-self-healing exec -- cargo "$@"
 }
 
 archive_prior_logs() {
@@ -88,7 +91,6 @@ archive_prior_logs() {
     done < <(
         find "$TEST_RESULTS_DIR" \
             -type f \( -name "*.jsonl" -o -name "cass.log" -o -name "acceptance_test_output_*.txt" \) \
-            ! -name "trace.jsonl" \
             ! -name "combined.jsonl" \
             ! -path "$TEST_RESULTS_DIR/.previous/*" \
             -print0 2>/dev/null
@@ -146,6 +148,17 @@ RUN_LOG="$TEST_RESULTS_DIR/acceptance_run.jsonl"
 if [[ "$QUICK_MODE" == false ]]; then
     echo "Step 1: Running E2E tests with logging enabled..."
 
+    E2E_TEST_ARGS=()
+    while IFS= read -r test_file; do
+        test_target=$(basename "$test_file" .rs)
+        E2E_TEST_ARGS+=(--test "$test_target")
+    done < <(find tests -maxdepth 1 -type f -name 'e2e_*.rs' | sort)
+    if [[ ${#E2E_TEST_ARGS[@]} -eq 0 ]]; then
+        echo "FAIL: No tests/e2e_*.rs targets were discovered"
+        exit 1
+    fi
+    echo "  Discovered $((${#E2E_TEST_ARGS[@]} / 2)) explicit E2E test targets"
+
     # Generate a unique run ID
     RUN_ID="acceptance_$(date +%Y%m%d_%H%M%S)_$(head -c 6 /dev/urandom | xxd -p)"
     archive_prior_logs "$RUN_ID"
@@ -157,7 +170,8 @@ if [[ "$QUICK_MODE" == false ]]; then
     # Run E2E tests with logging through rch - capture exit code
     ensure_rch
     set +e
-    E2E_LOG=1 run_cargo test --test 'e2e_*' -- --test-threads=1 2>&1 | tee "$TEST_OUTPUT_FILE"
+    E2E_LOG=1 run_cargo test --locked "${E2E_TEST_ARGS[@]}" -- --test-threads=1 2>&1 \
+        | tee "$TEST_OUTPUT_FILE"
     TEST_EXIT=$?
     set -e
 
@@ -175,6 +189,7 @@ fi
 echo ""
 echo "Step 2: Verifying JSONL files created..."
 JSONL_FILES=()
+TRACE_FILES=()
 while IFS= read -r -d '' file; do
     JSONL_FILES+=("$file")
 done < <(
@@ -182,6 +197,14 @@ done < <(
         -type f \( -name "*.jsonl" -o -name "cass.log" \) \
         ! -name "trace.jsonl" \
         ! -name "combined.jsonl" \
+        ! -path "$TEST_RESULTS_DIR/.previous/*" \
+        -print0 2>/dev/null | sort -z
+)
+while IFS= read -r -d '' file; do
+    TRACE_FILES+=("$file")
+done < <(
+    find "$TEST_RESULTS_DIR" \
+        -type f -name "trace.jsonl" \
         ! -path "$TEST_RESULTS_DIR/.previous/*" \
         -print0 2>/dev/null | sort -z
 )
@@ -193,18 +216,58 @@ if [[ "$JSONL_COUNT" -eq 0 ]]; then
     exit 1
 fi
 echo "  Found $JSONL_COUNT JSONL/log files"
+echo "  Found ${#TRACE_FILES[@]} versioned per-test trace files"
+
+NONEMPTY_TRACE_COUNT=0
+TRACE_BYTES=0
+TRACE_EVENTS=0
+for trace_file in "${TRACE_FILES[@]}"; do
+    if [[ -s "$trace_file" ]]; then
+        NONEMPTY_TRACE_COUNT=$((NONEMPTY_TRACE_COUNT + 1))
+        TRACE_BYTES=$((TRACE_BYTES + $(wc -c < "$trace_file")))
+        TRACE_EVENTS=$((TRACE_EVENTS + $(wc -l < "$trace_file")))
+    fi
+done
+echo "  Non-empty trace files: $NONEMPTY_TRACE_COUNT"
+echo "  Persisted trace bytes: $TRACE_BYTES"
+echo "  Persisted trace events: $TRACE_EVENTS"
+if [[ "$QUICK_MODE" == false && "$NONEMPTY_TRACE_COUNT" -eq 0 ]]; then
+    echo "FAIL: Full acceptance run produced no diagnostic trace events"
+    exit 1
+fi
 
 # Step 3: Validate all JSONL files with schema validator
 echo ""
 echo "Step 3: Validating JSONL schema..."
 if [[ -x "$SCRIPT_DIR/validate-e2e-jsonl.sh" ]]; then
-    if ! "$SCRIPT_DIR/validate-e2e-jsonl.sh" "${JSONL_FILES[@]}"; then
+    if ! "$SCRIPT_DIR/validate-e2e-jsonl.sh" "${JSONL_FILES[@]}" "${TRACE_FILES[@]}"; then
         echo "FAIL: JSONL schema validation failed"
         exit 1
     fi
     echo "  Schema validation passed"
 else
     echo "  Warning: validate-e2e-jsonl.sh not found, skipping schema validation"
+fi
+
+if [[ "$NONEMPTY_TRACE_COUNT" -gt 0 ]]; then
+    echo "  Trace target histogram (top 20):"
+    jq -r '.target // "unknown"' "${TRACE_FILES[@]}" 2>/dev/null \
+        | sort \
+        | uniq -c \
+        | sort -nr \
+        | head -20 \
+        | sed 's/^/    /'
+    echo "  Trace receipts:"
+    jq -r '.fields.event // empty' "${TRACE_FILES[@]}" 2>/dev/null \
+        | awk '
+            $0 == "trace_truncated" { truncated += 1 }
+            $0 == "trace_filter_summary" { filtered += 1 }
+            $0 == "command_summary" { commands += 1 }
+            END {
+                printf "    command_summary=%d trace_filter_summary=%d trace_truncated=%d\n",
+                    commands, filtered, truncated
+            }
+        '
 fi
 
 # Step 4: Check event type coverage
@@ -289,6 +352,10 @@ File Coverage
 -------------
 JSONL/log files: $JSONL_COUNT
 Total events: $TOTAL_EVENTS
+Trace files: ${#TRACE_FILES[@]}
+Non-empty trace files: $NONEMPTY_TRACE_COUNT
+Trace bytes: $TRACE_BYTES
+Trace events: $TRACE_EVENTS
 
 Event Type Coverage
 -------------------
@@ -321,20 +388,19 @@ cat "$REPORT_FILE"
 # Final result
 echo ""
 echo "============================================="
-if [[ $TEST_EXIT -eq 0 ]] && [[ -z "$PHASE_WARNING" ]] && [[ -z "$METRICS_WARNING" ]]; then
+if [[ $TEST_EXIT -ne 0 ]]; then
+    echo "=== ACCEPTANCE TEST FAILED ==="
+    echo "E2E test exit code: $TEST_EXIT"
+    exit 1
+elif [[ -z "$PHASE_WARNING" ]] && [[ -z "$METRICS_WARNING" ]]; then
     echo "=== ACCEPTANCE TEST PASSED ==="
     exit 0
-elif [[ $TEST_EXIT -eq 0 ]]; then
+else
     echo "=== ACCEPTANCE TEST PASSED (with warnings) ==="
     [[ -n "$PHASE_WARNING" ]] && echo "  - $PHASE_WARNING"
     [[ -n "$METRICS_WARNING" ]] && echo "  - $METRICS_WARNING"
     echo ""
     echo "Note: Logging infrastructure is working. Warnings indicate"
     echo "some tests may need additional instrumentation."
-    exit 0
-else
-    echo "=== ACCEPTANCE TEST COMPLETED WITH TEST FAILURES ==="
-    echo "Note: Some E2E tests failed, but logging infrastructure is working"
-    echo "E2E test exit code: $TEST_EXIT"
     exit 0
 fi

@@ -255,8 +255,14 @@ fn artifact_tree_snapshot(root: &Path) -> Vec<ArtifactTreeEntrySnapshot> {
 // Semantic Index Build Tests
 // =============================================================================
 
+// These tests temporarily replace process-global HOME, CODEX_HOME, and trace
+// variables. Keep their outer test bodies serialized until the harness passes
+// those values only to each spawned command; otherwise parallel test threads
+// can cross-wire fixtures and evidence artifacts.
+
 /// Test: Index with --semantic builds vector index alongside text index.
 #[test]
+#[serial_test::serial]
 fn semantic_index_builds_vector_file() {
     let tracker = tracker_for("semantic_index_builds_vector_file");
     let _trace_guard = tracker.trace_env_guard();
@@ -372,6 +378,7 @@ fn semantic_index_builds_vector_file() {
 /// Hash embeddings deliberately exercise the architecture-sensitive `DistDot`
 /// normalization path that previously panicked while building the graph.
 #[test]
+#[serial_test::serial]
 fn semantic_index_builds_hnsw() {
     let tracker = tracker_for("semantic_index_builds_hnsw");
     let _trace_guard = tracker.trace_env_guard();
@@ -448,6 +455,7 @@ fn semantic_index_builds_hnsw() {
 
 /// Test: Search with --mode semantic returns results.
 #[test]
+#[serial_test::serial]
 fn search_semantic_mode_returns_results() {
     let tracker = tracker_for("search_semantic_mode_returns_results");
     let _trace_guard = tracker.trace_env_guard();
@@ -556,6 +564,7 @@ fn search_semantic_mode_returns_results() {
 /// `vector.quality.idx`. Corrupt decoys at all three fixed names make the
 /// selected path observable without mocks.
 #[test]
+#[serial_test::serial]
 fn exact_artifact_contract_restart_uses_writer_path_and_ignores_decoys() {
     let tracker =
         tracker_for("semantic_restart_uses_exact_writer_artifact_and_ignores_fixed_name_decoys");
@@ -792,6 +801,7 @@ fn exact_artifact_contract_restart_uses_writer_path_and_ignores_decoys() {
 /// advertise a semantic capability that a fresh query process cannot use.
 #[cfg(unix)]
 #[test]
+#[serial_test::serial]
 fn fsvi_symlink_is_rejected_by_readiness_and_serving_without_mutation() {
     use std::os::unix::fs::symlink;
 
@@ -966,6 +976,7 @@ fn fsvi_symlink_is_rejected_by_readiness_and_serving_without_mutation() {
 
 /// Test: Search with --mode hybrid combines lexical and semantic.
 #[test]
+#[serial_test::serial]
 fn search_hybrid_mode_combines_results() {
     let tracker = tracker_for("search_hybrid_mode_combines_results");
     let _trace_guard = tracker.trace_env_guard();
@@ -1065,6 +1076,7 @@ fn search_hybrid_mode_combines_results() {
 /// Hash embeddings deliberately exercise HNSW query normalization without
 /// requiring an external model fixture.
 #[test]
+#[serial_test::serial]
 fn search_approximate_uses_hnsw() {
     let tracker = tracker_for("search_approximate_uses_hnsw");
     let _trace_guard = tracker.trace_env_guard();
@@ -1185,6 +1197,7 @@ fn search_approximate_uses_hnsw() {
 
 /// Test: Semantic search without vector index reports informative error.
 #[test]
+#[serial_test::serial]
 fn semantic_without_index_reports_error() {
     let tracker = tracker_for("semantic_without_index_reports_error");
     let _trace_guard = tracker.trace_env_guard();
@@ -1275,6 +1288,7 @@ fn semantic_without_index_reports_error() {
 
 /// Test: Approximate search without HNSW stays useful via exact fallback.
 #[test]
+#[serial_test::serial]
 fn approximate_without_hnsw_falls_back_exact_with_typed_reason() {
     let tracker = tracker_for("approximate_without_hnsw_falls_back_exact_with_typed_reason");
     let _trace_guard = tracker.trace_env_guard();
@@ -1433,6 +1447,7 @@ fn approximate_without_hnsw_falls_back_exact_with_typed_reason() {
 /// A fresh process must reject an ANN built from the same ordered document IDs
 /// but different vector contents, then answer from the selected exact FSVI.
 #[test]
+#[serial_test::serial]
 fn approximate_stale_same_doc_ids_falls_back_exact_without_mutation() {
     let tracker = tracker_for("approximate_stale_same_doc_ids_falls_back_exact_without_mutation");
     let _trace_guard = tracker.trace_env_guard();
@@ -1739,6 +1754,7 @@ fn exercise_invalid_ann_fresh_process_fallback(case: InvalidAnnInstallation) {
 
 /// Invalid optional ANN artifacts must never disable exact semantic search.
 #[test]
+#[serial_test::serial]
 fn approximate_invalid_ann_falls_back_exact_without_mutation() {
     let mut cases = vec![
         InvalidAnnInstallation::CorruptMetadata,
@@ -1762,6 +1778,7 @@ fn approximate_invalid_ann_falls_back_exact_without_mutation() {
 
 /// Test: Semantic search captures timing metrics.
 #[test]
+#[serial_test::serial]
 fn semantic_search_emits_timing() {
     let tracker = tracker_for("semantic_search_emits_timing");
     let _trace_guard = tracker.trace_env_guard();

@@ -9,8 +9,8 @@
 # br: coding_agent_session_search-3koo
 #
 # Environment:
-#   RCH_BIN         rch executable (default: rch)
-#   RCH_TARGET_DIR  cargo target dir for offloaded test runs
+#   RCH_BIN               rch executable (default: rch)
+#   RCH_TEST_TIMEOUT_SEC  strict remote test timeout (default: 7200)
 
 set -euo pipefail
 
@@ -18,7 +18,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RCH_BIN="${RCH_BIN:-rch}"
-RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_e2e_logging_acceptance}"
 
 # Source the E2E logging library
 # shellcheck disable=SC1091
@@ -48,7 +47,11 @@ ensure_rch() {
 }
 
 run_cargo() {
-    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+    RCH_REQUIRE_REMOTE=1 \
+        RCH_NO_SELF_HEALING=1 \
+        RCH_TEST_TIMEOUT_SEC="${RCH_TEST_TIMEOUT_SEC:-7200}" \
+        env -u CARGO_TARGET_DIR \
+        "$RCH_BIN" --no-self-healing exec -- cargo "$@"
 }
 
 archive_prior_logs() {
@@ -76,7 +79,6 @@ archive_prior_logs() {
     done < <(
         find "$results_dir" \
             -type f \( -name "*.jsonl" -o -name "cass.log" -o -name "acceptance_test_output_*.txt" \) \
-            ! -name "trace.jsonl" \
             ! -name "combined.jsonl" \
             ! -path "$results_dir/.previous/*" \
             -print0 2>/dev/null
@@ -121,12 +123,22 @@ PHASE_START=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
 
 echo ""
 echo "Step 2: Running E2E tests with logging enabled..."
-echo "  Running through rch: E2E_LOG=1 cargo test --test 'e2e_*' -- --test-threads=1"
+E2E_TEST_ARGS=()
+while IFS= read -r test_file; do
+    test_target=$(basename "$test_file" .rs)
+    E2E_TEST_ARGS+=(--test "$test_target")
+done < <(find "$PROJECT_ROOT/tests" -maxdepth 1 -type f -name 'e2e_*.rs' | sort)
+if [ "${#E2E_TEST_ARGS[@]}" -eq 0 ]; then
+    echo "  [FAIL] No tests/e2e_*.rs targets were discovered"
+    exit 1
+fi
+echo "  Running $((${#E2E_TEST_ARGS[@]} / 2)) explicit E2E targets through strict rch"
 
 TEST_EXIT=0
 ensure_rch
 TEST_OUTPUT_FILE="$PROJECT_ROOT/test-results/e2e/acceptance_test_output_$(e2e_run_id).txt"
-E2E_LOG=1 run_cargo test --test 'e2e_*' -- --test-threads=1 2>&1 | tee "$TEST_OUTPUT_FILE" || TEST_EXIT=$?
+E2E_LOG=1 run_cargo test --locked "${E2E_TEST_ARGS[@]}" -- --test-threads=1 2>&1 \
+    | tee "$TEST_OUTPUT_FILE" || TEST_EXIT=$?
 
 if [ "$TEST_EXIT" -eq 0 ]; then
     echo "  All E2E tests passed"
@@ -163,6 +175,49 @@ else
     check_pass "jsonl_files_exist ($JSONL_COUNT files)"
 fi
 
+TRACE_COUNT=$(
+    find "$PROJECT_ROOT/test-results/e2e" \
+        -name "trace.jsonl" \
+        -type f \
+        ! -path "$PROJECT_ROOT/test-results/e2e/.previous/*" \
+        2>/dev/null | wc -l
+)
+NONEMPTY_TRACE_COUNT=$(
+    find "$PROJECT_ROOT/test-results/e2e" \
+        -name "trace.jsonl" \
+        -type f \
+        -size +0c \
+        ! -path "$PROJECT_ROOT/test-results/e2e/.previous/*" \
+        2>/dev/null | wc -l
+)
+TRACE_BYTES=$(
+    find "$PROJECT_ROOT/test-results/e2e" \
+        -name "trace.jsonl" \
+        -type f \
+        ! -path "$PROJECT_ROOT/test-results/e2e/.previous/*" \
+        -printf '%s\n' 2>/dev/null \
+        | awk '{ total += $1 } END { print total + 0 }'
+)
+TRACE_EVENTS=$(
+    find "$PROJECT_ROOT/test-results/e2e" \
+        -name "trace.jsonl" \
+        -type f \
+        -size +0c \
+        ! -path "$PROJECT_ROOT/test-results/e2e/.previous/*" \
+        -print0 2>/dev/null \
+        | xargs -0 -r wc -l \
+        | awk '$2 != "total" { total += $1 } END { print total + 0 }'
+)
+echo "  Trace files: $TRACE_COUNT"
+echo "  Non-empty trace files: $NONEMPTY_TRACE_COUNT"
+echo "  Persisted trace bytes: $TRACE_BYTES"
+echo "  Persisted trace events: $TRACE_EVENTS"
+if [ "$NONEMPTY_TRACE_COUNT" -eq 0 ]; then
+    check_fail "trace_files_nonempty" "Full E2E run produced no diagnostic trace events"
+else
+    check_pass "trace_files_nonempty ($NONEMPTY_TRACE_COUNT files)"
+fi
+
 # List the files found
 echo "  Files:"
 find "$PROJECT_ROOT/test-results/e2e" \
@@ -186,13 +241,18 @@ echo ""
 echo "Step 4: Validating JSONL schema..."
 
 SCHEMA_EXIT=0
-run_cargo test --test e2e_jsonl_schema_test 2>&1 | tail -20 || SCHEMA_EXIT=$?
+"$PROJECT_ROOT/scripts/validate-e2e-jsonl.sh" || SCHEMA_EXIT=$?
+RUST_SCHEMA_EXIT=0
+run_cargo test --locked --test e2e_jsonl_schema_test 2>&1 | tail -20 || RUST_SCHEMA_EXIT=$?
+if [ "$RUST_SCHEMA_EXIT" -ne 0 ]; then
+    SCHEMA_EXIT=$RUST_SCHEMA_EXIT
+fi
 
 if [ "$SCHEMA_EXIT" -eq 0 ]; then
-    check_pass "jsonl_schema_valid"
+    check_pass "jsonl_schema_and_trace_budget_valid"
 else
-    check_fail "jsonl_schema_valid" "Schema validation failed"
-    e2e_error "JSONL schema validation failed"
+    check_fail "jsonl_schema_and_trace_budget_valid" "Schema or trace budget validation failed"
+    e2e_error "JSONL schema or trace budget validation failed"
 fi
 
 PHASE_END=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
@@ -311,6 +371,10 @@ Exit code: $TEST_EXIT
 Test output: ${TEST_OUTPUT_FILE:-n/a}
 JSONL files: $JSONL_COUNT
 Total events: $TOTAL_EVENTS
+Trace files: $TRACE_COUNT
+Non-empty trace files: $NONEMPTY_TRACE_COUNT
+Trace bytes: $TRACE_BYTES
+Trace events: $TRACE_EVENTS
 
 Event Coverage
 --------------
@@ -351,11 +415,19 @@ if [ "$JSONL_COUNT" -eq 0 ]; then
     LOGGING_OK=false
 fi
 
+if [ "$NONEMPTY_TRACE_COUNT" -eq 0 ]; then
+    LOGGING_OK=false
+fi
+
 if [ -n "$MISSING_EVENTS" ]; then
     LOGGING_OK=false
 fi
 
 if [ "$SCHEMA_EXIT" -ne 0 ]; then
+    LOGGING_OK=false
+fi
+
+if [ "$TEST_EXIT" -ne 0 ]; then
     LOGGING_OK=false
 fi
 
@@ -367,6 +439,6 @@ if [ "$LOGGING_OK" = true ]; then
 else
     echo "=== ACCEPTANCE TEST FAILED ==="
     echo "E2E logging infrastructure has issues that need attention."
-    e2e_run_end "$TOTAL_CHECKS" "$PASSED_CHECKS" "$FAILED_CHECKS" "0" "$TOTAL_DURATION"
+    e2e_run_end "$TOTAL_CHECKS" "$PASSED_CHECKS" "$FAILED_CHECKS" "1" "$TOTAL_DURATION"
     exit 1
 fi
