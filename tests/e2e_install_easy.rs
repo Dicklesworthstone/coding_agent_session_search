@@ -26,7 +26,6 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
 
 mod util;
 use util::e2e_log::{E2eError, E2eErrorContext, E2ePerformanceMetrics, PhaseTracker};
@@ -169,7 +168,7 @@ fn install_easy_mode_end_to_end() {
     skip_unless_install_tests!();
 
     let tracker = tracker_for("install_easy_mode_end_to_end");
-    let _trace_guard = tracker.trace_env_guard();
+    let command_env = tracker.command_environment();
 
     // Phase: Setup isolated test environment
     let phase_start = tracker.start("setup", Some("Create isolated test environment"));
@@ -184,7 +183,8 @@ fn install_easy_mode_end_to_end() {
     let phase_start = tracker.start("run_install", Some("Run install.sh with real toolchain"));
     let install_start = std::time::Instant::now();
 
-    let output = Command::new("timeout")
+    let output = command_env
+        .timeout_command()
         .arg("30s")
         .arg("bash")
         .arg("install.sh")
@@ -264,7 +264,9 @@ fn install_easy_mode_end_to_end() {
     );
 
     // Verify installed binary runs
-    let help_output = Command::new(&bin)
+    let mut help_command = std::process::Command::new(&bin);
+    command_env.apply_to_std(&mut help_command);
+    let help_output = help_command
         .arg("--help")
         .output()
         .expect("run binary --help");
@@ -308,7 +310,7 @@ fn install_basic_mode() {
     skip_unless_install_tests!();
 
     let tracker = tracker_for("install_basic_mode");
-    let _trace_guard = tracker.trace_env_guard();
+    let command_env = tracker.command_environment();
 
     let phase_start = tracker.start("setup", Some("Create isolated test environment"));
     let fix = InstallFixture::new();
@@ -321,7 +323,8 @@ fn install_basic_mode() {
     let phase_start = tracker.start("run_install", Some("Run install.sh in basic mode"));
     let install_start = std::time::Instant::now();
 
-    let output = Command::new("timeout")
+    let output = command_env
+        .timeout_command()
         .arg("30s")
         .arg("bash")
         .arg("install.sh")
@@ -360,10 +363,9 @@ fn install_basic_mode() {
     assert!(bin.exists(), "Binary not found at {}", bin.display());
 
     // Verify binary runs
-    let help_output = Command::new(&bin)
-        .arg("--help")
-        .output()
-        .expect("run --help");
+    let mut help_command = std::process::Command::new(&bin);
+    command_env.apply_to_std(&mut help_command);
+    let help_output = help_command.arg("--help").output().expect("run --help");
     assert!(
         help_output.status.success(),
         "Installed binary --help should succeed"
@@ -387,7 +389,7 @@ fn install_quiet_mode() {
     skip_unless_install_tests!();
 
     let tracker = tracker_for("install_quiet_mode");
-    let _trace_guard = tracker.trace_env_guard();
+    let command_env = tracker.command_environment();
 
     let phase_start = tracker.start("setup", Some("Create isolated test environment"));
     let fix = InstallFixture::new();
@@ -399,7 +401,8 @@ fn install_quiet_mode() {
 
     let phase_start = tracker.start("run_install", Some("Run install.sh with --quiet"));
 
-    let output = Command::new("timeout")
+    let output = command_env
+        .timeout_command()
         .arg("30s")
         .arg("bash")
         .arg("install.sh")
@@ -457,7 +460,7 @@ fn install_checksum_mismatch_fails() {
     skip_unless_install_tests!();
 
     let tracker = tracker_for("install_checksum_mismatch_fails");
-    let _trace_guard = tracker.trace_env_guard();
+    let command_env = tracker.command_environment();
 
     let phase_start = tracker.start("setup", Some("Create isolated test environment"));
     let fix = InstallFixture::new();
@@ -472,7 +475,8 @@ fn install_checksum_mismatch_fails() {
     // Use an invalid checksum
     let bad_checksum = "0000000000000000000000000000000000000000000000000000000000000000";
 
-    let output = Command::new("timeout")
+    let output = command_env
+        .timeout_command()
         .arg("30s")
         .arg("bash")
         .arg("install.sh")
@@ -531,7 +535,7 @@ fn install_missing_artifact_fails() {
     skip_unless_install_tests!();
 
     let tracker = tracker_for("install_missing_artifact_fails");
-    let _trace_guard = tracker.trace_env_guard();
+    let command_env = tracker.command_environment();
 
     let phase_start = tracker.start("setup", Some("Create isolated test environment"));
     let fix = InstallFixture::new();
@@ -546,7 +550,8 @@ fn install_missing_artifact_fails() {
     // Use a non-existent file URL
     let bad_url = "file:///nonexistent/path/to/artifact.tar.gz";
 
-    let output = Command::new("timeout")
+    let output = command_env
+        .timeout_command()
         .arg("30s")
         .arg("bash")
         .arg("install.sh")
@@ -592,11 +597,12 @@ fn install_help_flag() {
     skip_unless_install_tests!();
 
     let tracker = tracker_for("install_help_flag");
-    let _trace_guard = tracker.trace_env_guard();
+    let command_env = tracker.command_environment();
 
     let phase_start = tracker.start("run_help", Some("Run install.sh --help"));
 
-    let output = Command::new("bash")
+    let output = command_env
+        .bash_command()
         .arg("install.sh")
         .arg("--help")
         .output()
@@ -636,7 +642,7 @@ fn install_lock_prevents_concurrent() {
     skip_unless_install_tests!();
 
     let tracker = tracker_for("install_lock_prevents_concurrent");
-    let _trace_guard = tracker.trace_env_guard();
+    let command_env = tracker.command_environment();
 
     let phase_start = tracker.start("setup", Some("Create isolated test environment"));
     let fix = InstallFixture::new();
@@ -658,7 +664,8 @@ fn install_lock_prevents_concurrent() {
 
     let phase_start = tracker.start("run_install", Some("Run install.sh with lock held"));
 
-    let output = Command::new("timeout")
+    let output = command_env
+        .timeout_command()
         .arg("5s")
         .arg("bash")
         .arg("install.sh")
@@ -712,7 +719,7 @@ fn install_creates_expected_artifacts() {
     skip_unless_install_tests!();
 
     let tracker = tracker_for("install_creates_expected_artifacts");
-    let _trace_guard = tracker.trace_env_guard();
+    let command_env = tracker.command_environment();
 
     let phase_start = tracker.start("setup", Some("Create isolated test environment"));
     let fix = InstallFixture::new();
@@ -724,7 +731,8 @@ fn install_creates_expected_artifacts() {
 
     let phase_start = tracker.start("run_install", Some("Run install.sh"));
 
-    let output = Command::new("timeout")
+    let output = command_env
+        .timeout_command()
         .arg("30s")
         .arg("bash")
         .arg("install.sh")

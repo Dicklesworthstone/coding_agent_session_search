@@ -263,7 +263,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 #[test]
 fn e2e_github_prerequisites_validation() {
     let tracker = tracker_for("e2e_github_prerequisites_validation");
-    let _guard = tracker.trace_env_guard();
 
     // Test 1: All prerequisites met
     let start = tracker.start("all_ready", Some("Test prerequisites all ready"));
@@ -340,7 +339,6 @@ fn e2e_github_prerequisites_validation() {
 #[test]
 fn e2e_github_size_check() -> Result<()> {
     let tracker = tracker_for("e2e_github_size_check");
-    let _guard = tracker.trace_env_guard();
 
     let temp_dir = TempDir::new()?;
 
@@ -379,7 +377,6 @@ fn e2e_github_size_check() -> Result<()> {
 #[test]
 fn e2e_local_git_orphan_branch_workflow() -> Result<()> {
     let tracker = tracker_for("e2e_local_git_orphan_branch_workflow");
-    let _guard = tracker.trace_env_guard();
 
     let temp_dir = TempDir::new()?;
 
@@ -446,7 +443,6 @@ fn e2e_local_git_orphan_branch_workflow() -> Result<()> {
 #[test]
 fn e2e_local_git_bundle_copy_integrity() -> Result<()> {
     let tracker = tracker_for("e2e_local_git_bundle_copy_integrity");
-    let _guard = tracker.trace_env_guard();
 
     let temp_dir = TempDir::new()?;
 
@@ -513,7 +509,6 @@ fn e2e_local_git_bundle_copy_integrity() -> Result<()> {
 #[test]
 fn e2e_cloudflare_prerequisites_validation() {
     let tracker = tracker_for("e2e_cloudflare_prerequisites_validation");
-    let _guard = tracker.trace_env_guard();
 
     // Test 1: All prerequisites met with interactive auth
     let start = tracker.start("interactive_auth", Some("Test with interactive auth"));
@@ -588,7 +583,6 @@ fn e2e_cloudflare_prerequisites_validation() {
 #[test]
 fn e2e_cloudflare_headers_generation() -> Result<()> {
     let tracker = tracker_for("e2e_cloudflare_headers_generation");
-    let _guard = tracker.trace_env_guard();
 
     let temp_dir = TempDir::new()?;
     let bundle_dir = temp_dir.path().join("bundle");
@@ -656,7 +650,6 @@ fn e2e_cloudflare_headers_generation() -> Result<()> {
 #[test]
 fn e2e_cloudflare_redirects_generation() -> Result<()> {
     let tracker = tracker_for("e2e_cloudflare_redirects_generation");
-    let _guard = tracker.trace_env_guard();
 
     let temp_dir = TempDir::new()?;
     let bundle_dir = temp_dir.path().join("bundle");
@@ -699,7 +692,6 @@ fn e2e_cloudflare_redirects_generation() -> Result<()> {
 #[test]
 fn e2e_full_deploy_bundle_preparation() -> Result<()> {
     let tracker = tracker_for("e2e_full_deploy_bundle_preparation");
-    let _guard = tracker.trace_env_guard();
 
     let temp_dir = TempDir::new()?;
 
@@ -768,7 +760,6 @@ fn e2e_full_deploy_bundle_preparation() -> Result<()> {
 #[test]
 fn e2e_deploy_error_paths() -> Result<()> {
     let tracker = tracker_for("e2e_deploy_error_paths");
-    let _guard = tracker.trace_env_guard();
 
     let _temp_dir = TempDir::new()?;
 

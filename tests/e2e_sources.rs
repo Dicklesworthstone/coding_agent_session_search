@@ -9,18 +9,16 @@
 //!
 //! Note: Tests that require actual SSH connectivity are marked #[ignore].
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 mod util;
-use util::EnvGuard;
-use util::e2e_log::PhaseTracker;
+use util::e2e_log::{E2eCommandEnvironment, PhaseTracker};
 
 fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_sources", test_name)
@@ -132,7 +130,6 @@ fn seed_archive_conversation(db_path: &Path, agent_slug: &str, marker: &str) {
 #[test]
 fn sources_list_empty() {
     let tracker = tracker_for("sources_list_empty");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create temp config directory"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -140,11 +137,11 @@ fn sources_list_empty() {
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&config_dir).unwrap();
     fs::create_dir_all(&data_dir).unwrap();
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp config directory"), start);
 
     let start = tracker.start("run_sources_list", Some("Run sources list with no config"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "list"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -176,7 +173,6 @@ fn sources_list_empty() {
 #[test]
 fn sources_list_with_sources() {
     let tracker = tracker_for("sources_list_with_sources");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with one source"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -193,11 +189,11 @@ paths = ["~/.claude/projects"]
 sync_schedule = "manual"
 "#,
     );
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with one source"), start);
 
     let start = tracker.start("run_sources_list", Some("Run sources list"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "list"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -228,20 +224,18 @@ sync_schedule = "manual"
 #[test]
 fn sources_agents_exclude_and_list_json() -> Result<(), Box<dyn std::error::Error>> {
     let tracker = tracker_for("sources_agents_exclude_and_list_json");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new()?;
     let config_dir = tmp.path().join("config");
     let data_dir = cass_data_dir(&tmp.path().join("data"));
     fs::create_dir_all(&config_dir)?;
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("CASS_DATA_DIR", data_dir.to_string_lossy());
 
     let start = tracker.start(
         "exclude_agent",
         Some("Exclude openclaw from future indexing runs"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "agents",
@@ -271,7 +265,8 @@ fn sources_agents_exclude_and_list_json() -> Result<(), Box<dyn std::error::Erro
     );
 
     let start = tracker.start("list_agents_json", Some("List excluded agents in JSON"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "agents", "list", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
@@ -290,7 +285,8 @@ fn sources_agents_exclude_and_list_json() -> Result<(), Box<dyn std::error::Erro
     let json: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(json["disabled_agents"], serde_json::json!(["openclaw"]));
 
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "list", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
@@ -306,19 +302,18 @@ fn sources_agents_exclude_and_list_json() -> Result<(), Box<dyn std::error::Erro
 #[test]
 fn sources_agents_include_removes_existing_exclusion() {
     let tracker = tracker_for("sources_agents_include_removes_existing_exclusion");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
     create_sources_config(&config_dir, "disabled_agents = [\"openclaw\"]\n");
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
 
     let start = tracker.start(
         "include_agent",
         Some("Re-enable openclaw for future indexing runs"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "agents", "include", "openclaw"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -335,7 +330,8 @@ fn sources_agents_include_removes_existing_exclusion() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "agents", "list", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -350,7 +346,6 @@ fn sources_agents_include_removes_existing_exclusion() {
 #[test]
 fn sources_agents_exclude_purges_local_archive_data_by_default() {
     let tracker = tracker_for("sources_agents_exclude_purges_local_archive_data_by_default");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
@@ -359,13 +354,12 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
     fs::create_dir_all(&config_dir).unwrap();
     fs::create_dir_all(&data_dir).unwrap();
     let db_path = data_dir.join("agent_search.db");
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("CASS_DATA_DIR", data_dir.to_string_lossy());
 
     seed_archive_conversation(&db_path, "openclaw", "purge-me");
     seed_archive_conversation(&db_path, "codex", "keep-me");
 
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "agents", "exclude", "openclaw"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
@@ -384,7 +378,8 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
     assert_eq!(conversations.len(), 1);
     assert_eq!(conversations[0].agent_slug, "codex");
 
-    let search_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let search_output = command
         .args(["search", "purge-me", "--robot", "--limit", "5"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
@@ -422,7 +417,8 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
         String::from_utf8_lossy(&search_output.stdout)
     );
 
-    let search_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let search_output = command
         .args(["search", "keep-me", "--robot", "--limit", "5"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
@@ -458,7 +454,6 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
 #[test]
 fn sources_list_verbose() {
     let tracker = tracker_for("sources_list_verbose");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with verbose-testable source"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -475,7 +470,6 @@ paths = ["~/.claude/projects", "~/.codex/sessions"]
 sync_schedule = "daily"
 "#,
     );
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create config with verbose-testable source"),
@@ -486,7 +480,8 @@ sync_schedule = "daily"
         "run_sources_list_verbose",
         Some("Run sources list --verbose"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "list", "--verbose"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -526,7 +521,6 @@ sync_schedule = "daily"
 #[test]
 fn sources_list_json() {
     let tracker = tracker_for("sources_list_json");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config for JSON output test"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -544,12 +538,11 @@ host = "user@laptop.local"
 paths = ["~/.claude/projects"]
 "#,
     );
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
     tracker.end("setup", Some("Create config for JSON output test"), start);
 
     let start = tracker.start("run_sources_list_json", Some("Run sources list --json"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "list", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -607,17 +600,16 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_add_no_test() {
     let tracker = tracker_for("sources_add_no_test");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create temp config directory"));
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp config directory"), start);
 
     let start = tracker.start("run_sources_add", Some("Run sources add with --no-test"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "add",
@@ -673,20 +665,19 @@ fn sources_add_no_test() {
 #[test]
 fn sources_add_explicit_paths() {
     let tracker = tracker_for("sources_add_explicit_paths");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create temp config directory"));
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp config directory"), start);
 
     let start = tracker.start(
         "run_sources_add",
         Some("Run sources add with explicit paths"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "add",
@@ -736,17 +727,16 @@ fn sources_add_explicit_paths() {
 #[test]
 fn sources_add_no_paths_error() {
     let tracker = tracker_for("sources_add_no_paths_error");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create temp config directory"));
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp config directory"), start);
 
     let start = tracker.start("run_sources_add", Some("Run sources add without paths"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "add",
@@ -784,7 +774,6 @@ fn sources_add_no_paths_error() {
 #[test]
 fn sources_add_duplicate_error() {
     let tracker = tracker_for("sources_add_duplicate_error");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with existing source"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -800,14 +789,14 @@ host = "user@laptop.local"
 paths = ["~/.claude/projects"]
 "#,
     );
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with existing source"), start);
 
     let start = tracker.start(
         "run_sources_add_duplicate",
         Some("Add source with duplicate name"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "add",
@@ -847,20 +836,19 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_add_reserved_local_name_error() {
     let tracker = tracker_for("sources_add_reserved_local_name_error");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create temp config directory"));
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp config directory"), start);
 
     let start = tracker.start(
         "run_sources_add_reserved_local",
         Some("Attempt to add source named local"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "add",
@@ -900,7 +888,6 @@ fn sources_add_reserved_local_name_error() {
 #[test]
 fn sources_add_duplicate_error_case_insensitive() {
     let tracker = tracker_for("sources_add_duplicate_error_case_insensitive");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start(
         "setup",
@@ -919,7 +906,6 @@ host = "user@laptop.local"
 paths = ["~/.claude/projects"]
 "#,
     );
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create config with existing mixed-case source"),
@@ -930,7 +916,8 @@ paths = ["~/.claude/projects"]
         "run_sources_add_duplicate",
         Some("Add source with duplicate name differing only by case"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "add",
@@ -977,20 +964,19 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_add_invalid_url() {
     let tracker = tracker_for("sources_add_invalid_url");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create temp config directory"));
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp config directory"), start);
 
     let start = tracker.start(
         "run_sources_add_invalid",
         Some("Add source with invalid URL"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "add",
@@ -1028,17 +1014,16 @@ fn sources_add_invalid_url() {
 #[test]
 fn sources_add_auto_name() {
     let tracker = tracker_for("sources_add_auto_name");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create temp config directory"));
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp config directory"), start);
 
     let start = tracker.start("run_sources_add", Some("Add source without explicit name"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "add",
@@ -1081,20 +1066,19 @@ fn sources_add_auto_name() {
 #[test]
 fn sources_add_auto_name_disambiguates_reserved_local() {
     let tracker = tracker_for("sources_add_auto_name_disambiguates_reserved_local");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create temp config directory"));
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp config directory"), start);
 
     let start = tracker.start(
         "run_sources_add",
         Some("Add source without explicit name for reserved local hostname"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "add",
@@ -1148,7 +1132,6 @@ fn sources_add_auto_name_disambiguates_reserved_local() {
 #[test]
 fn sources_remove_basic() {
     let tracker = tracker_for("sources_remove_basic");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with two sources"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1172,11 +1155,11 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with two sources"), start);
 
     let start = tracker.start("run_sources_remove", Some("Remove laptop source"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "remove", "laptop", "-y"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -1216,7 +1199,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_remove_nonexistent() {
     let tracker = tracker_for("sources_remove_nonexistent");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with one source"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1234,11 +1216,11 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with one source"), start);
 
     let start = tracker.start("run_sources_remove", Some("Remove nonexistent source"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "remove", "nonexistent", "-y"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -1270,7 +1252,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_remove_with_purge() {
     let tracker = tracker_for("sources_remove_with_purge");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start(
         "setup",
@@ -1298,8 +1279,6 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create config and data directory for purge test"),
@@ -1310,7 +1289,8 @@ paths = ["~/.claude/projects"]
         "run_sources_remove_purge",
         Some("Remove source with --purge"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "remove", "laptop", "--purge", "-y"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -1353,7 +1333,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_remove_with_purge_case_insensitive_uses_stored_name() {
     let tracker = tracker_for("sources_remove_with_purge_case_insensitive_uses_stored_name");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start(
         "setup",
@@ -1398,8 +1377,6 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create mixed-case config and matching data directory for purge test"),
@@ -1410,7 +1387,8 @@ paths = ["~/.claude/projects"]
         "run_sources_remove_purge",
         Some("Remove mixed-case source with lowercase filter and --purge"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "remove", "laptop", "--purge", "-y"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -1460,7 +1438,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_remove_prompt_uses_stored_name_case_insensitive() {
     let tracker = tracker_for("sources_remove_prompt_uses_stored_name_case_insensitive");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with mixed-case source"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1478,14 +1455,13 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with mixed-case source"), start);
 
     let start = tracker.start(
         "run_sources_remove_cancelled",
         Some("Run interactive remove with lowercase filter and cancel it"),
     );
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    let mut cmd = tracker.cass_std_command();
     cmd.args(["sources", "remove", "laptop"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .stdin(Stdio::piped())
@@ -1540,21 +1516,20 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_doctor_no_sources() {
     let tracker = tracker_for("sources_doctor_no_sources");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create empty config directory"));
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create empty config directory"), start);
 
     let start = tracker.start(
         "run_sources_doctor",
         Some("Run sources doctor with no sources"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "doctor"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -1587,7 +1562,6 @@ fn sources_doctor_no_sources() {
 #[test]
 fn sources_doctor_json() {
     let tracker = tracker_for("sources_doctor_json");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start(
         "setup",
@@ -1608,7 +1582,6 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create config with one source for doctor JSON"),
@@ -1616,7 +1589,8 @@ paths = ["~/.claude/projects"]
     );
 
     let start = tracker.start("run_sources_doctor_json", Some("Run sources doctor --json"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "doctor", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -1679,7 +1653,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_doctor_single_source() {
     let tracker = tracker_for("sources_doctor_single_source");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with two sources"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1703,14 +1676,14 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with two sources"), start);
 
     let start = tracker.start(
         "run_sources_doctor_filtered",
         Some("Run doctor filtered to laptop"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "doctor", "--source", "laptop", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -1752,7 +1725,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_doctor_health_unreachable_is_mutation_free_and_safe() {
     let tracker = tracker_for("sources_doctor_health_unreachable_is_mutation_free_and_safe");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Config with an unreachable remote"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1774,12 +1746,12 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     let before = read_sources_config(&config_dir);
     tracker.end("setup", Some("Config with an unreachable remote"), start);
 
     let start = tracker.start("run", Some("Run sources doctor --json"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "doctor", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
@@ -1854,7 +1826,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_doctor_unreachable_omits_unprobed_remote_binary_8_7() {
     let tracker = tracker_for("sources_doctor_unreachable_omits_unprobed_remote_binary_8_7");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Config with an unreachable remote"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1876,12 +1847,12 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     let before = read_sources_config(&config_dir);
     tracker.end("setup", Some("Config with an unreachable remote"), start);
 
     let start = tracker.start("run", Some("Run sources doctor --json"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "doctor", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
@@ -1935,7 +1906,6 @@ paths = ["~/.claude/projects"]
 fn sources_doctor_budget_exhaustion_is_bounded_explicit_and_mutation_free() {
     let tracker =
         tracker_for("sources_doctor_budget_exhaustion_is_bounded_explicit_and_mutation_free");
-    let _trace_guard = tracker.trace_env_guard();
 
     let setup_start = tracker.start(
         "setup",
@@ -2025,7 +1995,7 @@ paths = ["~/.codex/sessions"]
         Some("Run real sources doctor JSON surface with a one-millisecond budget"),
     );
     let wall_start = std::time::Instant::now();
-    let mut robot_cmd = Command::new(util::cass_bin());
+    let mut robot_cmd = tracker.cass_std_command();
     robot_cmd
         .args(["sources", "doctor", "--json"])
         .current_dir(tmp.path())
@@ -2128,7 +2098,7 @@ paths = ["~/.codex/sessions"]
         "human_budget",
         Some("Run human surface and verify parity with the robot timeout contract"),
     );
-    let mut human_cmd = Command::new(util::cass_bin());
+    let mut human_cmd = tracker.cass_std_command();
     human_cmd
         .args(["sources", "doctor"])
         .current_dir(tmp.path())
@@ -2222,7 +2192,6 @@ paths = ["~/.codex/sessions"]
 fn sources_doctor_rejects_unbounded_fixture_delay_before_network_or_mutation() {
     let tracker =
         tracker_for("sources_doctor_rejects_unbounded_fixture_delay_before_network_or_mutation");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().expect("create invalid-delay fixture root");
     let config_dir = tmp.path().join("config");
@@ -2262,7 +2231,7 @@ paths = ["~/.claude/projects"]
         "reject",
         Some("Run real binary and reject delay above the fixed fixture ceiling"),
     );
-    let mut cmd = Command::new(util::cass_bin());
+    let mut cmd = tracker.cass_std_command();
     cmd.args(["sources", "doctor", "--json"])
         .current_dir(tmp.path())
         .env("HOME", tmp.path())
@@ -2327,6 +2296,7 @@ struct ReachableDoctorScenario {
 }
 
 fn prove_reachable_source_doctor_scenario(
+    command_env: &E2eCommandEnvironment,
     fixture_root: &Path,
     scenario: ReachableDoctorScenario,
 ) -> Result<(), String> {
@@ -2437,7 +2407,7 @@ paths = ["~/.claude/projects"]
     let mirror_members_before = directory_membership(&mirror_dir)
         .map_err(|err| format!("{}: list mirror dir: {err}", scenario.expected_state))?;
 
-    let mut cmd = Command::new(util::cass_bin());
+    let mut cmd = command_env.cass_std_command();
     cmd.args(["sources", "doctor", "--json"])
         .current_dir(&case_root)
         .env("HOME", &case_root)
@@ -2587,7 +2557,7 @@ paths = ["~/.claude/projects"]
         }
     }
 
-    let mut human_cmd = Command::new(util::cass_bin());
+    let mut human_cmd = command_env.cass_std_command();
     human_cmd
         .args(["sources", "doctor"])
         .current_dir(&case_root)
@@ -2676,6 +2646,8 @@ paths = ["~/.claude/projects"]
 /// serialize the robot envelope.
 #[test]
 fn sources_doctor_reachable_states_use_live_real_binary_reduction() -> Result<(), String> {
+    let tracker = tracker_for("sources_doctor_reachable_states_use_live_real_binary_reduction");
+    let command_env = tracker.command_environment();
     let scenarios = [
         ReachableDoctorScenario {
             expected_state: "cass_missing",
@@ -2730,9 +2702,10 @@ fn sources_doctor_reachable_states_use_live_real_binary_reduction() -> Result<()
     let tmp = tempfile::tempdir().map_err(|err| format!("create fixture root: {err}"))?;
 
     for scenario in scenarios {
-        prove_reachable_source_doctor_scenario(tmp.path(), scenario)?;
+        prove_reachable_source_doctor_scenario(&command_env, tmp.path(), scenario)?;
     }
 
+    tracker.complete();
     Ok(())
 }
 
@@ -2744,7 +2717,6 @@ fn sources_doctor_reachable_states_use_live_real_binary_reduction() -> Result<()
 #[test]
 fn sources_sync_no_sources() {
     let tracker = tracker_for("sources_sync_no_sources");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create empty config and data directories"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -2753,8 +2725,6 @@ fn sources_sync_no_sources() {
     fs::create_dir_all(&config_dir).unwrap();
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create empty config and data directories"),
@@ -2762,7 +2732,8 @@ fn sources_sync_no_sources() {
     );
 
     let start = tracker.start("run_sources_sync", Some("Run sources sync with no sources"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "sync"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -2795,7 +2766,6 @@ fn sources_sync_no_sources() {
 #[test]
 fn sources_sync_dry_run() {
     let tracker = tracker_for("sources_sync_dry_run");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with one source for dry-run"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -2815,8 +2785,6 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create config with one source for dry-run"),
@@ -2827,7 +2795,8 @@ paths = ["~/.claude/projects"]
         "run_sources_sync_dry_run",
         Some("Run sources sync --dry-run"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "sync", "--dry-run"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -2863,7 +2832,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_sync_single_source() {
     let tracker = tracker_for("sources_sync_single_source");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start(
         "setup",
@@ -2892,8 +2860,6 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create config with two sources for filtered sync"),
@@ -2904,7 +2870,8 @@ paths = ["~/.claude/projects"]
         "run_sources_sync_filtered",
         Some("Run sync filtered to laptop"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "sync", "--source", "laptop", "--dry-run"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -2943,7 +2910,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_sync_json() {
     let tracker = tracker_for("sources_sync_json");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config for sync JSON test"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -2963,15 +2929,14 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
     tracker.end("setup", Some("Create config for sync JSON test"), start);
 
     let start = tracker.start(
         "run_sources_sync_json",
         Some("Run sources sync --json --dry-run"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "sync", "--json", "--dry-run"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -3051,7 +3016,8 @@ paths = ["~/.claude/projects"]
             "each path should include failure_reason: {paths:?}"
         );
 
-        let env_output = cargo_bin_cmd!("cass")
+        let mut command = tracker.cass_assert_command();
+        let env_output = command
             .args(["sources", "sync", "--dry-run"])
             .env("XDG_CONFIG_HOME", &config_dir)
             .env("XDG_DATA_HOME", &data_dir)
@@ -3090,19 +3056,18 @@ paths = ["~/.claude/projects"]
 #[test]
 fn sources_workflow_add_list_remove() {
     let tracker = tracker_for("sources_workflow_add_list_remove");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create temp config directory"));
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp config directory"), start);
 
     // 1. Add a source
     let start = tracker.start("add_source", Some("Add server source"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "add",
@@ -3129,7 +3094,8 @@ fn sources_workflow_add_list_remove() {
         "list_sources",
         Some("List sources and verify server present"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "list"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -3150,7 +3116,8 @@ fn sources_workflow_add_list_remove() {
 
     // 3. Remove the source
     let start = tracker.start("remove_source", Some("Remove server source"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "remove", "server", "-y"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -3165,7 +3132,8 @@ fn sources_workflow_add_list_remove() {
 
     // 4. List again - should be empty
     let start = tracker.start("verify_empty", Some("Verify source was removed"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "list"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -3190,19 +3158,18 @@ fn sources_workflow_add_list_remove() {
 #[test]
 fn sources_multiple_add_list() {
     let tracker = tracker_for("sources_multiple_add_list");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create temp config directory"));
     let tmp = tempfile::TempDir::new().unwrap();
     let config_dir = tmp.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp config directory"), start);
 
     // Add first source
     let start = tracker.start("add_laptop", Some("Add laptop source"));
-    cargo_bin_cmd!("cass")
+    tracker
+        .cass_assert_command()
         .args([
             "sources",
             "add",
@@ -3220,7 +3187,8 @@ fn sources_multiple_add_list() {
 
     // Add second source
     let start = tracker.start("add_workstation", Some("Add workstation source"));
-    cargo_bin_cmd!("cass")
+    tracker
+        .cass_assert_command()
         .args([
             "sources",
             "add",
@@ -3238,7 +3206,8 @@ fn sources_multiple_add_list() {
 
     // List all sources
     let start = tracker.start("verify_list", Some("List sources and verify both present"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "list", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -3274,7 +3243,6 @@ fn sources_multiple_add_list() {
 #[test]
 fn mappings_list_empty() {
     let tracker = tracker_for("mappings_list_empty");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with source but no mappings"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3292,7 +3260,6 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create config with source but no mappings"),
@@ -3300,7 +3267,8 @@ paths = ["~/.claude/projects"]
     );
 
     let start = tracker.start("run_mappings_list", Some("Run mappings list for laptop"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "mappings", "list", "laptop"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -3336,7 +3304,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn mappings_list_with_mappings() {
     let tracker = tracker_for("mappings_list_with_mappings");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with source and path mapping"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3358,7 +3325,6 @@ to = "/Users/me/projects"
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create config with source and path mapping"),
@@ -3366,7 +3332,8 @@ to = "/Users/me/projects"
     );
 
     let start = tracker.start("run_mappings_list", Some("Run mappings list for laptop"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "mappings", "list", "laptop"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -3402,7 +3369,6 @@ to = "/Users/me/projects"
 #[test]
 fn mappings_list_json() {
     let tracker = tracker_for("mappings_list_json");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with mapping for JSON test"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3424,7 +3390,6 @@ to = "/Users/me/projects"
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create config with mapping for JSON test"),
@@ -3432,7 +3397,8 @@ to = "/Users/me/projects"
     );
 
     let start = tracker.start("run_mappings_list_json", Some("Run mappings list --json"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "mappings", "list", "laptop", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -3470,7 +3436,6 @@ to = "/Users/me/projects"
 #[test]
 fn mappings_list_nonexistent_source() {
     let tracker = tracker_for("mappings_list_nonexistent_source");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with laptop source"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3488,14 +3453,14 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with laptop source"), start);
 
     let start = tracker.start(
         "run_mappings_list",
         Some("List mappings for nonexistent source"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "mappings", "list", "nonexistent"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -3530,7 +3495,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn mappings_add_basic() {
     let tracker = tracker_for("mappings_add_basic");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with laptop source"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3548,11 +3512,11 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with laptop source"), start);
 
     let start = tracker.start("run_mappings_add", Some("Add basic path mapping"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "mappings",
@@ -3594,7 +3558,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn mappings_add_with_agents() {
     let tracker = tracker_for("mappings_add_with_agents");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with laptop source"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3612,11 +3575,11 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with laptop source"), start);
 
     let start = tracker.start("run_mappings_add", Some("Add mapping with agent filter"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "mappings",
@@ -3663,7 +3626,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn mappings_add_multiple() {
     let tracker = tracker_for("mappings_add_multiple");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with laptop source"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3681,12 +3643,12 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with laptop source"), start);
 
     // Add first mapping
     let start = tracker.start("add_first_mapping", Some("Add /home/user mapping"));
-    cargo_bin_cmd!("cass")
+    tracker
+        .cass_assert_command()
         .args([
             "sources",
             "mappings",
@@ -3704,7 +3666,8 @@ paths = ["~/.claude/projects"]
 
     // Add second mapping
     let start = tracker.start("add_second_mapping", Some("Add /opt/projects mapping"));
-    cargo_bin_cmd!("cass")
+    tracker
+        .cass_assert_command()
         .args([
             "sources",
             "mappings",
@@ -3744,7 +3707,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn mappings_add_nonexistent_source() {
     let tracker = tracker_for("mappings_add_nonexistent_source");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with laptop source"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3762,14 +3724,14 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with laptop source"), start);
 
     let start = tracker.start(
         "run_mappings_add",
         Some("Add mapping to nonexistent source"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "mappings",
@@ -3813,7 +3775,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn mappings_remove_by_index() {
     let tracker = tracker_for("mappings_remove_by_index");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with two path mappings"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3839,11 +3800,11 @@ to = "/Work"
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with two path mappings"), start);
 
     let start = tracker.start("run_mappings_remove", Some("Remove mapping at index 0"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "mappings", "remove", "laptop", "0"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -3887,7 +3848,6 @@ to = "/Work"
 #[test]
 fn mappings_remove_invalid_index() {
     let tracker = tracker_for("mappings_remove_invalid_index");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with one path mapping"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3909,14 +3869,14 @@ to = "/Users/me"
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with one path mapping"), start);
 
     let start = tracker.start(
         "run_mappings_remove",
         Some("Remove mapping at invalid index 99"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "mappings", "remove", "laptop", "99"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -3951,7 +3911,6 @@ to = "/Users/me"
 #[test]
 fn mappings_remove_from_empty() {
     let tracker = tracker_for("mappings_remove_from_empty");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with no mappings"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3969,14 +3928,14 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with no mappings"), start);
 
     let start = tracker.start(
         "run_mappings_remove",
         Some("Remove from empty mappings list"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "mappings", "remove", "laptop", "0"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -4011,7 +3970,6 @@ paths = ["~/.claude/projects"]
 #[test]
 fn mappings_test_match() {
     let tracker = tracker_for("mappings_test_match");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with path mapping"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -4033,11 +3991,11 @@ to = "/Users/me/projects"
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with path mapping"), start);
 
     let start = tracker.start("run_mappings_test", Some("Test path that matches mapping"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "mappings",
@@ -4079,7 +4037,6 @@ to = "/Users/me/projects"
 #[test]
 fn mappings_test_no_match() {
     let tracker = tracker_for("mappings_test_no_match");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with path mapping"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -4101,14 +4058,14 @@ to = "/Users/me/projects"
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with path mapping"), start);
 
     let start = tracker.start(
         "run_mappings_test",
         Some("Test path that does not match mapping"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "mappings",
@@ -4154,7 +4111,6 @@ to = "/Users/me/projects"
 #[test]
 fn mappings_test_with_agent() {
     let tracker = tracker_for("mappings_test_with_agent");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with agent-filtered mapping"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -4177,7 +4133,6 @@ agents = ["claude_code"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create config with agent-filtered mapping"),
@@ -4189,7 +4144,8 @@ agents = ["claude_code"]
         "run_mappings_test",
         Some("Test mapping with matching agent"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "mappings",
@@ -4240,7 +4196,6 @@ agents = ["claude_code"]
 #[test]
 fn mappings_workflow_complete() {
     let tracker = tracker_for("mappings_workflow_complete");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("setup", Some("Create config with laptop source"));
     let tmp = tempfile::TempDir::new().unwrap();
@@ -4258,12 +4213,12 @@ paths = ["~/.claude/projects"]
 "#,
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with laptop source"), start);
 
     // 1. Add a mapping
     let start = tracker.start("add_mapping", Some("Add path mapping"));
-    cargo_bin_cmd!("cass")
+    tracker
+        .cass_assert_command()
         .args([
             "sources",
             "mappings",
@@ -4281,7 +4236,8 @@ paths = ["~/.claude/projects"]
 
     // 2. List mappings - should show the added mapping
     let start = tracker.start("list_mappings", Some("List mappings and verify added"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "mappings", "list", "laptop"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()
@@ -4302,7 +4258,8 @@ paths = ["~/.claude/projects"]
 
     // 3. Test the mapping
     let start = tracker.start("test_mapping", Some("Test path rewriting"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "mappings",
@@ -4325,7 +4282,8 @@ paths = ["~/.claude/projects"]
 
     // 4. Remove the mapping
     let start = tracker.start("remove_mapping", Some("Remove the mapping"));
-    cargo_bin_cmd!("cass")
+    tracker
+        .cass_assert_command()
         .args(["sources", "mappings", "remove", "laptop", "0"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .assert()
@@ -4334,7 +4292,8 @@ paths = ["~/.claude/projects"]
 
     // 5. List again - should be empty
     let start = tracker.start("verify_empty", Some("Verify mapping was removed"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "mappings", "list", "laptop"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .output()

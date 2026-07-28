@@ -6,12 +6,10 @@
 //! - Workspace filter (--workspace)
 //! - Combined filters
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use std::fs;
 use std::path::Path;
 
 mod util;
-use util::EnvGuard;
 use util::e2e_log::{E2ePerformanceMetrics, PhaseTracker};
 
 fn tracker_for(test_name: &str) -> PhaseTracker {
@@ -54,7 +52,6 @@ fn make_claude_session_at(claude_home: &Path, project_name: &str, content: &str,
 #[test]
 fn filter_by_agent_codex() {
     let tracker = tracker_for("filter_by_agent_codex");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
@@ -62,9 +59,10 @@ fn filter_by_agent_codex() {
     let claude_home = home.join(".claude");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     let ps = tracker.start("setup_fixtures", Some("Create codex and claude sessions"));
     make_codex_session_at(
@@ -87,7 +85,8 @@ fn filter_by_agent_codex() {
     );
 
     let ps = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -97,7 +96,8 @@ fn filter_by_agent_codex() {
     tracker.end("run_index", Some("Run full index"), ps);
 
     let ps = tracker.start("test_agent_filter", Some("Search with --agent codex"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "agenttest",
@@ -151,16 +151,16 @@ fn filter_by_agent_codex() {
 #[test]
 fn filter_by_time_since() {
     let tracker = tracker_for("filter_by_time_since");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     let ps = tracker.start("setup_fixtures", Some("Create old and new sessions"));
     make_codex_session_at(
@@ -180,7 +180,8 @@ fn filter_by_time_since() {
     tracker.end("setup_fixtures", Some("Create old and new sessions"), ps);
 
     let ps = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -190,7 +191,8 @@ fn filter_by_time_since() {
     tracker.end("run_index", Some("Run full index"), ps);
 
     let ps = tracker.start("test_since_filter", Some("Search with --since 2024-11-20"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "sincetest",
@@ -254,16 +256,16 @@ fn filter_by_time_since() {
 #[test]
 fn filter_by_time_until() {
     let tracker = tracker_for("filter_by_time_until");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     let ps = tracker.start("setup_fixtures", Some("Create old and new sessions"));
     make_codex_session_at(
@@ -283,7 +285,8 @@ fn filter_by_time_until() {
     tracker.end("setup_fixtures", Some("Create old and new sessions"), ps);
 
     let ps = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -293,7 +296,8 @@ fn filter_by_time_until() {
     tracker.end("run_index", Some("Run full index"), ps);
 
     let ps = tracker.start("test_until_filter", Some("Search with --until 2024-11-20"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "untiltest",
@@ -357,16 +361,16 @@ fn filter_by_time_until() {
 #[test]
 fn filter_by_time_range() {
     let tracker = tracker_for("filter_by_time_range");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     let ps = tracker.start(
         "setup_fixtures",
@@ -400,7 +404,8 @@ fn filter_by_time_range() {
     );
 
     let ps = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -413,7 +418,8 @@ fn filter_by_time_range() {
         "test_range_filter",
         Some("Search with --since/--until date range"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "rangetest",
@@ -482,7 +488,6 @@ fn filter_by_time_range() {
 #[test]
 fn filter_combined_agent_and_time() {
     let tracker = tracker_for("filter_combined_agent_and_time");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
@@ -490,9 +495,10 @@ fn filter_combined_agent_and_time() {
     let claude_home = home.join(".claude");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     let ps = tracker.start("setup_fixtures", Some("Create codex and claude sessions"));
     make_codex_session_at(
@@ -528,7 +534,8 @@ fn filter_combined_agent_and_time() {
     );
 
     let ps = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -541,7 +548,8 @@ fn filter_combined_agent_and_time() {
         "test_combined_filter",
         Some("Search with --agent codex --since"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "combinedtest",
@@ -611,16 +619,16 @@ fn filter_combined_agent_and_time() {
 #[test]
 fn filter_no_matches() {
     let tracker = tracker_for("filter_no_matches");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     let ps = tracker.start("setup_fixtures", Some("Create November session"));
     make_codex_session_at(
@@ -633,7 +641,8 @@ fn filter_no_matches() {
     tracker.end("setup_fixtures", Some("Create November session"), ps);
 
     let ps = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -646,7 +655,8 @@ fn filter_no_matches() {
         "test_no_match_filter",
         Some("Search with impossible date filter"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "nomatchtest",
@@ -698,15 +708,13 @@ fn filter_no_matches() {
 #[test]
 fn filter_by_workspace() {
     let tracker = tracker_for("filter_by_workspace");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let claude_home = home.join(".claude");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let command_env = tracker.command_environment().with_home(home);
 
     let workspace_alpha = "/projects/workspace-alpha";
     let workspace_beta = "/projects/workspace-beta";
@@ -736,7 +744,8 @@ fn filter_by_workspace() {
     );
 
     let ps = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -748,7 +757,8 @@ fn filter_by_workspace() {
         "test_workspace_filter",
         Some("Search with --workspace filter"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "workspacetest",
@@ -811,16 +821,16 @@ fn filter_by_workspace() {
 #[test]
 fn filter_by_days() {
     let tracker = tracker_for("filter_by_days");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -846,7 +856,8 @@ fn filter_by_days() {
     tracker.end("setup_fixtures", Some("Create recent and old sessions"), ps);
 
     let ps = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -856,7 +867,8 @@ fn filter_by_days() {
     tracker.end("run_index", Some("Run full index"), ps);
 
     let ps = tracker.start("test_days_filter", Some("Search with --days 7"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["search", "daystest", "--days", "7", "--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -916,16 +928,16 @@ fn filter_by_days() {
 #[test]
 fn filter_by_source_local() {
     let tracker = tracker_for("filter_by_source_local");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     let ps = tracker.start("setup_fixtures", Some("Create local codex session"));
     make_codex_session_at(
@@ -938,7 +950,8 @@ fn filter_by_source_local() {
     tracker.end("setup_fixtures", Some("Create local codex session"), ps);
 
     let ps = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -948,7 +961,8 @@ fn filter_by_source_local() {
     tracker.end("run_index", Some("Run full index"), ps);
 
     let ps = tracker.start("test_source_local", Some("Search with --source local"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "sourcetest",
@@ -1008,16 +1022,16 @@ fn filter_by_source_local() {
 #[test]
 fn filter_by_source_specific_name() {
     let tracker = tracker_for("filter_by_source_specific_name");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create session and index", || {
         make_codex_session_at(
@@ -1027,7 +1041,8 @@ fn filter_by_source_specific_name() {
             "searchdata specifictest",
             1732118400000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1040,7 +1055,8 @@ fn filter_by_source_specific_name() {
         "test_source_specific",
         Some("Search with --source local name"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "specifictest",
@@ -1090,16 +1106,16 @@ fn filter_by_source_specific_name() {
 #[test]
 fn filter_by_source_nonexistent() {
     let tracker = tracker_for("filter_by_source_nonexistent");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create session and index", || {
         make_codex_session_at(
@@ -1109,7 +1125,8 @@ fn filter_by_source_nonexistent() {
             "somedata nonexistentsourcetest",
             1732118400000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1122,7 +1139,8 @@ fn filter_by_source_nonexistent() {
         "test_source_nonexistent",
         Some("Search with nonexistent source"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "nonexistentsourcetest",
@@ -1166,16 +1184,16 @@ fn filter_by_source_nonexistent() {
 #[test]
 fn filter_by_source_remote_empty() {
     let tracker = tracker_for("filter_by_source_remote_empty");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create local session and index", || {
         make_codex_session_at(
@@ -1185,7 +1203,8 @@ fn filter_by_source_remote_empty() {
             "localonly remotefiltertest",
             1732118400000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1195,7 +1214,8 @@ fn filter_by_source_remote_empty() {
     });
 
     let ps = tracker.start("test_source_remote", Some("Search with --source remote"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "remotefiltertest",
@@ -1239,16 +1259,16 @@ fn filter_by_source_remote_empty() {
 #[test]
 fn filter_by_source_all_explicit() {
     let tracker = tracker_for("filter_by_source_all_explicit");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create session and index", || {
         make_codex_session_at(
@@ -1258,7 +1278,8 @@ fn filter_by_source_all_explicit() {
             "allsources allsourcetest",
             1732118400000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1268,7 +1289,8 @@ fn filter_by_source_all_explicit() {
     });
 
     let ps = tracker.start("test_source_all", Some("Search with --source all"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "allsourcetest",
@@ -1305,16 +1327,16 @@ fn filter_by_source_all_explicit() {
 #[test]
 fn filter_by_source_remote_returns_empty_without_remote_indexing() {
     let tracker = tracker_for("filter_by_source_remote_returns_empty_without_remote_indexing");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create local session and index", || {
         make_codex_session_at(
@@ -1324,7 +1346,8 @@ fn filter_by_source_remote_returns_empty_without_remote_indexing() {
             "searchabledata remotefiltertest",
             1732118400000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1334,7 +1357,8 @@ fn filter_by_source_remote_returns_empty_without_remote_indexing() {
     });
 
     let ps = tracker.start("test_source_remote", Some("Search with --source remote"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "remotefiltertest",
@@ -1378,16 +1402,16 @@ fn filter_by_source_remote_returns_empty_without_remote_indexing() {
 #[test]
 fn filter_by_source_specific_unindexed_source() {
     let tracker = tracker_for("filter_by_source_specific_unindexed_source");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create local session and index", || {
         make_codex_session_at(
@@ -1397,7 +1421,8 @@ fn filter_by_source_specific_unindexed_source() {
             "searchabledata specificsourcetest",
             1732118400000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1410,7 +1435,8 @@ fn filter_by_source_specific_unindexed_source() {
         "test_source_unindexed",
         Some("Search with unindexed source name"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "specificsourcetest",
@@ -1458,16 +1484,16 @@ fn filter_by_source_specific_unindexed_source() {
 #[test]
 fn timeline_source_local() {
     let tracker = tracker_for("timeline_source_local");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create session and index", || {
         make_codex_session_at(
@@ -1477,7 +1503,8 @@ fn timeline_source_local() {
             "timelinelocal sessiondata",
             1732118400000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1490,7 +1517,8 @@ fn timeline_source_local() {
         "test_timeline_source_local",
         Some("Timeline with --source local"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["timeline", "--source", "local", "--json", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -1523,16 +1551,16 @@ fn timeline_source_local() {
 #[test]
 fn timeline_source_remote_empty() {
     let tracker = tracker_for("timeline_source_remote_empty");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create session and index", || {
         make_codex_session_at(
@@ -1542,7 +1570,8 @@ fn timeline_source_remote_empty() {
             "timelineremote sessiondata",
             1732118400000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1555,7 +1584,8 @@ fn timeline_source_remote_empty() {
         "test_timeline_source_remote",
         Some("Timeline with --source remote"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["timeline", "--source", "remote", "--json", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -1592,16 +1622,16 @@ fn timeline_source_remote_empty() {
 #[test]
 fn timeline_source_specific() {
     let tracker = tracker_for("timeline_source_specific");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create session and index", || {
         make_codex_session_at(
@@ -1611,7 +1641,8 @@ fn timeline_source_specific() {
             "timelinespecific data",
             1732118400000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1624,7 +1655,8 @@ fn timeline_source_specific() {
         "test_timeline_source_specific",
         Some("Timeline with specific source"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["timeline", "--source", "local", "--json", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -1665,16 +1697,16 @@ fn timeline_source_specific() {
 #[test]
 fn stats_source_local() {
     let tracker = tracker_for("stats_source_local");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create session and index", || {
         make_codex_session_at(
@@ -1684,7 +1716,8 @@ fn stats_source_local() {
             "statslocal data",
             1732118400000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1694,7 +1727,8 @@ fn stats_source_local() {
     });
 
     let ps = tracker.start("test_stats_source_local", Some("Stats with --source local"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["stats", "--source", "local", "--json", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -1737,16 +1771,16 @@ fn stats_source_local() {
 #[test]
 fn stats_source_remote_empty() {
     let tracker = tracker_for("stats_source_remote_empty");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create session and index", || {
         make_codex_session_at(
@@ -1756,7 +1790,8 @@ fn stats_source_remote_empty() {
             "statsremote data",
             1732118400000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1769,7 +1804,8 @@ fn stats_source_remote_empty() {
         "test_stats_source_remote",
         Some("Stats with --source remote"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["stats", "--source", "remote", "--json", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -1806,16 +1842,16 @@ fn stats_source_remote_empty() {
 #[test]
 fn stats_by_source_grouping() {
     let tracker = tracker_for("stats_by_source_grouping");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create session and index", || {
         make_codex_session_at(
@@ -1825,7 +1861,8 @@ fn stats_by_source_grouping() {
             "bysource data",
             1732118400000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1835,7 +1872,8 @@ fn stats_by_source_grouping() {
     });
 
     let ps = tracker.start("test_stats_by_source", Some("Stats with --by-source"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["stats", "--by-source", "--json", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -1877,16 +1915,16 @@ fn stats_by_source_grouping() {
 #[test]
 fn stats_by_source_with_filter() {
     let tracker = tracker_for("stats_by_source_with_filter");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     tracker.phase("setup_and_index", "Create sessions and index", || {
         make_codex_session_at(
@@ -1903,7 +1941,8 @@ fn stats_by_source_with_filter() {
             "statsbyfilter data2",
             1732204800000,
         );
-        cargo_bin_cmd!("cass")
+        command_env
+            .cass_assert_command()
             .args(["index", "--full", "--data-dir"])
             .arg(&data_dir)
             .env("CODEX_HOME", &codex_home)
@@ -1916,7 +1955,8 @@ fn stats_by_source_with_filter() {
         "test_stats_by_source_filtered",
         Some("Stats --by-source --source local"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "stats",
             "--by-source",

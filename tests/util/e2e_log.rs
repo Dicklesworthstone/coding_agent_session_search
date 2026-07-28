@@ -20,9 +20,9 @@
 //! logger.run_end(total, passed, failed, skipped, duration_ms)?;
 //! ```
 
-use super::EnvGuard;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -1179,9 +1179,21 @@ impl PhaseTracker {
         &self.artifacts.trace_id
     }
 
-    /// Set environment variables to route trace output to this test's artifacts.
-    pub fn trace_env_guard(&self) -> E2eTraceGuard {
-        E2eTraceGuard::new(&self.artifacts)
+    /// Build the immutable environment applied to subprocesses owned by this test.
+    pub fn command_environment(&self) -> E2eCommandEnvironment {
+        E2eCommandEnvironment::new(&self.artifacts)
+    }
+
+    /// Construct a `cass` subprocess with this tracker's immutable environment.
+    #[must_use]
+    pub fn cass_assert_command(&self) -> assert_cmd::Command {
+        self.command_environment().cass_assert_command()
+    }
+
+    /// Construct a standard-library `cass` subprocess with this tracker's environment.
+    #[must_use]
+    pub fn cass_std_command(&self) -> std::process::Command {
+        self.command_environment().cass_std_command()
     }
 
     /// Execute a phase and log start/end events.
@@ -1314,20 +1326,43 @@ impl PhaseTracker {
     }
 }
 
-/// Guard that configures trace env vars for a test run.
-pub struct E2eTraceGuard {
-    _trace_file: EnvGuard,
-    _trace_id: EnvGuard,
-    _trace_test_id: EnvGuard,
-    _trace_filter: EnvGuard,
-    _trace_max_bytes: EnvGuard,
-    _trace_max_events: EnvGuard,
+/// Immutable, per-child environment for E2E commands.
+///
+/// Rust integration tests share one process, so mutating the process environment
+/// can cross-route one test's child output into another test's artifacts. This
+/// value carries the complete trace contract and applies it directly to each
+/// child command instead.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct E2eCommandEnvironment {
+    trace_file: PathBuf,
+    trace_id: String,
+    trace_test_id: String,
+    home: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+    extra: Vec<(String, OsString)>,
 }
 
-impl E2eTraceGuard {
+const RESERVED_COMMAND_ENVIRONMENT_KEYS: &[&str] = &[
+    "CASS_TRACE_FILE",
+    "CASS_TRACE_ID",
+    "CASS_TRACE_TEST_ID",
+    "CASS_TRACE_FILTER",
+    "CASS_TRACE_MAX_BYTES",
+    "CASS_TRACE_MAX_EVENTS",
+    "HOME",
+    "CODEX_HOME",
+];
+
+fn is_reserved_command_environment_key(key: &str) -> bool {
+    RESERVED_COMMAND_ENVIRONMENT_KEYS
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(key))
+}
+
+#[allow(dead_code)]
+impl E2eCommandEnvironment {
     fn new(artifacts: &E2eArtifactPaths) -> Self {
-        let trace_file = artifacts.trace_path.to_string_lossy().to_string();
-        let trace_id = artifacts.trace_id.clone();
         let trace_test_id = artifacts
             .dir
             .strip_prefix(
@@ -1339,16 +1374,124 @@ impl E2eTraceGuard {
             .to_string_lossy()
             .to_string();
         Self {
-            _trace_file: EnvGuard::set("CASS_TRACE_FILE", trace_file),
-            _trace_id: EnvGuard::set("CASS_TRACE_ID", trace_id),
-            _trace_test_id: EnvGuard::set("CASS_TRACE_TEST_ID", trace_test_id),
-            _trace_filter: EnvGuard::set(
-                "CASS_TRACE_FILTER",
-                "warn,coding_agent_search=debug,cass=debug,cass::redact::memo=warn",
-            ),
-            _trace_max_bytes: EnvGuard::set("CASS_TRACE_MAX_BYTES", "524288"),
-            _trace_max_events: EnvGuard::set("CASS_TRACE_MAX_EVENTS", "4096"),
+            trace_file: artifacts.trace_path.clone(),
+            trace_id: artifacts.trace_id.clone(),
+            trace_test_id,
+            home: None,
+            codex_home: None,
+            extra: Vec::new(),
         }
+    }
+
+    /// Bind this command environment to an isolated HOME.
+    #[must_use]
+    pub fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.home = Some(home.into());
+        self
+    }
+
+    /// Bind this command environment to an isolated CODEX_HOME.
+    #[must_use]
+    pub fn with_codex_home(mut self, codex_home: impl Into<PathBuf>) -> Self {
+        self.codex_home = Some(codex_home.into());
+        self
+    }
+
+    /// Add an arbitrary child-only environment variable.
+    ///
+    /// Correlation, budget, and home keys have typed setters and cannot be
+    /// replaced through this escape hatch.
+    #[must_use]
+    pub fn with_var(mut self, key: impl Into<String>, value: impl AsRef<OsStr>) -> Self {
+        let key = key.into();
+        assert!(
+            !is_reserved_command_environment_key(&key),
+            "`{key}` is reserved by E2eCommandEnvironment"
+        );
+        self.extra.push((key, value.as_ref().to_os_string()));
+        self
+    }
+
+    fn for_each(&self, mut apply: impl FnMut(&str, &OsStr)) {
+        apply("CASS_TRACE_FILE", self.trace_file.as_os_str());
+        apply("CASS_TRACE_ID", OsStr::new(&self.trace_id));
+        apply("CASS_TRACE_TEST_ID", OsStr::new(&self.trace_test_id));
+        apply(
+            "CASS_TRACE_FILTER",
+            OsStr::new("warn,coding_agent_search=debug,cass=debug,cass::redact::memo=warn"),
+        );
+        apply("CASS_TRACE_MAX_BYTES", OsStr::new("524288"));
+        apply("CASS_TRACE_MAX_EVENTS", OsStr::new("4096"));
+        if let Some(home) = &self.home {
+            apply("HOME", home.as_os_str());
+        }
+        if let Some(codex_home) = &self.codex_home {
+            apply("CODEX_HOME", codex_home.as_os_str());
+        }
+        for (key, value) in &self.extra {
+            apply(key, value);
+        }
+    }
+
+    /// Apply the complete environment to a standard-library subprocess.
+    pub fn apply_to_std(&self, command: &mut std::process::Command) {
+        self.for_each(|key, value| {
+            command.env(key, value);
+        });
+    }
+
+    /// Apply the complete environment to an `assert_cmd` subprocess.
+    pub fn apply_to_assert(&self, command: &mut assert_cmd::Command) {
+        self.for_each(|key, value| {
+            command.env(key, value);
+        });
+    }
+
+    /// Construct a POSIX shell subprocess with this environment.
+    #[must_use]
+    pub fn sh_command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new("sh");
+        self.apply_to_std(&mut command);
+        command
+    }
+
+    /// Construct a Bash subprocess with this environment.
+    #[must_use]
+    pub fn bash_command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new("bash");
+        self.apply_to_std(&mut command);
+        command
+    }
+
+    /// Construct a timeout-wrapper subprocess with this environment.
+    #[must_use]
+    pub fn timeout_command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new("timeout");
+        self.apply_to_std(&mut command);
+        command
+    }
+
+    /// Construct an `assert_cmd` invocation of the workspace `cass` binary.
+    #[must_use]
+    pub fn cass_assert_command(&self) -> assert_cmd::Command {
+        let mut command = assert_cmd::cargo::cargo_bin_cmd!("cass");
+        self.apply_to_assert(&mut command);
+        command
+    }
+
+    /// Construct a standard-library invocation of the workspace `cass` binary.
+    #[must_use]
+    pub fn cass_std_command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        self.apply_to_std(&mut command);
+        command
+    }
+
+    /// Apply the complete environment to a PTY subprocess.
+    pub fn apply_to_pty(&self, command: &mut portable_pty::CommandBuilder) {
+        self.for_each(|key, value| {
+            command.env(key, value);
+        });
     }
 }
 
@@ -2596,6 +2739,72 @@ mod tests {
     }
 
     // ==================== PhaseTracker Tests ====================
+
+    #[test]
+    fn test_command_environment_is_complete_and_process_local() {
+        for key in RESERVED_COMMAND_ENVIRONMENT_KEYS {
+            assert!(is_reserved_command_environment_key(key));
+            assert!(is_reserved_command_environment_key(
+                &key.to_ascii_lowercase()
+            ));
+        }
+        assert!(!is_reserved_command_environment_key("XDG_DATA_HOME"));
+
+        let trace_keys = [
+            "CASS_TRACE_FILE",
+            "CASS_TRACE_ID",
+            "CASS_TRACE_TEST_ID",
+            "CASS_TRACE_FILTER",
+            "CASS_TRACE_MAX_BYTES",
+            "CASS_TRACE_MAX_EVENTS",
+        ];
+        let process_before = trace_keys.map(std::env::var_os);
+        let tracker = PhaseTracker::new("test_suite", "command_environment");
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let codex_home = temp.path().join("codex");
+        let environment = tracker
+            .command_environment()
+            .with_home(&home)
+            .with_codex_home(&codex_home);
+        let mut command = std::process::Command::new("unused-e2e-child");
+        environment.apply_to_std(&mut command);
+        let child_env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            child_env["CASS_TRACE_FILE"].as_deref(),
+            Some(tracker.artifacts().trace_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            child_env["CASS_TRACE_ID"].as_deref(),
+            Some(tracker.trace_id())
+        );
+        assert!(
+            child_env["CASS_TRACE_TEST_ID"]
+                .as_deref()
+                .is_some_and(|test_id| test_id.contains("command_environment"))
+        );
+        assert_eq!(child_env["CASS_TRACE_MAX_BYTES"].as_deref(), Some("524288"));
+        assert_eq!(child_env["CASS_TRACE_MAX_EVENTS"].as_deref(), Some("4096"));
+        assert_eq!(
+            child_env["HOME"].as_deref(),
+            Some(home.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            child_env["CODEX_HOME"].as_deref(),
+            Some(codex_home.to_string_lossy().as_ref())
+        );
+        assert_eq!(trace_keys.map(std::env::var_os), process_before);
+        tracker.complete();
+    }
 
     #[test]
     fn test_phase_tracker_new() {

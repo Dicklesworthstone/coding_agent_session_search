@@ -259,10 +259,8 @@ fn trace_collection_excludes_archived_evidence() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
-#[serial_test::serial]
 fn shell_validator_rejects_test_end_without_result_status() -> SchemaTestResult {
     let tracker = tracker_for("shell_validator_rejects_test_end_without_result_status");
-    let _trace_guard = tracker.trace_env_guard();
 
     let temp = tempfile::TempDir::new()?;
     let log_path = temp.path().join("missing_status.jsonl");
@@ -302,10 +300,8 @@ fn shell_validator_rejects_test_end_without_result_status() -> SchemaTestResult 
 }
 
 #[test]
-#[serial_test::serial]
 fn shell_validator_rejects_unversioned_trace_jsonl() -> SchemaTestResult {
     let tracker = tracker_for("shell_validator_rejects_unversioned_trace_jsonl");
-    let _trace_guard = tracker.trace_env_guard();
 
     let temp = tempfile::TempDir::new()?;
     let trace_path = temp.path().join("trace.jsonl");
@@ -338,10 +334,8 @@ fn shell_validator_rejects_unversioned_trace_jsonl() -> SchemaTestResult {
 }
 
 #[test]
-#[serial_test::serial]
 fn shell_validator_rejects_trace_without_command_outcome() -> SchemaTestResult {
     let tracker = tracker_for("shell_validator_rejects_trace_without_command_outcome");
-    let _trace_guard = tracker.trace_env_guard();
 
     let temp = tempfile::TempDir::new()?;
     let trace_path = temp.path().join("trace.jsonl");
@@ -374,10 +368,8 @@ fn shell_validator_rejects_trace_without_command_outcome() -> SchemaTestResult {
 }
 
 #[test]
-#[serial_test::serial]
 fn shell_validator_enforces_the_semantic_trace_aggregate_budget() -> SchemaTestResult {
     let tracker = tracker_for("shell_validator_enforces_the_semantic_trace_aggregate_budget");
-    let _trace_guard = tracker.trace_env_guard();
 
     let temp = tempfile::TempDir::new()?;
     let semantic_root = temp.path().join("test-results/e2e/e2e_semantic_search");
@@ -431,10 +423,8 @@ fn shell_validator_enforces_the_semantic_trace_aggregate_budget() -> SchemaTestR
 }
 
 #[test]
-#[serial_test::serial]
 fn shell_validator_default_discovery_skips_archived_logs() -> SchemaTestResult {
     let tracker = tracker_for("shell_validator_default_discovery_skips_archived_logs");
-    let _trace_guard = tracker.trace_env_guard();
 
     let repo_root = std::env::current_dir()?;
     let validator = repo_root.join("scripts/validate-e2e-jsonl.sh");
@@ -483,10 +473,8 @@ fn shell_validator_default_discovery_skips_archived_logs() -> SchemaTestResult {
 }
 
 #[test]
-#[serial_test::serial]
 fn jsonl_files_valid_schema() {
     let tracker = tracker_for("jsonl_files_valid_schema");
-    let _trace_guard = tracker.trace_env_guard();
 
     let e2e_dir = Path::new("test-results/e2e");
     if !e2e_dir.exists() {
@@ -582,10 +570,8 @@ fn jsonl_files_valid_schema() {
 }
 
 #[test]
-#[serial_test::serial]
 fn trace_jsonl_files_are_valid_correlated_and_bounded() -> SchemaTestResult {
     let tracker = tracker_for("trace_jsonl_files_are_valid_correlated_and_bounded");
-    let _trace_guard = tracker.trace_env_guard();
 
     let e2e_dir = Path::new("test-results/e2e");
     if !e2e_dir.exists() {
@@ -785,10 +771,190 @@ fn trace_jsonl_files_are_valid_correlated_and_bounded() -> SchemaTestResult {
 }
 
 #[test]
-#[serial_test::serial]
+fn e2e_subprocess_sources_cannot_mutate_the_parent_environment() -> SchemaTestResult {
+    let tracker = tracker_for("e2e_subprocess_sources_cannot_mutate_the_parent_environment");
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let sources = [
+        "tests/e2e_cli_flows.rs",
+        "tests/e2e_deploy.rs",
+        "tests/e2e_filters.rs",
+        "tests/e2e_index_tui.rs",
+        "tests/e2e_install_easy.rs",
+        "tests/e2e_jsonl_schema_test.rs",
+        "tests/e2e_large_dataset.rs",
+        "tests/e2e_multi_connector.rs",
+        "tests/e2e_pages.rs",
+        "tests/e2e_search_index.rs",
+        "tests/e2e_semantic_search.rs",
+        "tests/e2e_sources.rs",
+        "tests/e2e_ssh_sources.rs",
+        "tests/e2e_tui_smoke_flows.rs",
+        "tests/pages_preview_integration.rs",
+        "tests/util/e2e_log.rs",
+    ];
+    let forbidden = [
+        ["trace_env", "_guard"].concat(),
+        ["EnvGuard", "::set("].concat(),
+        ["std::env::", "set_var"].concat(),
+        ["std::env::", "remove_var"].concat(),
+    ];
+    let mut violations = Vec::new();
+
+    for relative in sources {
+        let path = manifest_dir.join(relative);
+        let content = fs::read_to_string(&path)?;
+        let policy_surface = if relative == "tests/util/e2e_log.rs" {
+            content
+                .split_once("#[cfg(test)]")
+                .map_or(content.as_str(), |(production, _)| production)
+        } else {
+            content.as_str()
+        };
+        for needle in &forbidden {
+            if policy_surface.contains(needle) {
+                violations.push(format!(
+                    "{relative}: forbidden process-global mutation `{needle}`"
+                ));
+            }
+        }
+    }
+
+    schema_test_require!(
+        violations.is_empty(),
+        "E2E subprocess environment policy regressed:\n{}",
+        violations.join("\n")
+    );
+    tracker.metrics(
+        "process_environment_policy",
+        &E2ePerformanceMetrics::new()
+            .with_custom("files_checked", serde_json::json!(sources.len()))
+            .with_custom("forbidden_patterns", serde_json::json!(forbidden.len())),
+    );
+    tracker.complete();
+    Ok(())
+}
+
+#[test]
+fn concurrent_children_keep_home_codex_home_and_trace_artifacts_disjoint() -> SchemaTestResult {
+    #[derive(Debug)]
+    struct Witness {
+        trace_id: String,
+        home: String,
+        codex_home: String,
+        trace_file: String,
+        witness_path: PathBuf,
+    }
+
+    fn run_witness(root: PathBuf, name: &'static str) -> Result<Witness, String> {
+        let tracker = tracker_for(name);
+        let home = root.join(name).join("home");
+        let codex_home = root.join(name).join("codex");
+        fs::create_dir_all(&home).map_err(|error| format!("create HOME: {error}"))?;
+        fs::create_dir_all(&codex_home).map_err(|error| format!("create CODEX_HOME: {error}"))?;
+        let witness_path = tracker.artifacts().dir.join("child-environment.txt");
+        let command_env = tracker
+            .command_environment()
+            .with_home(&home)
+            .with_codex_home(&codex_home);
+
+        let version = command_env
+            .cass_assert_command()
+            .arg("--version")
+            .output()
+            .map_err(|error| format!("run cass --version: {error}"))?;
+        if !version.status.success() {
+            return Err(format!(
+                "cass --version failed: {}",
+                String::from_utf8_lossy(&version.stderr)
+            ));
+        }
+
+        let output = command_env
+            .sh_command()
+            .arg("-c")
+            .arg(
+                "printf '%s\\n%s\\n%s\\n%s\\n' \
+                 \"$CASS_TRACE_ID\" \"$HOME\" \"$CODEX_HOME\" \"$CASS_TRACE_FILE\" \
+                 > \"$CASS_ENV_WITNESS\"",
+            )
+            .env("CASS_ENV_WITNESS", &witness_path)
+            .output()
+            .map_err(|error| format!("run child environment witness: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "environment witness failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let fields = fs::read_to_string(&witness_path)
+            .map_err(|error| format!("read environment witness: {error}"))?
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if fields.len() != 4 {
+            return Err(format!("expected four witness fields, got {fields:?}"));
+        }
+        let witness = Witness {
+            trace_id: fields[0].clone(),
+            home: fields[1].clone(),
+            codex_home: fields[2].clone(),
+            trace_file: fields[3].clone(),
+            witness_path,
+        };
+        tracker.complete();
+        Ok(witness)
+    }
+
+    let tracker =
+        tracker_for("concurrent_children_keep_home_codex_home_and_trace_artifacts_disjoint");
+    let tracked_keys = ["HOME", "CODEX_HOME", "CASS_TRACE_FILE", "CASS_TRACE_ID"];
+    let process_before = tracked_keys.map(std::env::var_os);
+    let tmp = tempfile::TempDir::new()?;
+    let left_root = tmp.path().to_path_buf();
+    let right_root = tmp.path().to_path_buf();
+    let left = std::thread::spawn(move || run_witness(left_root, "parallel_environment_left"));
+    let right = std::thread::spawn(move || run_witness(right_root, "parallel_environment_right"));
+    let left = left
+        .join()
+        .map_err(|_| "left environment witness panicked")??;
+    let right = right
+        .join()
+        .map_err(|_| "right environment witness panicked")??;
+
+    schema_test_require!(left.trace_id != right.trace_id, "trace IDs must be unique");
+    schema_test_require!(left.home != right.home, "HOME values must be isolated");
+    schema_test_require!(
+        left.codex_home != right.codex_home,
+        "CODEX_HOME values must be isolated"
+    );
+    schema_test_require!(
+        left.trace_file != right.trace_file,
+        "trace artifact paths must be isolated"
+    );
+    schema_test_require!(
+        left.witness_path.exists() && right.witness_path.exists(),
+        "both child-specific witness artifacts must exist"
+    );
+    schema_test_require!(
+        tracked_keys.map(std::env::var_os) == process_before,
+        "child environment application must not mutate the parent process"
+    );
+
+    tracker.metrics(
+        "parallel_environment_isolation",
+        &E2ePerformanceMetrics::new()
+            .with_custom("child_count", 2)
+            .with_custom("distinct_trace_ids", 2)
+            .with_custom("distinct_trace_files", 2),
+    );
+    tracker.complete();
+    Ok(())
+}
+
+#[test]
 fn jsonl_timestamps_are_rfc3339() {
     let tracker = tracker_for("jsonl_timestamps_are_rfc3339");
-    let _trace_guard = tracker.trace_env_guard();
 
     let e2e_dir = Path::new("test-results/e2e");
     if !e2e_dir.exists() {
@@ -841,10 +1007,8 @@ fn jsonl_timestamps_are_rfc3339() {
 }
 
 #[test]
-#[serial_test::serial]
 fn jsonl_run_ids_consistent_within_file() {
     let tracker = tracker_for("jsonl_run_ids_consistent_within_file");
-    let _trace_guard = tracker.trace_env_guard();
 
     let e2e_dir = Path::new("test-results/e2e");
     if !e2e_dir.exists() {

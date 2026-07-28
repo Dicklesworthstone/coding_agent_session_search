@@ -25,7 +25,6 @@
 //! CI should route this file through a separate scheduled / nightly
 //! gate rather than the routine all-targets check.
 
-use assert_cmd::cargo::cargo_bin;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use serial_test::serial;
@@ -34,8 +33,7 @@ use std::path::Path;
 use std::time::Duration;
 
 mod util;
-use util::EnvGuard;
-use util::e2e_log::{E2ePerformanceMetrics, PhaseTracker};
+use util::e2e_log::{E2eCommandEnvironment, E2ePerformanceMetrics, PhaseTracker};
 use util::timeout::spawn_with_timeout_or_diag;
 
 /// Retrofit helper (bead 2gypv): wraps `std::process::Command::new(cass_bin)`
@@ -44,19 +42,15 @@ use util::timeout::spawn_with_timeout_or_diag;
 /// hangs into structured diagnostic dumps instead of leaving cargo-test
 /// waiting on a stalled child indefinitely.
 fn run_cass_with_timeout(
+    command_env: &E2eCommandEnvironment,
     label: &str,
     args: &[&str],
     data_dir: &Path,
     home: &Path,
-    codex_home: &Path,
     timeout: Duration,
 ) -> std::process::Output {
-    let mut cmd = std::process::Command::new(cargo_bin("cass"));
-    cmd.args(args)
-        .arg(data_dir)
-        .current_dir(home)
-        .env("CODEX_HOME", codex_home)
-        .env("HOME", home);
+    let mut cmd = command_env.cass_std_command();
+    cmd.args(args).arg(data_dir).current_dir(home);
     spawn_with_timeout_or_diag(cmd, label, Some(data_dir), timeout)
 }
 
@@ -176,15 +170,15 @@ fn count_conversations(db_path: &Path) -> i64 {
 #[ignore = "bd-3ii77: long-run e2e; opt-in via `cargo test -- --ignored`"]
 fn index_large_single_session() {
     let tracker = tracker_for("index_large_single_session");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Generate large session (5000 messages = 2500 user + 2500 assistant)
     let message_count = 2500; // Results in 5000 total messages (user + assistant pairs)
@@ -203,11 +197,11 @@ fn index_large_single_session() {
     // Index the large session
     let phase_start = tracker.start("index_large", Some("Index large session"));
     let out = run_cass_with_timeout(
+        &command_env,
         "index_large_single_session",
         &["index", "--full", "--data-dir"],
         &data_dir,
         home,
-        &codex_home,
         Duration::from_secs(300),
     );
     assert!(
@@ -283,15 +277,15 @@ fn index_large_single_session() {
 #[ignore = "bd-3ii77: long-run e2e; opt-in via `cargo test -- --ignored`"]
 fn index_many_conversations() {
     let tracker = tracker_for("index_many_conversations");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Generate many sessions
     let session_count = 100;
@@ -310,11 +304,11 @@ fn index_many_conversations() {
     // Index all sessions
     let phase_start = tracker.start("index_many", Some("Index many conversations"));
     let out = run_cass_with_timeout(
+        &command_env,
         "index_many_conversations",
         &["index", "--full", "--data-dir"],
         &data_dir,
         home,
-        &codex_home,
         Duration::from_secs(300),
     );
     assert!(
@@ -364,15 +358,15 @@ fn index_many_conversations() {
 #[ignore = "bd-3ii77: long-run e2e; opt-in via `cargo test -- --ignored`"]
 fn search_large_result_set() {
     let tracker = tracker_for("search_large_result_set");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Generate sessions with a common searchable term
     let session_count = 50;
@@ -403,11 +397,11 @@ fn search_large_result_set() {
     // Index
     let phase_start = tracker.start("index", Some("Index searchable sessions"));
     let out = run_cass_with_timeout(
+        &command_env,
         "search_large_result_set:index",
         &["index", "--full", "--data-dir"],
         &data_dir,
         home,
-        &codex_home,
         Duration::from_secs(300),
     );
     assert!(
@@ -421,6 +415,7 @@ fn search_large_result_set() {
     // Search with term that matches all messages
     let phase_start = tracker.start("search_large", Some("Execute broad search query"));
     let search_output = run_cass_with_timeout(
+        &command_env,
         "search_large_result_set:search",
         &[
             "search",
@@ -432,7 +427,6 @@ fn search_large_result_set() {
         ],
         &data_dir,
         home,
-        &codex_home,
         Duration::from_secs(30),
     );
     assert!(
@@ -490,15 +484,15 @@ fn search_large_result_set() {
 #[ignore = "bd-3ii77: long-run e2e; opt-in via `cargo test -- --ignored`"]
 fn memory_bounded_during_index() {
     let tracker = tracker_for("memory_bounded_during_index");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Generate moderate sized dataset
     let message_count = 1000;
@@ -516,11 +510,11 @@ fn memory_bounded_during_index() {
     // Index
     let phase_start = tracker.start("index", Some("Index with memory monitoring"));
     let out = run_cass_with_timeout(
+        &command_env,
         "memory_bounded_during_index",
         &["index", "--full", "--data-dir"],
         &data_dir,
         home,
-        &codex_home,
         Duration::from_secs(300),
     );
     assert!(
@@ -570,15 +564,15 @@ fn memory_bounded_during_index() {
 #[ignore = "bd-3ii77: long-run e2e; opt-in via `cargo test -- --ignored`"]
 fn incremental_index_on_large_base() {
     let tracker = tracker_for("incremental_index_on_large_base");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Create initial large dataset
     let initial_count = 1000;
@@ -593,11 +587,11 @@ fn incremental_index_on_large_base() {
     // Full index
     let phase_start = tracker.start("index_full", Some("Initial full index"));
     let out = run_cass_with_timeout(
+        &command_env,
         "incremental_index_on_large_base:full",
         &["index", "--full", "--data-dir"],
         &data_dir,
         home,
-        &codex_home,
         Duration::from_secs(300),
     );
     assert!(
@@ -632,11 +626,11 @@ fn incremental_index_on_large_base() {
     // Incremental index
     let phase_start = tracker.start("index_incremental", Some("Incremental index"));
     let out = run_cass_with_timeout(
+        &command_env,
         "incremental_index_on_large_base:incremental",
         &["index", "--data-dir"],
         &data_dir,
         home,
-        &codex_home,
         Duration::from_secs(120),
     );
     assert!(
