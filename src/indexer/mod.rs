@@ -41309,7 +41309,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
         let db_path = data_dir.join("agent_search.db");
-        std::fs::write(&db_path, vec![0u8; 4096]).unwrap();
+        // Fixtures must clear INDEX_MIN_FREE_SPACE_BYTES (512 MiB), otherwise the
+        // floor dominates both sides and the lexical contribution is invisible.
+        // Sparse `set_len` keeps this cheap.
+        std::fs::File::create(&db_path)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
 
         let without_index = required_index_headroom_bytes(
             &data_dir,
@@ -41320,7 +41326,10 @@ mod tests {
         // A rebuild must also make room for a second copy of the lexical index.
         let index_dir = data_dir.join(LEXICAL_INDEX_ROOT_DIR).join("seg");
         std::fs::create_dir_all(&index_dir).unwrap();
-        std::fs::write(index_dir.join("0.store"), vec![0u8; 64 * 1024]).unwrap();
+        std::fs::File::create(index_dir.join("0.store"))
+            .unwrap()
+            .set_len(200 * 1024 * 1024)
+            .unwrap();
 
         let with_index = required_index_headroom_bytes(
             &data_dir,
@@ -41333,7 +41342,9 @@ mod tests {
             "lexical index size must raise the rebuild headroom requirement \
              (without={without_index}, with={with_index})"
         );
-        assert_eq!(with_index - without_index, 2 * 64 * 1024);
+        // db(300 MiB)*2 = 600 MiB already clears the 512 MiB floor, so the whole
+        // delta is attributable to the lexical index being counted twice.
+        assert_eq!(with_index - without_index, 2 * 200 * 1024 * 1024);
     }
 
     #[test]
