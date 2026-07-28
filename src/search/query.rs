@@ -16,14 +16,14 @@ use frankensearch::lexical_tantivy::{
 };
 use frankensearch::{
     Cx as FsCx, InMemoryTwoTierIndex as FsInMemoryTwoTierIndex,
-    InMemoryVectorIndex as FsInMemoryVectorIndex, LexicalSearch as FsLexicalSearch,
-    QueryClass as FsQueryClass, RrfConfig as FsRrfConfig, ScoreSource as FsScoreSource,
-    ScoredResult as FsScoredResult, SearchError as FsSearchError, SearchFuture as FsSearchFuture,
-    SearchPhase as FsSearchPhase, SyncEmbedderAdapter as FsSyncEmbedderAdapter,
-    SyncTwoTierSearcher as FsSyncTwoTierSearcher, TwoTierConfig as FsTwoTierConfig,
-    TwoTierIndex as FsTwoTierIndex, TwoTierSearcher as FsTwoTierSearcher, VectorHit as FsVectorHit,
-    candidate_count as fs_candidate_count,
-    core::filter::SearchFilter as FsSearchFilter,
+    InMemoryVectorIndex as FsInMemoryVectorIndex, QueryClass as FsQueryClass,
+    RrfConfig as FsRrfConfig, ScoreSource as FsScoreSource, ScoredResult as FsScoredResult,
+    SearchError as FsSearchError, SearchFuture as FsSearchFuture, SearchPhase as FsSearchPhase,
+    SyncEmbedderAdapter as FsSyncEmbedderAdapter, SyncTwoTierSearcher as FsSyncTwoTierSearcher,
+    TwoTierConfig as FsTwoTierConfig, TwoTierIndex as FsTwoTierIndex,
+    TwoTierIndexPaths as FsTwoTierIndexPaths, TwoTierSearcher as FsTwoTierSearcher,
+    VectorHit as FsVectorHit, candidate_count as fs_candidate_count,
+    core::{LexicalRead as FsLexicalRead, filter::SearchFilter as FsSearchFilter},
     index::{
         HNSW_DEFAULT_EF_SEARCH as FS_HNSW_DEFAULT_EF_SEARCH, HnswIndex as FsHnswIndex,
         VectorIndex as FsVectorIndex,
@@ -248,7 +248,8 @@ fn semantic_doc_component_id_from_db(raw: Option<i64>) -> u32 {
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, is_search_noise_text};
 use crate::search::embedder::Embedder;
 use crate::search::vector_index::{
-    ROLE_USER, SemanticDocId, SemanticFilter, SemanticFilterMaps, VectorIndex, VectorSearchResult,
+    ROLE_USER, SemanticAnnUnavailableReason, SemanticDocId, SemanticFilter, SemanticFilterMaps,
+    SemanticIndexArtifact, SemanticProgressiveUnavailableReason, VectorSearchResult,
     parse_semantic_doc_id, role_code_from_str,
 };
 use crate::sources::provenance::SourceFilter;
@@ -1420,6 +1421,8 @@ pub struct SearchResult {
     pub suggestions: Vec<QuerySuggestion>,
     /// ANN search statistics (present when --approximate was used)
     pub ann_stats: Option<crate::search::ann_index::AnnSearchStats>,
+    /// Stable reason an approximate request fell back to exact FSVI search.
+    pub ann_unavailable_reason: Option<SemanticAnnUnavailableReason>,
     /// True total matching documents from the search engine when that is cheap
     /// and available. Large saturated lexical pages intentionally leave this as
     /// `None`; robot output then reports `total_matches` as a lower bound
@@ -2068,40 +2071,69 @@ fn semantic_filter_as_search_filter(filter: &SemanticFilter) -> Option<&dyn FsSe
     if unrestricted { None } else { Some(filter) }
 }
 
-fn open_fs_semantic_ann_index(fs_index: &FsVectorIndex, ann_path: &Path) -> Result<FsHnswIndex> {
-    if !ann_path.is_file() {
-        bail!(
-            "approximate search unavailable: HNSW index not found at {}",
-            ann_path.display()
-        );
+#[derive(Debug)]
+struct SemanticAnnOpenFailure {
+    reason: SemanticAnnUnavailableReason,
+    diagnostic: &'static str,
+}
+
+fn open_fs_semantic_ann_index(
+    fs_index: &FsVectorIndex,
+    ann_path: &Path,
+) -> std::result::Result<FsHnswIndex, SemanticAnnOpenFailure> {
+    match std::fs::symlink_metadata(ann_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SemanticAnnOpenFailure {
+                reason: SemanticAnnUnavailableReason::SidecarMissing,
+                diagnostic: "selected_metadata_missing",
+            });
+        }
+        Err(_) => {
+            return Err(SemanticAnnOpenFailure {
+                reason: SemanticAnnUnavailableReason::SidecarOpenFailed,
+                diagnostic: "selected_metadata_stat_failed",
+            });
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(SemanticAnnOpenFailure {
+                reason: SemanticAnnUnavailableReason::SidecarOpenFailed,
+                diagnostic: "selected_metadata_symlink",
+            });
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(SemanticAnnOpenFailure {
+                reason: SemanticAnnUnavailableReason::SidecarOpenFailed,
+                diagnostic: "selected_metadata_not_regular_file",
+            });
+        }
+        Ok(_) => {}
     }
 
-    let ann = FsHnswIndex::load(ann_path, fs_index)
-        .map_err(|err| anyhow!("open HNSW index failed: {err}"))?;
-    let matches = ann
-        .matches_vector_index(fs_index)
-        .map_err(|err| anyhow!("validate HNSW index failed: {err}"))?;
-    if !matches {
-        bail!(
-            "approximate search unavailable: HNSW index at {} is stale for current semantic index (run 'cass index --semantic --build-hnsw')",
-            ann_path.display()
-        );
+    match FsHnswIndex::try_load_native(ann_path, fs_index) {
+        Ok(Some(ann)) => Ok(ann),
+        Ok(None) => Err(SemanticAnnOpenFailure {
+            reason: SemanticAnnUnavailableReason::SidecarNotNative,
+            diagnostic: "selected_graph_not_native",
+        }),
+        Err(_) => Err(SemanticAnnOpenFailure {
+            reason: SemanticAnnUnavailableReason::SidecarOpenFailed,
+            diagnostic: "selected_graph_open_failed",
+        }),
     }
-
-    Ok(ann)
 }
 
 struct SemanticSearchState {
     context_token: Arc<()>,
     embedder: Arc<dyn Embedder>,
-    fs_semantic_index: Arc<FsVectorIndex>,
-    fs_semantic_indexes: Arc<Vec<Arc<FsVectorIndex>>>,
+    artifacts: Arc<Vec<SemanticIndexArtifact>>,
+    quality_artifact: Option<SemanticIndexArtifact>,
     fs_ann_index: Option<Arc<FsHnswIndex>>,
-    ann_path: Option<PathBuf>,
+    fs_ann_unavailable: Option<SemanticAnnUnavailableReason>,
+    fs_ann_fallback_reported: bool,
     fs_in_memory_two_tier_index: Option<Arc<FsInMemoryTwoTierIndex>>,
     in_memory_two_tier_unavailable: InMemoryTwoTierUnavailable,
     progressive_context: Option<Arc<ProgressiveTwoTierContext>>,
-    progressive_context_unavailable: bool,
+    progressive_context_unavailable: Option<SemanticProgressiveUnavailableReason>,
     filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
     query_cache: QueryCache,
@@ -2109,28 +2141,40 @@ struct SemanticSearchState {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct InMemoryTwoTierUnavailable {
-    fast_only: bool,
-    quality: bool,
+    fast_only: Option<SemanticProgressiveUnavailableReason>,
+    quality: Option<SemanticProgressiveUnavailableReason>,
 }
 
 impl InMemoryTwoTierUnavailable {
-    fn is_known_unavailable(self, tier_mode: SemanticTierMode) -> bool {
+    fn reason(self, tier_mode: SemanticTierMode) -> Option<SemanticProgressiveUnavailableReason> {
         match tier_mode {
-            SemanticTierMode::Single => false,
+            SemanticTierMode::Single => None,
             SemanticTierMode::FastOnly => self.fast_only,
             SemanticTierMode::Progressive | SemanticTierMode::QualityOnly => self.quality,
         }
     }
 
-    fn mark_unavailable(&mut self, tier_mode: SemanticTierMode) {
+    fn mark_unavailable(
+        &mut self,
+        tier_mode: SemanticTierMode,
+        reason: SemanticProgressiveUnavailableReason,
+    ) {
         match tier_mode {
             SemanticTierMode::Single => {}
             SemanticTierMode::FastOnly => {
-                self.fast_only = true;
+                self.fast_only = Some(reason);
             }
             SemanticTierMode::Progressive | SemanticTierMode::QualityOnly => {
-                self.quality = true;
+                self.quality = Some(reason);
             }
+        }
+    }
+
+    fn clear_available(&mut self, tier_mode: SemanticTierMode) {
+        match tier_mode {
+            SemanticTierMode::Single => {}
+            SemanticTierMode::FastOnly => self.fast_only = None,
+            SemanticTierMode::Progressive | SemanticTierMode::QualityOnly => self.quality = None,
         }
     }
 }
@@ -2144,8 +2188,7 @@ struct ProgressiveTwoTierContext {
 
 #[derive(Clone)]
 struct SemanticCandidateContext {
-    fs_semantic_index: Arc<FsVectorIndex>,
-    fs_semantic_indexes: Arc<Vec<Arc<FsVectorIndex>>>,
+    artifacts: Arc<Vec<SemanticIndexArtifact>>,
     filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
 }
@@ -2241,49 +2284,59 @@ impl Embedder for SharedCassSyncEmbedder {
 }
 
 fn build_in_memory_two_tier_index(
-    ann_path: Option<PathBuf>,
-    embedder_id: &str,
+    fast_path: &Path,
+    quality_path: Option<&Path>,
     tier_mode: SemanticTierMode,
-) -> Option<Arc<FsInMemoryTwoTierIndex>> {
-    let index_dir = ann_path
-        .as_ref()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-    let Some(index_dir) = index_dir else {
-        tracing::debug!("two-tier semantic unavailable: ann/index directory path missing");
-        return None;
+) -> std::result::Result<Arc<FsInMemoryTwoTierIndex>, SemanticProgressiveUnavailableReason> {
+    let fast = match FsInMemoryVectorIndex::from_fsvi(fast_path) {
+        Ok(index) => index,
+        Err(err) => {
+            tracing::debug!(
+                path = %fast_path.display(),
+                error = %err,
+                "fast semantic artifact load failed"
+            );
+            return Err(SemanticProgressiveUnavailableReason::ExactArtifactOpenFailed);
+        }
     };
 
-    match FsInMemoryTwoTierIndex::from_dir(&index_dir) {
-        Ok(index) => return Some(Arc::new(index)),
-        Err(err) => {
-            tracing::debug!(
-                dir = %index_dir.display(),
-                error = %err,
-                "two-tier semantic index load failed; considering fallback"
-            );
+    let quality = if matches!(
+        tier_mode,
+        SemanticTierMode::Progressive | SemanticTierMode::QualityOnly
+    ) {
+        let quality_path =
+            quality_path.ok_or(SemanticProgressiveUnavailableReason::QualityArtifactMissing)?;
+        match same_file::is_same_file(fast_path, quality_path) {
+            Ok(true) => {
+                return Err(SemanticProgressiveUnavailableReason::ExactArtifactRoleAlias);
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::debug!(
+                    fast_path = %fast_path.display(),
+                    quality_path = %quality_path.display(),
+                    error = %err,
+                    "compare exact semantic artifact roles failed"
+                );
+                return Err(SemanticProgressiveUnavailableReason::ExactArtifactOpenFailed);
+            }
         }
-    }
-
-    if !matches!(tier_mode, SemanticTierMode::FastOnly) {
-        return None;
-    }
-
-    let fallback_fast = index_dir.join(format!("index-{embedder_id}.fsvi"));
-    if !fallback_fast.is_file() {
-        return None;
-    }
-
-    match FsInMemoryVectorIndex::from_fsvi(&fallback_fast) {
-        Ok(fast) => Some(Arc::new(FsInMemoryTwoTierIndex::new(fast, None))),
-        Err(err) => {
-            tracing::debug!(
-                path = %fallback_fast.display(),
-                error = %err,
-                "fast-only semantic fallback index load failed"
-            );
-            None
+        match FsInMemoryVectorIndex::from_fsvi(quality_path) {
+            Ok(index) => Some(index),
+            Err(err) => {
+                tracing::debug!(
+                    path = %quality_path.display(),
+                    error = %err,
+                    "quality semantic artifact load failed"
+                );
+                return Err(SemanticProgressiveUnavailableReason::ExactArtifactOpenFailed);
+            }
         }
-    }
+    } else {
+        None
+    };
+
+    Ok(Arc::new(FsInMemoryTwoTierIndex::new(fast, quality)))
 }
 
 fn two_tier_index_supports_mode(
@@ -2426,7 +2479,7 @@ impl CassProgressiveLexicalAdapter {
     }
 }
 
-impl FsLexicalSearch for CassProgressiveLexicalAdapter {
+impl FsLexicalRead for CassProgressiveLexicalAdapter {
     fn search<'a>(
         &'a self,
         cx: &'a FsCx,
@@ -2500,23 +2553,6 @@ impl FsLexicalSearch for CassProgressiveLexicalAdapter {
 
             Ok(scored)
         })
-    }
-
-    fn index_document<'a>(
-        &'a self,
-        _cx: &'a FsCx,
-        _doc: &'a frankensearch::IndexableDocument,
-    ) -> FsSearchFuture<'a, ()> {
-        Box::pin(async move {
-            Err(FsSearchError::SubsystemError {
-                subsystem: "cass_lexical_adapter",
-                source: Box::new(std::io::Error::other("cass lexical adapter is read-only")),
-            })
-        })
-    }
-
-    fn commit<'a>(&'a self, _cx: &'a FsCx) -> FsSearchFuture<'a, ()> {
-        Box::pin(async move { Ok(()) })
     }
 
     fn doc_count(&self) -> usize {
@@ -3877,60 +3913,64 @@ impl SearchClient {
     pub fn set_semantic_context(
         &self,
         embedder: Arc<dyn Embedder>,
-        fs_semantic_index: VectorIndex,
+        artifact: SemanticIndexArtifact,
+        quality_artifact: Option<SemanticIndexArtifact>,
         filter_maps: SemanticFilterMaps,
         roles: Option<HashSet<u8>>,
-        ann_path: Option<PathBuf>,
     ) -> Result<()> {
-        self.set_semantic_indexes_context(
+        self.set_semantic_artifacts_context(
             embedder,
-            vec![fs_semantic_index],
+            vec![artifact],
+            quality_artifact,
             filter_maps,
             roles,
-            ann_path,
         )
     }
 
-    pub fn set_semantic_indexes_context(
+    pub fn set_semantic_artifacts_context(
         &self,
         embedder: Arc<dyn Embedder>,
-        fs_semantic_indexes: Vec<VectorIndex>,
+        artifacts: Vec<SemanticIndexArtifact>,
+        quality_artifact: Option<SemanticIndexArtifact>,
         filter_maps: SemanticFilterMaps,
         roles: Option<HashSet<u8>>,
-        ann_path: Option<PathBuf>,
     ) -> Result<()> {
-        if fs_semantic_indexes.is_empty() {
+        if artifacts.is_empty() {
             bail!("semantic context requires at least one vector index");
         }
 
-        let fs_semantic_indexes = fs_semantic_indexes
-            .into_iter()
-            .map(|index| {
-                let embedder_id = index.embedder_id().to_string();
-                let dimension = index.dimension();
-                if embedder_id != embedder.id() {
-                    bail!(
-                        "embedder mismatch: index uses {}, embedder is {}",
-                        embedder_id,
-                        embedder.id()
-                    );
-                }
-                if dimension != embedder.dimension() {
-                    bail!(
-                        "embedder dimension mismatch: index uses {}, embedder is {}",
-                        dimension,
-                        embedder.dimension()
-                    );
-                }
-                Ok(Arc::new(index))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let fs_semantic_index = Arc::clone(&fs_semantic_indexes[0]);
-        let shard_count = fs_semantic_indexes.len();
-        let ann_path = if shard_count == 1 { ann_path } else { None };
-        let embedder_id = fs_semantic_index.embedder_id().to_string();
-        let dimension = fs_semantic_index.dimension();
-        let fs_semantic_indexes = Arc::new(fs_semantic_indexes);
+        for artifact in &artifacts {
+            let index = artifact.index();
+            let embedder_id = index.embedder_id();
+            let dimension = index.dimension();
+            if embedder_id != embedder.id() {
+                bail!(
+                    "embedder mismatch: index uses {}, embedder is {}",
+                    embedder_id,
+                    embedder.id()
+                );
+            }
+            if dimension != embedder.dimension() {
+                bail!(
+                    "embedder dimension mismatch: index uses {}, embedder is {}",
+                    dimension,
+                    embedder.dimension()
+                );
+            }
+        }
+        let embedder_id = artifacts[0].index().embedder_id().to_string();
+        let dimension = artifacts[0].index().dimension();
+        let shard_count = artifacts.len();
+        let fs_ann_unavailable = if shard_count != 1 {
+            Some(SemanticAnnUnavailableReason::MultipleExactShards)
+        } else if let Some(reason) = artifacts[0].ann_unavailable_reason() {
+            Some(reason)
+        } else if artifacts[0].ann_path().is_none() {
+            Some(SemanticAnnUnavailableReason::SidecarMissing)
+        } else {
+            None
+        };
+        let artifacts = Arc::new(artifacts);
 
         let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
         let context_token = Arc::new(());
@@ -3941,14 +3981,15 @@ impl SearchClient {
         *state_guard = Some(SemanticSearchState {
             context_token,
             embedder,
-            fs_semantic_index,
-            fs_semantic_indexes,
+            artifacts,
+            quality_artifact,
             fs_ann_index: None,
-            ann_path,
+            fs_ann_unavailable,
+            fs_ann_fallback_reported: false,
             fs_in_memory_two_tier_index: None,
             in_memory_two_tier_unavailable: InMemoryTwoTierUnavailable::default(),
             progressive_context: None,
-            progressive_context_unavailable: false,
+            progressive_context_unavailable: None,
             filter_maps,
             roles,
             query_cache: QueryCache::new(embedder_id.as_str(), capacity),
@@ -4046,7 +4087,7 @@ impl SearchClient {
         tier_mode: SemanticTierMode,
     ) -> Result<Option<Arc<FsInMemoryTwoTierIndex>>> {
         loop {
-            let (ann_path, embedder_id, context_token) = {
+            let (fast_path, quality_path, context_token) = {
                 let mut guard = self
                     .semantic
                     .lock()
@@ -4054,25 +4095,66 @@ impl SearchClient {
                 let state = guard.as_mut().ok_or_else(|| {
                     anyhow!("semantic search unavailable (no embedder or vector index)")
                 })?;
+                let fast_owner_backed = state
+                    .artifacts
+                    .iter()
+                    .all(SemanticIndexArtifact::has_owner_backed_progressive_reader);
+                let quality_owner_backed = !matches!(
+                    tier_mode,
+                    SemanticTierMode::Progressive | SemanticTierMode::QualityOnly
+                ) || state
+                    .quality_artifact
+                    .as_ref()
+                    .is_some_and(SemanticIndexArtifact::has_owner_backed_progressive_reader);
+                if !fast_owner_backed || !quality_owner_backed {
+                    let reason = SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired;
+                    tracing::debug!(
+                        reason = reason.code(),
+                        ?tier_mode,
+                        "two-tier semantic unavailable"
+                    );
+                    state
+                        .in_memory_two_tier_unavailable
+                        .mark_unavailable(tier_mode, reason);
+                    return Ok(None);
+                }
                 if let Some(index) = state.fs_in_memory_two_tier_index.as_ref()
                     && two_tier_index_supports_mode(index.as_ref(), tier_mode)
                 {
                     return Ok(Some(Arc::clone(index)));
                 }
-                if state
-                    .in_memory_two_tier_unavailable
-                    .is_known_unavailable(tier_mode)
-                {
+                if let Some(reason) = state.in_memory_two_tier_unavailable.reason(tier_mode) {
+                    tracing::debug!(
+                        reason = reason.code(),
+                        ?tier_mode,
+                        "two-tier semantic remains unavailable"
+                    );
+                    return Ok(None);
+                }
+                if state.artifacts.len() != 1 {
+                    let reason = SemanticProgressiveUnavailableReason::MultipleExactShards;
+                    tracing::debug!(
+                        reason = reason.code(),
+                        shard_count = state.artifacts.len(),
+                        "two-tier semantic unavailable"
+                    );
+                    state
+                        .in_memory_two_tier_unavailable
+                        .mark_unavailable(tier_mode, reason);
                     return Ok(None);
                 }
                 (
-                    state.ann_path.clone(),
-                    state.embedder.id().to_string(),
+                    state.artifacts[0].fsvi_path().to_path_buf(),
+                    state
+                        .quality_artifact
+                        .as_ref()
+                        .map(|artifact| artifact.fsvi_path().to_path_buf()),
                     Arc::clone(&state.context_token),
                 )
             };
 
-            let index = build_in_memory_two_tier_index(ann_path.clone(), &embedder_id, tier_mode);
+            let index =
+                build_in_memory_two_tier_index(&fast_path, quality_path.as_deref(), tier_mode);
 
             let mut guard = self
                 .semantic
@@ -4089,31 +4171,62 @@ impl SearchClient {
             if !Arc::ptr_eq(&state.context_token, &context_token) {
                 continue;
             }
-            let Some(index) = index else {
-                state
-                    .in_memory_two_tier_unavailable
-                    .mark_unavailable(tier_mode);
-                return Ok(None);
+            let index = match index {
+                Ok(index) => index,
+                Err(reason) => {
+                    tracing::debug!(
+                        reason = reason.code(),
+                        ?tier_mode,
+                        "two-tier semantic unavailable"
+                    );
+                    state
+                        .in_memory_two_tier_unavailable
+                        .mark_unavailable(tier_mode, reason);
+                    return Ok(None);
+                }
             };
             if !two_tier_index_supports_mode(index.as_ref(), tier_mode) {
+                let reason = SemanticProgressiveUnavailableReason::QualityArtifactMissing;
                 state
                     .in_memory_two_tier_unavailable
-                    .mark_unavailable(tier_mode);
+                    .mark_unavailable(tier_mode, reason);
                 return Ok(None);
             }
             state.fs_in_memory_two_tier_index = Some(Arc::clone(&index));
             if index.has_quality_index() {
                 state.in_memory_two_tier_unavailable = InMemoryTwoTierUnavailable::default();
             } else {
-                state.in_memory_two_tier_unavailable.fast_only = false;
+                state
+                    .in_memory_two_tier_unavailable
+                    .clear_available(SemanticTierMode::FastOnly);
             }
             return Ok(Some(index));
         }
     }
 
-    fn ann_index(&self) -> Result<Arc<FsHnswIndex>> {
+    /// Resolve and return the stable reason an in-memory two-tier mode is
+    /// unavailable. `None` means that mode is ready.
+    pub fn two_tier_unavailability_reason(
+        &self,
+        tier_mode: SemanticTierMode,
+    ) -> Result<Option<SemanticProgressiveUnavailableReason>> {
+        let resolution = self.in_memory_two_tier_index(tier_mode);
+        let reason = self
+            .semantic
+            .lock()
+            .map_err(|_| anyhow!("semantic lock poisoned"))?
+            .as_ref()
+            .and_then(|state| state.in_memory_two_tier_unavailable.reason(tier_mode));
+        match (resolution, reason) {
+            (_, Some(reason)) => Ok(Some(reason)),
+            (Ok(_), None) => Ok(None),
+            (Err(error), None) => Err(error),
+        }
+    }
+
+    fn ann_index(&self) -> Result<Option<Arc<FsHnswIndex>>> {
         loop {
-            let (ann_path, fs_semantic_index) = {
+            let (ann_path, fs_semantic_index, context_token) = {
                 let mut guard = self
                     .semantic
                     .lock()
@@ -4122,20 +4235,36 @@ impl SearchClient {
                     anyhow!("semantic search unavailable (no embedder or vector index)")
                 })?;
                 if let Some(index) = state.fs_ann_index.as_ref() {
-                    return Ok(Arc::clone(index));
+                    return Ok(Some(Arc::clone(index)));
                 }
-                let ann_path = state.ann_path.clone().ok_or_else(|| {
-                    anyhow!(
-                        "approximate search unavailable: HNSW index missing (run 'cass index --semantic --build-hnsw')"
-                    )
-                })?;
-                (ann_path, Arc::clone(&state.fs_semantic_index))
+                if let Some(reason) = state.fs_ann_unavailable {
+                    if !state.fs_ann_fallback_reported {
+                        tracing::warn!(
+                            reason_code = reason.code(),
+                            "approximate semantic index unavailable; using exact FSVI search"
+                        );
+                        state.fs_ann_fallback_reported = true;
+                    }
+                    return Ok(None);
+                }
+                if state.artifacts.len() != 1 {
+                    state.fs_ann_unavailable =
+                        Some(SemanticAnnUnavailableReason::MultipleExactShards);
+                    continue;
+                }
+                let artifact = &state.artifacts[0];
+                let Some(ann_path) = artifact.ann_path().map(Path::to_path_buf) else {
+                    state.fs_ann_unavailable = Some(SemanticAnnUnavailableReason::SidecarMissing);
+                    continue;
+                };
+                (
+                    ann_path,
+                    artifact.index_owner(),
+                    Arc::clone(&state.context_token),
+                )
             };
 
-            let ann = Arc::new(open_fs_semantic_ann_index(
-                fs_semantic_index.as_ref(),
-                &ann_path,
-            )?);
+            let opened = open_fs_semantic_ann_index(fs_semantic_index.as_ref(), &ann_path);
 
             let mut guard = self
                 .semantic
@@ -4145,15 +4274,48 @@ impl SearchClient {
                 anyhow!("semantic search unavailable (no embedder or vector index)")
             })?;
             if let Some(existing) = state.fs_ann_index.as_ref() {
-                return Ok(Arc::clone(existing));
+                return Ok(Some(Arc::clone(existing)));
             }
-            if state.ann_path.as_ref() != Some(&ann_path)
-                || !Arc::ptr_eq(&state.fs_semantic_index, &fs_semantic_index)
-            {
+            if !Arc::ptr_eq(&state.context_token, &context_token) {
                 continue;
             }
-            state.fs_ann_index = Some(Arc::clone(&ann));
-            return Ok(ann);
+            match opened {
+                Ok(ann) => {
+                    let ann = Arc::new(ann);
+                    state.fs_ann_unavailable = None;
+                    state.fs_ann_fallback_reported = false;
+                    state.fs_ann_index = Some(Arc::clone(&ann));
+                    return Ok(Some(ann));
+                }
+                Err(failure) => {
+                    tracing::warn!(
+                        reason_code = failure.reason.code(),
+                        diagnostic = failure.diagnostic,
+                        "approximate semantic index unavailable; using exact FSVI search"
+                    );
+                    state.fs_ann_unavailable = Some(failure.reason);
+                    state.fs_ann_fallback_reported = true;
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    /// Resolve and return the stable reason ANN acceleration is unavailable.
+    ///
+    /// `None` means the explicitly paired native ANN artifact is ready.
+    pub fn ann_unavailability_reason(&self) -> Result<Option<SemanticAnnUnavailableReason>> {
+        let resolution = self.ann_index();
+        let reason = self
+            .semantic
+            .lock()
+            .map_err(|_| anyhow!("semantic lock poisoned"))?
+            .as_ref()
+            .and_then(|state| state.fs_ann_unavailable);
+        match (resolution, reason) {
+            (_, Some(reason)) => Ok(Some(reason)),
+            (Ok(_), None) => Ok(None),
+            (Err(error), None) => Err(error),
         }
     }
 
@@ -4231,11 +4393,11 @@ impl SearchClient {
         fetch_limit: usize,
         fs_filter: Option<&dyn FsSearchFilter>,
     ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
-        if context.fs_semantic_indexes.len() == 1 {
-            let record_count = context.fs_semantic_index.record_count();
+        if context.artifacts.len() == 1 {
+            let index = context.artifacts[0].index();
+            let record_count = index.record_count();
             let candidate_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
-            let fs_hits = context
-                .fs_semantic_index
+            let fs_hits = index
                 .search_top_k(embedding, candidate_limit, fs_filter)
                 .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
             let mut best_by_message = HashMap::with_capacity(fs_hits.len());
@@ -4268,7 +4430,8 @@ impl SearchClient {
         let mut raw_hits = 0usize;
         let mut max_omitted_score: Option<f32> = None;
         let mut has_more_candidates = false;
-        for index in context.fs_semantic_indexes.iter() {
+        for artifact in context.artifacts.iter() {
+            let index = artifact.index();
             let shard_record_count = index.record_count();
             // Search chunks, then collapse by message. A message can have many
             // high-scoring chunks, so per-shard top-k chunks alone is not a
@@ -4304,7 +4467,7 @@ impl SearchClient {
         let exact_window_may_omit_competitor =
             Self::semantic_window_may_omit_competitor(&collapsed, fetch_limit, max_omitted_score);
         tracing::debug!(
-            shard_count = context.fs_semantic_indexes.len(),
+            shard_count = context.artifacts.len(),
             raw_hits,
             returned = collapsed.len(),
             "semantic sharded exact merge complete"
@@ -4489,9 +4652,31 @@ impl SearchClient {
             .unwrap_or(false)
     }
 
+    /// Resolve and return the stable reason progressive serving is unavailable.
+    ///
+    /// `None` means an exact fast+quality pair is ready. The method performs
+    /// the same lazy resolution used by search so diagnostics and execution
+    /// cannot disagree about artifact topology.
+    pub fn progressive_unavailability_reason(
+        &self,
+    ) -> Result<Option<SemanticProgressiveUnavailableReason>> {
+        let resolution = self.progressive_context();
+        let reason = self
+            .semantic
+            .lock()
+            .map_err(|_| anyhow!("semantic lock poisoned"))?
+            .as_ref()
+            .and_then(|state| state.progressive_context_unavailable);
+        match (resolution, reason) {
+            (_, Some(reason)) => Ok(Some(reason)),
+            (Ok(_), None) => Ok(None),
+            (Err(error), None) => Err(error),
+        }
+    }
+
     fn progressive_context(&self) -> Result<Option<Arc<ProgressiveTwoTierContext>>> {
         loop {
-            let (ann_path, embedder, context_token) = {
+            let (fast_artifact, quality_artifact, embedder, context_token) = {
                 let mut guard = self
                     .semantic
                     .lock()
@@ -4499,21 +4684,91 @@ impl SearchClient {
                 let state = guard.as_mut().ok_or_else(|| {
                     anyhow!("semantic search unavailable (no embedder or vector index)")
                 })?;
+                let owner_backed = state
+                    .artifacts
+                    .iter()
+                    .all(SemanticIndexArtifact::has_owner_backed_progressive_reader)
+                    && state
+                        .quality_artifact
+                        .as_ref()
+                        .is_some_and(SemanticIndexArtifact::has_owner_backed_progressive_reader);
+                if !owner_backed {
+                    let reason = SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired;
+                    tracing::debug!(reason = reason.code(), "progressive semantic unavailable");
+                    state.progressive_context_unavailable = Some(reason);
+                    return Ok(None);
+                }
                 if let Some(context) = state.progressive_context.as_ref() {
                     return Ok(Some(Arc::clone(context)));
                 }
-                if state.progressive_context_unavailable {
+                if let Some(reason) = state.progressive_context_unavailable {
+                    tracing::debug!(
+                        reason = reason.code(),
+                        "progressive semantic remains unavailable"
+                    );
                     return Ok(None);
                 }
+                if state.artifacts.len() != 1 {
+                    let reason = SemanticProgressiveUnavailableReason::MultipleExactShards;
+                    tracing::debug!(
+                        reason = reason.code(),
+                        shard_count = state.artifacts.len(),
+                        "progressive semantic unavailable"
+                    );
+                    state.progressive_context_unavailable = Some(reason);
+                    return Ok(None);
+                }
+                let Some(quality_artifact) = state.quality_artifact.clone() else {
+                    let reason = SemanticProgressiveUnavailableReason::QualityArtifactMissing;
+                    tracing::debug!(reason = reason.code(), "progressive semantic unavailable");
+                    state.progressive_context_unavailable = Some(reason);
+                    return Ok(None);
+                };
                 (
-                    state.ann_path.clone(),
+                    state.artifacts[0].clone(),
+                    quality_artifact,
                     Arc::clone(&state.embedder),
                     Arc::clone(&state.context_token),
                 )
             };
 
+            let pair_reason = match same_file::is_same_file(
+                fast_artifact.fsvi_path(),
+                quality_artifact.fsvi_path(),
+            ) {
+                Ok(true) => Some(SemanticProgressiveUnavailableReason::ExactArtifactRoleAlias),
+                Ok(false) => None,
+                Err(err) => {
+                    tracing::debug!(
+                        fast_path = %fast_artifact.fsvi_path().display(),
+                        quality_path = %quality_artifact.fsvi_path().display(),
+                        error = %err,
+                        "compare progressive semantic artifact roles failed"
+                    );
+                    Some(SemanticProgressiveUnavailableReason::ExactArtifactOpenFailed)
+                }
+            };
+            if let Some(reason) = pair_reason {
+                let mut guard = self
+                    .semantic
+                    .lock()
+                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
+                let state = guard.as_mut().ok_or_else(|| {
+                    anyhow!("semantic search unavailable (no embedder or vector index)")
+                })?;
+                if !Arc::ptr_eq(&state.context_token, &context_token) {
+                    continue;
+                }
+                state.progressive_context_unavailable = Some(reason);
+                bail!(
+                    "progressive semantic artifact contract rejected: {}",
+                    reason.code()
+                );
+            }
+
             let context = match self.build_progressive_context(
-                ann_path.clone(),
+                &fast_artifact,
+                &quality_artifact,
                 embedder,
                 Arc::clone(&context_token),
             ) {
@@ -4532,26 +4787,10 @@ impl SearchClient {
                     if !Arc::ptr_eq(&state.context_token, &context_token) {
                         continue;
                     }
+                    state.progressive_context_unavailable =
+                        Some(SemanticProgressiveUnavailableReason::ExactArtifactOpenFailed);
                     return Err(err);
                 }
-            };
-
-            let Some(context) = context else {
-                let mut guard = self
-                    .semantic
-                    .lock()
-                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                let state = guard.as_mut().ok_or_else(|| {
-                    anyhow!("semantic search unavailable (no embedder or vector index)")
-                })?;
-                if let Some(existing) = state.progressive_context.as_ref() {
-                    return Ok(Some(Arc::clone(existing)));
-                }
-                if !Arc::ptr_eq(&state.context_token, &context_token) {
-                    continue;
-                }
-                state.progressive_context_unavailable = true;
-                return Ok(None);
             };
 
             let mut guard = self
@@ -4567,7 +4806,7 @@ impl SearchClient {
             if !Arc::ptr_eq(&state.context_token, &context_token) {
                 continue;
             }
-            state.progressive_context_unavailable = false;
+            state.progressive_context_unavailable = None;
             state.progressive_context = Some(Arc::clone(&context));
             return Ok(Some(context));
         }
@@ -4575,41 +4814,17 @@ impl SearchClient {
 
     fn build_progressive_context(
         &self,
-        ann_path: Option<PathBuf>,
+        fast_artifact: &SemanticIndexArtifact,
+        quality_artifact: &SemanticIndexArtifact,
         embedder: Arc<dyn Embedder>,
         context_token: Arc<()>,
-    ) -> Result<Option<Arc<ProgressiveTwoTierContext>>> {
-        let Some(index_dir) = ann_path
-            .as_ref()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-        else {
-            return Ok(None);
-        };
-
-        let fast_path = {
-            let explicit = index_dir.join("vector.fast.idx");
-            if explicit.is_file() {
-                explicit
-            } else {
-                let fallback = index_dir.join("vector.idx");
-                if fallback.is_file() {
-                    fallback
-                } else {
-                    return Ok(None);
-                }
-            }
-        };
-        let quality_path = index_dir.join("vector.quality.idx");
-        if !quality_path.is_file() {
-            return Ok(None);
-        }
-
-        let fast_index = FsVectorIndex::open(&fast_path)
-            .map_err(|err| anyhow!("open fast-tier index failed: {err}"))?;
-        let quality_index = FsVectorIndex::open(&quality_path)
-            .map_err(|err| anyhow!("open quality-tier index failed: {err}"))?;
+    ) -> Result<Arc<ProgressiveTwoTierContext>> {
+        let fast_index = fast_artifact.index();
+        let quality_index = quality_artifact.index();
+        let paths = FsTwoTierIndexPaths::new(fast_artifact.fsvi_path())
+            .with_quality_index(quality_artifact.fsvi_path());
         let index = Arc::new(
-            FsTwoTierIndex::open(&index_dir, frankensearch_two_tier_config())
+            FsTwoTierIndex::open_with_paths(&paths, frankensearch_two_tier_config())
                 .map_err(|err| anyhow!("open progressive two-tier index failed: {err}"))?,
         );
 
@@ -4631,12 +4846,12 @@ impl SearchClient {
                 as Arc<dyn frankensearch::Embedder>
         });
 
-        Ok(Some(Arc::new(ProgressiveTwoTierContext {
+        Ok(Arc::new(ProgressiveTwoTierContext {
             context_token,
             index,
             fast_embedder,
             quality_embedder,
-        })))
+        }))
     }
 
     fn load_embedder_for_progressive_id(
@@ -4652,8 +4867,16 @@ impl SearchClient {
         if let Some(dim) = embedder_id.strip_prefix("fnv1a-")
             && let Ok(parsed) = dim.parse::<usize>()
         {
+            if parsed != dimension {
+                bail!(
+                    "progressive hash embedder dimension mismatch: identity {} declares {}, index has {}",
+                    embedder_id,
+                    parsed,
+                    dimension
+                );
+            }
             return Ok(Arc::new(crate::search::hash_embedder::HashEmbedder::new(
-                parsed.max(dimension),
+                parsed,
             )));
         }
 
@@ -5271,6 +5494,7 @@ impl SearchClient {
             cache_stats: self.cache_stats(),
             suggestions,
             ann_stats: None,
+            ann_unavailable_reason: None,
             total_count: None,
         })
     }
@@ -5535,7 +5759,15 @@ impl SearchClient {
         let initial_fetch_limit = target_hits;
         let fallback_fetch_limit = target_hits.saturating_mul(3);
         loop {
-            let (embedding, candidate_context, in_memory_two_tier_index, ann_index, context_token) = loop {
+            let (
+                embedding,
+                candidate_context,
+                in_memory_two_tier_index,
+                ann_index,
+                effective_approximate,
+                effective_tier_mode,
+                context_token,
+            ) = loop {
                 let embedding = self.semantic_query_embedding(&canonical)?;
                 let (candidate_context, context_token) = {
                     let guard = self
@@ -5547,8 +5779,7 @@ impl SearchClient {
                     })?;
                     (
                         SemanticCandidateContext {
-                            fs_semantic_index: Arc::clone(&state.fs_semantic_index),
-                            fs_semantic_indexes: Arc::clone(&state.fs_semantic_indexes),
+                            artifacts: Arc::clone(&state.artifacts),
                             filter_maps: state.filter_maps.clone(),
                             roles: state.roles.clone(),
                         },
@@ -5563,10 +5794,12 @@ impl SearchClient {
                 } else {
                     None
                 };
-                let ann_index = if approximate {
-                    Some(self.ann_index()?)
+                let ann_index = if approximate { self.ann_index()? } else { None };
+                let effective_approximate = approximate && ann_index.is_some();
+                let effective_tier_mode = if approximate {
+                    SemanticTierMode::Single
                 } else {
-                    None
+                    tier_mode
                 };
 
                 let guard = self
@@ -5584,6 +5817,8 @@ impl SearchClient {
                     candidate_context,
                     in_memory_two_tier_index,
                     ann_index,
+                    effective_approximate,
+                    effective_tier_mode,
                     context_token,
                 );
             };
@@ -5600,8 +5835,8 @@ impl SearchClient {
                 &filters,
                 SemanticCandidateSearchRequest {
                     fetch_limit: initial_fetch_limit,
-                    approximate,
-                    tier_mode,
+                    approximate: effective_approximate,
+                    tier_mode: effective_tier_mode,
                     in_memory_two_tier_index: in_memory_two_tier_index.as_ref(),
                     ann_index: ann_index.as_ref(),
                 },
@@ -5631,8 +5866,8 @@ impl SearchClient {
                     &filters,
                     SemanticCandidateSearchRequest {
                         fetch_limit: fallback_fetch_limit,
-                        approximate,
-                        tier_mode,
+                        approximate: effective_approximate,
+                        tier_mode: effective_tier_mode,
                         in_memory_two_tier_index: in_memory_two_tier_index.as_ref(),
                         ann_index: ann_index.as_ref(),
                     },
@@ -5744,6 +5979,7 @@ impl SearchClient {
                 cache_stats: baseline_stats,
                 suggestions,
                 ann_stats: None,
+                ann_unavailable_reason: None,
                 total_count: tantivy_total,
             });
         }
@@ -5760,6 +5996,7 @@ impl SearchClient {
                 cache_stats: baseline_stats,
                 suggestions,
                 ann_stats: None,
+                ann_unavailable_reason: None,
                 total_count: tantivy_total,
             });
         }
@@ -5806,6 +6043,7 @@ impl SearchClient {
                 cache_stats: fallback_stats,
                 suggestions,
                 ann_stats: None,
+                ann_unavailable_reason: None,
                 total_count: fallback_tantivy_total,
             })
         } else {
@@ -5822,6 +6060,7 @@ impl SearchClient {
                 cache_stats: baseline_stats,
                 suggestions,
                 ann_stats: None,
+                ann_unavailable_reason: None,
                 total_count: tantivy_total,
             })
         }
@@ -5883,6 +6122,7 @@ impl SearchClient {
                 cache_stats: self.cache_stats(),
                 suggestions: Vec::new(),
                 ann_stats: None,
+                ann_unavailable_reason: None,
                 total_count: None,
             });
         }
@@ -5917,6 +6157,11 @@ impl SearchClient {
             approximate,
             semantic_tier_mode,
         )?;
+        let semantic_ann_unavailable_reason = if approximate {
+            self.ann_unavailability_reason()?
+        } else {
+            None
+        };
         let fused = rrf_fuse_hits(&lexical.hits, &semantic_hits, semantic_query, limit, offset);
         let suggestions = if fused.is_empty() {
             lexical.suggestions.clone()
@@ -5929,6 +6174,7 @@ impl SearchClient {
             cache_stats: lexical.cache_stats,
             suggestions,
             ann_stats: semantic_ann_stats,
+            ann_unavailable_reason: semantic_ann_unavailable_reason,
             total_count: None,
         })
     }
@@ -8748,6 +8994,7 @@ mod tests {
     use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::tantivy::TantivyIndex;
+    use crate::search::vector_index::VectorIndex;
     use crate::storage::sqlite::FrankenStorage;
     use frankensqlite::Connection as FrankenConnection;
     use frankensqlite::compat::ParamValue;
@@ -9084,6 +9331,72 @@ mod tests {
         client: SearchClient,
         doc_ids: Vec<String>,
         source_paths: Vec<String>,
+        vector_dir: PathBuf,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SemanticAnnFixtureMode {
+        Missing,
+        Native,
+        StaleSameDocIds,
+        CorruptMetadata,
+        CrossRoleAlias,
+        #[cfg(unix)]
+        FinalComponentSymlink,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SemanticArtifactEntrySnapshot {
+        relative_path: PathBuf,
+        file_kind: &'static str,
+        contents: Option<Vec<u8>>,
+        modified: std::time::SystemTime,
+        readonly: bool,
+        #[cfg(unix)]
+        mode: u32,
+    }
+
+    fn semantic_artifact_tree_snapshot(root: &Path) -> Result<Vec<SemanticArtifactEntrySnapshot>> {
+        let mut snapshot = Vec::new();
+        for entry in walkdir::WalkDir::new(root).min_depth(1).follow_links(false) {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(path)?;
+            let file_type = metadata.file_type();
+            let (file_kind, contents) = if file_type.is_file() {
+                ("file", Some(std::fs::read(path)?))
+            } else if file_type.is_dir() {
+                ("directory", None)
+            } else if file_type.is_symlink() {
+                (
+                    "symlink",
+                    Some(
+                        std::fs::read_link(path)?
+                            .to_string_lossy()
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                )
+            } else {
+                ("other", None)
+            };
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode()
+            };
+            snapshot.push(SemanticArtifactEntrySnapshot {
+                relative_path: path.strip_prefix(root)?.to_path_buf(),
+                file_kind,
+                contents,
+                modified: metadata.modified()?,
+                readonly: metadata.permissions().readonly(),
+                #[cfg(unix)]
+                mode,
+            });
+        }
+        snapshot.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(snapshot)
     }
 
     struct ProgressiveHybridFixture {
@@ -9324,7 +9637,8 @@ mod tests {
     }
 
     #[test]
-    fn quality_mode_does_not_reuse_fast_only_two_tier_cache() -> Result<()> {
+    fn exact_artifact_contract_path_opened_two_tier_modes_require_owner_backed_reader() -> Result<()>
+    {
         let dir = TempDir::new()?;
         let mut index = TantivyIndex::open_or_create(dir.path())?;
         index.commit()?;
@@ -9343,7 +9657,8 @@ mod tests {
 
         client.set_semantic_context(
             embedder,
-            VectorIndex::open(&fast_path)?,
+            SemanticIndexArtifact::open(&fast_path, None)?,
+            None,
             SemanticFilterMaps::for_tests(
                 HashMap::new(),
                 HashMap::new(),
@@ -9351,15 +9666,17 @@ mod tests {
                 HashSet::new(),
             ),
             None,
-            Some(fast_path),
         )?;
 
-        let fast_only_index = client
-            .in_memory_two_tier_index(SemanticTierMode::FastOnly)?
-            .expect("fast-only index should load");
         assert!(
-            !fast_only_index.has_quality_index(),
-            "fixture should only provide the fast tier"
+            client
+                .in_memory_two_tier_index(SemanticTierMode::FastOnly)?
+                .is_none(),
+            "fast-only two-tier serving must not reopen the retained path"
+        );
+        assert_eq!(
+            client.two_tier_unavailability_reason(SemanticTierMode::FastOnly)?,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired)
         );
 
         let quality_index = client.in_memory_two_tier_index(SemanticTierMode::QualityOnly)?;
@@ -9367,12 +9684,16 @@ mod tests {
             quality_index.is_none(),
             "quality mode must not reuse a cached fast-only two-tier index"
         );
+        assert_eq!(
+            client.two_tier_unavailability_reason(SemanticTierMode::QualityOnly)?,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired)
+        );
 
         Ok(())
     }
 
     #[test]
-    fn failed_quality_probe_does_not_block_fast_only_two_tier_load() -> Result<()> {
+    fn exact_artifact_contract_quality_probe_does_not_authorize_fast_path_reopen() -> Result<()> {
         let dir = TempDir::new()?;
         let mut index = TantivyIndex::open_or_create(dir.path())?;
         index.commit()?;
@@ -9391,7 +9712,8 @@ mod tests {
 
         client.set_semantic_context(
             embedder,
-            VectorIndex::open(&fast_path)?,
+            SemanticIndexArtifact::open(&fast_path, None)?,
+            None,
             SemanticFilterMaps::for_tests(
                 HashMap::new(),
                 HashMap::new(),
@@ -9399,7 +9721,6 @@ mod tests {
                 HashSet::new(),
             ),
             None,
-            Some(fast_path),
         )?;
 
         assert!(
@@ -9409,19 +9730,27 @@ mod tests {
             "quality-only lookup should fail for a fast-only fixture"
         );
 
-        let fast_only_index = client
-            .in_memory_two_tier_index(SemanticTierMode::FastOnly)?
-            .expect("a failed quality-only probe must not poison fast-only loads");
         assert!(
-            !fast_only_index.has_quality_index(),
-            "fixture should still resolve to the fast-only tier"
+            client
+                .in_memory_two_tier_index(SemanticTierMode::FastOnly)?
+                .is_none(),
+            "fast-only serving must keep using exact search from the retained owner"
+        );
+        assert_eq!(
+            client.two_tier_unavailability_reason(SemanticTierMode::QualityOnly)?,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired)
+        );
+        assert_eq!(
+            client.two_tier_unavailability_reason(SemanticTierMode::FastOnly)?,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired)
         );
 
         Ok(())
     }
 
     #[test]
-    fn progressive_context_error_does_not_poison_future_attempts() -> Result<()> {
+    fn exact_artifact_contract_progressive_ignores_conventional_decoys_without_quality()
+    -> Result<()> {
         let dir = TempDir::new()?;
         let mut index = TantivyIndex::open_or_create(dir.path())?;
         index.commit()?;
@@ -9442,7 +9771,8 @@ mod tests {
 
         client.set_semantic_context(
             embedder,
-            VectorIndex::open(&fast_path)?,
+            SemanticIndexArtifact::open(&fast_path, None)?,
+            None,
             SemanticFilterMaps::for_tests(
                 HashMap::new(),
                 HashMap::new(),
@@ -9450,43 +9780,214 @@ mod tests {
                 HashSet::new(),
             ),
             None,
-            Some(fast_path),
         )?;
 
-        let first_err = client
-            .progressive_context()
-            .err()
-            .expect("invalid progressive index files should fail to load");
+        let first = client.progressive_context()?;
         assert!(
-            first_err
-                .to_string()
-                .contains("open fast-tier index failed"),
-            "unexpected first progressive-context error: {first_err}"
+            first.is_none(),
+            "fixed-name decoys must not create a progressive context"
         );
 
-        let second_err = client
-            .progressive_context()
-            .err()
-            .expect("a failed progressive load must not be memoized as None");
+        let second = client.progressive_context()?;
         assert!(
-            second_err
+            second.is_none(),
+            "cached unavailability must remain independent of fixed-name decoys"
+        );
+        assert_eq!(
+            client.progressive_unavailability_reason()?,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired)
+        );
+        assert!(
+            client
+                .in_memory_two_tier_index(SemanticTierMode::FastOnly)?
+                .is_none(),
+            "path-based fast-only construction must remain disabled"
+        );
+        assert_eq!(
+            client.two_tier_unavailability_reason(SemanticTierMode::FastOnly)?,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn exact_artifact_contract_rejects_wrong_identity_and_dimension() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        index.commit()?;
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
+
+        let wrong_id_path = dir.path().join("selected-wrong-id.fsvi");
+        VectorIndex::create_with_revision(
+            &wrong_id_path,
+            "different-embedder-256",
+            "wrong-id-rev",
+            embedder.dimension(),
+            frankensearch::index::Quantization::F16,
+        )?
+        .finish()?;
+        let wrong_id_error = client
+            .set_semantic_context(
+                embedder.clone(),
+                SemanticIndexArtifact::open(&wrong_id_path, None)?,
+                None,
+                SemanticFilterMaps::for_tests(
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashSet::new(),
+                ),
+                None,
+            )
+            .expect_err("wrong embedder identity must fail before installation");
+        assert!(
+            wrong_id_error.to_string().contains("embedder mismatch"),
+            "unexpected identity error: {wrong_id_error}"
+        );
+
+        let wrong_dimension_path = dir.path().join("selected-wrong-dimension.fsvi");
+        VectorIndex::create_with_revision(
+            &wrong_dimension_path,
+            embedder.id(),
+            "wrong-dimension-rev",
+            384,
+            frankensearch::index::Quantization::F16,
+        )?
+        .finish()?;
+        let wrong_dimension_error = client
+            .set_semantic_context(
+                embedder,
+                SemanticIndexArtifact::open(&wrong_dimension_path, None)?,
+                None,
+                SemanticFilterMaps::for_tests(
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashSet::new(),
+                ),
+                None,
+            )
+            .expect_err("wrong embedder dimension must fail before installation");
+        assert!(
+            wrong_dimension_error
                 .to_string()
-                .contains("open fast-tier index failed"),
-            "unexpected second progressive-context error: {second_err}"
+                .contains("embedder dimension mismatch"),
+            "unexpected dimension error: {wrong_dimension_error}"
+        );
+        assert!(
+            client
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?
+                .is_none(),
+            "a rejected artifact must not partially install semantic state"
+        );
+
+        let current: Arc<dyn Embedder> =
+            Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
+        let hash_identity_error =
+            match client.load_embedder_for_progressive_id(&current, "fnv1a-384", 256) {
+                Ok(_) => panic!("hash identity dimension disagreement must fail closed"),
+                Err(error) => error,
+            };
+        assert!(
+            hash_identity_error
+                .to_string()
+                .contains("identity fnv1a-384 declares 384, index has 256"),
+            "unexpected hash identity error: {hash_identity_error}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn exact_artifact_contract_does_not_reopen_fast_quality_alias() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        index.commit()?;
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
+        let fast_path = dir.path().join("selected-fast.fsvi");
+        let quality_alias_path = dir.path().join("selected-quality-alias.fsvi");
+        VectorIndex::create_with_revision(
+            &fast_path,
+            embedder.id(),
+            "alias-rev",
+            embedder.dimension(),
+            frankensearch::index::Quantization::F16,
+        )?
+        .finish()?;
+        std::fs::hard_link(&fast_path, &quality_alias_path)?;
+        let bytes_before = std::fs::read(&fast_path)?;
+
+        client.set_semantic_context(
+            embedder,
+            SemanticIndexArtifact::open(&fast_path, None)?,
+            Some(SemanticIndexArtifact::open(&quality_alias_path, None)?),
+            SemanticFilterMaps::for_tests(
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashSet::new(),
+            ),
+            None,
+        )?;
+
+        assert!(
+            client.progressive_context()?.is_none(),
+            "path-based progressive construction must fail closed before reopening either role"
+        );
+        assert_eq!(
+            client.progressive_unavailability_reason()?,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired)
+        );
+        assert_eq!(
+            client.two_tier_unavailability_reason(SemanticTierMode::QualityOnly)?,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired)
+        );
+        assert!(
+            client
+                .in_memory_two_tier_index(SemanticTierMode::FastOnly)?
+                .is_none(),
+            "fast-only two-tier construction must not reopen the retained path"
+        );
+        assert_eq!(
+            std::fs::read(&fast_path)?,
+            bytes_before,
+            "owner-required fallback must not rewrite the fast role"
+        );
+        assert_eq!(
+            std::fs::read(&quality_alias_path)?,
+            bytes_before,
+            "owner-required fallback must not rewrite the aliased quality role"
         );
 
         Ok(())
     }
 
     fn build_semantic_test_fixture() -> Result<SemanticTestFixture> {
-        build_semantic_test_fixture_with_shards(false)
+        build_semantic_test_fixture_with_options(false, SemanticAnnFixtureMode::Missing)
+    }
+
+    fn build_semantic_test_fixture_with_ann(
+        ann_mode: SemanticAnnFixtureMode,
+    ) -> Result<SemanticTestFixture> {
+        build_semantic_test_fixture_with_options(false, ann_mode)
     }
 
     fn build_sharded_semantic_test_fixture() -> Result<SemanticTestFixture> {
-        build_semantic_test_fixture_with_shards(true)
+        build_semantic_test_fixture_with_options(true, SemanticAnnFixtureMode::Missing)
     }
 
-    fn build_semantic_test_fixture_with_shards(sharded: bool) -> Result<SemanticTestFixture> {
+    fn build_semantic_test_fixture_with_options(
+        sharded: bool,
+        ann_mode: SemanticAnnFixtureMode,
+    ) -> Result<SemanticTestFixture> {
+        if sharded && ann_mode != SemanticAnnFixtureMode::Missing {
+            bail!("the sharded semantic fixture does not synthesize an ANN topology");
+        }
         let dir = TempDir::new()?;
         let db_path = dir.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path)?;
@@ -9589,7 +10090,7 @@ mod tests {
             vector_records.push((doc_id, vector));
         }
 
-        let mut vector_indexes = Vec::new();
+        let mut artifacts = Vec::new();
         if sharded {
             for (shard_index, chunk) in vector_records.chunks(2).enumerate() {
                 let vector_path = vector_dir.join(format!("shard-{shard_index}.fsvi"));
@@ -9604,7 +10105,7 @@ mod tests {
                     writer.write_record(doc_id, vector)?;
                 }
                 writer.finish()?;
-                vector_indexes.push(VectorIndex::open(&vector_path)?);
+                artifacts.push(SemanticIndexArtifact::open(&vector_path, None)?);
             }
         } else {
             let vector_path = vector_dir.join("index-test-fixed-2d.fsvi");
@@ -9619,18 +10120,78 @@ mod tests {
                 writer.write_record(doc_id, vector)?;
             }
             writer.finish()?;
-            vector_indexes.push(VectorIndex::open(&vector_path)?);
+            let ann_path = match ann_mode {
+                SemanticAnnFixtureMode::Missing => None,
+                SemanticAnnFixtureMode::Native => {
+                    let ann_path = vector_dir.join("selected-native-ann.chsw");
+                    let source_index = VectorIndex::open(&vector_path)?;
+                    let ann = FsHnswIndex::build_from_vector_index(
+                        &source_index,
+                        frankensearch::index::HnswConfig::default(),
+                    )?;
+                    ann.save(&ann_path)?;
+                    Some(ann_path)
+                }
+                SemanticAnnFixtureMode::StaleSameDocIds => {
+                    let stale_source_path = vector_dir.join("stale-ann-source.fsvi");
+                    let mut stale_writer = VectorIndex::create_with_revision(
+                        &stale_source_path,
+                        embedder.id(),
+                        "stale-ann-rev",
+                        embedder.dimension(),
+                        frankensearch::index::Quantization::F16,
+                    )?;
+                    let stale_vectors =
+                        [[0.0_f32, 1.0_f32], [0.1_f32, 0.9_f32], [1.0_f32, 0.0_f32]];
+                    for ((doc_id, _), stale_vector) in
+                        vector_records.iter().zip(stale_vectors.iter())
+                    {
+                        stale_writer.write_record(doc_id, stale_vector)?;
+                    }
+                    stale_writer.finish()?;
+                    let stale_source_index = VectorIndex::open(&stale_source_path)?;
+                    let ann = FsHnswIndex::build_from_vector_index(
+                        &stale_source_index,
+                        frankensearch::index::HnswConfig::default(),
+                    )?;
+                    let ann_path = vector_dir.join("selected-stale-ann.chsw");
+                    ann.save(&ann_path)?;
+                    Some(ann_path)
+                }
+                SemanticAnnFixtureMode::CorruptMetadata => {
+                    let ann_path = vector_dir.join("selected-corrupt-ann.chsw");
+                    std::fs::write(&ann_path, b"not HNSW metadata")?;
+                    Some(ann_path)
+                }
+                SemanticAnnFixtureMode::CrossRoleAlias => {
+                    let ann_path = vector_dir.join("selected-aliased-ann.chsw");
+                    std::fs::hard_link(&vector_path, &ann_path)?;
+                    Some(ann_path)
+                }
+                #[cfg(unix)]
+                SemanticAnnFixtureMode::FinalComponentSymlink => {
+                    use std::os::unix::fs::symlink;
+
+                    let target = vector_dir.join("selected-ann-target.chsw");
+                    std::fs::write(&target, b"not selected through an alias")?;
+                    let ann_path = vector_dir.join("selected-ann-symlink.chsw");
+                    symlink(&target, &ann_path)?;
+                    Some(ann_path)
+                }
+            };
+            artifacts.push(SemanticIndexArtifact::open(&vector_path, ann_path)?);
         }
         drop(storage);
 
         let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("db-backed client");
-        client.set_semantic_indexes_context(embedder, vector_indexes, filter_maps, None, None)?;
+        client.set_semantic_artifacts_context(embedder, artifacts, None, filter_maps, None)?;
 
         Ok(SemanticTestFixture {
             _dir: dir,
             client,
             doc_ids,
             source_paths,
+            vector_dir,
         })
     }
 
@@ -9791,8 +10352,8 @@ mod tests {
             HashMap::from([(source_id.to_string(), source_hash)]),
             HashSet::new(),
         );
-        let fast_path = dir.path().join("vector.fast.idx");
-        let quality_path = dir.path().join("vector.quality.idx");
+        let fast_path = dir.path().join("selected-fast-cass.fsvi");
+        let quality_path = dir.path().join("selected-quality-cass.fsvi");
 
         let mut fast_writer = VectorIndex::create_with_revision(
             &fast_path,
@@ -9830,6 +10391,18 @@ mod tests {
         }
         fast_writer.finish()?;
         quality_writer.finish()?;
+        std::fs::write(
+            dir.path().join("vector.fast.idx"),
+            b"corrupt fixed-name decoy",
+        )?;
+        std::fs::write(
+            dir.path().join("vector.idx"),
+            b"corrupt fallback-name decoy",
+        )?;
+        std::fs::write(
+            dir.path().join("vector.quality.idx"),
+            b"corrupt quality-name decoy",
+        )?;
 
         let reader = fs_cass_open_search_reader(dir.path(), ReloadPolicy::Manual).ok();
         let client = SearchClient {
@@ -9851,10 +10424,10 @@ mod tests {
         let semantic_embedder: Arc<dyn Embedder> = fast_embedder;
         client.set_semantic_context(
             semantic_embedder,
-            VectorIndex::open(&fast_path)?,
+            SemanticIndexArtifact::open(&fast_path, None)?,
+            Some(SemanticIndexArtifact::open(&quality_path, None)?),
             filter_maps,
             None,
-            Some(fast_path),
         )?;
 
         Ok(ProgressiveHybridFixture {
@@ -18598,7 +19171,294 @@ mod tests {
     }
 
     #[test]
-    fn semantic_search_merges_sharded_vector_indexes() -> Result<()> {
+    fn exact_artifact_contract_native_ann_searches_without_mutating_generation() -> Result<()> {
+        let fixture = build_semantic_test_fixture_with_ann(SemanticAnnFixtureMode::Native)?;
+        let artifacts_before = semantic_artifact_tree_snapshot(&fixture.vector_dir)?;
+
+        let (hits, ann_stats) = fixture.client.search_semantic(
+            "semantic fixture query",
+            SearchFilters::default(),
+            1,
+            0,
+            FieldMask::FULL,
+            true,
+        )?;
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].source_path, fixture.source_paths[0],
+            "the selected native ANN must preserve the exact source ranking"
+        );
+        assert!(
+            ann_stats.is_some(),
+            "a native explicitly paired ANN must report ANN execution stats"
+        );
+        assert_eq!(fixture.client.ann_unavailability_reason()?, None);
+        assert_eq!(
+            semantic_artifact_tree_snapshot(&fixture.vector_dir)?,
+            artifacts_before,
+            "native ANN serving must preserve bytes, mtimes, permissions, and inventory"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_artifact_contract_path_replacement_keeps_exact_owner_and_disables_progressive()
+    -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        let selected_path = fixture.vector_dir.join("index-test-fixed-2d.fsvi");
+        let selected_bytes = std::fs::read(&selected_path)?;
+
+        let (initial_hits, initial_ann_stats) = fixture.client.search_semantic(
+            "semantic fixture query",
+            SearchFilters::default(),
+            1,
+            0,
+            FieldMask::FULL,
+            false,
+        )?;
+        assert!(initial_ann_stats.is_none());
+        assert_eq!(initial_hits.len(), 1);
+        assert_eq!(initial_hits[0].source_path, fixture.source_paths[0]);
+
+        let replacement_path = fixture.vector_dir.join("replacement.fsvi");
+        let mut replacement = VectorIndex::create_with_revision(
+            &replacement_path,
+            "test-fixed-2d",
+            "replacement-rev",
+            2,
+            frankensearch::index::Quantization::F16,
+        )?;
+        for (doc_id, vector) in
+            fixture
+                .doc_ids
+                .iter()
+                .zip([[0.0_f32, 1.0_f32], [0.1_f32, 0.9_f32], [1.0_f32, 0.0_f32]])
+        {
+            replacement.write_record(doc_id, &vector)?;
+        }
+        replacement.finish()?;
+        std::fs::rename(&replacement_path, &selected_path)?;
+
+        let replacement_bytes = std::fs::read(&selected_path)?;
+        assert_ne!(
+            replacement_bytes, selected_bytes,
+            "the selected pathname must now name a different FSVI image"
+        );
+        let replacement_index = VectorIndex::open(&selected_path)?;
+        let replacement_hits = replacement_index.search_top_k(&[1.0, 0.0], 1, None)?;
+        assert_eq!(replacement_hits.len(), 1);
+        assert_eq!(
+            replacement_hits[0].doc_id.as_str(),
+            fixture.doc_ids[2],
+            "the replacement path must realize a different winner"
+        );
+        let post_replace_snapshot = semantic_artifact_tree_snapshot(&fixture.vector_dir)?;
+
+        let (exact_hits, exact_ann_stats) = fixture.client.search_semantic(
+            "semantic fixture query",
+            SearchFilters::default(),
+            1,
+            0,
+            FieldMask::FULL,
+            false,
+        )?;
+        assert!(exact_ann_stats.is_none());
+        assert_eq!(exact_hits.len(), 1);
+        assert_eq!(
+            exact_hits[0].source_path, fixture.source_paths[0],
+            "exact search must stay on the constructor-retained owner"
+        );
+
+        let (fast_only_hits, fast_only_ann_stats) = fixture.client.search_semantic_with_tier(
+            "semantic fixture query",
+            SearchFilters::default(),
+            1,
+            0,
+            FieldMask::FULL,
+            false,
+            SemanticTierMode::FastOnly,
+        )?;
+        assert!(fast_only_ann_stats.is_none());
+        assert_eq!(fast_only_hits.len(), 1);
+        assert_eq!(
+            fast_only_hits[0].source_path, fixture.source_paths[0],
+            "fast-only requests must fall back to the retained exact owner"
+        );
+        assert_eq!(
+            fixture
+                .client
+                .two_tier_unavailability_reason(SemanticTierMode::FastOnly)?,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired)
+        );
+        assert!(fixture.client.progressive_context()?.is_none());
+        assert_eq!(
+            fixture.client.progressive_unavailability_reason()?,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired)
+        );
+        assert_eq!(
+            semantic_artifact_tree_snapshot(&fixture.vector_dir)?,
+            post_replace_snapshot,
+            "exact fallback and progressive diagnostics must not mutate the replacement tree"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn exact_artifact_contract_stale_ann_with_same_doc_ids_falls_back_exact_read_only() -> Result<()>
+    {
+        let fixture =
+            build_semantic_test_fixture_with_ann(SemanticAnnFixtureMode::StaleSameDocIds)?;
+        let artifacts_before = semantic_artifact_tree_snapshot(&fixture.vector_dir)?;
+
+        let (hits, ann_stats) = fixture.client.search_semantic(
+            "semantic fixture query",
+            SearchFilters::default(),
+            1,
+            0,
+            FieldMask::FULL,
+            true,
+        )?;
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].source_path, fixture.source_paths[0],
+            "a stale same-doc-id ANN must not influence the exact fallback ranking"
+        );
+        assert!(
+            ann_stats.is_none(),
+            "a rejected stale ANN must not claim approximate execution"
+        );
+        assert_eq!(
+            fixture.client.ann_unavailability_reason()?,
+            Some(SemanticAnnUnavailableReason::SidecarNotNative)
+        );
+        assert_eq!(
+            semantic_artifact_tree_snapshot(&fixture.vector_dir)?,
+            artifacts_before,
+            "stale ANN rejection must preserve bytes, mtimes, permissions, and inventory"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn exact_artifact_contract_invalid_optional_ann_falls_back_exact_read_only() -> Result<()> {
+        let mut modes = vec![
+            SemanticAnnFixtureMode::CorruptMetadata,
+            SemanticAnnFixtureMode::CrossRoleAlias,
+        ];
+        #[cfg(unix)]
+        modes.push(SemanticAnnFixtureMode::FinalComponentSymlink);
+
+        for mode in modes {
+            let fixture = build_semantic_test_fixture_with_ann(mode)?;
+            let artifacts_before = semantic_artifact_tree_snapshot(&fixture.vector_dir)?;
+
+            let (hits, ann_stats) = fixture.client.search_semantic(
+                "semantic fixture query",
+                SearchFilters::default(),
+                1,
+                0,
+                FieldMask::FULL,
+                true,
+            )?;
+
+            assert_eq!(hits.len(), 1, "exact fallback failed for {mode:?}");
+            assert_eq!(
+                hits[0].source_path, fixture.source_paths[0],
+                "an invalid optional ANN must not influence exact ranking for {mode:?}"
+            );
+            assert!(
+                ann_stats.is_none(),
+                "an invalid optional ANN must not claim approximate execution for {mode:?}"
+            );
+            assert_eq!(
+                fixture.client.ann_unavailability_reason()?,
+                Some(SemanticAnnUnavailableReason::SidecarOpenFailed),
+                "invalid optional ANN reason disagreed for {mode:?}"
+            );
+            assert_eq!(
+                semantic_artifact_tree_snapshot(&fixture.vector_dir)?,
+                artifacts_before,
+                "invalid ANN fallback must preserve bytes, mtimes, permissions, and inventory for {mode:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn exact_artifact_contract_missing_ann_falls_back_exact_with_typed_reason() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        let artifacts_before = semantic_artifact_tree_snapshot(&fixture.vector_dir)?;
+
+        let (hits, ann_stats) = fixture.client.search_semantic(
+            "semantic fixture query",
+            SearchFilters::default(),
+            1,
+            0,
+            FieldMask::FULL,
+            true,
+        )?;
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_path, fixture.source_paths[0]);
+        assert!(
+            ann_stats.is_none(),
+            "an exact fallback must not emit ANN stats"
+        );
+        assert_eq!(
+            fixture.client.ann_unavailability_reason()?,
+            Some(SemanticAnnUnavailableReason::SidecarMissing)
+        );
+        assert_eq!(
+            semantic_artifact_tree_snapshot(&fixture.vector_dir)?,
+            artifacts_before,
+            "missing ANN fallback must not synthesize or rewrite artifacts"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn exact_artifact_contract_sharded_ann_request_falls_back_exact_with_typed_reason() -> Result<()>
+    {
+        let fixture = build_sharded_semantic_test_fixture()?;
+        let artifacts_before = semantic_artifact_tree_snapshot(&fixture.vector_dir)?;
+
+        let (hits, ann_stats) = fixture.client.search_semantic(
+            "semantic fixture query",
+            SearchFilters::default(),
+            3,
+            0,
+            FieldMask::FULL,
+            true,
+        )?;
+
+        assert!(ann_stats.is_none());
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].source_path, fixture.source_paths[0]);
+        assert_eq!(hits[1].source_path, fixture.source_paths[1]);
+        assert_eq!(hits[2].source_path, fixture.source_paths[2]);
+        assert_eq!(
+            fixture.client.ann_unavailability_reason()?,
+            Some(SemanticAnnUnavailableReason::MultipleExactShards)
+        );
+        assert_eq!(
+            semantic_artifact_tree_snapshot(&fixture.vector_dir)?,
+            artifacts_before,
+            "sharded ANN fallback must preserve the exact artifact set"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn exact_artifact_contract_sharded_exact_search_has_typed_progressive_fallback() -> Result<()> {
         let fixture = build_sharded_semantic_test_fixture()?;
         let (hits, ann_stats) = fixture.client.search_semantic(
             "semantic fixture query",
@@ -18617,6 +19477,27 @@ mod tests {
         assert_eq!(hits[0].source_path, fixture.source_paths[0]);
         assert_eq!(hits[1].source_path, fixture.source_paths[1]);
         assert_eq!(hits[2].source_path, fixture.source_paths[2]);
+        assert!(
+            fixture
+                .client
+                .in_memory_two_tier_index(SemanticTierMode::FastOnly)?
+                .is_none(),
+            "multi-shard exact serving must not synthesize an unsharded two-tier index"
+        );
+        assert!(
+            fixture.client.progressive_context()?.is_none(),
+            "multi-shard exact serving must report progressive refinement unavailable"
+        );
+        assert_eq!(
+            fixture
+                .client
+                .two_tier_unavailability_reason(SemanticTierMode::FastOnly)?,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired)
+        );
+        assert_eq!(
+            fixture.client.progressive_unavailability_reason()?,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired)
+        );
 
         Ok(())
     }

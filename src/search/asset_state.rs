@@ -37,7 +37,9 @@ use crate::search::semantic_manifest::{
     TierKind, semantic_shard_artifact_path_is_safe,
 };
 use crate::search::tantivy::SCHEMA_HASH;
-use crate::search::vector_index::{VECTOR_INDEX_DIR, vector_index_path};
+#[cfg(test)]
+use crate::search::vector_index::VECTOR_INDEX_DIR;
+use crate::search::vector_index::{SemanticProgressiveUnavailableReason, vector_index_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum SearchMaintenanceMode {
@@ -491,6 +493,7 @@ pub(crate) struct SemanticAssetState {
     pub hnsw_path: Option<PathBuf>,
     pub hnsw_ready: bool,
     pub progressive_ready: bool,
+    pub progressive_reason_code: Option<&'static str>,
     /// Sub-fix 3 for cass#257: true when a quality-tier vector index is
     /// published, matches the current DB fingerprint, and could serve a
     /// `--mode semantic` search even if the progressive/hybrid stack is
@@ -559,6 +562,7 @@ pub(crate) struct SemanticTierAssetState {
     pub completed_at_ms: Option<i64>,
     pub size_bytes: Option<u64>,
     pub index_path: Option<PathBuf>,
+    pub shard_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -714,7 +718,8 @@ fn semantic_state_not_inspected(
         model_dir: preference_surface.model_dir,
         hnsw_path: None,
         hnsw_ready: false,
-        progressive_ready: semantic_progressive_assets_ready(data_dir),
+        progressive_ready: false,
+        progressive_reason_code: None,
         // The fast-path skip-DB-open lane doesn't have an
         // `availability` to consult, so we can't honestly call the
         // tiers queryable here — leave the sub-fix-3 flags false. The
@@ -793,7 +798,7 @@ pub(crate) fn semantic_state_from_availability(
     let base_hnsw_path = base_embedder_id
         .as_deref()
         .map(|embedder_id| hnsw_index_path(data_dir, embedder_id));
-    let runtime = semantic_runtime_surface(SemanticRuntimeInputs {
+    let mut runtime = semantic_runtime_surface(SemanticRuntimeInputs {
         data_dir,
         availability,
         preference,
@@ -806,6 +811,18 @@ pub(crate) fn semantic_state_from_availability(
         base_model_dir: base_model_dir.clone(),
         base_hnsw_path: base_hnsw_path.clone(),
     });
+    let (progressive_ready, progressive_reason) =
+        semantic_progressive_topology(availability, &fast_tier, &quality_tier);
+    let progressive_reason_code = progressive_reason.map(|reason| reason.code());
+    if let Some(reason) = progressive_reason
+        && runtime.can_search
+    {
+        runtime.summary = format!(
+            "{}; progressive refinement unavailable ({})",
+            runtime.summary,
+            reason.code()
+        );
+    }
     let use_runtime_paths = runtime.embedder_id.is_some();
     let embedder_id = runtime.embedder_id.or(base_embedder_id);
     let vector_index_path = if use_runtime_paths {
@@ -824,7 +841,6 @@ pub(crate) fn semantic_state_from_availability(
         runtime.hnsw_path.or(base_hnsw_path)
     };
     let hnsw_ready = hnsw_path.as_ref().is_some_and(|path| path.is_file());
-    let progressive_ready = semantic_progressive_assets_ready(data_dir);
 
     // Sub-fix 3 for cass#257: report quality-tier readiness as a
     // first-class flag so operators querying `--mode semantic` can
@@ -848,6 +864,7 @@ pub(crate) fn semantic_state_from_availability(
         hnsw_path,
         hnsw_ready,
         progressive_ready,
+        progressive_reason_code,
         quality_tier_published,
         semantic_only_search_available,
         hint: runtime.hint,
@@ -1119,6 +1136,7 @@ fn semantic_tier_asset_state(
         completed_at_ms: Some(artifact.completed_at_ms),
         size_bytes: Some(artifact.size_bytes),
         index_path: None,
+        shard_count: Some(1),
     }
 }
 
@@ -1211,6 +1229,7 @@ fn promote_complete_shard_generation_state(
         completed_at_ms: Some(completed_at_ms),
         size_bytes: Some(size_bytes),
         index_path: Some(first_index_path),
+        shard_count: u32::try_from(records.len()).ok(),
     };
 }
 
@@ -1549,9 +1568,38 @@ fn semantic_vector_index_path(
     }
 }
 
-fn semantic_progressive_assets_ready(data_dir: &Path) -> bool {
-    let vector_dir = data_dir.join(VECTOR_INDEX_DIR);
-    vector_dir.join("vector.fast.idx").is_file() && vector_dir.join("vector.quality.idx").is_file()
+fn semantic_progressive_topology(
+    availability: &SemanticAvailability,
+    fast_tier: &SemanticTierAssetState,
+    quality_tier: &SemanticTierAssetState,
+) -> (bool, Option<SemanticProgressiveUnavailableReason>) {
+    if matches!(
+        availability,
+        SemanticAvailability::LoadFailed { context }
+            if context
+                == SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired.code()
+    ) {
+        return (
+            false,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired),
+        );
+    }
+
+    let fast_queryable = semantic_tier_queryable(availability, fast_tier);
+    let quality_queryable = semantic_tier_queryable(availability, quality_tier);
+    if !availability.can_search() && !fast_queryable && !quality_queryable {
+        return (false, None);
+    }
+
+    // Readiness must describe the strongest unsatisfied serving contract.
+    // Every currently available progressive constructor reopens a pathname;
+    // neither filename topology nor a successful prior exact open proves that
+    // the reopened file is the same inode/generation. Keep all such lanes
+    // unavailable until status and serving can share retained owners.
+    (
+        false,
+        Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired),
+    )
 }
 
 fn semantic_availability_code(availability: &SemanticAvailability) -> &'static str {
@@ -3137,7 +3185,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_state_detects_progressive_and_hnsw_assets() {
+    fn exact_artifact_contract_status_ignores_fixed_name_progressive_decoys() {
         let temp = tempfile::tempdir().expect("tempdir");
         let vector_dir = temp.path().join(VECTOR_INDEX_DIR);
         std::fs::create_dir_all(&vector_dir).expect("create vector dir");
@@ -3157,7 +3205,19 @@ mod tests {
         );
 
         assert_eq!(state.status, "ready");
-        assert!(state.progressive_ready);
+        assert!(
+            !state.progressive_ready,
+            "obsolete fixed-name files must not claim progressive readiness"
+        );
+        assert_eq!(
+            state.progressive_reason_code,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired.code())
+        );
+        assert!(
+            state.summary.contains("owner_backed_reader_required"),
+            "human summary and JSON reason code must agree: {}",
+            state.summary
+        );
         assert!(state.hnsw_ready);
         assert_eq!(
             state.embedder_id.as_deref(),
@@ -3380,6 +3440,17 @@ mod tests {
         assert!(state.can_search);
         assert_eq!(state.fallback_mode, None);
         assert_eq!(state.fast_tier.doc_count, Some(21));
+        assert_eq!(state.fast_tier.shard_count, Some(2));
+        assert!(!state.progressive_ready);
+        assert_eq!(
+            state.progressive_reason_code,
+            Some(SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired.code())
+        );
+        assert!(
+            state.summary.contains("owner_backed_reader_required"),
+            "human summary and JSON reason code must agree: {}",
+            state.summary
+        );
         let expected_path = temp
             .path()
             .join("vector_index/shards/fast-hash/shard-0.fsvi");

@@ -51,6 +51,7 @@ rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
 fs2 = "0.4.3"
+same-file = "1.0.6"
 lru = "0.18"
 rustc-hash = "2.1.2"  # Fast non-cryptographic hashing for cache keys (P1 Opt 1.3), replaces unmaintained fxhash
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }  # Fast content hashing for search-hit dedup (bead sdoxg)
@@ -91,7 +92,7 @@ bytemuck = "1.25.0"
 # not run the all-MiniLM LayerNorm export, and its prebuilt AVX/AVX2 vendor
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
-frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "bfa9fc0583ef2e2ac55bab847347e2f70a37134f", default-features = false, features = ["hash", "cass-compat", "ann", "native"] }
+frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "ad8e29eaa03c9f29abc472d895a0ea9bcbe04ff1", default-features = false, features = ["hash", "cass-compat", "ann", "native"] }
 franken-agent-detection = { version = "0.1.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "6d24c532667aebdf31ecac8a9ddb457bef32b3f7", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization

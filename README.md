@@ -3035,7 +3035,7 @@ Update check state is stored in the data directory:
 | `frankensqlite` / `fsqlite-types` | `f9cc3294` (`0.1.19`; exact Git source containing the existing-only schema-open contract that the same-version registry archive lacks, plus a `[patch.crates-io]` source override so connector dependencies cannot reintroduce a second registry-backed family; also includes contentless-FTS5 reopen/catch-up, bounded clean-page reclamation, and fused equality-run counting [cass#345 / frankensqlite#131]) |
 | `franken-agent-detection` | `6d24c532` (Grok Build connector [cass #328], plus Gemini CLI JSONL discovery, ordered `$set.messages` replay, and current role normalization [cass #341]) |
 | `asupersync` | `=0.3.9` |
-| `frankensearch` | `bfa9fc05` (pure-Rust `native` feature, architecture-safe HNSW `DistDot` normalization, and the explicit `cass-compat` → `lexical-tantivy` foreign-index surface; frankentorch remains pinned by git rev inside frankensearch — cass #308, #333, bd-8nqz.5) |
+| `frankensearch` | `ad8e29ea` (pure-Rust `native`, architecture-safe HNSW with native-only read admission that never rebuilds a rejected selected artifact, explicit `cass-compat` → `lexical-tantivy`, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission, cancellation-safe facade opening, generation-pinned Quill hydration, and the restored positionless-term-frequency plumbing; frankentorch remains pinned by git rev inside frankensearch — cass #308, #333, bd-8nqz.5, bd-07os, bd-r65a.1) |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 

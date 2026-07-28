@@ -18568,6 +18568,7 @@ fn state_meta_json_inner(
                 hnsw_path: None,
                 hnsw_ready: false,
                 progressive_ready: false,
+                progressive_reason_code: None,
                 quality_tier_published: false,
                 semantic_only_search_available: false,
                 hint: Some(
@@ -18615,6 +18616,7 @@ fn state_meta_json_inner(
         assets.semantic.hnsw_path = None;
         assets.semantic.hnsw_ready = false;
         assets.semantic.progressive_ready = false;
+        assets.semantic.progressive_reason_code = None;
         assets.semantic.quality_tier_published = false;
         assets.semantic.semantic_only_search_available = false;
         assets.semantic.hint = Some(
@@ -18906,6 +18908,7 @@ fn state_meta_json_inner(
             "hnsw_path": semantic.hnsw_path.as_ref().map(|path| path.display().to_string()),
             "hnsw_ready": semantic.hnsw_ready,
             "progressive_ready": semantic.progressive_ready,
+            "progressive_reason_code": semantic.progressive_reason_code,
             // Always true since bead tg5o9 retired the `semantic` Cargo
             // feature: every build carries the pure-Rust
             // frankensearch/native backend (no ONNX, no `-baseline`
@@ -18932,6 +18935,7 @@ fn state_meta_json_inner(
                     .completed_at_ms
                     .and_then(format_timestamp_millis_rfc3339),
                 "size_bytes": semantic.fast_tier.size_bytes,
+                "shard_count": semantic.fast_tier.shard_count,
             },
             "quality_tier": {
                 "present": semantic.quality_tier.present,
@@ -18946,6 +18950,7 @@ fn state_meta_json_inner(
                     .completed_at_ms
                     .and_then(format_timestamp_millis_rfc3339),
                 "size_bytes": semantic.quality_tier.size_bytes,
+                "shard_count": semantic.quality_tier.shard_count,
             },
             "backlog": {
                 "total_conversations": semantic.backlog.total_conversations,
@@ -23453,8 +23458,8 @@ fn run_cli_search(
 
         if let Some(context) = setup.context {
             let embedder = context.embedder;
-            let index = context.index;
-            let additional_indexes = context.additional_indexes;
+            let artifacts = context.artifacts;
+            let quality_artifact = context.quality_artifact;
             let filter_maps = context.filter_maps;
             let roles = context.roles;
             let daemon_embedder_compatible = embedder.id()
@@ -23492,17 +23497,13 @@ fn run_cli_search(
                     embedder
                 };
 
-            let ann_path = Some(
-                data_dir
-                    .join(crate::search::vector_index::VECTOR_INDEX_DIR)
-                    .join(format!("hnsw-{}.chsw", embedder.id())),
-            );
-            let mut indexes = Vec::with_capacity(additional_indexes.len().saturating_add(1));
-            indexes.push(index);
-            indexes.extend(additional_indexes);
-            if let Err(err) =
-                client.set_semantic_indexes_context(embedder, indexes, filter_maps, roles, ann_path)
-            {
+            if let Err(err) = client.set_semantic_artifacts_context(
+                embedder,
+                artifacts,
+                quality_artifact,
+                filter_maps,
+                roles,
+            ) {
                 let hint = if prefer_hash {
                     "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
                         .to_string()
@@ -23652,6 +23653,7 @@ fn run_cli_search(
             cache_stats: crate::search::query::CacheStats::default(),
             suggestions: Vec::new(),
             ann_stats: None,
+            ann_unavailable_reason: None,
             total_count: None,
         }
     } else {
@@ -23729,12 +23731,27 @@ fn run_cli_search(
                             }
                         }
                     })?;
+                    let ann_unavailable_reason = if approximate {
+                        client.ann_unavailability_reason().map_err(|e| CliError {
+                            code: 9,
+                            kind: CliErrorKind::Search.kind_str(),
+                            message: format!("failed to inspect ANN fallback state: {e}"),
+                            hint: Some(
+                                "Retry the search; CASS could not read the active semantic context"
+                                    .to_string(),
+                            ),
+                            retryable: true,
+                        })?
+                    } else {
+                        None
+                    };
                     crate::search::query::SearchResult {
                         hits,
                         wildcard_fallback: false,
                         cache_stats: crate::search::query::CacheStats::default(),
                         suggestions: Vec::new(),
                         ann_stats,
+                        ann_unavailable_reason,
                         total_count: None,
                     }
                 }
@@ -23916,6 +23933,7 @@ fn run_cli_search(
                             cache_stats: result.cache_stats,
                             suggestions: result.suggestions,
                             ann_stats: result.ann_stats,
+                            ann_unavailable_reason: result.ann_unavailable_reason,
                             total_count: result.total_count,
                         }
                     }
@@ -23989,6 +24007,7 @@ fn run_cli_search(
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions.clone(),
                 ann_stats: result.ann_stats.clone(),
+                ann_unavailable_reason: result.ann_unavailable_reason,
                 total_count: result.total_count,
             };
             let has_more = total > offset_val + display.hits.len();
@@ -24015,6 +24034,7 @@ fn run_cli_search(
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions.clone(),
                 ann_stats: result.ann_stats.clone(),
+                ann_unavailable_reason: result.ann_unavailable_reason,
                 total_count: result.total_count,
             };
             (Aggregations::default(), display, total, has_more, false)
@@ -24042,6 +24062,7 @@ fn run_cli_search(
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions,
                 ann_stats: result.ann_stats,
+                ann_unavailable_reason: result.ann_unavailable_reason,
                 total_count: result.total_count,
             };
             (
@@ -24284,6 +24305,9 @@ fn run_cli_search(
             eprintln!("{}", summary.render_compact_line());
         }
     }
+    if is_human_search && let Some(reason) = display_result.ann_unavailable_reason {
+        eprintln!("{}", ann_fallback_human_warning(reason));
+    }
 
     Ok(())
 }
@@ -24524,6 +24548,7 @@ fn run_cli_pack(
             cache_stats: crate::search::query::CacheStats::default(),
             suggestions: Vec::new(),
             ann_stats: None,
+            ann_unavailable_reason: None,
             total_count: None,
         }
     } else {
@@ -26028,6 +26053,61 @@ fn search_mode_label(mode: crate::search::query::SearchMode) -> &'static str {
     }
 }
 
+fn ann_fallback_human_warning(
+    reason: crate::search::vector_index::SemanticAnnUnavailableReason,
+) -> String {
+    let action = match reason {
+        crate::search::vector_index::SemanticAnnUnavailableReason::MultipleExactShards => {
+            "Exact multi-shard results remain available; inspect `cass health --json` before enabling sharded ANN acceleration."
+        }
+        crate::search::vector_index::SemanticAnnUnavailableReason::SidecarMissing
+        | crate::search::vector_index::SemanticAnnUnavailableReason::SidecarOpenFailed
+        | crate::search::vector_index::SemanticAnnUnavailableReason::SidecarNotNative => {
+            "Run `cass index --semantic --build-hnsw` to rebuild ANN acceleration."
+        }
+    };
+    format!(
+        "Approximate ANN unavailable ({}); CASS used exact semantic search for this request. {action}",
+        reason.code()
+    )
+}
+
+#[cfg(test)]
+mod ann_fallback_human_warning_tests {
+    use super::ann_fallback_human_warning;
+    use crate::search::vector_index::SemanticAnnUnavailableReason;
+
+    #[test]
+    fn warning_uses_the_same_stable_reason_code_as_robot_metadata() {
+        for reason in [
+            SemanticAnnUnavailableReason::MultipleExactShards,
+            SemanticAnnUnavailableReason::SidecarMissing,
+            SemanticAnnUnavailableReason::SidecarOpenFailed,
+            SemanticAnnUnavailableReason::SidecarNotNative,
+        ] {
+            let warning = ann_fallback_human_warning(reason);
+            assert!(
+                warning.contains(reason.code()),
+                "human warning must expose the robot metadata code: {warning}"
+            );
+            assert!(
+                warning.contains("exact semantic search"),
+                "human warning must name the realized fallback: {warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn warning_recommends_rebuild_only_for_unsharded_sidecar_failures() {
+        let missing = ann_fallback_human_warning(SemanticAnnUnavailableReason::SidecarMissing);
+        assert!(missing.contains("cass index --semantic --build-hnsw"));
+
+        let sharded = ann_fallback_human_warning(SemanticAnnUnavailableReason::MultipleExactShards);
+        assert!(sharded.contains("cass health --json"));
+        assert!(!sharded.contains("build-hnsw"));
+    }
+}
+
 fn toon_encode_options_from_env() -> toon::EncodeOptions {
     let indent = match dotenvy::var("TOON_INDENT") {
         Ok(v) if !v.trim().is_empty() => match v.parse::<usize>() {
@@ -26975,6 +27055,14 @@ fn output_robot_results(
                         serde_json::to_value(ann_stats).unwrap_or_default(),
                     );
                 }
+                if let Some(reason) = result.ann_unavailable_reason
+                    && let serde_json::Value::Object(ref mut m) = meta
+                {
+                    m.insert(
+                        "ann_unavailable_reason".to_string(),
+                        serde_json::json!(reason.code()),
+                    );
+                }
                 map.insert("_meta".to_string(), meta);
 
                 if let Some(warn) = &warning {
@@ -27291,6 +27379,14 @@ fn output_robot_results(
                         serde_json::to_value(ann_stats).unwrap_or_default(),
                     );
                 }
+                if let Some(reason) = result.ann_unavailable_reason
+                    && let serde_json::Value::Object(ref mut m) = meta
+                {
+                    m.insert(
+                        "ann_unavailable_reason".to_string(),
+                        serde_json::json!(reason.code()),
+                    );
+                }
                 map.insert("_meta".to_string(), meta);
                 if let Some(warn) = &warning {
                     map.insert(
@@ -27423,6 +27519,14 @@ fn output_robot_results(
                     m.insert(
                         "ann_stats".to_string(),
                         serde_json::to_value(ann_stats).unwrap_or_default(),
+                    );
+                }
+                if let Some(reason) = result.ann_unavailable_reason
+                    && let serde_json::Value::Object(ref mut m) = meta
+                {
+                    m.insert(
+                        "ann_unavailable_reason".to_string(),
+                        serde_json::json!(reason.code()),
                     );
                 }
                 map.insert("_meta".to_string(), meta);
@@ -73648,6 +73752,47 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    fn exact_artifact_contract_status_json_and_human_summary_share_owner_reason() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+
+        let pointer_path =
+            crate::search::semantic_manifest::SemanticCurrentPointerV1::path(temp.path());
+        std::fs::create_dir_all(pointer_path.parent().expect("pointer parent"))
+            .expect("create pointer parent");
+        std::fs::write(
+            &pointer_path,
+            br#"{"schema_version":1,"generation_id":"selected","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","selection_epoch":1,"selected_at_ms":1733100000000}"#,
+        )
+        .expect("write semantic current pointer");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        let reason = crate::search::vector_index::SemanticProgressiveUnavailableReason::
+            OwnerBackedReaderRequired
+            .code();
+        assert_eq!(
+            state["semantic"]["progressive_reason_code"].as_str(),
+            Some(reason)
+        );
+        assert_eq!(
+            state["semantic"]["progressive_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            state["semantic"]["availability"].as_str(),
+            Some("load_failed")
+        );
+        assert!(
+            state["semantic"]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains(reason)),
+            "the human status summary and JSON reason code must use the same stable reason"
+        );
+    }
+
+    #[test]
     fn active_index_run_details_reads_matching_lock_metadata() {
         let (temp, db_path) = seed_cli_db();
         let lock_path = temp.path().join("index-run.lock");
@@ -80282,6 +80427,7 @@ fn response_schema_semantic_state() -> serde_json::Value {
             "hnsw_path": { "type": ["string", "null"] },
             "hnsw_ready": { "type": "boolean" },
             "progressive_ready": { "type": "boolean" },
+            "progressive_reason_code": { "type": ["string", "null"] },
             "feature_compiled_in": { "type": "boolean" },
             "quality_tier_published": { "type": "boolean" },
             "semantic_only_search_available": { "type": "boolean" },
@@ -80297,7 +80443,8 @@ fn response_schema_semantic_state() -> serde_json::Value {
                     "embedder_id": { "type": ["string", "null"] },
                     "model_revision": { "type": ["string", "null"] },
                     "completed_at": { "type": ["string", "null"] },
-                    "size_bytes": { "type": ["integer", "null"] }
+                    "size_bytes": { "type": ["integer", "null"] },
+                    "shard_count": { "type": ["integer", "null"] }
                 }
             },
             "quality_tier": {
@@ -80311,7 +80458,8 @@ fn response_schema_semantic_state() -> serde_json::Value {
                     "embedder_id": { "type": ["string", "null"] },
                     "model_revision": { "type": ["string", "null"] },
                     "completed_at": { "type": ["string", "null"] },
-                    "size_bytes": { "type": ["integer", "null"] }
+                    "size_bytes": { "type": ["integer", "null"] },
+                    "shard_count": { "type": ["integer", "null"] }
                 }
             },
             "backlog": {
