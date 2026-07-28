@@ -50,6 +50,8 @@ PEER_WORKER_ID="${CASS_E2E_PEER_WORKER:-}"
 SSH_TARGET=""
 SSH_OPTIONS=()
 RSYNC_RSH=""
+RCH_EXIT="not-run"
+RCH_ARTIFACT_SYNC_DISPOSITION="not-run"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -660,6 +662,44 @@ run_cargo() {
             -- cargo "$@"
 }
 
+classify_rch_runner_result() {
+    local rch_exit="$1"
+    local output_file="$2"
+    local worker_id="$3"
+    local artifact_diagnostic remote_exit_diagnostic
+    local artifact_diagnostic_count=0 remote_exit_diagnostic_count=0
+    if [[ "$rch_exit" -eq 0 ]]; then
+        printf '%s\n' "complete"
+        return 0
+    fi
+    if [[ "$rch_exit" -ne 102 ]]; then
+        printf 'unclassified-rch-exit-%s\n' "$rch_exit"
+        return 1
+    fi
+
+    # `cargo run --bin e2e-run-bundle` is classified by RCH as a build, so RCH
+    # tries to copy the linked runner and dependency outputs back after the
+    # remote runner has already sealed its evidence. The runner binary is
+    # intentionally remote-only: acceptance independently retrieves and
+    # byte-verifies the receipted run bundle over the exact worker's SSH
+    # endpoint. Admit only RCH-E309's exact successful-remote/incomplete-local
+    # diagnostic; no other nonzero RCH result is evidence.
+    artifact_diagnostic="[RCH] RCH-E309 remote compile on $worker_id SUCCEEDED but build artifacts could not be retrieved — the local build is INCOMPLETE (expected binaries/libraries are missing). Treating as a build failure (exit 102); re-run to rebuild, or check connectivity to the worker."
+    remote_exit_diagnostic="[RCH] remote $worker_id failed (exit 102)"
+    artifact_diagnostic_count=$(
+        grep -F -x -c -- "$artifact_diagnostic" "$output_file" || true
+    )
+    remote_exit_diagnostic_count=$(
+        grep -F -x -c -- "$remote_exit_diagnostic" "$output_file" || true
+    )
+    if [[ "$artifact_diagnostic_count" -eq 1 && "$remote_exit_diagnostic_count" -eq 1 ]]; then
+        printf '%s\n' "remote-run-complete-local-runner-artifact-sync-incomplete-rch-e309"
+        return 0
+    fi
+    printf '%s\n' "unverified-rch-e309"
+    return 1
+}
+
 run_concurrency_contract() {
     local nonce timestamp stale_id left_id right_id stale_root remote_stale_root contract_root
     local left_log right_log left_pid right_pid left_exit right_exit contract_worker index
@@ -957,6 +997,12 @@ if [[ "$QUICK_MODE" == false ]]; then
         --test-threads=1 2>&1 | tee "$TEST_OUTPUT_FILE"
     RCH_EXIT=$?
     set -e
+    RCH_RESULT_ACCEPTABLE=false
+    if RCH_ARTIFACT_SYNC_DISPOSITION=$(
+        classify_rch_runner_result "$RCH_EXIT" "$TEST_OUTPUT_FILE" "$WORKER_ID"
+    ); then
+        RCH_RESULT_ACCEPTABLE=true
+    fi
 
     mapfile -t RUN_STARTS < <(
         jq -Rrc \
@@ -1061,13 +1107,17 @@ if [[ "$QUICK_MODE" == false ]]; then
     CARGO_EXIT=$(jq -er '.cargo_exit_code' "$STAGING_DIR/manifest.json")
     ACCEPTANCE_PASS=$(jq -er '.complete and (.cargo_exit_code == 0) and ([.gates[].passed] | all)' \
         "$STAGING_DIR/manifest.json")
-    if [[ $RCH_EXIT -ne 0 || "$ACCEPTANCE_PASS" != true ]]; then
-        echo "Error: run failed closed (rch=$RCH_EXIT cargo=$CARGO_EXIT acceptance=$ACCEPTANCE_PASS)"
+    if [[ "$RCH_RESULT_ACCEPTABLE" != true || "$ACCEPTANCE_PASS" != true ]]; then
+        echo "Error: run failed closed (rch=$RCH_EXIT disposition=$RCH_ARTIFACT_SYNC_DISPOSITION cargo=$CARGO_EXIT acceptance=$ACCEPTANCE_PASS)"
         echo "  Recoverable staging evidence retained at: $STAGING_DIR"
         if [[ "$CARGO_EXIT" -ne 0 ]]; then
             exit "$CARGO_EXIT"
         fi
         exit 1
+    fi
+    if [[ "$RCH_EXIT" -eq 102 ]]; then
+        echo "  RCH disposition: $RCH_ARTIFACT_SYNC_DISPOSITION"
+        echo "  The remote runner and verified bundle are complete; no local runner binary is consumed."
     fi
     TEST_RESULTS_DIR="$STAGING_DIR"
     PUBLISH_PENDING=true
@@ -1307,6 +1357,8 @@ Test Execution
 --------------
 Exit code: $TEST_EXIT
 Quick mode: $QUICK_MODE
+RCH wrapper exit: $RCH_EXIT
+RCH artifact sync disposition: $RCH_ARTIFACT_SYNC_DISPOSITION
 Test output: ${TEST_OUTPUT_FILE:-n/a}
 
 File Coverage

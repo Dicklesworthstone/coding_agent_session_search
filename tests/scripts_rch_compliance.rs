@@ -394,6 +394,15 @@ fn e2e_acceptance_is_exact_worker_run_scoped_and_publish_last() -> Result<(), St
         "expected one versioned runner receipt",
         "e2e-run-started",
         "e2e-run-finalized",
+        "classify_rch_runner_result",
+        "RCH_ARTIFACT_SYNC_DISPOSITION",
+        "remote-run-complete-local-runner-artifact-sync-incomplete-rch-e309",
+        "RCH-E309 remote compile on $worker_id SUCCEEDED but build artifacts could not be",
+        "remote $worker_id failed (exit 102)",
+        "grep -F -x -c -- \"$artifact_diagnostic\"",
+        "grep -F -x -c -- \"$remote_exit_diagnostic\"",
+        "RCH_RESULT_ACCEPTABLE",
+        "no local runner binary is consumed",
         "Incomplete remote run retained for diagnosis",
         "REMOTE_MANIFEST=$(jq -er '.manifest'",
         "verify_bundle_locally",
@@ -433,6 +442,14 @@ fn e2e_acceptance_is_exact_worker_run_scoped_and_publish_last() -> Result<(), St
     if canonical.contains("archive_prior_logs") {
         return Err(
             "acceptance must preserve prior immutable bundles instead of moving process-global logs"
+                .to_string(),
+        );
+    }
+    if canonical.contains("[[ $RCH_EXIT -eq 102 ]] ||")
+        || canonical.contains("[[ $RCH_EXIT -ne 0 &&")
+    {
+        return Err(
+            "RCH-E309 must be admitted only by the exact diagnostic classifier, not by a generic exit-102 exception"
                 .to_string(),
         );
     }
