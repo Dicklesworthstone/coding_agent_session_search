@@ -374,9 +374,14 @@ fn e2e_acceptance_is_exact_worker_run_scoped_and_publish_last() -> Result<(), St
         .map_err(|error| format!("could not read {}: {error}", canonical_path.display()))?;
     for required in [
         "RCH_WORKER=\"$WORKER_ID\"",
+        "CASS_E2E_PEER_WORKER",
         "RCH_REQUIRE_REMOTE=1",
         "RCH_NO_SELF_HEALING=1",
-        "--no-self-healing exec -- cargo",
+        "\"$RCH_BIN\" --no-self-healing exec",
+        "--base \"$SOURCE_SHA\"",
+        "--clean-overlay",
+        "--no-overlay",
+        "-- cargo \"$@\"",
         "CASS_E2E_HANDOFF_TIMEOUT_SECONDS",
         "ServerAliveInterval=15",
         "timeout --signal=TERM --kill-after=10",
@@ -396,6 +401,8 @@ fn e2e_acceptance_is_exact_worker_run_scoped_and_publish_last() -> Result<(), St
         "command SHA-256 does not match",
         "bundle contains undeclared artifact",
         "--concurrency-contract",
+        "--peer-worker",
+        "concurrency workers must be distinct because RCH excludes simultaneous same-project jobs on one worker",
         "contract-stale-",
         "remote_stale_root",
         "contradictory remote stale evidence was not durably staged",
@@ -403,8 +410,19 @@ fn e2e_acceptance_is_exact_worker_run_scoped_and_publish_last() -> Result<(), St
         "worker_ssh",
         "worker_rsync",
         "parallel_cass_children_keep_corpus_and_trace_artifacts_isolated",
+        "--worker \"$left_worker\"",
+        "--worker \"$right_worker\"",
+        "expected_workers=(\"$left_worker\" \"$right_worker\")",
+        "concurrent reports disagree on committed source identity",
         "rsync -a --protect-args",
         "SOURCE_DIFF_SHA256",
+        "SOURCE_TREE_SHA256",
+        "SOURCE_TREE_PATHS",
+        "sha256sum --zero",
+        "--source-tree-sha256",
+        ".schema_version == 2",
+        "':(exclude).rch-target-*/**'",
+        "':(exclude)test-results/**'",
         "manifest.json",
         "complete.json",
     ] {
@@ -423,6 +441,53 @@ fn e2e_acceptance_is_exact_worker_run_scoped_and_publish_last() -> Result<(), St
     {
         return Err(
             "acceptance must resolve the exact SSH endpoint and emitted manifest from versioned RCH data"
+                .to_string(),
+        );
+    }
+    let runner_path = project_root()
+        .join("src")
+        .join("bin")
+        .join("e2e-run-bundle.rs");
+    let runner = std::fs::read_to_string(&runner_path)
+        .map_err(|error| format!("could not read {}: {error}", runner_path.display()))?;
+    for required in [
+        "e2e_source_tree_sha256",
+        "source_tree_sha256",
+        "worker source-tree SHA-256 mismatch",
+        "clean-overlay evidence requires an empty source diff",
+    ] {
+        if !runner.contains(required) {
+            return Err(missing_contract_token(&runner_path, required));
+        }
+    }
+    if runner.contains("Command::new(\"git\")") || runner.contains("git rev-parse") {
+        return Err(
+            "clean-overlay runner must verify source bytes without requiring worker-side Git"
+                .to_string(),
+        );
+    }
+    let run_bundle = runner
+        .split("fn run_bundle(args: RunArgs)")
+        .nth(1)
+        .and_then(|body| body.split("fn verify_bundle(args: VerifyArgs)").next())
+        .ok_or_else(|| "could not isolate e2e-run-bundle execution body".to_string())?;
+    if run_bundle
+        .matches("verify_worker_source(&project_root, &args)")
+        .count()
+        != 2
+    {
+        return Err(
+            "clean-overlay runner must verify source identity before execution and before sealing"
+                .to_string(),
+        );
+    }
+    if canonical
+        .matches("for contract_worker in \"$left_worker\" \"$right_worker\"; do")
+        .count()
+        < 2
+    {
+        return Err(
+            "concurrency contract must stage and recheck stale evidence on both exact workers"
                 .to_string(),
         );
     }

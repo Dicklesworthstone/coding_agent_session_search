@@ -19,16 +19,17 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use coding_agent_search::proof_artifact::{
     E2E_RUN_BUNDLE_SCHEMA_VERSION, E2eRunBundleExpectation, E2eRunBundleMetadata, E2eRunGateResult,
-    finalize_e2e_run_bundle, validate_e2e_run_id, validate_e2e_source_identity,
-    validate_rch_worker_id, verify_e2e_run_bundle,
+    e2e_source_tree_sha256, finalize_e2e_run_bundle, validate_e2e_run_id,
+    validate_e2e_source_identity, validate_rch_worker_id, verify_e2e_run_bundle,
 };
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 7_200;
 const DEFAULT_STREAM_CAP_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STREAM_CAP_BYTES: u64 = 64 * 1024 * 1024;
+const CLEAN_SOURCE_DIFF_SHA256: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -58,6 +59,8 @@ struct RunArgs {
     source_sha: String,
     #[arg(long)]
     source_diff_sha256: String,
+    #[arg(long)]
+    source_tree_sha256: String,
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECONDS)]
     timeout_seconds: u64,
     #[arg(long, default_value_t = DEFAULT_STREAM_CAP_BYTES)]
@@ -81,6 +84,8 @@ struct VerifyArgs {
     source_sha: Option<String>,
     #[arg(long)]
     source_diff_sha256: Option<String>,
+    #[arg(long)]
+    source_tree_sha256: Option<String>,
     /// Check byte integrity and provenance while permitting a recorded test failure.
     #[arg(long)]
     integrity_only: bool,
@@ -111,6 +116,7 @@ struct RunStartedSummary<'a> {
     worker_hostname: &'a str,
     source_sha: &'a str,
     source_diff_sha256: &'a str,
+    source_tree_sha256: &'a str,
     run_root: String,
 }
 
@@ -121,6 +127,9 @@ struct RunSummary<'a> {
     run_id: &'a str,
     worker_id: &'a str,
     worker_hostname: &'a str,
+    source_sha: &'a str,
+    source_diff_sha256: &'a str,
+    source_tree_sha256: &'a str,
     cargo_exit_code: i32,
     schema_exit_code: i32,
     acceptance_pass: bool,
@@ -140,6 +149,7 @@ struct VerifySummary<'a> {
     worker_hostname: &'a str,
     source_sha: &'a str,
     source_diff_sha256: &'a str,
+    source_tree_sha256: &'a str,
     cargo_exit_code: i32,
     acceptance_pass: bool,
     files: u64,
@@ -183,6 +193,7 @@ fn write_run_start(path: &Path, args: &RunArgs) -> Result<()> {
         "runner": "rust",
         "env": {
             "git_sha": args.source_sha,
+            "source_tree_sha256": args.source_tree_sha256,
             "worker_id": args.worker_id,
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
@@ -253,7 +264,18 @@ fn worker_hostname() -> Result<String> {
 fn validate_run_args(args: &RunArgs) -> Result<()> {
     validate_e2e_run_id(&args.run_id)?;
     validate_rch_worker_id(&args.worker_id)?;
-    validate_e2e_source_identity(&args.source_sha, &args.source_diff_sha256)?;
+    validate_e2e_source_identity(
+        &args.source_sha,
+        &args.source_diff_sha256,
+        &args.source_tree_sha256,
+    )?;
+    ensure!(
+        args.source_diff_sha256
+            .as_str()
+            .cmp(CLEAN_SOURCE_DIFF_SHA256)
+            .is_eq(),
+        "clean-overlay evidence requires an empty source diff"
+    );
     ensure!(
         (1..=14_400).contains(&args.timeout_seconds),
         "timeout_seconds must be between 1 and 14400"
@@ -269,7 +291,9 @@ fn validate_run_args(args: &RunArgs) -> Result<()> {
         "the wrapped cargo test command must use --locked"
     );
     ensure!(
-        args.cargo_args.iter().any(|argument| argument == "--test"),
+        args.cargo_args
+            .iter()
+            .any(|argument| argument.as_str().cmp("--test").is_eq()),
         "the wrapped cargo test command must name explicit --test targets"
     );
     ensure!(
@@ -282,59 +306,14 @@ fn validate_run_args(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn git_output(project_root: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
-        .args(arguments)
-        .current_dir(project_root)
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("run git {}", arguments.join(" ")))?;
-    ensure!(
-        output.status.success(),
-        "git {} exited {}: {}",
-        arguments.join(" "),
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(output.stdout)
-}
-
 fn verify_worker_source(project_root: &Path, args: &RunArgs) -> Result<()> {
-    let head = git_output(project_root, &["rev-parse", "HEAD"])?;
-    let head = String::from_utf8(head).context("worker git SHA was not UTF-8")?;
+    let actual = e2e_source_tree_sha256(project_root).context("hash clean-overlay source tree")?;
     ensure!(
-        head.trim() == args.source_sha,
-        "worker source SHA mismatch: expected {}, found {}",
-        args.source_sha,
-        head.trim()
+        actual.as_str().cmp(&args.source_tree_sha256).is_eq(),
+        "worker source-tree SHA-256 mismatch: expected {}, found {}",
+        args.source_tree_sha256,
+        actual
     );
-
-    let diff = git_output(
-        project_root,
-        &["diff", "--binary", "HEAD", "--", ".", ":(exclude).beads/**"],
-    )?;
-    let diff_sha256 = hex::encode(Sha256::digest(&diff));
-    ensure!(
-        diff_sha256.cmp(&args.source_diff_sha256).is_eq(),
-        "worker source diff SHA-256 mismatch: expected {}, found {}",
-        args.source_diff_sha256,
-        diff_sha256
-    );
-
-    let untracked = git_output(
-        project_root,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    )?;
-    for raw_path in untracked
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-    {
-        let path = std::str::from_utf8(raw_path).context("worker untracked path was not UTF-8")?;
-        ensure!(
-            path.starts_with(".beads/") || path.starts_with("test-results/"),
-            "worker contains unreceipted source path `{path}`"
-        );
-    }
     Ok(())
 }
 
@@ -567,6 +546,7 @@ fn run_bundle(args: RunArgs) -> Result<i32> {
         worker_hostname: &hostname,
         source_sha: &args.source_sha,
         source_diff_sha256: &args.source_diff_sha256,
+        source_tree_sha256: &args.source_tree_sha256,
         run_root: run_root.display().to_string(),
     })?;
     let timeout = Duration::from_secs(args.timeout_seconds);
@@ -591,6 +571,8 @@ fn run_bundle(args: RunArgs) -> Result<i32> {
 
     let schema_result =
         run_schema_validator(&project_root, &run_root, timeout, args.max_stream_bytes)?;
+    verify_worker_source(&project_root, &args)
+        .context("verify source tree remained immutable during E2E execution")?;
     let ended_at_unix_ms = unix_ms();
     let command = std::iter::once("cargo".to_string())
         .chain(std::iter::once("test".to_string()))
@@ -604,6 +586,7 @@ fn run_bundle(args: RunArgs) -> Result<i32> {
         run_id: args.run_id.clone(),
         source_sha: args.source_sha,
         source_diff_sha256: args.source_diff_sha256,
+        source_tree_sha256: args.source_tree_sha256,
         worker_id: args.worker_id.clone(),
         worker_hostname: hostname.clone(),
         command,
@@ -642,6 +625,9 @@ fn run_bundle(args: RunArgs) -> Result<i32> {
         run_id: &manifest.run_id,
         worker_id: &manifest.worker_id,
         worker_hostname: &manifest.worker_hostname,
+        source_sha: &manifest.source_sha,
+        source_diff_sha256: &manifest.source_diff_sha256,
+        source_tree_sha256: &manifest.source_tree_sha256,
         cargo_exit_code: cargo_result.exit_code,
         schema_exit_code: schema_result.exit_code,
         acceptance_pass: manifest.is_acceptance_pass(),
@@ -678,6 +664,7 @@ fn verify_bundle(args: VerifyArgs) -> Result<i32> {
             run_id: args.run_id,
             source_sha: args.source_sha,
             source_diff_sha256: args.source_diff_sha256,
+            source_tree_sha256: args.source_tree_sha256,
             worker_id: args.worker_id,
             worker_hostname: args.worker_hostname,
         },
@@ -689,6 +676,7 @@ fn verify_bundle(args: VerifyArgs) -> Result<i32> {
         worker_hostname: &manifest.worker_hostname,
         source_sha: &manifest.source_sha,
         source_diff_sha256: &manifest.source_diff_sha256,
+        source_tree_sha256: &manifest.source_tree_sha256,
         cargo_exit_code: manifest.cargo_exit_code,
         acceptance_pass: manifest.is_acceptance_pass(),
         files: manifest.aggregates.files,
@@ -716,4 +704,73 @@ fn main() -> Result<()> {
         std::process::exit(exit_code);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use anyhow::{Context, Result, bail, ensure};
+
+    use super::{
+        CLEAN_SOURCE_DIFF_SHA256, RunArgs, e2e_source_tree_sha256, validate_run_args,
+        verify_worker_source,
+    };
+
+    fn run_args(source_tree_sha256: String) -> RunArgs {
+        RunArgs {
+            run_id: "acceptance-20260728-runner-test".to_string(),
+            worker_id: "ovh-a".to_string(),
+            source_sha: "a".repeat(40),
+            source_diff_sha256: CLEAN_SOURCE_DIFF_SHA256.to_string(),
+            source_tree_sha256,
+            timeout_seconds: 60,
+            max_stream_bytes: 1_024,
+            cargo_args: vec![
+                "--locked".to_string(),
+                "--test".to_string(),
+                "e2e_semantic_search".to_string(),
+            ],
+        }
+    }
+
+    #[test]
+    fn run_arguments_require_a_clean_overlay_diff() -> Result<()> {
+        let mut args = run_args("b".repeat(64));
+        args.source_diff_sha256 = "c".repeat(64);
+        let Err(error) = validate_run_args(&args) else {
+            bail!("runner accepted a nonempty source diff");
+        };
+        ensure!(
+            error
+                .to_string()
+                .contains("clean-overlay evidence requires an empty source diff"),
+            "unexpected dirty-source error: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_source_verification_accepts_exact_bytes_and_rejects_drift() -> Result<()> {
+        let root = tempfile::TempDir::new().context("create source fixture")?;
+        fs::create_dir_all(root.path().join("src")).context("create source directory")?;
+        fs::write(root.path().join("src/lib.rs"), b"pub fn exact() {}\n")
+            .context("write exact source")?;
+        let digest = e2e_source_tree_sha256(root.path()).context("hash exact source")?;
+        let args = run_args(digest);
+        verify_worker_source(root.path(), &args).context("verify exact source")?;
+
+        fs::write(root.path().join("src/lib.rs"), b"pub fn drifted() {}\n")
+            .context("mutate source fixture")?;
+        let Err(error) = verify_worker_source(root.path(), &args) else {
+            bail!("runner accepted drifted worker source");
+        };
+        ensure!(
+            error
+                .to_string()
+                .contains("worker source-tree SHA-256 mismatch"),
+            "unexpected worker-source error: {error}"
+        );
+        Ok(())
+    }
 }

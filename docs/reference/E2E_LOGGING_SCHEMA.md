@@ -25,13 +25,14 @@ retain their ordinary non-acceptance output paths.
 
 ## Immutable strict-RCH run bundles
 
-`e2e-run-bundle` executes explicit Cargo test targets, captures bounded
-stdout/stderr, validates the selected run's JSONL, and writes:
+Bundle schema v2 is content-addressed. `e2e-run-bundle` executes explicit Cargo
+test targets, captures bounded stdout/stderr, validates the selected run's
+JSONL, and writes:
 
-- `manifest.json`: source SHA and diff digest, exact worker ID and hostname,
-  complete Cargo command and command digest, timestamps, exit status, every
-  file's relative path/SHA-256/byte count/event count/schema, deterministic
-  aggregates, and named gate outcomes.
+- `manifest.json`: source SHA, clean diff digest, canonical source-tree digest,
+  exact worker ID and hostname, complete Cargo command and command digest,
+  timestamps, exit status, every file's relative path/SHA-256/byte
+  count/event count/schema, deterministic aggregates, and named gate outcomes.
 - `complete.json`: a completion receipt binding the exact manifest bytes.
 
 Both control files are created without overwrite and fsynced. Verification
@@ -41,9 +42,11 @@ tampering, source drift, worker drift, failed tests, failed schema validation,
 truncated command capture, empty artifacts, empty traces, or missing aggregate
 `run_start`, `test_start`, `test_end`, and `run_end` coverage.
 
-The repository acceptance entry point requires an explicit RCH worker and runs
-and finalizes the bundle on that same worker and source. It resolves that
-worker's SSH user and host from
+The repository acceptance entry point requires an explicit RCH worker. It pins
+RCH to the committed source SHA and uses `--clean-overlay --no-overlay`, which
+streams a fresh Git archive into an isolated remote root without applying
+ambient workspace changes. It runs and finalizes the bundle in that root on
+the same exact worker. It resolves that worker's SSH user and host from
 `rch --json workers list` and joins that exact host to the unique identity
 reported by `rch --json workers discover`; the opaque worker ID is never assumed
 to be an SSH alias. It takes the remote manifest path only from the runner's
@@ -64,11 +67,15 @@ SSH discovery, probes, and rsync handoff are bounded by a validated
 connect timeout, and server-alive failure detection. A timeout is a failed
 handoff, never permission to inspect an older local bundle.
 
-The concurrency contract creates the same uniquely named contradictory stale
-witness locally and on the explicitly resolved worker before launching either
-child run. Both stale copies remain present after the two no-mock runs, while
-both independently verified reports and manifests prove they consumed neither
-copy. The test never deletes a previous local or remote witness.
+The concurrency contract requires two distinct explicitly resolved workers.
+RCH deliberately excludes simultaneous jobs for the same project from one
+worker checkout, so treating one worker as a concurrency target would test only
+the scheduler's rejection path. The contract creates the same uniquely named
+contradictory stale witness locally and on both workers before launching either
+child run. All three stale copies remain present after the two no-mock runs,
+while both independently verified reports and manifests bind their expected
+worker and run ID and prove they consumed no stale copy. The test never deletes
+a previous local or remote witness.
 
 The runner emits one flushed `e2e-run-started` JSON receipt after creating its
 absent run directory, then one `e2e-run-finalized` receipt only after the
@@ -76,10 +83,31 @@ manifest and completion receipt are durable. If execution fails between those
 points, the acceptance script uses only the validated started-receipt path to
 retrieve and retain the unfinalized directory; it never publishes it.
 
-Before execution, the worker independently recomputes `git rev-parse HEAD`, the
-binary diff digest excluding tracker-only `.beads` state, and the untracked path
-set. A caller-supplied SHA/diff mismatch or any unreceipted source path outside
-`.beads/` and `test-results/` fails before the test command begins.
+Before dispatch, the caller requires a clean committed source tree apart from
+tracker-only `.beads/` and retained `test-results/` state. It rejects tracked
+symlinks, submodules, and control-byte paths, then hashes every other tracked
+file in byte-sorted relative-path order. After Cargo starts the runner in the
+fresh overlay, the worker independently walks all non-transient entries and
+recomputes that source-tree digest without requiring `.git`. Symbolic links,
+hard links, non-files, non-UTF-8/control-byte paths, changed bytes, missing
+files, or extra source files fail before the test command begins. The worker
+repeats the same check after the test and schema commands and before sealing the
+manifest, so source mutation during execution leaves only an explicitly
+incomplete diagnostic run.
+
+The only top-level entries omitted from source-tree identity are the explicit
+transport/output surfaces `.git`, `.beads`, `.rch-tmp`, `.rch-target-*`,
+`target`, and `test-results`. A same-named directory below another source
+directory remains covered. The language-neutral digest stream is the
+concatenation, in byte-sorted relative-path order, of:
+
+```text
+<lowercase-file-sha256><two spaces><relative-path><NUL>
+```
+
+The final SHA-256 of that stream is `source_tree_sha256`. This is exactly GNU
+`sha256sum --zero` framing, so the shell caller and Rust worker verify the same
+bytes independently.
 
 The command digest has a language-neutral framing so Rust and shell verification
 cannot accidentally hash different argument boundaries:
@@ -100,10 +128,12 @@ ordinary successful-build artifact retrieval.
 ```bash
 RCH_WORKER=ovh-a ./scripts/e2e_logging_acceptance_test.sh
 
-# Prove two simultaneous no-mock semantic runs remain isolated from one another
-# and from retained contradictory stale runs on both the caller and worker.
+# Prove two simultaneous no-mock semantic runs on distinct exact workers remain
+# isolated from one another and from retained contradictory stale runs on the
+# caller and both workers.
 RCH_WORKER=ovh-a ./scripts/e2e_logging_acceptance_test.sh \
-  --concurrency-contract
+  --concurrency-contract \
+  --peer-worker ovh-b
 
 # Exercise one explicit target/filter while developing the bundle contract.
 RCH_WORKER=ovh-a ./scripts/e2e_logging_acceptance_test.sh \

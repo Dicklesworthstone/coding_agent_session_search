@@ -12,10 +12,13 @@
 #   --quick          Verify one explicit completed run without executing tests
 #   --run-id ID      Collision-free run id (generated for a full run)
 #   --worker ID      Exact RCH worker; defaults to RCH_WORKER
+#   --peer-worker ID Second exact RCH worker for the concurrency contract
 #
 # Environment:
-#   RCH_BIN               rch executable (default: rch)
-#   RCH_TEST_TIMEOUT_SEC  strict remote test timeout (default: 7200)
+#   RCH_BIN                      rch executable (default: rch)
+#   RCH_TEST_TIMEOUT_SEC         strict remote test timeout (default: 7200)
+#   CASS_E2E_PEER_WORKER         second worker for --concurrency-contract
+#   CASS_E2E_HANDOFF_TIMEOUT_SECONDS  bounded SSH/rsync timeout (default: 900)
 #
 # Exit codes:
 #   0 - Acceptance test passed
@@ -43,16 +46,10 @@ CONTRACT_FILTER=""
 EVIDENCE_SCOPE="comprehensive-e2e"
 RUN_ID="${CASS_E2E_RUN_ID:-}"
 WORKER_ID="${RCH_WORKER:-}"
+PEER_WORKER_ID="${CASS_E2E_PEER_WORKER:-}"
 SSH_TARGET=""
-SSH_OPTIONS=(
-    -o BatchMode=yes
-    -o IdentitiesOnly=yes
-    -o ConnectTimeout=15
-    -o ConnectionAttempts=1
-    -o ServerAliveInterval=15
-    -o ServerAliveCountMax=4
-)
-RSYNC_RSH="ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+SSH_OPTIONS=()
+RSYNC_RSH=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -75,6 +72,14 @@ while [[ $# -gt 0 ]]; do
                 exit 2
             }
             WORKER_ID="$2"
+            shift 2
+            ;;
+        --peer-worker)
+            [[ $# -ge 2 ]] || {
+                echo "Error: --peer-worker requires a value"
+                exit 2
+            }
+            PEER_WORKER_ID="$2"
             shift 2
             ;;
         --contract-only)
@@ -104,12 +109,13 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [--quick] [--run-id ID] [--worker ID]"
             echo "       $0 --contract-only --contract-target TARGET --contract-filter FILTER [--run-id ID] --worker ID"
-            echo "       $0 --concurrency-contract --worker ID"
+            echo "       $0 --concurrency-contract --worker ID --peer-worker ID"
             echo ""
             echo "Options:"
             echo "  --quick          Verify one explicit completed run without executing tests"
             echo "  --run-id ID      Collision-free run id (generated for a full run)"
             echo "  --worker ID      Exact RCH worker; defaults to RCH_WORKER"
+            echo "  --peer-worker ID Second distinct exact worker; defaults to CASS_E2E_PEER_WORKER"
             echo "  --contract-only  Run one explicit no-mock target/filter as bundle-contract evidence"
             echo "  --contract-target TARGET  Integration-test target for --contract-only"
             echo "  --contract-filter FILTER  Exact test filter for --contract-only"
@@ -166,6 +172,14 @@ validate_contract_mode() {
             echo "Error: --concurrency-contract allocates two run IDs; do not provide CASS_E2E_RUN_ID or --run-id"
             return 2
         fi
+        if [[ -z "$PEER_WORKER_ID" ]]; then
+            echo "Error: --concurrency-contract requires CASS_E2E_PEER_WORKER or --peer-worker"
+            return 2
+        fi
+        if [[ "$PEER_WORKER_ID" == "$WORKER_ID" ]]; then
+            echo "Error: concurrency workers must be distinct because RCH excludes simultaneous same-project jobs on one worker"
+            return 2
+        fi
     elif [[ "$CONTRACT_ONLY" == true ]]; then
         if [[ ! "$CONTRACT_TARGET" =~ ^[A-Za-z0-9_]+$ ]] \
             || [[ ! "$CONTRACT_FILTER" =~ ^[A-Za-z0-9_:]+$ ]]; then
@@ -188,12 +202,25 @@ ensure_rch() {
         echo "Error: CASS_E2E_HANDOFF_TIMEOUT_SECONDS must be 1-99999 seconds"
         exit 1
     fi
-    for command in ssh rsync sha256sum timeout; do
+    for command in ssh rsync sha256sum sort timeout xargs; do
         if ! command -v "$command" >/dev/null 2>&1; then
             echo "Error: $command is required for exact-worker artifact handoff"
             exit 1
         fi
     done
+}
+
+reset_worker_transport() {
+    SSH_TARGET=""
+    SSH_OPTIONS=(
+        -o BatchMode=yes
+        -o IdentitiesOnly=yes
+        -o ConnectTimeout=15
+        -o ConnectionAttempts=1
+        -o ServerAliveInterval=15
+        -o ServerAliveCountMax=4
+    )
+    RSYNC_RSH="ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 }
 
 worker_ssh() {
@@ -210,6 +237,7 @@ worker_rsync() {
 resolve_worker_ssh_target() {
     local workers_json discovery_json worker_count discovery_count
     local worker_host worker_user identity_file ssh_host
+    reset_worker_transport
     workers_json=$("$RCH_BIN" --json workers list) || {
         echo "Error: unable to read the RCH worker inventory"
         return 1
@@ -288,6 +316,7 @@ verify_bundle_locally() {
     local expected_worker_hostname="$4"
     local expected_source_sha="$5"
     local expected_source_diff_sha256="$6"
+    local expected_source_tree_sha256="$7"
     local manifest_file="$bundle_root/manifest.json"
     local completion_file="$bundle_root/complete.json"
     local control_file expected_manifest_sha actual_manifest_sha
@@ -328,16 +357,19 @@ verify_bundle_locally() {
         --arg worker_hostname "$expected_worker_hostname" \
         --arg source_sha "$expected_source_sha" \
         --arg source_diff_sha256 "$expected_source_diff_sha256" \
+        --arg source_tree_sha256 "$expected_source_tree_sha256" \
         '
-        .schema_version == 1
+        .schema_version == 2
         and .run_id == $run_id
         and .worker_id == $worker_id
         and .worker_hostname == $worker_hostname
         and .source_sha == $source_sha
         and .source_diff_sha256 == $source_diff_sha256
+        and .source_tree_sha256 == $source_tree_sha256
         and .complete == true
         and (.source_sha | test("^[0-9a-f]{40}$"))
         and (.source_diff_sha256 | test("^[0-9a-f]{64}$"))
+        and (.source_tree_sha256 | test("^[0-9a-f]{64}$"))
         and (.command_sha256 | test("^[0-9a-f]{64}$"))
         and (.started_at_unix_ms | type == "number")
         and (.ended_at_unix_ms | type == "number")
@@ -399,7 +431,7 @@ verify_bundle_locally() {
         --arg manifest_sha256 "$actual_manifest_sha" \
         --argjson ended_at "$(jq -er '.ended_at_unix_ms' "$manifest_file")" \
         '
-        .schema_version == 1
+        .schema_version == 2
         and .run_id == $run_id
         and .manifest_sha256 == $manifest_sha256
         and .finalized_at_unix_ms == $ended_at
@@ -621,19 +653,28 @@ run_cargo() {
         RCH_NO_SELF_HEALING=1 \
         RCH_TEST_TIMEOUT_SEC="${RCH_TEST_TIMEOUT_SEC:-7200}" \
         env -u CARGO_TARGET_DIR \
-        "$RCH_BIN" --no-self-healing exec -- cargo "$@"
+        "$RCH_BIN" --no-self-healing exec \
+            --base "$SOURCE_SHA" \
+            --clean-overlay \
+            --no-overlay \
+            -- cargo "$@"
 }
 
 run_concurrency_contract() {
     local nonce timestamp stale_id left_id right_id stale_root remote_stale_root contract_root
-    local left_log right_log left_pid right_pid left_exit right_exit manifest
+    local left_log right_log left_pid right_pid left_exit right_exit contract_worker index
+    local left_source_identity right_source_identity
+    local left_worker="$WORKER_ID"
+    local right_worker="$PEER_WORKER_ID"
+    local -a manifests expected_workers expected_runs
+    local -A remote_stale_locations=()
     if [[ -z "$WORKER_ID" ]]; then
         echo "Error: --concurrency-contract requires RCH_WORKER or --worker"
         return 2
     fi
-    validate_worker_id "$WORKER_ID"
+    validate_worker_id "$left_worker"
+    validate_worker_id "$right_worker"
     ensure_rch
-    resolve_worker_ssh_target
     timestamp=$(date -u +%Y%m%dT%H%M%SZ)
     nonce=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
     stale_id="contract-stale-$timestamp-$nonce"
@@ -657,20 +698,26 @@ run_concurrency_contract() {
         return 1
     fi
     remote_stale_root="$PROJECT_ROOT/$stale_root"
-    if ! worker_ssh \
-        "test -d '$PROJECT_ROOT' && test ! -e '$remote_stale_root' && mkdir -p '$remote_stale_root'"; then
-        echo "Error: could not create contradictory stale evidence on exact worker $WORKER_ID"
-        return 1
-    fi
-    if ! worker_rsync "$stale_root/" "$SSH_TARGET:$remote_stale_root/"; then
-        echo "Error: could not transfer contradictory stale evidence to exact worker $WORKER_ID"
-        return 1
-    fi
-    if ! worker_ssh \
-        "test -f '$remote_stale_root/manifest.json' && test -f '$remote_stale_root/run.jsonl'"; then
-        echo "Error: contradictory remote stale evidence was not durably staged"
-        return 1
-    fi
+    for contract_worker in "$left_worker" "$right_worker"; do
+        WORKER_ID="$contract_worker"
+        resolve_worker_ssh_target
+        if ! worker_ssh \
+            "test -d '$PROJECT_ROOT' && test ! -e '$remote_stale_root' && mkdir -p '$remote_stale_root'"; then
+            echo "Error: could not create contradictory stale evidence on exact worker $contract_worker"
+            return 1
+        fi
+        if ! worker_rsync "$stale_root/" "$SSH_TARGET:$remote_stale_root/"; then
+            echo "Error: could not transfer contradictory stale evidence to exact worker $contract_worker"
+            return 1
+        fi
+        if ! worker_ssh \
+            "test -f '$remote_stale_root/manifest.json' && test -f '$remote_stale_root/run.jsonl'"; then
+            echo "Error: contradictory remote stale evidence was not durably staged on $contract_worker"
+            return 1
+        fi
+        remote_stale_locations["$contract_worker"]="$SSH_TARGET:$remote_stale_root"
+    done
+    WORKER_ID="$left_worker"
 
     left_log="$contract_root/left.log"
     right_log="$contract_root/right.log"
@@ -679,7 +726,7 @@ run_concurrency_contract() {
         --contract-target e2e_semantic_search \
         --contract-filter parallel_cass_children_keep_corpus_and_trace_artifacts_isolated \
         --run-id "$left_id" \
-        --worker "$WORKER_ID" \
+        --worker "$left_worker" \
         >"$left_log" 2>&1 &
     left_pid=$!
     "$SCRIPT_DIR/e2e_logging_acceptance_test.sh" \
@@ -687,7 +734,7 @@ run_concurrency_contract() {
         --contract-target e2e_semantic_search \
         --contract-filter parallel_cass_children_keep_corpus_and_trace_artifacts_isolated \
         --run-id "$right_id" \
-        --worker "$WORKER_ID" \
+        --worker "$right_worker" \
         >"$right_log" 2>&1 &
     right_pid=$!
     set +e
@@ -701,30 +748,41 @@ run_concurrency_contract() {
         echo "  Left log: $left_log"
         echo "  Right log: $right_log"
         echo "  Contradictory stale evidence retained at: $stale_root"
+        echo "  Remote stale evidence retained at: ${remote_stale_locations[$left_worker]}"
+        echo "  Remote stale evidence retained at: ${remote_stale_locations[$right_worker]}"
         return 1
     fi
 
-    for manifest in \
+    manifests=(
         "$E2E_RESULTS_ROOT/runs/$left_id/manifest.json" \
-        "$E2E_RESULTS_ROOT/runs/$right_id/manifest.json"; do
+        "$E2E_RESULTS_ROOT/runs/$right_id/manifest.json"
+    )
+    expected_workers=("$left_worker" "$right_worker")
+    expected_runs=("$left_id" "$right_id")
+    for index in "${!manifests[@]}"; do
         if ! jq -e \
-            --arg worker_id "$WORKER_ID" \
+            --arg worker_id "${expected_workers[$index]}" \
+            --arg run_id "${expected_runs[$index]}" \
             --arg stale_id "$stale_id" \
             '
             .worker_id == $worker_id
+            and .run_id == $run_id
             and .complete == true
             and .cargo_exit_code == 0
             and ([.gates[].passed] | all)
             and all(.files[]; (.path | contains($stale_id) | not))
             ' \
-            "$manifest" >/dev/null; then
-            echo "Error: concurrent bundle is not isolated or is not an acceptance pass: $manifest"
+            "${manifests[$index]}" >/dev/null; then
+            echo "Error: concurrent bundle is not isolated or is not an acceptance pass: ${manifests[$index]}"
             return 1
         fi
     done
-    if [[ $(jq -r '.run_id' "$E2E_RESULTS_ROOT/runs/$left_id/manifest.json") != "$left_id" ]] \
-        || [[ $(jq -r '.run_id' "$E2E_RESULTS_ROOT/runs/$right_id/manifest.json") != "$right_id" ]]; then
-        echo "Error: concurrent reports crossed run identities"
+    left_source_identity=$(jq -er '[.source_sha, .source_diff_sha256, .source_tree_sha256] | @tsv' \
+        "${manifests[0]}")
+    right_source_identity=$(jq -er '[.source_sha, .source_diff_sha256, .source_tree_sha256] | @tsv' \
+        "${manifests[1]}")
+    if [[ "$left_source_identity" != "$right_source_identity" ]]; then
+        echo "Error: concurrent reports disagree on committed source identity"
         return 1
     fi
     if grep -Fq "$stale_id" \
@@ -733,17 +791,22 @@ run_concurrency_contract() {
         echo "Error: a concurrent report consumed contradictory stale evidence"
         return 1
     fi
-    if ! worker_ssh \
-        "test -f '$remote_stale_root/manifest.json' && test -f '$remote_stale_root/run.jsonl'"; then
-        echo "Error: remote stale witness disappeared during concurrent exact-worker runs"
-        return 1
-    fi
+    for contract_worker in "$left_worker" "$right_worker"; do
+        WORKER_ID="$contract_worker"
+        resolve_worker_ssh_target
+        if ! worker_ssh \
+            "test -f '$remote_stale_root/manifest.json' && test -f '$remote_stale_root/run.jsonl'"; then
+            echo "Error: remote stale witness disappeared during concurrent exact-worker runs on $contract_worker"
+            return 1
+        fi
+    done
+    WORKER_ID="$left_worker"
     echo "Concurrent strict-RCH bundle contract passed"
-    echo "  Left run: $left_id"
-    echo "  Right run: $right_id"
-    echo "  Worker: $WORKER_ID"
+    echo "  Left run: $left_id on $left_worker"
+    echo "  Right run: $right_id on $right_worker"
     echo "  Contradictory stale evidence retained and ignored: $stale_root"
-    echo "  Contradictory remote stale evidence retained and ignored: $SSH_TARGET:$remote_stale_root"
+    echo "  Contradictory remote stale evidence retained and ignored: ${remote_stale_locations[$left_worker]}"
+    echo "  Contradictory remote stale evidence retained and ignored: ${remote_stale_locations[$right_worker]}"
     echo "  Detailed logs: $left_log $right_log"
 }
 
@@ -769,7 +832,9 @@ validate_run_id "$RUN_ID"
 
 SOURCE_SHA=""
 SOURCE_DIFF_SHA256=""
+SOURCE_TREE_SHA256=""
 if [[ "$QUICK_MODE" == false ]]; then
+    ensure_rch
     SOURCE_SHA=$(git rev-parse HEAD)
     SOURCE_DIFF_SHA256=$(
         git diff --binary HEAD -- . ':(exclude).beads/**' \
@@ -789,6 +854,47 @@ if [[ "$QUICK_MODE" == false ]]; then
                 ;;
         esac
     done < <(git ls-files --others --exclude-standard -z)
+    SOURCE_TREE_PATHS=(
+        .
+        ':(exclude).git'
+        ':(exclude).git/**'
+        ':(exclude).beads'
+        ':(exclude).beads/**'
+        ':(exclude).rch-tmp'
+        ':(exclude).rch-tmp/**'
+        ':(exclude).rch-target-*'
+        ':(exclude).rch-target-*/**'
+        ':(exclude)target'
+        ':(exclude)target/**'
+        ':(exclude)test-results'
+        ':(exclude)test-results/**'
+    )
+    while IFS= read -r -d '' tracked_entry; do
+        tracked_mode=${tracked_entry%% *}
+        tracked_path=${tracked_entry#*$'\t'}
+        case "$tracked_mode" in
+            100644|100755) ;;
+            *)
+                echo "Error: source-tree receipt forbids non-regular Git mode $tracked_mode at $tracked_path"
+                exit 1
+                ;;
+        esac
+        if printf '%s' "$tracked_path" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+            echo "Error: source-tree receipt forbids control bytes in tracked path: $tracked_path"
+            exit 1
+        fi
+    done < <(git ls-files --stage -z -- "${SOURCE_TREE_PATHS[@]}")
+    SOURCE_TREE_SHA256=$(
+        git ls-files --cached -z -- "${SOURCE_TREE_PATHS[@]}" \
+            | LC_ALL=C sort -z \
+            | xargs -0 -r sha256sum --zero -- \
+            | sha256sum \
+            | awk '{print $1}'
+    )
+    if [[ ! "$SOURCE_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "Error: could not compute a canonical source-tree SHA-256"
+        exit 1
+    fi
 fi
 
 FINAL_RUN_ROOT="$E2E_RESULTS_ROOT/runs/$RUN_ID"
@@ -825,6 +931,7 @@ if [[ "$QUICK_MODE" == false ]]; then
     echo "  Worker: $WORKER_ID"
     echo "  Source: $SOURCE_SHA"
     echo "  Source diff SHA-256: $SOURCE_DIFF_SHA256"
+    echo "  Source tree SHA-256: $SOURCE_TREE_SHA256"
     echo "  Evidence scope: $EVIDENCE_SCOPE"
     if [[ "$CONTRACT_ONLY" == true ]]; then
         echo "  Contract target/filter: $CONTRACT_TARGET :: $CONTRACT_FILTER"
@@ -841,6 +948,7 @@ if [[ "$QUICK_MODE" == false ]]; then
         --worker-id "$WORKER_ID" \
         --source-sha "$SOURCE_SHA" \
         --source-diff-sha256 "$SOURCE_DIFF_SHA256" \
+        --source-tree-sha256 "$SOURCE_TREE_SHA256" \
         --timeout-seconds "${RCH_TEST_TIMEOUT_SEC:-7200}" \
         -- \
         --locked \
@@ -851,21 +959,39 @@ if [[ "$QUICK_MODE" == false ]]; then
     set -e
 
     mapfile -t RUN_STARTS < <(
-        jq -Rrc --arg run_id "$RUN_ID" \
+        jq -Rrc \
+            --arg run_id "$RUN_ID" \
+            --arg worker_id "$WORKER_ID" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_diff_sha256 "$SOURCE_DIFF_SHA256" \
+            --arg source_tree_sha256 "$SOURCE_TREE_SHA256" \
             'fromjson? | select(
-                .schema_version == 1
+                .schema_version == 2
                 and .kind == "e2e-run-started"
                 and .run_id == $run_id
+                and .worker_id == $worker_id
+                and .source_sha == $source_sha
+                and .source_diff_sha256 == $source_diff_sha256
+                and .source_tree_sha256 == $source_tree_sha256
                 and (.run_root | type == "string")
             )' \
             "$TEST_OUTPUT_FILE"
     )
     mapfile -t RUN_SUMMARIES < <(
-        jq -Rrc --arg run_id "$RUN_ID" \
+        jq -Rrc \
+            --arg run_id "$RUN_ID" \
+            --arg worker_id "$WORKER_ID" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_diff_sha256 "$SOURCE_DIFF_SHA256" \
+            --arg source_tree_sha256 "$SOURCE_TREE_SHA256" \
             'fromjson? | select(
-                .schema_version == 1
+                .schema_version == 2
                 and .kind == "e2e-run-finalized"
                 and .run_id == $run_id
+                and .worker_id == $worker_id
+                and .source_sha == $source_sha
+                and .source_diff_sha256 == $source_diff_sha256
+                and .source_tree_sha256 == $source_tree_sha256
                 and (.manifest | type == "string")
             )' \
             "$TEST_OUTPUT_FILE"
@@ -926,7 +1052,8 @@ if [[ "$QUICK_MODE" == false ]]; then
         "$WORKER_ID" \
         "$REMOTE_HOSTNAME" \
         "$SOURCE_SHA" \
-        "$SOURCE_DIFF_SHA256"; then
+        "$SOURCE_DIFF_SHA256" \
+        "$SOURCE_TREE_SHA256"; then
         echo "Error: retrieved run failed byte/provenance verification"
         echo "  Recoverable staging evidence retained at: $STAGING_DIR"
         exit 1
@@ -955,6 +1082,7 @@ else
     fi
     SOURCE_SHA=$(jq -er '.source_sha' "$FINAL_RUN_ROOT/manifest.json")
     SOURCE_DIFF_SHA256=$(jq -er '.source_diff_sha256' "$FINAL_RUN_ROOT/manifest.json")
+    SOURCE_TREE_SHA256=$(jq -er '.source_tree_sha256' "$FINAL_RUN_ROOT/manifest.json")
     if [[ -z "$WORKER_ID" ]]; then
         WORKER_ID=$(jq -er '.worker_id' "$FINAL_RUN_ROOT/manifest.json")
     fi
@@ -966,7 +1094,8 @@ else
         "$WORKER_ID" \
         "$REMOTE_HOSTNAME" \
         "$SOURCE_SHA" \
-        "$SOURCE_DIFF_SHA256"
+        "$SOURCE_DIFF_SHA256" \
+        "$SOURCE_TREE_SHA256"
     ACCEPTANCE_PASS=$(jq -er '.complete and (.cargo_exit_code == 0) and ([.gates[].passed] | all)' \
         "$FINAL_RUN_ROOT/manifest.json")
     if [[ "$ACCEPTANCE_PASS" != true ]]; then
@@ -1164,6 +1293,7 @@ Run ID: $RUN_ID
 Evidence scope: $EVIDENCE_SCOPE
 Source SHA: $SOURCE_SHA
 Source diff SHA-256: $SOURCE_DIFF_SHA256
+Source tree SHA-256: $SOURCE_TREE_SHA256
 Worker ID: $WORKER_ID
 Worker hostname: $WORKER_HOSTNAME
 Command: $COMMAND_JSON

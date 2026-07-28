@@ -355,7 +355,7 @@ impl ProofManifest {
 }
 
 /// Stable schema for one immutable, run-scoped E2E evidence bundle.
-pub const E2E_RUN_BUNDLE_SCHEMA_VERSION: u32 = 1;
+pub const E2E_RUN_BUNDLE_SCHEMA_VERSION: u32 = 2;
 /// Canonical manifest filename inside a run directory.
 pub const E2E_RUN_MANIFEST_FILENAME: &str = "manifest.json";
 /// Completion receipt written only after the manifest is durable.
@@ -497,9 +497,11 @@ fn validate_hex_digest(
 pub fn validate_e2e_source_identity(
     source_sha: &str,
     source_diff_sha256: &str,
+    source_tree_sha256: &str,
 ) -> Result<(), E2eRunBundleError> {
     validate_hex_digest("source_sha", source_sha, 40)?;
-    validate_hex_digest("source_diff_sha256", source_diff_sha256, 64)
+    validate_hex_digest("source_diff_sha256", source_diff_sha256, 64)?;
+    validate_hex_digest("source_tree_sha256", source_tree_sha256, 64)
 }
 
 fn validate_worker_hostname(hostname: &str) -> Result<(), E2eRunBundleError> {
@@ -582,6 +584,83 @@ fn sha256_file(path: &Path) -> Result<String, E2eRunBundleError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn is_transient_e2e_source_entry(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let Some(Component::Normal(first)) = relative.components().next() else {
+        return false;
+    };
+    let Some(name) = first.to_str() else {
+        return false;
+    };
+    matches!(
+        name,
+        ".git" | ".beads" | ".rch-tmp" | "target" | "test-results"
+    ) || name.starts_with(".rch-target-")
+}
+
+/// Hash every non-transient source file using GNU `sha256sum --zero` framing.
+///
+/// RCH clean overlays do not contain `.git`, and Cargo/RCH create transient
+/// output directories while the runner is starting. Those top-level transport
+/// and output directories are excluded; every other entry is part of the
+/// source identity. Symbolic links, hard links, non-files, and non-UTF-8 paths
+/// fail closed so an overlay cannot alias bytes outside the attested tree.
+pub fn e2e_source_tree_sha256(root: &Path) -> Result<String, E2eRunBundleError> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|error| bundle_io(root, error))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(unsafe_bundle_entry(
+            root,
+            "source root must be a real directory",
+        ));
+    }
+
+    let mut files = Vec::new();
+    let entries = WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_transient_e2e_source_entry(root, entry.path()));
+    for entry in entries {
+        let entry = entry.map_err(invalid_manifest)?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(path).map_err(|error| bundle_io(path, error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(unsafe_bundle_entry(
+                path,
+                "symbolic source entries are forbidden",
+            ));
+        }
+        if metadata.is_dir() {
+            continue;
+        }
+        reject_aliasing_file(path, &metadata)?;
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| unsafe_bundle_entry(path, "source entry is outside its root"))?;
+        let relative = validate_relative_artifact_path(relative)?;
+        if relative.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(unsafe_bundle_entry(
+                path,
+                "source path contains an ASCII control byte",
+            ));
+        }
+        files.push((relative, path.to_path_buf()));
+    }
+    files.sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+
+    let mut tree_hasher = Sha256::new();
+    for (relative, path) in files {
+        let file_sha256 = sha256_file(&path)?;
+        tree_hasher.update(file_sha256.as_bytes());
+        tree_hasher.update(b"  ");
+        tree_hasher.update(relative.as_bytes());
+        tree_hasher.update([0]);
+    }
+    Ok(hex::encode(tree_hasher.finalize()))
+}
+
 /// The schema recognized for one captured artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -629,6 +708,7 @@ pub struct E2eRunBundleManifest {
     pub run_id: String,
     pub source_sha: String,
     pub source_diff_sha256: String,
+    pub source_tree_sha256: String,
     pub worker_id: String,
     pub worker_hostname: String,
     pub command: Vec<String>,
@@ -674,6 +754,7 @@ pub struct E2eRunBundleMetadata {
     pub run_id: String,
     pub source_sha: String,
     pub source_diff_sha256: String,
+    pub source_tree_sha256: String,
     pub worker_id: String,
     pub worker_hostname: String,
     pub command: Vec<String>,
@@ -689,6 +770,7 @@ pub struct E2eRunBundleExpectation {
     pub run_id: Option<String>,
     pub source_sha: Option<String>,
     pub source_diff_sha256: Option<String>,
+    pub source_tree_sha256: Option<String>,
     pub worker_id: Option<String>,
     pub worker_hostname: Option<String>,
 }
@@ -949,7 +1031,11 @@ fn validate_manifest_shape(manifest: &E2eRunBundleManifest) -> Result<(), E2eRun
     }
     validate_e2e_run_id(&manifest.run_id)?;
     validate_rch_worker_id(&manifest.worker_id)?;
-    validate_e2e_source_identity(&manifest.source_sha, &manifest.source_diff_sha256)?;
+    validate_e2e_source_identity(
+        &manifest.source_sha,
+        &manifest.source_diff_sha256,
+        &manifest.source_tree_sha256,
+    )?;
     validate_hex_digest("command_sha256", &manifest.command_sha256, 64)?;
     validate_worker_hostname(&manifest.worker_hostname)?;
     validate_e2e_command(&manifest.command)?;
@@ -1021,7 +1107,11 @@ pub fn finalize_e2e_run_bundle(
 ) -> Result<E2eRunBundleManifest, E2eRunBundleError> {
     validate_e2e_run_id(&metadata.run_id)?;
     validate_rch_worker_id(&metadata.worker_id)?;
-    validate_e2e_source_identity(&metadata.source_sha, &metadata.source_diff_sha256)?;
+    validate_e2e_source_identity(
+        &metadata.source_sha,
+        &metadata.source_diff_sha256,
+        &metadata.source_tree_sha256,
+    )?;
     validate_worker_hostname(&metadata.worker_hostname)?;
     let root_name = root.file_name().and_then(|name| name.to_str());
     if root_name != Some(metadata.run_id.as_str()) {
@@ -1082,6 +1172,7 @@ pub fn finalize_e2e_run_bundle(
         run_id: metadata.run_id,
         source_sha: metadata.source_sha,
         source_diff_sha256: metadata.source_diff_sha256,
+        source_tree_sha256: metadata.source_tree_sha256,
         worker_id: metadata.worker_id,
         worker_hostname: metadata.worker_hostname,
         command_sha256: command_sha256(&metadata.command),
@@ -1153,6 +1244,11 @@ pub fn verify_e2e_run_bundle(
             "source_diff_sha256",
             manifest.source_diff_sha256.as_str(),
             expected.source_diff_sha256.as_deref(),
+        ),
+        (
+            "source_tree_sha256",
+            manifest.source_tree_sha256.as_str(),
+            expected.source_tree_sha256.as_deref(),
         ),
         (
             "worker_id",
@@ -1476,6 +1572,7 @@ mod tests {
             run_id: run_id.to_string(),
             source_sha: "a".repeat(40),
             source_diff_sha256: "b".repeat(64),
+            source_tree_sha256: "c".repeat(64),
             worker_id: "vmi1149989".to_string(),
             worker_hostname: "worker-a".to_string(),
             command: vec![
@@ -1583,9 +1680,126 @@ mod tests {
         }
         validate_rch_worker_id("vmi1149989")?;
         validate_rch_worker_id("a")?;
-        validate_e2e_source_identity(&"a".repeat(40), &"b".repeat(64))?;
-        if validate_e2e_source_identity(&"A".repeat(40), &"b".repeat(64)).is_ok() {
+        validate_e2e_source_identity(&"a".repeat(40), &"b".repeat(64), &"c".repeat(64))?;
+        if validate_e2e_source_identity(&"A".repeat(40), &"b".repeat(64), &"c".repeat(64)).is_ok() {
             return Err("accepted uppercase source digest".into());
+        }
+        if validate_e2e_source_identity(&"a".repeat(40), &"b".repeat(64), &"C".repeat(64)).is_ok() {
+            return Err("accepted uppercase source-tree digest".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_digest_is_order_independent_and_shell_framed() -> BundleTestResult {
+        let first = tempfile::TempDir::new()?;
+        let second = tempfile::TempDir::new()?;
+        std::fs::create_dir_all(first.path().join("src"))?;
+        std::fs::create_dir_all(second.path().join("src"))?;
+        std::fs::write(first.path().join("src/z.rs"), b"z\n")?;
+        std::fs::write(first.path().join("Cargo.toml"), b"[package]\n")?;
+        std::fs::write(second.path().join("Cargo.toml"), b"[package]\n")?;
+        std::fs::write(second.path().join("src/z.rs"), b"z\n")?;
+
+        let first_digest = e2e_source_tree_sha256(first.path())?;
+        let second_digest = e2e_source_tree_sha256(second.path())?;
+        if first_digest.cmp(&second_digest).is_ne() {
+            return Err("source-tree digest depends on filesystem creation order".into());
+        }
+
+        let cargo_digest = hex::encode(Sha256::digest(b"[package]\n"));
+        let source_digest = hex::encode(Sha256::digest(b"z\n"));
+        let mut expected = Sha256::new();
+        expected.update(cargo_digest.as_bytes());
+        expected.update(b"  Cargo.toml\0");
+        expected.update(source_digest.as_bytes());
+        expected.update(b"  src/z.rs\0");
+        let expected = hex::encode(expected.finalize());
+        if first_digest.cmp(&expected).is_ne() {
+            return Err(format!(
+                "source-tree digest does not match sha256sum --zero framing: expected {expected}, found {first_digest}"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_digest_detects_changed_and_extra_source_files() -> BundleTestResult {
+        let dir = tempfile::TempDir::new()?;
+        std::fs::create_dir_all(dir.path().join("src"))?;
+        std::fs::write(dir.path().join("src/lib.rs"), b"pub fn original() {}\n")?;
+        let original = e2e_source_tree_sha256(dir.path())?;
+
+        std::fs::write(dir.path().join("src/lib.rs"), b"pub fn changed() {}\n")?;
+        let changed = e2e_source_tree_sha256(dir.path())?;
+        if changed == original {
+            return Err("changed source bytes preserved the tree digest".into());
+        }
+
+        std::fs::write(dir.path().join("src/extra.rs"), b"pub fn extra() {}\n")?;
+        let extra = e2e_source_tree_sha256(dir.path())?;
+        if extra == changed {
+            return Err("extra source file preserved the tree digest".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_digest_ignores_only_declared_top_level_transients() -> BundleTestResult {
+        let dir = tempfile::TempDir::new()?;
+        std::fs::create_dir_all(dir.path().join("src/target"))?;
+        std::fs::write(dir.path().join("src/target/tracked.rs"), b"tracked\n")?;
+        let original = e2e_source_tree_sha256(dir.path())?;
+
+        for transient in [
+            ".git",
+            ".beads",
+            ".rch-tmp",
+            ".rch-target-debug",
+            "target",
+            "test-results",
+        ] {
+            let transient_root = dir.path().join(transient);
+            std::fs::create_dir_all(&transient_root)?;
+            std::fs::write(transient_root.join("ignored"), transient.as_bytes())?;
+        }
+        let with_transients = e2e_source_tree_sha256(dir.path())?;
+        if with_transients != original {
+            return Err("declared top-level transport output changed source digest".into());
+        }
+
+        std::fs::write(dir.path().join("src/target/tracked.rs"), b"changed\n")?;
+        if e2e_source_tree_sha256(dir.path())? == with_transients {
+            return Err("nested directory with a transient name was incorrectly excluded".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_tree_digest_rejects_symlink_and_hardlink_aliases() -> BundleTestResult {
+        use std::os::unix::fs::symlink;
+
+        let symlink_dir = tempfile::TempDir::new()?;
+        std::fs::write(symlink_dir.path().join("real"), b"source\n")?;
+        symlink("real", symlink_dir.path().join("alias"))?;
+        let symlink_error =
+            expected_bundle_error(e2e_source_tree_sha256(symlink_dir.path()), "symlink source")?;
+        if !bundle_error_contains(&symlink_error, "symbolic source entries") {
+            return Err(format!("unexpected symlink source error: {symlink_error}").into());
+        }
+
+        let hardlink_dir = tempfile::TempDir::new()?;
+        let first = hardlink_dir.path().join("first");
+        std::fs::write(&first, b"source\n")?;
+        std::fs::hard_link(&first, hardlink_dir.path().join("second"))?;
+        let hardlink_error = expected_bundle_error(
+            e2e_source_tree_sha256(hardlink_dir.path()),
+            "hardlink source",
+        )?;
+        if !bundle_error_contains(&hardlink_error, "hard links") {
+            return Err(format!("unexpected hardlink source error: {hardlink_error}").into());
         }
         Ok(())
     }
@@ -1678,6 +1892,7 @@ mod tests {
                 run_id: Some(run_id.to_string()),
                 source_sha: Some("a".repeat(40)),
                 source_diff_sha256: Some("b".repeat(64)),
+                source_tree_sha256: Some("c".repeat(64)),
                 worker_id: Some("vmi1149989".to_string()),
                 worker_hostname: None,
             },
@@ -1772,6 +1987,10 @@ mod tests {
             },
             E2eRunBundleExpectation {
                 source_diff_sha256: Some("d".repeat(64)),
+                ..Default::default()
+            },
+            E2eRunBundleExpectation {
+                source_tree_sha256: Some("e".repeat(64)),
                 ..Default::default()
             },
         ];
