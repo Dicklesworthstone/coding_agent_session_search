@@ -15,7 +15,7 @@ use coding_agent_search::search::tantivy::{
     searchable_index_summary,
 };
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensearch::lexical::{
+use frankensearch::lexical_tantivy::{
     CassQueryFilters, CassSourceFilter, Count, IndexReader, ReloadPolicy, cass_build_tantivy_query,
     cass_open_search_reader,
 };

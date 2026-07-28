@@ -40,6 +40,180 @@ fn rusqlite_is_dev_dependency_only() {
     );
 }
 
+/// The registry archive and the required Git source both declare version
+/// 0.1.19, but only the immutable Git revision contains CASS's
+/// existing-schema-only open contract. Freeze the complete source identity
+/// across the manifest, lockfile, build-time validator, and user-facing
+/// dependency contract so a version-only update cannot silently regress it.
+#[test]
+fn frankensqlite_existing_only_source_identity_is_exact_and_coherent() {
+    const REVISION: &str = "f9cc32945eb96d9304b760fd5cdead8daf1eb40a";
+    const REPOSITORY: &str = "https://github.com/Dicklesworthstone/frankensqlite";
+
+    let manifest: toml::Table =
+        toml::from_str(include_str!("../Cargo.toml")).expect("parse Cargo.toml");
+    for (table_name, dependency_name, package_name) in [
+        ("dependencies", "frankensqlite", "fsqlite"),
+        ("dependencies", "fsqlite-types", "fsqlite-types"),
+        ("dev-dependencies", "fsqlite-types", "fsqlite-types"),
+    ] {
+        let dependency = manifest
+            .get(table_name)
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.get(dependency_name))
+            .and_then(toml::Value::as_table)
+            .expect("missing structured dependency entry");
+        assert_eq!(
+            dependency.get("package").and_then(toml::Value::as_str),
+            Some(package_name),
+            "{dependency_name} package identity drifted in [{table_name}]"
+        );
+        assert_eq!(
+            dependency.get("version").and_then(toml::Value::as_str),
+            Some("0.1.19"),
+            "{dependency_name} declared version drifted in [{table_name}]"
+        );
+        assert_eq!(
+            dependency.get("git").and_then(toml::Value::as_str),
+            Some(REPOSITORY),
+            "{dependency_name} Git source drifted in [{table_name}]"
+        );
+        assert_eq!(
+            dependency.get("rev").and_then(toml::Value::as_str),
+            Some(REVISION),
+            "{dependency_name} revision drifted in [{table_name}]"
+        );
+    }
+
+    let crates_io_patch = manifest
+        .get("patch")
+        .and_then(toml::Value::as_table)
+        .and_then(|patches| patches.get("crates-io"))
+        .and_then(toml::Value::as_table)
+        .expect("[patch.crates-io] source override");
+    for dependency_name in ["fsqlite", "fsqlite-types"] {
+        let dependency = crates_io_patch
+            .get(dependency_name)
+            .and_then(toml::Value::as_table)
+            .expect("missing crates.io source override");
+        assert_eq!(
+            dependency.get("git").and_then(toml::Value::as_str),
+            Some(REPOSITORY)
+        );
+        assert_eq!(
+            dependency.get("rev").and_then(toml::Value::as_str),
+            Some(REVISION)
+        );
+        assert!(
+            dependency.get("path").is_none()
+                && dependency.get("branch").is_none()
+                && dependency.get("tag").is_none(),
+            "{dependency_name} override must be immutable and clean-clone-safe"
+        );
+    }
+
+    let lockfile: toml::Value =
+        toml::from_str(include_str!("../Cargo.lock")).expect("parse Cargo.lock");
+    let packages = lockfile
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .expect("Cargo.lock package array");
+    let expected_source = format!("git+{REPOSITORY}?rev={REVISION}#{REVISION}");
+    let resolved_fsqlite: Vec<_> = packages
+        .iter()
+        .filter(|package| {
+            package
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|name| name == "fsqlite" || name.starts_with("fsqlite-"))
+        })
+        .collect();
+    assert!(
+        !resolved_fsqlite.is_empty(),
+        "Cargo.lock must contain the FrankenSQLite package family"
+    );
+    for package in resolved_fsqlite {
+        let name = package["name"].as_str().expect("locked package name");
+        assert_eq!(
+            package.get("source").and_then(toml::Value::as_str),
+            Some(expected_source.as_str()),
+            "{name} resolved from a different source despite sharing version 0.1.19"
+        );
+        assert!(
+            package.get("checksum").is_none(),
+            "Git-resolved package {name} must not retain a registry checksum"
+        );
+    }
+
+    let build_contract = include_str!("../build.rs");
+    assert!(
+        build_contract.contains(&format!("expected_rev: \"{REVISION}\""))
+            && build_contract.contains(&format!("expected_git: \"{REPOSITORY}\"")),
+        "build.rs must validate the exact FrankenSQLite source identity"
+    );
+    let readme = include_str!("../README.md");
+    assert!(
+        readme.contains(&REVISION[..8])
+            && readme.contains("existing-only schema-open contract")
+            && readme.contains("registry archive lacks")
+            && readme.contains("[patch.crates-io]"),
+        "README must explain why equal version numbers are not interchangeable"
+    );
+}
+
+/// Exercise the exact API that disappeared from the same-version registry
+/// archive. A missing database must remain missing, while an existing database
+/// must reopen without schema initialization and retain its rows.
+#[test]
+fn frankensqlite_existing_schema_only_open_never_creates_and_reopens_exact_data() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let missing_path = dir.path().join("must-remain-missing.db");
+    let missing = missing_path.to_string_lossy();
+    let error = match FrankenConnection::open_existing_schema_only(missing.as_ref()) {
+        Err(error) => error,
+        Ok(_) => unreachable!("existing-only open must reject a missing database"),
+    };
+    assert!(
+        !missing_path.exists(),
+        "existing-only open must not create or zero-initialize a missing path"
+    );
+    assert!(
+        !error.to_string().trim().is_empty(),
+        "missing-path rejection must be actionable"
+    );
+
+    let database_path = dir.path().join("existing.db");
+    {
+        let path = database_path.to_string_lossy();
+        let conn = FrankenConnection::open(path.as_ref()).expect("create fixture database");
+        conn.execute("CREATE TABLE exact_rows(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+            .expect("create exact_rows");
+        conn.execute("INSERT INTO exact_rows(id, value) VALUES (7, 'preserved')")
+            .expect("insert exact row");
+    }
+    let size_before = std::fs::metadata(&database_path)
+        .expect("fixture database metadata")
+        .len();
+    {
+        let path = database_path.to_string_lossy();
+        let reopened = FrankenConnection::open_existing_schema_only(path.as_ref())
+            .expect("reopen existing database without schema initialization");
+        let rows = reopened
+            .query("SELECT id, value FROM exact_rows")
+            .expect("query exact preserved row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(7)));
+        assert_eq!(rows[0].get(1), Some(&SqliteValue::Text("preserved".into())));
+    }
+    assert_eq!(
+        std::fs::metadata(&database_path)
+            .expect("reopened database metadata")
+            .len(),
+        size_before,
+        "schema-only reopen must not replace or truncate the database"
+    );
+}
+
 // ============================================================================
 // GATE 1: FTS5 Compatibility
 // ============================================================================

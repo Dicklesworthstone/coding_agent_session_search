@@ -535,8 +535,8 @@ fn test_path_dependency_compile_contracts() {
         ..Default::default()
     };
 
-    let _open_search_reader = frankensearch::lexical::cass_open_search_reader;
-    let _reload_policy = frankensearch::lexical::ReloadPolicy::Manual;
+    let _open_search_reader = frankensearch::lexical_tantivy::cass_open_search_reader;
+    let _reload_policy = frankensearch::lexical_tantivy::ReloadPolicy::Manual;
     assert_eq!(
         frankensearch::ModelCategory::HashEmbedder.default_tier(),
         frankensearch::ModelTier::Fast

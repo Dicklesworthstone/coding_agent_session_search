@@ -1927,6 +1927,389 @@ paths = ["~/.claude/projects"]
     tracker.complete();
 }
 
+/// A deliberately slow external-probe fixture drives the real binary past a
+/// one-millisecond fleet budget. Both robot and human surfaces must stop
+/// honestly, identify every skipped source, preserve all evidence byte-for-byte,
+/// and return a bounded partial diagnosis instead of hanging.
+#[test]
+fn sources_doctor_budget_exhaustion_is_bounded_explicit_and_mutation_free() {
+    let tracker =
+        tracker_for("sources_doctor_budget_exhaustion_is_bounded_explicit_and_mutation_free");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let setup_start = tracker.start(
+        "setup",
+        Some("Create two-source fixture with a probe slower than the total budget"),
+    );
+    let tmp = tempfile::TempDir::new().expect("create source-doctor budget fixture");
+    let config_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&config_dir).expect("create config directory");
+    fs::create_dir_all(&data_dir).expect("create data directory");
+    let archive_path = data_dir.join("agent_search.db");
+    let sync_status_path = data_dir.join("sync_status.json");
+    let first_mirror_dir = data_dir.join("remotes").join("budget-first").join("mirror");
+    let second_mirror_dir = data_dir
+        .join("remotes")
+        .join("budget-second")
+        .join("mirror");
+    fs::create_dir_all(&first_mirror_dir).expect("create first source mirror");
+    fs::create_dir_all(&second_mirror_dir).expect("create second source mirror");
+    fs::write(&archive_path, b"pre-existing archive evidence\n")
+        .expect("write archive evidence sentinel");
+    fs::write(
+        &sync_status_path,
+        serde_json::to_vec_pretty(&serde_json::json!({ "sources": {} }))
+            .expect("serialize sync-status evidence"),
+    )
+    .expect("write sync-status evidence sentinel");
+    let first_mirror_marker = first_mirror_dir.join("retained-first.jsonl");
+    let second_mirror_marker = second_mirror_dir.join("retained-second.jsonl");
+    fs::write(&first_mirror_marker, b"retained first mirror evidence\n")
+        .expect("write first mirror evidence sentinel");
+    fs::write(&second_mirror_marker, b"retained second mirror evidence\n")
+        .expect("write second mirror evidence sentinel");
+    create_sources_config(
+        &config_dir,
+        r#"
+[[sources]]
+name = "budget-first"
+type = "ssh"
+host = "fixture@budget.test"
+paths = ["~/.claude/projects"]
+
+[[sources]]
+name = "budget-second"
+type = "ssh"
+host = "fixture@budget.test"
+paths = ["~/.codex/sessions"]
+"#,
+    );
+    let probe_path = tmp.path().join("source-doctor-budget-probe.json");
+    fs::write(
+        &probe_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "host": "fixture@budget.test",
+            "os": "Linux",
+            "cass_version": env!("CARGO_PKG_VERSION"),
+            "remote_path": "nonempty",
+            "delay_ms": 5,
+        }))
+        .expect("serialize source-doctor budget probe"),
+    )
+    .expect("write source-doctor budget probe");
+    let config_path = config_dir.join("cass/sources.toml");
+    let config_before = fs::read(&config_path).expect("read source config before diagnosis");
+    let probe_before = fs::read(&probe_path).expect("read probe before diagnosis");
+    let archive_before = fs::read(&archive_path).expect("read archive evidence before diagnosis");
+    let sync_status_before =
+        fs::read(&sync_status_path).expect("read sync-status evidence before diagnosis");
+    let first_mirror_before =
+        fs::read(&first_mirror_marker).expect("read first mirror evidence before diagnosis");
+    let second_mirror_before =
+        fs::read(&second_mirror_marker).expect("read second mirror evidence before diagnosis");
+    let data_members_before =
+        directory_membership(&data_dir).expect("list data directory before diagnosis");
+    let first_mirror_members_before =
+        directory_membership(&first_mirror_dir).expect("list first mirror before diagnosis");
+    let second_mirror_members_before =
+        directory_membership(&second_mirror_dir).expect("list second mirror before diagnosis");
+    tracker.end(
+        "setup",
+        Some("Create two-source fixture with a probe slower than the total budget"),
+        setup_start,
+    );
+
+    let robot_start = tracker.start(
+        "robot_budget",
+        Some("Run real sources doctor JSON surface with a one-millisecond budget"),
+    );
+    let wall_start = std::time::Instant::now();
+    let mut robot_cmd = Command::new(util::cass_bin());
+    robot_cmd
+        .args(["sources", "doctor", "--json"])
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("CASS_TEST_SOURCES_DOCTOR_PROBE", &probe_path)
+        .env("CASS_FLEET_PER_HOST_BUDGET_MS", "20")
+        .env("CASS_FLEET_BUDGET_MS", "1")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("NO_COLOR", "1");
+    let robot_output = util::timeout::spawn_with_timeout_or_diag(
+        robot_cmd,
+        "sources_doctor_budget_robot",
+        Some(&data_dir),
+        std::time::Duration::from_secs(5),
+    );
+    let robot_wall = wall_start.elapsed();
+    tracker.end(
+        "robot_budget",
+        Some("Run real sources doctor JSON surface with a one-millisecond budget"),
+        robot_start,
+    );
+    assert_eq!(
+        robot_output.status.code(),
+        Some(1),
+        "budget-exhausted diagnosis must be non-healthy; stdout={}; stderr={}",
+        String::from_utf8_lossy(&robot_output.stdout),
+        String::from_utf8_lossy(&robot_output.stderr)
+    );
+    assert!(
+        robot_wall < std::time::Duration::from_secs(5),
+        "source doctor exceeded the E2E hard bound: {robot_wall:?}"
+    );
+    assert!(
+        robot_output.stdout.len() < 256 * 1024 && robot_output.stderr.len() < 256 * 1024,
+        "bounded diagnosis emitted unbounded output: stdout={} stderr={}",
+        robot_output.stdout.len(),
+        robot_output.stderr.len()
+    );
+
+    let verify_robot_start = tracker.start(
+        "verify_robot",
+        Some("Verify partial JSON truthfully reports timeout and skipped work"),
+    );
+    let payload: Value =
+        serde_json::from_slice(&robot_output.stdout).expect("budget output must be valid JSON");
+    assert_eq!(payload["mutation_free"], true);
+    assert_eq!(payload["budget"]["budget_ms"], 1);
+    assert_eq!(payload["budget"]["timed_out"], true);
+    assert!(
+        payload["budget"]["elapsed_ms"]
+            .as_u64()
+            .is_some_and(|elapsed| elapsed < 1_000),
+        "budget accounting must remain bounded: {}",
+        payload["budget"]
+    );
+    assert_eq!(
+        payload["budget"]["recommended_next_probe"],
+        "cass sources list --json"
+    );
+    let skipped = payload["budget"]["skipped_sections"]
+        .as_array()
+        .expect("skipped source list");
+    for source in ["budget-first", "budget-second"] {
+        assert!(
+            skipped
+                .iter()
+                .any(|entry| entry == &Value::String(format!("source:{source}"))),
+            "budget output must name skipped source {source}: {payload}"
+        );
+    }
+    let sources = payload["sources"].as_array().expect("health sources array");
+    assert_eq!(sources.len(), 2);
+    assert!(
+        sources.iter().all(|source| {
+            source["state"] == "timeout"
+                && source["host_reached"] == false
+                && source["connection_error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("timed out"))
+        }),
+        "every uncompleted source must be an explicit timeout: {payload}"
+    );
+    let diagnostics = payload["diagnostics"]
+        .as_array()
+        .expect("raw diagnostics array");
+    assert_eq!(diagnostics.len(), 2);
+    assert!(diagnostics.iter().all(|diagnostic| {
+        diagnostic["host_report"]["status"] == "timed-out"
+            && diagnostic["host_report"]["timed_out"] == true
+    }));
+    tracker.end(
+        "verify_robot",
+        Some("Verify partial JSON truthfully reports timeout and skipped work"),
+        verify_robot_start,
+    );
+
+    let human_start = tracker.start(
+        "human_budget",
+        Some("Run human surface and verify parity with the robot timeout contract"),
+    );
+    let mut human_cmd = Command::new(util::cass_bin());
+    human_cmd
+        .args(["sources", "doctor"])
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("CASS_TEST_SOURCES_DOCTOR_PROBE", &probe_path)
+        .env("CASS_FLEET_PER_HOST_BUDGET_MS", "20")
+        .env("CASS_FLEET_BUDGET_MS", "1")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("NO_COLOR", "1");
+    let human_output = util::timeout::spawn_with_timeout_or_diag(
+        human_cmd,
+        "sources_doctor_budget_human",
+        Some(&data_dir),
+        std::time::Duration::from_secs(5),
+    );
+    tracker.end(
+        "human_budget",
+        Some("Run human surface and verify parity with the robot timeout contract"),
+        human_start,
+    );
+    assert_eq!(human_output.status.code(), Some(1));
+    let human = String::from_utf8(human_output.stdout).expect("human output is UTF-8");
+    for expected in [
+        "Checking source: budget-first",
+        "Checking source: budget-second",
+        "State codes: source=timeout host=timed-out",
+        "Budget:",
+        "skipped: source:budget-first, source:budget-second",
+        "Next bounded probe: cass sources list --json",
+    ] {
+        assert!(
+            human.contains(expected),
+            "human timeout output missing {expected:?}: {human}"
+        );
+    }
+
+    let mutation_start = tracker.start(
+        "verify_mutation_free",
+        Some("Prove config, probe, and data membership remained byte-identical"),
+    );
+    assert_eq!(
+        fs::read(&config_path).expect("read source config after diagnosis"),
+        config_before
+    );
+    assert_eq!(
+        fs::read(&probe_path).expect("read probe after diagnosis"),
+        probe_before
+    );
+    assert_eq!(
+        fs::read(&archive_path).expect("read archive evidence after diagnosis"),
+        archive_before
+    );
+    assert_eq!(
+        fs::read(&sync_status_path).expect("read sync-status evidence after diagnosis"),
+        sync_status_before
+    );
+    assert_eq!(
+        fs::read(&first_mirror_marker).expect("read first mirror evidence after diagnosis"),
+        first_mirror_before
+    );
+    assert_eq!(
+        fs::read(&second_mirror_marker).expect("read second mirror evidence after diagnosis"),
+        second_mirror_before
+    );
+    assert_eq!(
+        directory_membership(&data_dir).expect("list data directory after diagnosis"),
+        data_members_before
+    );
+    assert_eq!(
+        directory_membership(&first_mirror_dir).expect("list first mirror after diagnosis"),
+        first_mirror_members_before
+    );
+    assert_eq!(
+        directory_membership(&second_mirror_dir).expect("list second mirror after diagnosis"),
+        second_mirror_members_before
+    );
+    tracker.end(
+        "verify_mutation_free",
+        Some("Prove config, probe, and data membership remained byte-identical"),
+        mutation_start,
+    );
+    tracker.complete();
+}
+
+/// The slow-probe seam is intentionally tiny and test-only. Reject an
+/// excessive delay before any network operation, and preserve both the source
+/// configuration and the fixture that caused the error.
+#[test]
+fn sources_doctor_rejects_unbounded_fixture_delay_before_network_or_mutation() {
+    let tracker =
+        tracker_for("sources_doctor_rejects_unbounded_fixture_delay_before_network_or_mutation");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let tmp = tempfile::TempDir::new().expect("create invalid-delay fixture root");
+    let config_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&config_dir).expect("create config directory");
+    fs::create_dir_all(&data_dir).expect("create data directory");
+    create_sources_config(
+        &config_dir,
+        r#"
+[[sources]]
+name = "bounded-fixture"
+type = "ssh"
+host = "fixture@bounded.test"
+paths = ["~/.claude/projects"]
+"#,
+    );
+    let probe_path = tmp.path().join("invalid-delay.json");
+    fs::write(
+        &probe_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "host": "fixture@bounded.test",
+            "os": "Linux",
+            "cass_version": env!("CARGO_PKG_VERSION"),
+            "remote_path": "nonempty",
+            "delay_ms": 101,
+        }))
+        .expect("serialize invalid-delay probe"),
+    )
+    .expect("write invalid-delay probe");
+    let config_path = config_dir.join("cass/sources.toml");
+    let config_before = fs::read(&config_path).expect("read config before invalid probe");
+    let probe_before = fs::read(&probe_path).expect("read invalid probe before command");
+    let data_members_before =
+        directory_membership(&data_dir).expect("list data before invalid probe");
+
+    let start = tracker.start(
+        "reject",
+        Some("Run real binary and reject delay above the fixed fixture ceiling"),
+    );
+    let mut cmd = Command::new(util::cass_bin());
+    cmd.args(["sources", "doctor", "--json"])
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("CASS_TEST_SOURCES_DOCTOR_PROBE", &probe_path)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("NO_COLOR", "1");
+    let output = util::timeout::spawn_with_timeout_or_diag(
+        cmd,
+        "sources_doctor_invalid_delay",
+        Some(&data_dir),
+        std::time::Duration::from_secs(5),
+    );
+    tracker.end(
+        "reject",
+        Some("Run real binary and reject delay above the fixed fixture ceiling"),
+        start,
+    );
+    assert!(
+        !output.status.success(),
+        "invalid fixture delay must fail closed"
+    );
+    let rendered = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        rendered.contains("delay_ms") && rendered.contains("100"),
+        "error must identify the bounded field and ceiling: {rendered}"
+    );
+    assert_eq!(
+        fs::read(&config_path).expect("read config after invalid probe"),
+        config_before
+    );
+    assert_eq!(
+        fs::read(&probe_path).expect("read invalid probe after command"),
+        probe_before
+    );
+    assert_eq!(
+        directory_membership(&data_dir).expect("list data after invalid probe"),
+        data_members_before
+    );
+    tracker.complete();
+}
+
 #[derive(Clone, Copy)]
 enum ReachableDoctorSyncFixture {
     None,

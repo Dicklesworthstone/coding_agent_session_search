@@ -88,6 +88,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -18746,9 +18747,9 @@ fn state_meta_json_inner(
     // fans out across every segment file on the hot robot path.
     let index_doc_count: Option<u64> = if db_opened && message_count > 0 && lexical.exists {
         lexical_manifest_indexed_doc_count(&index_path).or_else(|| {
-            frankensearch::lexical::cass_open_search_reader(
+            frankensearch::lexical_tantivy::cass_open_search_reader(
                 &index_path,
-                frankensearch::lexical::ReloadPolicy::Manual,
+                frankensearch::lexical_tantivy::ReloadPolicy::Manual,
             )
             .ok()
             .map(|(reader, _fields)| reader.searcher().num_docs())
@@ -21471,6 +21472,28 @@ const fn semantic_daemon_policy(daemon: bool, no_daemon: bool) -> SemanticDaemon
     }
 }
 
+fn compose_daemon_embedder_or_verified_local(
+    daemon: Arc<dyn crate::search::daemon_client::DaemonClient>,
+    embedder: Arc<dyn crate::search::embedder::Embedder>,
+    config: crate::search::daemon_client::DaemonRetryConfig,
+) -> Arc<dyn crate::search::embedder::Embedder> {
+    match crate::search::daemon_client::DaemonFallbackEmbedder::new(
+        daemon,
+        Arc::clone(&embedder),
+        config,
+    ) {
+        Ok(verified) => Arc::new(verified),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                embedder_id = %embedder.id(),
+                "Daemon embedding identity is unverifiable; using the verified local embedder"
+            );
+            embedder
+        }
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn issue_347_semantic_daemon_policy_discovers_existing_by_default_and_respects_overrides() {
@@ -21494,6 +21517,31 @@ fn issue_347_semantic_daemon_policy_discovers_existing_by_default_and_respects_o
             use_existing: false,
             auto_spawn: false,
         }
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn unverifiable_daemon_composition_preserves_the_verified_local_embedding_space() {
+    use crate::search::daemon_client::{DaemonRetryConfig, NoopDaemonClient};
+    use crate::search::embedder::Embedder;
+    use crate::search::hash_embedder::HashEmbedder;
+
+    let local: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(32));
+    let expected = local
+        .embed_sync("preserve verified local vectors")
+        .expect("local control embedding");
+    let daemon = Arc::new(NoopDaemonClient::new("unverified-test-daemon"));
+    let composed =
+        compose_daemon_embedder_or_verified_local(daemon, local, DaemonRetryConfig::default());
+
+    assert_eq!(composed.id(), "fnv1a-32");
+    assert_eq!(
+        composed
+            .embed_sync("preserve verified local vectors")
+            .expect("composed embedding"),
+        expected,
+        "an unverifiable daemon must not change the query embedding space"
     );
 }
 
@@ -23414,7 +23462,7 @@ fn run_cli_search(
 
             let embedder: Arc<dyn crate::search::embedder::Embedder> =
                 if semantic_opts.use_daemon && !prefer_hash && daemon_embedder_compatible {
-                    use crate::search::daemon_client::{DaemonFallbackEmbedder, DaemonRetryConfig};
+                    use crate::search::daemon_client::DaemonRetryConfig;
 
                     #[cfg(unix)]
                     {
@@ -23430,7 +23478,7 @@ fn run_cli_search(
                             ))
                         });
                         let config = DaemonRetryConfig::from_env();
-                        Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
+                        compose_daemon_embedder_or_verified_local(daemon, embedder, config)
                     }
                     #[cfg(not(unix))]
                     {
@@ -23438,7 +23486,7 @@ fn run_cli_search(
                             "daemon-unconfigured",
                         ));
                         let config = DaemonRetryConfig::from_env();
-                        Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
+                        compose_daemon_embedder_or_verified_local(daemon, embedder, config)
                     }
                 } else {
                     embedder
@@ -96893,6 +96941,7 @@ struct SourcesDoctorOutput<'a> {
 }
 
 const SOURCE_DOCTOR_FIXTURE_MAX_BYTES: usize = 16 * 1024;
+const SOURCE_DOCTOR_FIXTURE_MAX_DELAY_MS: u64 = 100;
 
 fn configured_fleet_probe_budget() -> crate::fleet_probe::ProbeBudget {
     let defaults = crate::fleet_probe::ProbeBudget::default();
@@ -96904,10 +96953,7 @@ fn configured_fleet_probe_budget() -> crate::fleet_probe::ProbeBudget {
             .unwrap_or(default)
     };
     crate::fleet_probe::ProbeBudget {
-        per_host_ms: positive_env(
-            "CASS_FLEET_PER_HOST_BUDGET_MS",
-            defaults.per_host_ms,
-        ),
+        per_host_ms: positive_env("CASS_FLEET_PER_HOST_BUDGET_MS", defaults.per_host_ms),
         total_ms: positive_env("CASS_FLEET_BUDGET_MS", defaults.total_ms),
     }
 }
@@ -96922,6 +96968,25 @@ fn remaining_probe_timeout(
             .min(total_budget.remaining_ms())
             .max(1),
     )
+}
+
+fn source_probe_budget_exhausted(
+    host_budget: &crate::robot_budget_envelope::RobotBudget,
+    total_budget: &crate::robot_budget_envelope::RobotBudget,
+) -> bool {
+    host_budget.is_exhausted() || total_budget.is_exhausted()
+}
+
+fn skipped_source_probe(name: impl Into<String>) -> DiagnosticCheck {
+    DiagnosticCheck {
+        name: name.into(),
+        status: "warn".into(),
+        message: "Probe timed out before this check could run".into(),
+        remediation: Some(
+            "Retry with larger CASS_FLEET_PER_HOST_BUDGET_MS and CASS_FLEET_BUDGET_MS values"
+                .into(),
+        ),
+    }
 }
 
 /// Test-only external-probe facts for deterministic real-binary source-doctor
@@ -96942,6 +97007,8 @@ struct SourceDoctorFixtureProbe {
     os: String,
     cass_version: Option<String>,
     remote_path: SourceDoctorFixtureRemotePath,
+    #[serde(default)]
+    delay_ms: u64,
 }
 
 impl SourceDoctorFixtureProbe {
@@ -97067,6 +97134,12 @@ fn load_source_doctor_fixture_probe(host: &str) -> CliResult<Option<SourceDoctor
             fixture.host
         )));
     }
+    if fixture.delay_ms > SOURCE_DOCTOR_FIXTURE_MAX_DELAY_MS {
+        return Err(source_doctor_fixture_error(format!(
+            "Source-doctor probe fixture delay_ms must not exceed {}",
+            SOURCE_DOCTOR_FIXTURE_MAX_DELAY_MS
+        )));
+    }
     Ok(Some(fixture))
 }
 
@@ -97133,6 +97206,8 @@ fn run_sources_doctor(
     use crate::sources::config::{SourcesConfig, source_names_equal, source_path_entry_error};
     use colored::Colorize;
 
+    let probe_limits = configured_fleet_probe_budget();
+    let total_budget = crate::robot_budget_envelope::RobotBudget::new(probe_limits.total_ms);
     let config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
         kind: CliErrorKind::Config.kind_str(),
@@ -97151,11 +97226,17 @@ fn run_sources_doctor(
         });
 
         if let Some(_fmt) = structured_format {
+            let budget = crate::robot_budget_envelope::BudgetBlock::from_budget(
+                &total_budget,
+                Vec::new(),
+                None,
+            );
             println!(
                 "{}",
                 serde_json::json!({
                     "error": "No sources configured",
-                    "sources": []
+                    "sources": [],
+                    "budget": budget,
                 })
             );
         } else {
@@ -97184,23 +97265,45 @@ fn run_sources_doctor(
 
     let mut all_diagnostics = Vec::new();
     let mut observations = Vec::new();
+    let mut budget_skipped_sections = Vec::new();
 
     for source in sources_to_check {
         let source_start = std::time::Instant::now();
+        let host_budget = crate::robot_budget_envelope::RobotBudget::new(probe_limits.per_host_ms);
         let mut checks = Vec::new();
 
         // Check 1: SSH connectivity
         let host = source.host.as_deref().unwrap_or("unknown");
         let fixture_probe = load_source_doctor_fixture_probe(host)?;
-        let ssh_check = fixture_probe
-            .as_ref()
-            .map_or_else(|| check_ssh_connectivity(host), |probe| probe.ssh_check());
+        if !source_probe_budget_exhausted(&host_budget, &total_budget)
+            && let Some(probe) = fixture_probe.as_ref()
+            && probe.delay_ms > 0
+        {
+            let bounded_delay_ms = probe
+                .delay_ms
+                .min(host_budget.remaining_ms())
+                .min(total_budget.remaining_ms());
+            if bounded_delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(bounded_delay_ms));
+            }
+        }
+        let ssh_check = if source_probe_budget_exhausted(&host_budget, &total_budget) {
+            skipped_source_probe("SSH Connectivity")
+        } else if let Some(probe) = fixture_probe.as_ref() {
+            probe.ssh_check()
+        } else {
+            check_ssh_connectivity(host, remaining_probe_timeout(&host_budget, &total_budget))
+        };
         checks.push(ssh_check);
 
         // Check 2: rsync availability on remote
-        let rsync_check = fixture_probe
-            .as_ref()
-            .map_or_else(|| check_rsync_available(host), |probe| probe.rsync_check());
+        let rsync_check = if source_probe_budget_exhausted(&host_budget, &total_budget) {
+            skipped_source_probe("rsync Available")
+        } else if let Some(probe) = fixture_probe.as_ref() {
+            probe.rsync_check()
+        } else {
+            check_rsync_available(host, remaining_probe_timeout(&host_budget, &total_budget))
+        };
         checks.push(rsync_check);
 
         // Check 3: Remote paths exist
@@ -97212,10 +97315,15 @@ fn run_sources_doctor(
                     message: format!("Invalid source path: {message}"),
                     remediation: Some("Fix or remove this path in sources.toml".into()),
                 });
+            } else if source_probe_budget_exhausted(&host_budget, &total_budget) {
+                checks.push(skipped_source_probe(format!("Remote Path: {path}")));
+            } else if let Some(probe) = fixture_probe.as_ref() {
+                checks.push(probe.remote_path_check(path));
             } else {
-                checks.push(fixture_probe.as_ref().map_or_else(
-                    || check_remote_path(host, path),
-                    |probe| probe.remote_path_check(path),
+                checks.push(check_remote_path(
+                    host,
+                    path,
+                    remaining_probe_timeout(&host_budget, &total_budget),
                 ));
             }
         }
@@ -97265,59 +97373,80 @@ fn run_sources_doctor(
         // not-observed defaults so the report never claims an unprobed axis.
         if observation.host_reachable {
             if source.host.is_some() {
-                let probe = fixture_probe.as_ref().map_or_else(
-                    || check_remote_cass(host),
-                    SourceDoctorFixtureProbe::remote_cass_probe,
-                );
+                let probe = if source_probe_budget_exhausted(&host_budget, &total_budget) {
+                    RemoteCassProbe {
+                        os: None,
+                        cass_version: None,
+                        cass_found: false,
+                        timed_out: true,
+                    }
+                } else if let Some(fixture) = fixture_probe.as_ref() {
+                    fixture.remote_cass_probe()
+                } else {
+                    check_remote_cass(host, remaining_probe_timeout(&host_budget, &total_budget))
+                };
+                if probe.timed_out {
+                    host_report.status = crate::fleet_doctor_schema::HostProbeStatus::TimedOut;
+                    host_report.timed_out = true;
+                    observation.host_reachable = false;
+                    observation.connection_error =
+                        Some("remote cass probe timed out within the source budget".into());
+                }
                 if let Some(uname) = probe.os.as_deref() {
                     host_report.platform = platform_from_uname(uname);
                 }
                 host_report.cass_version = probe.cass_version.clone();
-                if !probe.cass_found {
+                if !probe.cass_found && !probe.timed_out {
                     host_report.status =
                         crate::fleet_doctor_schema::HostProbeStatus::CommandNotFound;
                 }
-                let version_assessment =
-                    crate::fleet_version_skew::assess_host(&host_report, env!("CARGO_PKG_VERSION"));
-                let gap = version_assessment.capability_gap;
-                crate::source_doctor_health::apply_remote_binary(
-                    &mut observation,
-                    crate::source_doctor_health::RemoteBinaryOutcome::from_capability_gap(gap),
-                );
-                if matches!(
-                    gap,
-                    crate::fleet_version_skew::CapabilityGap::Major
-                        | crate::fleet_version_skew::CapabilityGap::BinaryMissing
-                ) {
-                    host_report.status = if gap == crate::fleet_version_skew::CapabilityGap::Major {
-                        crate::fleet_doctor_schema::HostProbeStatus::OldBinarySkew
-                    } else {
-                        crate::fleet_doctor_schema::HostProbeStatus::CommandNotFound
-                    };
-                    host_report.timed_out = false;
-                    host_report.unreachable = false;
-                    let attribution = if gap == crate::fleet_version_skew::CapabilityGap::Major {
-                        crate::root_cause_projection::project_root_cause(
-                            &crate::root_cause_projection::ProjectionSignals {
-                                binary_behind_contract: true,
-                                ..Default::default()
-                            },
-                        )
-                    } else {
-                        crate::root_cause_taxonomy::RootCauseAttribution::unattributed(
-                            "remote cass binary was not found on PATH; no running version was observed",
-                        )
-                    };
-                    host_report.likely_root_cause = Some(attribution.family);
-                    host_report.root_cause = Some(attribution);
-                    host_report.recommended_action =
-                        version_assessment.install_hint.command.clone().or_else(|| {
-                            version_assessment
-                                .install_hint
-                                .manual_steps
-                                .first()
-                                .cloned()
-                        });
+                if !probe.timed_out {
+                    let version_assessment = crate::fleet_version_skew::assess_host(
+                        &host_report,
+                        env!("CARGO_PKG_VERSION"),
+                    );
+                    let gap = version_assessment.capability_gap;
+                    crate::source_doctor_health::apply_remote_binary(
+                        &mut observation,
+                        crate::source_doctor_health::RemoteBinaryOutcome::from_capability_gap(gap),
+                    );
+                    if matches!(
+                        gap,
+                        crate::fleet_version_skew::CapabilityGap::Major
+                            | crate::fleet_version_skew::CapabilityGap::BinaryMissing
+                    ) {
+                        host_report.status =
+                            if gap == crate::fleet_version_skew::CapabilityGap::Major {
+                                crate::fleet_doctor_schema::HostProbeStatus::OldBinarySkew
+                            } else {
+                                crate::fleet_doctor_schema::HostProbeStatus::CommandNotFound
+                            };
+                        host_report.timed_out = false;
+                        host_report.unreachable = false;
+                        let attribution = if gap == crate::fleet_version_skew::CapabilityGap::Major
+                        {
+                            crate::root_cause_projection::project_root_cause(
+                                &crate::root_cause_projection::ProjectionSignals {
+                                    binary_behind_contract: true,
+                                    ..Default::default()
+                                },
+                            )
+                        } else {
+                            crate::root_cause_taxonomy::RootCauseAttribution::unattributed(
+                                "remote cass binary was not found on PATH; no running version was observed",
+                            )
+                        };
+                        host_report.likely_root_cause = Some(attribution.family);
+                        host_report.root_cause = Some(attribution);
+                        host_report.recommended_action =
+                            version_assessment.install_hint.command.clone().or_else(|| {
+                                version_assessment
+                                    .install_hint
+                                    .manual_steps
+                                    .first()
+                                    .cloned()
+                            });
+                    }
                 }
                 let evidence = gather_source_sync_evidence(source, &checks);
                 crate::source_doctor_health::apply_sync_evidence(&mut observation, &evidence);
@@ -97326,6 +97455,31 @@ fn run_sources_doctor(
                 observation.cass_present = Some(true);
                 observation.cass_current = Some(true);
             }
+        }
+        host_report = crate::fleet_probe::finalize_host(
+            host_report,
+            u64::try_from(source_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            probe_limits.per_host_ms,
+        );
+        if total_budget.is_exhausted() && !host_report.status.is_hard_failure() {
+            host_report.status = crate::fleet_doctor_schema::HostProbeStatus::TimedOut;
+            host_report.timed_out = true;
+            if !host_report
+                .skipped_sections
+                .iter()
+                .any(|section| matches!(section.as_str(), "remaining-probes"))
+            {
+                host_report.skipped_sections.push("remaining-probes".into());
+            }
+        }
+        if matches!(
+            host_report.status,
+            crate::fleet_doctor_schema::HostProbeStatus::TimedOut
+        ) {
+            observation.host_reachable = false;
+            observation.connection_error =
+                Some("source probe timed out within its bounded budget".into());
+            budget_skipped_sections.push(format!("source:{}", source.name));
         }
         observations.push(observation);
 
@@ -97343,6 +97497,13 @@ fn run_sources_doctor(
     // source-doctor health report (per-source state, preservation-safe next
     // command, mutation-free marker). Pure: building the report performs no I/O.
     let health_report = crate::source_doctor_health::SourceDoctorReport::build(&observations);
+    let recommended_next_probe =
+        (!budget_skipped_sections.is_empty()).then(|| "cass sources list --json".to_string());
+    let budget = crate::robot_budget_envelope::BudgetBlock::from_budget(
+        &total_budget,
+        budget_skipped_sections,
+        recommended_next_probe,
+    );
 
     // Output results
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -97357,6 +97518,7 @@ fn run_sources_doctor(
         let output = SourcesDoctorOutput {
             health: &health_report,
             diagnostics: &all_diagnostics,
+            budget: &budget,
         };
         println!(
             "{}",
@@ -97415,6 +97577,18 @@ fn run_sources_doctor(
                 diag.warnings.to_string().yellow(),
                 diag.failed.to_string().red()
             );
+        }
+        if budget.timed_out || !budget.skipped_sections.is_empty() {
+            println!();
+            println!(
+                "Budget: {}/{}ms; skipped: {}",
+                budget.elapsed_ms,
+                budget.budget_ms,
+                budget.skipped_sections.join(", ")
+            );
+            if let Some(next) = budget.recommended_next_probe.as_deref() {
+                println!("Next bounded probe: {next}");
+            }
         }
     }
 
@@ -99138,14 +99312,17 @@ fn probe_remote_host_for_rehearsal(
 ) {
     use crate::fleet_doctor_schema::{HostDoctorReport, HostProbeStatus, Platform};
     let start = std::time::Instant::now();
-    let probe = check_remote_cass(host);
+    let probe_budget = configured_fleet_probe_budget();
+    let probe = check_remote_cass(host, Duration::from_millis(probe_budget.per_host_ms));
     let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let platform = probe
         .os
         .as_deref()
         .map(platform_from_uname)
         .unwrap_or_else(Platform::linux_x86_64);
-    let status = if probe.os.is_none() {
+    let status = if probe.timed_out {
+        HostProbeStatus::TimedOut
+    } else if probe.os.is_none() {
         // No usable response: the host could not be reached for the probe.
         HostProbeStatus::Unreachable
     } else if !probe.cass_found {
@@ -99156,7 +99333,11 @@ fn probe_remote_host_for_rehearsal(
     let mut report = HostDoctorReport::skeleton(name, platform, status, elapsed);
     report.cass_version = probe.cass_version.clone();
     report.unreachable = matches!(status, HostProbeStatus::Unreachable);
-    (report, unknown_archive_coverage())
+    report.timed_out = matches!(status, HostProbeStatus::TimedOut);
+    (
+        crate::fleet_probe::finalize_host(report, elapsed, probe_budget.per_host_ms),
+        unknown_archive_coverage(),
+    )
 }
 
 /// Drive the bounded post-upgrade check battery against the local binary and

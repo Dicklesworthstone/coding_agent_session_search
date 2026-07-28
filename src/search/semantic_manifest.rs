@@ -9000,13 +9000,17 @@ mod tests {
             );
             let candidate =
                 test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![artifact]);
-            prop_assert!(matches!(
+            let rejected_as_path_invariant = matches!(
                 candidate.validate(),
                 Err(SemanticGenerationError::InvalidManifest {
                     class: SemanticManifestInvariantClass::Path,
                     ..
                 })
-            ));
+            );
+            prop_assert!(
+                rejected_as_path_invariant,
+                "parent-alias paths must fail the semantic manifest path invariant"
+            );
         }
 
         #[test]

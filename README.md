@@ -3028,14 +3028,14 @@ Update check state is stored in the data directory:
 
 ## Dependency Source Contract
 
-`cass` pins dependency identities in [`Cargo.toml`](Cargo.toml): exact registry version requirements for crates.io-only dependencies and git revisions for source dependencies. The repo keeps local `[patch]` overrides commented out by default; enable them only for local development and never commit an active sibling path override.
+`cass` pins dependency identities in [`Cargo.toml`](Cargo.toml): exact registry version requirements for crates.io-only dependencies and git revisions for source dependencies. Immutable remote `[patch.crates-io]` entries may unify transitive source identity; local sibling-path overrides stay commented out by default and must never be committed active.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `=0.1.18` (crates.io; contentless-FTS5 reopen/catch-up support, bounded clean-page reclamation that prevents false `OutOfMemory` failures during large FTS rebuilds, fused equality-run counting for exact bounded parity checks, and the latest corruption/recovery correctness fixes [cass#345 / frankensqlite#131]) |
+| `frankensqlite` / `fsqlite-types` | `f9cc3294` (`0.1.19`; exact Git source containing the existing-only schema-open contract that the same-version registry archive lacks, plus a `[patch.crates-io]` source override so connector dependencies cannot reintroduce a second registry-backed family; also includes contentless-FTS5 reopen/catch-up, bounded clean-page reclamation, and fused equality-run counting [cass#345 / frankensqlite#131]) |
 | `franken-agent-detection` | `6d24c532` (Grok Build connector [cass #328], plus Gemini CLI JSONL discovery, ordered `$set.messages` replay, and current role normalization [cass #341]) |
 | `asupersync` | `=0.3.9` |
-| `frankensearch` | `f7fa7a02` (pure-Rust `native` feature plus architecture-safe HNSW `DistDot` normalization; frankentorch pinned by git rev inside frankensearch — cass #308, #333) |
+| `frankensearch` | `bfa9fc05` (pure-Rust `native` feature, architecture-safe HNSW `DistDot` normalization, and the explicit `cass-compat` → `lexical-tantivy` foreign-index surface; frankentorch remains pinned by git rev inside frankensearch — cass #308, #333, bd-8nqz.5) |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 
@@ -3048,7 +3048,7 @@ Update check state is stored in the data directory:
 **Expected interface contract**
 - `frankensqlite` (`fsqlite`): `Connection`, `params!`, and `compat::{ConnectionExt, RowExt}` with `row.get_typed(...)`.
 - `franken-agent-detection`: `AgentDetectOptions` and `detect_installed_agents(...)`.
-- `frankensearch`: `lexical::cass_open_search_reader`, `lexical::ReloadPolicy`, `ModelCategory`, and `ModelTier`.
+- `frankensearch`: the explicit `lexical_tantivy::{cass_open_search_reader, ReloadPolicy}` CASS compatibility surface, plus `ModelCategory` and `ModelTier`.
 - `frankentui`: `ftui::Frame`, `GraphemePool`, `Style`, `ftui-runtime`, `ftui-tty`, and the `ftui-extras` features enabled by cass.
 - `asupersync`: `runtime::RuntimeBuilder` and `http::h1::HttpClient::builder()`.
 - `toon` (`tru`): `toon::encode(...)`.

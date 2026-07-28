@@ -47,17 +47,12 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // crates.io-only exact pin: fsqlite 0.1.19 carries the existing-only,
-        // schema-only open lane used to keep CASS archive and doctor opens
-        // bounded, in addition to the contentless-FTS5 reopen/catch-up fixes,
-        // bounded clean-page reclamation (#131), and fused composite-index
-        // equality-run counter used by CASS parity checks. Together these
-        // prevent accidental archive creation, false OutOfMemory failures, and
-        // multi-hour row crossings during multi-million-row FTS rebuilds.
-        // Empty `expected_git` signals
-        // `validate_manifest_dependency_spec` to skip git/rev checks.
-        expected_git: "",
-        expected_rev: "",
+        // The published 0.1.19 archive predates the existing-only schema-open
+        // API that CASS calls. Pin the immutable source that actually contains
+        // that API and its no-create/bounded-open tests; a version-only pin is
+        // ambiguous because both sources declare 0.1.19.
+        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
+        expected_rev: "f9cc32945eb96d9304b760fd5cdead8daf1eb40a",
         expected_version: "0.1.19",
         expected_features: &["fts5"],
         expected_default_features: None,
@@ -68,14 +63,32 @@ const CONTRACTS: &[DependencyContract] = &[
         mode: ValidationMode::StrictOptIn,
     },
     DependencyContract {
-        label: "frankensqlite shared types",
+        label: "frankensqlite shared types (production)",
+        dep_table: "dependencies",
+        dep_key: "fsqlite-types",
+        crate_package_name: "fsqlite-types",
+        manifest_package_field: Some("fsqlite-types"),
+        // Keep shared types on the identical immutable source as the facade.
+        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
+        expected_rev: "f9cc32945eb96d9304b760fd5cdead8daf1eb40a",
+        expected_version: "0.1.19",
+        expected_features: &[],
+        expected_default_features: None,
+        repo_rel: "../frankensqlite",
+        manifest_rel: "crates/fsqlite-types/Cargo.toml",
+        patch_url: Some("https://github.com/Dicklesworthstone/frankensqlite"),
+        patch_key: Some("fsqlite-types"),
+        mode: ValidationMode::StrictOptIn,
+    },
+    DependencyContract {
+        label: "frankensqlite shared types (test)",
         dep_table: "dev-dependencies",
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // crates.io-only exact pin aligned with the frankensqlite facade at 0.1.19.
-        expected_git: "",
-        expected_rev: "",
+        // Keep shared types on the identical immutable source as the facade.
+        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
+        expected_rev: "f9cc32945eb96d9304b760fd5cdead8daf1eb40a",
         expected_version: "0.1.19",
         expected_features: &[],
         expected_default_features: None,
@@ -138,10 +151,11 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankensearch",
         // Pins the frankensearch rev carrying the pure-Rust `native` feature
-        // (frankentorch NativeEmbedder + NativeReranker), with frankentorch
-        // referenced by git rev inside frankensearch so the feature is
-        // git-consumable from cass (cass #308).
-        expected_rev: "f7fa7a020cf084ed1cc5e53926521e3a0d8743cc",
+        // and the explicit `cass-compat` -> `lexical-tantivy` foreign-index
+        // surface. The latter keeps CASS schema-v8 access independent from
+        // FrankenSearch's swappable generic lexical backend (cass #308,
+        // bd-8nqz.5).
+        expected_rev: "bfa9fc0583ef2e2ac55bab847347e2f70a37134f",
         expected_version: "0.3.2",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
@@ -149,7 +163,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // separate `-baseline` build is needed). Bead tg5o9 retired the vacuous
         // cass `semantic` feature; semantic readiness is now determined solely
         // by runtime model/vector assets.
-        expected_features: &["ann", "hash", "lexical", "native"],
+        expected_features: &["ann", "cass-compat", "hash", "native"],
         expected_default_features: Some(false),
         repo_rel: "../frankensearch",
         manifest_rel: "frankensearch/Cargo.toml",
@@ -292,6 +306,7 @@ fn validate_path_dependency_contracts(
     packaged_manifest: bool,
 ) {
     let strict_enabled = strict_path_dep_validation_enabled();
+    validate_fsqlite_registry_source_override(manifest, packaged_manifest);
 
     for contract in CONTRACTS {
         validate_manifest_dependency_spec(manifest, contract, packaged_manifest);
@@ -302,6 +317,42 @@ fn validate_path_dependency_contracts(
 
         if contract.mode == ValidationMode::ActivePathOverride || strict_enabled {
             validate_local_contract(manifest_dir, contract, strict_enabled);
+        }
+    }
+}
+
+fn validate_fsqlite_registry_source_override(manifest: &Value, packaged_manifest: bool) {
+    // Cargo omits root patch directives from its normalized publish manifest.
+    // The source-tree contract remains enforced during every ordinary build.
+    if packaged_manifest {
+        return;
+    }
+
+    const EXPECTED_GIT: &str = "https://github.com/Dicklesworthstone/frankensqlite";
+    const EXPECTED_REV: &str = "f9cc32945eb96d9304b760fd5cdead8daf1eb40a";
+
+    let patch_tables = table(manifest, "patch", "manifest root");
+    let crates_io = table_value(Some(patch_tables), "crates-io", "[patch]")
+        .as_table()
+        .unwrap_or_else(|| {
+            fatal("dependency source contract violation: [patch.crates-io] must be a table")
+        });
+    for dependency in ["fsqlite", "fsqlite-types"] {
+        let spec = inline_table(crates_io, dependency, "[patch.crates-io]");
+        let git = string_value(spec, "git", dependency);
+        let revision = string_value(spec, "rev", dependency);
+        if git != EXPECTED_GIT || revision != EXPECTED_REV {
+            fatal(format!(
+                "dependency source contract violation for {dependency}: \
+                 [patch.crates-io].{dependency} must pin git = {EXPECTED_GIT:?}, \
+                 rev = {EXPECTED_REV:?}; found git = {git:?}, rev = {revision:?}"
+            ));
+        }
+        if spec.contains_key("path") || spec.contains_key("branch") || spec.contains_key("tag") {
+            fatal(format!(
+                "dependency source contract violation for {dependency}: \
+                 the committed crates.io override must use only immutable git + rev identity"
+            ));
         }
     }
 }

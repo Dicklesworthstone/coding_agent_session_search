@@ -282,7 +282,7 @@ use frankensearch::{VectorIndex, index};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;

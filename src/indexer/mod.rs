@@ -4101,7 +4101,7 @@ impl LexicalRebuildConversationPacket {
         }
     }
 
-    fn prebuilt_docs(&self) -> Vec<frankensearch::lexical::CassDocumentRef<'_>> {
+    fn prebuilt_docs(&self) -> Vec<frankensearch::lexical_tantivy::CassDocumentRef<'_>> {
         let Some(conversation_id) = self.identity.conversation_id else {
             return Vec::new();
         };
@@ -4117,7 +4117,7 @@ impl LexicalRebuildConversationPacket {
             ) {
                 continue;
             }
-            docs.push(frankensearch::lexical::CassDocumentRef {
+            docs.push(frankensearch::lexical_tantivy::CassDocumentRef {
                 agent: self.identity.agent.as_str(),
                 workspace: self.identity.workspace.as_deref(),
                 workspace_original: None,
@@ -4646,7 +4646,7 @@ fn flush_streamed_lexical_rebuild_batch(
 fn lexical_rebuild_prepare_prebuilt_doc_refs<'a>(
     batch: &'a [LexicalRebuildConversationPacket],
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
-) -> Vec<frankensearch::lexical::CassDocumentRef<'a>> {
+) -> Vec<frankensearch::lexical_tantivy::CassDocumentRef<'a>> {
     let build_doc_shards = || {
         batch
             .par_iter()
@@ -33857,7 +33857,7 @@ mod tests {
         assert_eq!(
             crate::search::tantivy::open_federated_search_readers(
                 &merged_path,
-                frankensearch::lexical::ReloadPolicy::Manual,
+                frankensearch::lexical_tantivy::ReloadPolicy::Manual,
             )
             .unwrap()
             .expect("federated readers")
@@ -44180,7 +44180,7 @@ mod tests {
         assert_eq!(
             crate::search::tantivy::open_federated_search_readers(
                 &index_path,
-                frankensearch::lexical::ReloadPolicy::Manual,
+                frankensearch::lexical_tantivy::ReloadPolicy::Manual,
             )
             .unwrap()
             .expect("published federated readers")
@@ -51914,26 +51914,26 @@ mod tests {
         );
         assert_eq!(persisted_tool_calls[0].2, tool_call.created_at);
 
-        let (reader, fields) = frankensearch::lexical::cass_open_search_reader(
+        let (reader, fields) = frankensearch::lexical_tantivy::cass_open_search_reader(
             &index_path,
-            frankensearch::lexical::ReloadPolicy::Manual,
+            frankensearch::lexical_tantivy::ReloadPolicy::Manual,
         )
         .unwrap();
-        let filters = frankensearch::lexical::CassQueryFilters {
+        let filters = frankensearch::lexical_tantivy::CassQueryFilters {
             agents: Default::default(),
             workspaces: Default::default(),
             created_from: None,
             created_to: None,
-            source_filter: frankensearch::lexical::CassSourceFilter::All,
+            source_filter: frankensearch::lexical_tantivy::CassSourceFilter::All,
         };
-        let query = frankensearch::lexical::cass_build_tantivy_query(
+        let query = frankensearch::lexical_tantivy::cass_build_tantivy_query(
             "cass339toolargsneedle",
             &filters,
             &fields,
         );
         let lexical_matches = reader
             .searcher()
-            .search(&*query, &frankensearch::lexical::Count)
+            .search(&*query, &frankensearch::lexical_tantivy::Count)
             .unwrap();
         assert_eq!(
             lexical_matches, 1,

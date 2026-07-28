@@ -14,7 +14,7 @@ use crate::model::conversation_packet::{
 use crate::search::canonicalize::is_hard_message_noise;
 use crate::sources::provenance::LOCAL_SOURCE_ID;
 use anyhow::{Context, Error, Result};
-use frankensearch::lexical::{
+use frankensearch::lexical_tantivy::{
     CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument as FsCassDocument,
     CassDocumentRef as FsCassDocumentRef, CassFields as FsCassFields,
     CassMergeStatus as FsCassMergeStatus, CassTantivyIndex as FsCassTantivyIndex, Index,
@@ -2052,14 +2052,15 @@ mod tests {
 
     #[test]
     fn generate_edge_ngrams_prefixes() {
-        let out = frankensearch::lexical::cass_generate_edge_ngrams("hello world");
+        let out = frankensearch::lexical_tantivy::cass_generate_edge_ngrams("hello world");
         assert!(out.contains("he"));
         assert!(out.contains("world"));
     }
 
     #[test]
     fn build_preview_truncates_with_ellipsis() {
-        let preview = frankensearch::lexical::cass_build_preview("abcdefghijklmnopqrstuvwxyz", 10);
+        let preview =
+            frankensearch::lexical_tantivy::cass_build_preview("abcdefghijklmnopqrstuvwxyz", 10);
         assert_eq!(preview, "abcdefghij…");
     }
 

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel as mpsc;
-use frankensearch::lexical::{
+use frankensearch::lexical_tantivy::{
     BooleanQuery, CASS_SCHEMA_HASH as FS_CASS_SCHEMA_HASH, CassFields as FsCassFields,
     CassQueryFilters as FsCassQueryFilters, CassQueryToken as FsCassQueryToken,
     CassSourceFilter as FsCassSourceFilter, CassWildcardPattern as FsCassWildcardPattern, Count,
