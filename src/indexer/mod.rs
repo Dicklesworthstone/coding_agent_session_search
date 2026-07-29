@@ -2169,12 +2169,24 @@ fn capture_lexical_rebuild_pipeline_runtime(
     }
 }
 
+/// #366: a producer park-site transition counts as forward progress only
+/// when at least one side is a working site. Flapping between the three
+/// waiting sites (`waiting_result`/`waiting_turn`/`waiting_budget`) is
+/// scheduler churn a livelocked pipeline can sustain forever; it must not
+/// keep resetting the stall clock. Real progress out of a waiting state
+/// (a result arriving, a handoff, a new listing pass) also moves a job or
+/// queue counter, which the caller checks independently.
+fn producer_state_transition_is_work(previous: &str, current: &str) -> bool {
+    previous != current && !(previous.starts_with("waiting_") && current.starts_with("waiting_"))
+}
+
 /// #366: true when the pipeline runtime snapshot moved on a field that only
 /// changes with forward progress — pages flowing, prep/build/merge jobs
 /// starting or finishing, the producer moving between park sites. Pure wait
-/// counters/durations, host metrics, controller mode/reason, and budget
-/// generation are deliberately excluded: they keep changing while the
-/// pipeline is genuinely wedged and must not defeat the stall watchdog.
+/// counters/durations, host metrics, controller mode/reason, budget
+/// generation, and waiting↔waiting park flaps are deliberately excluded:
+/// they keep changing while the pipeline is genuinely wedged and must not
+/// defeat the stall watchdog.
 fn lexical_rebuild_pipeline_work_advanced(
     previous: &LexicalRebuildPipelineRuntimeSnapshot,
     current: &LexicalRebuildPipelineRuntimeSnapshot,
@@ -2186,7 +2198,7 @@ fn lexical_rebuild_pipeline_work_advanced(
         || previous.active_page_prep_jobs != current.active_page_prep_jobs
         || previous.ordered_buffered_pages != current.ordered_buffered_pages
         || previous.reservation_next_sequence != current.reservation_next_sequence
-        || previous.producer_state != current.producer_state
+        || producer_state_transition_is_work(&previous.producer_state, &current.producer_state)
         || previous.staged_merge_active_jobs != current.staged_merge_active_jobs
         || previous.staged_merge_ready_artifacts != current.staged_merge_ready_artifacts
         || previous.staged_merge_ready_groups != current.staged_merge_ready_groups
@@ -9435,15 +9447,26 @@ fn repair_fallback_fts_after_full_index_run(
         }
     };
 
-    if let Some(archive_fingerprint) = known_archive_fingerprint
-        && fresh_storage
-            .fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)?
-    {
-        return Ok(Some(
-            FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
-                archive_fingerprint: archive_fingerprint.to_string(),
-            },
-        ));
+    if let Some(archive_fingerprint) = known_archive_fingerprint {
+        match fresh_storage
+            .fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)
+        {
+            Ok(true) => {
+                return Ok(Some(
+                    FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
+                        archive_fingerprint: archive_fingerprint.to_string(),
+                    },
+                ));
+            }
+            Ok(false) => {}
+            // #329: same policy as the repair itself — a failed probe of the
+            // optional derived asset must not fail the completed run.
+            Err(err) => {
+                return Ok(Some(FallbackFtsRepairOutcome::SkippedRepairFailed {
+                    detail: format!("probing fallback FTS archive-fingerprint health: {err:#}"),
+                }));
+            }
+        }
     }
 
     let repair = match fresh_storage.ensure_search_fallback_fts_consistency() {
@@ -30154,6 +30177,37 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    /// #366: waiting↔waiting park flaps are scheduler churn a livelocked
+    /// pipeline can sustain forever; they must not reset the stall clock.
+    /// Every transition through a working site is genuine progress.
+    #[test]
+    fn producer_state_waiting_flaps_are_not_work() {
+        assert!(!producer_state_transition_is_work(
+            "waiting_turn",
+            "waiting_budget"
+        ));
+        assert!(!producer_state_transition_is_work(
+            "waiting_budget",
+            "waiting_result"
+        ));
+        assert!(!producer_state_transition_is_work("idle", "idle"));
+        assert!(!producer_state_transition_is_work(
+            "waiting_turn",
+            "waiting_turn"
+        ));
+        assert!(producer_state_transition_is_work("idle", "listing_db"));
+        assert!(producer_state_transition_is_work(
+            "listing_db",
+            "waiting_budget"
+        ));
+        assert!(producer_state_transition_is_work(
+            "waiting_turn",
+            "handoff_send"
+        ));
+        assert!(producer_state_transition_is_work("handoff_send", "idle"));
+        assert!(producer_state_transition_is_work("waiting_result", "idle"));
+    }
 
     fn read_index_run_lock_metadata_for_test(lock_path: &Path) -> Result<String> {
         #[cfg(windows)]

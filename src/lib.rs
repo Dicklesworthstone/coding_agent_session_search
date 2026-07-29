@@ -76768,7 +76768,7 @@ pub(crate) fn run_doctor_impl(
                                                     "fts_table",
                                                     "warn",
                                                     format!(
-                                                        "Database-resident FTS shadow is queryable but out of parity with the canonical archive ({indexed_messages} indexed vs {indexable_messages} indexable messages); run `cass doctor --rebuild-canonical-fts --yes` to catch it up"
+                                                        "Database-resident FTS shadow is queryable but out of parity with the canonical archive ({indexed_messages} indexed vs {indexable_messages} indexable messages); run `cass doctor --rebuild-canonical-fts --yes` to catch it up. Small drift during an active index run is transient — re-check after it completes"
                                                     ),
                                                     false
                                                 );
@@ -90695,7 +90695,10 @@ fn run_index_with_data(
         output_structured_value(payload, fmt)?;
     }
 
-    if show_plain {
+    // gh359: `res.is_ok()` — the plain completion line used to print even
+    // after the error arm above had already reported a failed run, so a
+    // failing `cass index` ended its stderr with "index completed".
+    if show_plain && res.is_ok() {
         // gh359: "index completed" after a run that deferred the
         // authoritative lexical repair (and therefore made nothing new
         // searchable) was the worst possible signal for a large archive.
