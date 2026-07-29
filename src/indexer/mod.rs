@@ -21646,7 +21646,10 @@ fn ingest_non_watch_oom_retry_or_quarantine(
     let real_pressure = watch_oom_under_real_memory_pressure();
     let should_quarantine = match real_pressure {
         Some(true) => true,
-        Some(false) | None => !small_conversation,
+        // #364: ample reported memory proves the NoMem is a bounded-guard
+        // artifact regardless of conversation size — defer, never poison.
+        Some(false) => false,
+        None => !small_conversation,
     };
     if !should_quarantine {
         tracing::warn!(
@@ -21974,9 +21977,14 @@ fn ingest_watch_batch_with_oom_split_inner(
                     let should_quarantine = match real_pressure {
                         // Real host pressure: quarantine is justified.
                         Some(true) => true,
-                        // Ample memory reported: only quarantine large
-                        // conversations; small ones stay eligible.
-                        Some(false) => !small_conversation,
+                        // Ample memory reported: the NoMem is a frankensqlite
+                        // bounded-allocation artifact by definition (#364) —
+                        // conversation size makes a guard more likely to trip
+                        // but cannot turn it into host exhaustion. Defer so a
+                        // later scan retries; quarantining here turned a
+                        // healthy, replayable 36 MB source into a
+                        // same-version-irreducible coverage hole.
+                        Some(false) => false,
                         // Pressure unknowable (e.g. macOS): fall back to the
                         // size gate — never quarantine a small conversation
                         // on a typed NoMem we cannot attribute to real
@@ -39192,6 +39200,13 @@ mod tests {
         // small-conversation plausibility gate must be disabled — otherwise a
         // tiny fixture conversation is deferred instead of quarantined.
         let _small_gate_guard = set_env("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES", "0");
+        // #364: quarantine now additionally requires *real* host memory
+        // pressure; pin the probe to "always real pressure" so the poison
+        // path stays reachable deterministically on any host.
+        let _pressure_guard = set_env(
+            "CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES",
+            "18446744073709551615",
+        );
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -47879,6 +47894,13 @@ mod tests {
         // new solo-retry-before-quarantine behavior.
         let _solo_oom_guard = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
         let _small_gate_guard = set_env("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES", "0");
+        // #364: quarantine now additionally requires *real* host memory
+        // pressure; pin the probe to "always real pressure" so the poison
+        // path stays reachable deterministically on any host.
+        let _pressure_guard = set_env(
+            "CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES",
+            "18446744073709551615",
+        );
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
             full: false,
@@ -48006,6 +48028,94 @@ mod tests {
                 .join("quarantine/watch_ingest_poison.jsonl")
                 .exists(),
             "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
+        );
+    }
+
+    /// #364 gate: a *large* conversation whose solo isolate-retry also OOMs
+    /// must still be deferred — not quarantined — when the host reports ample
+    /// available memory. Ample memory proves the typed NoMem is a
+    /// frankensqlite bounded-allocation artifact; conversation size makes a
+    /// guard more likely to trip but cannot turn it into host exhaustion, and
+    /// a quarantine here is a same-version-irreducible coverage hole for a
+    /// healthy, replayable source (the reported case: a 36 MB Codex session
+    /// under ~89 GiB MemAvailable).
+    #[test]
+    #[serial]
+    fn watch_reindex_defers_large_conversation_with_ample_memory() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-oom-defer-large");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let now_u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let created_at = i64::try_from(now_u128)
+            .unwrap_or(i64::MAX)
+            .saturating_add(10_000);
+        let amp_file = amp_dir.join("thread-watch-oom-defer-large.json");
+        std::fs::write(
+            &amp_file,
+            format!(
+                r#"{{"id":"thread-watch-oom-defer-large","messages":[{{"role":"user","text":"defer the large one","createdAt":{created_at}}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _solo_oom_guard = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
+        // Classify the tiny fixture as "large" so the old size gate would
+        // have quarantined it...
+        let _small_gate_guard = set_env("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES", "1");
+        // ...while the pressure probe deterministically reports ample memory.
+        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![amp_file],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 1);
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "deferred watch sources must remain eligible for later retry"
+        );
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "a large conversation with ample host memory must be deferred, not \
+             quarantined as same-version-irreducible (#364)"
         );
     }
 
