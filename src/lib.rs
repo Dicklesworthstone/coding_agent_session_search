@@ -2014,7 +2014,8 @@ pub enum SourcesCommand {
         /// Friendly name for this source (becomes source_id)
         #[arg(long)]
         name: Option<String>,
-        /// Use preset paths for platform (macos-defaults, linux-defaults)
+        /// Use preset paths for platform (macos-defaults, linux-defaults);
+        /// merged with any explicit --path entries
         #[arg(long)]
         preset: Option<String>,
         /// Paths to sync (can be specified multiple times)
@@ -73893,16 +73894,52 @@ fn wait_with_progress<T>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DoctorFtsTableState {
     QueryableViaFrankensqlite,
-    Missing { frankensqlite_error: String },
+    PartialParity {
+        indexable_messages: i64,
+        indexed_messages: i64,
+    },
+    Missing {
+        frankensqlite_error: String,
+    },
 }
 
 fn probe_doctor_fts_table(conn: &frankensqlite::Connection) -> DoctorFtsTableState {
-    match conn.query("SELECT rowid FROM fts_messages LIMIT 1;") {
-        Ok(_) => DoctorFtsTableState::QueryableViaFrankensqlite,
-        Err(frankensqlite_error) => DoctorFtsTableState::Missing {
+    if let Err(frankensqlite_error) = conn.query("SELECT rowid FROM fts_messages LIMIT 1;") {
+        return DoctorFtsTableState::Missing {
             frankensqlite_error: frankensqlite_error.to_string(),
-        },
+        };
     }
+    // Queryable is necessary but not sufficient (#355): an interrupted
+    // canonical FTS rebuild leaves a queryable-but-partial shadow that
+    // `index --full` then fails against. Compare the cheap docsize row count
+    // to the canonical indexable count — the exact-intersection scan stays in
+    // the repair path. A docsize count failure is itself a corruption signal.
+    let indexed_messages = match conn.query_row_map(
+        "SELECT COUNT(*) FROM fts_messages_docsize",
+        &[] as &[frankensqlite::compat::ParamValue],
+        |row| row.get_typed::<i64>(0),
+    ) {
+        Ok(count) => count,
+        Err(frankensqlite_error) => {
+            return DoctorFtsTableState::Missing {
+                frankensqlite_error: frankensqlite_error.to_string(),
+            };
+        }
+    };
+    let Ok(indexable_messages) = conn.query_row_map(
+        crate::storage::sqlite::FTS_INDEXABLE_MESSAGE_COUNT_SQL,
+        &[] as &[frankensqlite::compat::ParamValue],
+        |row| row.get_typed::<i64>(0),
+    ) else {
+        return DoctorFtsTableState::QueryableViaFrankensqlite;
+    };
+    if indexed_messages != indexable_messages {
+        return DoctorFtsTableState::PartialParity {
+            indexable_messages,
+            indexed_messages,
+        };
+    }
+    DoctorFtsTableState::QueryableViaFrankensqlite
 }
 
 #[cfg(test)]
@@ -73982,6 +74019,68 @@ mod doctor_fts_tests {
         assert!(
             matches!(state, DoctorFtsTableState::Missing { .. }),
             "missing FTS table should be reported as missing: {state:?}"
+        );
+
+        Ok(())
+    }
+
+    /// #355: a queryable-but-partial FTS shadow (interrupted rebuild) must not
+    /// report as healthy. The messages table mirrors the production
+    /// `UNIQUE(conversation_id, idx)` so `sqlite_autoindex_messages_1` exists
+    /// for the indexable-count query.
+    #[test]
+    fn doctor_fts_probe_reports_partial_parity() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let db_path = temp_dir.path().join("partial-fts.db");
+
+        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER,
+                UNIQUE(conversation_id, idx)
+             );
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                message_id UNINDEXED,
+                tokenize='porter'
+             );
+             INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+             VALUES(1, 1, 1, 'local', NULL, 'retro', '/tmp/retro.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(7, 1, 0, 'retro investigation', 42);
+             INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(8, 1, 1, 'second message never indexed', 43);
+             INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES(7, 'retro investigation', 'retro', 'codex', '/ws', '/tmp/retro.jsonl', 42, '7');",
+        )?;
+        let state = probe_doctor_fts_table(&conn);
+        assert!(
+            matches!(
+                state,
+                DoctorFtsTableState::PartialParity {
+                    indexable_messages: 2,
+                    indexed_messages: 1,
+                }
+            ),
+            "queryable-but-partial FTS shadow must be reported out of parity (#355): {state:?}"
         );
 
         Ok(())
@@ -76640,6 +76739,23 @@ pub(crate) fn run_doctor_impl(
                                                     "fts_table",
                                                     "pass",
                                                     "FTS search table (fts_messages) is queryable via frankensqlite",
+                                                    false
+                                                );
+                                            }
+                                            Some(DoctorFtsTableState::PartialParity {
+                                                indexable_messages,
+                                                indexed_messages,
+                                            }) => {
+                                                // #355: a queryable-but-partial shadow previously
+                                                // reported `pass` here while `index --full` failed
+                                                // on it. Lexical search still works via Tantivy,
+                                                // so this warns rather than fails.
+                                                add_check!(
+                                                    "fts_table",
+                                                    "warn",
+                                                    format!(
+                                                        "Database-resident FTS shadow is queryable but out of parity with the canonical archive ({indexed_messages} indexed vs {indexable_messages} indexable messages); run `cass doctor --rebuild-canonical-fts --yes` to catch it up"
+                                                    ),
                                                     false
                                                 );
                                             }
@@ -98313,15 +98429,23 @@ fn run_sources_add(
     // Parse URL to extract host
     let (host, source_id) = parse_source_url(url, name.as_deref())?;
 
-    // Determine paths: preset, explicit args, or error
+    // Determine paths: preset and explicit args merge (#358 — explicit
+    // --path entries must never be silently discarded when a preset is
+    // also given), explicit args alone, or error
     let paths = if let Some(ref preset_name) = preset {
-        get_preset_paths(preset_name).map_err(|e| CliError {
+        let mut merged = get_preset_paths(preset_name).map_err(|e| CliError {
             code: 10,
             kind: CliErrorKind::Config.kind_str(),
             message: format!("Invalid preset: {e}"),
             hint: Some("Valid presets: macos-defaults, linux-defaults".into()),
             retryable: false,
-        })?
+        })?;
+        for path in paths_arg {
+            if !merged.contains(&path) {
+                merged.push(path);
+            }
+        }
+        merged
     } else if !paths_arg.is_empty() {
         paths_arg
     } else {

@@ -723,6 +723,71 @@ fn sources_add_explicit_paths() {
     tracker.complete();
 }
 
+/// Test: sources add merges --preset paths with explicit --path entries (#358).
+#[test]
+fn sources_add_preset_merges_explicit_paths() {
+    let tracker = tracker_for("sources_add_preset_merges_explicit_paths");
+
+    let start = tracker.start("setup", Some("Create temp config directory"));
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    tracker.end("setup", Some("Create temp config directory"), start);
+
+    let start = tracker.start(
+        "run_sources_add",
+        Some("Run sources add with --preset plus --path"),
+    );
+    let mut command = tracker.cass_assert_command();
+    let output = command
+        .args([
+            "sources",
+            "add",
+            "user@studio.local",
+            "--name",
+            "studio",
+            "--preset",
+            "linux-defaults",
+            "--path",
+            "~/.local/share/opencode",
+            "--no-test",
+        ])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .output()
+        .expect("sources add command");
+    tracker.end(
+        "run_sources_add",
+        Some("Run sources add with --preset plus --path"),
+        start,
+    );
+
+    let start = tracker.start(
+        "verify_config",
+        Some("Verify preset and custom paths both present"),
+    );
+    assert!(
+        output.status.success(),
+        "sources add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config_content = read_sources_config(&config_dir);
+    assert!(
+        config_content.contains(".claude/projects"),
+        "Preset path missing from config: {config_content}"
+    );
+    assert!(
+        config_content.contains(".local/share/opencode"),
+        "Explicit --path entry silently dropped when combined with --preset (#358): {config_content}"
+    );
+    tracker.end(
+        "verify_config",
+        Some("Verify preset and custom paths both present"),
+        start,
+    );
+
+    tracker.complete();
+}
+
 /// Test: sources add fails without paths.
 #[test]
 fn sources_add_no_paths_error() {

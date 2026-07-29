@@ -1123,7 +1123,7 @@ const FTS_FRANKEN_REBUILD_GENERATION: i64 = 1;
 /// conversation rowid counts its complete equality-prefix run in the
 /// `(conversation_id, idx)` uniqueness index without opening the message table,
 /// crossing the Rust row handler per message, or admitting orphan parent IDs.
-const FTS_INDEXABLE_MESSAGE_COUNT_SQL: &str = "SELECT COUNT(*) \
+pub(crate) const FTS_INDEXABLE_MESSAGE_COUNT_SQL: &str = "SELECT COUNT(*) \
      FROM messages INDEXED BY sqlite_autoindex_messages_1 \
      WHERE conversation_id IN (SELECT rowid FROM conversations)";
 /// Exact intersection stream driven by the (potentially much smaller) derived
