@@ -5943,11 +5943,13 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "swarm",
     "timeline",
     "mirror",
+    "forget",
     "export",
     "export-html",
     "pages",
     "import",
     "daemon",
+    "upgrade",
     "completions",
     "man",
     "tui",
@@ -5966,6 +5968,73 @@ fn closest_top_level_command(arg: &str) -> Option<&'static str> {
         .filter(|(_, distance)| *distance <= 2)
         .min_by_key(|(_, distance)| *distance)
         .map(|(candidate, _)| candidate)
+}
+
+#[cfg(test)]
+mod canonical_top_level_command_tests {
+    use super::*;
+
+    /// GH #367: `cass forget --source-glob <pat> --robot` was rewritten to
+    /// `search forget ...` because the implicit-robot-query recovery consults
+    /// `CANONICAL_TOP_LEVEL_COMMANDS` and `forget` was never added when the
+    /// subcommand landed (#292). Any visible clap subcommand missing from the
+    /// list gets folded into a search query the moment a robot flag is
+    /// present — silently breaking exactly the machine-readable path agents
+    /// are told to use. Pin the list to the clap command tree.
+    #[test]
+    fn canonical_list_covers_every_clap_subcommand() {
+        // Building the full clap command tree needs more than the default
+        // 2 MiB test stack (same reason tests/cli_robot.rs runs clap work on
+        // a dedicated large-stack thread).
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::command();
+                for sub in cli.get_subcommands() {
+                    if sub.is_hide_set() {
+                        continue;
+                    }
+                    let name = sub.get_name().to_string();
+                    assert!(
+                        CANONICAL_TOP_LEVEL_COMMANDS.contains(&name.as_str()),
+                        "clap subcommand `{name}` is missing from CANONICAL_TOP_LEVEL_COMMANDS; \
+                         robot mode will rewrite `cass {name} ... --robot` into `search {name} ...` (GH #367)"
+                    );
+                }
+            })
+            .expect("spawn large-stack clap test thread");
+        match handle.join() {
+            Ok(()) => {}
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// Behavioral pin for the #367 repro: the robot flag must not turn a
+    /// recognized subcommand into a search query.
+    #[test]
+    fn forget_with_robot_flag_is_not_rewritten_to_search() {
+        let (normalized, _note) = normalize_args(
+            [
+                "cass",
+                "forget",
+                "--source-glob",
+                "**/subagents/*.jsonl",
+                "--robot",
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        );
+        assert_eq!(
+            normalized.get(1).map(String::as_str),
+            Some("forget"),
+            "forget must survive robot-mode normalization untouched: {normalized:?}"
+        );
+        assert!(
+            !normalized.iter().any(|arg| arg == "search"),
+            "forget must not be folded into an implicit search query (GH #367): {normalized:?}"
+        );
+    }
 }
 
 /// Heuristic recovery for command-line errors to help agents.
