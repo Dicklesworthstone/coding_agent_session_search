@@ -214,6 +214,123 @@ fn frankensqlite_existing_schema_only_open_never_creates_and_reopens_exact_data(
     );
 }
 
+/// Exercise the existing-only contract beyond a toy single-page fixture. The
+/// durable database/WAL bundle spans thousands of pages so an implementation
+/// that accidentally recreates, truncates, or only partially reopens the
+/// archive cannot satisfy the count, sentinel, and artifact checks.
+#[test]
+fn frankensqlite_existing_schema_only_reopens_large_archive_without_truncation() {
+    const ROW_COUNT: i64 = 2_048;
+    const PAYLOAD_BYTES: usize = 4_096;
+    const MINIMUM_DATABASE_BYTES: u64 = 8 * 1024 * 1024;
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let database_path = dir.path().join("large-existing.db");
+    {
+        let path = database_path.to_string_lossy();
+        let conn = FrankenConnection::open(path.as_ref()).expect("create large fixture database");
+        conn.execute(
+            "CREATE TABLE archive_rows(
+                id INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL
+            )",
+        )
+        .expect("create archive_rows");
+        conn.execute("BEGIN")
+            .expect("begin large fixture transaction");
+        for id in 0..ROW_COUNT {
+            let payload = format!("{id:08}:{}", "x".repeat(PAYLOAD_BYTES.saturating_sub(9)));
+            conn.execute_with_params(
+                "INSERT INTO archive_rows(id, payload) VALUES (?1, ?2)",
+                &[SqliteValue::Integer(id), SqliteValue::Text(payload.into())],
+            )
+            .expect("insert large fixture row");
+        }
+        conn.execute("COMMIT")
+            .expect("commit large fixture transaction");
+    }
+
+    let suffixed_path = |suffix: &str| {
+        let mut path = database_path.as_os_str().to_owned();
+        path.push(suffix);
+        std::path::PathBuf::from(path)
+    };
+    let durable_artifact_paths = [
+        database_path.clone(),
+        suffixed_path("-journal"),
+        suffixed_path("-wal"),
+        suffixed_path("-wal-fec"),
+    ];
+    let snapshot_durable_artifacts = || -> std::io::Result<Vec<Option<Vec<u8>>>> {
+        durable_artifact_paths
+            .iter()
+            .map(|artifact_path| match std::fs::read(artifact_path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "snapshot durable artifact {}: {error}",
+                        artifact_path.display()
+                    ),
+                )),
+            })
+            .collect()
+    };
+    let durable_before =
+        snapshot_durable_artifacts().expect("snapshot durable artifacts before reopen");
+    let size_before = durable_before
+        .iter()
+        .filter_map(|artifact| artifact.as_ref())
+        .map(Vec::len)
+        .sum::<usize>();
+    assert!(
+        size_before
+            >= usize::try_from(MINIMUM_DATABASE_BYTES).expect("minimum database size fits usize"),
+        "large reopen fixture's durable database/WAL bundle must span at least \
+         {MINIMUM_DATABASE_BYTES} bytes, got {size_before}"
+    );
+
+    {
+        let path = database_path.to_string_lossy();
+        let reopened = FrankenConnection::open_existing_schema_only(path.as_ref())
+            .expect("reopen large database without schema initialization");
+        let count = reopened
+            .query("SELECT COUNT(*) FROM archive_rows")
+            .expect("count reopened large archive rows");
+        assert_eq!(
+            count.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Integer(ROW_COUNT)),
+            "existing-only reopen lost archive rows"
+        );
+
+        for id in [0, ROW_COUNT / 2, ROW_COUNT - 1] {
+            let rows = reopened
+                .query_with_params(
+                    "SELECT payload FROM archive_rows WHERE id = ?1",
+                    &[SqliteValue::Integer(id)],
+                )
+                .expect("query reopened large archive sentinel");
+            assert_eq!(rows.len(), 1, "missing sentinel row {id}");
+            let expected = SqliteValue::Text(
+                format!("{id:08}:{}", "x".repeat(PAYLOAD_BYTES.saturating_sub(9))).into(),
+            );
+            assert_eq!(
+                rows.first().and_then(|row| row.get(0)),
+                Some(&expected),
+                "sentinel payload changed for row {id}"
+            );
+        }
+    }
+
+    assert_eq!(
+        snapshot_durable_artifacts().expect("snapshot durable artifacts after reopen"),
+        durable_before,
+        "existing-only large-archive reopen must not replace, truncate, or rewrite \
+         the database's durable main/journal/WAL artifact bundle"
+    );
+}
+
 // ============================================================================
 // GATE 1: FTS5 Compatibility
 // ============================================================================

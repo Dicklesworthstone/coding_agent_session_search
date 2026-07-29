@@ -4900,7 +4900,7 @@ mod tests {
                 schema_version: VECTOR_STORAGE_IDENTITY_SCHEMA_V1,
                 format: storage_format.to_owned(),
                 quantization: QuantizationFormat::F16,
-                endianness: "little".to_owned(),
+                endianness: "little-endian".to_owned(),
                 vector_normalization: "l2-f32-v1".to_owned(),
                 dimension,
             },
@@ -8888,7 +8888,46 @@ mod tests {
 
     #[test]
     fn accepted_structured_events_include_context_and_redact_paths_and_full_hashes() {
+        use std::process::{Command, Stdio};
         use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tracing_subscriber::prelude::*;
+        use wait_timeout::ChildExt;
+
+        const TRACE_CAPTURE_CHILD_ENV: &str = "CASS_SEMANTIC_MANIFEST_TRACE_CAPTURE_ISOLATED_V1";
+        const TRACE_CAPTURE_TEST_NAME: &str = "search::semantic_manifest::tests::\
+            accepted_structured_events_include_context_and_redact_paths_and_full_hashes";
+        const TRACE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
+
+        if std::env::var_os(TRACE_CAPTURE_CHILD_ENV).is_none() {
+            let mut child =
+                Command::new(std::env::current_exe().expect("current library test binary")) // ubs:ignore — fixed current test binary.
+                    .arg("--exact")
+                    .arg(TRACE_CAPTURE_TEST_NAME)
+                    .arg("--nocapture")
+                    .env(TRACE_CAPTURE_CHILD_ENV, "1")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("spawn isolated semantic-manifest tracing test");
+            let status = child
+                .wait_timeout(TRACE_CAPTURE_TIMEOUT)
+                .expect("wait for isolated semantic-manifest tracing test");
+            if status.is_none() {
+                child
+                    .kill()
+                    .expect("kill timed-out semantic-manifest tracing test");
+                let _ = child.wait();
+            }
+            let status =
+                status.expect("isolated semantic-manifest tracing test exceeded 30-second timeout");
+            assert!(
+                status.success(),
+                "isolated semantic-manifest tracing test failed with {status}"
+            );
+            return;
+        }
 
         #[derive(Clone)]
         struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -8932,12 +8971,16 @@ mod tests {
             &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
         );
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
+        let filter = tracing_subscriber::filter::dynamic_filter_fn(|_, _| true)
+            .with_max_level_hint(tracing_subscriber::filter::LevelFilter::TRACE);
+        let layer = tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .without_time()
             .with_writer(SharedWriter(Arc::clone(&buffer)))
-            .finish();
+            .with_filter(filter);
+        let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             manifest.write_immutable(temp.path()).unwrap();
             let pointer =
                 SemanticCurrentPointerV1::for_manifest(&manifest, manifest.sealed_at_ms + 1, 1)
@@ -8973,7 +9016,7 @@ mod tests {
         ] {
             assert!(
                 logs.contains(field),
-                "missing structured field/event {field}"
+                "missing structured field/event {field}; captured logs:\n{logs}"
             );
         }
         assert!(logs.contains("fast/primary.fsvi"));
