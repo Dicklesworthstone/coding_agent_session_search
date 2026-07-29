@@ -404,6 +404,9 @@
         "progressive_ready": {
           "type": "boolean"
         },
+        "progressive_reason_code": {
+          "type": "null"
+        },
         "feature_compiled_in": {
           "type": "boolean"
         },
@@ -445,6 +448,9 @@
             },
             "size_bytes": {
               "type": "null"
+            },
+            "shard_count": {
+              "type": "null"
             }
           }
         },
@@ -476,6 +482,9 @@
               "type": "null"
             },
             "size_bytes": {
+              "type": "null"
+            },
+            "shard_count": {
               "type": "null"
             }
           }

@@ -4465,6 +4465,17 @@
                             }
                           }
                         },
+                        "progressive_reason_code": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "feature_compiled_in": {
                           "type": "object",
                           "properties": {
@@ -4601,6 +4612,17 @@
                                       }
                                     }
                                   }
+                                },
+                                "shard_count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
                                 }
                               }
                             }
@@ -4698,6 +4720,17 @@
                                   }
                                 },
                                 "size_bytes": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "shard_count": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
@@ -47447,6 +47480,17 @@
                             }
                           }
                         },
+                        "progressive_reason_code": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "feature_compiled_in": {
                           "type": "object",
                           "properties": {
@@ -47583,6 +47627,17 @@
                                       }
                                     }
                                   }
+                                },
+                                "shard_count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
                                 }
                               }
                             }
@@ -47680,6 +47735,17 @@
                                   }
                                 },
                                 "size_bytes": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "shard_count": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
@@ -54259,6 +54325,17 @@
                                     }
                                   }
                                 },
+                                "progressive_reason_code": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "feature_compiled_in": {
                                   "type": "object",
                                   "properties": {
@@ -54395,6 +54472,17 @@
                                               }
                                             }
                                           }
+                                        },
+                                        "shard_count": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
                                         }
                                       }
                                     }
@@ -54492,6 +54580,17 @@
                                           }
                                         },
                                         "size_bytes": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "shard_count": {
                                           "type": "object",
                                           "properties": {
                                             "type": {
@@ -56528,6 +56627,70 @@
                     }
                   }
                 },
+                "budget": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "properties": {
+                      "type": "object",
+                      "properties": {
+                        "elapsed_ms": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "budget_ms": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "timed_out": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "skipped_sections": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "recommended_next_probe": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
                 "query": {
                   "type": "object",
                   "properties": {
@@ -57504,6 +57667,70 @@
                   "properties": {
                     "type": {
                       "type": "string"
+                    }
+                  }
+                },
+                "budget": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "properties": {
+                      "type": "object",
+                      "properties": {
+                        "elapsed_ms": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "budget_ms": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "timed_out": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "skipped_sections": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "recommended_next_probe": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        }
+                      }
                     }
                   }
                 },
@@ -59631,6 +59858,17 @@
                                             }
                                           }
                                         },
+                                        "progressive_reason_code": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
                                         "feature_compiled_in": {
                                           "type": "object",
                                           "properties": {
@@ -59767,6 +60005,17 @@
                                                       }
                                                     }
                                                   }
+                                                },
+                                                "shard_count": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "array",
+                                                      "items": {
+                                                        "type": "string"
+                                                      }
+                                                    }
+                                                  }
                                                 }
                                               }
                                             }
@@ -59864,6 +60113,17 @@
                                                   }
                                                 },
                                                 "size_bytes": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "type": {
+                                                      "type": "array",
+                                                      "items": {
+                                                        "type": "string"
+                                                      }
+                                                    }
+                                                  }
+                                                },
+                                                "shard_count": {
                                                   "type": "object",
                                                   "properties": {
                                                     "type": {
@@ -62179,6 +62439,17 @@
                             }
                           }
                         },
+                        "progressive_reason_code": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "feature_compiled_in": {
                           "type": "object",
                           "properties": {
@@ -62315,6 +62586,17 @@
                                       }
                                     }
                                   }
+                                },
+                                "shard_count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
                                 }
                               }
                             }
@@ -62412,6 +62694,17 @@
                                   }
                                 },
                                 "size_bytes": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "shard_count": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
@@ -66067,6 +66360,17 @@
                             }
                           }
                         },
+                        "progressive_reason_code": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "feature_compiled_in": {
                           "type": "object",
                           "properties": {
@@ -66203,6 +66507,17 @@
                                       }
                                     }
                                   }
+                                },
+                                "shard_count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
                                 }
                               }
                             }
@@ -66300,6 +66615,17 @@
                                   }
                                 },
                                 "size_bytes": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "shard_count": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
@@ -70294,6 +70620,17 @@
                                     }
                                   }
                                 },
+                                "progressive_reason_code": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "feature_compiled_in": {
                                   "type": "object",
                                   "properties": {
@@ -70430,6 +70767,17 @@
                                               }
                                             }
                                           }
+                                        },
+                                        "shard_count": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
                                         }
                                       }
                                     }
@@ -70527,6 +70875,17 @@
                                           }
                                         },
                                         "size_bytes": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "shard_count": {
                                           "type": "object",
                                           "properties": {
                                             "type": {
@@ -71149,6 +71508,70 @@
                   "properties": {
                     "type": {
                       "type": "string"
+                    }
+                  }
+                },
+                "budget": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "properties": {
+                      "type": "object",
+                      "properties": {
+                        "elapsed_ms": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "budget_ms": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "timed_out": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "skipped_sections": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "recommended_next_probe": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        }
+                      }
                     }
                   }
                 },

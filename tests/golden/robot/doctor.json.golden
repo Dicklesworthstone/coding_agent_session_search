@@ -737,6 +737,7 @@
     "hnsw_path": null,
     "hnsw_ready": false,
     "progressive_ready": false,
+    "progressive_reason_code": null,
     "feature_compiled_in": true,
     "quality_tier_published": false,
     "semantic_only_search_available": false,
@@ -750,7 +751,8 @@
       "embedder_id": null,
       "model_revision": null,
       "completed_at": null,
-      "size_bytes": null
+      "size_bytes": null,
+      "shard_count": null
     },
     "quality_tier": {
       "present": false,
@@ -761,7 +763,8 @@
       "embedder_id": null,
       "model_revision": null,
       "completed_at": null,
-      "size_bytes": null
+      "size_bytes": null,
+      "shard_count": null
     },
     "backlog": {
       "total_conversations": 0,
@@ -952,7 +955,7 @@
     "schema_version": 1,
     "state": "not-running",
     "observation": {
-      "socket_path": "[REPO]/.rch-tmp/semantic-daemon-ubuntu.sock",
+      "socket_path": "[DAEMON_SOCKET]",
       "data_dir": "[TEST_HOME]/coding-agent-search",
       "run_lock_present": false,
       "socket_present": false,

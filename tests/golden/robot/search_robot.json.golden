@@ -23,5 +23,12 @@
   "max_tokens": null,
   "request_id": null,
   "cursor": null,
-  "hits_clamped": false
+  "hits_clamped": false,
+  "budget": {
+    "elapsed_ms": "[ELAPSED_MS]",
+    "budget_ms": 8000,
+    "timed_out": false,
+    "skipped_sections": [],
+    "recommended_next_probe": null
+  }
 }

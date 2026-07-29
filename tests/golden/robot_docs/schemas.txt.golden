@@ -655,6 +655,7 @@ schemas: (auto-generated from contract)
         - model_revision: ?
         - present: boolean
         - ready: boolean
+        - shard_count: ?
         - size_bytes: ?
       - feature_compiled_in: boolean
       - hint: ?
@@ -663,6 +664,7 @@ schemas: (auto-generated from contract)
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
+      - progressive_reason_code: ?
       - quality_tier: object
         - completed_at: ?
         - conversation_count: ?
@@ -672,6 +674,7 @@ schemas: (auto-generated from contract)
         - model_revision: ?
         - present: boolean
         - ready: boolean
+        - shard_count: ?
         - size_bytes: ?
       - quality_tier_published: boolean
       - semantic_only_search_available: boolean
@@ -2497,6 +2500,7 @@ schemas: (auto-generated from contract)
         - model_revision: ?
         - present: boolean
         - ready: boolean
+        - shard_count: ?
         - size_bytes: ?
       - feature_compiled_in: boolean
       - hint: ?
@@ -2505,6 +2509,7 @@ schemas: (auto-generated from contract)
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
+      - progressive_reason_code: ?
       - quality_tier: object
         - completed_at: ?
         - conversation_count: ?
@@ -2514,6 +2519,7 @@ schemas: (auto-generated from contract)
         - model_revision: ?
         - present: boolean
         - ready: boolean
+        - shard_count: ?
         - size_bytes: ?
       - quality_tier_published: boolean
       - semantic_only_search_available: boolean
@@ -2977,6 +2983,7 @@ schemas: (auto-generated from contract)
         - model_dir: ?
         - preferred_backend: string
         - progressive_ready: boolean
+        - progressive_reason_code: ?
         - quality_tier: object
         - quality_tier_published: boolean
         - semantic_only_search_available: boolean
@@ -3053,6 +3060,12 @@ schemas: (auto-generated from contract)
       - partial: boolean
       - request_id: ?
       - warnings: array
+    - budget: object
+      - budget_ms: integer
+      - elapsed_ms: integer
+      - recommended_next_probe: ?
+      - skipped_sections: array
+      - timed_out: boolean
     - evidence: array
     - freshness: object
       - newest_evidence_at_ms: ?
@@ -3212,6 +3225,12 @@ schemas: (auto-generated from contract)
     - _timeout: ?
     - _warning: ?
     - aggregations: ?
+    - budget: object
+      - budget_ms: integer
+      - elapsed_ms: integer
+      - recommended_next_probe: ?
+      - skipped_sections: array
+      - timed_out: boolean
     - count: integer
     - cursor: ?
     - explanation: ?
@@ -3486,6 +3505,7 @@ schemas: (auto-generated from contract)
         - model_revision: ?
         - present: boolean
         - ready: boolean
+        - shard_count: ?
         - size_bytes: ?
       - feature_compiled_in: boolean
       - hint: ?
@@ -3494,6 +3514,7 @@ schemas: (auto-generated from contract)
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
+      - progressive_reason_code: ?
       - quality_tier: object
         - completed_at: ?
         - conversation_count: ?
@@ -3503,6 +3524,7 @@ schemas: (auto-generated from contract)
         - model_revision: ?
         - present: boolean
         - ready: boolean
+        - shard_count: ?
         - size_bytes: ?
       - quality_tier_published: boolean
       - semantic_only_search_available: boolean
@@ -3847,6 +3869,7 @@ schemas: (auto-generated from contract)
         - model_revision: ?
         - present: boolean
         - ready: boolean
+        - shard_count: ?
         - size_bytes: ?
       - feature_compiled_in: boolean
       - hint: ?
@@ -3855,6 +3878,7 @@ schemas: (auto-generated from contract)
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
+      - progressive_reason_code: ?
       - quality_tier: object
         - completed_at: ?
         - conversation_count: ?
@@ -3864,6 +3888,7 @@ schemas: (auto-generated from contract)
         - model_revision: ?
         - present: boolean
         - ready: boolean
+        - shard_count: ?
         - size_bytes: ?
       - quality_tier_published: boolean
       - semantic_only_search_available: boolean
@@ -4034,6 +4059,7 @@ schemas: (auto-generated from contract)
         - model_dir: ?
         - preferred_backend: string
         - progressive_ready: boolean
+        - progressive_reason_code: ?
         - quality_tier: object
         - quality_tier_published: boolean
         - semantic_only_search_available: boolean
@@ -4063,6 +4089,12 @@ schemas: (auto-generated from contract)
     - status: string
     - surface: string
   view:
+    - budget: object
+      - budget_ms: integer
+      - elapsed_ms: integer
+      - recommended_next_probe: ?
+      - skipped_sections: array
+      - timed_out: boolean
     - context: integer
     - end_line: integer
     - highlight_line: ?

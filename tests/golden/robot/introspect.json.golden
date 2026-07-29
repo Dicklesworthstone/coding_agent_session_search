@@ -5599,6 +5599,12 @@
             "progressive_ready": {
               "type": "boolean"
             },
+            "progressive_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "feature_compiled_in": {
               "type": "boolean"
             },
@@ -5664,6 +5670,12 @@
                     "integer",
                     "null"
                   ]
+                },
+                "shard_count": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 }
               }
             },
@@ -5713,6 +5725,12 @@
                   ]
                 },
                 "size_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "shard_count": {
                   "type": [
                     "integer",
                     "null"
@@ -25718,6 +25736,12 @@
             "progressive_ready": {
               "type": "boolean"
             },
+            "progressive_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "feature_compiled_in": {
               "type": "boolean"
             },
@@ -25783,6 +25807,12 @@
                     "integer",
                     "null"
                   ]
+                },
+                "shard_count": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 }
               }
             },
@@ -25832,6 +25862,12 @@
                   ]
                 },
                 "size_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "shard_count": {
                   "type": [
                     "integer",
                     "null"
@@ -29000,6 +29036,12 @@
                 "progressive_ready": {
                   "type": "boolean"
                 },
+                "progressive_reason_code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "feature_compiled_in": {
                   "type": "boolean"
                 },
@@ -29065,6 +29107,12 @@
                         "integer",
                         "null"
                       ]
+                    },
+                    "shard_count": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
                     }
                   }
                 },
@@ -29114,6 +29162,12 @@
                       ]
                     },
                     "size_bytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "shard_count": {
                       "type": [
                         "integer",
                         "null"
@@ -29983,6 +30037,32 @@
         "schema_version": {
           "type": "string"
         },
+        "budget": {
+          "type": "object",
+          "properties": {
+            "elapsed_ms": {
+              "type": "integer"
+            },
+            "budget_ms": {
+              "type": "integer"
+            },
+            "timed_out": {
+              "type": "boolean"
+            },
+            "skipped_sections": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "recommended_next_probe": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
         "query": {
           "type": "object",
           "properties": {
@@ -30377,6 +30457,32 @@
         },
         "hits_clamped": {
           "type": "boolean"
+        },
+        "budget": {
+          "type": "object",
+          "properties": {
+            "elapsed_ms": {
+              "type": "integer"
+            },
+            "budget_ms": {
+              "type": "integer"
+            },
+            "timed_out": {
+              "type": "boolean"
+            },
+            "skipped_sections": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "recommended_next_probe": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
         },
         "hits": {
           "type": "array",
@@ -31334,6 +31440,12 @@
                     "progressive_ready": {
                       "type": "boolean"
                     },
+                    "progressive_reason_code": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "feature_compiled_in": {
                       "type": "boolean"
                     },
@@ -31399,6 +31511,12 @@
                             "integer",
                             "null"
                           ]
+                        },
+                        "shard_count": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
                         }
                       }
                     },
@@ -31448,6 +31566,12 @@
                           ]
                         },
                         "size_bytes": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "shard_count": {
                           "type": [
                             "integer",
                             "null"
@@ -32521,6 +32645,12 @@
             "progressive_ready": {
               "type": "boolean"
             },
+            "progressive_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "feature_compiled_in": {
               "type": "boolean"
             },
@@ -32586,6 +32716,12 @@
                     "integer",
                     "null"
                   ]
+                },
+                "shard_count": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 }
               }
             },
@@ -32635,6 +32771,12 @@
                   ]
                 },
                 "size_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "shard_count": {
                   "type": [
                     "integer",
                     "null"
@@ -34336,6 +34478,12 @@
             "progressive_ready": {
               "type": "boolean"
             },
+            "progressive_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "feature_compiled_in": {
               "type": "boolean"
             },
@@ -34401,6 +34549,12 @@
                     "integer",
                     "null"
                   ]
+                },
+                "shard_count": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 }
               }
             },
@@ -34450,6 +34604,12 @@
                   ]
                 },
                 "size_bytes": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "shard_count": {
                   "type": [
                     "integer",
                     "null"
@@ -36312,6 +36472,12 @@
                 "progressive_ready": {
                   "type": "boolean"
                 },
+                "progressive_reason_code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "feature_compiled_in": {
                   "type": "boolean"
                 },
@@ -36377,6 +36543,12 @@
                         "integer",
                         "null"
                       ]
+                    },
+                    "shard_count": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
                     }
                   }
                 },
@@ -36426,6 +36598,12 @@
                       ]
                     },
                     "size_bytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "shard_count": {
                       "type": [
                         "integer",
                         "null"
@@ -36705,6 +36883,32 @@
         },
         "total_lines": {
           "type": "integer"
+        },
+        "budget": {
+          "type": "object",
+          "properties": {
+            "elapsed_ms": {
+              "type": "integer"
+            },
+            "budget_ms": {
+              "type": "integer"
+            },
+            "timed_out": {
+              "type": "boolean"
+            },
+            "skipped_sections": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "recommended_next_probe": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
         },
         "lines": {
           "type": "array",

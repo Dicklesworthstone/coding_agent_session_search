@@ -790,6 +790,16 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         .replace_all(&out, r#""slowest_operation": "[LIVE_OPERATION]""#)
         .to_string();
 
+    // 5b. The semantic daemon socket path derives from $TMPDIR and $USER
+    // ("$TMPDIR/semantic-daemon-$USER.sock"), so its value is pure host
+    // environment — a golden regenerated on a different machine (or through
+    // rch) would otherwise freeze that host's temp dir into the contract.
+    // Keep the field, scrub the value.
+    let socket_path_re = regex::Regex::new(r#""socket_path"\s*:\s*"[^"]*""#).unwrap();
+    out = socket_path_re
+        .replace_all(&out, r#""socket_path": "[DAEMON_SOCKET]""#)
+        .to_string();
+
     // 6. Live-sampled kernel metrics in health --json (load average per
     // core and PSI CPU pressure). These float values change between runs
     // based on whatever else is happening on the box. Scrub to placeholders
