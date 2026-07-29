@@ -89013,11 +89013,25 @@ impl IndexStallWatchdog {
         // threshold. Because the checkpoint blocks a single thread and cannot be
         // heartbeated, the bound is the only liveness guard: once it elapses the
         // finalize is aborted too.
+        // #366: the finalize grace also applies while a staged lexical
+        // rebuild is active but its pipeline has not produced the first page
+        // yet (`is_rebuilding` set, quiescent, current >= total). That
+        // ingest→staged-shard-build hand-off legitimately blocks in
+        // synchronous frankensqlite work — e.g. a multi-GB WAL replay inside
+        // the producer's read-only open — that cannot be heartbeated, exactly
+        // like the finalize checkpoint. Once the pipeline starts moving, the
+        // runtime refresh ticks `activity` on every stage-progress change and
+        // quiescence ends, so this grace only covers the otherwise
+        // unobservable pre-first-page window; a genuinely wedged rebuild
+        // still aborts at the (larger) finalize threshold.
         let effective_abort_threshold = if finalize_wedge
             && phase_code != 2
-            && index_progress
+            && (index_progress
                 .finalizing
                 .load(std::sync::atomic::Ordering::Relaxed)
+                || index_progress
+                    .is_rebuilding
+                    .load(std::sync::atomic::Ordering::Relaxed))
         {
             // Finalize aborts disabled (CASS_INDEX_FINALIZE_ABORT_SECS=0):
             // treat the finalize window as report-only.
@@ -89747,6 +89761,78 @@ mod stall_diagnostics_tests {
         let abort = wedge_watchdog.observe(&progress, 200).ok_or_else(|| {
             anyhow::anyhow!("non-finalizing wedge did not abort at the ordinary threshold")
         })?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// Regression for #366: `cass index --full --force-rebuild` on a large
+    /// corpus was aborted (exit 70) in the gap between ingest completion and
+    /// the first staged-shard-build progress event. That hand-off matches the
+    /// #297 finalize-wedge shape (phase 0, `current >= total`, quiescent
+    /// pipeline) but is legitimate work — e.g. the producer's read-only open
+    /// replaying a multi-GB WAL — so while `is_rebuilding` is set the
+    /// watchdog must (a) apply the larger finalize grace, (b) treat an
+    /// activity tick (pipeline runtime movement) as liveness, and (c) still
+    /// abort the same shape at the ordinary threshold once the rebuild flag
+    /// is clear.
+    #[test]
+    fn issue_366_watchdog_grants_rebuild_handoff_finalize_grace() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortPhaseTwo,
+        );
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        watchdog.finalize_abort_threshold = Some(Duration::from_secs(3600));
+        watchdog.last_phase = 0;
+        watchdog.last_current = 1207;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        // The exact #366 shape: preparing complete, pipeline quiescent, staged
+        // rebuild active but no shard-build progress yet.
+        let progress = Arc::new(IndexingProgress::default());
+        progress.phase.store(0, Ordering::Relaxed);
+        progress.total.store(1207, Ordering::Relaxed);
+        progress.current.store(1207, Ordering::Relaxed);
+        progress.is_rebuilding.store(true, Ordering::Relaxed);
+        assert!(progress.rebuild_pipeline_is_quiescent());
+
+        let detected = watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("hand-off stall did not report"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        assert!(
+            watchdog.observe(&progress, 200).is_none(),
+            "an active rebuild's hand-off window must get the finalize grace, \
+             not the ordinary abort threshold (#366)"
+        );
+
+        // Pipeline runtime movement ticks the activity channel and resets the
+        // stall clock entirely.
+        progress.tick_activity();
+        assert!(watchdog.observe(&progress, 300).is_none());
+
+        // Control: without the rebuild flag the identical quiescent shape is a
+        // genuine #297 wedge again — report, then abort, at the ordinary
+        // threshold.
+        progress.is_rebuilding.store(false, Ordering::Relaxed);
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+        let detected = watchdog
+            .observe(&progress, 400)
+            .ok_or_else(|| anyhow::anyhow!("non-rebuild wedge did not report"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        let abort = watchdog
+            .observe(&progress, 500)
+            .ok_or_else(|| anyhow::anyhow!("non-rebuild wedge did not abort"))?;
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
         Ok(())

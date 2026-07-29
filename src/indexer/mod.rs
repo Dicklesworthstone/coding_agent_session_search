@@ -2169,6 +2169,34 @@ fn capture_lexical_rebuild_pipeline_runtime(
     }
 }
 
+/// #366: true when the pipeline runtime snapshot moved on a field that only
+/// changes with forward progress — pages flowing, prep/build/merge jobs
+/// starting or finishing, the producer moving between park sites. Pure wait
+/// counters/durations, host metrics, controller mode/reason, and budget
+/// generation are deliberately excluded: they keep changing while the
+/// pipeline is genuinely wedged and must not defeat the stall watchdog.
+fn lexical_rebuild_pipeline_work_advanced(
+    previous: &LexicalRebuildPipelineRuntimeSnapshot,
+    current: &LexicalRebuildPipelineRuntimeSnapshot,
+) -> bool {
+    previous.queue_depth != current.queue_depth
+        || previous.inflight_message_bytes != current.inflight_message_bytes
+        || previous.pending_batch_conversations != current.pending_batch_conversations
+        || previous.pending_batch_message_bytes != current.pending_batch_message_bytes
+        || previous.active_page_prep_jobs != current.active_page_prep_jobs
+        || previous.ordered_buffered_pages != current.ordered_buffered_pages
+        || previous.reservation_next_sequence != current.reservation_next_sequence
+        || previous.producer_state != current.producer_state
+        || previous.staged_merge_active_jobs != current.staged_merge_active_jobs
+        || previous.staged_merge_ready_artifacts != current.staged_merge_ready_artifacts
+        || previous.staged_merge_ready_groups != current.staged_merge_ready_groups
+        || previous.staged_shard_build_active_jobs != current.staged_shard_build_active_jobs
+        || previous.staged_shard_build_pending_jobs != current.staged_shard_build_pending_jobs
+        || previous.staged_shard_build_completed_jobs != current.staged_shard_build_completed_jobs
+        || previous.staged_shard_build_last_shard_index
+            != current.staged_shard_build_last_shard_index
+}
+
 fn refresh_lexical_rebuild_pipeline_runtime(
     latest_runtime: &mut LexicalRebuildPipelineRuntimeSnapshot,
     progress: Option<&Arc<IndexingProgress>>,
@@ -2178,16 +2206,27 @@ fn refresh_lexical_rebuild_pipeline_runtime(
     budget_generation: usize,
     sink_runtime: LexicalRebuildPipelineSinkRuntimeSnapshot,
 ) {
-    *latest_runtime = capture_lexical_rebuild_pipeline_runtime(
-        flow_limiter,
-        producer_telemetry,
-        responsiveness_controller,
-        budget_generation,
-        sink_runtime,
+    let previous_runtime = std::mem::replace(
+        latest_runtime,
+        capture_lexical_rebuild_pipeline_runtime(
+            flow_limiter,
+            producer_telemetry,
+            responsiveness_controller,
+            budget_generation,
+            sink_runtime,
+        ),
     );
     let Some(progress) = progress else {
         return;
     };
+    // #366: pipeline stage progress (producer park-site transitions, page-prep
+    // and shard-build/merge job movement) is real forward progress, but none
+    // of it advances `phase`/`current`, so the stall watchdog used to abort a
+    // healthy ingest→staged-shard-build hand-off after 300 s. Tick the #332
+    // activity channel whenever the work-bearing snapshot fields move.
+    if lexical_rebuild_pipeline_work_advanced(&previous_runtime, latest_runtime) {
+        progress.tick_activity();
+    }
     progress
         .rebuild_pipeline_queue_depth
         .store(latest_runtime.queue_depth, Ordering::Relaxed);
@@ -9298,9 +9337,25 @@ fn should_repair_fallback_fts_after_full_index_run(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FallbackFtsRepairOutcome {
-    SkippedKnownHealthyForFingerprint { archive_fingerprint: String },
-    SkippedUnsupportedPopulatedShadowReload { detail: String },
-    SkippedCorruptDerivedIndex { detail: String },
+    SkippedKnownHealthyForFingerprint {
+        archive_fingerprint: String,
+    },
+    SkippedUnsupportedPopulatedShadowReload {
+        detail: String,
+    },
+    SkippedCorruptDerivedIndex {
+        detail: String,
+    },
+    /// #329/#345: the optional DB-resident fallback FTS repair failed for a
+    /// reason outside the enumerated nonfatal classes (e.g. an internal
+    /// frankensqlite allocation failure on a multi-million-message shadow
+    /// rebuild). The canonical archive and the published Tantivy index are
+    /// already good at this point, so the failure is reported instead of
+    /// failing the whole `index --full` run with exit 9 after hours of
+    /// successful work; doctor surfaces the shadow state on its next check.
+    SkippedRepairFailed {
+        detail: String,
+    },
     Repaired(FtsConsistencyRepair),
 }
 
@@ -9366,15 +9421,17 @@ fn repair_fallback_fts_after_full_index_run(
         Ok(storage) => storage,
         Err(err) => {
             let detail = format!("{err:#}");
-            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail) {
+            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail.clone()) {
                 return Ok(Some(outcome));
             }
-            return Err(err).with_context(|| {
-                format!(
-                    "opening fresh frankensqlite connection for fallback FTS repair at {}",
-                    db_path.display()
-                )
-            });
+            // #329: the canonical archive and Tantivy publish already
+            // succeeded; an unopenable connection for the *optional* derived
+            // repair must not fail the whole run.
+            return Ok(Some(FallbackFtsRepairOutcome::SkippedRepairFailed {
+                detail: format!(
+                    "opening fresh frankensqlite connection for fallback FTS repair: {detail}"
+                ),
+            }));
         }
     };
 
@@ -9393,14 +9450,28 @@ fn repair_fallback_fts_after_full_index_run(
         Ok(repair) => repair,
         Err(err) => {
             let detail = format!("{err:#}");
-            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail) {
+            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail.clone()) {
                 return Ok(Some(outcome));
             }
-            return Err(err);
+            // #329/#345: internal repair failures (frankensqlite "out of
+            // memory" on huge shadow rebuilds being the reported case) no
+            // longer fail an `index --full` whose canonical + Tantivy work
+            // already completed. Lexical search is served by Tantivy and
+            // doctor treats the shadow state honestly on its next check.
+            return Ok(Some(FallbackFtsRepairOutcome::SkippedRepairFailed {
+                detail,
+            }));
         }
     };
-    if let Some(archive_fingerprint) = known_archive_fingerprint {
-        fresh_storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)?;
+    if let Some(archive_fingerprint) = known_archive_fingerprint
+        && let Err(err) =
+            fresh_storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)
+    {
+        return Ok(Some(FallbackFtsRepairOutcome::SkippedRepairFailed {
+            detail: format!(
+                "fallback FTS repair succeeded but recording its archive fingerprint failed: {err:#}"
+            ),
+        }));
     }
     Ok(Some(FallbackFtsRepairOutcome::Repaired(repair)))
 }
@@ -14934,6 +15005,13 @@ pub fn run_index(
                     "derived fallback FTS remains corrupt after its best-effort repair; preserving the successful canonical SQLite and Tantivy build. Run 'cass doctor check --json' before an explicit fallback-FTS rebuild"
                 );
             }
+            FallbackFtsRepairOutcome::SkippedRepairFailed { detail } => {
+                tracing::warn!(
+                    db_path = %opts.db_path.display(),
+                    error = %detail,
+                    "optional derived fallback FTS repair failed; preserving the successful canonical SQLite and Tantivy build (#329). Lexical search is served by Tantivy; run 'cass doctor check --json' to inspect the shadow, and 'cass doctor --rebuild-canonical-fts --yes' for an explicit repair"
+                );
+            }
             FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
@@ -20229,7 +20307,15 @@ fn rebuild_tantivy_from_db_with_options(
     let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
     let prep_started = Instant::now();
     let mut prep_step_started = Instant::now();
-    let log_prep_step = |step: &str, step_started: &mut Instant| {
+    let prep_progress = progress.clone();
+    let log_prep_step = move |step: &str, step_started: &mut Instant| {
+        // #366: each completed prep step (readonly open, checkpoint load,
+        // shard planning, ...) is forward progress. Tick the watchdog's
+        // activity channel unconditionally so the pre-pipeline hand-off
+        // window is not misread as a finalize wedge and aborted.
+        if let Some(p) = &prep_progress {
+            p.tick_activity();
+        }
         let step_ms = step_started.elapsed().as_millis() as u64;
         let total_ms = prep_started.elapsed().as_millis() as u64;
         if prep_profile {
