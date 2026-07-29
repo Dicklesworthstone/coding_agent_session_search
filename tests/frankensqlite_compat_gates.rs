@@ -47,7 +47,11 @@ fn rusqlite_is_dev_dependency_only() {
 /// dependency contract so a version-only update cannot silently regress it.
 #[test]
 fn frankensqlite_existing_only_source_identity_is_exact_and_coherent() {
-    const REVISION: &str = "f9cc32945eb96d9304b760fd5cdead8daf1eb40a";
+    // 62a58ee3 = branch `fts5-overlong-hotfix-cass362`: the f9cc3294 family
+    // plus only the FTS5 overlong-term skip cap (cass#362). Upstream main has
+    // moved to an async-first API, so the full-forward bump is a separate
+    // validated porting pass.
+    const REVISION: &str = "62a58ee388775ffdf133c069372a6d01e3a589b4";
     const REPOSITORY: &str = "https://github.com/Dicklesworthstone/frankensqlite";
 
     let manifest: toml::Table =

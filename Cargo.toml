@@ -43,10 +43,10 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-frankensqlite = { version = "0.1.19", package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "f9cc32945eb96d9304b760fd5cdead8daf1eb40a", features = ["fts5"] }
+frankensqlite = { version = "0.1.19", package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "62a58ee388775ffdf133c069372a6d01e3a589b4", features = ["fts5"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "0.1.19", package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "f9cc32945eb96d9304b760fd5cdead8daf1eb40a" }
+fsqlite-types = { version = "0.1.19", package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "62a58ee388775ffdf133c069372a6d01e3a589b4" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -187,7 +187,7 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "0.1.19", package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "f9cc32945eb96d9304b760fd5cdead8daf1eb40a" }
+fsqlite-types = { version = "0.1.19", package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "62a58ee388775ffdf133c069372a6d01e3a589b4" }
 
 # Some enabled connector crates depend on the crates.io `fsqlite` line. A
 # direct Git dependency does not replace those transitive registry edges, so
@@ -196,8 +196,8 @@ fsqlite-types = { version = "0.1.19", package = "fsqlite-types", git = "https://
 # contract (not a local path override): every direct and transitive fsqlite
 # consumer converges on the revision containing `open_existing_schema_only`.
 [patch.crates-io]
-fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "f9cc32945eb96d9304b760fd5cdead8daf1eb40a" }
-fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "f9cc32945eb96d9304b760fd5cdead8daf1eb40a" }
+fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "62a58ee388775ffdf133c069372a6d01e3a589b4" }
+fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "62a58ee388775ffdf133c069372a6d01e3a589b4" }
 
 [[bin]]
 name = "cass"

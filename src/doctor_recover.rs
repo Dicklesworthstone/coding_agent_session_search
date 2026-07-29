@@ -1021,4 +1021,63 @@ mod tests {
         assert_eq!(envelope["would_mutate"], false);
         assert_eq!(envelope["apply_command"], serde_json::Value::Null);
     }
+
+    /// GH #362: a single whitespace-delimited token beyond the FTS5 u16
+    /// leaf-offset space (91,548 bytes observed in a real Codex rollout) used
+    /// to fail every canonical FTS repair path with "fts5: corrupt %_data
+    /// record: segment leaf term offset exceeds u16" — including this exact
+    /// `--rebuild-canonical-fts` recovery. With frankensqlite ≥ 95ec7126 the
+    /// overlong term is skipped at the tokenizer, the rebuild completes, and
+    /// neighboring terms in the same message stay indexed.
+    #[test]
+    fn rebuild_canonical_fts_survives_overlong_term_in_corpus() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let giant = "a".repeat(91_548);
+        {
+            let storage = FrankenStorage::open(&db_path).expect("open db");
+            let agent_id = seed_agent(&storage);
+            let conversation_id =
+                seed_conversation(&storage, agent_id, "overlong", "/orig/overlong.jsonl");
+            // The giant token must land in `messages.content` — that is the
+            // column the FTS rebuild streams through the tokenizer. (The
+            // `write_message` helper stores a placeholder content, which
+            // would never exercise the overlong path.)
+            for (idx, content) in [
+                (0_i64, format!("before {giant} needle")),
+                (1_i64, "ordinary reply".to_string()),
+            ] {
+                storage
+                    .raw()
+                    .execute_compat(
+                        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) \
+                         VALUES(?1, ?2, 'user', NULL, ?3, ?4, NULL, NULL)",
+                        &[
+                            ParamValue::from(conversation_id),
+                            ParamValue::from(idx),
+                            ParamValue::from(1000_i64 + idx),
+                            ParamValue::from(content),
+                        ] as &[ParamValue],
+                    )
+                    .expect("insert message with overlong content");
+            }
+        }
+
+        run_doctor_rebuild_canonical_fts(
+            Some(tmp.path().to_path_buf()),
+            Some(db_path.clone()),
+            false,
+            true,
+            Some(RobotFormat::Json),
+        )
+        .expect("rebuild must survive an overlong term in the corpus (GH #362)");
+
+        let readonly = FrankenStorage::open_readonly(&db_path).expect("reopen read-only");
+        let parity = readonly
+            .inspect_search_fallback_fts_parity()
+            .expect("inspect rebuilt FTS");
+        assert_eq!(parity.status, FtsShadowParityStatus::Healthy);
+        assert_eq!(parity.canonical_messages, 2);
+        assert_eq!(parity.indexed_messages, Some(2));
+    }
 }
