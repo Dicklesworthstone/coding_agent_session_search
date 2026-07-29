@@ -23736,10 +23736,24 @@ fn ensure_lexical_assets_for_search(
             ));
         }
         if diagnosis.checkpoint_refresh_allowed {
+            // gh359: on a large populated archive, plain `cass index` defers
+            // the authoritative lexical repair by size policy, so recommending
+            // it here sent agents in a circle (search defers to index, index
+            // defers the repair, search defers again). Point straight at
+            // `--full` when this database exceeds the auto-repair threshold.
+            let next_action = if crate::indexer::db_size_bytes_for_incremental_lexical_repair_policy(
+                db_path,
+            )
+                > crate::indexer::incremental_authoritative_lexical_repair_max_db_bytes()
+            {
+                "Run `cass index --full --json` to rebuild the lexical checkpoint: this database exceeds the automatic-repair size threshold, so plain `cass index` defers the repair and cannot complete it."
+            } else {
+                "Run `cass index --json` to complete the lexical rebuild checkpoint, then retry the search."
+            };
             return Err(search_robot_degraded_error(
                 "checkpoint_incomplete",
                 &reason,
-                "Run `cass index --json` to complete the lexical rebuild checkpoint, then retry the search.",
+                next_action,
             ));
         }
     }
@@ -90682,7 +90696,22 @@ fn run_index_with_data(
     }
 
     if show_plain {
-        eprintln!("index completed");
+        // gh359: "index completed" after a run that deferred the
+        // authoritative lexical repair (and therefore made nothing new
+        // searchable) was the worst possible signal for a large archive.
+        // Say what actually happened and name the command that completes it.
+        let lexical_deferred = index_progress
+            .stats
+            .lock()
+            .map(|stats| stats.lexical_update_deferred)
+            .unwrap_or(false);
+        if lexical_deferred {
+            eprintln!(
+                "index completed WITHOUT refreshing lexical search: this archive exceeds the automatic-repair size threshold, so the authoritative lexical rebuild was deferred. Run `cass index --full` to make new sessions searchable."
+            );
+        } else {
+            eprintln!("index completed");
+        }
     }
 
     match res {

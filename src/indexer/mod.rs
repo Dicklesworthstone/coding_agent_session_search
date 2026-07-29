@@ -1781,7 +1781,7 @@ fn non_watch_ingest_chunk_size() -> usize {
     }
 }
 
-fn incremental_authoritative_lexical_repair_max_db_bytes() -> u64 {
+pub(crate) fn incremental_authoritative_lexical_repair_max_db_bytes() -> u64 {
     dotenvy::var("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -1819,7 +1819,7 @@ fn is_plain_populated_incremental_index_run(
             .is_none_or(|paths| paths.is_empty())
 }
 
-fn db_size_bytes_for_incremental_lexical_repair_policy(db_path: &Path) -> u64 {
+pub(crate) fn db_size_bytes_for_incremental_lexical_repair_policy(db_path: &Path) -> u64 {
     std::fs::metadata(db_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0)
