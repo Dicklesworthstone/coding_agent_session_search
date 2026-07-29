@@ -222,6 +222,16 @@ fn apply_default_fsqlite_read_witness_cap() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // (cass #356) Restore the default SIGPIPE disposition so an early-exiting
+    // pipe consumer (`cass ... --json | head`) terminates cass quietly with
+    // the conventional 141 instead of panicking on EPIPE — which, under the
+    // release profile's panic=abort, dumps a SIGABRT crash report per run.
+    // Daemon/socket I/O is unaffected: Rust's std sends with MSG_NOSIGNAL on
+    // Linux and sets SO_NOSIGPIPE on Apple platforms, so only pipe/stdio
+    // writes regain the default kill-on-EPIPE behavior.
+    #[cfg(unix)]
+    sigpipe::reset();
+
     // (cass #308) The semantic stack is now pure-Rust (frankensearch `native`
     // frankentorch embedder + reranker), so there is no prebuilt ONNX Runtime and
     // no AVX/AVX2 static-init hazard. The old pre-AVX2 preflight + `-baseline`

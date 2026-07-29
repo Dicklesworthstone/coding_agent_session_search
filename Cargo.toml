@@ -141,6 +141,12 @@ security-framework = "3.7.0"
 [target.'cfg(not(windows))'.dependencies]
 openssl = { version = "0.10.79", features = ["vendored"] }
 
+# Restores the default SIGPIPE disposition at startup (#356): with Rust's
+# ignore-SIGPIPE default plus the release profile's panic=abort, every stdout
+# write to a closed pipe (`cass ... | head`) became a SIGABRT crash report.
+[target.'cfg(unix)'.dependencies]
+sigpipe = "0.1.3"
+
 [features]
 default = ["qr", "encryption"]
 qr = ["dep:qrcode", "dep:image"]

@@ -8201,3 +8201,37 @@ fn stats_on_empty_indexed_db_reports_zeroes_and_empty_by_agent() {
         by_agent.len()
     );
 }
+
+/// #356: an early-exiting pipe consumer (`cass ... | head`) must terminate
+/// cass via the restored default SIGPIPE disposition (signal 13), not a stdio
+/// panic — which unwinds to exit 101 in dev builds and, under the release
+/// profile's panic=abort, becomes a SIGABRT with a crash report on macOS.
+#[cfg(unix)]
+#[test]
+fn broken_stdout_pipe_terminates_via_sigpipe_not_abort() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command as StdCommand, Stdio};
+
+    const SIGPIPE: i32 = 13;
+
+    // `robot-docs schemas` emits well over the 64 KiB pipe capacity and needs
+    // no database, so a closed read end deterministically forces an EPIPE
+    // write regardless of scheduling.
+    let mut child = StdCommand::new(cass_bin())
+        .args(["robot-docs", "schemas"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cass with piped stdout");
+
+    drop(child.stdout.take());
+
+    let status = child.wait().expect("wait for cass");
+    assert_eq!(
+        status.signal(),
+        Some(SIGPIPE),
+        "expected quiet SIGPIPE termination on a closed stdout pipe, got {status:?}"
+    );
+}
