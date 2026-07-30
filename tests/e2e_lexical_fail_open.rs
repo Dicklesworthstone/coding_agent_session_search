@@ -528,6 +528,28 @@ fn explicit_semantic_budget_pressure_never_realizes_lexical() -> Result<(), Stri
             .is_some_and(|message| message.contains("requested semantic search")),
         format!("strict budget error must preserve semantic intent: {strict_error}"),
     )?;
+    require(
+        strict_error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                let near_limit = message.contains("phase=near-limit");
+                let exhausted = message.contains("phase=exhausted");
+                near_limit ^ exhausted
+                    && [
+                        "checkpoint=before-setup",
+                        "elapsed_ms=",
+                        "budget_ms=1",
+                        "remaining_ms=",
+                    ]
+                    .iter()
+                    .all(|field| message.contains(field))
+            }),
+        format!(
+            "strict budget error must carry its immutable admission snapshot: \
+             {strict_error}"
+        ),
+    )?;
     let hint = strict_error
         .get("hint")
         .and_then(Value::as_str)
@@ -692,16 +714,18 @@ fn explicit_semantic_budget_pressure_never_realizes_lexical() -> Result<(), Stri
     // after semantic context/model setup. The hook sleeps only after a healthy
     // first checkpoint, targeting the requested deterministic phase at the
     // same sample used by both mode admission and generic search shedding.
-    for (label, phase, budget_ms) in [
+    for (label, phase, budget_ms, expected_phase_field) in [
         (
             "semantic-budget-strict-after-setup-near-limit",
             "near-limit",
             "5000",
+            "phase=near-limit",
         ),
         (
             "semantic-budget-strict-after-setup-exhausted",
             "exhausted",
             "3000",
+            "phase=exhausted",
         ),
     ] {
         let strict_after_setup = run_search(
@@ -731,6 +755,25 @@ fn explicit_semantic_budget_pressure_never_realizes_lexical() -> Result<(), Stri
                 .is_some_and(|message| message.contains("Semantic setup left insufficient")),
             label,
             "must prove the post-setup checkpoint rejected dispatch",
+            &error,
+        )?;
+        require_with_debug(
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| {
+                    [
+                        "checkpoint=before-search",
+                        expected_phase_field,
+                        "elapsed_ms=",
+                        "budget_ms=",
+                        "remaining_ms=",
+                    ]
+                    .iter()
+                    .all(|field| message.contains(field))
+                }),
+            label,
+            "must carry the exact dispatch admission snapshot",
             &error,
         )?;
     }

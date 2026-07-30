@@ -83,6 +83,7 @@ use frankensqlite::compat::{
 };
 use indexer::IndexOptions;
 use model::cli_error_kind::ErrorKind as CliErrorKind;
+use robot_budget_envelope::BudgetSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -25136,12 +25137,8 @@ fn run_cli_search(
         });
     }
 
-    let budget_action = semantic_budget_action(
-        &mode_meta,
-        search_budget
-            .as_ref()
-            .map(crate::robot_budget_envelope::RobotBudget::phase),
-    );
+    let setup_budget_snapshot = search_budget.as_ref().map(BudgetSnapshot::capture);
+    let budget_action = semantic_budget_action(&mode_meta, setup_budget_snapshot);
     let execute_semantic = match budget_action {
         SemanticBudgetAction::Execute => semantic_requested,
         SemanticBudgetAction::StrictSemanticTimeout => {
@@ -25150,7 +25147,7 @@ fn run_cli_search(
             // headroom is a deadline-admission failure even before Exhausted.
             return Err(strict_semantic_budget_error(
                 &mode_meta,
-                search_budget.as_ref(),
+                setup_budget_snapshot,
                 SemanticBudgetCheckpoint::BeforeSetup,
             ));
         }
@@ -25376,15 +25373,13 @@ fn run_cli_search(
     // mode-aware semantic policy and the generic exhausted-budget branch use
     // it, so a scheduler preemption cannot produce an empty successful result
     // that still claims semantic/hybrid refinement.
-    let dispatch_budget_phase = search_budget
-        .as_ref()
-        .map(crate::robot_budget_envelope::RobotBudget::phase);
-    match semantic_budget_action(&mode_meta, dispatch_budget_phase) {
+    let dispatch_budget_snapshot = search_budget.as_ref().map(BudgetSnapshot::capture);
+    match semantic_budget_action(&mode_meta, dispatch_budget_snapshot) {
         SemanticBudgetAction::Execute => {}
         SemanticBudgetAction::StrictSemanticTimeout => {
             return Err(strict_semantic_budget_error(
                 &mode_meta,
-                search_budget.as_ref(),
+                dispatch_budget_snapshot,
                 SemanticBudgetCheckpoint::BeforeSearch,
             ));
         }
@@ -25407,7 +25402,7 @@ fn run_cli_search(
     // dispatch controls so it measures only the search operation.
     let search_start = Instant::now();
     let result = if matches!(
-        dispatch_budget_phase,
+        dispatch_budget_snapshot.map(BudgetSnapshot::phase),
         Some(crate::robot_budget_envelope::BudgetPhase::Exhausted)
     ) {
         skipped_sections.push("search".to_string());
@@ -27766,6 +27761,29 @@ enum SemanticBudgetCheckpoint {
     BeforeSearch,
 }
 
+impl SemanticBudgetCheckpoint {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeSetup => "before-setup",
+            Self::BeforeSearch => "before-search",
+        }
+    }
+}
+
+fn semantic_budget_diagnostic_suffix(
+    snapshot: BudgetSnapshot,
+    checkpoint: SemanticBudgetCheckpoint,
+) -> String {
+    format!(
+        " [semantic_budget checkpoint={} phase={} elapsed_ms={} budget_ms={} remaining_ms={}]",
+        checkpoint.as_str(),
+        snapshot.phase().as_str(),
+        snapshot.elapsed_ms(),
+        snapshot.budget_ms(),
+        snapshot.remaining_ms()
+    )
+}
+
 fn semantic_budget_fallback_reason(checkpoint: SemanticBudgetCheckpoint) -> &'static str {
     match checkpoint {
         SemanticBudgetCheckpoint::BeforeSetup => {
@@ -27779,21 +27797,17 @@ fn semantic_budget_fallback_reason(checkpoint: SemanticBudgetCheckpoint) -> &'st
 
 fn strict_semantic_budget_error(
     mode_meta: &SearchModeMeta,
-    budget: Option<&crate::robot_budget_envelope::RobotBudget>,
+    snapshot: Option<BudgetSnapshot>,
     checkpoint: SemanticBudgetCheckpoint,
 ) -> CliError {
-    if let Some(budget) = budget {
-        let budget_ms = budget.total_ms();
-        let elapsed_ms = budget.elapsed_ms();
-        let phase = crate::robot_budget_envelope::budget_status(elapsed_ms, budget_ms);
-        let remaining_ms = budget_ms.saturating_sub(elapsed_ms);
+    if let Some(snapshot) = snapshot {
         tracing::warn!(
             requested_mode = ?mode_meta.requested,
             checkpoint = ?checkpoint,
-            phase = ?phase,
-            elapsed_ms,
-            budget_ms,
-            remaining_ms,
+            phase = ?snapshot.phase(),
+            elapsed_ms = snapshot.elapsed_ms(),
+            budget_ms = snapshot.budget_ms(),
+            remaining_ms = snapshot.remaining_ms(),
             "requested semantic search rejected by robot budget admission"
         );
     }
@@ -27806,10 +27820,16 @@ fn strict_semantic_budget_error(
             "Semantic setup left insufficient robot-search budget to execute requested semantic search"
         }
     };
+    let diagnostic_suffix = snapshot
+        .map(|snapshot| semantic_budget_diagnostic_suffix(snapshot, checkpoint))
+        .unwrap_or_default();
     CliError {
         code: 10,
         kind: CliErrorKind::Timeout.kind_str(),
-        message: message.to_string(),
+        // `CliError` has no extensible details object, so the robot error
+        // envelope carries the immutable checkpoint fields as stable key=value
+        // tokens in `error.message`.
+        message: format!("{message}{diagnostic_suffix}"),
         hint: Some(
             "Increase --timeout and retry the same semantic request; use hybrid only when lexical fail-open is acceptable"
                 .to_string(),
@@ -27820,7 +27840,7 @@ fn strict_semantic_budget_error(
 
 fn semantic_budget_action(
     mode_meta: &SearchModeMeta,
-    phase: Option<crate::robot_budget_envelope::BudgetPhase>,
+    snapshot: Option<BudgetSnapshot>,
 ) -> SemanticBudgetAction {
     use crate::robot_budget_envelope::BudgetPhase;
     use crate::search::query::SearchMode;
@@ -27831,7 +27851,10 @@ fn semantic_budget_action(
     ) {
         return SemanticBudgetAction::Execute;
     }
-    if !matches!(phase, Some(BudgetPhase::NearLimit | BudgetPhase::Exhausted)) {
+    if !matches!(
+        snapshot.map(BudgetSnapshot::phase),
+        Some(BudgetPhase::NearLimit | BudgetPhase::Exhausted)
+    ) {
         return SemanticBudgetAction::Execute;
     }
     if mode_meta.fail_open_on_semantic_unavailable() {
@@ -104241,6 +104264,14 @@ mod subcommand_robot_output_tests {
         use crate::robot_budget_envelope::BudgetPhase;
         use crate::search::query::SearchMode;
 
+        fn snapshot(phase: BudgetPhase) -> BudgetSnapshot {
+            match phase {
+                BudgetPhase::Healthy => BudgetSnapshot::from_elapsed(0, 10),
+                BudgetPhase::NearLimit => BudgetSnapshot::from_elapsed(8, 10),
+                BudgetPhase::Exhausted => BudgetSnapshot::from_elapsed(10, 10),
+            }
+        }
+
         macro_rules! require_matches {
             ($observed:expr, $expected:pat, $context:expr) => {{
                 match $observed {
@@ -104262,22 +104293,22 @@ mod subcommand_robot_output_tests {
 
         for phase in [None, Some(BudgetPhase::Healthy)] {
             require_matches!(
-                semantic_budget_action(&explicit_semantic, phase),
+                semantic_budget_action(&explicit_semantic, phase.map(snapshot)),
                 SemanticBudgetAction::Execute,
                 "healthy explicit semantic"
             );
             require_matches!(
-                semantic_budget_action(&explicit_hybrid, phase),
+                semantic_budget_action(&explicit_hybrid, phase.map(snapshot)),
                 SemanticBudgetAction::Execute,
                 "healthy explicit hybrid"
             );
             require_matches!(
-                semantic_budget_action(&default_hybrid, phase),
+                semantic_budget_action(&default_hybrid, phase.map(snapshot)),
                 SemanticBudgetAction::Execute,
                 "healthy default hybrid"
             );
             require_matches!(
-                semantic_budget_action(&lexical_mode_meta, phase),
+                semantic_budget_action(&lexical_mode_meta, phase.map(snapshot)),
                 SemanticBudgetAction::Execute,
                 "healthy lexical"
             );
@@ -104285,22 +104316,22 @@ mod subcommand_robot_output_tests {
 
         for phase in [BudgetPhase::NearLimit, BudgetPhase::Exhausted] {
             require_matches!(
-                semantic_budget_action(&explicit_semantic, Some(phase)),
+                semantic_budget_action(&explicit_semantic, Some(snapshot(phase))),
                 SemanticBudgetAction::StrictSemanticTimeout,
                 "explicit semantic must fail closed instead of changing its realized mode"
             );
             require_matches!(
-                semantic_budget_action(&explicit_hybrid, Some(phase)),
+                semantic_budget_action(&explicit_hybrid, Some(snapshot(phase))),
                 SemanticBudgetAction::HybridLexicalFallback,
                 "hybrid may fail open when semantic work no longer fits the budget"
             );
             require_matches!(
-                semantic_budget_action(&default_hybrid, Some(phase)),
+                semantic_budget_action(&default_hybrid, Some(snapshot(phase))),
                 SemanticBudgetAction::HybridLexicalFallback,
                 "default hybrid mode must retain the same explicit fail-open policy"
             );
             require_matches!(
-                semantic_budget_action(&lexical_mode_meta, Some(phase)),
+                semantic_budget_action(&lexical_mode_meta, Some(snapshot(phase))),
                 SemanticBudgetAction::Execute,
                 "lexical mode has no semantic work to shed"
             );
@@ -104308,7 +104339,7 @@ mod subcommand_robot_output_tests {
 
         let mut meta = SearchModeMeta::new(SearchMode::Semantic, false);
         if matches!(
-            semantic_budget_action(&meta, Some(BudgetPhase::NearLimit)),
+            semantic_budget_action(&meta, Some(snapshot(BudgetPhase::NearLimit))),
             SemanticBudgetAction::HybridLexicalFallback
         ) {
             meta.fall_back_to_lexical("budget pressure");
@@ -104330,7 +104361,7 @@ mod subcommand_robot_output_tests {
         unavailable_hybrid.fall_back_to_lexical("semantic context unavailable: no index");
         for phase in [BudgetPhase::NearLimit, BudgetPhase::Exhausted] {
             require_matches!(
-                semantic_budget_action(&unavailable_hybrid, Some(phase)),
+                semantic_budget_action(&unavailable_hybrid, Some(snapshot(phase))),
                 SemanticBudgetAction::Execute,
                 "a prior semantic-availability fallback must keep its original cause"
             );
@@ -104342,6 +104373,50 @@ mod subcommand_robot_output_tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn strict_semantic_budget_error_preserves_the_decision_snapshot() {
+        use crate::robot_budget_envelope::BudgetPhase;
+        use crate::search::query::SearchMode;
+
+        // The timing fields deliberately describe an exhausted budget while
+        // the captured phase remains NearLimit. This cannot come from
+        // `capture`, but it proves the policy and diagnostic consume the exact
+        // same immutable value instead of recomputing the phase or re-reading
+        // a live clock at the error boundary.
+        let snapshot = BudgetSnapshot::from_parts_for_test(BudgetPhase::NearLimit, 10, 10, 0);
+        let mode_meta = SearchModeMeta::new(SearchMode::Semantic, false);
+
+        assert_eq!(
+            semantic_budget_action(&mode_meta, Some(snapshot)),
+            SemanticBudgetAction::StrictSemanticTimeout
+        );
+        let error = strict_semantic_budget_error(
+            &mode_meta,
+            Some(snapshot),
+            SemanticBudgetCheckpoint::BeforeSearch,
+        );
+        assert_eq!(error.code, 10);
+        assert!(error.retryable);
+        for expected in [
+            "checkpoint=before-search",
+            "phase=near-limit",
+            "elapsed_ms=10",
+            "budget_ms=10",
+            "remaining_ms=0",
+        ] {
+            assert!(
+                error.message.contains(expected),
+                "strict error must preserve {expected:?}: {}",
+                error.message
+            );
+        }
+        assert!(
+            !error.message.contains("phase=exhausted"),
+            "strict error must not recompute a later phase: {}",
+            error.message
+        );
     }
 
     #[test]

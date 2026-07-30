@@ -45,6 +45,17 @@ pub enum BudgetPhase {
     Exhausted,
 }
 
+impl BudgetPhase {
+    /// Stable kebab-case wire label for diagnostics and structured metadata.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::NearLimit => "near-limit",
+            Self::Exhausted => "exhausted",
+        }
+    }
+}
+
 /// Pure budget-phase decision. `budget_ms == 0` means "no time" → always
 /// [`BudgetPhase::Exhausted`]. Deterministic and the single source of truth for
 /// [`RobotBudget`].
@@ -69,6 +80,77 @@ pub fn budget_status(elapsed_ms: u64, budget_ms: u64) -> BudgetPhase {
 pub struct RobotBudget {
     total_ms: u64,
     start: Instant,
+}
+
+/// One immutable, internally consistent observation of a [`RobotBudget`].
+///
+/// Callers that make a policy decision and later emit diagnostics must pass
+/// this value through both paths. Re-reading the live clock can otherwise make
+/// a NearLimit decision appear to have been an Exhausted decision after a
+/// scheduler preemption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct BudgetSnapshot {
+    /// Phase derived from this snapshot's `elapsed_ms` and `budget_ms`.
+    phase: BudgetPhase,
+    /// Elapsed wall-clock time sampled once at capture.
+    elapsed_ms: u64,
+    /// Configured total budget.
+    budget_ms: u64,
+    /// Remaining budget at capture, saturated at zero.
+    remaining_ms: u64,
+}
+
+impl BudgetSnapshot {
+    /// Capture a live budget exactly once.
+    pub(crate) fn capture(budget: &RobotBudget) -> Self {
+        Self::from_elapsed(budget.elapsed_ms(), budget.total_ms())
+    }
+
+    /// Build a deterministic snapshot from an elapsed/total pair.
+    pub(crate) fn from_elapsed(elapsed_ms: u64, budget_ms: u64) -> Self {
+        Self {
+            phase: budget_status(elapsed_ms, budget_ms),
+            elapsed_ms,
+            budget_ms,
+            remaining_ms: budget_ms.saturating_sub(elapsed_ms),
+        }
+    }
+
+    #[cfg(test)]
+    /// Build a deliberately synthetic snapshot for identity-path tests.
+    pub(crate) const fn from_parts_for_test(
+        phase: BudgetPhase,
+        elapsed_ms: u64,
+        budget_ms: u64,
+        remaining_ms: u64,
+    ) -> Self {
+        Self {
+            phase,
+            elapsed_ms,
+            budget_ms,
+            remaining_ms,
+        }
+    }
+
+    /// Captured phase.
+    pub(crate) const fn phase(self) -> BudgetPhase {
+        self.phase
+    }
+
+    /// Captured elapsed milliseconds.
+    pub(crate) const fn elapsed_ms(self) -> u64 {
+        self.elapsed_ms
+    }
+
+    /// Captured total budget milliseconds.
+    pub(crate) const fn budget_ms(self) -> u64 {
+        self.budget_ms
+    }
+
+    /// Captured remaining milliseconds.
+    pub(crate) const fn remaining_ms(self) -> u64 {
+        self.remaining_ms
+    }
 }
 
 impl RobotBudget {
@@ -99,12 +181,17 @@ impl RobotBudget {
 
     /// Milliseconds remaining (saturating at 0).
     pub fn remaining_ms(&self) -> u64 {
-        self.total_ms.saturating_sub(self.elapsed_ms())
+        self.snapshot().remaining_ms
+    }
+
+    /// Capture one immutable observation for a multi-step policy decision.
+    pub(crate) fn snapshot(&self) -> BudgetSnapshot {
+        BudgetSnapshot::capture(self)
     }
 
     /// Current budget phase.
     pub fn phase(&self) -> BudgetPhase {
-        budget_status(self.elapsed_ms(), self.total_ms)
+        self.snapshot().phase
     }
 
     /// `true` once the budget is reached or exceeded.
@@ -164,12 +251,11 @@ impl BudgetBlock {
         skipped_sections: Vec<String>,
         recommended_next_probe: Option<String>,
     ) -> Self {
-        let elapsed_ms = budget.elapsed_ms();
-        let budget_ms = budget.total_ms();
+        let snapshot = budget.snapshot();
         Self {
-            elapsed_ms,
-            budget_ms,
-            timed_out: budget_status(elapsed_ms, budget_ms) == BudgetPhase::Exhausted,
+            elapsed_ms: snapshot.elapsed_ms,
+            budget_ms: snapshot.budget_ms,
+            timed_out: snapshot.phase == BudgetPhase::Exhausted,
             skipped_sections,
             recommended_next_probe,
         }
@@ -260,13 +346,22 @@ impl<T> BudgetEnvelope<T> {
     /// exhausted budget is a timeout; skipped without exhaustion is partial;
     /// nothing skipped is complete.
     pub fn from_budget(data: T, budget: &RobotBudget, skipped_sections: Vec<String>) -> Self {
-        let elapsed_ms = budget.elapsed_ms();
-        let budget_ms = budget.total_ms();
-        let exhausted = budget.is_exhausted();
+        let snapshot = budget.snapshot();
+        let exhausted = snapshot.phase == BudgetPhase::Exhausted;
         match (skipped_sections.is_empty(), exhausted) {
-            (true, false) => Self::complete(data, elapsed_ms, budget_ms),
-            (_, true) => Self::timed_out(data, elapsed_ms, budget_ms, skipped_sections),
-            (false, false) => Self::partial(data, elapsed_ms, budget_ms, skipped_sections),
+            (true, false) => Self::complete(data, snapshot.elapsed_ms, snapshot.budget_ms),
+            (_, true) => Self::timed_out(
+                data,
+                snapshot.elapsed_ms,
+                snapshot.budget_ms,
+                skipped_sections,
+            ),
+            (false, false) => Self::partial(
+                data,
+                snapshot.elapsed_ms,
+                snapshot.budget_ms,
+                skipped_sections,
+            ),
         }
     }
 
@@ -317,6 +412,30 @@ mod tests {
         assert_eq!(budget_status(5000, 1000), BudgetPhase::Exhausted);
         // Zero budget is always exhausted.
         assert_eq!(budget_status(0, 0), BudgetPhase::Exhausted);
+    }
+
+    #[test]
+    fn budget_snapshot_is_internally_consistent_and_uses_stable_phase_labels() {
+        for (elapsed_ms, budget_ms, expected_phase, expected_remaining) in [
+            (799, 1000, BudgetPhase::Healthy, 201),
+            (800, 1000, BudgetPhase::NearLimit, 200),
+            (1000, 1000, BudgetPhase::Exhausted, 0),
+            (5000, 1000, BudgetPhase::Exhausted, 0),
+        ] {
+            let snapshot = BudgetSnapshot::from_elapsed(elapsed_ms, budget_ms);
+            assert_eq!(snapshot.phase, expected_phase);
+            assert_eq!(snapshot.elapsed_ms, elapsed_ms);
+            assert_eq!(snapshot.budget_ms, budget_ms);
+            assert_eq!(snapshot.remaining_ms, expected_remaining);
+            assert_eq!(
+                snapshot.phase.as_str(),
+                match expected_phase {
+                    BudgetPhase::Healthy => "healthy",
+                    BudgetPhase::NearLimit => "near-limit",
+                    BudgetPhase::Exhausted => "exhausted",
+                }
+            );
+        }
     }
 
     #[test]
