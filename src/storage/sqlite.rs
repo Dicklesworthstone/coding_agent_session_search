@@ -3046,6 +3046,13 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
         "-lock-shared",
         "-lock-reserved",
         "-lock-pending",
+        // frankensqlite VFS namespace sidecars (fsqlite-vfs namespace.rs).
+        // The pinned family creates these next to every opened database;
+        // without this exclusion a `<stem>.corrupt.<ts>-fsqlite-ns-use`
+        // lock file (40 bytes, non-empty) is discovered as a historical
+        // bundle candidate and can even be seeded into the canonical path.
+        "-fsqlite-ns-gate",
+        "-fsqlite-ns-use",
     ];
     SIDECAR_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }

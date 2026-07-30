@@ -281,3 +281,7 @@ fuzz/fuzz/
 /beads_compliance_audit/
 # br doctor per-run artifacts
 .doctor/
+
+# frankensqlite VFS namespace lock sidecars (machine-local, created next to any opened DB)
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
