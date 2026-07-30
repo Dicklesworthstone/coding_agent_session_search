@@ -17,7 +17,6 @@
 //!   - Setting CASS_IGNORE_SOURCES_CONFIG=1 so the indexer doesn't
 //!     pick up the operator's real `~/.config/cass/sources.toml`.
 
-use assert_cmd::Command;
 use coding_agent_search::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, SemanticShardBuildPlan,
 };
@@ -27,9 +26,15 @@ use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use std::process::{Command, Output};
+use std::time::Duration;
 use tempfile::TempDir;
+use util::timeout::spawn_with_timeout_or_diag;
 
 mod util;
+
+const INDEX_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(180);
+const SEARCH_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn cass_cmd(temp_home: &std::path::Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
@@ -53,13 +58,64 @@ fn run_fresh_index(home: &Path, data_dir: &Path) {
     index
         .args(["index", "--full", "--json", "--data-dir"])
         .arg(data_dir);
-    let index_output = index.output().expect("run cass index --full");
+    let index_output = spawn_with_timeout_or_diag(
+        index,
+        "semantic-budget-index",
+        Some(data_dir),
+        INDEX_SUBPROCESS_TIMEOUT,
+    );
     assert!(
         index_output.status.success(),
         "cass index --full must succeed on the seeded corpus. stdout: {} stderr: {}",
         String::from_utf8_lossy(&index_output.stdout),
         String::from_utf8_lossy(&index_output.stderr)
     );
+}
+
+fn bounded_output_text(label: &str, output: &Output) -> (String, String) {
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let emitted_bytes = output.stdout.len().saturating_add(output.stderr.len());
+    let emitted_lines = stdout
+        .lines()
+        .count()
+        .saturating_add(stderr.lines().count());
+    assert!(
+        emitted_bytes < 8 * 1024 * 1024,
+        "{label} emitted {emitted_bytes} bytes"
+    );
+    assert!(
+        emitted_lines < 10_000,
+        "{label} emitted {emitted_lines} lines"
+    );
+    (stdout, stderr)
+}
+
+fn structured_cli_error(label: &str, output: &Output) -> Value {
+    let (stdout, stderr) = bounded_output_text(label, output);
+    assert!(
+        !output.status.success(),
+        "{label} must fail with a structured error. stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "{label} must not mix a failed result payload into stdout: {stdout}"
+    );
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_else(|| panic!("{label} must emit a structured error on stderr"));
+    let payload: Value = serde_json::from_str(last_line.trim()).unwrap_or_else(|error| {
+        panic!(
+            "{label} must end stderr with a JSON error: {error}\n\
+             stdout: {stdout}\nstderr: {stderr}"
+        )
+    });
+    payload
+        .get("error")
+        .cloned()
+        .unwrap_or_else(|| panic!("{label} must carry an error object: {payload}"))
 }
 
 fn lexical_checkpoint(data_dir: &Path) -> Value {
@@ -236,6 +292,464 @@ fn run_hybrid_hash_search(home: &Path, data_dir: &Path, query: &str) -> Value {
             String::from_utf8_lossy(&output.stdout)
         )
     })
+}
+
+#[test]
+fn explicit_semantic_budget_pressure_never_realizes_lexical() {
+    let tmp = TempDir::new().expect("create isolated semantic-budget home");
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).expect("create isolated semantic-budget data dir");
+
+    for idx in 1..=3 {
+        let name = format!("rollout-explicit-semantic-budget-{idx:02}.jsonl");
+        seed_codex_session(
+            &codex_home,
+            &name,
+            &format!("semanticbudgetprobe concept {idx}"),
+        );
+    }
+    run_fresh_index(home, &data_dir);
+    build_hash_semantic_assets(&data_dir, false);
+
+    let run_search = |label: &str,
+                      mode: Option<&str>,
+                      model: Option<&str>,
+                      budget_ms: &str,
+                      dispatch_budget_phase: Option<&str>| {
+        let mut search = cass_cmd(home);
+        search
+            .env("CASS_SEARCH_BUDGET_MS", budget_ms)
+            .env("CASS_SEARCH_TIMEOUT_MS", "")
+            .env("CASS_SEARCH_TIMEOUT", "")
+            .env("CASS_SEARCH_MODE", "")
+            .env("CASS_TEST_SEMANTIC_DISPATCH_BUDGET_PHASE", "");
+        if let Some(phase) = dispatch_budget_phase {
+            search.env("CASS_TEST_SEMANTIC_DISPATCH_BUDGET_PHASE", phase);
+        }
+        search.args([
+            "search",
+            "semanticbudgetprobe",
+            "--json",
+            "--robot-meta",
+            "--limit",
+            "5",
+        ]);
+        if let Some(mode) = mode {
+            search.args(["--mode", mode]);
+        }
+        if let Some(model) = model {
+            search.args(["--model", model]);
+        }
+        search.arg("--data-dir").arg(&data_dir);
+        spawn_with_timeout_or_diag(search, label, Some(&data_dir), SEARCH_SUBPROCESS_TIMEOUT)
+    };
+
+    // Prove the persisted hash vector space is genuinely usable before
+    // exercising budget admission. This prevents a missing-model or malformed
+    // semantic fixture from making the strict-mode regression pass vacuously.
+    let healthy = run_search(
+        "semantic-budget-healthy-control",
+        Some("semantic"),
+        Some("hash"),
+        "600000",
+        None,
+    );
+    let (healthy_stdout, healthy_stderr) =
+        bounded_output_text("healthy semantic control", &healthy);
+    assert!(
+        healthy.status.success(),
+        "healthy explicit semantic/hash search must succeed. stdout: {healthy_stdout}\n\
+         stderr: {healthy_stderr}"
+    );
+    let healthy_payload: Value =
+        serde_json::from_str(healthy_stdout.trim()).unwrap_or_else(|error| {
+            panic!(
+                "healthy semantic control must emit JSON: {error}\n\
+                 stdout: {healthy_stdout}\nstderr: {healthy_stderr}"
+            )
+        });
+    let healthy_meta = healthy_payload
+        .get("_meta")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("healthy semantic control must emit _meta: {healthy_payload}"));
+    assert_eq!(
+        healthy_meta
+            .get("requested_search_mode")
+            .and_then(Value::as_str),
+        Some("semantic")
+    );
+    assert_eq!(
+        healthy_meta.get("search_mode").and_then(Value::as_str),
+        Some("semantic")
+    );
+    assert_eq!(healthy_meta.get("fallback_tier"), Some(&Value::Null));
+    assert!(
+        healthy_payload
+            .get("hits")
+            .and_then(Value::as_array)
+            .is_some_and(|hits| !hits.is_empty()),
+        "healthy semantic control must execute against the persisted hash vectors: {healthy_payload}"
+    );
+
+    // Cheap configuration validation has precedence over budget shedding.
+    // Otherwise an invalid explicit producer would look like a retryable
+    // timeout or a successful lexical fallback.
+    for mode in ["semantic", "hybrid"] {
+        let invalid_model = run_search(
+            &format!("semantic-budget-invalid-model-{mode}"),
+            Some(mode),
+            Some("definitely-invalid-budget-probe"),
+            "1",
+            None,
+        );
+        let invalid_model_error =
+            structured_cli_error(&format!("invalid {mode} model"), &invalid_model);
+        assert_eq!(
+            invalid_model.status.code(),
+            Some(15),
+            "invalid {mode} model must retain the embedder-unavailable exit code"
+        );
+        assert_eq!(
+            invalid_model_error.get("kind").and_then(Value::as_str),
+            Some("embedder-unavailable")
+        );
+        assert_eq!(
+            invalid_model_error.get("code").and_then(Value::as_i64),
+            Some(15)
+        );
+        assert_eq!(
+            invalid_model_error
+                .get("retryable")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    // A one-millisecond robot budget is deterministically at least NearLimit
+    // even at elapsed_ms=0 because the integer 80% threshold rounds down to
+    // zero. No hard --timeout is set: this isolates semantic budget admission
+    // from the later generic wall-clock deadline. Requested Semantic is strict:
+    // NearLimit is an admission failure, never permission to execute Lexical
+    // under a semantic label.
+    let strict = run_search(
+        "semantic-budget-strict-semantic",
+        Some("semantic"),
+        Some("hash"),
+        "1",
+        None,
+    );
+    let strict_error = structured_cli_error("strict semantic budget admission", &strict);
+    assert_eq!(strict.status.code(), Some(10));
+    assert_eq!(
+        strict_error.get("kind").and_then(Value::as_str),
+        Some("timeout")
+    );
+    assert_eq!(strict_error.get("code").and_then(Value::as_i64), Some(10));
+    assert_eq!(
+        strict_error.get("retryable").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        strict_error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("requested semantic search")),
+        "strict budget error must preserve semantic intent: {strict_error}"
+    );
+    let hint = strict_error
+        .get("hint")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("strict semantic timeout must carry a hint: {strict_error}"));
+    assert!(
+        hint.contains("Increase --timeout") && hint.contains("hybrid"),
+        "strict timeout hint must name the retry and opt-in fail-open: {hint}"
+    );
+
+    let assert_hybrid_budget_fallback =
+        |label: &str,
+         mode: Option<&str>,
+         budget_ms: &str,
+         dispatch_budget_phase: Option<&str>,
+         expected_defaulted: bool,
+         expected_search_skipped: Option<bool>| {
+            let hybrid = run_search(label, mode, Some("hash"), budget_ms, dispatch_budget_phase);
+            let (hybrid_stdout, hybrid_stderr) = bounded_output_text(label, &hybrid);
+            assert!(
+                hybrid.status.success(),
+                "{label} must fail open. stdout: {hybrid_stdout}\n\
+             stderr: {hybrid_stderr}"
+            );
+            let hybrid_payload: Value =
+                serde_json::from_str(hybrid_stdout.trim()).unwrap_or_else(|error| {
+                    panic!(
+                        "{label} must emit JSON: {error}\n\
+                     stdout: {hybrid_stdout}\nstderr: {hybrid_stderr}"
+                    )
+                });
+            let hybrid_meta = hybrid_payload
+                .get("_meta")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{label} must emit _meta: {hybrid_payload}"));
+            assert_eq!(
+                hybrid_meta
+                    .get("requested_search_mode")
+                    .and_then(Value::as_str),
+                Some("hybrid")
+            );
+            assert_eq!(
+                hybrid_meta.get("mode_defaulted").and_then(Value::as_bool),
+                Some(expected_defaulted),
+                "{label} must report whether Hybrid was explicit or defaulted"
+            );
+            assert_eq!(
+                hybrid_meta.get("search_mode").and_then(Value::as_str),
+                Some("lexical")
+            );
+            assert_eq!(
+                hybrid_meta.get("fallback_tier").and_then(Value::as_str),
+                Some("lexical")
+            );
+            assert_eq!(
+                hybrid_meta
+                    .get("semantic_refinement")
+                    .and_then(Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                hybrid_meta.get("refinement_level").and_then(Value::as_str),
+                Some("lexical_only")
+            );
+            assert_eq!(
+                hybrid_meta
+                    .get("semantic_fallback_reason")
+                    .and_then(Value::as_str),
+                Some("semantic_budget_limited")
+            );
+            assert!(
+                hybrid_meta
+                    .get("fallback_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| reason.contains("budget")),
+                "{label} must explain the budget demotion: {hybrid_payload}"
+            );
+            assert!(
+                hybrid_payload
+                    .get("budget")
+                    .and_then(|budget| budget.get("skipped_sections"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|sections| {
+                        sections
+                            .iter()
+                            .any(|section| section.as_str() == Some("semantic_refinement"))
+                    }),
+                "{label} budget metadata must name the shed semantic section: {hybrid_payload}"
+            );
+            let hybrid_skipped = hybrid_payload
+                .get("budget")
+                .and_then(|budget| budget.get("skipped_sections"))
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("{label} budget block must list skipped sections"));
+            let search_skipped = hybrid_skipped
+                .iter()
+                .any(|section| section.as_str() == Some("search"));
+            if let Some(expected) = expected_search_skipped {
+                assert_eq!(
+                    search_skipped, expected,
+                    "{label} search-dispatch outcome must match the forced phase: {hybrid_payload}"
+                );
+            }
+            if search_skipped {
+                assert_eq!(
+                    hybrid_payload
+                        .get("budget")
+                        .and_then(|budget| budget.get("timed_out"))
+                        .and_then(Value::as_bool),
+                    Some(true),
+                    "a skipped lexical search must be reported as budget exhaustion"
+                );
+                assert_eq!(
+                    hybrid_payload
+                        .get("hits")
+                        .and_then(Value::as_array)
+                        .map(Vec::len),
+                    Some(0),
+                    "an exhausted response must not claim unexecuted lexical hits"
+                );
+            } else {
+                assert!(
+                    hybrid_payload
+                        .get("hits")
+                        .and_then(Value::as_array)
+                        .is_some_and(|hits| !hits.is_empty()),
+                    "when lexical search fits, {label} must return its real hits: {hybrid_payload}"
+                );
+            }
+            hybrid_payload
+        };
+
+    // Explicit and default Hybrid retain the same documented fail-open
+    // behavior when pressure is already visible before setup. Exercising both
+    // through the shipped CLI proves argument defaulting cannot diverge from
+    // the pure policy function.
+    for (label, mode, expected_defaulted) in [
+        ("semantic-budget-hybrid-fail-open", Some("hybrid"), false),
+        ("semantic-budget-default-hybrid-fail-open", None, true),
+    ] {
+        let _ = assert_hybrid_budget_fallback(label, mode, "1", None, expected_defaulted, None);
+    }
+
+    // The authoritative dispatch checkpoint must catch a budget transition
+    // after semantic context/model setup. The hook sleeps only after a healthy
+    // first checkpoint, targeting the requested deterministic phase at the
+    // same sample used by both mode admission and generic search shedding.
+    for phase in ["near-limit", "exhausted"] {
+        let label = format!("semantic-budget-strict-after-setup-{phase}");
+        let strict_after_setup = run_search(
+            &label,
+            Some("semantic"),
+            Some("hash"),
+            if phase == "near-limit" {
+                "5000"
+            } else {
+                "3000"
+            },
+            Some(phase),
+        );
+        let error = structured_cli_error(&label, &strict_after_setup);
+        assert_eq!(strict_after_setup.status.code(), Some(10));
+        assert_eq!(error.get("kind").and_then(Value::as_str), Some("timeout"));
+        assert_eq!(error.get("code").and_then(Value::as_i64), Some(10));
+        assert_eq!(error.get("retryable").and_then(Value::as_bool), Some(true));
+        assert!(
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("Semantic setup left insufficient")),
+            "{label} must prove the post-setup checkpoint rejected dispatch: {error}"
+        );
+    }
+
+    for (mode_label, mode, expected_defaulted) in
+        [("explicit", Some("hybrid"), false), ("default", None, true)]
+    {
+        let near_label = format!("semantic-budget-{mode_label}-hybrid-after-setup-near-limit");
+        let near_payload = assert_hybrid_budget_fallback(
+            &near_label,
+            mode,
+            "5000",
+            Some("near-limit"),
+            expected_defaulted,
+            Some(false),
+        );
+        assert!(
+            near_payload
+                .get("_meta")
+                .and_then(|meta| meta.get("fallback_reason"))
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason.contains("after setup")),
+            "{near_label} must identify the second admission checkpoint: {near_payload}"
+        );
+
+        let exhausted_label = format!("semantic-budget-{mode_label}-hybrid-after-setup-exhausted");
+        let exhausted_payload = assert_hybrid_budget_fallback(
+            &exhausted_label,
+            mode,
+            "3000",
+            Some("exhausted"),
+            expected_defaulted,
+            Some(true),
+        );
+        assert!(
+            exhausted_payload
+                .get("_meta")
+                .and_then(|meta| meta.get("fallback_reason"))
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason.contains("after setup")),
+            "{exhausted_label} must identify the second admission checkpoint: {exhausted_payload}"
+        );
+    }
+
+    // Lexical has no semantic setup to shed and must not inherit the strict
+    // semantic admission failure. The one-millisecond robot budget may still
+    // truthfully skip the search itself if it is already exhausted.
+    let lexical = run_search(
+        "semantic-budget-lexical-control",
+        Some("lexical"),
+        None,
+        "1",
+        None,
+    );
+    let (lexical_stdout, lexical_stderr) = bounded_output_text("lexical budget control", &lexical);
+    assert!(
+        lexical.status.success(),
+        "lexical budget control must remain available. stdout: {lexical_stdout}\n\
+         stderr: {lexical_stderr}"
+    );
+    let lexical_payload: Value =
+        serde_json::from_str(lexical_stdout.trim()).unwrap_or_else(|error| {
+            panic!(
+                "lexical budget control must emit JSON: {error}\n\
+                 stdout: {lexical_stdout}\nstderr: {lexical_stderr}"
+            )
+        });
+    let lexical_meta = lexical_payload
+        .get("_meta")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("lexical budget control must emit _meta: {lexical_payload}"));
+    assert_eq!(
+        lexical_meta
+            .get("requested_search_mode")
+            .and_then(Value::as_str),
+        Some("lexical")
+    );
+    assert_eq!(
+        lexical_meta.get("search_mode").and_then(Value::as_str),
+        Some("lexical")
+    );
+    assert_eq!(lexical_meta.get("fallback_tier"), Some(&Value::Null));
+    assert_eq!(lexical_meta.get("fallback_reason"), Some(&Value::Null));
+    let lexical_skipped = lexical_payload
+        .get("budget")
+        .and_then(|budget| budget.get("skipped_sections"))
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("lexical budget block must list skipped sections"));
+    assert!(
+        !lexical_skipped
+            .iter()
+            .any(|section| section.as_str() == Some("semantic_refinement")),
+        "lexical mode must not claim it shed semantic work: {lexical_payload}"
+    );
+    if lexical_skipped
+        .iter()
+        .any(|section| section.as_str() == Some("search"))
+    {
+        assert_eq!(
+            lexical_payload
+                .get("budget")
+                .and_then(|budget| budget.get("timed_out"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "a skipped lexical search must be reported as budget exhaustion"
+        );
+        assert_eq!(
+            lexical_payload
+                .get("hits")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "an exhausted lexical response must not claim unexecuted hits"
+        );
+    } else {
+        assert!(
+            lexical_payload
+                .get("hits")
+                .and_then(Value::as_array)
+                .is_some_and(|hits| !hits.is_empty()),
+            "when lexical search fits, the control must return its real hits: {lexical_payload}"
+        );
+    }
 }
 
 fn run_lexical_search(home: &Path, data_dir: &Path, query: &str) -> Value {
