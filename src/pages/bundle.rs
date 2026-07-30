@@ -1330,11 +1330,14 @@ mod tests {
     }
 
     fn encrypted_config_for_files(files: Vec<&str>) -> EncryptionConfig {
+        use base64::prelude::*;
         let chunk_count = files.len();
         EncryptionConfig {
             version: crate::pages::encrypt::SCHEMA_VERSION,
-            export_id: "export-123".to_string(),
-            base_nonce: "nonce".to_string(),
+            // The shared payload-format validation decodes these as base64
+            // and requires exactly 16 / 12 bytes.
+            export_id: BASE64_STANDARD.encode([0u8; 16]),
+            base_nonce: BASE64_STANDARD.encode([0u8; 12]),
             compression: "deflate".to_string(),
             kdf_defaults: crate::pages::encrypt::Argon2Params::default(),
             payload: crate::pages::encrypt::PayloadMeta {

@@ -1904,9 +1904,14 @@ mod tests {
         assert_eq!(key_slot_id_for_len(255).unwrap(), 255);
 
         let err = key_slot_id_for_len(256).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "maximum of 256 key slots exceeded (256 slots already allocated): out of range integral type conversion attempted"
+        // Only pin our own context prefix: the appended cause is std's
+        // TryFromIntError Display text, which the floating nightly toolchain
+        // has reworded before and may reword again.
+        let rendered = err.to_string();
+        assert!(
+            rendered
+                .starts_with("maximum of 256 key slots exceeded (256 slots already allocated): "),
+            "unexpected overflow error: {rendered}"
         );
     }
 

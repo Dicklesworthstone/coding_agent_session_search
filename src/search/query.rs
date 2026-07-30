@@ -15123,8 +15123,10 @@ mod tests {
     #[test]
     fn wildcard_pattern_to_regex_suffix() {
         let pattern = FsCassWildcardPattern::Suffix("foo".into());
-        // Suffix patterns need $ anchor to ensure "ends with" semantics
-        assert_eq!(pattern.to_regex(), Some(".*foo$".into()));
+        // tantivy-fst regexes match the complete term and reject zero-width
+        // assertions, so suffix patterns carry no `$` anchor — "ends with"
+        // comes from the engine's full-term matching.
+        assert_eq!(pattern.to_regex(), Some(".*foo".into()));
     }
 
     #[test]
@@ -15187,7 +15189,7 @@ mod tests {
     fn wildcard_pattern_to_regex_escapes_special_chars() {
         assert_eq!(
             FsCassWildcardPattern::Suffix("foo.bar".into()).to_regex(),
-            Some(".*foo\\.bar$".into())
+            Some(".*foo\\.bar".into())
         );
         assert_eq!(
             FsCassWildcardPattern::Substring("a+b*c?".into()).to_regex(),
@@ -15199,7 +15201,7 @@ mod tests {
     fn wildcard_pattern_to_regex_escapes_complex_patterns() {
         assert_eq!(
             FsCassWildcardPattern::Suffix("test[0-9]+".into()).to_regex(),
-            Some(".*test\\[0-9\\]\\+$".into())
+            Some(".*test\\[0-9\\]\\+".into())
         );
         assert_eq!(
             FsCassWildcardPattern::Substring("(a|b)".into()).to_regex(),
@@ -17433,11 +17435,11 @@ mod tests {
         // Exact and prefix patterns don't need regex
         assert_eq!(FsCassWildcardPattern::Exact("foo".into()).to_regex(), None);
         assert_eq!(FsCassWildcardPattern::Prefix("foo".into()).to_regex(), None);
-        // Suffix and substring need regex
-        // Suffix needs $ anchor for "ends with" semantics
+        // Suffix and substring need regex. tantivy-fst regexes match the
+        // complete term and reject zero-width assertions, so no `$` anchor.
         assert_eq!(
             FsCassWildcardPattern::Suffix("foo".into()).to_regex(),
-            Some(".*foo$".into())
+            Some(".*foo".into())
         );
         assert_eq!(
             FsCassWildcardPattern::Substring("foo".into()).to_regex(),

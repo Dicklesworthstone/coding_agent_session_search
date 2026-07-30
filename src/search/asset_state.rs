@@ -3124,10 +3124,29 @@ mod tests {
         let db_path = temp.path().join("agent_search.db");
         std::fs::create_dir_all(&db_path).expect("create unopenable db path");
 
-        let vector_path = vector_index_path(temp.path(), HashEmbedder::default().id());
+        // The availability probe validates the artifact it finds (it no
+        // longer trusts bare file existence), so the fixture must be a real
+        // hash vector index. The contract under test is unchanged: the DB
+        // itself (an unopenable directory here) must not be re-opened when
+        // the caller already probed it.
+        let embedder = HashEmbedder::default();
+        let vector_path = vector_index_path(temp.path(), embedder.id());
         std::fs::create_dir_all(vector_path.parent().expect("vector parent"))
             .expect("create vector dir");
-        std::fs::write(&vector_path, b"index").expect("write vector index");
+        let mut writer = crate::search::vector_index::VectorIndex::create_with_revision(
+            &vector_path,
+            embedder.id(),
+            crate::indexer::semantic::HASH_VECTOR_SPACE_REVISION,
+            embedder.dimension(),
+            frankensearch::index::Quantization::F16,
+        )
+        .expect("create hash vector index");
+        let mut vector = vec![0.0_f32; embedder.dimension()];
+        vector[0] = 1.0;
+        writer
+            .write_record("doc-0", &vector)
+            .expect("write hash vector record");
+        writer.finish().expect("finish hash vector index");
 
         let snapshot = inspect_search_assets(InspectSearchAssetsInput {
             data_dir: temp.path(),

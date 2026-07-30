@@ -1695,9 +1695,13 @@ mod tests {
 
         let err =
             key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap_err();
+        // The shared payload-format validation now rejects the oversized
+        // chunk_size first ("unsupported encryption metadata
+        // (payload.chunk_size)"), before key_rotate's own bound message;
+        // either shape proves the rotate refused to rewrite.
         let rendered = err.to_string();
         assert!(
-            rendered.contains("chunk_size") && rendered.contains("must be <="),
+            rendered.contains("chunk_size"),
             "unexpected chunk-size error: {err:#}"
         );
 

@@ -64,7 +64,11 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "fsqlite",
         manifest_table: "dependencies",
         manifest_key: "frankensqlite",
-        source_kind: "registry",
+        // Git-pinned since the same-version registry archive lacks the
+        // existing-only schema-open contract cass depends on (cass#345);
+        // the compat gates in tests/frankensqlite_compat_gates.rs own the
+        // exact revision.
+        source_kind: "git",
         repo_rel: "../frankensqlite",
         required_tests: &[
             STRICT_CHECK_COMMAND,
@@ -77,7 +81,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "fsqlite-types",
         manifest_table: "dev-dependencies",
         manifest_key: "fsqlite-types",
-        source_kind: "registry",
+        source_kind: "git",
         repo_rel: "../frankensqlite",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
@@ -923,9 +927,9 @@ mod tests {
         let frankensqlite_spec = dependency_spec("frankensqlite")?;
         let frankensqlite = manifest_pin(&manifest, frankensqlite_spec);
         ensure(
-            frankensqlite.status == "version-pinned",
+            frankensqlite.status == "pinned",
             format!(
-                "expected frankensqlite version-pinned, got {}",
+                "expected frankensqlite git-pinned, got {}",
                 frankensqlite.status
             ),
         )?;
@@ -933,9 +937,15 @@ mod tests {
             frankensqlite.package.as_deref() == Some(frankensqlite_spec.package),
             "frankensqlite package should match the dependency spec",
         )?;
+        // The exact revision is owned by tests/frankensqlite_compat_gates.rs;
+        // here we only require a well-formed immutable pin so routine pin
+        // bumps do not have to touch this test.
         ensure(
-            frankensqlite.version.as_deref() == Some("=0.1.19"),
-            "frankensqlite registry version pin should match Cargo.toml",
+            frankensqlite
+                .rev
+                .as_deref()
+                .is_some_and(|rev| rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit())),
+            "frankensqlite git pin should carry a full 40-hex revision",
         )?;
 
         let asupersync = manifest_pin(&manifest, dependency_spec("asupersync")?);
