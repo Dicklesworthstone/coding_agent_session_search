@@ -104237,52 +104237,70 @@ mod subcommand_robot_output_tests {
     }
 
     #[test]
-    fn robot_budget_policy_never_demotes_explicit_semantic_to_lexical() {
+    fn robot_budget_policy_never_demotes_explicit_semantic_to_lexical() -> Result<(), String> {
         use crate::robot_budget_envelope::BudgetPhase;
         use crate::search::query::SearchMode;
+
+        macro_rules! require_matches {
+            ($observed:expr, $expected:pat, $context:expr) => {{
+                match $observed {
+                    $expected => {}
+                    budget_policy_observed => {
+                        return Err(format!(
+                            "{}: unexpected {budget_policy_observed:?}",
+                            $context
+                        ));
+                    }
+                }
+            }};
+        }
 
         let explicit_semantic = SearchModeMeta::new(SearchMode::Semantic, false);
         let explicit_hybrid = SearchModeMeta::new(SearchMode::Hybrid, false);
         let default_hybrid = SearchModeMeta::new(SearchMode::Hybrid, true);
-        let lexical = SearchModeMeta::new(SearchMode::Lexical, false);
+        let lexical_mode_meta = SearchModeMeta::new(SearchMode::Lexical, false);
 
         for phase in [None, Some(BudgetPhase::Healthy)] {
-            assert_eq!(
+            require_matches!(
                 semantic_budget_action(&explicit_semantic, phase),
-                SemanticBudgetAction::Execute
+                SemanticBudgetAction::Execute,
+                "healthy explicit semantic"
             );
-            assert_eq!(
+            require_matches!(
                 semantic_budget_action(&explicit_hybrid, phase),
-                SemanticBudgetAction::Execute
+                SemanticBudgetAction::Execute,
+                "healthy explicit hybrid"
             );
-            assert_eq!(
+            require_matches!(
                 semantic_budget_action(&default_hybrid, phase),
-                SemanticBudgetAction::Execute
+                SemanticBudgetAction::Execute,
+                "healthy default hybrid"
             );
-            assert_eq!(
-                semantic_budget_action(&lexical, phase),
-                SemanticBudgetAction::Execute
+            require_matches!(
+                semantic_budget_action(&lexical_mode_meta, phase),
+                SemanticBudgetAction::Execute,
+                "healthy lexical"
             );
         }
 
         for phase in [BudgetPhase::NearLimit, BudgetPhase::Exhausted] {
-            assert_eq!(
+            require_matches!(
                 semantic_budget_action(&explicit_semantic, Some(phase)),
                 SemanticBudgetAction::StrictSemanticTimeout,
                 "explicit semantic must fail closed instead of changing its realized mode"
             );
-            assert_eq!(
+            require_matches!(
                 semantic_budget_action(&explicit_hybrid, Some(phase)),
                 SemanticBudgetAction::HybridLexicalFallback,
                 "hybrid may fail open when semantic work no longer fits the budget"
             );
-            assert_eq!(
+            require_matches!(
                 semantic_budget_action(&default_hybrid, Some(phase)),
                 SemanticBudgetAction::HybridLexicalFallback,
                 "default hybrid mode must retain the same explicit fail-open policy"
             );
-            assert_eq!(
-                semantic_budget_action(&lexical, Some(phase)),
+            require_matches!(
+                semantic_budget_action(&lexical_mode_meta, Some(phase)),
                 SemanticBudgetAction::Execute,
                 "lexical mode has no semantic work to shed"
             );
@@ -104295,24 +104313,35 @@ mod subcommand_robot_output_tests {
         ) {
             meta.fall_back_to_lexical("budget pressure");
         }
-        assert_eq!(meta.requested, SearchMode::Semantic);
-        assert_eq!(meta.realized, SearchMode::Semantic);
-        assert_eq!(meta.fallback_tier, None);
-        assert_eq!(meta.fallback_reason, None);
+        require_matches!(
+            meta.requested,
+            SearchMode::Semantic,
+            "strict requested mode"
+        );
+        require_matches!(meta.realized, SearchMode::Semantic, "strict realized mode");
+        require_matches!(meta.fallback_tier, None, "strict fallback tier");
+        require_matches!(
+            meta.fallback_reason.as_deref(),
+            None,
+            "strict fallback reason"
+        );
 
         let mut unavailable_hybrid = SearchModeMeta::new(SearchMode::Hybrid, false);
         unavailable_hybrid.fall_back_to_lexical("semantic context unavailable: no index");
         for phase in [BudgetPhase::NearLimit, BudgetPhase::Exhausted] {
-            assert_eq!(
+            require_matches!(
                 semantic_budget_action(&unavailable_hybrid, Some(phase)),
                 SemanticBudgetAction::Execute,
                 "a prior semantic-availability fallback must keep its original cause"
             );
         }
-        assert_eq!(
+        require_matches!(
             unavailable_hybrid.fallback_reason.as_deref(),
-            Some("semantic context unavailable: no index")
+            Some("semantic context unavailable: no index"),
+            "prior fallback reason"
         );
+
+        Ok(())
     }
 
     #[test]
