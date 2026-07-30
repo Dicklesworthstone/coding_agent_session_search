@@ -374,13 +374,13 @@ Ingests history from 23 local agents, normalizing them into a unified `Conversat
 - **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
 - **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
-- **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content)
+- **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content), plus Oh My Pi (`omp`) at `~/.omp/agent/sessions` — same wire format, including per-session sub-agent transcripts
 - **GitHub Copilot Chat**: VS Code global storage under `github.copilot-chat` (JSON)
 - **Copilot CLI**: `~/.copilot/session-state`, legacy `~/.copilot/history-session-state`, and `gh copilot` config paths (JSONL/JSON)
 - **OpenClaw**: `~/.openclaw/agents/*/sessions` (Session JSONL)
 - **Crush**: `~/.crush/crush.db` and per-project `.crush/crush.db` (SQLite)
 - **Hermes**: `~/.hermes/state.db` and project-local `.hermes/state.db` (SQLite)
-- **Kimi Code**: `~/.kimi/sessions/*/*/wire.jsonl` (Session JSONL)
+- **Kimi Code**: `$KIMI_CODE_HOME/sessions/*/*/agents/*/wire.jsonl` (default `~/.kimi-code`; sub-agents index as `<sessionId>:<agentId>`), plus the legacy `~/.kimi/sessions/*/*/wire.jsonl` layout (Session JSONL)
 - **Qwen Code**: `~/.qwen/tmp/*/chats/session-*.json` (Chat JSON)
 - **Factory (Droid)**: `~/.factory/sessions` (JSONL files organized by workspace slug)
 - **Antigravity (agy)**: `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl` (clean JSONL transcript), with the durable per-conversation `conversations/<uuid>.db` (SQLite) mirrored alongside. Resume with `cass resume <transcript> --agent agy` (`agy --conversation <uuid>`).
@@ -3033,7 +3033,7 @@ Update check state is stored in the data directory:
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | `62a58ee3` (`0.1.19`; branch `fts5-overlong-hotfix-cass362` = the pinned `f9cc3294` family plus only the FTS5 overlong-term skip cap routed through every tokenizer construction [cass#362]. Upstream main has since gone async-first, so the full-forward bump is a separate validated pass. Family features unchanged: the exact Git source containing the existing-only schema-open contract that the same-version registry archive lacks, a `[patch.crates-io]` source override so connector dependencies cannot reintroduce a second registry-backed family, contentless-FTS5 reopen/catch-up, bounded clean-page reclamation, and fused equality-run counting [cass#345 / frankensqlite#131]) |
-| `franken-agent-detection` | `f7f38440` (OpenCode remote-root scan isolation [cass #357], plus Grok Build connector [cass #328], Gemini CLI JSONL discovery, ordered `$set.messages` replay, and current role normalization [cass #341]) |
+| `franken-agent-detection` | `1a258873` (current Kimi Code layout + `KIMI_CODE_HOME` [cass #351], Oh My Pi probe roots + sub-agent transcripts, OpenCode remote-root scan isolation [cass #357], Grok Build connector [cass #328], Gemini CLI JSONL discovery and role normalization [cass #341]) |
 | `asupersync` | `=0.3.9` |
 | `frankensearch` | `ad8e29ea` (pure-Rust `native`, architecture-safe HNSW with native-only read admission that never rebuilds a rejected selected artifact, explicit `cass-compat` → `lexical-tantivy`, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission, cancellation-safe facade opening, generation-pinned Quill hydration, and the restored positionless-term-frequency plumbing; frankentorch remains pinned by git rev inside frankensearch — cass #308, #333, bd-8nqz.5, bd-07os, bd-r65a.1) |
 | `frankentui` | `5f78cfa0` |

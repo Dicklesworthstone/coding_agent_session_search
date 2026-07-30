@@ -243,3 +243,71 @@ fn kimi_oversized_sparse_wire_file_returns_empty_result_without_panic() {
 
     assert!(scan_storage(&storage).is_empty());
 }
+
+/// GH #351: the modern Kimi Code layout (`$KIMI_CODE_HOME`-style tree with
+/// `sessions/<workDirKey>/<sessionId>/agents/<agentId>/wire.jsonl` and a
+/// session-root `state.json`) must parse end-to-end through the cass
+/// re-export: collision-free session IDs, state.json metadata, the
+/// turn.prompt/context.append_message dedup rule, and tool invocations with
+/// call IDs. Deep schema coverage lives in franken_agent_detection; this pins
+/// the integration.
+#[test]
+fn kimi_modern_layout_parses_end_to_end() {
+    let tmp = TempDir::new().unwrap();
+    let storage = tmp.path().join(".kimi-code/sessions");
+    let session_dir = storage.join("wd_example").join("session-modern-1");
+    let wire_dir = session_dir.join("agents").join("main");
+    fs::create_dir_all(&wire_dir).unwrap();
+    fs::write(
+        session_dir.join("state.json"),
+        r#"{"title":"Modern session title","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:01:00Z","workDir":"/path/to/project","agents":{"main":{"type":"main"}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        wire_dir.join("wire.jsonl"),
+        concat!(
+            r#"{"type":"turn.prompt","input":[{"type":"text","text":"find the bug"}],"time":"2026-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"find the bug"}]},"time":"2026-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"looking now"}},"time":"2026-01-01T00:00:02Z"}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"call_1","name":"ReadFile","args":{"path":"src/lib.rs"}},"time":"2026-01-01T00:00:03Z"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let convs = scan_storage(&storage);
+    assert_eq!(convs.len(), 1, "one modern session expected");
+    let conv = &convs[0];
+    assert_eq!(
+        conv.external_id.as_deref(),
+        Some("session-modern-1"),
+        "main-agent external_id must be the session ID, not 'main'"
+    );
+    assert_eq!(
+        conv.workspace.as_deref(),
+        Some(Path::new("/path/to/project")),
+        "workspace must come from state.json workDir"
+    );
+    assert_eq!(conv.title.as_deref(), Some("Modern session title"));
+    let user_messages: Vec<_> = conv
+        .messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .collect();
+    assert_eq!(
+        user_messages.len(),
+        1,
+        "turn.prompt and its context.append_message echo must dedupe to one user message"
+    );
+    let invocation = conv
+        .messages
+        .iter()
+        .flat_map(|message| message.invocations.iter())
+        .next()
+        .expect("tool.call must produce an invocation");
+    assert_eq!(invocation.name, "ReadFile");
+    assert_eq!(invocation.call_id.as_deref(), Some("call_1"));
+}
