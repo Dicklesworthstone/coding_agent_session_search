@@ -5955,6 +5955,14 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "tui",
 ];
 
+/// Commands that mutate state or reach the network must never be entered by
+/// fuzzy typo attraction — only by exact spelling. `forget` deletes indexed
+/// data (its reparse failure also used to swallow the implicit-search
+/// fallback: `cass format` → "forget" → hard exit-2 instead of searching)
+/// and `upgrade` performs a release check / interactive install (`cass
+/// parade` executed it). Adversarial-review finding F1 on GH #367.
+const SIDE_EFFECT_EXACT_ONLY_COMMANDS: &[&str] = &["forget", "upgrade"];
+
 fn closest_top_level_command(arg: &str) -> Option<&'static str> {
     let lower = arg.to_ascii_lowercase();
     if lower.len() < 3 {
@@ -5964,6 +5972,7 @@ fn closest_top_level_command(arg: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .filter(|candidate| candidate != &lower)
+        .filter(|candidate| !SIDE_EFFECT_EXACT_ONLY_COMMANDS.contains(candidate))
         .map(|candidate| (candidate, strsim::levenshtein(&lower, candidate)))
         .filter(|(_, distance)| *distance <= 2)
         .min_by_key(|(_, distance)| *distance)
@@ -6001,12 +6010,57 @@ mod canonical_top_level_command_tests {
                          robot mode will rewrite `cass {name} ... --robot` into `search {name} ...` (GH #367)"
                     );
                 }
+                // Reverse direction: a canonical entry with no matching clap
+                // subcommand is a stale typo attractor — a removed/renamed
+                // command would keep pulling nearby query words into a
+                // rewrite that can only fail (adversarial-review F1).
+                let clap_names: Vec<String> = cli
+                    .get_subcommands()
+                    .map(|sub| sub.get_name().to_string())
+                    .collect();
+                for canonical in CANONICAL_TOP_LEVEL_COMMANDS {
+                    assert!(
+                        clap_names.iter().any(|name| name == canonical),
+                        "CANONICAL_TOP_LEVEL_COMMANDS entry `{canonical}` has no clap subcommand; \
+                         remove the stale entry so it stops attracting typo corrections"
+                    );
+                }
             })
             .expect("spawn large-stack clap test thread");
         match handle.join() {
             Ok(()) => {}
             Err(panic) => std::panic::resume_unwind(panic),
         }
+    }
+
+    /// Adversarial-review F1 on GH #367: adding `forget`/`upgrade` to the
+    /// canonical list put common English query words inside the
+    /// Levenshtein-2 attraction net. `cass format` stopped auto-recovering
+    /// to `search "format"` and hard-failed on forget's required
+    /// `--source-glob`; `cass parade` silently EXECUTED the upgrade
+    /// release-check. Side-effectful commands dispatch on exact spelling
+    /// only.
+    #[test]
+    fn side_effectful_commands_are_never_typo_attractors() {
+        for query_word in ["format", "forest", "forge", "forged", "fort"] {
+            assert_ne!(
+                closest_top_level_command(query_word),
+                Some("forget"),
+                "`cass {query_word}` must fall through to implicit search, not forget"
+            );
+        }
+        for query_word in ["parade", "upgrades", "upgrde", "grade"] {
+            assert_ne!(
+                closest_top_level_command(query_word),
+                Some("upgrade"),
+                "`cass {query_word}` must never execute the upgrade release-check"
+            );
+        }
+        // Exact spellings still dispatch (GH #367's actual fix is untouched).
+        assert!(CANONICAL_TOP_LEVEL_COMMANDS.contains(&"forget"));
+        assert!(CANONICAL_TOP_LEVEL_COMMANDS.contains(&"upgrade"));
+        assert!(looks_like_top_level_command_or_typo("forget"));
+        assert!(looks_like_top_level_command_or_typo("upgrade"));
     }
 
     /// Behavioral pin for the #367 repro: the robot flag must not turn a
@@ -18582,7 +18636,11 @@ fn state_meta_json_inner(
         },
     )
     .unwrap_or_else(|err| {
-        let summary = err.to_string();
+        // `{err:#}` renders the full anyhow chain: the outer context alone
+        // ("computing lexical storage fingerprint for ...") hides the root
+        // cause (e.g. a corrupt FTS5 structure record), which is the only
+        // actionable part of the failure (cass#368).
+        let summary = format!("{err:#}");
         crate::search::asset_state::SearchAssetSnapshot {
             lexical: crate::search::asset_state::LexicalAssetState {
                 status: "error",
@@ -23576,7 +23634,7 @@ fn search_lexical_self_heal_diagnosis(
                     code: 5,
                     kind: CliErrorKind::StorageFingerprint.kind_str(),
                     message: format!(
-                        "failed to fingerprint cass database {} while validating lexical assets: {err}",
+                        "failed to fingerprint cass database {} while validating lexical assets: {err:#}",
                         db_path.display()
                     ),
                     hint: Some(
@@ -23815,7 +23873,7 @@ fn ensure_lexical_assets_for_search(
             )
                 > crate::indexer::incremental_authoritative_lexical_repair_max_db_bytes()
             {
-                "Run `cass index --full --json` to rebuild the lexical checkpoint: this database exceeds the automatic-repair size threshold, so plain `cass index` defers the repair and cannot complete it."
+                "Run `cass index --full --json` to rebuild the lexical checkpoint: this database exceeds the automatic-repair size threshold, so plain `cass index` defers the repair (unless CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR=1 forces it)."
             } else {
                 "Run `cass index --json` to complete the lexical rebuild checkpoint, then retry the search."
             };
@@ -46859,6 +46917,9 @@ fn doctor_archive_export_verify_target(target_root: &Path, data_dir: &Path) -> s
             ) {
                 continue;
             }
+            if is_fsqlite_runtime_lock_sidecar(&relative) {
+                continue;
+            }
             if !expected_paths.contains(&relative) {
                 issues.push(serde_json::json!({
                     "kind": "extra_file",
@@ -49171,6 +49232,9 @@ fn doctor_support_bundle_verify_path(
                 continue;
             }
             if relative == "manifest.json" {
+                continue;
+            }
+            if is_fsqlite_runtime_lock_sidecar(&relative) {
                 continue;
             }
             if !expected_paths.contains(&relative) {
@@ -52329,6 +52393,20 @@ fn promote_doctor_reconstruct_candidate_bundle(
             continue;
         }
         if item.live_exists && !item.candidate_exists {
+            // A live `-shm` without a candidate replacement is legitimate:
+            // the pinned frankensqlite's shm lifecycle creates one on any
+            // WAL-mode open, but shm is a transient shared-memory index that
+            // SQLite rebuilds on the next open — a candidate bundle never
+            // needs to ship one. The stale live copy is backed up and then
+            // removed after promotion so it cannot pair with the new DB.
+            // A live `-wal` without replacement stays fatal: WAL holds data.
+            if item.suffix == "-shm" {
+                report.warnings.push(format!(
+                    "live shm sidecar {} has no candidate replacement; it will be backed up and removed at promotion (shm is rebuilt on next open)",
+                    item.target_path.display()
+                ));
+                continue;
+            }
             report.blocked_reasons.push(format!(
                 "live sqlite bundle component {} exists but candidate replacement {} is missing",
                 item.target_path.display(),
@@ -52374,10 +52452,13 @@ fn promote_doctor_reconstruct_candidate_bundle(
     report.sidecar_bundle_complete = bundle_items
         .iter()
         .filter(|item| item.asset_class == DoctorAssetClass::ArchiveDbSidecar)
+        // `-shm` is transient and excluded from the completeness contract
+        // (see the per-item warning above); only WAL carries data.
+        .filter(|item| item.suffix != "-shm")
         .all(|item| !item.live_exists || item.candidate_exists);
     if !report.sidecar_bundle_complete {
         report.blocked_reasons.push(
-            "sqlite sidecar bundle is incomplete; every live WAL/SHM component must have a verified candidate replacement"
+            "sqlite sidecar bundle is incomplete; every live WAL component must have a verified candidate replacement"
                 .to_string(),
         );
     }
@@ -52703,6 +52784,33 @@ fn promote_doctor_reconstruct_candidate_bundle(
                 receipt.status = DoctorActionStatus::Failed;
                 receipt.blocked_reasons.push(err);
                 break;
+            }
+        }
+        // A live `-shm` with no candidate replacement was backed up above;
+        // remove the stale copy now so the transient shared-memory index of
+        // the REPLACED database cannot pair with the newly promoted one
+        // (SQLite rebuilds shm on the next WAL-mode open).
+        if receipt.status != DoctorActionStatus::Failed {
+            for item in bundle_items
+                .iter()
+                .filter(|item| item.suffix == "-shm" && item.live_exists && !item.candidate_exists)
+            {
+                match std::fs::remove_file(&item.target_path) {
+                    Ok(()) => {
+                        receipt
+                            .precondition_checks
+                            .push("stale_live_shm_removed_after_backup:-shm".to_string());
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        receipt.status = DoctorActionStatus::Failed;
+                        receipt.blocked_reasons.push(format!(
+                            "failed to remove stale live shm sidecar {} after backup: {err}",
+                            item.target_path.display()
+                        ));
+                        break;
+                    }
+                }
             }
         }
         if receipt.status != DoctorActionStatus::Failed
@@ -53173,7 +53281,9 @@ fn doctor_operation_owner_from_doctor_lock(
         } else if active {
             "current doctor process owns the mutation lock".to_string()
         } else {
-            "stale doctor lock metadata is advisory; do not delete it without inspecting receipts"
+            "stale doctor lock metadata is advisory; do not delete it — cass doctor --fix \
+             reclaims it with a receipt under doctor/reclaimed/ once the dead owner's \
+             heartbeat exceeds the self-heal bound"
                 .to_string()
         },
     })
@@ -54352,6 +54462,177 @@ fn doctor_failure_marker_report_from_marker(
         failed_checks: marker.failed_checks,
         corrupt_reason: None,
     }
+}
+
+/// Generous bound after which a dead `doctor --fix` owner's leftovers stop
+/// blocking new repairs (cass#368). Deliberately much larger than
+/// [`DOCTOR_LOCK_HEARTBEAT_STALE_AFTER_MS`]: suspecting staleness only makes
+/// diagnostics honest, while reclaiming re-arms a mutating repair.
+const DOCTOR_STALE_SELF_HEAL_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
+
+struct DoctorStaleSelfHealSummary {
+    receipt_path: PathBuf,
+    reclaimed_marker_files: usize,
+    lock_metadata_cleared: bool,
+}
+
+fn doctor_file_mtime_age_ms(path: &Path, now_ms: i64) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    doctor_elapsed_since_ms(now_ms, system_time_to_unix_ms(modified))
+}
+
+/// Self-heal for the cass#368 dead end: a `doctor --fix` that crashed mid
+/// `repair_apply` leaves the mutation-lock file with dead-owner metadata and
+/// a repair failure marker, and every later `--fix` refuses with
+/// `manual_delete_allowed: false` — forever.
+///
+/// Reclaim is evidence-gated, in line with the #176 index-run doctrine that
+/// flock acquisition (not pid probing, which breaks under pid reuse) is the
+/// proof that the recorded owner is gone:
+///
+/// * the mutation flock must be acquirable (owner provably gone), AND
+/// * the lock file must carry metadata whose heartbeat is older than
+///   [`DOCTOR_STALE_SELF_HEAL_AFTER_MS`] — i.e. a *crashed* owner, not a
+///   repair that failed cleanly and released the lock.
+///
+/// Only then is the failure marker (itself older than the bound) moved —
+/// never deleted — into `doctor/reclaimed/<ts>-stale-repair-state/` with a
+/// receipt, and the stale lock metadata truncated in place while the flock
+/// is held (the metadata is preserved verbatim in the receipt). A marker
+/// without crashed-owner lock evidence is a deliberate fail-closed record of
+/// a completed-but-failed repair and continues to require
+/// `--allow-repeated-repair`.
+fn doctor_self_heal_stale_repair_state(
+    data_dir: &Path,
+    repair_class: &str,
+) -> Option<DoctorStaleSelfHealSummary> {
+    let now_ms = doctor_now_ms();
+    let lock_path = doctor_mutation_lock_path(data_dir);
+    if !lock_path.exists() {
+        return None;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .ok()?;
+    if fs2::FileExt::try_lock_exclusive(&file).is_err() {
+        // A live owner (or an uninspectable lock): never heal underneath it.
+        return None;
+    }
+
+    let outcome = (|| {
+        let metadata = doctor_read_lock_metadata(&file);
+        if metadata.is_empty() {
+            return None;
+        }
+        let heartbeat_age_ms = doctor_elapsed_since_ms(
+            now_ms,
+            doctor_lock_metadata_i64(&metadata, "updated_at_ms")
+                .or_else(|| doctor_lock_metadata_i64(&metadata, "started_at_ms")),
+        )
+        .or_else(|| doctor_file_mtime_age_ms(&lock_path, now_ms));
+        if !heartbeat_age_ms.is_some_and(|age| age > DOCTOR_STALE_SELF_HEAL_AFTER_MS) {
+            return None;
+        }
+
+        let marker = collect_doctor_repair_failure_marker(data_dir, repair_class);
+        let marker_age_ms = marker
+            .found
+            .then(|| {
+                doctor_elapsed_since_ms(now_ms, marker.failed_at_ms).or_else(|| {
+                    marker
+                        .path
+                        .as_deref()
+                        .and_then(|path| doctor_file_mtime_age_ms(Path::new(path), now_ms))
+                })
+            })
+            .flatten();
+        let reclaim_marker = marker_age_ms.is_some_and(|age| age > DOCTOR_STALE_SELF_HEAL_AFTER_MS);
+
+        let stamp = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms)
+            .map(|dt| dt.format("%Y%m%dT%H%M%SZ").to_string())
+            .unwrap_or_else(|| now_ms.to_string());
+        let reclaim_dir = data_dir
+            .join("doctor")
+            .join("reclaimed")
+            .join(format!("{stamp}-stale-repair-state"));
+        std::fs::create_dir_all(&reclaim_dir).ok()?;
+
+        let mut moved_markers = Vec::new();
+        if reclaim_marker {
+            let marker_dir = doctor_repair_failure_marker_dir(data_dir, repair_class);
+            if let Ok(entries) = std::fs::read_dir(&marker_dir) {
+                for entry in entries.flatten() {
+                    let from = entry.path();
+                    if from.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let Some(name) = from.file_name() else {
+                        continue;
+                    };
+                    let to = reclaim_dir.join(name);
+                    if std::fs::rename(&from, &to).is_ok() {
+                        moved_markers.push(serde_json::json!({
+                            "from": from.display().to_string(),
+                            "to": to.display().to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+
+        let receipt = serde_json::json!({
+            "schema_version": 1,
+            "kind": "cass_doctor_stale_repair_state_reclaim_v1",
+            "reclaimed_at_ms": now_ms,
+            "repair_class": repair_class,
+            "self_heal_bound_ms": DOCTOR_STALE_SELF_HEAL_AFTER_MS,
+            "lock": {
+                "path": lock_path.display().to_string(),
+                "heartbeat_age_ms": heartbeat_age_ms,
+                "metadata": metadata,
+                "metadata_cleared": true,
+            },
+            "marker": {
+                "found": marker.found,
+                "age_ms": marker_age_ms,
+                "parse_status": marker.parse_status,
+                "reclaimed": reclaim_marker,
+                "moved": moved_markers,
+            },
+            "rationale": "previous doctor --fix owner is provably gone (mutation flock \
+                          acquired) and its heartbeat exceeded the self-heal bound; the \
+                          crashed repair's leftovers were reclaimed with this receipt \
+                          instead of blocking repairs indefinitely (cass#368)",
+        });
+        let receipt_path = reclaim_dir.join("receipt.json");
+        let encoded = serde_json::to_vec_pretty(&receipt).ok()?;
+        std::fs::write(&receipt_path, encoded).ok()?;
+
+        // Reap the stale metadata in place while holding the flock (the #176
+        // index-run pattern); the metadata lives on inside the receipt.
+        if file.set_len(0).is_ok() {
+            let _ = file.sync_all();
+        }
+
+        tracing::info!(
+            lock_path = %lock_path.display(),
+            receipt = %receipt_path.display(),
+            reclaimed_marker_files = moved_markers.len(),
+            heartbeat_age_ms,
+            "doctor self-heal reclaimed stale repair state from a dead --fix owner (cass#368)"
+        );
+
+        Some(DoctorStaleSelfHealSummary {
+            receipt_path,
+            reclaimed_marker_files: moved_markers.len(),
+            lock_metadata_cleared: true,
+        })
+    })();
+
+    let _ = fs2::FileExt::unlock(&file);
+    outcome
 }
 
 fn collect_doctor_repair_failure_marker(
@@ -61376,6 +61657,179 @@ mod doctor_asset_taxonomy_tests {
         assert!(outcome.requires_override);
     }
 
+    fn write_stale_doctor_lock_metadata(data_dir: &Path, heartbeat_ms: i64) -> PathBuf {
+        use std::io::Write as _;
+        let lock_path = doctor_mutation_lock_path(data_dir);
+        std::fs::create_dir_all(lock_path.parent().expect("lock parent"))
+            .expect("create doctor lock dir");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open doctor lock");
+        write!(
+            file,
+            "schema_version=1\npid=999999\nstarted_at_ms={heartbeat_ms}\nupdated_at_ms={heartbeat_ms}\nmode=safe_auto_run\ncommand=cass doctor --fix\n"
+        )
+        .expect("write doctor lock metadata");
+        lock_path
+    }
+
+    fn write_aged_failure_marker(
+        data_dir: &Path,
+        repair_class: &str,
+        failed_at_ms: i64,
+    ) -> PathBuf {
+        let marker_dir = doctor_repair_failure_marker_dir(data_dir, repair_class);
+        std::fs::create_dir_all(&marker_dir).expect("create marker dir");
+        let marker = serde_json::json!({
+            "marker_kind": DOCTOR_REPAIR_FAILURE_MARKER_KIND,
+            "schema_version": DOCTOR_REPAIR_FAILURE_MARKER_SCHEMA_VERSION,
+            "repair_class": repair_class,
+            "operation_id": "crashed-op",
+            "command_line_mode": "cass doctor --json --fix",
+            "plan_fingerprint": "plan-crashed-op",
+            "affected_artifacts": [],
+            "selected_authorities": [],
+            "rejected_authorities": [],
+            "preflight_checks": [],
+            "applied_actions": [],
+            "verification_checks": [],
+            "failed_checks": ["rebuild:crashed"],
+            "forensic_bundle_path": null,
+            "candidate_path": null,
+            "started_at_ms": failed_at_ms - 10,
+            "failed_at_ms": failed_at_ms,
+            "cass_version": env!("CARGO_PKG_VERSION"),
+            "platform": "test/test",
+            "user_data_modified": false,
+            "operation_outcome_kind": "repair-failed",
+        });
+        let path = marker_dir.join(format!("{failed_at_ms}-crashed-op.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&marker).expect("encode marker"),
+        )
+        .expect("write marker");
+        path
+    }
+
+    /// cass#368: the crashed-owner shape (dead-owner lock metadata + old
+    /// marker) must self-heal with a receipt so `--fix` is not blocked
+    /// forever.
+    #[test]
+    fn doctor_self_heal_reclaims_crashed_owner_lock_and_marker() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path();
+        let now_ms = doctor_now_ms();
+        let nine_days_ago = now_ms - 9 * 24 * 60 * 60 * 1000;
+        let lock_path = write_stale_doctor_lock_metadata(data_dir, nine_days_ago);
+        let marker_path = write_aged_failure_marker(data_dir, "repair_apply", nine_days_ago);
+
+        let heal = doctor_self_heal_stale_repair_state(data_dir, "repair_apply")
+            .expect("crashed-owner shape should self-heal");
+        assert_eq!(heal.reclaimed_marker_files, 1);
+        assert!(heal.lock_metadata_cleared);
+        assert!(heal.receipt_path.exists(), "receipt must exist");
+        assert!(
+            !marker_path.exists(),
+            "marker must be moved (not left) out of the marker dir"
+        );
+        let reclaim_dir = heal.receipt_path.parent().expect("reclaim dir");
+        assert!(
+            reclaim_dir
+                .join(marker_path.file_name().expect("marker name"))
+                .exists(),
+            "marker must be preserved inside the reclaim dir"
+        );
+        let lock_len = std::fs::metadata(&lock_path).expect("lock metadata").len();
+        assert_eq!(
+            lock_len, 0,
+            "stale lock metadata must be truncated in place"
+        );
+
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&heal.receipt_path).expect("read receipt"))
+                .expect("receipt JSON");
+        assert_eq!(
+            receipt["kind"].as_str(),
+            Some("cass_doctor_stale_repair_state_reclaim_v1")
+        );
+        assert_eq!(
+            receipt["lock"]["metadata"]["pid"].as_str(),
+            Some("999999"),
+            "receipt must preserve the reclaimed lock metadata verbatim"
+        );
+
+        let marker = collect_doctor_repair_failure_marker(data_dir, "repair_apply");
+        assert!(
+            !marker.found,
+            "failure marker must no longer gate --fix after the reclaim"
+        );
+    }
+
+    /// A marker without crashed-owner lock evidence is a deliberate
+    /// fail-closed record of a completed-but-failed repair; the self-heal
+    /// must leave it alone (the doctor_fix_refuses_repeated_repair contract).
+    #[test]
+    fn doctor_self_heal_leaves_marker_only_state_alone() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path();
+        let now_ms = doctor_now_ms();
+        let marker_path =
+            write_aged_failure_marker(data_dir, "repair_apply", now_ms - 9 * 24 * 60 * 60 * 1000);
+
+        assert!(
+            doctor_self_heal_stale_repair_state(data_dir, "repair_apply").is_none(),
+            "marker-only state must stay fail-closed"
+        );
+        assert!(marker_path.exists(), "marker must be preserved");
+    }
+
+    /// A recent crash (heartbeat inside the bound) must not self-heal yet.
+    #[test]
+    fn doctor_self_heal_respects_the_generous_bound() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path();
+        let now_ms = doctor_now_ms();
+        let one_hour_ago = now_ms - 60 * 60 * 1000;
+        write_stale_doctor_lock_metadata(data_dir, one_hour_ago);
+        let marker_path = write_aged_failure_marker(data_dir, "repair_apply", one_hour_ago);
+
+        assert!(
+            doctor_self_heal_stale_repair_state(data_dir, "repair_apply").is_none(),
+            "a fresh crash must keep the existing fail-closed behavior"
+        );
+        assert!(marker_path.exists(), "marker must be preserved");
+    }
+
+    /// A live `--fix` owner holding the flock must never be healed under.
+    #[test]
+    fn doctor_self_heal_never_touches_a_live_owner() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path();
+        let now_ms = doctor_now_ms();
+        let nine_days_ago = now_ms - 9 * 24 * 60 * 60 * 1000;
+        let lock_path = write_stale_doctor_lock_metadata(data_dir, nine_days_ago);
+        let marker_path = write_aged_failure_marker(data_dir, "repair_apply", nine_days_ago);
+
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock as holder");
+        fs2::FileExt::try_lock_exclusive(&holder).expect("hold doctor lock");
+
+        assert!(
+            doctor_self_heal_stale_repair_state(data_dir, "repair_apply").is_none(),
+            "self-heal must back off while the flock is held"
+        );
+        assert!(marker_path.exists(), "marker must be preserved");
+        let lock_len = std::fs::metadata(&lock_path).expect("lock metadata").len();
+        assert!(lock_len > 0, "held lock metadata must not be truncated");
+    }
+
     #[test]
     fn doctor_operation_state_blocks_mutation_for_active_index_lock() {
         use std::io::Write as _;
@@ -61580,10 +62034,12 @@ mod doctor_asset_taxonomy_tests {
         assert_eq!(locks[0].stale_suspected, Some(true));
         assert!(!locks[0].manual_delete_allowed);
         assert!(
-            locks[0]
-                .recommended_action
-                .contains("do not delete it without inspecting receipts"),
-            "stale metadata must not become unsafe delete advice: {locks:#?}"
+            locks[0].recommended_action.contains("do not delete it")
+                && locks[0]
+                    .recommended_action
+                    .contains("reclaims it with a receipt"),
+            "stale metadata must not become unsafe delete advice, and must name \
+             the --fix self-heal path (cass#368): {locks:#?}"
         );
     }
 
@@ -73974,6 +74430,15 @@ fn wait_with_progress<T>(
     result
 }
 
+/// frankensqlite VFS namespace lock sidecars (`-fsqlite-ns-gate`,
+/// `-fsqlite-ns-use`) are created next to any database the moment it is
+/// opened — including by an export verification's own read-only probe of
+/// the copy it is checking. They are runtime droppings, never archive
+/// content, so manifest walkers must not report them as extra files.
+fn is_fsqlite_runtime_lock_sidecar(relative_path: &str) -> bool {
+    relative_path.ends_with("-fsqlite-ns-gate") || relative_path.ends_with("-fsqlite-ns-use")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DoctorFtsTableState {
     QueryableViaFrankensqlite,
@@ -73982,6 +74447,13 @@ enum DoctorFtsTableState {
         indexed_messages: i64,
     },
     Missing {
+        frankensqlite_error: String,
+    },
+    /// The FTS virtual table answers queries but its docsize shadow cannot
+    /// even be counted — the #362/#368 corruption class. Distinct from
+    /// `Missing` (a benign absent shadow) so doctor warns instead of
+    /// passing (adversarial-review F6).
+    ShadowCorrupt {
         frankensqlite_error: String,
     },
 }
@@ -74004,7 +74476,7 @@ fn probe_doctor_fts_table(conn: &frankensqlite::Connection) -> DoctorFtsTableSta
     ) {
         Ok(count) => count,
         Err(frankensqlite_error) => {
-            return DoctorFtsTableState::Missing {
+            return DoctorFtsTableState::ShadowCorrupt {
                 frankensqlite_error: frankensqlite_error.to_string(),
             };
         }
@@ -74164,6 +74636,30 @@ mod doctor_fts_tests {
                 }
             ),
             "queryable-but-partial FTS shadow must be reported out of parity (#355): {state:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Adversarial-review F6 (the #362/#368 corruption class): a queryable
+    /// `fts_messages` whose docsize shadow cannot even be counted must
+    /// classify as `ShadowCorrupt` (doctor warns), not `Missing` (doctor
+    /// passes with the error buried in a green message).
+    #[test]
+    fn doctor_fts_probe_reports_uncountable_docsize_as_shadow_corrupt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let db_path = temp_dir.path().join("corrupt-shadow-fts.db");
+
+        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        // A plain table satisfies the queryability probe while having no
+        // docsize shadow behind it — the same observable shape as a shadow
+        // whose structure record is corrupt.
+        conn.execute_batch("CREATE TABLE fts_messages (rowid INTEGER PRIMARY KEY, content TEXT);")?;
+        let state = probe_doctor_fts_table(&conn);
+        assert!(
+            matches!(state, DoctorFtsTableState::ShadowCorrupt { .. }),
+            "queryable table with uncountable docsize must be ShadowCorrupt: {state:?}"
         );
 
         Ok(())
@@ -76389,6 +76885,15 @@ pub(crate) fn run_doctor_impl(
     let safe_auto_run_requested = command_surface == doctor::DoctorCommandSurface::LegacyDoctor
         && execution_mode == doctor::DoctorExecutionMode::SafeAutoFix;
     let repair_class = doctor_repair_class_for_execution(command_surface, execution_mode);
+    // cass#368 self-heal: before the failure marker gates this run, reclaim
+    // (with a receipt, never deleting) leftovers of a --fix owner that
+    // crashed long ago and left the mutation lock + marker blocking every
+    // later repair.
+    let stale_self_heal = if fix {
+        doctor_self_heal_stale_repair_state(&data_dir, &repair_class)
+    } else {
+        None
+    };
     let initial_failure_marker = collect_doctor_repair_failure_marker(&data_dir, &repair_class);
     let repeat_refusal_reason =
         doctor_repair_failure_marker_refusal_reason(&initial_failure_marker);
@@ -76473,6 +76978,25 @@ pub(crate) fn run_doctor_impl(
     }
 
     let mut checks: Vec<Check> = Vec::new();
+    if let Some(heal) = &stale_self_heal {
+        checks.push(Check {
+            name: "stale_repair_state_self_heal".to_string(),
+            status: "pass".to_string(),
+            message: format!(
+                "reclaimed stale repair state from a crashed doctor --fix owner \
+                 ({} failure-marker file(s){}) with receipt {}",
+                heal.reclaimed_marker_files,
+                if heal.lock_metadata_cleared {
+                    " + stale mutation-lock metadata"
+                } else {
+                    ""
+                },
+                heal.receipt_path.display()
+            ),
+            fix_available: true,
+            fix_applied: true,
+        });
+    }
     let mut needs_rebuild = force_rebuild;
     let mut db_ok = false;
     let mut db_conversations: Option<usize> = None;
@@ -76855,6 +77379,25 @@ pub(crate) fn run_doctor_impl(
                                                     "pass",
                                                     format!(
                                                         "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
+                                                    ),
+                                                    false
+                                                );
+                                            }
+                                            Some(DoctorFtsTableState::ShadowCorrupt {
+                                                frankensqlite_error,
+                                            }) => {
+                                                // A queryable table whose docsize shadow
+                                                // cannot be counted is the #362/#368
+                                                // corruption class — previously buried
+                                                // inside a `pass` message
+                                                // (adversarial-review F6). Lexical
+                                                // search still works via Tantivy, so
+                                                // warn rather than fail.
+                                                add_check!(
+                                                    "fts_table",
+                                                    "warn",
+                                                    format!(
+                                                        "Database-resident FTS shadow is queryable but its docsize shadow table failed to count ({frankensqlite_error}); the shadow structure is likely corrupt — run `cass doctor --rebuild-canonical-fts --yes` to rebuild it. Lexical search continues via the Tantivy index"
                                                     ),
                                                     false
                                                 );
@@ -85508,6 +86051,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                         "discovery": {
                             "type": "object",
                             "properties": {
+                                "schema_version": { "type": "integer", "const": 1 },
                                 "caps": {
                                     "type": "object",
                                     "properties": {
@@ -85608,7 +86152,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     },
                     "required": ["schema_version", "count_scope", "scan_units", "discovery", "top_sessions", "total_sessions", "total_hits", "top_sessions_truncated", "redaction"]
                 },
-                "_meta": { "type": "object" }
+                "_meta": response_schema_opaque_object()
             },
             "required": ["command", "data", "_meta"]
         }),
@@ -85645,6 +86189,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "search_completeness": response_schema_search_completeness(),
                 "root_cause": response_schema_root_cause_attribution(),
                 "storage_integrity": response_schema_storage_integrity(),
+                "budget": response_schema_budget_block(),
                 "_meta": {
                     "type": "object",
                     "properties": {
@@ -85721,6 +86266,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                         }
                     }
                 },
+                "budget": response_schema_budget_block(),
                 "_meta": {
                     "type": "object",
                     "properties": {
@@ -85803,6 +86349,11 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "remote_source_sync": response_schema_doctor_remote_source_sync_runtime_summary(),
                 "coverage_risk": response_schema_doctor_coverage_risk(),
                 "quarantine": response_schema_opaque_object(),
+                "daemon_runtime": response_schema_opaque_object(),
+                "budget": response_schema_budget_block(),
+                "search_completeness": response_schema_search_completeness(),
+                "root_cause": response_schema_root_cause_attribution(),
+                "storage_integrity": response_schema_storage_integrity(),
                 "_meta": {
                     "type": "object",
                     "properties": {
@@ -86092,6 +86643,10 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "target_line": { "type": ["integer", "null"] },
                 "context": { "type": "integer" },
                 "total_lines": { "type": "integer" },
+                // Provenance flags (uojcg.2.3): archive_only=true means the
+                // source file is gone/stale and content came from the archive.
+                "source_exists": { "type": "boolean" },
+                "archive_only": { "type": "boolean" },
                 "budget": response_schema_budget_block(),
                 "lines": {
                     "type": "array",
@@ -86460,6 +87015,18 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
         "daemon_runtime".to_string(),
         response_schema_opaque_object(),
     );
+    // #287 degradation taxonomy: `reason_code` is the primary entry of
+    // `degraded_reason_codes`; both null/empty on healthy runs. The `budget`
+    // envelope mirrors the search/pack budget block (gh352 family).
+    doctor_properties.insert(
+        "reason_code".to_string(),
+        json!({ "type": ["string", "null"] }),
+    );
+    doctor_properties.insert(
+        "degraded_reason_codes".to_string(),
+        json!({ "type": "array", "items": { "type": "string" } }),
+    );
+    doctor_properties.insert("budget".to_string(), response_schema_budget_block());
     doctor_schema
         .get_mut("required")
         .and_then(|value| value.as_array_mut())
@@ -89104,8 +89671,12 @@ impl IndexStallWatchdog {
         // the producer's read-only open — that cannot be heartbeated, exactly
         // like the finalize checkpoint. Once the pipeline starts moving, the
         // runtime refresh ticks `activity` on every stage-progress change and
-        // quiescence ends, so this grace only covers the otherwise
-        // unobservable pre-first-page window; a genuinely wedged rebuild
+        // quiescence ends. Note the breadth honestly: `is_rebuilding` is set
+        // at scan start and cleared only on rebuild completion, so ANY
+        // phase-0 quiescent wedge between ingest completion and rebuild
+        // completion in a one-shot run gets the finalize grace (a bounded
+        // delay by default; never-abort only if the operator sets
+        // CASS_INDEX_FINALIZE_ABORT_SECS=0). A genuinely wedged rebuild
         // still aborts at the (larger) finalize threshold.
         let effective_abort_threshold = if finalize_wedge
             && phase_code != 2
@@ -90772,10 +91343,19 @@ fn run_index_with_data(
         // authoritative lexical repair (and therefore made nothing new
         // searchable) was the worst possible signal for a large archive.
         // Say what actually happened and name the command that completes it.
+        // Keyed on the specific size-threshold deferral record — the broad
+        // `lexical_update_deferred` flag is also set by OOM-deferred inline
+        // updates whose run then completes a full in-run rebuild, where this
+        // footer would be wrong on both outcome and cause (adversarial-review
+        // F3).
         let lexical_deferred = index_progress
             .stats
             .lock()
-            .map(|stats| stats.lexical_update_deferred)
+            .map(|stats| {
+                stats.lexical_repair.as_ref().is_some_and(|repair| {
+                    repair.kind == "deferred_authoritative_canonical_db_rebuild"
+                })
+            })
             .unwrap_or(false);
         if lexical_deferred {
             eprintln!(
@@ -102666,7 +103246,7 @@ fn run_models_backfill(
             code: 5,
             kind: CliErrorKind::StorageFingerprint.kind_str(),
             message: format!(
-                "Failed to fingerprint cass database {}: {e}",
+                "Failed to fingerprint cass database {}: {e:#}",
                 db_path.display()
             ),
             hint: Some(

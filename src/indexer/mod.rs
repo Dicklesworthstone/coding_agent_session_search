@@ -9490,11 +9490,15 @@ fn repair_fallback_fts_after_full_index_run(
         && let Err(err) =
             fresh_storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)
     {
-        return Ok(Some(FallbackFtsRepairOutcome::SkippedRepairFailed {
-            detail: format!(
-                "fallback FTS repair succeeded but recording its archive fingerprint failed: {err:#}"
-            ),
-        }));
+        // The repair itself SUCCEEDED — only the memo that lets the next run
+        // skip re-probing failed to persist, so the worst case is one
+        // redundant probe/repair later. Report the repair honestly instead
+        // of discarding it as SkippedRepairFailed, which logged "repair
+        // failed" for a fully repaired shadow (adversarial-review F5).
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            "fallback FTS repair succeeded but recording its archive fingerprint failed; the next run will re-probe"
+        );
     }
     Ok(Some(FallbackFtsRepairOutcome::Repaired(repair)))
 }
@@ -10483,7 +10487,7 @@ fn published_lexical_index_validated_for_current_data(index_path: &Path, db_path
         Ok(current_fingerprint) => current_fingerprint == checkpoint.storage_fingerprint,
         Err(err) => {
             tracing::debug!(
-                error = %err,
+                error = %format!("{err:#}"),
                 "could not compute current storage fingerprint while validating published index"
             );
             false
@@ -44110,6 +44114,35 @@ mod tests {
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
     }
 
+    /// cass#368: the storage-fingerprint failure chain must keep its root
+    /// cause. Every render site formats with `{err:#}`; if the chain itself
+    /// were collapsed (e.g. a `map_err` swapping in a fresh error), users
+    /// would again see only "opening readonly storage ..." while the real
+    /// frankensqlite failure (a corrupt FTS5 structure record, a bad header)
+    /// stays invisible.
+    #[test]
+    fn storage_fingerprint_error_keeps_root_cause_in_alternate_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("corrupt.db");
+        std::fs::write(&db_path, b"definitely not a sqlite database").unwrap();
+
+        let err = lexical_rebuild_storage_fingerprint(&db_path).unwrap_err();
+        assert!(
+            err.chain().count() > 1,
+            "fingerprint failure must carry the inner storage-open cause, got: {err:#}"
+        );
+        let root_cause = err.chain().last().unwrap().to_string();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("opening readonly storage to compute lexical fingerprint"),
+            "outer context missing: {rendered}"
+        );
+        assert!(
+            rendered.contains(root_cause.trim()),
+            "root cause {root_cause:?} must survive alternate display: {rendered}"
+        );
+    }
+
     #[test]
     #[serial]
     fn rebuild_tantivy_from_db_deferred_startup_emits_deferred_prep_profile_logs() {
@@ -48039,6 +48072,12 @@ mod tests {
     /// a quarantine here is a same-version-irreducible coverage hole for a
     /// healthy, replayable source (the reported case: a 36 MB Codex session
     /// under ~89 GiB MemAvailable).
+    ///
+    /// Linux/macOS only: the reserve=0 pin yields `Some(false)` real
+    /// pressure only where `available_memory_bytes()` reports a value; on
+    /// other platforms the probe returns `None`, the (pinned) size gate
+    /// fires, and the disposition legitimately quarantines.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[serial]
     fn watch_reindex_defers_large_conversation_with_ample_memory() {

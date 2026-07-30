@@ -139,8 +139,8 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | `62a58ee3` (git branch `fts5-overlong-hotfix-cass362`; `f9cc3294` family + FTS5 overlong-term skip cap [cass#362]) |
 | `franken-agent-detection` | `1557300b` |
-| `asupersync` | `=0.3.6` |
-| `frankensearch` | `2eaf7539` (pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308) |
+| `asupersync` | `=0.3.9` |
+| `frankensearch` | `ad8e29ea` (pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308) |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 

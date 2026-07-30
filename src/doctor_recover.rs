@@ -1026,9 +1026,11 @@ mod tests {
     /// leaf-offset space (91,548 bytes observed in a real Codex rollout) used
     /// to fail every canonical FTS repair path with "fts5: corrupt %_data
     /// record: segment leaf term offset exceeds u16" — including this exact
-    /// `--rebuild-canonical-fts` recovery. With frankensqlite ≥ 95ec7126 the
-    /// overlong term is skipped at the tokenizer, the rebuild completes, and
-    /// neighboring terms in the same message stay indexed.
+    /// `--rebuild-canonical-fts` recovery. With the pinned frankensqlite
+    /// hotfix family (branch `fts5-overlong-hotfix-cass362`, which carries
+    /// the overlong-term skip cap) the overlong term is skipped at the
+    /// tokenizer, the rebuild completes, and neighboring terms in the same
+    /// message stay indexed.
     #[test]
     fn rebuild_canonical_fts_survives_overlong_term_in_corpus() {
         let tmp = tempfile::tempdir().expect("tempdir");

@@ -51,6 +51,17 @@ fn is_transient_lexical_build_path(path: &Path) -> bool {
     })
 }
 
+/// frankensqlite VFS namespace lock sidecars appear next to any database the
+/// moment a local test run opens the committed fixture DB. They carry
+/// machine-local lock state: cloning them into the isolated tempdir makes
+/// the copied database fail its readonly open, so the fixture clone must
+/// never carry them (they are also gitignored).
+fn is_fsqlite_runtime_lock_sidecar_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("-fsqlite-ns-gate") || name.ends_with("-fsqlite-ns-use"))
+}
+
 fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let mut dst = dst_root.to_path_buf();
     for component in rel.components() {
@@ -84,6 +95,9 @@ fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
             }
             Err(err) => return Err(Box::new(err)),
         };
+        if is_fsqlite_runtime_lock_sidecar_path(entry.path()) {
+            continue;
+        }
         let rel = entry.path().strip_prefix(src)?;
         let dst = safe_fixture_destination(tmp.path(), rel)?;
         if entry.file_type().is_dir() {
