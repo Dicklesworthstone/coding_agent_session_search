@@ -1,0 +1,24 @@
+{
+  "dirty_count": 0,
+  "last_export_time": "2026-07-30T00:38:37.344951707+00:00",
+  "last_import_time": "2026-07-27T21:45:39.276117782+00:00",
+  "jsonl_content_hash": "ba36521b07ee8dab497b2bf21c614b6a16a233fdbbd4e9268b88fb5ef73067bc",
+  "jsonl_exists": true,
+  "jsonl_newer": false,
+  "db_newer": false,
+  "workspace_health": "healthy",
+  "reliability_audit": {
+    "source": "sync.status",
+    "health": "healthy",
+    "anomaly_count": 0,
+    "anomalies": []
+  },
+  "git_export": {
+    "available": true,
+    "tracked": true,
+    "worktree_clean": true,
+    "index_clean": false,
+    "head_hash": "8aa671f92623e1d4f8703916627fa4a797534474",
+    "worktree_hash": "4c759b81d94aadc2d4540382722616cf10007a18"
+  }
+}
