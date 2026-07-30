@@ -15,7 +15,23 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
-## Unreleased
+## [v0.6.23] -- 2026-07-30
+
+**Everything landed in the 128 commits between the [v0.6.22 GitHub
+Release](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.6.22)
+(2026-07-06) and 2026-07-30: a hybrid semantic search subsystem plus
+operations/incident observability, two connector expansions (Grok Build;
+current Kimi Code + Oh My Pi), a late-July GitHub-issue triage wave (37
+issues closed in the window), the first half of the
+[#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368)
+FTS5 corruption-opacity defects, and a pinned-dependency wave
+(frankensqlite `62a58ee3` hotfix, franken-agent-detection `1557300b`,
+frankensearch `ad8e29ea`, asupersync `=0.3.9`). Shipping this as a release
+binary also unblocks
+[#352](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/352),
+which was open only because the resumable fast-backfill fix (#348) existed
+solely on `main`. 61 tracked workstreams were closed in
+`.beads/issues.jsonl` over the same window.**
 
 ### Added
 
@@ -34,7 +50,219 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
   discovery/raw-mirror coverage, and the `capabilities --json` inventory
   (now 23 connectors).
 
+- **Current Kimi Code layout + Oh My Pi coverage**
+  ([#351](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/351);
+  commits
+  [`71aefb7e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/71aefb7e),
+  [`8c01f50c`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8c01f50c)).
+  The Kimi connector now reads the modern `$KIMI_CODE_HOME` (default
+  `~/.kimi-code`) tree — `sessions/<workDirKey>/<sessionId>/state.json`
+  plus per-agent `agents/<agentId>/wire.jsonl` transcripts with the new
+  event envelope (prompt-echo dedup, `tool.result` folded onto the
+  originating call, collision-free `<sessionId>:<agentId>` sub-agent IDs) —
+  while legacy `~/.kimi` behavior is preserved verbatim. Oh My Pi (`omp`)
+  surfaces in the pi_agent connector: `.omp/agent` probe roots plus
+  per-session sub-agent transcripts. Fresh-eyes hardening in the final
+  `1557300b` pin: canonical scan-root dedup for symlinked `~/.kimi` →
+  `~/.kimi-code`, `KIMI_CODE_HOME` override replaces (not prepends) the
+  default roots, and out-of-order/duplicate tool results surface as
+  standalone tool messages instead of dropping.
+
+- **Lightweight semantic + hybrid search subsystem with trust-scored
+  reranking** (commit
+  [`31f8c14b`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/31f8c14b)).
+  Embedders behind an `embedder_registry` (FNV-1a feature hashing as an
+  explicit degraded mode, pure-Rust native MiniLM), pure-Rust cross-encoder
+  reranking with RRF-style fusion, and trust scoring/correlation weighting
+  results, with storage-integrity and contention diagnostics keeping the
+  vector path safe.
+
+- **Analytics, operations dashboard, and guided-ops observability** (commit
+  [`ebc181ae`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ebc181ae)).
+  Operator-facing analytics (derive/query/types), the operations dashboard
+  and pages bundle/wizard, and the daemon/indexer/storage plumbing behind
+  them, gated by e2e contracts (onboarding, lessons, guided-ops golden,
+  operations-dashboard contract, bounded quarantine-retry, robot-json).
+
+- **Incident discovery, classification, and redaction for support bundles**
+  (commits
+  [`48c5ee78`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/48c5ee78),
+  [`3699aca3`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/3699aca3),
+  [`ee78f33d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ee78f33d)).
+  Raw session evidence is classified into incident categories and passed
+  through a redaction policy/manifest before it leaves the process, archive
+  discovery and replay are hard-bounded, and the top incident-bearing
+  sessions are summarized for the bundle.
+
+- **Immutable, schema-versioned semantic generation manifests with atomic
+  pointer publish** (commit
+  [`7009b076`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/7009b076)).
+  Generations persist under `generations/<id>/` and are never mutated after
+  publish; `current.json` swaps only after the target generation's manifest
+  validates, so a restarted consumer resolves exact, digest-verified
+  artifacts instead of conventional vector filenames — and serving consumes
+  the exact FSVI artifacts (commit
+  [`e6198947`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e6198947)).
+
+- **Additive budget-envelope metadata on robot payloads** (commit
+  [`e1ad3575`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e1ad3575)):
+  optional top-level `budget` accounting (token/row/time) that existing
+  consumers ignore and budget-aware clients read.
+
+- **`cass sessions --since`, and crash-orphaned lexical staging dirs are
+  reclaimed at startup**
+  ([#324](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/324);
+  commit
+  [`4fddb21f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/4fddb21f)
+  — one crash loop had leaked 410 GB of `cass-lexical-*` staging overnight).
+  `cass sessions --limit` also stays off the full-scan path via an
+  `INDEXED BY` hint
+  ([#323](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/323);
+  commit
+  [`46ccb036`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/46ccb036)).
+
+- **`cass doctor` full-verify mode for the raw-mirror integrity check**
+  (commit
+  [`d6c2093e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d6c2093e)),
+  and **encrypted-archive KDF parameter / key-slot validation on decrypt**
+  (commit
+  [`5a679b02`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5a679b02)).
+
+### Changed
+
+- **FrankenSQLite is pinned to the FTS5 overlong-term hotfix branch**
+  `fts5-overlong-hotfix-cass362` @ `62a58ee3` (`0.1.19`), closing
+  [#362](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/362)
+  (commit
+  [`19b664d2`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/19b664d2)):
+  terms over 1024 bytes are skipped at a shared capped tokenizer factory —
+  a 91,548-byte token (normal data in coding-agent corpora) previously
+  corrupted the `%_data` segment write and blocked every repair path,
+  including from-scratch rebuilds; the porter stemmer passes >64-byte
+  tokens through unstemmed; and a failed pending-flush is a hard error
+  instead of silently writing an empty structure row. Pin journey inside
+  this window: `=0.1.13` → `=0.1.18` (commit
+  [`aa92a453`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/aa92a453))
+  → crates.io family (commit
+  [`3abf6165`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/3abf6165))
+  → the git hotfix pin, because upstream main has moved to an async-first
+  API and the full forward bump is a separate validated pass.
+
+- **franken-agent-detection advanced to `1557300b`** (0.1.10): `6d24c532`
+  (Grok Build parser/factory, commit
+  [`aa92a453`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/aa92a453))
+  → `f7f38440` (OpenCode remote-root scan isolation, so local
+  `opencode.db` sessions are no longer double-tagged under configured
+  remote SSH sources —
+  [#357](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/357);
+  commit
+  [`e2151f95`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e2151f95))
+  → `1a258873` (Kimi Code / Oh My Pi, commit
+  [`71aefb7e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/71aefb7e))
+  → `1557300b` (fresh-eyes hardening, commit
+  [`8c01f50c`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8c01f50c)).
+
+- **frankensearch pinned to `ad8e29ea`** with the explicit
+  `lexical_tantivy` CASS compatibility surface and cancellation-safe facade
+  opening (commits
+  [`e6198947`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e6198947),
+  [`b976d49d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/b976d49d)
+  — the latter also enforces exact dependency and daemon identity
+  contracts).
+
+- **asupersync `=0.3.5` → `=0.3.9`** (commits
+  [`047f70a4`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/047f70a4),
+  [`aa92a453`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/aa92a453)).
+
+- **Release engineering**: simplified per-target release matrix and
+  installer version/artifact handling (commit
+  [`f83da705`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f83da705));
+  the fresh-clone CI guard rejects only sibling-path `[patch]` overrides,
+  so the checked-in hotfix pins build from a clean clone
+  ([#361](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/361) /
+  [#365](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/365);
+  commit
+  [`472983c2`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/472983c2)).
+
 ### Fixed
+
+- **`cass forget --robot` and `cass upgrade` parse again, and no longer sit
+  in the typo-attractor net**
+  ([#367](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/367);
+  commits
+  [`d62bb6a5`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d62bb6a5),
+  [`d887ae20`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d887ae20)).
+  `forget`/`upgrade` joined `CANONICAL_TOP_LEVEL_COMMANDS` — the list is
+  now pinned to the clap tree in both directions — and side-effect commands
+  are matched exactly only: the Levenshtein-2 net had made `cass format`
+  hard-fail on `forget`'s required `--source-glob` and made `cass parade`
+  silently *execute* the upgrade release-check.
+
+- **cass dies quietly on stdout EPIPE**
+  ([#356](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/356);
+  commit
+  [`87a39572`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/87a39572))
+  via the default SIGPIPE disposition — an early-exiting pipe consumer no
+  longer produces a SIGABRT and a macOS crash report.
+
+- **Watch-once no longer quarantines a session on a false OOM**
+  ([#364](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/364),
+  the quarantine-poisoning half; commit
+  [`ef7e2595`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ef7e2595)):
+  an ingest `NoMem` while the host reports ample memory now defers instead
+  of quarantining the session. The issue stays open for its remaining half.
+
+- **Stall-watchdog liveness across the ingest → staged-shard-build
+  hand-off**
+  ([#366](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/366)
+  and the watchdog half of
+  [#359](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/359);
+  mitigates #329/#345; commits
+  [`368467d6`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/368467d6),
+  [`8b42750a`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8b42750a)).
+  `cass index --full --force-rebuild` on a large corpus no longer aborts
+  (exit 70) in a legitimate hand-off window; park-site flapping between
+  waiting states no longer resets the stall clock; and an optional FTS
+  repair failure no longer fails a completed `index --full`.
+
+- **Truthful deferral verdicts for large archives**
+  ([#359](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/359);
+  commit
+  [`5fb24973`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5fb24973)).
+  Plain `cass index` now states when it deferred the authoritative lexical
+  rebuild and names `cass index --full` as the completing command, and the
+  `checkpoint_incomplete` hint is size-aware instead of recommending the
+  exact command that defers again. "index completed" is also no longer
+  printed after a failed run (commit
+  [`8b42750a`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8b42750a)).
+
+- **`cass sources add` merges `--preset` with explicit `--path` instead of
+  silently dropping the custom paths**
+  ([#358](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/358)),
+  and **doctor flags a queryable-but-partial canonical FTS shadow
+  (PartialParity) instead of passing it**
+  ([#355](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/355))
+  — commit
+  [`2c85eeaf`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/2c85eeaf),
+  with the parity warning noting that small drift during an active index
+  run is transient (commit
+  [`8b42750a`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8b42750a)).
+
+- **First half of the #368 FTS5-corruption failure chain**
+  ([#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368),
+  defects 1 and 4 of 4; commit
+  [`d887ae20`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d887ae20)).
+  Every fingerprint-failure render site now formats the full `anyhow` chain
+  with `{err:#}`, so the root cause (`fts5: corrupt %_data record ...`) is
+  no longer swallowed by the outer "opening readonly storage" context. A
+  `doctor --fix` that crashed mid-repair now self-heals its stale
+  mutation-lock state — evidence-gated (flock acquirable *and* heartbeat
+  beyond a 24 h bound), markers moved (never deleted) into
+  `doctor/reclaimed/<ts>-stale-repair-state/` with a `receipt.json` — where
+  it previously left a 9-day dead end with no way out. And the new
+  `DoctorFtsTableState::ShadowCorrupt` classification warns on a queryable
+  `fts_messages` whose docsize shadow cannot be counted instead of passing
+  with the error buried. Defects 2–3 remain open.
 
 - **Resumed semantic candidate selection remains bounded across sparse parent
   gaps** (#348). Resume scans now stream eligible rows once from the canonical
@@ -74,7 +302,8 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
   a single shadow-driven primary-key probe stream instead of repeatedly
   rescanning 4,096-row keyset pages or retaining the complete shadow rowid
   domain. The FrankenSQLite
-  pin is also advanced to 0.1.18, whose fused composite-index equality-run
+  pin was advanced to 0.1.18 (superseded later in this same release by the
+  `62a58ee3` hotfix pin — see *Changed*), whose fused composite-index equality-run
   counter supplies the bounded canonical count and whose bounded clean-page
   reclamation prevents the false `OutOfMemory` failure observed while creating
   an absent FTS shadow inside a 24 GiB cgroup. Failure-atomic publication and
@@ -105,6 +334,124 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
   conversations / messages / vectors per phase) and `total_is_final`;
   `eta_seconds` is suppressed while `total` is still a lazily expanding
   "discovered so far" count instead of regressing by hours.
+
+- **Semantic rebuilds are failure-atomic, and the index → embed hand-off no
+  longer deadlocks (fastembed) or panics (hash)**
+  ([#333](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/333);
+  commit
+  [`486801f9`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/486801f9)
+  — the same commit fixed the macOS daemon-socket refusal on the symlinked
+  `/tmp` → `/private/tmp` parent,
+  [#346](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/346)).
+  Semantic rebuild progress is reported
+  ([#342](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/342);
+  commit
+  [`93401d54`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/93401d54)),
+  and resumed semantic selection is bounded
+  ([#343](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/343);
+  commit
+  [`75e66a17`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/75e66a17),
+  completed by the #348 work above).
+
+- **Canonical FTS repair is resumable and failure-atomic**
+  ([#344](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/344);
+  commit
+  [`77c16b07`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/77c16b07)).
+  The same change gives `doctor --rebuild-canonical-fts --dry-run`
+  unconditional precedence over `--yes` — the non-mutating preview that
+  [#354](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/354)
+  reported as missing.
+
+- **Connector regressions**: Gemini CLI's current `session-*.jsonl`
+  sessions ingest again
+  ([#341](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/341);
+  commit
+  [`11900a44`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/11900a44));
+  the Codex connector preserves modern `function_call` arguments in
+  searchable content
+  ([#339](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/339);
+  commit
+  [`8eb80495`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8eb80495));
+  mutable watch-once semantic artifacts reconcile
+  ([#336](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/336);
+  commit
+  [`af95327b`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/af95327b));
+  guide planner aliases are disambiguated
+  ([#337](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/337);
+  commit
+  [`84d71f25`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/84d71f25)).
+
+- **Early-window indexer reliability**: the post-publish WAL checkpoint is
+  no longer killed as a finalize wedge
+  ([#319](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/319) /
+  [#321](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/321);
+  commit
+  [`e4360670`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e4360670));
+  a corrupt derived fallback-FTS after a successful full index run is
+  non-fatal
+  ([#327](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/327);
+  commit
+  [`8110944f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8110944f));
+  deferred-checkpoint mode uses the bounded bulk-import WAL cadence instead
+  of disabling autocheckpoint (commit
+  [`968a5f3c`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/968a5f3c)).
+
+- **Storage/doctor/fleet batch (2026-07-22)**: embedder verification,
+  quality-eval sanitization, and FTS5 duplicate recovery (commit
+  [`78d25b7f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/78d25b7f));
+  the daemon reconciles the semantic index with canonical messages (commit
+  [`ada71e79`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ada71e79));
+  `daily_stats` rebuild stays bounded (commit
+  [`51ca7e9f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/51ca7e9f));
+  sources-doctor assesses local storage without mutating the source path
+  (commit
+  [`34676c12`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/34676c12))
+  and prefers preservation evidence over the generic unreadable-path signal
+  (commit
+  [`a5edfe67`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/a5edfe67));
+  fleet doctor state stays truthful (commit
+  [`52e03506`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/52e03506))
+  and unsuccessful upgrade rehearsals fail (commit
+  [`28c92ca1`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/28c92ca1));
+  repro emits a runnable, share-safe rerun contract (commit
+  [`82927dfc`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/82927dfc)).
+
+- **Test-infrastructure and pinned-dependency fallout**: frankensqlite VFS
+  namespace lock sidecars (`-fsqlite-ns-gate` / `-fsqlite-ns-use`) are
+  never treated as historical bundles in salvage (commit
+  [`d3adf9da`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d3adf9da))
+  and are skipped by the archive-export / support-bundle manifest walkers
+  and candidate promotion (commit
+  [`d887ae20`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d887ae20));
+  pre-existing lib-suite breakage was repaired so `main` is green (commit
+  [`a37c9069`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/a37c9069));
+  introspect golden coverage is bound to the executable matrix (commit
+  [`fdf28d22`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/fdf28d22));
+  compatibility and manifest proofs were hardened (commit
+  [`9d02210c`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/9d02210c));
+  and the E2E suite binds strict-RCH evidence to immutable runs (commits
+  [`78ea1ecb`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/78ea1ecb),
+  [`29b87cd6`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/29b87cd6)),
+  isolates child-process environments (commit
+  [`704a49f1`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/704a49f1)),
+  and bounds semantic trace artifacts (commit
+  [`aefd6357`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/aefd6357)).
+
+> **Still open after this release**:
+> [#329](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/329)
+> (daily_stats RSS on a 967k-message corpus),
+> [#345](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/345)
+> (dry-run cost on a large partial shadow),
+> [#349](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/349) /
+> [#350](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/350)
+> (macOS migration OOM / watch-once scan breadth),
+> [#353](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/353)
+> (status/search fingerprint disagreement — circular mechanism analyzed and
+> an equivalence-gated repair designed on the tracker), the remaining half
+> of
+> [#364](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/364),
+> and defects 2–3 of
+> [#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368).
 
 ## [v0.6.20] -- 2026-06-30
 
