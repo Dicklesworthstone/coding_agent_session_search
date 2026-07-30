@@ -24756,6 +24756,51 @@ fn maybe_test_search_delay() {
     }
 }
 
+/// Force a dispatch-boundary budget transition for fresh-process integration tests.
+/// Production callers never set this test-only environment variable.
+fn maybe_test_force_semantic_dispatch_budget_phase(
+    budget: Option<&crate::robot_budget_envelope::RobotBudget>,
+) {
+    use crate::robot_budget_envelope::{BudgetPhase, NEAR_LIMIT_FRACTION};
+
+    let Ok(raw_phase) = dotenvy::var("CASS_TEST_SEMANTIC_DISPATCH_BUDGET_PHASE") else {
+        return;
+    };
+    let target_phase = match raw_phase.trim() {
+        "near-limit" => BudgetPhase::NearLimit,
+        "exhausted" => BudgetPhase::Exhausted,
+        _ => return,
+    };
+    let Some(budget) = budget else {
+        return;
+    };
+
+    let budget_ms = budget.total_ms();
+    let target_elapsed_ms = match target_phase {
+        BudgetPhase::NearLimit => {
+            let percent = (NEAR_LIMIT_FRACTION * 100.0) as u128;
+            u64::try_from((u128::from(budget_ms) * percent) / 100).unwrap_or(u64::MAX)
+        }
+        BudgetPhase::Exhausted => budget_ms,
+        BudgetPhase::Healthy => return,
+    };
+    let elapsed_ms = budget.elapsed_ms();
+    if elapsed_ms < target_elapsed_ms {
+        let sleep_ms = target_elapsed_ms
+            .saturating_sub(elapsed_ms)
+            .saturating_add(1);
+        tracing::warn!(
+            target_phase = ?target_phase,
+            elapsed_ms,
+            budget_ms,
+            sleep_ms,
+            test_hook = true,
+            "forcing semantic dispatch budget transition"
+        );
+        std::thread::sleep(Duration::from_millis(sleep_ms));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -25046,6 +25091,10 @@ fn run_cli_search(
     mode_meta.quality_tier_refined =
         semantic_opts.tier_mode != crate::search::query::SemanticTierMode::FastOnly;
     let hybrid_fail_open = mode_meta.fail_open_on_semantic_unavailable();
+    let semantic_requested = matches!(
+        mode_meta.requested,
+        SearchMode::Semantic | SearchMode::Hybrid
+    );
 
     if semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
         && !matches!(mode_meta.requested, SearchMode::Semantic)
@@ -25053,27 +25102,15 @@ fn run_cli_search(
         eprintln!("Warning: tier flags currently only affect --mode semantic.");
     }
 
-    let semantic_budget_available = search_budget
-        .as_ref()
-        .is_none_or(|budget| budget.is_healthy());
-    if matches!(
-        mode_meta.requested,
-        SearchMode::Semantic | SearchMode::Hybrid
-    ) && !semantic_budget_available
-    {
-        skipped_sections.push("semantic_refinement".to_string());
-        mode_meta.fall_back_to_lexical(
-            "semantic refinement skipped because the robot search budget is nearly exhausted",
-        );
-    } else if matches!(
-        mode_meta.requested,
-        SearchMode::Semantic | SearchMode::Hybrid
-    ) {
-        use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
+    use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
 
-        // Use embedder registry for model selection (bd-2mbe)
-        let registry = EmbedderRegistry::new(&data_dir);
-        let env_model = dotenvy::var("CASS_SEMANTIC_EMBEDDER")
+    // Validate an explicitly named producer before budget shedding. This is a
+    // cheap configuration check: an invalid or unavailable embedder must not
+    // be masked by a retryable budget outcome. Model/index opening and
+    // inference remain deferred until semantic execution is admitted below.
+    let registry = EmbedderRegistry::new(&data_dir);
+    let env_model = if semantic_requested {
+        dotenvy::var("CASS_SEMANTIC_EMBEDDER")
             .ok()
             .and_then(|value| {
                 if value.trim().eq_ignore_ascii_case("hash") {
@@ -25081,21 +25118,53 @@ fn run_cli_search(
                 } else {
                     crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
                 }
-            });
-        let requested_model = semantic_opts.model.as_deref().or(env_model);
+            })
+    } else {
+        None
+    };
+    let requested_model = semantic_opts.model.as_deref().or(env_model);
+    if semantic_requested
+        && let Some(model_name) = semantic_opts.model.as_deref()
+        && let Err(error) = registry.validate(model_name)
+    {
+        return Err(CliError {
+            code: 15,
+            kind: CliErrorKind::EmbedderUnavailable.kind_str(),
+            message: format!("Embedder validation failed: {error}"),
+            hint: Some("Run 'cass models list' to see available embedders".to_string()),
+            retryable: false,
+        });
+    }
 
-        // Validate requested model if specified
-        if let Some(model_name) = semantic_opts.model.as_deref()
-            && let Err(e) = registry.validate(model_name)
-        {
-            return Err(CliError {
-                code: 15,
-                kind: CliErrorKind::EmbedderUnavailable.kind_str(),
-                message: format!("Embedder validation failed: {e}"),
-                hint: Some("Run 'cass models list' to see available embedders".to_string()),
-                retryable: false,
-            });
+    let budget_action = semantic_budget_action(
+        &mode_meta,
+        search_budget
+            .as_ref()
+            .map(crate::robot_budget_envelope::RobotBudget::phase),
+    );
+    let execute_semantic = match budget_action {
+        SemanticBudgetAction::Execute => semantic_requested,
+        SemanticBudgetAction::StrictSemanticTimeout => {
+            // NearLimit is deliberately a typed timeout here: semantic setup
+            // is an indivisible expensive stage, so insufficient remaining
+            // headroom is a deadline-admission failure even before Exhausted.
+            return Err(strict_semantic_budget_error(
+                &mode_meta,
+                search_budget.as_ref(),
+                SemanticBudgetCheckpoint::BeforeSetup,
+            ));
         }
+        SemanticBudgetAction::HybridLexicalFallback => {
+            skipped_sections.push("semantic_refinement".to_string());
+            mode_meta.fall_back_to_lexical(semantic_budget_fallback_reason(
+                SemanticBudgetCheckpoint::BeforeSetup,
+            ));
+            false
+        }
+    };
+
+    if execute_semantic {
+        // Use embedder registry for model selection (bd-2mbe).
 
         // Determine which embedder to use
         let embedder_info = match requested_model {
@@ -25215,13 +25284,6 @@ fn run_cli_search(
         }
     }
 
-    let approximate =
-        if semantic_opts.approximate && matches!(mode_meta.realized, SearchMode::Lexical) {
-            eprintln!("Warning: --approximate has no effect in lexical mode.");
-            false
-        } else {
-            semantic_opts.approximate
-        };
     // The one-shot CLI emits one final result set. Its legacy synchronous
     // two-tier helper accepts only one query vector, which would incorrectly
     // reuse a MiniLM vector against the FNV fast index. The interactive TUI has
@@ -25307,12 +25369,47 @@ fn run_cli_search(
         );
     }
 
-    // Track search timing breakdown (T7.4)
-    let search_start = Instant::now();
-    let result = if search_budget
+    if execute_semantic && mode_meta.semantic_refinement() {
+        maybe_test_force_semantic_dispatch_budget_phase(search_budget.as_ref());
+    }
+    // This is the one authoritative dispatch-boundary sample. Both the
+    // mode-aware semantic policy and the generic exhausted-budget branch use
+    // it, so a scheduler preemption cannot produce an empty successful result
+    // that still claims semantic/hybrid refinement.
+    let dispatch_budget_phase = search_budget
         .as_ref()
-        .is_some_and(crate::robot_budget_envelope::RobotBudget::is_exhausted)
-    {
+        .map(crate::robot_budget_envelope::RobotBudget::phase);
+    match semantic_budget_action(&mode_meta, dispatch_budget_phase) {
+        SemanticBudgetAction::Execute => {}
+        SemanticBudgetAction::StrictSemanticTimeout => {
+            return Err(strict_semantic_budget_error(
+                &mode_meta,
+                search_budget.as_ref(),
+                SemanticBudgetCheckpoint::BeforeSearch,
+            ));
+        }
+        SemanticBudgetAction::HybridLexicalFallback => {
+            skipped_sections.push("semantic_refinement".to_string());
+            mode_meta.fall_back_to_lexical(semantic_budget_fallback_reason(
+                SemanticBudgetCheckpoint::BeforeSearch,
+            ));
+            let _ = client.clear_semantic_context();
+        }
+    }
+    let approximate =
+        if semantic_opts.approximate && matches!(mode_meta.realized, SearchMode::Lexical) {
+            eprintln!("Warning: --approximate has no effect in lexical mode.");
+            false
+        } else {
+            semantic_opts.approximate
+        };
+    // Track search timing breakdown (T7.4) after admission and test-only
+    // dispatch controls so it measures only the search operation.
+    let search_start = Instant::now();
+    let result = if matches!(
+        dispatch_budget_phase,
+        Some(crate::robot_budget_envelope::BudgetPhase::Exhausted)
+    ) {
         skipped_sections.push("search".to_string());
         crate::search::query::SearchResult {
             hits: Vec::new(),
@@ -27654,6 +27751,96 @@ struct SearchModeMeta {
     fallback_tier: Option<&'static str>,
     fallback_reason: Option<String>,
     quality_tier_refined: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticBudgetAction {
+    Execute,
+    StrictSemanticTimeout,
+    HybridLexicalFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticBudgetCheckpoint {
+    BeforeSetup,
+    BeforeSearch,
+}
+
+fn semantic_budget_fallback_reason(checkpoint: SemanticBudgetCheckpoint) -> &'static str {
+    match checkpoint {
+        SemanticBudgetCheckpoint::BeforeSetup => {
+            "semantic refinement skipped because the robot search budget is nearly exhausted"
+        }
+        SemanticBudgetCheckpoint::BeforeSearch => {
+            "semantic refinement skipped after setup because the robot search budget is nearly exhausted"
+        }
+    }
+}
+
+fn strict_semantic_budget_error(
+    mode_meta: &SearchModeMeta,
+    budget: Option<&crate::robot_budget_envelope::RobotBudget>,
+    checkpoint: SemanticBudgetCheckpoint,
+) -> CliError {
+    if let Some(budget) = budget {
+        let budget_ms = budget.total_ms();
+        let elapsed_ms = budget.elapsed_ms();
+        let phase = crate::robot_budget_envelope::budget_status(elapsed_ms, budget_ms);
+        let remaining_ms = budget_ms.saturating_sub(elapsed_ms);
+        tracing::warn!(
+            requested_mode = ?mode_meta.requested,
+            checkpoint = ?checkpoint,
+            phase = ?phase,
+            elapsed_ms,
+            budget_ms,
+            remaining_ms,
+            "requested semantic search rejected by robot budget admission"
+        );
+    }
+
+    let message = match checkpoint {
+        SemanticBudgetCheckpoint::BeforeSetup => {
+            "Insufficient robot-search budget remaining to start requested semantic search"
+        }
+        SemanticBudgetCheckpoint::BeforeSearch => {
+            "Semantic setup left insufficient robot-search budget to execute requested semantic search"
+        }
+    };
+    CliError {
+        code: 10,
+        kind: CliErrorKind::Timeout.kind_str(),
+        message: message.to_string(),
+        hint: Some(
+            "Increase --timeout and retry the same semantic request; use hybrid only when lexical fail-open is acceptable"
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+fn semantic_budget_action(
+    mode_meta: &SearchModeMeta,
+    phase: Option<crate::robot_budget_envelope::BudgetPhase>,
+) -> SemanticBudgetAction {
+    use crate::robot_budget_envelope::BudgetPhase;
+    use crate::search::query::SearchMode;
+
+    if !matches!(
+        mode_meta.realized,
+        SearchMode::Semantic | SearchMode::Hybrid
+    ) {
+        return SemanticBudgetAction::Execute;
+    }
+    if !matches!(phase, Some(BudgetPhase::NearLimit | BudgetPhase::Exhausted)) {
+        return SemanticBudgetAction::Execute;
+    }
+    if mode_meta.fail_open_on_semantic_unavailable() {
+        return SemanticBudgetAction::HybridLexicalFallback;
+    }
+    if matches!(mode_meta.requested, SearchMode::Semantic) {
+        return SemanticBudgetAction::StrictSemanticTimeout;
+    }
+    SemanticBudgetAction::Execute
 }
 
 impl SearchModeMeta {
@@ -104047,6 +104234,114 @@ mod subcommand_robot_output_tests {
         assert!(default_hybrid.fail_open_on_semantic_unavailable());
         assert!(explicit_hybrid.fail_open_on_semantic_unavailable());
         assert!(!explicit_semantic.fail_open_on_semantic_unavailable());
+    }
+
+    #[test]
+    fn robot_budget_policy_never_demotes_explicit_semantic_to_lexical() -> Result<(), String> {
+        use crate::robot_budget_envelope::BudgetPhase;
+        use crate::search::query::SearchMode;
+
+        macro_rules! require_matches {
+            ($observed:expr, $expected:pat, $context:expr) => {{
+                match $observed {
+                    $expected => {}
+                    budget_policy_observed => {
+                        return Err(format!(
+                            "{}: unexpected {budget_policy_observed:?}",
+                            $context
+                        ));
+                    }
+                }
+            }};
+        }
+
+        let explicit_semantic = SearchModeMeta::new(SearchMode::Semantic, false);
+        let explicit_hybrid = SearchModeMeta::new(SearchMode::Hybrid, false);
+        let default_hybrid = SearchModeMeta::new(SearchMode::Hybrid, true);
+        let lexical_mode_meta = SearchModeMeta::new(SearchMode::Lexical, false);
+
+        for phase in [None, Some(BudgetPhase::Healthy)] {
+            require_matches!(
+                semantic_budget_action(&explicit_semantic, phase),
+                SemanticBudgetAction::Execute,
+                "healthy explicit semantic"
+            );
+            require_matches!(
+                semantic_budget_action(&explicit_hybrid, phase),
+                SemanticBudgetAction::Execute,
+                "healthy explicit hybrid"
+            );
+            require_matches!(
+                semantic_budget_action(&default_hybrid, phase),
+                SemanticBudgetAction::Execute,
+                "healthy default hybrid"
+            );
+            require_matches!(
+                semantic_budget_action(&lexical_mode_meta, phase),
+                SemanticBudgetAction::Execute,
+                "healthy lexical"
+            );
+        }
+
+        for phase in [BudgetPhase::NearLimit, BudgetPhase::Exhausted] {
+            require_matches!(
+                semantic_budget_action(&explicit_semantic, Some(phase)),
+                SemanticBudgetAction::StrictSemanticTimeout,
+                "explicit semantic must fail closed instead of changing its realized mode"
+            );
+            require_matches!(
+                semantic_budget_action(&explicit_hybrid, Some(phase)),
+                SemanticBudgetAction::HybridLexicalFallback,
+                "hybrid may fail open when semantic work no longer fits the budget"
+            );
+            require_matches!(
+                semantic_budget_action(&default_hybrid, Some(phase)),
+                SemanticBudgetAction::HybridLexicalFallback,
+                "default hybrid mode must retain the same explicit fail-open policy"
+            );
+            require_matches!(
+                semantic_budget_action(&lexical_mode_meta, Some(phase)),
+                SemanticBudgetAction::Execute,
+                "lexical mode has no semantic work to shed"
+            );
+        }
+
+        let mut meta = SearchModeMeta::new(SearchMode::Semantic, false);
+        if matches!(
+            semantic_budget_action(&meta, Some(BudgetPhase::NearLimit)),
+            SemanticBudgetAction::HybridLexicalFallback
+        ) {
+            meta.fall_back_to_lexical("budget pressure");
+        }
+        require_matches!(
+            meta.requested,
+            SearchMode::Semantic,
+            "strict requested mode"
+        );
+        require_matches!(meta.realized, SearchMode::Semantic, "strict realized mode");
+        require_matches!(meta.fallback_tier, None, "strict fallback tier");
+        require_matches!(
+            meta.fallback_reason.as_deref(),
+            None,
+            "strict fallback reason"
+        );
+
+        let mut unavailable_hybrid = SearchModeMeta::new(SearchMode::Hybrid, false);
+        unavailable_hybrid.fall_back_to_lexical("semantic context unavailable: no index");
+        for phase in [BudgetPhase::NearLimit, BudgetPhase::Exhausted] {
+            require_matches!(
+                semantic_budget_action(&unavailable_hybrid, Some(phase)),
+                SemanticBudgetAction::Execute,
+                "a prior semantic-availability fallback must keep its original cause"
+            );
+        }
+        require_matches!(
+            unavailable_hybrid.fallback_reason.as_deref(),
+            Some("semantic context unavailable: no index"),
+            "prior fallback reason"
+        );
+
+        Ok(())
     }
 
     #[test]
