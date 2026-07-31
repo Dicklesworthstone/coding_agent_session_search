@@ -18631,7 +18631,16 @@ fn state_meta_json_inner(
             maintenance: index_run.clone(),
             semantic_preference,
             db_available: db_opened,
-            compute_lexical_fingerprint: include_counts,
+            // GH #368 defect 2: the lexical-fingerprint open is the operation
+            // search actually performs, and it is what fails on a corrupt FTS5
+            // structure. It was previously gated behind `include_counts` (DB
+            // <= 256 MiB), so on large corpora (the 1.17 GB report) the
+            // corruption was never probed and readiness reported "usable". The
+            // fingerprint is cheap (readonly open + COUNT(conversations), not a
+            // message scan), so attempt it on every real open — additively, so
+            // tiny-DB and the health skip-open fast path (open_skipped=true)
+            // are unchanged.
+            compute_lexical_fingerprint: include_counts || (db_opened && !open_skipped),
             inspect_semantic,
         },
     )
@@ -19441,6 +19450,17 @@ fn lexical_readiness_from_state(
     if status == "error" && reason.contains("quarantin") {
         return LexicalReadinessState::CorruptQuarantined;
     }
+    // GH #368 defect 2: any other asset-inspection error means search actually
+    // hard-fails — most importantly the lexical-fingerprint open failing on a
+    // corrupt FTS5 structure ("computing lexical storage fingerprint ... fts5:
+    // corrupt %_data record ..."). That error path (state_meta_json_inner's
+    // unwrap_or_else fallback) sets status="error" AND fresh=false, and the
+    // fresh=false branch below previously classified it StaleButSearchable —
+    // reporting "Search usable now: yes" while every query errored. An errored
+    // index is corrupt/unusable (non-searchable, inspect first), not stale.
+    if status == "error" {
+        return LexicalReadinessState::CorruptQuarantined;
+    }
     if status == "stale"
         || index
             .and_then(|idx| idx.get("fresh"))
@@ -19928,6 +19948,76 @@ mod readiness_projection_tests {
         assert_eq!(
             semantic_readiness_from_state(&state),
             SemanticReadinessState::FastTierReady
+        );
+    }
+
+    /// GH #368 defect 2: a non-quarantine asset-inspection error (the
+    /// lexical-fingerprint open failing on a corrupt FTS5 structure) must NOT
+    /// be classified searchable via the `fresh=false` fall-through.
+    #[test]
+    fn errored_lexical_index_is_corrupt_not_searchable() {
+        use super::lexical_readiness_from_state;
+        use crate::search::readiness::LexicalReadinessState;
+        let state = json!({
+            "index": {
+                "exists": true,
+                "status": "error",
+                "fresh": false,
+                "reason": "asset inspection failed: computing lexical storage fingerprint for /x: fts5: corrupt %_data record: structure segment count exceeds FTS5 maximum"
+            },
+            "rebuild": { "active": false }
+        });
+        let lexical = lexical_readiness_from_state(&state, false);
+        assert_eq!(lexical, LexicalReadinessState::CorruptQuarantined);
+        assert!(
+            !lexical.is_searchable(),
+            "an errored (corrupt-FTS) index must not report search usable (GH #368 defect 2)"
+        );
+    }
+
+    /// A genuine `quarantin`ed error keeps mapping to CorruptQuarantined
+    /// (unchanged by the defect-2 fix).
+    #[test]
+    fn quarantined_lexical_error_stays_corrupt_quarantined() {
+        use super::lexical_readiness_from_state;
+        use crate::search::readiness::LexicalReadinessState;
+        let state = json!({
+            "index": { "exists": true, "status": "error", "fresh": false,
+                       "reason": "lexical index quarantined: schema_drift" },
+            "rebuild": { "active": false }
+        });
+        assert_eq!(
+            lexical_readiness_from_state(&state, false),
+            LexicalReadinessState::CorruptQuarantined
+        );
+    }
+
+    /// GH #369 non-regression: a merely-stale index (e.g. an *absent* FTS5
+    /// shadow where the fingerprint open still succeeds and Tantivy serves
+    /// search) has status != "error", so it stays StaleButSearchable — the
+    /// defect-2 fix must not downgrade legitimately-searchable stale indexes.
+    #[test]
+    fn stale_healthy_index_stays_searchable() {
+        use super::lexical_readiness_from_state;
+        use crate::search::readiness::LexicalReadinessState;
+        let state = json!({
+            "index": { "exists": true, "status": "stale", "fresh": false },
+            "rebuild": { "active": false }
+        });
+        let lexical = lexical_readiness_from_state(&state, false);
+        assert_eq!(lexical, LexicalReadinessState::StaleButSearchable);
+        assert!(
+            lexical.is_searchable(),
+            "a stale-but-healthy index must remain searchable (GH #369 absent-shadow case)"
+        );
+
+        let ready = json!({
+            "index": { "exists": true, "status": "ready", "fresh": true },
+            "rebuild": { "active": false }
+        });
+        assert_eq!(
+            lexical_readiness_from_state(&ready, false),
+            LexicalReadinessState::Ready
         );
     }
 }
