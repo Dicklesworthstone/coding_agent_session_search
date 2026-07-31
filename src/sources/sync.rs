@@ -54,8 +54,9 @@ use std::net::{Shutdown, TcpStream};
 /// neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RsyncArgProtection {
-    /// Neither flag supported — callers must manually quote remote paths for
-    /// the remote login shell.
+    /// Neither flag supported — rsync is invoked without an arg-protection
+    /// flag, and local rsync backslash-escapes the remote path itself when
+    /// building the remote command line (see `remote_spec_for_rsync`).
     None,
     /// rsync 3.0.0..3.4.0 — original flag name.
     ProtectArgs,
@@ -120,14 +121,18 @@ fn remote_spec_for_shell_bound_copy(host: &str, remote_path: &str) -> String {
     format!("{host}:{}", quote_remote_shell_path(remote_path))
 }
 
-fn remote_spec_for_rsync(host: &str, remote_path: &str, protect_args_supported: bool) -> String {
-    if protect_args_supported {
-        // With --protect-args, rsync handles its own escaping over the wire
-        format!("{host}:{remote_path}")
-    } else {
-        // Without it (e.g. openrsync), we must manually quote for the remote shell
-        remote_spec_for_shell_bound_copy(host, remote_path)
-    }
+fn remote_spec_for_rsync(host: &str, remote_path: &str) -> String {
+    // Pass the path through unquoted: local rsync builds the remote command
+    // line itself and backslash-escapes spaces and shell-special characters
+    // in the path when arg protection is unavailable, so this works with and
+    // without --protect-args/--secluded-args. Manually shell-quoting here is
+    // actively wrong for rsync: the literal quotes survive into the remote
+    // path and the remote reports "(l)stat: No such file or directory"
+    // (observed with openrsync on macOS 15+). Note that without arg
+    // protection the remote shell may still expand wildcard characters in
+    // the path; that is inherent to rsync's no-protection mode and cannot be
+    // fixed by quoting (which breaks the path entirely).
+    format!("{host}:{remote_path}")
 }
 
 fn run_rsync_command(
@@ -1194,8 +1199,7 @@ impl SyncEngine {
         } else {
             detect_rsync_arg_protection()
         };
-        let protect_args_supported = arg_protection.is_supported();
-        let remote_spec = remote_spec_for_rsync(host, &expanded_path, protect_args_supported);
+        let remote_spec = remote_spec_for_rsync(host, &expanded_path);
         let ssh_opts = strict_ssh_command_for_rsync(self.connection_timeout);
 
         let local_path_str = match local_path.to_str() {
@@ -1253,10 +1257,10 @@ impl SyncEngine {
                 host = %host,
                 remote_path = %expanded_path,
                 protection_flag = ?arg_protection.flag(),
-                "remote rsync rejected argument-protection flag; retrying with shell-quoted remote path"
+                "remote rsync rejected argument-protection flag; retrying without it"
             );
 
-            let fallback_remote_spec = remote_spec_for_rsync(host, &expanded_path, false);
+            let fallback_remote_spec = remote_spec_for_rsync(host, &expanded_path);
             let retry = match run_rsync_command(
                 &timeout_str,
                 &ssh_opts,
@@ -1404,7 +1408,7 @@ impl SyncEngine {
         // E.g. C:\Users\george\AppData\... → /mnt/c/Users/george/AppData/...
         let wsl_dest = windows_path_to_wsl(local_path_str);
 
-        let remote_spec = remote_spec_for_rsync(host, &expanded_path, true);
+        let remote_spec = remote_spec_for_rsync(host, &expanded_path);
         let ssh_opts = strict_ssh_command_for_rsync(self.connection_timeout);
         let timeout_str = self.transfer_timeout.to_string();
 
@@ -3698,19 +3702,32 @@ Total transferred file size: 1,234 bytes
     }
 
     #[test]
-    fn test_remote_spec_for_rsync_quotes_only_when_needed() {
+    fn test_remote_spec_for_rsync_never_shell_quotes_path() {
+        // The rsync remote spec must always be the plain host:path form, with
+        // no manual shell quoting: local rsync backslash-escapes the path
+        // itself when building the remote command line, so quoting leaves
+        // literal quotes in the remote path and breaks the transfer (observed
+        // with openrsync remotes on macOS 15+).
         assert_eq!(
-            remote_spec_for_rsync("work-mac", "/tmp/has space", true),
+            remote_spec_for_rsync("work-mac", "/tmp/has space"),
             "work-mac:/tmp/has space"
         );
         assert_eq!(
-            remote_spec_for_rsync("work-mac", "/tmp/that's all", true),
+            remote_spec_for_rsync("work-mac", "/tmp/that's all"),
             "work-mac:/tmp/that's all"
         );
         assert_eq!(
-            remote_spec_for_rsync("work-mac", "/tmp/has space", false),
-            "work-mac:'/tmp/has space'"
+            remote_spec_for_rsync("work-mac", "/Users/x/.cursor"),
+            "work-mac:/Users/x/.cursor"
         );
+        // No shell-quoting is added around paths that don't themselves
+        // contain quote characters.
+        for path in ["/tmp/has space", "/Users/x/.cursor"] {
+            assert!(
+                !remote_spec_for_rsync("work-mac", path).contains('\''),
+                "rsync remote spec must not contain shell quotes"
+            );
+        }
     }
 
     #[test]
