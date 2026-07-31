@@ -8179,7 +8179,13 @@ impl FrankenStorage {
                 &missing_tail_positions,
             )?;
         }
-        if !every_footprint_was_missing_tail {
+        // When every conversation already has last_message_idx / tail-state
+        // coverage, skip the full `messages GROUP BY conversation_id` raise.
+        // That exact-count pass was observed to thrash for 10–20+ minutes on
+        // multi-GB archives during plan_lexical_shards (cass 0.6.23 prepare
+        // wedge). Tail estimates are sufficient for shard sizing; exact
+        // message counts are still available later from the rebuild sink.
+        if !missing_tail_positions.is_empty() && !every_footprint_was_missing_tail {
             self.raise_lexical_rebuild_footprints_to_exact_message_counts(&mut footprints)?;
         }
 

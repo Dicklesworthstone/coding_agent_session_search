@@ -745,8 +745,8 @@ pub enum Commands {
         #[arg(long, visible_alias = "robot")]
         json: bool,
 
-        /// Staleness threshold in seconds (default: 300)
-        #[arg(long, default_value_t = 300)]
+        /// Staleness threshold in seconds (default: 1800 = 30 minutes)
+        #[arg(long, default_value_t = 1800)]
         stale_threshold: u64,
     },
     /// Assemble a redacted, share-safe recovery/support evidence bundle
@@ -759,8 +759,8 @@ pub enum Commands {
         #[arg(long, visible_alias = "robot")]
         json: bool,
 
-        /// Staleness threshold in seconds (default: 300)
-        #[arg(long, default_value_t = 300)]
+        /// Staleness threshold in seconds (default: 1800 = 30 minutes)
+        #[arg(long, default_value_t = 1800)]
         stale_threshold: u64,
 
         /// Include full filesystem paths in the bundle (default: basename-only)
@@ -831,8 +831,11 @@ pub enum Commands {
         /// Include _meta block (elapsed, freshness, data_dir/db_path)
         #[arg(long, default_value_t = false)]
         robot_meta: bool,
-        /// Staleness threshold in seconds (default: 300)
-        #[arg(long, default_value_t = 300)]
+        /// Staleness threshold in seconds (default: 1800 = 30 minutes).
+        /// Matches `cass status` / `DEFAULT_STALE_THRESHOLD_SECS` so bare
+        /// `cass health` does not flip unhealthy five minutes after a rebuild
+        /// on large archives that are not in continuous watch mode.
+        #[arg(long, default_value_t = 1800)]
         stale_threshold: u64,
     },
     /// First-run source onboarding + readiness wizard. Read-only: explains what
@@ -6542,7 +6545,7 @@ async fn execute_cli(
             Commands::Triage {
                 data_dir: None,
                 json: true,
-                stale_threshold: 300,
+                stale_threshold: 1800,
             }
         } else {
             Commands::Tui {
@@ -24956,7 +24959,11 @@ fn search_budget_ms(timeout_ms: Option<u64>) -> u64 {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|&milliseconds| milliseconds > 0)
-            .unwrap_or(8_000)
+            // Multi-shard federated Tantivy open on multi-GB archives routinely
+            // exceeds the historical 8s default (cold open alone can be 20–30s+).
+            // Prefer completing a real search over returning 0 hits on budget
+            // exhaustion. Override down via CASS_SEARCH_BUDGET_MS or --timeout.
+            .unwrap_or(120_000)
     })
 }
 

@@ -2748,6 +2748,55 @@ fn try_readonly_canonical_force_rebuild(
             observed_messages,
         );
     }
+
+    // Force-rebuild deliberately skips the writable index path (readonly DB →
+    // Tantivy only). Without an explicit watermark write, `last_indexed_at`
+    // stays frozen from the previous incremental run and `cass status` /
+    // `cass health` report stale forever even though the lexical index is
+    // freshly rebuilt. performed_scan=false so last_scan_ts is preserved.
+    let now_ms = FrankenStorage::now_millis();
+    match FrankenStorage::open_writer(&opts.db_path) {
+        Ok(writer) => {
+            let write_result = writer.set_last_indexed_at(now_ms);
+            match writer.close() {
+                Ok(()) => {
+                    if let Err(err) = write_result {
+                        tracing::warn!(
+                            db_path = %opts.db_path.display(),
+                            now_ms,
+                            error = %format!("{err:#}"),
+                            "force rebuild succeeded but failed to update last_indexed_at; \
+                             status/health may report stale until the next index run"
+                        );
+                    } else {
+                        tracing::info!(
+                            now_ms,
+                            "updated last_indexed_at for status display after force rebuild"
+                        );
+                    }
+                }
+                Err(close_err) => {
+                    tracing::warn!(
+                        db_path = %opts.db_path.display(),
+                        now_ms,
+                        write_ok = write_result.is_ok(),
+                        error = %format!("{close_err:#}"),
+                        "force rebuild metadata writer close failed after last_indexed_at update attempt"
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                now_ms,
+                error = %format!("{err:#}"),
+                "force rebuild succeeded but could not open writer to update last_indexed_at; \
+                 status/health may report stale until the next index run"
+            );
+        }
+    }
+
     Ok(true)
 }
 
