@@ -68,6 +68,58 @@ fn storage_error(message: impl Into<String>, hint: Option<&str>) -> CliError {
     }
 }
 
+/// True when an FTS-repair failure is the frankensqlite FTS5 segment-writer
+/// leaf-offset ceiling rather than corruption of the operator's data (GH #369).
+///
+/// frankensqlite writes exactly one segment leaf per flush and stores each
+/// term's byte offset inside that leaf in a `u16`. When a single insert batch's
+/// combined terms + doclists encode past 65,535 bytes, `Fts5SegmentLeaf::encode`
+/// hard-fails with `segment leaf term offset exceeds u16` (surfaced as
+/// `fts5: corrupt %_data record: …`) and the failure-atomic rebuild rolls back
+/// without publishing a partial shadow. This is a *content-dependent, sticky*
+/// engine limitation — not archive corruption — so it deserves a distinct,
+/// reassuring operator diagnostic instead of the generic storage-error wall.
+/// Note the `gh362` overlong-*term* tokenizer cap (`FTS5_MAX_TERM_BYTES`) does
+/// not address this: the overflow is cumulative across many in-cap terms, not a
+/// single oversized token.
+fn is_fts5_oversized_leaf_error(err: &anyhow::Error) -> bool {
+    // Match the full rendered chain so it is robust to however the fsqlite
+    // error was wrapped on the way up (context strings, `{e:#}`, etc.).
+    let rendered = format!("{err:#}");
+    rendered.contains("segment leaf term offset exceeds u16")
+        || rendered.contains("segment leaf rowid offset exceeds u16")
+        || rendered.contains("segment leaf footer offset exceeds u16")
+        || rendered.contains("segment footer offset exceeds u16")
+        || (rendered.contains("corrupt %_data record") && rendered.contains("segment leaf"))
+}
+
+/// The distinct, non-alarming diagnostic for the GH #369 oversized-leaf case:
+/// canonical rows and the Tantivy index are intact and fully serve search; only
+/// the optional SQLite-side FTS5 shadow cannot be materialized for this corpus.
+fn fts5_oversized_leaf_shadow_error(db_path: &Path) -> CliError {
+    CliError {
+        code: 13,
+        kind: "fts5-oversized-leaf-shadow-unbuildable",
+        message: format!(
+            "the canonical SQLite FTS5 shadow cannot be built for {} because a single insert \
+             batch in this corpus encodes past the frankensqlite FTS5 segment-leaf u16 offset \
+             ceiling (one-leaf-per-segment limitation, GH #369) — this is an engine limitation, \
+             not corruption of your archive, and the failed rebuild was rolled back without \
+             publishing a partial shadow",
+            db_path.display()
+        ),
+        hint: Some(
+            "No action is needed and no data was lost: the canonical SQLite tables and the \
+             Tantivy lexical index are intact and fully serve search — only the optional \
+             SQLite-side `fts_messages` shadow is affected, and `cass doctor check` stays \
+             healthy. This is tracked upstream for a multi-leaf FTS5 segment writer; re-run \
+             `--rebuild-canonical-fts --yes` once the pinned frankensqlite build ships that fix."
+                .to_string(),
+        ),
+        retryable: false,
+    }
+}
+
 fn print_json(envelope: &serde_json::Value) -> CliResult<()> {
     let rendered = serde_json::to_string_pretty(envelope).map_err(|e| CliError {
         code: 9,
@@ -466,12 +518,20 @@ pub fn run_doctor_rebuild_canonical_fts(
     let repair = storage
         .ensure_search_fallback_fts_consistency()
         .map_err(|e| {
-            storage_error(
-                format!("safely repairing canonical FTS5 shadow tables: {e:#}"),
-                Some(
-                    "Preserve the complete database bundle. Re-run the dry-run to inspect exact current parity before any retry.",
-                ),
-            )
+            if is_fts5_oversized_leaf_error(&e) {
+                // GH #369: a known, content-dependent engine limitation — not
+                // archive corruption. Surface a distinct, reassuring diagnostic
+                // instead of the generic storage wall so operators do not treat
+                // a working (Tantivy-served) search as broken.
+                fts5_oversized_leaf_shadow_error(&db_path)
+            } else {
+                storage_error(
+                    format!("safely repairing canonical FTS5 shadow tables: {e:#}"),
+                    Some(
+                        "Preserve the complete database bundle. Re-run the dry-run to inspect exact current parity before any retry.",
+                    ),
+                )
+            }
         })?;
     let after = storage.inspect_search_fallback_fts_parity().map_err(|e| {
         storage_error(
@@ -1081,5 +1141,63 @@ mod tests {
         assert_eq!(parity.status, FtsShadowParityStatus::Healthy);
         assert_eq!(parity.canonical_messages, 2);
         assert_eq!(parity.indexed_messages, Some(2));
+    }
+
+    /// GH #369: the cumulative oversized-leaf failure (many in-cap terms in one
+    /// batch, not a single overlong token) must be recognized so the operator
+    /// gets a reassuring "search still works via Tantivy" diagnostic rather than
+    /// the generic storage wall. This mirrors the exact wrapped chain the
+    /// failure-atomic rebuild produces (`sqlite.rs` `.context(...)`), with the
+    /// fsqlite root string preserved.
+    #[test]
+    fn oversized_leaf_error_is_classified_and_gets_reassuring_diagnostic() {
+        let wrapped = anyhow::anyhow!(
+            "inserting 4000 rows into fts_messages during streaming FTS maintenance: \
+             fts5: corrupt %_data record: segment leaf term offset exceeds u16"
+        )
+        .context("failure-atomic FTS rebuild rolled back without publishing a partial shadow");
+        assert!(
+            is_fts5_oversized_leaf_error(&wrapped),
+            "the real wrapped chain must be recognized as the GH #369 oversized-leaf case"
+        );
+
+        // Each sibling leaf/footer overflow signature is also covered.
+        for signature in [
+            "segment leaf rowid offset exceeds u16",
+            "segment leaf footer offset exceeds u16",
+            "segment footer offset exceeds u16",
+        ] {
+            assert!(
+                is_fts5_oversized_leaf_error(&anyhow::anyhow!(signature.to_string())),
+                "signature must be recognized: {signature}"
+            );
+        }
+
+        // Unrelated storage failures must NOT be misclassified — they still get
+        // the generic storage wall + bundle-preservation hint.
+        for unrelated in [
+            "database is locked",
+            "no such table: fts_messages",
+            "disk I/O error while reading page 42",
+            "segment terms must be strictly increasing",
+        ] {
+            assert!(
+                !is_fts5_oversized_leaf_error(&anyhow::anyhow!(unrelated.to_string())),
+                "unrelated error must not be misclassified: {unrelated}"
+            );
+        }
+
+        let diagnostic = fts5_oversized_leaf_shadow_error(Path::new("/tmp/agent_search.db"));
+        assert_eq!(diagnostic.kind, "fts5-oversized-leaf-shadow-unbuildable");
+        assert!(!diagnostic.retryable);
+        assert!(
+            diagnostic.message.contains("not corruption of your archive"),
+            "message must reassure the operator their data is intact"
+        );
+        let hint = diagnostic.hint.expect("oversized-leaf diagnostic carries a hint");
+        assert!(
+            hint.contains("Tantivy") && hint.contains("No action is needed"),
+            "hint must state search still works and no action is needed"
+        );
     }
 }
