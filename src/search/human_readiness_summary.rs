@@ -303,7 +303,7 @@ fn headline_for(class: ReadinessClass) -> String {
         ReadinessClass::StaleSearchable => "≈ Search ready (index stale)",
         ReadinessClass::Repairing => "↻ Search degraded (rebuild in progress)",
         ReadinessClass::Missing => "✗ Search unavailable (no index)",
-        ReadinessClass::CorruptQuarantined => "✗ Search unavailable (index quarantined)",
+        ReadinessClass::CorruptQuarantined => "✗ Search unavailable (index corrupt/quarantined)",
         ReadinessClass::DbUnusable => "✗ Search unavailable (database unusable)",
         ReadinessClass::Unreachable => "? Host unreachable",
     }
