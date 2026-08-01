@@ -9447,60 +9447,137 @@ fn repair_fallback_fts_after_full_index_run(
         }
     };
 
-    if let Some(archive_fingerprint) = known_archive_fingerprint {
-        match fresh_storage
-            .fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)
-        {
-            Ok(true) => {
-                return Ok(Some(
-                    FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
+    let outcome: FallbackFtsRepairOutcome = 'compute: {
+        if let Some(archive_fingerprint) = known_archive_fingerprint {
+            match fresh_storage
+                .fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)
+            {
+                Ok(true) => {
+                    break 'compute FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
                         archive_fingerprint: archive_fingerprint.to_string(),
-                    },
-                ));
-            }
-            Ok(false) => {}
-            // #329: same policy as the repair itself — a failed probe of the
-            // optional derived asset must not fail the completed run.
-            Err(err) => {
-                return Ok(Some(FallbackFtsRepairOutcome::SkippedRepairFailed {
-                    detail: format!("probing fallback FTS archive-fingerprint health: {err:#}"),
-                }));
+                    };
+                }
+                Ok(false) => {}
+                // #329: same policy as the repair itself — a failed probe of the
+                // optional derived asset must not fail the completed run.
+                Err(err) => {
+                    break 'compute FallbackFtsRepairOutcome::SkippedRepairFailed {
+                        detail: format!(
+                            "probing fallback FTS archive-fingerprint health: {err:#}"
+                        ),
+                    };
+                }
             }
         }
-    }
 
-    let repair = match fresh_storage.ensure_search_fallback_fts_consistency() {
-        Ok(repair) => repair,
-        Err(err) => {
-            let detail = format!("{err:#}");
-            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail.clone()) {
-                return Ok(Some(outcome));
+        let repair = match fresh_storage.ensure_search_fallback_fts_consistency() {
+            Ok(repair) => repair,
+            Err(err) => {
+                let detail = format!("{err:#}");
+                if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail.clone()) {
+                    break 'compute outcome;
+                }
+                // #329/#345: internal repair failures (frankensqlite "out of
+                // memory" on huge shadow rebuilds being the reported case) no
+                // longer fail an `index --full` whose canonical + Tantivy work
+                // already completed. Lexical search is served by Tantivy and
+                // doctor treats the shadow state honestly on its next check.
+                break 'compute FallbackFtsRepairOutcome::SkippedRepairFailed { detail };
             }
-            // #329/#345: internal repair failures (frankensqlite "out of
-            // memory" on huge shadow rebuilds being the reported case) no
-            // longer fail an `index --full` whose canonical + Tantivy work
-            // already completed. Lexical search is served by Tantivy and
-            // doctor treats the shadow state honestly on its next check.
-            return Ok(Some(FallbackFtsRepairOutcome::SkippedRepairFailed {
-                detail,
-            }));
+        };
+        if let Some(archive_fingerprint) = known_archive_fingerprint
+            && let Err(err) =
+                fresh_storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)
+        {
+            // The repair itself SUCCEEDED — only the memo that lets the next run
+            // skip re-probing failed to persist, so the worst case is one
+            // redundant probe/repair later. Report the repair honestly instead
+            // of discarding it as SkippedRepairFailed, which logged "repair
+            // failed" for a fully repaired shadow (adversarial-review F5).
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "fallback FTS repair succeeded but recording its archive fingerprint failed; the next run will re-probe"
+            );
         }
+        FallbackFtsRepairOutcome::Repaired(repair)
     };
-    if let Some(archive_fingerprint) = known_archive_fingerprint
-        && let Err(err) =
-            fresh_storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)
+
+    // zn1xn (adversarial-review F5): persist a "canonical FTS shadow may be
+    // half-rebuilt" marker when the repair was skipped/failed, or clear it once
+    // the shadow is repaired/known-healthy, so `cass index --json` / `status`
+    // surface the half-built shadow immediately. Best-effort: a marker write
+    // failure must never fail a run whose canonical + Tantivy work succeeded.
+    if let Err(err) =
+        fresh_storage.record_fallback_fts_repair_pending(fallback_fts_repair_pending_detail(&outcome))
     {
-        // The repair itself SUCCEEDED — only the memo that lets the next run
-        // skip re-probing failed to persist, so the worst case is one
-        // redundant probe/repair later. Report the repair honestly instead
-        // of discarding it as SkippedRepairFailed, which logged "repair
-        // failed" for a fully repaired shadow (adversarial-review F5).
-        tracing::warn!(
+        tracing::debug!(
             error = %format!("{err:#}"),
-            "fallback FTS repair succeeded but recording its archive fingerprint failed; the next run will re-probe"
+            "recording fallback FTS repair-pending marker failed (non-fatal)"
         );
     }
-    Ok(Some(FallbackFtsRepairOutcome::Repaired(repair)))
+    Ok(Some(outcome))
+}
+
+/// The failure detail to persist as the "shadow may be half-rebuilt" marker for
+/// an outcome — `Some` for the skipped/failed cases, `None` (clear) when the
+/// shadow is repaired or known-healthy (zn1xn).
+fn fallback_fts_repair_pending_detail(outcome: &FallbackFtsRepairOutcome) -> Option<&str> {
+    match outcome {
+        FallbackFtsRepairOutcome::SkippedRepairFailed { detail }
+        | FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail }
+        | FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail } => {
+            Some(detail.as_str())
+        }
+        FallbackFtsRepairOutcome::Repaired(_)
+        | FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod fallback_fts_repair_pending_tests {
+    use super::{FallbackFtsRepairOutcome, fallback_fts_repair_pending_detail};
+    use crate::storage::sqlite::FtsConsistencyRepair;
+
+    #[test]
+    fn only_broken_outcomes_mark_the_shadow_pending() {
+        assert_eq!(
+            fallback_fts_repair_pending_detail(&FallbackFtsRepairOutcome::SkippedRepairFailed {
+                detail: "boom".to_string()
+            }),
+            Some("boom")
+        );
+        assert_eq!(
+            fallback_fts_repair_pending_detail(
+                &FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex {
+                    detail: "corrupt".to_string()
+                }
+            ),
+            Some("corrupt")
+        );
+        assert_eq!(
+            fallback_fts_repair_pending_detail(
+                &FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload {
+                    detail: "unsupported".to_string()
+                }
+            ),
+            Some("unsupported")
+        );
+        // Repaired / known-healthy outcomes clear the marker (None).
+        assert_eq!(
+            fallback_fts_repair_pending_detail(
+                &FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
+                    archive_fingerprint: "fp".to_string()
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            fallback_fts_repair_pending_detail(&FallbackFtsRepairOutcome::Repaired(
+                FtsConsistencyRepair::AlreadyHealthy { rows: 3 }
+            )),
+            None
+        );
+    }
 }
 
 fn full_rebuild_requires_historical_restart(

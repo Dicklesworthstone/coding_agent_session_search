@@ -17801,6 +17801,10 @@ struct StateDbSnapshot {
     /// regular-file metadata alone in that case; callers needing the actual
     /// open-success signal use `cass diag` / `cass doctor`.
     open_skipped: bool,
+    /// zn1xn: failure detail when the last full index run left the canonical
+    /// `fts_messages` shadow unrepaired (skipped/failed optional derived
+    /// fallback-FTS repair). `None` when the shadow is not known half-built.
+    fallback_repair_pending: Option<String>,
 }
 
 fn probe_state_db(
@@ -17882,6 +17886,17 @@ fn probe_state_db_modes(
     )
     .ok()
     .and_then(|s| s.parse::<i64>().ok());
+    // zn1xn: cheap single-row read of the "canonical FTS shadow may be
+    // half-rebuilt" marker, alongside the other watermarks, so `index --json`
+    // and `status` surface it without a separate probe.
+    snapshot.fallback_repair_pending = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'fts_fallback_repair_pending'",
+        params![],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .filter(|detail| !detail.is_empty());
     if include_counts && !watermarks_only {
         snapshot.conversation_count = franken_query_row_map_retry(
             &conn,
@@ -18601,6 +18616,7 @@ fn state_meta_json_inner(
     let db_open_retryable = db_snapshot.open_retryable;
     let counts_skipped = db_snapshot.counts_skipped;
     let open_skipped = db_snapshot.open_skipped;
+    let fallback_fts_repair_pending = db_snapshot.fallback_repair_pending.clone();
 
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
     let lexical_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
@@ -18939,7 +18955,7 @@ fn state_meta_json_inner(
         None
     };
 
-    serde_json::json!({
+    let mut state = serde_json::json!({
         "index": {
             "exists": lexical.exists,
             "status": lexical.status,
@@ -19125,7 +19141,19 @@ fn state_meta_json_inner(
             "data_dir": data_dir.display().to_string(),
             "db_path": db_path.display().to_string()
         }
-    })
+    });
+    // zn1xn: emit the "canonical FTS shadow may be half-rebuilt" signal
+    // additively — present only when the last full index run left the shadow
+    // unrepaired — so existing status/index JSON is byte-identical otherwise.
+    if let Some(detail) = fallback_fts_repair_pending
+        && let Some(index) = state.get_mut("index").and_then(|v| v.as_object_mut())
+    {
+        index.insert(
+            "fallback_fts_repair".to_string(),
+            serde_json::json!({ "pending": true, "detail": detail }),
+        );
+    }
+    state
 }
 
 fn lexical_manifest_indexed_doc_count(index_path: &Path) -> Option<u64> {
@@ -74776,6 +74804,66 @@ mod cli_read_db_tests {
             .expect("set last_scan_ts");
         drop(storage);
         (temp, db_path)
+    }
+
+    /// zn1xn: a full index run that leaves the canonical FTS shadow half-built
+    /// records a marker that `state_meta_json` (hence `index --json`/`status`)
+    /// surfaces additively; a later repair clears it and the field is omitted.
+    #[test]
+    fn state_meta_surfaces_pending_fallback_fts_repair_additively() {
+        let (temp, db_path) = seed_cli_db();
+
+        // No marker → the field is omitted (existing JSON is byte-identical).
+        let clean = state_meta_json(temp.path(), &db_path, 3600, true);
+        assert!(
+            clean.pointer("/index/fallback_fts_repair").is_none(),
+            "fallback_fts_repair must be omitted when no repair is pending"
+        );
+
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+            storage
+                .record_fallback_fts_repair_pending(Some(
+                    "inserting 4000 rows into fts_messages during streaming FTS maintenance: \
+                     fts5: corrupt %_data record: segment leaf term offset exceeds u16",
+                ))
+                .expect("record pending marker");
+            // Storage-level round-trip through the symmetric read accessor.
+            assert!(
+                storage
+                    .read_fallback_fts_repair_pending()
+                    .expect("read pending marker")
+                    .is_some_and(|d| d.contains("corrupt %_data record")),
+                "the recorded marker must read back through read_fallback_fts_repair_pending"
+            );
+            drop(storage);
+        }
+        let pending = state_meta_json(temp.path(), &db_path, 3600, true);
+        assert_eq!(
+            pending.pointer("/index/fallback_fts_repair/pending"),
+            Some(&serde_json::Value::Bool(true)),
+            "a persisted marker must surface as fallback_fts_repair.pending=true"
+        );
+        assert!(
+            pending
+                .pointer("/index/fallback_fts_repair/detail")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|d| d.contains("corrupt %_data record")),
+            "the detail must carry the failure reason"
+        );
+
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+            storage
+                .record_fallback_fts_repair_pending(None)
+                .expect("clear pending marker");
+            drop(storage);
+        }
+        let cleared = state_meta_json(temp.path(), &db_path, 3600, true);
+        assert!(
+            cleared.pointer("/index/fallback_fts_repair").is_none(),
+            "clearing the marker must omit the field again"
+        );
     }
 
     fn write_index_lock_metadata(lock_path: &Path, lock_file: &mut std::fs::File, metadata: &str) {

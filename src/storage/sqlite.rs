@@ -1117,6 +1117,16 @@ pub const FTS5_REGISTER_SQL: &str = "\
 
 const FTS_FRANKEN_REBUILD_META_KEY: &str = "fts_frankensqlite_rebuild_generation";
 const FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY: &str = "fts_frankensqlite_archive_fingerprint";
+/// zn1xn (adversarial-review F5): set to the failure detail when a full index
+/// run's optional derived fallback-FTS repair was skipped/failed and the
+/// canonical SQLite `fts_messages` shadow may be half-rebuilt; deleted when a
+/// later run repairs it. Surfaced additively in `state_meta_json` so `cass
+/// index --json` / `status` expose the half-built shadow immediately, rather
+/// than only when doctor's next PartialParity/ShadowCorrupt check catches it.
+const FTS_FALLBACK_REPAIR_PENDING_META_KEY: &str = "fts_fallback_repair_pending";
+/// Bound on the persisted failure detail so a pathological error chain cannot
+/// bloat the `meta` row.
+const FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES: usize = 400;
 const FTS_FRANKEN_REBUILD_GENERATION: i64 = 1;
 /// Exact canonical cardinality driven by the compact parent-rowid domain.
 /// FrankenSQLite 0.1.19 lowers this shape to `CountIndexEqRun`: each real
@@ -10712,6 +10722,51 @@ impl FrankenStorage {
             )
             .with_context(|| "recording frankensqlite FTS archive fingerprint")?;
         Ok(())
+    }
+
+    /// Record (or, with `None`, clear) the "the canonical FTS shadow may be
+    /// half-rebuilt" marker after a full index run (zn1xn). Best-effort:
+    /// callers ignore errors because this is observability, not correctness —
+    /// a failed marker write must never fail a run whose canonical + Tantivy
+    /// work already succeeded.
+    pub(crate) fn record_fallback_fts_repair_pending(&self, detail: Option<&str>) -> Result<()> {
+        match detail {
+            Some(detail) => {
+                let bounded: String = detail
+                    .chars()
+                    .take(FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES)
+                    .collect();
+                self.conn
+                    .execute_compat(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                        fparams![FTS_FALLBACK_REPAIR_PENDING_META_KEY, bounded],
+                    )
+                    .with_context(|| "recording fallback FTS repair-pending marker")?;
+            }
+            None => {
+                self.conn
+                    .execute_compat(
+                        "DELETE FROM meta WHERE key = ?1",
+                        fparams![FTS_FALLBACK_REPAIR_PENDING_META_KEY],
+                    )
+                    .with_context(|| "clearing fallback FTS repair-pending marker")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The persisted fallback-FTS repair-pending detail, if the last full index
+    /// run left the canonical `fts_messages` shadow unrepaired (zn1xn).
+    pub(crate) fn read_fallback_fts_repair_pending(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![FTS_FALLBACK_REPAIR_PENDING_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?
+            .filter(|detail: &String| !detail.is_empty()))
     }
 
     pub(crate) fn daily_stats_is_known_healthy_for_archive_fingerprint(
