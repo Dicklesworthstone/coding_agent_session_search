@@ -1127,6 +1127,14 @@ const FTS_FALLBACK_REPAIR_PENDING_META_KEY: &str = "fts_fallback_repair_pending"
 /// Bound on the persisted failure detail so a pathological error chain cannot
 /// bloat the `meta` row.
 const FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES: usize = 400;
+/// zn1xn F4: consecutive count of non-watch index runs that deferred inline
+/// lexical updates (an OOM under ample memory reroutes EVERY plain run through
+/// the full authoritative lexical rebuild — a multi-minute/hour amplification
+/// that was previously only a stderr warn). Surfaced in `status`/`index --json`
+/// so operators/agents can see the persistently-deferred degradation and its
+/// streak length, and reset once a run completes without deferring.
+const LEXICAL_REPAIR_DEFERRED_COUNT_META_KEY: &str = "lexical_repair_deferred_consecutive_runs";
+const LEXICAL_REPAIR_DEFERRED_REASON_META_KEY: &str = "lexical_repair_deferred_reason";
 const FTS_FRANKEN_REBUILD_GENERATION: i64 = 1;
 /// Exact canonical cardinality driven by the compact parent-rowid domain.
 /// FrankenSQLite 0.1.19 lowers this shape to `CountIndexEqRun`: each real
@@ -10758,6 +10766,7 @@ impl FrankenStorage {
     /// The persisted fallback-FTS repair-pending detail, if the last full index
     /// run left the canonical `fts_messages` shadow unrepaired (zn1xn).
     #[cfg(test)]
+    #[cfg(test)]
     pub(crate) fn read_fallback_fts_repair_pending(&self) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -10768,6 +10777,81 @@ impl FrankenStorage {
             )
             .optional()?
             .filter(|detail: &String| !detail.is_empty()))
+    }
+
+    fn read_lexical_repair_deferred_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![LEXICAL_REPAIR_DEFERRED_COUNT_META_KEY],
+                |row| row.get_typed::<String>(0),
+            )
+            .optional()?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// Increment the consecutive-deferral streak and record the reason after a
+    /// non-watch run deferred inline lexical updates (zn1xn F4). Returns the new
+    /// streak length. Best-effort observability — callers ignore errors.
+    pub(crate) fn record_lexical_repair_deferred(&self, reason: &str) -> Result<i64> {
+        let next = self.read_lexical_repair_deferred_count()?.saturating_add(1);
+        self.conn
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![LEXICAL_REPAIR_DEFERRED_COUNT_META_KEY, next.to_string()],
+            )
+            .with_context(|| "recording lexical-repair deferral streak")?;
+        let bounded: String = reason
+            .chars()
+            .take(FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES)
+            .collect();
+        self.conn
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![LEXICAL_REPAIR_DEFERRED_REASON_META_KEY, bounded],
+            )
+            .with_context(|| "recording lexical-repair deferral reason")?;
+        Ok(next)
+    }
+
+    /// Clear the consecutive-deferral streak after a non-watch run completed
+    /// without deferring inline lexical updates (zn1xn F4).
+    pub(crate) fn clear_lexical_repair_deferred(&self) -> Result<()> {
+        self.conn
+            .execute_compat(
+                "DELETE FROM meta WHERE key = ?1",
+                fparams![LEXICAL_REPAIR_DEFERRED_COUNT_META_KEY],
+            )
+            .with_context(|| "clearing lexical-repair deferral streak")?;
+        self.conn
+            .execute_compat(
+                "DELETE FROM meta WHERE key = ?1",
+                fparams![LEXICAL_REPAIR_DEFERRED_REASON_META_KEY],
+            )
+            .with_context(|| "clearing lexical-repair deferral reason")?;
+        Ok(())
+    }
+
+    /// The consecutive-deferral streak length and last reason, if a non-watch
+    /// run has persistently deferred inline lexical updates (zn1xn F4).
+    #[cfg(test)]
+    pub(crate) fn read_lexical_repair_deferred(&self) -> Result<Option<(i64, String)>> {
+        let count = self.read_lexical_repair_deferred_count()?;
+        if count <= 0 {
+            return Ok(None);
+        }
+        let reason = self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![LEXICAL_REPAIR_DEFERRED_REASON_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        Ok(Some((count, reason)))
     }
 
     pub(crate) fn daily_stats_is_known_healthy_for_archive_fingerprint(

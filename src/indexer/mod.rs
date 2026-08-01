@@ -14994,6 +14994,26 @@ pub fn run_index(
             scan_start_ts,
             now_ms,
         )?;
+        // zn1xn F4: track the persistent lexical-repair deferral streak so
+        // `status`/`index --json` expose the recurring full-rebuild
+        // amplification (previously only a stderr warn). Increment when this
+        // run deferred inline lexical updates; clear the streak when a scan
+        // completed without deferring. Best-effort observability — a marker
+        // write must never fail a run whose indexing work already succeeded.
+        if scan_lexical_update_deferred {
+            if let Err(err) = storage.record_lexical_repair_deferred(
+                "inline lexical updates deferred during non-watch scan (streaming ingest \
+                 pressure on one or more conversations); full authoritative lexical rebuild \
+                 performed — recurs every run until the offending source is resolved",
+            ) {
+                tracing::debug!(
+                    error = %format!("{err:#}"),
+                    "recording lexical-repair deferral marker failed (non-fatal)"
+                );
+            }
+        } else if performed_scan {
+            let _ = storage.clear_lexical_repair_deferred();
+        }
         if performed_scan_for_connector_watermarks {
             persist_connector_scan_watermarks(
                 &storage,

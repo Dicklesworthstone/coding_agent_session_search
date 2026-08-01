@@ -17805,6 +17805,11 @@ struct StateDbSnapshot {
     /// `fts_messages` shadow unrepaired (skipped/failed optional derived
     /// fallback-FTS repair). `None` when the shadow is not known half-built.
     fallback_repair_pending: Option<String>,
+    /// zn1xn F4: consecutive count of non-watch runs that deferred inline
+    /// lexical updates (rerouting through a full authoritative rebuild), and
+    /// the last reason. `None` streak when the last run did not defer.
+    lexical_repair_deferred_runs: Option<i64>,
+    lexical_repair_deferred_reason: Option<String>,
 }
 
 fn probe_state_db(
@@ -17897,6 +17902,24 @@ fn probe_state_db_modes(
     )
     .ok()
     .filter(|detail| !detail.is_empty());
+    // zn1xn F4: persistent lexical-repair deferral streak + reason.
+    snapshot.lexical_repair_deferred_runs = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'lexical_repair_deferred_consecutive_runs'",
+        params![],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<i64>().ok())
+    .filter(|runs| *runs > 0);
+    snapshot.lexical_repair_deferred_reason = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'lexical_repair_deferred_reason'",
+        params![],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .filter(|reason| !reason.is_empty());
     if include_counts && !watermarks_only {
         snapshot.conversation_count = franken_query_row_map_retry(
             &conn,
@@ -18617,6 +18640,8 @@ fn state_meta_json_inner(
     let counts_skipped = db_snapshot.counts_skipped;
     let open_skipped = db_snapshot.open_skipped;
     let fallback_fts_repair_pending = db_snapshot.fallback_repair_pending.clone();
+    let lexical_repair_deferred_runs = db_snapshot.lexical_repair_deferred_runs;
+    let lexical_repair_deferred_reason = db_snapshot.lexical_repair_deferred_reason.clone();
 
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
     let lexical_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
@@ -19151,6 +19176,20 @@ fn state_meta_json_inner(
         index.insert(
             "fallback_fts_repair".to_string(),
             serde_json::json!({ "pending": true, "detail": detail }),
+        );
+    }
+    // zn1xn F4: surface a persistent lexical-repair deferral streak additively —
+    // present only when the last non-watch run deferred inline lexical updates,
+    // so existing JSON is byte-identical otherwise.
+    if let Some(runs) = lexical_repair_deferred_runs
+        && let Some(index) = state.get_mut("index").and_then(|v| v.as_object_mut())
+    {
+        index.insert(
+            "lexical_repair_deferred".to_string(),
+            serde_json::json!({
+                "consecutive_runs": runs,
+                "reason": lexical_repair_deferred_reason,
+            }),
         );
     }
     state
@@ -74863,6 +74902,73 @@ mod cli_read_db_tests {
         assert!(
             cleared.pointer("/index/fallback_fts_repair").is_none(),
             "clearing the marker must omit the field again"
+        );
+    }
+
+    /// zn1xn F4: a non-watch run that persistently defers inline lexical updates
+    /// tracks a consecutive-run streak, surfaced additively in status/index
+    /// JSON, and cleared once a run completes without deferring.
+    #[test]
+    fn state_meta_surfaces_persistent_lexical_repair_deferral_streak() {
+        let (temp, db_path) = seed_cli_db();
+
+        let clean = state_meta_json(temp.path(), &db_path, 3600, true);
+        assert!(
+            clean.pointer("/index/lexical_repair_deferred").is_none(),
+            "lexical_repair_deferred must be omitted when no streak is active"
+        );
+
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+            assert_eq!(
+                storage
+                    .record_lexical_repair_deferred("deferred: streaming OOM on one source")
+                    .expect("record deferral"),
+                1,
+                "first deferral starts the streak at 1"
+            );
+            assert_eq!(
+                storage
+                    .record_lexical_repair_deferred("deferred: streaming OOM again")
+                    .expect("record deferral"),
+                2,
+                "a consecutive deferral advances the streak"
+            );
+            assert_eq!(
+                storage.read_lexical_repair_deferred().expect("read streak"),
+                Some((2, "deferred: streaming OOM again".to_string()))
+            );
+            drop(storage);
+        }
+        let deferred = state_meta_json(temp.path(), &db_path, 3600, true);
+        assert_eq!(
+            deferred.pointer("/index/lexical_repair_deferred/consecutive_runs"),
+            Some(&serde_json::json!(2)),
+            "the streak length must surface as consecutive_runs"
+        );
+        assert!(
+            deferred
+                .pointer("/index/lexical_repair_deferred/reason")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|r| r.contains("OOM again")),
+            "the last deferral reason must surface"
+        );
+
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+            storage
+                .clear_lexical_repair_deferred()
+                .expect("clear streak");
+            assert_eq!(
+                storage.read_lexical_repair_deferred().expect("read streak"),
+                None
+            );
+            drop(storage);
+        }
+        let cleared = state_meta_json(temp.path(), &db_path, 3600, true);
+        assert!(
+            cleared.pointer("/index/lexical_repair_deferred").is_none(),
+            "clearing the streak must omit the field again"
         );
     }
 
