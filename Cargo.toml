@@ -165,6 +165,10 @@ backtrace = []
 # Opt-in: upgrade sibling repo rev/worktree drift from warning to hard error and
 # validate the optional /data/projects path checkouts before enabling local overrides.
 strict-path-dep-validation = []
+# Internal, in-memory seam for feeding engine-ranked message identities through
+# the production CASS SQLite message projector and result reducer. This does not
+# enable artifact persistence or make a conformance/admission claim by itself.
+cass-layer-b-conformance = []
 
 [build-dependencies]
 vergen = { version = "10.0.0", default-features = false, features = ["build", "cargo"] }

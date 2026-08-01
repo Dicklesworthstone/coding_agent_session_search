@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 use frankensqlite::Connection;
 #[cfg(test)]
 use frankensqlite::compat::OptionalExtension;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt};
 #[cfg(test)]
 use frankensqlite::params;
 
@@ -1339,6 +1339,130 @@ pub struct SearchHit {
     pub origin_host: Option<String>,
 }
 
+/// One engine-ranked message admitted to the CASS lexical Layer-B hydrator.
+///
+/// This in-memory conformance input deliberately uses the exact
+/// `(conversation_id, message_index)` pair stored by both lexical engines. The
+/// schema's historical `source_id#msg_idx` rendering is not a safe hydration
+/// key for real CASS data: `source_id` is provenance (commonly `local`) and
+/// `msg_idx` restarts in every conversation. The Layer-B seam resolves the
+/// exact pair to one globally unique database message and rejects a missing or
+/// ambiguous mapping instead of falling back to source/path heuristics.
+#[cfg(any(test, feature = "cass-layer-b-conformance"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CassLexicalLayerBCandidate {
+    /// Database conversation identity stored by both lexical engines.
+    pub conversation_id: i64,
+    /// Zero-based message index within `conversation_id`.
+    pub message_index: u64,
+    /// Exact engine score representation. It is converted to `f32` only while
+    /// the production `SearchHit` is materialized.
+    pub score_bits: u32,
+    /// Zero-based rank in the engine-owned candidate stream.
+    pub rank: usize,
+}
+
+/// Largest candidate stream the bounded Layer-B projector can hydrate in one
+/// transaction without exceeding FrankenSQLite's bind-variable ceiling.
+#[cfg(any(test, feature = "cass-layer-b-conformance"))]
+pub const CASS_LEXICAL_LAYER_B_CANDIDATE_MAX: usize = SQLITE_MAX_VARIABLE_NUMBER;
+
+/// Same-input request for the bounded CASS Layer-B projection seam.
+#[cfg(any(test, feature = "cass-layer-b-conformance"))]
+#[derive(Debug, Clone, Copy)]
+pub struct CassLexicalLayerBRequest<'a> {
+    pub candidates: &'a [CassLexicalLayerBCandidate],
+    pub raw_query: &'a str,
+    /// The only filter owned by Layer B. Agent, workspace, time, and source
+    /// filters must already have been realized by the engine-owned Layer A.
+    pub session_paths: &'a HashSet<String>,
+    pub limit: usize,
+    pub offset: usize,
+    pub field_mask: FieldMask,
+}
+
+/// One CASS-visible result after the production hydrator and post-filter.
+#[cfg(any(test, feature = "cass-layer-b-conformance"))]
+#[derive(Debug, Clone)]
+pub struct CassLexicalLayerBHit {
+    pub message_id: u64,
+    pub input_rank: usize,
+    pub hit: SearchHit,
+}
+
+/// Semantics intentionally outside the first bounded Layer-B extraction.
+///
+/// Keeping these gaps typed prevents a successful projection test from being
+/// promoted into a claim about the controller's retry or count behavior.
+#[cfg(any(test, feature = "cass-layer-b-conformance"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CassLexicalLayerBNoClaim {
+    AdaptiveFetchRetry,
+    AutomaticWildcardFallback,
+    BoundedPreviewProjection,
+    QueryAwareSnippet,
+    ShippingTantivyMaterializer,
+    TotalCountPrecision,
+    WorkspaceOriginal,
+}
+
+/// Bounded result of one same-input CASS Layer-B projection.
+#[cfg(any(test, feature = "cass-layer-b-conformance"))]
+#[derive(Debug, Clone)]
+pub struct CassLexicalLayerBPage {
+    pub input_candidate_count: usize,
+    pub hydrated_candidate_count: usize,
+    /// Count after noise filtering, deduplication, and `session_paths`, before
+    /// applying `offset` and `limit`.
+    pub available_hits: usize,
+    pub hits: Vec<CassLexicalLayerBHit>,
+    pub no_claims: [CassLexicalLayerBNoClaim; 7],
+}
+
+/// Fail-closed validation and hydration errors for the Layer-B seam.
+#[cfg(any(test, feature = "cass-layer-b-conformance"))]
+#[derive(Debug, thiserror::Error)]
+pub enum CassLexicalLayerBError {
+    #[error("Layer-B candidate count {actual} exceeds the bound {maximum}")]
+    CandidateBoundExceeded { actual: usize, maximum: usize },
+    #[error("Layer-B candidate at position {position} declared rank {actual_rank}")]
+    NonCanonicalRank { position: usize, actual_rank: usize },
+    #[error("Layer-B candidate at rank {rank} has invalid conversation_id {conversation_id}")]
+    InvalidConversationId { rank: usize, conversation_id: i64 },
+    #[error("Layer-B candidate at rank {rank} has a message index that does not fit i64")]
+    MessageIndexOutOfRange { rank: usize },
+    #[error(
+        "Layer-B candidate identity ({conversation_id}, {message_index}) appears more than once"
+    )]
+    DuplicateIdentity {
+        conversation_id: i64,
+        message_index: u64,
+    },
+    #[error("Layer-B candidate at rank {rank} has a non-finite score")]
+    NonFiniteScore { rank: usize },
+    #[error("Layer-B projection requires a non-zero page limit")]
+    ZeroLimit,
+    #[error("Layer-B offset plus limit overflows usize")]
+    PaginationOverflow,
+    #[error("Layer-B query-aware snippets are outside this contract slice")]
+    SnippetNotSupported,
+    #[error("Layer-B bounded preview projection is outside this contract slice")]
+    BoundedPreviewNotSupported,
+    #[error(
+        "Layer-B candidate identity ({conversation_id}, {message_index}) did not resolve uniquely"
+    )]
+    UnresolvedIdentity {
+        conversation_id: i64,
+        message_index: u64,
+    },
+    #[error("Layer-B message_id {message_id} disappeared during hydration")]
+    HydratedCandidateMissing { message_id: u64 },
+    #[error("Layer-B SQLite hydration failed")]
+    Hydration(#[source] anyhow::Error),
+    #[error("Layer-B post-filter output lost its message/rank binding")]
+    LostCandidateBinding,
+}
+
 static LAZY_FIELDS_ENABLED: Lazy<bool> = Lazy::new(|| {
     dotenvy::var("CASS_LAZY_FIELDS")
         .ok()
@@ -2353,6 +2477,14 @@ fn two_tier_index_supports_mode(
 struct ResolvedSemanticDocId {
     message_id: u64,
     doc_id: String,
+}
+
+/// Engine-agnostic input to the production SQLite message projector.
+/// Semantic search and the CASS Layer-B seam both adapt into this shape.
+#[derive(Debug, Clone, Copy)]
+struct RankedMessageHydrationCandidate {
+    message_id: u64,
+    score: f32,
 }
 
 type ProgressiveLookupKey = (String, String, Option<i64>, String, i64, Option<i64>, u64);
@@ -3424,6 +3556,24 @@ pub(crate) fn deduplicate_hits_with_query(hits: Vec<SearchHit>, query: &str) -> 
     }
 
     deduped
+}
+
+/// Production CASS result reducer shared by lexical, semantic, progressive,
+/// and feature-gated conformance callers.
+fn postprocess_hits_page_core(
+    hits: Vec<SearchHit>,
+    query: &str,
+    session_paths: &HashSet<String>,
+    limit: usize,
+    offset: usize,
+) -> (usize, Vec<SearchHit>) {
+    let mut hits = deduplicate_hits_with_query(hits, query);
+    if !session_paths.is_empty() {
+        hits.retain(|hit| session_paths.contains(&hit.source_path));
+    }
+    let available_hits = hits.len();
+    let paged_hits = hits.into_iter().skip(offset).take(limit).collect();
+    (available_hits, paged_hits)
 }
 
 fn should_try_wildcard_fallback(
@@ -5193,18 +5343,16 @@ impl SearchClient {
         collapsed
     }
 
-    fn hydrate_semantic_hits_with_ids(
+    fn hydrate_ranked_message_hits_in_transaction(
         &self,
-        results: &[VectorSearchResult],
+        transaction: &Transaction<'_>,
+        results: &[RankedMessageHydrationCandidate],
         field_mask: FieldMask,
+        match_type: MatchType,
     ) -> Result<Vec<(u64, SearchHit)>> {
         if results.is_empty() {
             return Ok(Vec::new());
         }
-        let sqlite_guard = self.sqlite_guard()?;
-        let conn = sqlite_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
 
         #[derive(Debug)]
         struct MessageHydrationRow {
@@ -5253,8 +5401,10 @@ impl SearchClient {
              WHERE id IN ({message_placeholders})"
         );
 
-        let message_rows: Vec<MessageHydrationRow> =
-            conn.query_map_collect(&message_sql, &message_params, |row: &frankensqlite::Row| {
+        let message_rows: Vec<MessageHydrationRow> = transaction.query_map_collect(
+            &message_sql,
+            &message_params,
+            |row: &frankensqlite::Row| {
                 let message_id: i64 = row.get_typed(0)?;
                 Ok(MessageHydrationRow {
                     message_id: semantic_message_id_from_db(message_id)?,
@@ -5263,7 +5413,8 @@ impl SearchClient {
                     msg_created_at: row.get_typed(3)?,
                     idx: row.get_typed(4)?,
                 })
-            })?;
+            },
+        )?;
         if message_rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -5307,8 +5458,8 @@ impl SearchClient {
              WHERE c.id IN ({conversation_placeholders})"
         );
 
-        let conversation_rows: Vec<(i64, ConversationHydrationRow)> =
-            conn.query_map_collect(&sql, &conversation_params, |row: &frankensqlite::Row| {
+        let conversation_rows: Vec<(i64, ConversationHydrationRow)> = transaction
+            .query_map_collect(&sql, &conversation_params, |row: &frankensqlite::Row| {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let title: Option<String> = if field_mask.wants_title() {
                     row.get_typed(1)?
@@ -5386,7 +5537,7 @@ impl SearchClient {
                     workspace_original: None,
                     created_at,
                     line_number,
-                    match_type: MatchType::Exact,
+                    match_type,
                     source_id,
                     origin_kind,
                     origin_host: conversation.origin_host.clone(),
@@ -5410,6 +5561,36 @@ impl SearchClient {
         }
 
         Ok(ordered)
+    }
+
+    fn hydrate_semantic_hits_with_ids(
+        &self,
+        results: &[VectorSearchResult],
+        field_mask: FieldMask,
+    ) -> Result<Vec<(u64, SearchHit)>> {
+        if results.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates = results
+            .iter()
+            .map(|result| RankedMessageHydrationCandidate {
+                message_id: result.message_id,
+                score: result.score,
+            })
+            .collect::<Vec<_>>();
+        let sqlite_guard = self.sqlite_guard()?;
+        let conn = sqlite_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
+        let mut transaction = conn.transaction()?;
+        let hits = self.hydrate_ranked_message_hits_in_transaction(
+            &transaction,
+            &candidates,
+            field_mask,
+            MatchType::Exact,
+        )?;
+        transaction.rollback()?;
+        Ok(hits)
     }
 
     fn overlay_progressive_lexical_hit(
@@ -5901,6 +6082,278 @@ impl SearchClient {
             .map(|rows| rows.into_iter().map(|(_, hit)| hit).collect())
     }
 
+    /// Project an engine-ranked candidate stream through the production CASS
+    /// SQLite hydrator and result reducer.
+    ///
+    /// This is an in-memory conformance seam, not an artifact or admission
+    /// API. The caller owns the Layer-A query/filter execution and must provide
+    /// exact `(conversation_id, message_index)` identities from the engine's
+    /// stored fields. CASS resolves those pairs fail-closed, then applies the
+    /// same SQLite message projector used by shipping semantic/progressive
+    /// hydration and the same noise filter, deduplicator, `session_paths`
+    /// filter, and page reducer used across shipping search paths. The output
+    /// carries an explicit no-claim for Tantivy's separate stored-document
+    /// materializer; this bounded seam does not prove those two projectors are
+    /// equivalent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation error for malformed or ambiguous candidate
+    /// streams and a wrapped hydration error for SQLite failures.
+    #[cfg(any(test, feature = "cass-layer-b-conformance"))]
+    pub fn project_cass_lexical_layer_b_page(
+        &self,
+        request: CassLexicalLayerBRequest<'_>,
+    ) -> std::result::Result<CassLexicalLayerBPage, CassLexicalLayerBError> {
+        if request.candidates.len() > CASS_LEXICAL_LAYER_B_CANDIDATE_MAX {
+            return Err(CassLexicalLayerBError::CandidateBoundExceeded {
+                actual: request.candidates.len(),
+                maximum: CASS_LEXICAL_LAYER_B_CANDIDATE_MAX,
+            });
+        }
+        if request.limit == 0 {
+            return Err(CassLexicalLayerBError::ZeroLimit);
+        }
+        request
+            .offset
+            .checked_add(request.limit)
+            .ok_or(CassLexicalLayerBError::PaginationOverflow)?;
+        if request.field_mask.wants_snippet() {
+            return Err(CassLexicalLayerBError::SnippetNotSupported);
+        }
+        if request.field_mask.preview_content_limit().is_some() {
+            return Err(CassLexicalLayerBError::BoundedPreviewNotSupported);
+        }
+
+        let mut seen_identities = HashSet::with_capacity(request.candidates.len());
+        let mut indices_by_conversation: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (position, candidate) in request.candidates.iter().enumerate() {
+            if candidate.rank != position {
+                return Err(CassLexicalLayerBError::NonCanonicalRank {
+                    position,
+                    actual_rank: candidate.rank,
+                });
+            }
+            if candidate.conversation_id <= 0 {
+                return Err(CassLexicalLayerBError::InvalidConversationId {
+                    rank: candidate.rank,
+                    conversation_id: candidate.conversation_id,
+                });
+            }
+            let message_index = i64::try_from(candidate.message_index).map_err(|_| {
+                CassLexicalLayerBError::MessageIndexOutOfRange {
+                    rank: candidate.rank,
+                }
+            })?;
+            if !f32::from_bits(candidate.score_bits).is_finite() {
+                return Err(CassLexicalLayerBError::NonFiniteScore {
+                    rank: candidate.rank,
+                });
+            }
+            if !seen_identities.insert((candidate.conversation_id, candidate.message_index)) {
+                return Err(CassLexicalLayerBError::DuplicateIdentity {
+                    conversation_id: candidate.conversation_id,
+                    message_index: candidate.message_index,
+                });
+            }
+            indices_by_conversation
+                .entry(candidate.conversation_id)
+                .or_default()
+                .push(message_index);
+        }
+
+        let sanitized_query = nfc_sanitize_query(request.raw_query);
+        let match_type = dominant_match_type(&sanitized_query);
+        let (resolved_message_ids, hydrated) = {
+            let sqlite_guard = self
+                .sqlite_guard()
+                .map_err(CassLexicalLayerBError::Hydration)?;
+            let conn = sqlite_guard.as_ref().ok_or_else(|| {
+                CassLexicalLayerBError::Hydration(anyhow!(
+                    "CASS Layer-B projection requires a database connection"
+                ))
+            })?;
+            let mut transaction = conn
+                .transaction()
+                .map_err(|error| CassLexicalLayerBError::Hydration(anyhow::Error::new(error)))?;
+            let mut conversation_ids = indices_by_conversation.keys().copied().collect::<Vec<_>>();
+            conversation_ids.sort_unstable();
+            let mut resolved_by_identity = HashMap::with_capacity(request.candidates.len());
+
+            for conversation_id in conversation_ids {
+                let Some(message_indices) = indices_by_conversation.get_mut(&conversation_id)
+                else {
+                    continue;
+                };
+                message_indices.sort_unstable();
+                for chunk in message_indices.chunks(SQLITE_MAX_VARIABLE_NUMBER - 1) {
+                    let placeholders = sql_placeholders(chunk.len());
+                    let sql = format!(
+                        "SELECT id, conversation_id, idx
+                         FROM messages
+                         WHERE conversation_id = ? AND idx IN ({placeholders})
+                         ORDER BY idx, id"
+                    );
+                    let mut params = Vec::with_capacity(chunk.len() + 1);
+                    params.push(ParamValue::from(conversation_id));
+                    params.extend(chunk.iter().copied().map(ParamValue::from));
+                    let rows: Vec<(i64, i64, i64)> = transaction
+                        .query_map_collect(&sql, &params, |row| {
+                            Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+                        })
+                        .map_err(|error| {
+                            CassLexicalLayerBError::Hydration(anyhow::Error::new(error))
+                        })?;
+                    for (message_id, row_conversation_id, message_index) in rows {
+                        let message_id = u64::try_from(message_id).map_err(|_| {
+                            CassLexicalLayerBError::Hydration(anyhow!(
+                                "CASS Layer-B resolved a negative message id"
+                            ))
+                        })?;
+                        if message_id == 0 {
+                            return Err(CassLexicalLayerBError::Hydration(anyhow!(
+                                "CASS Layer-B resolved invalid message id 0"
+                            )));
+                        }
+                        let public_message_index = u64::try_from(message_index).map_err(|_| {
+                            CassLexicalLayerBError::Hydration(anyhow!(
+                                "CASS Layer-B resolved a negative message index"
+                            ))
+                        })?;
+                        let key = (row_conversation_id, message_index);
+                        if resolved_by_identity.insert(key, message_id).is_some() {
+                            return Err(CassLexicalLayerBError::UnresolvedIdentity {
+                                conversation_id: row_conversation_id,
+                                message_index: public_message_index,
+                            });
+                        }
+                    }
+                }
+            }
+
+            let resolved_message_ids = request
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    let message_index = i64::try_from(candidate.message_index).map_err(|_| {
+                        CassLexicalLayerBError::MessageIndexOutOfRange {
+                            rank: candidate.rank,
+                        }
+                    })?;
+                    resolved_by_identity
+                        .get(&(candidate.conversation_id, message_index))
+                        .copied()
+                        .ok_or(CassLexicalLayerBError::UnresolvedIdentity {
+                            conversation_id: candidate.conversation_id,
+                            message_index: candidate.message_index,
+                        })
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let ranked_messages = request
+                .candidates
+                .iter()
+                .zip(resolved_message_ids.iter().copied())
+                .map(|(candidate, message_id)| RankedMessageHydrationCandidate {
+                    message_id,
+                    score: f32::from_bits(candidate.score_bits),
+                })
+                .collect::<Vec<_>>();
+            let hydrated = self
+                .hydrate_ranked_message_hits_in_transaction(
+                    &transaction,
+                    &ranked_messages,
+                    request.field_mask,
+                    match_type,
+                )
+                .map_err(CassLexicalLayerBError::Hydration)?;
+            transaction
+                .rollback()
+                .map_err(|error| CassLexicalLayerBError::Hydration(anyhow::Error::new(error)))?;
+            (resolved_message_ids, hydrated)
+        };
+
+        let hydrated_message_ids = hydrated
+            .iter()
+            .map(|(message_id, _)| *message_id)
+            .collect::<HashSet<_>>();
+        for message_id in &resolved_message_ids {
+            if !hydrated_message_ids.contains(message_id) {
+                return Err(CassLexicalLayerBError::HydratedCandidateMissing {
+                    message_id: *message_id,
+                });
+            }
+        }
+
+        let candidate_by_message_id = resolved_message_ids
+            .iter()
+            .copied()
+            .zip(request.candidates.iter().copied())
+            .collect::<HashMap<_, _>>();
+        // The exact identity resolver has already rejected duplicate
+        // `(conversation_id, message_index)` rows and candidate identities.
+        // Since hydration derives `conversation_id` and `line_number` from
+        // that same transaction snapshot, two valid candidates cannot share a
+        // `SearchHitKey`. Keep the occupied-entry handling defensive so a
+        // future projector change still binds the reducer's higher-score
+        // winner to the same message and input rank it retained.
+        let mut binding_by_hit_key: HashMap<SearchHitKey, (u64, usize, f32)> = HashMap::new();
+        for (message_id, hit) in &hydrated {
+            let candidate = candidate_by_message_id
+                .get(message_id)
+                .ok_or(CassLexicalLayerBError::LostCandidateBinding)?;
+            let key = SearchHitKey::from_hit(hit);
+            match binding_by_hit_key.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((*message_id, candidate.rank, hit.score));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry)
+                    if entry.get().2 < hit.score =>
+                {
+                    entry.insert((*message_id, candidate.rank, hit.score));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
+        }
+        let hydrated_candidate_count = hydrated.len();
+        let (available_hits, hits) = postprocess_hits_page_core(
+            hydrated.into_iter().map(|(_, hit)| hit).collect(),
+            &sanitized_query,
+            request.session_paths,
+            request.limit,
+            request.offset,
+        );
+        let hits = hits
+            .into_iter()
+            .map(|hit| {
+                let key = SearchHitKey::from_hit(&hit);
+                let (message_id, input_rank, _) = binding_by_hit_key
+                    .remove(&key)
+                    .ok_or(CassLexicalLayerBError::LostCandidateBinding)?;
+                Ok(CassLexicalLayerBHit {
+                    message_id,
+                    input_rank,
+                    hit,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, CassLexicalLayerBError>>()?;
+
+        Ok(CassLexicalLayerBPage {
+            input_candidate_count: request.candidates.len(),
+            hydrated_candidate_count,
+            available_hits,
+            hits,
+            no_claims: [
+                CassLexicalLayerBNoClaim::AdaptiveFetchRetry,
+                CassLexicalLayerBNoClaim::AutomaticWildcardFallback,
+                CassLexicalLayerBNoClaim::BoundedPreviewProjection,
+                CassLexicalLayerBNoClaim::QueryAwareSnippet,
+                CassLexicalLayerBNoClaim::ShippingTantivyMaterializer,
+                CassLexicalLayerBNoClaim::TotalCountPrecision,
+                CassLexicalLayerBNoClaim::WorkspaceOriginal,
+            ],
+        })
+    }
+
     fn postprocess_hits_page(
         &self,
         hits: Vec<SearchHit>,
@@ -5909,13 +6362,7 @@ impl SearchClient {
         limit: usize,
         offset: usize,
     ) -> (usize, Vec<SearchHit>) {
-        let mut hits = deduplicate_hits_with_query(hits, query);
-        if !filters.session_paths.is_empty() {
-            hits.retain(|hit| filters.session_paths.contains(&hit.source_path));
-        }
-        let available_hits = hits.len();
-        let paged_hits = hits.into_iter().skip(offset).take(limit).collect();
-        (available_hits, paged_hits)
+        postprocess_hits_page_core(hits, query, &filters.session_paths, limit, offset)
     }
 
     /// Search with automatic wildcard fallback for sparse results.
@@ -9050,6 +9497,42 @@ mod tests {
             message_id,
             chunk_idx: 0,
             score,
+        }
+    }
+
+    fn cass_layer_b_test_client(connection: Option<FrankenConnection>) -> SearchClient {
+        SearchClient {
+            reader: None,
+            sqlite: Mutex::new(connection.map(SendConnection)),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: "vtest|schema:cass-layer-b".into(),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        }
+    }
+
+    fn cass_layer_b_test_request<'a>(
+        candidates: &'a [CassLexicalLayerBCandidate],
+        session_paths: &'a HashSet<String>,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+    ) -> CassLexicalLayerBRequest<'a> {
+        CassLexicalLayerBRequest {
+            candidates,
+            raw_query: "needle",
+            session_paths,
+            limit,
+            offset,
+            field_mask,
         }
     }
 
@@ -13455,6 +13938,368 @@ mod tests {
         assert!(hits.iter().all(|(_, hit)| hit.content.is_empty()));
         assert!(hits.iter().all(|(_, hit)| !hit.snippet.is_empty()));
         assert_ne!(hits[0].1.content_hash, hits[1].1.content_hash);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cass_layer_b_projection_uses_alias_safe_real_sqlite_identity() -> Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let workspace_id = storage.ensure_workspace(dir.path(), None)?;
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent)?;
+
+        let make_conversation =
+            |external_id: &str, source_path: PathBuf, content: &str, timestamp: i64| Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: Some(dir.path().to_path_buf()),
+                external_id: Some(external_id.into()),
+                title: Some(format!("Layer B {external_id}")),
+                source_path,
+                started_at: Some(timestamp),
+                ended_at: Some(timestamp),
+                approx_tokens: Some(8),
+                metadata_json: json!({}),
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(timestamp),
+                    content: content.into(),
+                    extra_json: json!({}),
+                    snippets: Vec::new(),
+                }],
+                source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+                origin_host: None,
+            };
+
+        let path_a = dir.path().join("conversation-a.jsonl");
+        let path_b = dir.path().join("conversation-b.jsonl");
+        let path_noise = dir.path().join("conversation-noise.jsonl");
+        let outcome_a = storage.insert_conversation_tree(
+            agent_id,
+            Some(workspace_id),
+            &make_conversation(
+                "layer-b-a",
+                path_a.clone(),
+                "needle alpha from conversation a",
+                1_700_000_001_000,
+            ),
+        )?;
+        let outcome_b = storage.insert_conversation_tree(
+            agent_id,
+            Some(workspace_id),
+            &make_conversation(
+                "layer-b-b",
+                path_b.clone(),
+                "needle beta from conversation b",
+                1_700_000_002_000,
+            ),
+        )?;
+        let outcome_noise = storage.insert_conversation_tree(
+            agent_id,
+            Some(workspace_id),
+            &make_conversation("layer-b-noise", path_noise, "ok", 1_700_000_003_000),
+        )?;
+        storage.close()?;
+
+        let index_path = dir.path().join("absent-index");
+        let client = SearchClient::open(&index_path, Some(&db_path))?
+            .expect("SQLite-only client must be available");
+        let candidates = [
+            CassLexicalLayerBCandidate {
+                conversation_id: outcome_b.conversation_id,
+                message_index: 0,
+                score_bits: 0.9_f32.to_bits(),
+                rank: 0,
+            },
+            CassLexicalLayerBCandidate {
+                conversation_id: outcome_noise.conversation_id,
+                message_index: 0,
+                score_bits: 0.85_f32.to_bits(),
+                rank: 1,
+            },
+            CassLexicalLayerBCandidate {
+                conversation_id: outcome_a.conversation_id,
+                message_index: 0,
+                score_bits: 0.8_f32.to_bits(),
+                rank: 2,
+            },
+        ];
+        let field_mask = FieldMask::new(true, false, true, false);
+        let no_session_paths = HashSet::new();
+        let second_visible =
+            client.project_cass_lexical_layer_b_page(CassLexicalLayerBRequest {
+                candidates: &candidates,
+                raw_query: "needle*",
+                session_paths: &no_session_paths,
+                limit: 1,
+                offset: 1,
+                field_mask,
+            })?;
+
+        assert_eq!(second_visible.input_candidate_count, 3);
+        assert_eq!(second_visible.hydrated_candidate_count, 3);
+        assert_eq!(second_visible.available_hits, 2, "the 'ok' row is noise");
+        assert_eq!(second_visible.hits.len(), 1);
+        assert_eq!(second_visible.hits[0].input_rank, 2);
+        assert_eq!(
+            second_visible.hits[0].hit.score.to_bits(),
+            0.8_f32.to_bits()
+        );
+        assert_eq!(second_visible.hits[0].hit.match_type, MatchType::Prefix);
+        assert_eq!(
+            second_visible.hits[0].hit.source_path,
+            path_a.to_string_lossy()
+        );
+        assert!(
+            second_visible.hits[0]
+                .hit
+                .content
+                .contains("conversation a")
+        );
+        assert!(
+            second_visible
+                .no_claims
+                .contains(&CassLexicalLayerBNoClaim::TotalCountPrecision)
+        );
+
+        // Both engine identities would historically render as `local#0`.
+        // Exact conversation binding must nevertheless keep them distinct and
+        // let the production session-path reducer select only conversation A.
+        let only_a = HashSet::from([path_a.to_string_lossy().to_string()]);
+        let filtered = client.project_cass_lexical_layer_b_page(CassLexicalLayerBRequest {
+            candidates: &candidates,
+            raw_query: "needle*",
+            session_paths: &only_a,
+            limit: 1,
+            offset: 0,
+            field_mask,
+        })?;
+        assert_eq!(filtered.available_hits, 1);
+        assert_eq!(filtered.hits[0].input_rank, 2);
+        assert_eq!(filtered.hits[0].hit.source_path, path_a.to_string_lossy());
+
+        let missing = [CassLexicalLayerBCandidate {
+            conversation_id: i64::MAX,
+            message_index: 0,
+            score_bits: 1.0_f32.to_bits(),
+            rank: 0,
+        }];
+        let error = client
+            .project_cass_lexical_layer_b_page(CassLexicalLayerBRequest {
+                candidates: &missing,
+                raw_query: "needle",
+                session_paths: &no_session_paths,
+                limit: 1,
+                offset: 0,
+                field_mask,
+            })
+            .expect_err("a missing exact identity must fail closed");
+        assert!(matches!(
+            error,
+            CassLexicalLayerBError::UnresolvedIdentity {
+                conversation_id: i64::MAX,
+                message_index: 0
+            }
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn cass_layer_b_projection_rejects_malformed_candidate_streams_before_sqlite() {
+        let client = cass_layer_b_test_client(None);
+        let no_session_paths = HashSet::new();
+        let field_mask = FieldMask::new(true, false, true, false);
+        let valid = CassLexicalLayerBCandidate {
+            conversation_id: 1,
+            message_index: 0,
+            score_bits: 1.0_f32.to_bits(),
+            rank: 0,
+        };
+
+        let oversized = vec![valid; CASS_LEXICAL_LAYER_B_CANDIDATE_MAX + 1];
+        assert!(matches!(
+            client.project_cass_lexical_layer_b_page(cass_layer_b_test_request(
+                &oversized,
+                &no_session_paths,
+                1,
+                0,
+                field_mask,
+            )),
+            Err(CassLexicalLayerBError::CandidateBoundExceeded {
+                actual,
+                maximum: CASS_LEXICAL_LAYER_B_CANDIDATE_MAX,
+            }) if actual == CASS_LEXICAL_LAYER_B_CANDIDATE_MAX + 1
+        ));
+
+        let noncanonical_rank = [CassLexicalLayerBCandidate { rank: 1, ..valid }];
+        assert!(matches!(
+            client.project_cass_lexical_layer_b_page(cass_layer_b_test_request(
+                &noncanonical_rank,
+                &no_session_paths,
+                1,
+                0,
+                field_mask,
+            )),
+            Err(CassLexicalLayerBError::NonCanonicalRank {
+                position: 0,
+                actual_rank: 1,
+            })
+        ));
+
+        let invalid_conversation = [CassLexicalLayerBCandidate {
+            conversation_id: 0,
+            ..valid
+        }];
+        assert!(matches!(
+            client.project_cass_lexical_layer_b_page(cass_layer_b_test_request(
+                &invalid_conversation,
+                &no_session_paths,
+                1,
+                0,
+                field_mask,
+            )),
+            Err(CassLexicalLayerBError::InvalidConversationId {
+                rank: 0,
+                conversation_id: 0,
+            })
+        ));
+
+        let oversized_message_index = [CassLexicalLayerBCandidate {
+            message_index: u64::MAX,
+            ..valid
+        }];
+        assert!(matches!(
+            client.project_cass_lexical_layer_b_page(cass_layer_b_test_request(
+                &oversized_message_index,
+                &no_session_paths,
+                1,
+                0,
+                field_mask,
+            )),
+            Err(CassLexicalLayerBError::MessageIndexOutOfRange { rank: 0 })
+        ));
+
+        let non_finite_score = [CassLexicalLayerBCandidate {
+            score_bits: f32::NAN.to_bits(),
+            ..valid
+        }];
+        assert!(matches!(
+            client.project_cass_lexical_layer_b_page(cass_layer_b_test_request(
+                &non_finite_score,
+                &no_session_paths,
+                1,
+                0,
+                field_mask,
+            )),
+            Err(CassLexicalLayerBError::NonFiniteScore { rank: 0 })
+        ));
+
+        let duplicate_identity = [valid, CassLexicalLayerBCandidate { rank: 1, ..valid }];
+        assert!(matches!(
+            client.project_cass_lexical_layer_b_page(cass_layer_b_test_request(
+                &duplicate_identity,
+                &no_session_paths,
+                1,
+                0,
+                field_mask,
+            )),
+            Err(CassLexicalLayerBError::DuplicateIdentity {
+                conversation_id: 1,
+                message_index: 0,
+            })
+        ));
+
+        assert!(matches!(
+            client.project_cass_lexical_layer_b_page(cass_layer_b_test_request(
+                &[valid],
+                &no_session_paths,
+                0,
+                0,
+                field_mask,
+            )),
+            Err(CassLexicalLayerBError::ZeroLimit)
+        ));
+        assert!(matches!(
+            client.project_cass_lexical_layer_b_page(cass_layer_b_test_request(
+                &[valid],
+                &no_session_paths,
+                1,
+                usize::MAX,
+                field_mask,
+            )),
+            Err(CassLexicalLayerBError::PaginationOverflow)
+        ));
+        assert!(matches!(
+            client.project_cass_lexical_layer_b_page(cass_layer_b_test_request(
+                &[valid],
+                &no_session_paths,
+                1,
+                0,
+                FieldMask::new(true, true, true, false),
+            )),
+            Err(CassLexicalLayerBError::SnippetNotSupported)
+        ));
+        assert!(matches!(
+            client.project_cass_lexical_layer_b_page(cass_layer_b_test_request(
+                &[valid],
+                &no_session_paths,
+                1,
+                0,
+                field_mask.with_preview_content_limit(Some(32)),
+            )),
+            Err(CassLexicalLayerBError::BoundedPreviewNotSupported)
+        ));
+    }
+
+    #[test]
+    fn cass_layer_b_projection_rejects_ambiguous_historical_identity() -> Result<()> {
+        let conn = FrankenConnection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL
+             );
+             INSERT INTO messages(id, conversation_id, idx) VALUES(1, 7, 0);
+             INSERT INTO messages(id, conversation_id, idx) VALUES(2, 7, 0);",
+        )?;
+        let client = cass_layer_b_test_client(Some(conn));
+        let candidates = [CassLexicalLayerBCandidate {
+            conversation_id: 7,
+            message_index: 0,
+            score_bits: 0.75_f32.to_bits(),
+            rank: 0,
+        }];
+        let no_session_paths = HashSet::new();
+        let error = client
+            .project_cass_lexical_layer_b_page(cass_layer_b_test_request(
+                &candidates,
+                &no_session_paths,
+                1,
+                0,
+                FieldMask::new(true, false, true, false),
+            ))
+            .expect_err("a historical duplicate identity must fail closed");
+        assert!(matches!(
+            error,
+            CassLexicalLayerBError::UnresolvedIdentity {
+                conversation_id: 7,
+                message_index: 0,
+            }
+        ));
 
         Ok(())
     }
