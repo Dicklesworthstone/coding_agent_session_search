@@ -9462,9 +9462,7 @@ fn repair_fallback_fts_after_full_index_run(
                 // optional derived asset must not fail the completed run.
                 Err(err) => {
                     break 'compute FallbackFtsRepairOutcome::SkippedRepairFailed {
-                        detail: format!(
-                            "probing fallback FTS archive-fingerprint health: {err:#}"
-                        ),
+                        detail: format!("probing fallback FTS archive-fingerprint health: {err:#}"),
                     };
                 }
             }
@@ -9507,8 +9505,8 @@ fn repair_fallback_fts_after_full_index_run(
     // the shadow is repaired/known-healthy, so `cass index --json` / `status`
     // surface the half-built shadow immediately. Best-effort: a marker write
     // failure must never fail a run whose canonical + Tantivy work succeeded.
-    if let Err(err) =
-        fresh_storage.record_fallback_fts_repair_pending(fallback_fts_repair_pending_detail(&outcome))
+    if let Err(err) = fresh_storage
+        .record_fallback_fts_repair_pending(fallback_fts_repair_pending_detail(&outcome))
     {
         tracing::debug!(
             error = %format!("{err:#}"),

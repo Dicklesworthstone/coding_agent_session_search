@@ -1191,10 +1191,14 @@ mod tests {
         assert_eq!(diagnostic.kind, "fts5-oversized-leaf-shadow-unbuildable");
         assert!(!diagnostic.retryable);
         assert!(
-            diagnostic.message.contains("not corruption of your archive"),
+            diagnostic
+                .message
+                .contains("not corruption of your archive"),
             "message must reassure the operator their data is intact"
         );
-        let hint = diagnostic.hint.expect("oversized-leaf diagnostic carries a hint");
+        let hint = diagnostic
+            .hint
+            .expect("oversized-leaf diagnostic carries a hint");
         assert!(
             hint.contains("Tantivy") && hint.contains("No action is needed"),
             "hint must state search still works and no action is needed"
