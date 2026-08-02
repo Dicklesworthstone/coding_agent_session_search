@@ -38527,9 +38527,16 @@ fn collect_doctor_source_inventory(data_dir: &Path, db_path: &Path) -> DoctorSou
         Ok(rows) => {
             build_doctor_source_inventory_report(data_dir, true, None, rows, detected_roots)
         }
+        // The DB file exists but could not be read (unopenable/malformed, or a
+        // read timeout). `db_available` must reflect *readability*, not mere
+        // existence: reporting `true` here laundered a failed open into an
+        // "available archive" whose default 0-row count was then promoted into
+        // `archive-db-opened` evidence and selected as repair authority over a
+        // checksum-verified raw mirror (#374 Issue 1). The `db_query_error`
+        // below still surfaces the concrete failure to the operator.
         Err(err) => build_doctor_source_inventory_report(
             data_dir,
-            true,
+            false,
             Some(err.message),
             Vec::new(),
             detected_roots,
@@ -43318,7 +43325,22 @@ fn build_doctor_source_authority_report(
     let coverage_delta = doctor_source_authority_coverage_delta(source_inventory, raw_mirror);
     let freshness_delta = doctor_source_authority_freshness_delta(db_path, raw_mirror);
     let checksum_evidence = doctor_source_authority_checksum_evidence(raw_mirror);
-    let raw_mirror_trusted = raw_mirror.status == "verified"
+    // Trust the mirror as a repair authority on its *blob integrity*, not the
+    // aggregate `status` string. `status` degrades to "warn" for non-integrity
+    // reasons too — stale `interrupted_capture` tmp debris and size warnings —
+    // which wrongly refused a mirror with 0 missing / 0 mismatched blobs as a
+    // reconstruction authority (#374 Issue 1). This is a strict relaxation:
+    // every mirror the old `status == "verified"` gate accepted had all these
+    // integrity counts at 0 too, so nothing previously refused for a real
+    // integrity fault becomes trusted. Unrecorded checksums stay disqualifying
+    // (we can't confirm those blobs).
+    let raw_mirror_integrity_verified = raw_mirror.summary.manifest_count > 0
+        && raw_mirror.summary.invalid_manifest_count == 0
+        && raw_mirror.summary.missing_blob_count == 0
+        && raw_mirror.summary.checksum_mismatch_count == 0
+        && raw_mirror.summary.manifest_checksum_mismatch_count == 0
+        && raw_mirror.summary.manifest_checksum_not_recorded_count == 0;
+    let raw_mirror_trusted = raw_mirror_integrity_verified
         && checksum_evidence.summary_status == DoctorArtifactChecksumStatus::Matched;
     let archive_available = source_inventory.db_available;
     let mut selected_authorities = Vec::new();
@@ -68858,6 +68880,85 @@ paths = ["~/.claude/projects"]
             DoctorArtifactChecksumStatus::Matched
         );
         assert_eq!(report.coverage_delta.raw_mirror_db_link_count, 1);
+    }
+
+    #[test]
+    fn doctor_source_authority_prefers_verified_mirror_over_unreadable_archive() {
+        // #374 Issue 1: an unopenable/malformed archive DB must not be selected
+        // as repair authority over a checksum-verified raw mirror, and stale
+        // capture debris (interrupted_capture) must not veto an otherwise
+        // blob-clean mirror.
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"malformed db").expect("write db placeholder");
+        let source_path = data_dir.join("sessions/live.jsonl");
+
+        // The archive exists but the read-only open/query failed: db_available
+        // is false and the concrete cause is carried as db_query_error.
+        let source_inventory = build_doctor_source_inventory_report(
+            &data_dir,
+            false,
+            Some("database disk image is malformed".to_string()),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let bytes = b"{\"type\":\"message\",\"content\":\"preserved\"}\n";
+        let manifest = raw_mirror_test_manifest(
+            &data_dir,
+            "codex",
+            "local",
+            &source_path,
+            bytes,
+            vec![DoctorRawMirrorDbLink {
+                conversation_id: Some(1),
+                message_count: Some(1),
+                source_path: Some(source_path.display().to_string()),
+                started_at_ms: Some(1_733_000_000_000),
+            }],
+        );
+        write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+
+        // Stale interrupted-capture debris: a leftover file under the mirror's
+        // tmp/ dir downgrades status to "warn" without harming blob integrity.
+        let mirror_tmp = doctor_raw_mirror_root(&data_dir).join("tmp/op-123");
+        std::fs::create_dir_all(&mirror_tmp).expect("create mirror tmp");
+        std::fs::write(mirror_tmp.join("model.safetensors.tmp"), b"partial")
+            .expect("write debris");
+
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        assert_eq!(
+            raw_mirror.status, "warn",
+            "stale capture debris should mark aggregate status warn"
+        );
+        assert_eq!(raw_mirror.summary.missing_blob_count, 0);
+        assert_eq!(raw_mirror.summary.checksum_mismatch_count, 0);
+
+        let report =
+            build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
+
+        assert_eq!(
+            report.selected_authority,
+            Some(DoctorSourceAuthorityKind::VerifiedRawMirror),
+            "blob-clean mirror must outrank an unreadable archive despite warn status: {report:#?}"
+        );
+        assert!(
+            !report
+                .selected_authorities
+                .iter()
+                .any(|c| c.authority == DoctorSourceAuthorityKind::CanonicalArchiveDb),
+            "an unreadable archive must not be a selected authority: {report:#?}"
+        );
+        assert!(
+            !report
+                .selected_authorities
+                .iter()
+                .chain(report.rejected_authorities.iter())
+                .any(|c| c.evidence.iter().any(|e| e == "archive-db-opened")),
+            "a failed open must not emit archive-db-opened evidence: {report:#?}"
+        );
     }
 
     #[test]
