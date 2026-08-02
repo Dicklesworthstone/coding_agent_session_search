@@ -31427,6 +31427,41 @@ fn doctor_safe_auto_manual_next_command(check: &DoctorCheckReport) -> &'static s
     }
 }
 
+/// Pick the next command to recommend from a read-only `doctor check`.
+///
+/// #374 Defect 2B: the read-only surface used to hardcode `cass doctor --fix
+/// --json`, but `--fix` maps to the SafeAutoRun repair mode whose allowed
+/// mutation classes are derived-cleanup only (RetainedPublishBackup /
+/// ReclaimableDerivedCache / MemoCache). It can never repair a failing
+/// canonical-archive or source-authority check, so recommending it there is a
+/// dead end. Route those failures to the command that can actually address them
+/// (a dry-run reconstruct/restore, or an archive scan), prioritizing the most
+/// fundamental fault; fall back to `--fix` only when the failures are things the
+/// safe auto-fix path genuinely handles (derived cleanup, staging, locks).
+fn doctor_read_only_next_command(check_reports: &[DoctorCheckReport]) -> String {
+    let failing = |name: &str| {
+        check_reports
+            .iter()
+            .any(|check| check.name == name && (check.status == "fail" || check.status == "error"))
+    };
+    if failing("database")
+        || failing("database_backup")
+        || failing("safe_auto_archive_rebuild")
+        || failing("candidate_staging")
+        || failing("coverage_comparison_gate")
+    {
+        return "cass doctor repair --dry-run --json".to_string();
+    }
+    if failing("source_coverage")
+        || failing("source_inventory")
+        || failing("raw_mirror")
+        || failing("raw_mirror_backfill")
+    {
+        return "cass doctor archive-scan --json".to_string();
+    }
+    "cass doctor --fix --json".to_string()
+}
+
 fn build_doctor_safe_auto_run_report(
     input: DoctorSafeAutoRunBuildInput<'_>,
 ) -> DoctorSafeAutoRunReport {
@@ -31469,7 +31504,7 @@ fn build_doctor_safe_auto_run_report(
         report
             .why_blocked
             .push("safe auto-run was not requested for this command surface".to_string());
-        report.next_exact_command = Some("cass doctor --fix --json".to_string());
+        report.next_exact_command = Some(doctor_read_only_next_command(input.check_reports));
         return report;
     }
 
@@ -68958,6 +68993,40 @@ paths = ["~/.claude/projects"]
                 .chain(report.rejected_authorities.iter())
                 .any(|c| c.evidence.iter().any(|e| e == "archive-db-opened")),
             "a failed open must not emit archive-db-opened evidence: {report:#?}"
+        );
+    }
+
+    #[test]
+    fn doctor_read_only_next_command_routes_by_failing_asset_class() {
+        // #374 Defect 2B: a read-only `doctor check` must not recommend `--fix`
+        // for a failing canonical-archive or source-authority check, since
+        // SafeAutoRun (`--fix`) can only mutate derived-cleanup asset classes.
+        let fail_db = doctor_check_report("database", "fail", "archive unreadable", false, false);
+        assert_eq!(
+            doctor_read_only_next_command(std::slice::from_ref(&fail_db)),
+            "cass doctor repair --dry-run --json"
+        );
+
+        let fail_source =
+            doctor_check_report("source_coverage", "fail", "coverage shrank", false, false);
+        assert_eq!(
+            doctor_read_only_next_command(std::slice::from_ref(&fail_source)),
+            "cass doctor archive-scan --json"
+        );
+
+        // All-pass (or only derived-cleanup findings) keeps the safe auto-fix path.
+        let pass_db = doctor_check_report("database", "pass", "Database OK", true, true);
+        assert_eq!(
+            doctor_read_only_next_command(std::slice::from_ref(&pass_db)),
+            "cass doctor --fix --json"
+        );
+
+        // An archive fault outranks an incidental cleanup failure.
+        let cleanup =
+            doctor_check_report("derivative_cleanup", "fail", "stale cache", true, true);
+        assert_eq!(
+            doctor_read_only_next_command(&[cleanup, fail_db]),
+            "cass doctor repair --dry-run --json"
         );
     }
 
