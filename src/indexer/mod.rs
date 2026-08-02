@@ -9187,14 +9187,20 @@ fn should_run_targeted_watch_once_only(
     has_watch_once_paths: bool,
     watch_enabled: bool,
     full_rebuild: bool,
-    needs_rebuild: bool,
-    canonical_sessions_before_salvage: usize,
+    _needs_rebuild: bool,
+    _canonical_sessions_before_salvage: usize,
 ) -> bool {
-    if !has_watch_once_paths || watch_enabled || full_rebuild {
-        return false;
-    }
-
-    !needs_rebuild || canonical_sessions_before_salvage == 0
+    // GH #350: an explicit targeted `--watch-once <paths>` ALWAYS bounds work to
+    // the supplied paths — the path-scoped run ingests the changed sessions and
+    // applies their inline lexical updates, deferring any broader authoritative
+    // rebuild (exactly as the plain-index path defers it) instead of scanning the
+    // whole archive. Previously `!needs_rebuild || canonical_sessions == 0`
+    // flipped a populated archive whose derived index looked stale into a
+    // full-corpus authoritative rebuild — the reported "scans large archive for
+    // one changed session". `needs_rebuild` is true for essentially any change a
+    // watch-once exists to ingest, so gating the targeted path on it defeated the
+    // feature; the size-based deferral now keeps the run path-bounded.
+    has_watch_once_paths && !watch_enabled && !full_rebuild
 }
 
 fn should_skip_absent_explicit_watch_once_paths(opts: &IndexOptions) -> bool {
@@ -42594,17 +42600,18 @@ mod tests {
             "fresh explicit watch-once imports should not broaden into every detected connector"
         );
         assert!(
-            !should_run_targeted_watch_once_only(true, false, false, true, 43_678),
-            "populated archives with a missing or invalid index still need authoritative repair"
+            should_run_targeted_watch_once_only(true, false, false, true, 43_678),
+            "GH #350: a populated archive whose derived index looks stale must STILL bound a \
+             targeted watch-once to the requested paths (ingesting the changed sessions inline \
+             and deferring any broader rebuild), never silently broadened into a full-corpus scan"
         );
+        // Watch mode, full rebuild, and absent explicit paths are never a
+        // targeted path-bounded run (regardless of index health).
         assert!(!should_run_targeted_watch_once_only(
             true, true, false, false, 43_678
         ));
         assert!(!should_run_targeted_watch_once_only(
             true, false, true, false, 43_678
-        ));
-        assert!(!should_run_targeted_watch_once_only(
-            true, false, false, true, 43_678
         ));
         assert!(!should_run_targeted_watch_once_only(
             false, false, false, false, 43_678
