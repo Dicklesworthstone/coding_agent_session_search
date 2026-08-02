@@ -16846,15 +16846,19 @@ fn canonical_archive_unhealthy_for_index_error(db_path: &Path, reason: &str) -> 
     anyhow::anyhow!(
         "canonical cass archive at {} is not safe for indexing: {reason}. \
          cass index will not replace or truncate the SQLite source of truth. \
-         Run 'cass doctor check --json' to inspect the archive. If the canonical \
-         rows are readable but a derived/FTS5 structure is corrupt, run \
-         'cass doctor --rebuild-canonical-fts --dry-run --json' and apply its safe \
-         parity repair with '--yes'. If the archive cannot be opened, recover the \
-         source tree from cass's own preserved events with \
-         'cass doctor --recover-from-archive <DIR>' (rebuilds source JSONL from the \
-         extra_json/extra_bin envelopes — no stock-sqlite .recover needed), then \
-         re-ingest with 'cass index --full'. An explicit backup restore via \
-         'cass doctor backups restore <id>' also remains available.",
+         Run 'cass doctor check --json' first — it ranks the recovery authorities \
+         (canonical DB vs a checksum-verified raw mirror vs backups) and names the \
+         exact next command. If the canonical rows are readable but a derived/FTS5 \
+         structure is corrupt, run 'cass doctor --rebuild-canonical-fts --dry-run \
+         --json' and apply its safe parity repair with '--yes'. If the archive \
+         cannot be opened at all, run 'cass doctor reconstruct --json': it rebuilds \
+         the canonical archive from the checksum-verified raw-mirror blobs (reading \
+         the mirror, not the dead DB) and promotes it behind a coverage gate with a \
+         backup of the corrupt bundle. If instead the archive opens read-only but is \
+         malformed, 'cass doctor --recover-from-archive <DIR>' rebuilds the source \
+         JSONL from cass's preserved extra_json/extra_bin envelopes for re-ingest. \
+         An explicit backup restore via 'cass doctor backups restore <id>' also \
+         remains available.",
         db_path.display()
     )
 }
