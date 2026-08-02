@@ -72960,6 +72960,7 @@ fn maybe_test_status_delay() {
 fn gather_projection_signals_from_state(
     state: &serde_json::Value,
     host_disk_free_pct: Option<f64>,
+    storage_integrity: Option<&serde_json::Value>,
 ) -> crate::root_cause_projection::ProjectionSignals {
     let mut signals = crate::root_cause_projection::ProjectionSignals {
         host_disk_free_pct,
@@ -72986,6 +72987,38 @@ fn gather_projection_signals_from_state(
             || lower.contains("not a database")
             || lower.contains("disk image")
             || lower.contains("sqlite_");
+        if storage_fault {
+            signals.open_read_failure = true;
+        }
+    }
+
+    // #374 Issue 3: the storage-integrity verdict is a first-class storage-fault
+    // signal even when the failure is NOT surfaced as a `/database/open_error`
+    // string — e.g. an archive that opened for the snapshot but fails the
+    // dedicated OpenRead/integrity probe reports `storage_state: openread_failed`
+    // / `archive_readability: unreadable` with an empty open_error, which
+    // previously left `project_root_cause` unattributed. Consult the canonical
+    // StorageState vocabulary so `archive-db-unreadable` attributes to the
+    // frankensqlite-storage family. Busy/locked/derived-only/unchecked states are
+    // deliberately NOT faults here (they are host/transient or non-canonical).
+    if !signals.open_read_failure
+        && let Some(integrity) = storage_integrity
+    {
+        let storage_state = integrity
+            .get("storage_state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let archive_readability = integrity
+            .get("archive_readability")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let storage_fault = matches!(
+            storage_state,
+            "openread_failed"
+                | "integrity_failed"
+                | "legacy_interop_failed"
+                | "fts_metadata_failed"
+        ) || archive_readability == "unreadable";
         if storage_fault {
             signals.open_read_failure = true;
         }
@@ -73028,11 +73061,64 @@ mod root_cause_signal_gather_tests {
                 "open_retryable": false
             }
         });
-        let s = gather_projection_signals_from_state(&state, None);
+        let s = gather_projection_signals_from_state(&state, None, None);
         assert!(s.open_read_failure);
         assert_eq!(
             project_root_cause(&s).family,
             RootCauseFamily::FrankensqliteStorage
+        );
+    }
+
+    #[test]
+    fn storage_integrity_fault_without_open_error_attributes_storage() {
+        // #374 Issue 3: no /database/open_error, but the storage-integrity
+        // verdict reports a canonical-store fault — must still attribute to the
+        // frankensqlite-storage family instead of returning unknown.
+        let state = serde_json::json!({
+            "database": { "opened": true, "open_retryable": false }
+        });
+        for storage_state in ["openread_failed", "integrity_failed", "fts_metadata_failed"] {
+            let integrity = serde_json::json!({
+                "storage_state": storage_state,
+                "archive_readability": "unreadable",
+            });
+            let s = gather_projection_signals_from_state(&state, None, Some(&integrity));
+            assert!(
+                s.open_read_failure,
+                "storage_state {storage_state} must raise a storage fault"
+            );
+            assert_eq!(
+                project_root_cause(&s).family,
+                RootCauseFamily::FrankensqliteStorage
+            );
+        }
+
+        // archive_readability alone (unreadable) is sufficient.
+        let readability_only = serde_json::json!({
+            "storage_state": "unchecked",
+            "archive_readability": "unreadable",
+        });
+        assert!(
+            gather_projection_signals_from_state(&state, None, Some(&readability_only))
+                .open_read_failure
+        );
+
+        // Transient / non-canonical states are NOT storage faults.
+        for storage_state in ["ok", "unchecked", "busy_or_locked", "derived_only_drift"] {
+            let integrity = serde_json::json!({
+                "storage_state": storage_state,
+                "archive_readability": "not_checked",
+            });
+            assert!(
+                !gather_projection_signals_from_state(&state, None, Some(&integrity))
+                    .open_read_failure,
+                "storage_state {storage_state} must not raise a storage fault"
+            );
+        }
+
+        // Absent storage_integrity leaves the existing behavior untouched.
+        assert!(
+            !gather_projection_signals_from_state(&state, None, None).open_read_failure
         );
     }
 
@@ -73045,7 +73131,7 @@ mod root_cause_signal_gather_tests {
         ] {
             let state =
                 serde_json::json!({"database": {"open_error": err, "open_retryable": retryable}});
-            let s = gather_projection_signals_from_state(&state, None);
+            let s = gather_projection_signals_from_state(&state, None, None);
             assert!(!s.open_read_failure, "{err} must not be a storage fault");
             assert_eq!(project_root_cause(&s).family, RootCauseFamily::Unknown);
         }
@@ -73054,7 +73140,7 @@ mod root_cause_signal_gather_tests {
     #[test]
     fn empty_index_with_messages_attributes_derived_state() {
         let state = serde_json::json!({"index": {"empty_with_messages": true}});
-        let s = gather_projection_signals_from_state(&state, None);
+        let s = gather_projection_signals_from_state(&state, None, None);
         assert!(s.derived_truth_table_mismatch);
         assert_eq!(
             project_root_cause(&s).family,
@@ -73065,28 +73151,28 @@ mod root_cause_signal_gather_tests {
     #[test]
     fn semantic_load_failed_is_a_fault_but_absent_is_not() {
         let failed = serde_json::json!({"semantic": {"availability": "load_failed"}});
-        assert!(gather_projection_signals_from_state(&failed, None).semantic_requested_but_missing);
+        assert!(gather_projection_signals_from_state(&failed, None, None).semantic_requested_but_missing);
         let absent = serde_json::json!({"semantic": {"availability": "not_initialized"}});
         assert!(
-            !gather_projection_signals_from_state(&absent, None).semantic_requested_but_missing
+            !gather_projection_signals_from_state(&absent, None, None).semantic_requested_but_missing
         );
     }
 
     #[test]
     fn host_disk_pct_below_threshold_attributes_host_pressure() {
-        let s = gather_projection_signals_from_state(&serde_json::json!({}), Some(2.0));
+        let s = gather_projection_signals_from_state(&serde_json::json!({}), Some(2.0), None);
         assert_eq!(
             project_root_cause(&s).family,
             RootCauseFamily::HostDiskPressure
         );
         // Abundant free space rules it out.
-        let plenty = gather_projection_signals_from_state(&serde_json::json!({}), Some(60.0));
+        let plenty = gather_projection_signals_from_state(&serde_json::json!({}), Some(60.0), None);
         assert_eq!(project_root_cause(&plenty).family, RootCauseFamily::Unknown);
     }
 
     #[test]
     fn empty_state_is_explicit_unknown() {
-        let s = gather_projection_signals_from_state(&serde_json::json!({}), None);
+        let s = gather_projection_signals_from_state(&serde_json::json!({}), None, None);
         let a = project_root_cause(&s);
         assert_eq!(a.family, RootCauseFamily::Unknown);
         assert_eq!(a.confidence, AttributionConfidence::Unknown);
@@ -73491,7 +73577,7 @@ fn run_status(
             // implicates a family. Status is probe-free, so no host-disk signal.
             "root_cause": serde_json::to_value(
                 crate::root_cause_projection::project_root_cause(
-                    &gather_projection_signals_from_state(&state, None),
+                    &gather_projection_signals_from_state(&state, None, None),
                 ),
             )
             .unwrap_or(serde_json::Value::Null),
@@ -73870,7 +73956,7 @@ fn run_triage(
         // an agent's one-shot triage already names the likely fault family.
         "root_cause": serde_json::to_value(
             crate::root_cause_projection::project_root_cause(
-                &gather_projection_signals_from_state(&state, None),
+                &gather_projection_signals_from_state(&state, None, None),
             ),
         )
         .unwrap_or(serde_json::Value::Null),
@@ -73982,7 +74068,7 @@ fn run_support_bundle(
     let command_envelope = table.next_command_envelope(Some(&data_dir_str));
     let quarantine = table.quarantine.clone();
     let root_cause = crate::root_cause_projection::project_root_cause(
-        &gather_projection_signals_from_state(&state, None),
+        &gather_projection_signals_from_state(&state, None, None),
     );
 
     // Local source provenance: a single read-only "local" observation derived
@@ -79840,8 +79926,19 @@ pub(crate) fn run_doctor_impl(
         // and `storage_pressure` already reports low-disk state separately. The
         // projection still supports host-disk-pressure for a future surface that
         // can supply a deterministic/scrubbed signal.
+        // #374 Issue 3: feed the storage-integrity verdict into the root-cause
+        // projection so an unreadable/malformed archive attributes to the
+        // frankensqlite-storage family even when the failure isn't surfaced as a
+        // `/database/open_error` string (its serialized shape carries
+        // storage_state/archive_readability).
+        let storage_integrity_signal_value =
+            serde_json::to_value(&storage_integrity_report).unwrap_or(serde_json::Value::Null);
         let root_cause_attribution = crate::root_cause_projection::project_root_cause(
-            &gather_projection_signals_from_state(&readiness_snapshot, None),
+            &gather_projection_signals_from_state(
+                &readiness_snapshot,
+                None,
+                Some(&storage_integrity_signal_value),
+            ),
         );
         let mut payload = serde_json::json!({
             // Top-level envelope versioning. Bumped to 2 in world-class-doctor
