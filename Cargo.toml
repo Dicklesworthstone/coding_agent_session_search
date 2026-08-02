@@ -43,10 +43,10 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-frankensqlite = { version = "0.1.19", package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "62a58ee388775ffdf133c069372a6d01e3a589b4", features = ["fts5"] }
+frankensqlite = { version = "0.1.19", package = "fsqlite", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "618082ec83a840378eb4aed29deaf0dd24c83436", features = ["fts5"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "0.1.19", package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "62a58ee388775ffdf133c069372a6d01e3a589b4" }
+fsqlite-types = { version = "0.1.19", package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "618082ec83a840378eb4aed29deaf0dd24c83436" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -93,7 +93,7 @@ bytemuck = "1.25.0"
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
 frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "ad8e29eaa03c9f29abc472d895a0ea9bcbe04ff1", default-features = false, features = ["hash", "cass-compat", "ann", "native"] }
-franken-agent-detection = { version = "0.1.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "1557300b1df8a26abde191dc30b8ef4b6154d7bc", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
+franken-agent-detection = { version = "0.1.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "63b19eb846262b8cc15877c2577519f82263fbcd", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -191,7 +191,7 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "0.1.19", package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "62a58ee388775ffdf133c069372a6d01e3a589b4" }
+fsqlite-types = { version = "0.1.19", package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "618082ec83a840378eb4aed29deaf0dd24c83436" }
 
 # Some enabled connector crates depend on the crates.io `fsqlite` line. A
 # direct Git dependency does not replace those transitive registry edges, so
@@ -200,8 +200,8 @@ fsqlite-types = { version = "0.1.19", package = "fsqlite-types", git = "https://
 # contract (not a local path override): every direct and transitive fsqlite
 # consumer converges on the revision containing `open_existing_schema_only`.
 [patch.crates-io]
-fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "62a58ee388775ffdf133c069372a6d01e3a589b4" }
-fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "62a58ee388775ffdf133c069372a6d01e3a589b4" }
+fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "618082ec83a840378eb4aed29deaf0dd24c83436" }
+fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "618082ec83a840378eb4aed29deaf0dd24c83436" }
 
 [[bin]]
 name = "cass"
