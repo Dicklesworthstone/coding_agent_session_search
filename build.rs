@@ -52,7 +52,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // that API and its no-create/bounded-open tests; a version-only pin is
         // ambiguous because both sources declare 0.1.19.
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "62a58ee388775ffdf133c069372a6d01e3a589b4",
+        expected_rev: "618082ec83a840378eb4aed29deaf0dd24c83436",
         expected_version: "0.1.19",
         expected_features: &["fts5"],
         expected_default_features: None,
@@ -70,7 +70,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: Some("fsqlite-types"),
         // Keep shared types on the identical immutable source as the facade.
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "62a58ee388775ffdf133c069372a6d01e3a589b4",
+        expected_rev: "618082ec83a840378eb4aed29deaf0dd24c83436",
         expected_version: "0.1.19",
         expected_features: &[],
         expected_default_features: None,
@@ -88,7 +88,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: Some("fsqlite-types"),
         // Keep shared types on the identical immutable source as the facade.
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "62a58ee388775ffdf133c069372a6d01e3a589b4",
+        expected_rev: "618082ec83a840378eb4aed29deaf0dd24c83436",
         expected_version: "0.1.19",
         expected_features: &[],
         expected_default_features: None,
@@ -329,7 +329,7 @@ fn validate_fsqlite_registry_source_override(manifest: &Value, packaged_manifest
     }
 
     const EXPECTED_GIT: &str = "https://github.com/Dicklesworthstone/frankensqlite";
-    const EXPECTED_REV: &str = "62a58ee388775ffdf133c069372a6d01e3a589b4";
+    const EXPECTED_REV: &str = "618082ec83a840378eb4aed29deaf0dd24c83436";
 
     let patch_tables = table(manifest, "patch", "manifest root");
     let crates_io = table_value(Some(patch_tables), "crates-io", "[patch]")
