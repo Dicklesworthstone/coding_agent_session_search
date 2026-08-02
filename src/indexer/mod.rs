@@ -27194,7 +27194,6 @@ pub mod persist {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn persist_conversations_batched_begin_concurrent(
         storage: &FrankenStorage,
         db_path: &Path,

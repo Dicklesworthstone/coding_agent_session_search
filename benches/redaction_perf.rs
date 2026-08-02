@@ -8,7 +8,7 @@
 //! - `memoized`  — production path (rayon + MemoizingRedactor)
 //! - `uncached`  — same transform with the plain `redact_text` path
 //!   (no memo cache), parallel across conversations
-//! - `off`       — redaction disabled (`CASS_REDACT_SECRETS=0`):
+//! - `off`       — redaction disabled (`CASS_INDEX_REDACTION=off`):
 //!   pure clone/remap floor
 //!
 //! Configuration is via env vars (robust against cargo-injected CLI
@@ -142,8 +142,8 @@ fn run_mode(
         "memoized" => Box::new(|| bench_map_batch_to_internal(convs)),
         // Plain (non-memoized) redaction path, parallel across conversations.
         "uncached" => Box::new(|| convs.par_iter().map(map_to_internal).collect()),
-        // Redaction disabled: clone/remap floor (caller must have set
-        // CASS_REDACT_SECRETS=0; asserted in main()).
+        // Redaction disabled: clone/remap floor (main() forces
+        // CASS_INDEX_REDACTION per mode before calling run_mode).
         "off" => Box::new(|| bench_map_batch_to_internal(convs)),
         other => panic!("unknown bench mode: {other}"),
     };
@@ -200,13 +200,20 @@ fn main() {
     assert!(!convs.is_empty(), "fixture dir produced no conversations");
 
     for mode in modes_raw.split(',').map(str::trim).filter(|m| !m.is_empty()) {
-        if mode == "off" {
-            // SAFETY: single-threaded configuration point before the mode's
-            // rayon work begins; matches index_perf.rs precedent.
-            unsafe { std::env::set_var("CASS_REDACT_SECRETS", "0") };
-        } else {
-            // SAFETY: as above.
-            unsafe { std::env::remove_var("CASS_REDACT_SECRETS") };
+        // Drive redaction through the PRIMARY switch and clear the legacy
+        // one: CASS_INDEX_REDACTION outranks CASS_REDACT_SECRETS, so an
+        // ambient value of either could otherwise silently corrupt a mode
+        // (ambient `full` breaks the off-floor; ambient `off` breaks the
+        // memoized/uncached headline numbers). Setting both per mode makes
+        // the bench deterministic regardless of the caller's environment.
+        // SAFETY: single-threaded configuration point before the mode's
+        // rayon work begins; matches index_perf.rs precedent.
+        unsafe {
+            std::env::set_var(
+                "CASS_INDEX_REDACTION",
+                if mode == "off" { "off" } else { "full" },
+            );
+            std::env::remove_var("CASS_REDACT_SECRETS");
         }
         run_mode(mode, &convs, iters, warmup, msgs, bytes);
     }
