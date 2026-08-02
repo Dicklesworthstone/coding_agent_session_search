@@ -14525,6 +14525,12 @@ pub fn run_index(
 
                 let additional_scan_roots =
                     additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
+                // #372: drop remote mirror roots whose on-disk fingerprint is
+                // unchanged since the last error-free scan (they would otherwise
+                // be fully re-scanned every run), and capture fingerprints to
+                // persist for the roots we still scan.
+                let (additional_scan_roots, mirror_fingerprints_to_store) =
+                    plan_remote_mirror_scan_skips(&storage, &opts, additional_scan_roots);
                 let scan_requires_tantivy =
                     lexical_population_strategy_requires_inline_tantivy(lexical_strategy);
 
@@ -14583,6 +14589,23 @@ pub fn run_index(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
                     scan_had_errors |= scan_outcome.scan_had_errors;
+                }
+                // #372: persist remote mirror fingerprints only after an
+                // error-free scan (the same signal that gates last_scan_ts), so
+                // a scan with errors never memoizes a fingerprint that would
+                // skip re-scanning incompletely-ingested mirror data.
+                if !scan_had_errors {
+                    for (source_id, fingerprint) in &mirror_fingerprints_to_store {
+                        if let Err(error) =
+                            storage.record_mirror_scan_fingerprint(source_id, fingerprint)
+                        {
+                            tracing::warn!(
+                                source_id = %source_id,
+                                error = %error,
+                                "failed to record remote mirror scan fingerprint (#372)"
+                            );
+                        }
+                    }
                 }
                 performed_scan = true;
                 stale_index_ingest_quarantine_retry_attempted =
@@ -24462,6 +24485,320 @@ fn explicit_watch_once_root_unchanged_after_last_index(
             )
         })?;
     Ok(!matches.is_empty())
+}
+
+/// #372: fingerprint the current on-disk state of a remote mirror directory as
+/// `(relative_path, size, mtime)` over every regular file / symlink under
+/// `root_path`, hashed in a stable order.
+///
+/// This is compared against the fingerprint recorded at the last error-free
+/// scan to decide whether an unchanged mirror can skip its (deliberately
+/// full — see [`explicit_scan_root_since_ts`]) re-scan. It is intentionally
+/// self-referential: it compares the mirror to a prior snapshot of *itself*,
+/// never to a wall clock, so rsync's preservation of the *remote* mtime cannot
+/// cause a clock-skew false match. It also mirrors rsync's own size+mtime
+/// change-detection, so "rsync did not transfer" ⇒ "fingerprint unchanged".
+///
+/// Returns `None` on any doubt (missing path, walk/stat error, unreadable
+/// mtime) so the caller falls through to a full scan — never a false skip.
+fn remote_mirror_scan_fingerprint(root_path: &Path) -> Option<String> {
+    if !root_path.exists() {
+        return None;
+    }
+    let mut entries: Vec<(String, u64, i64)> = Vec::new();
+    for entry in walkdir::WalkDir::new(root_path)
+        .min_depth(1)
+        .follow_links(false)
+    {
+        let entry = entry.ok()?;
+        let file_type = entry.file_type();
+        if !(file_type.is_file() || file_type.is_symlink()) {
+            continue;
+        }
+        let metadata = entry.metadata().ok()?;
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_epoch_millis)?;
+        let relative = entry.path().strip_prefix(root_path).ok()?;
+        entries.push((
+            relative.to_string_lossy().into_owned(),
+            metadata.len(),
+            modified_ms,
+        ));
+    }
+    // Directory-walk order is not guaranteed stable across runs/platforms.
+    entries.sort();
+    let mut hasher = blake3::Hasher::new();
+    for (relative, size, modified_ms) in &entries {
+        hasher.update(relative.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&size.to_le_bytes());
+        hasher.update(&modified_ms.to_le_bytes());
+        hasher.update(b"\n");
+    }
+    // Include the file count so a missing dir, an empty dir, and a populated
+    // dir never collide on the empty-hash.
+    Some(format!(
+        "mirrorfp-v1:{}:{}",
+        entries.len(),
+        hasher.finalize().to_hex()
+    ))
+}
+
+/// #372: has this mirror source already produced at least one canonical
+/// conversation row? Guards the skip so a never-indexed mirror is always
+/// scanned even if a stale fingerprint somehow matched.
+fn remote_mirror_source_already_indexed(
+    storage: &FrankenStorage,
+    source_id: &str,
+) -> Result<bool> {
+    let matches: Vec<i64> = storage
+        .raw()
+        .query_map_collect(
+            "SELECT id FROM conversations WHERE source_id = ?1 LIMIT 1",
+            &[ParamValue::from(source_id)],
+            |row| row.get_typed(0),
+        )
+        .with_context(|| format!("checking indexed rows for mirror source {source_id}"))?;
+    Ok(!matches.is_empty())
+}
+
+/// #372: partition additional scan roots into the ones to actually scan and the
+/// remote-mirror fingerprints to persist on a clean scan.
+///
+/// A remote (ssh) mirror root gets `since_ts = None` (a full re-scan every run)
+/// so freshly-synced old-content sessions still promote to canonical. When the
+/// mirror is byte-identical to the last clean scan, that full re-scan is pure
+/// waste (issue #372: 2.9 h for a 2.67 GB `opencode.db`). Such a root is
+/// dropped from the returned scan set; the returned fingerprint list is stored
+/// by the caller *only after an error-free scan*.
+///
+/// Fail-safe: local roots are never touched (they already honor the incremental
+/// cutoff); `--full` / `--force-rebuild` never skip; and any fingerprint doubt
+/// falls through to a full scan.
+fn plan_remote_mirror_scan_skips(
+    storage: &FrankenStorage,
+    opts: &IndexOptions,
+    roots: Vec<ScanRoot>,
+) -> (Vec<ScanRoot>, Vec<(String, String)>) {
+    let skip_enabled = !opts.full && !opts.force_rebuild;
+    let mut scanned = Vec::with_capacity(roots.len());
+    let mut fingerprints_to_store: Vec<(String, String)> = Vec::new();
+    let mut skipped = 0usize;
+    for root in roots {
+        if root.origin.kind != SourceKind::Ssh {
+            scanned.push(root);
+            continue;
+        }
+        let fingerprint_now = remote_mirror_scan_fingerprint(&root.path);
+        let stored = storage
+            .read_mirror_scan_fingerprint(&root.origin.source_id)
+            .ok()
+            .flatten();
+        let unchanged = skip_enabled
+            && fingerprint_now.is_some()
+            && stored.is_some()
+            && stored.as_deref() == fingerprint_now.as_deref()
+            && remote_mirror_source_already_indexed(storage, &root.origin.source_id)
+                .unwrap_or(false);
+        if unchanged {
+            skipped += 1;
+            tracing::info!(
+                source_id = %root.origin.source_id,
+                root = %root.path.display(),
+                "skipping unchanged remote mirror scan; fingerprint matches last clean scan (#372)"
+            );
+            continue;
+        }
+        if let Some(fingerprint) = fingerprint_now {
+            fingerprints_to_store.push((root.origin.source_id.clone(), fingerprint));
+        }
+        scanned.push(root);
+    }
+    if skipped > 0 {
+        tracing::info!(
+            skipped_mirror_roots = skipped,
+            "#372: skipped unchanged remote mirror roots to avoid a redundant full re-scan"
+        );
+    }
+    (scanned, fingerprints_to_store)
+}
+
+#[cfg(test)]
+mod mirror_scan_skip_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn base_opts(db_path: &Path, data_dir: &Path) -> IndexOptions {
+        IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: None,
+            db_path: db_path.to_path_buf(),
+            data_dir: data_dir.to_path_buf(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        }
+    }
+
+    fn ssh_root(mirror: &Path, source_id: &str) -> ScanRoot {
+        ScanRoot::remote(
+            mirror.to_path_buf(),
+            Origin {
+                source_id: source_id.to_string(),
+                kind: SourceKind::Ssh,
+                host: Some(source_id.to_string()),
+            },
+            None,
+        )
+    }
+
+    fn insert_conv_with_source(storage: &FrankenStorage, source_id: &str, source_path: &Path) {
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conv = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "tester".into(),
+            workspace: None,
+            external_id: Some(format!("ext-{source_id}")),
+            title: Some("t".into()),
+            source_path: source_path.to_path_buf(),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![crate::model::types::Message {
+                id: None,
+                idx: 0,
+                role: crate::model::types::MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "hi".into(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: source_id.to_string(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conv).unwrap();
+    }
+
+    #[test]
+    fn remote_mirror_fingerprint_detects_changes() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("mirror");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("opencode.db"), b"hello").unwrap();
+
+        let fp1 = remote_mirror_scan_fingerprint(&dir).expect("fingerprint");
+        // Stable across repeated calls on an unchanged directory.
+        assert_eq!(
+            remote_mirror_scan_fingerprint(&dir).as_deref(),
+            Some(fp1.as_str())
+        );
+        // Content growth (size changes) -> different fingerprint.
+        std::fs::write(dir.join("opencode.db"), b"hello world").unwrap();
+        let fp2 = remote_mirror_scan_fingerprint(&dir).expect("fingerprint");
+        assert_ne!(fp1, fp2);
+        // A new file -> different fingerprint.
+        std::fs::write(dir.join("opencode.db-wal"), b"x").unwrap();
+        let fp3 = remote_mirror_scan_fingerprint(&dir).expect("fingerprint");
+        assert_ne!(fp2, fp3);
+        // Missing directory -> None (never skip).
+        assert_eq!(
+            remote_mirror_scan_fingerprint(&tmp.path().join("absent")),
+            None
+        );
+    }
+
+    #[test]
+    fn mirror_scan_fingerprint_meta_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&tmp.path().join("db.sqlite")).unwrap();
+        assert_eq!(storage.read_mirror_scan_fingerprint("css").unwrap(), None);
+        storage.record_mirror_scan_fingerprint("css", "fp-abc").unwrap();
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("css").unwrap(),
+            Some("fp-abc".to_string())
+        );
+        storage.record_mirror_scan_fingerprint("css", "fp-def").unwrap();
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("css").unwrap(),
+            Some("fp-def".to_string())
+        );
+        // Distinct source ids do not collide.
+        assert_eq!(storage.read_mirror_scan_fingerprint("csd").unwrap(), None);
+    }
+
+    #[test]
+    fn plan_skips_only_unchanged_indexed_remote_mirrors() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        let mirror = tmp.path().join("remotes/css/mirror");
+        std::fs::create_dir_all(&mirror).unwrap();
+        let mirror_db = mirror.join("opencode.db");
+        std::fs::write(&mirror_db, b"data").unwrap();
+
+        let remote = ssh_root(&mirror, "css");
+        let local = ScanRoot::local(tmp.path().join("localdir"));
+        let opts = base_opts(&db_path, tmp.path());
+
+        // 1. No stored fingerprint yet -> remote scanned + fp captured; local
+        //    root is never a skip candidate.
+        let (scanned, fps) =
+            plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone(), local.clone()]);
+        assert_eq!(scanned.len(), 2, "nothing skipped without a stored fingerprint");
+        assert_eq!(fps.len(), 1, "one remote fingerprint captured for storing");
+        assert_eq!(fps[0].0, "css");
+        storage
+            .record_mirror_scan_fingerprint(&fps[0].0, &fps[0].1)
+            .unwrap();
+
+        // 2. Fingerprint matches but the source was never indexed -> still scan.
+        let (scanned2, _) =
+            plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone()]);
+        assert_eq!(
+            scanned2.len(),
+            1,
+            "a never-indexed mirror must scan even with a matching fingerprint"
+        );
+
+        insert_conv_with_source(&storage, "css", &mirror_db);
+
+        // 3. Fingerprint matches AND the source is indexed -> skip.
+        let (scanned3, fps3) =
+            plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone()]);
+        assert!(scanned3.is_empty(), "unchanged indexed mirror should be skipped");
+        assert!(fps3.is_empty(), "a skipped mirror stores no new fingerprint");
+
+        // 3b. --full never skips, even when unchanged + indexed.
+        let mut full_opts = base_opts(&db_path, tmp.path());
+        full_opts.full = true;
+        let (scanned_full, _) =
+            plan_remote_mirror_scan_skips(&storage, &full_opts, vec![remote.clone()]);
+        assert_eq!(scanned_full.len(), 1, "--full must never skip a mirror");
+
+        // 4. Mirror content changes -> re-scanned and a fresh fingerprint captured.
+        std::fs::write(&mirror_db, b"data plus more").unwrap();
+        let (scanned4, fps4) =
+            plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone()]);
+        assert_eq!(scanned4.len(), 1, "a changed mirror must re-scan");
+        assert_eq!(fps4.len(), 1, "changed mirror captures a new fingerprint");
+        assert_ne!(fps4[0].1, fps[0].1, "fingerprint changed with content");
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]

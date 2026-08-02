@@ -7446,6 +7446,38 @@ impl FrankenStorage {
         Ok(())
     }
 
+    fn mirror_scan_fingerprint_meta_key(source_id: &str) -> String {
+        format!("mirror_scan_fp:{}", source_id.trim())
+    }
+
+    /// #372: read the file fingerprint recorded at the last error-free scan of a
+    /// remote mirror source, used to skip re-scanning an unchanged mirror. A
+    /// missing key returns `None` (never seen / never cleanly scanned).
+    pub fn read_mirror_scan_fingerprint(&self, source_id: &str) -> Result<Option<String>> {
+        let key = Self::mirror_scan_fingerprint_meta_key(source_id);
+        let result: Result<String, _> = self.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![key.as_str()],
+            |row| row.get_typed(0),
+        );
+        Ok(result.optional()?)
+    }
+
+    /// #372: record the current file fingerprint of a remote mirror after an
+    /// error-free scan, so the next incremental run can skip it if unchanged.
+    pub fn record_mirror_scan_fingerprint(
+        &self,
+        source_id: &str,
+        fingerprint: &str,
+    ) -> Result<()> {
+        let key = Self::mirror_scan_fingerprint_meta_key(source_id);
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![key.as_str(), fingerprint],
+        )?;
+        Ok(())
+    }
+
     /// Load per-connector scan watermarks and archived-row presence in one
     /// explicit transaction.
     ///
