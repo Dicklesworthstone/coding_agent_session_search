@@ -90224,13 +90224,23 @@ impl IndexStallWatchdog {
         // runtime refresh ticks `activity` on every stage-progress change and
         // quiescence ends. Note the breadth honestly: `is_rebuilding` is set
         // at scan start and cleared only on rebuild completion, so ANY
-        // phase-0 quiescent wedge between ingest completion and rebuild
+        // quiescent wedge between ingest completion and rebuild
         // completion in a one-shot run gets the finalize grace (a bounded
         // delay by default; never-abort only if the operator sets
         // CASS_INDEX_FINALIZE_ABORT_SECS=0). A genuinely wedged rebuild
         // still aborts at the (larger) finalize threshold.
+        // #373: this grace now also covers the phase-2 rebuild *tail* — the
+        // terminal `t_index.commit()` / federated-publish window that runs with
+        // `phase == 2`, `current == total`, and a quiescent pipeline while
+        // `is_rebuilding` is still set. That single blocking Tantivy commit
+        // (bulk-load merges collapse into it) can run for many minutes on a
+        // large index without advancing any progress atomic, and the previous
+        // `phase_code != 2` guard denied it the grace, so a healthy multi-hour
+        // rebuild tail was killed with exit(70) at the 300s abort. `finalize_wedge`
+        // already requires `current >= total` + quiescence, so a mid-rebuild
+        // phase-2 wedge (current < total, or a still-producing pipeline) is NOT
+        // a finalize_wedge and continues to abort at the normal threshold.
         let effective_abort_threshold = if finalize_wedge
-            && phase_code != 2
             && (index_progress
                 .finalizing
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -90662,6 +90672,79 @@ mod stall_diagnostics_tests {
         })?;
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["abort_process"], serde_json::json!(true));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// Regression for #373 Variant B: the phase-2 rebuild *tail* — the terminal
+    /// Tantivy commit / federated publish that runs with `phase == 2`,
+    /// `current == total`, a quiescent pipeline, and `is_rebuilding` still set —
+    /// is a legitimate finalize window. It must get the larger finalize grace
+    /// (here: never-abort / report-only), not be killed with exit(70) at the
+    /// normal abort threshold. A quiescent phase-2 tail WITHOUT an active
+    /// rebuild still aborts, so the grace is not over-broadened.
+    #[test]
+    fn watchdog_grants_finalize_grace_to_phase_two_rebuild_tail() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let make_watchdog = |tmp: &TempDir| {
+            let mut watchdog = IndexStallWatchdog::with_abort_policy(
+                tmp.path().to_path_buf(),
+                Duration::from_millis(50),
+                IndexStallAbortPolicy::AbortPhaseTwo,
+            );
+            watchdog.threshold = Some(Duration::from_millis(1));
+            watchdog.abort_threshold = Some(Duration::from_millis(2));
+            // Never-abort during finalize (report-only) so the grace is visible.
+            watchdog.finalize_abort_threshold = None;
+            watchdog.last_phase = 2;
+            watchdog.last_current = 100;
+            watchdog.last_progress_advance =
+                std::time::Instant::now() - Duration::from_millis(100);
+            watchdog
+        };
+
+        // Active rebuild tail: phase 2, current == total, quiescent, is_rebuilding.
+        let tmp = TempDir::new()?;
+        let mut watchdog = make_watchdog(&tmp);
+        let progress = Arc::new(IndexingProgress::default());
+        progress.phase.store(2, Ordering::Relaxed);
+        progress.total.store(100, Ordering::Relaxed);
+        progress.current.store(100, Ordering::Relaxed);
+        progress.is_rebuilding.store(true, Ordering::Relaxed);
+        assert!(progress.rebuild_pipeline_is_quiescent());
+
+        let report = watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("rebuild tail stall did not report"))?;
+        assert_eq!(report["event"], serde_json::json!("stall_detected"));
+        assert!(
+            watchdog.observe(&progress, 200).is_none(),
+            "phase-2 rebuild tail must get the finalize grace, not exit(70) at abort_threshold"
+        );
+
+        // Control: identical quiescent phase-2 tail but NOT an active rebuild
+        // still aborts at the normal threshold.
+        let tmp2 = TempDir::new()?;
+        let mut watchdog2 = make_watchdog(&tmp2);
+        let progress2 = Arc::new(IndexingProgress::default());
+        progress2.phase.store(2, Ordering::Relaxed);
+        progress2.total.store(100, Ordering::Relaxed);
+        progress2.current.store(100, Ordering::Relaxed);
+        // is_rebuilding + finalizing both false.
+        assert!(progress2.rebuild_pipeline_is_quiescent());
+        assert_eq!(
+            watchdog2.observe(&progress2, 100).map(|r| r["event"].clone()),
+            Some(serde_json::json!("stall_detected"))
+        );
+        let abort = watchdog2
+            .observe(&progress2, 200)
+            .ok_or_else(|| anyhow::anyhow!("non-rebuild phase-2 tail should still abort"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
         Ok(())
     }
