@@ -11896,6 +11896,21 @@ fn spawn_connector_producer(
         let mut is_discovered = false;
         let mut scan_succeeded = true;
 
+        // #373 Variant A: give the connector a liveness tick so a long internal
+        // scan (e.g. decoding a large opencode.db) advances the watchdog's
+        // `activity` signal BEFORE the first conversation is yielded — otherwise
+        // a multi-minute pre-first-yield scan false-fires as a stall. Wired to
+        // the same per-conversation `tick_activity` the streaming consumer uses.
+        let scan_progress_tick: Option<Arc<dyn Fn() + Send + Sync>> =
+            config.progress.as_ref().map(|progress| {
+                let progress = Arc::clone(progress);
+                Arc::new(move || progress.tick_activity()) as Arc<dyn Fn() + Send + Sync>
+            });
+        let with_scan_tick = |ctx: crate::connectors::ScanContext| match &scan_progress_tick {
+            Some(tick) => ctx.with_progress_tick(Arc::clone(tick)),
+            None => ctx,
+        };
+
         if detect.detected {
             // Update discovered agents count immediately when detected
             if let Some(p) = &config.progress {
@@ -11910,10 +11925,10 @@ fn spawn_connector_producer(
                 .unwrap_or(config.since_ts);
 
             // Scan local sources
-            let ctx = crate::connectors::ScanContext::local_default(
+            let ctx = with_scan_tick(crate::connectors::ScanContext::local_default(
                 config.data_dir.clone(),
                 local_since_ts,
-            );
+            ));
             let local_origin = Origin::local();
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
@@ -12019,11 +12034,11 @@ fn spawn_connector_producer(
                     "configured scan root is using a full root scan so already-mirrored sessions can be promoted to canonical"
                 );
             }
-            let ctx = crate::connectors::ScanContext::with_roots(
+            let ctx = with_scan_tick(crate::connectors::ScanContext::with_roots(
                 root.path.clone(),
                 vec![root.clone()],
                 root_since_ts,
-            );
+            ));
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
             let mut ingest_diagnostics = capture_connector_sources_before_parse(
