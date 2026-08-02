@@ -115,7 +115,16 @@ pub fn redact_text(input: &str) -> Cow<'_, str> {
     if !matches.matched_any() {
         return Cow::Borrowed(input);
     }
+    apply_replacements(input, &matches)
+}
 
+/// Ordered per-pattern replacement passes for an input whose RegexSet
+/// prefilter already reported candidate matches. Shared by the plain
+/// [`redact_text`] path and the memoizing miss path so the candidate
+/// scan runs exactly once per input. Replacement order (ascending
+/// pattern index, sequential `replace_all`) is part of the frozen
+/// behavior contract — see `redact_text_reference` in the tests.
+fn apply_replacements<'a>(input: &'a str, matches: &regex::SetMatches) -> Cow<'a, str> {
     let mut output = Cow::Borrowed(input);
     for idx in matches.iter() {
         let replaced = SECRET_PATTERNS[idx]
@@ -243,6 +252,15 @@ pub fn redaction_algorithm_fingerprint() -> String {
 /// fingerprint so repeated content stops paying the regex cost while a
 /// pattern bump invalidates every prior entry transparently.
 ///
+/// Prefilter-first scope (redaction-perf campaign, xu3jq): the cache is
+/// consulted only for inputs whose RegexSet prefilter reports at least
+/// one candidate pattern match. Clean inputs — the overwhelming
+/// majority of real corpora — bypass hashing, LRU bookkeeping, and
+/// audit records entirely, because profiling showed that bookkeeping
+/// costing ~18x the actual regex scanning on a 21.8MB real codex
+/// corpus. Hit/miss/insert telemetry therefore describes
+/// candidate-bearing content only.
+///
 /// The wrapper preserves the legacy [`redact_text`]/[`redact_json`]
 /// contract byte-for-byte: see
 /// `memoizing_redactor_matches_uncached_for_arbitrary_input` for the
@@ -334,6 +352,25 @@ impl MemoizingRedactor {
         if input.is_empty() {
             return (String::new(), Vec::new());
         }
+        // Prefilter-first fast path (redaction-perf campaign, xu3jq):
+        // run the RegexSet candidate scan BEFORE any cache machinery.
+        // Profiling the previous shape on a real 21.8MB codex corpus
+        // showed the memo bookkeeping (blake3 content hashing, MemoKey
+        // clones, and O(capacity) VecDeque LRU scans in touch/retain)
+        // costing ~18x the actual secret scanning, because the
+        // overwhelming majority of message bodies contain no secret
+        // candidates at all. Clean inputs now pay exactly one RegexSet
+        // scan plus the one unavoidable copy into the owned return
+        // value — no hashing, no LRU traffic, no audit records. Only
+        // candidate-bearing inputs (rare, and the ones whose ordered
+        // replace_all passes are genuinely expensive) consult the
+        // cache. Consequence: cache hit/miss/insert audit telemetry now
+        // describes candidate-bearing content only; clean content is
+        // silent by design.
+        let matches = SECRET_REGEX_SET.matches(input);
+        if !matches.matched_any() {
+            return (input.to_owned(), Vec::new());
+        }
         let key = self.key_for(input);
         let (lookup, lookup_audit) = self.text_cache.get_with_audit(&key);
         Self::trace_audit(&lookup_audit);
@@ -350,11 +387,11 @@ impl MemoizingRedactor {
                     algorithm = %self.algorithm_fingerprint,
                     "redaction memo entry is quarantined; falling back to direct regex pass"
                 );
-                let redacted = redact_text(input).into_owned();
+                let redacted = apply_replacements(input, &matches).into_owned();
                 (redacted, vec![lookup_audit])
             }
             crate::indexer::memoization::MemoLookup::Miss => {
-                let redacted = redact_text(input).into_owned();
+                let redacted = apply_replacements(input, &matches).into_owned();
                 let insert_audit = self.text_cache.insert_with_audit(key, redacted.clone());
                 Self::trace_audit(&insert_audit);
                 (redacted, vec![lookup_audit, insert_audit])
@@ -896,10 +933,12 @@ mod tests {
         );
     }
 
-    /// Repeated metadata / extra_json structures are common in salvage
-    /// replays and assistant boilerplate. The memoized JSON walker must
-    /// reuse repeated object keys and repeated scalar values instead of
-    /// re-running the regex set for every copy.
+    /// Repeated secret-bearing values inside metadata / extra_json are
+    /// common in salvage replays. The memoized JSON walker must reuse
+    /// the cached redaction for repeated candidate-bearing scalars
+    /// instead of re-running the replacement passes for every copy —
+    /// while clean keys and clean values bypass the cache entirely
+    /// (prefilter-first, redaction-perf campaign).
     #[test]
     fn memoizing_redactor_redact_json_reuses_repeated_keys_and_values() {
         let repeated_secret =
@@ -929,16 +968,16 @@ mod tests {
 
         let stats = redactor.stats();
         assert_eq!(
-            stats.misses, 6,
-            "first occurrences of root keys, repeated child keys, and scalar values should miss once"
+            stats.misses, 1,
+            "only the first occurrence of the candidate-bearing secret value should miss; clean keys/values bypass the cache"
         );
         assert_eq!(
-            stats.inserts, 6,
-            "each distinct JSON key/value string should be inserted once"
+            stats.inserts, 1,
+            "only the distinct candidate-bearing value should be inserted"
         );
         assert_eq!(
-            stats.hits, 9,
-            "repeated child keys and repeated scalar values should hit the memo cache"
+            stats.hits, 2,
+            "repeated candidate-bearing values should hit the memo cache; clean strings never do"
         );
     }
 
@@ -1013,14 +1052,40 @@ mod tests {
         }
     }
 
+    /// Prefilter-first bypass (redaction-perf campaign): inputs with
+    /// no secret candidates must never touch the memo cache — no miss,
+    /// no insert, no audit records — while still returning the input
+    /// text unchanged. This pins the fast path that removed the ~18x
+    /// memo-bookkeeping overhead on clean corpora.
+    #[test]
+    fn memoizing_redactor_clean_input_bypasses_cache_entirely() {
+        let mut redactor = MemoizingRedactor::with_capacity(8);
+        let clean = "no secret here, just a sentence";
+        let (output, audit) = redactor.redact_text_with_audit(clean);
+        assert_eq!(output, clean, "clean input must pass through unchanged");
+        assert!(
+            audit.is_empty(),
+            "clean input must not produce cache audit records"
+        );
+        let _ = redactor.redact_text(clean);
+        let stats = redactor.stats();
+        assert_eq!(stats.misses, 0, "clean input must not count as miss");
+        assert_eq!(stats.hits, 0, "clean input must not count as hit");
+        assert_eq!(stats.inserts, 0, "clean input must not insert");
+        // Invalidate on never-cached clean content is a no-op.
+        assert!(!redactor.invalidate(clean));
+    }
+
     /// Invalidate must remove the cached entry so the next call is a
     /// miss + re-insert. Pin the changed/no-op semantics so a caller
     /// can rely on the boolean return value to know whether anything
-    /// was actually evicted.
+    /// was actually evicted. (Payload carries a secret candidate:
+    /// since the prefilter-first bypass, only candidate-bearing
+    /// content enters the cache at all.)
     #[test]
     fn memoizing_redactor_invalidate_drops_cached_entry() {
         let mut redactor = MemoizingRedactor::with_capacity(8);
-        let payload = "no secret here, just a sentence";
+        let payload = "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij here";
 
         // Prime the cache.
         let _ = redactor.redact_text(payload);
