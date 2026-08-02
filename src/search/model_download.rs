@@ -1002,11 +1002,54 @@ impl DownloadError {
 const MODEL_HTTP_BODY_SIZE_FLOOR_BYTES: u64 = 500 * 1024 * 1024;
 const MODEL_HTTP_BODY_SIZE_MARGIN_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Flatten an error and its `source()` chain into one message.
+///
+/// `reqwest::Error`'s top-level `Display` is only "error sending request for
+/// url (...)"; the real cause — e.g. `invalid peer certificate: UnknownIssuer`
+/// from the TLS layer — lives further down the `source()` chain and is
+/// otherwise lost (#370). Consecutive duplicate fragments are collapsed so a
+/// wrapper that just re-displays its source doesn't double up.
+fn format_download_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(inner) = source {
+        let msg = inner.to_string();
+        if parts.last().map(|last| last != &msg).unwrap_or(true) {
+            parts.push(msg);
+        }
+        source = inner.source();
+    }
+    parts.join(": ")
+}
+
+/// Heuristic: does this flattened error chain describe a TLS trust failure?
+/// Used to surface a corporate-proxy hint instead of a bare "network error".
+fn download_error_looks_like_tls(chain_lower: &str) -> bool {
+    chain_lower.contains("certificate")
+        || chain_lower.contains("unknownissuer")
+        || chain_lower.contains("unknown issuer")
+        || chain_lower.contains("invalid peer certificate")
+        || chain_lower.contains("certificateunknown")
+        || chain_lower.contains("tls handshake")
+        || chain_lower.contains("handshake failure")
+}
+
 fn map_reqwest_download_error(err: reqwest::Error) -> DownloadError {
     if err.is_timeout() {
-        DownloadError::Timeout
+        return DownloadError::Timeout;
+    }
+    let chain = format_download_error_chain(&err);
+    if download_error_looks_like_tls(&chain.to_ascii_lowercase()) {
+        DownloadError::NetworkError(format!(
+            "{chain} — this looks like a TLS trust failure. If you are behind a \
+             corporate proxy that inspects TLS, install its root CA into your \
+             system trust store (cass now trusts the OS store) or point \
+             SSL_CERT_FILE at a CA bundle that includes it. As a workaround, \
+             fetch the model files with a client that trusts the system store \
+             and run `cass models install --from-file <DIR>`."
+        ))
     } else {
-        DownloadError::NetworkError(err.to_string())
+        DownloadError::NetworkError(chain)
     }
 }
 
@@ -1622,8 +1665,17 @@ fn classify_model_cache_state(
         };
     }
 
+    // A `.downloading` staging directory only means "acquiring" when the model
+    // is not already fully present. A failed/interrupted download leaves an
+    // (often empty) staging dir behind, and treating its mere existence as
+    // in-progress made `cass models status` report a complete, `.verified`
+    // install as not-installed — even after `install --from-file` succeeded and
+    // verified all files (#370). A valid install outranks leftover staging
+    // debris; the marker/checksum logic below decides the concrete ready state.
     let staging_dir = model_download_temp_dir(model_dir);
-    if staging_dir.is_dir() {
+    let install_looks_complete =
+        missing_files.is_empty() && model_dir.join(".verified").is_file();
+    if staging_dir.is_dir() && !install_looks_complete {
         return ModelCacheState::Acquiring {
             bytes_present: directory_size_bytes(&staging_dir),
             staging_dir,
@@ -2586,6 +2638,85 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn classify_cache_ignores_stale_staging_over_complete_verified_install() {
+        // #370: a leftover (often empty) `.downloading` staging directory left
+        // by a failed download must not mask a complete, verified install.
+        // Before the fix `cass models status` reported such an install as
+        // not-installed/acquiring even after `install --from-file` succeeded.
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.onnx"), b"model").unwrap();
+        fs::write(model_dir.join("tokenizer.json"), b"tok").unwrap();
+        fs::write(
+            model_dir.join(".verified"),
+            "revision=rev1\nsource=from-file\n",
+        )
+        .unwrap();
+        // Leftover empty staging dir from a prior interrupted download.
+        let staging_dir = model_download_temp_dir(&model_dir);
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        let manifest = build_test_manifest(
+            "repo/model",
+            "rev1",
+            &[("model.onnx", b"model"), ("tokenizer.json", b"tok")],
+        );
+
+        let report =
+            classify_model_cache(&model_dir, &manifest, &ModelAcquisitionPolicy::default());
+        assert_eq!(
+            report.state_code(),
+            "acquired",
+            "a stale staging dir must not mask a complete verified install"
+        );
+        assert!(report.is_usable());
+
+        // Regression guard: a genuinely incomplete install (missing file) plus a
+        // staging dir must still report acquiring — resume detection intact.
+        fs::remove_file(model_dir.join("tokenizer.json")).unwrap();
+        let report =
+            classify_model_cache(&model_dir, &manifest, &ModelAcquisitionPolicy::default());
+        assert_eq!(report.state_code(), "acquiring");
+    }
+
+    #[test]
+    fn download_error_chain_surfaces_tls_cause_and_hint() {
+        // #370: reqwest's top-level Display hides the TLS cause in its source
+        // chain. Our flattening + heuristic must surface it with a proxy hint.
+        #[derive(Debug)]
+        struct TlsCause;
+        impl std::fmt::Display for TlsCause {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "invalid peer certificate: UnknownIssuer")
+            }
+        }
+        impl std::error::Error for TlsCause {}
+
+        #[derive(Debug)]
+        struct SendErr(TlsCause);
+        impl std::fmt::Display for SendErr {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error sending request for url (https://cdn.example/model)")
+            }
+        }
+        impl std::error::Error for SendErr {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let chain = format_download_error_chain(&SendErr(TlsCause));
+        assert!(chain.contains("error sending request for url"));
+        assert!(
+            chain.contains("invalid peer certificate: UnknownIssuer"),
+            "source chain cause must be preserved: {chain}"
+        );
+        assert!(download_error_looks_like_tls(&chain.to_ascii_lowercase()));
+        assert!(!download_error_looks_like_tls("connection refused"));
     }
 
     #[test]
