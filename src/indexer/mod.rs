@@ -15048,6 +15048,30 @@ pub fn run_index(
             "skipping final lexical checkpoint refresh because targeted watch-once startup does not need broad checkpoint maintenance"
         );
     } else if let Some(deferred) = &large_incremental_authoritative_lexical_repair_probe_deferred {
+        // GH #353: a large incremental run defers the *expensive* authoritative
+        // rebuild — but it must NOT preserve a stale lexical checkpoint
+        // fingerprint forever. Otherwise search's fingerprint-mismatch defer
+        // ("storage fingerprint no longer matches") and this run's deferral form
+        // a loop that never repairs (`cass index` no-ops above the size cap and
+        // re-preserves the very fingerprint that keeps triggering the defer).
+        //
+        // Break the loop with the CHEAP, doc-count-gated metadata-only refresh:
+        // `refresh_completed_lexical_rebuild_checkpoint` rewrites the checkpoint
+        // fingerprint ONLY when the live Tantivy index already matches the
+        // canonical message count (i.e. the drift was absorbed inline), and
+        // safely skips otherwise — so it never masks genuine staleness (which
+        // would silently drop the newly-ingested sessions from search). When
+        // Tantivy is really behind, the refresh no-ops and search keeps
+        // deferring; the real escalation there is a full rebuild, named below.
+        if let Err(err) =
+            refresh_completed_lexical_rebuild_checkpoint(&storage, &opts.db_path, &opts.data_dir)
+        {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                error = %format!("{err:#}"),
+                "gh353: bounded lexical checkpoint reconciliation failed; leaving the checkpoint unchanged"
+            );
+        }
         tracing::warn!(
             db_path = %opts.db_path.display(),
             canonical_conversations = deferred.canonical_conversations,
@@ -15057,7 +15081,7 @@ pub fn run_index(
             reason = deferred.reason,
             inserted_conversations = scan_canonical_mutations.inserted_conversations,
             inserted_messages = scan_canonical_mutations.inserted_messages,
-            "skipping final lexical checkpoint refresh because this large incremental run deferred expensive lexical repair probes"
+            "deferred the expensive authoritative lexical repair on this large incremental run and reconciled the lexical checkpoint against the live Tantivy index where equivalent (GH #353). If search still reports the storage fingerprint no longer matches, the derived index is genuinely behind — run 'cass index --full --force-rebuild' to rebuild the lexical index authoritatively"
         );
     } else if should_skip_noop_final_lexical_checkpoint_refresh(
         opts.full,
@@ -51721,6 +51745,77 @@ mod tests {
         assert_eq!(
             checkpoint.storage_fingerprint,
             lexical_rebuild_storage_fingerprint(&db_path).unwrap()
+        );
+    }
+
+    /// GH #353: a deferred large-incremental run must break the forever-defer
+    /// loop by refreshing a STALE lexical checkpoint fingerprint to the live DB
+    /// fingerprint WHEN the live Tantivy index already matches the canonical
+    /// message count (the drift was absorbed inline). This is the exact call the
+    /// deferred branch now makes; the doc-count gate keeps it safe when Tantivy
+    /// is genuinely behind (verified separately by the gate's own tests).
+    #[test]
+    #[serial]
+    fn gh353_refresh_advances_stale_fingerprint_when_tantivy_is_equivalent() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = index_dir(&data_dir).unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+
+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let convs = vec![norm_conv(
+            Some("c1"),
+            vec![
+                norm_msg(0, 1_700_000_000_000),
+                norm_msg(1, 1_700_000_000_100),
+            ],
+        )];
+        ingest_batch(
+            &storage,
+            Some(&mut index),
+            &data_dir,
+            &convs,
+            &None,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+        )
+        .unwrap();
+        index.commit().unwrap();
+        drop(index);
+
+        let live_fingerprint = lexical_rebuild_storage_fingerprint(&db_path).unwrap();
+
+        // Persist a completed checkpoint carrying a STALE fingerprint — the #353
+        // loop state where search keeps deferring on the mismatch and a large
+        // incremental run keeps re-preserving it.
+        let mut state = LexicalRebuildState::new(
+            lexical_rebuild_db_state(&storage, &db_path).unwrap(),
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.db.storage_fingerprint = "content-v1:0:0:0".to_string();
+        state.mark_completed(index_meta_fingerprint(&index_path).unwrap());
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+        assert_ne!(
+            load_lexical_rebuild_checkpoint(&index_path)
+                .unwrap()
+                .unwrap()
+                .storage_fingerprint,
+            live_fingerprint,
+            "precondition: the checkpoint starts stale"
+        );
+
+        refresh_completed_lexical_rebuild_checkpoint(&storage, &db_path, &data_dir).unwrap();
+
+        assert_eq!(
+            load_lexical_rebuild_checkpoint(&index_path)
+                .unwrap()
+                .unwrap()
+                .storage_fingerprint,
+            live_fingerprint,
+            "GH #353: a stale checkpoint must be refreshed to the live fingerprint when Tantivy is equivalent, breaking the forever-defer loop"
         );
     }
 
