@@ -15,6 +15,92 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+## [Unreleased]
+
+Post-v0.6.23 GitHub-issue triage: the second half of the
+[#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368)
+FTS5 corruption-opacity defects, three fresh v0.6.x reports, and the genuine
+engine fix for the shipped
+[#369](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/369)
+FTS5 leaf-overflow (implemented + tested in frankensqlite, pending a dependency
+re-pin).
+
+### Fixed
+
+- **[#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368)
+  defect 2 -- readiness no longer reports "search usable" while search hard-fails
+  on a corrupt FTS structure**
+  ([`9bce58f4`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/9bce58f4),
+  headline accuracy
+  [`49efd299`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/49efd299)).
+  A non-quarantine asset-inspection error (the lexical-fingerprint open failing
+  on a corrupt FTS5 structure) fell through the `fresh=false ->
+  StaleButSearchable` mapping, and the fingerprint open was skipped entirely for
+  DBs > 256 MiB. Both fixed at the shared root, so `status`/`doctor`/`support-bundle`
+  are all truthful; non-regressing for the absent-shadow (Tantivy-served) case.
+  3 of 4 #368 defects now resolved (defect 3 is frankensqlite-blocked).
+
+- **[#350](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/350)
+  -- targeted `--watch-once <paths>` bounds to its paths instead of scanning the
+  whole archive**
+  ([`64b73dca`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/64b73dca)).
+  A populated archive whose derived index looked stale silently broadened a
+  targeted watch-once into a full-corpus rebuild (`processed_conversations=16301`
+  for one changed session). The gate now bounds work to the supplied paths and
+  defers any broader rebuild, as the plain-index path does.
+
+- **[#353](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/353)
+  -- the lexical-repair forever-defer loop is broken**
+  ([`47fb0724`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/47fb0724)).
+  Search deferred on a content-fingerprint mismatch while `cass index`
+  re-preserved the stale checkpoint fingerprint above the 1 GiB auto-repair cap
+  -- repeating every run. The deferred branch now runs a cheap, doc-count-gated
+  metadata refresh that advances the fingerprint only when the live Tantivy index
+  is provably equivalent (breaking the loop) and safely no-ops otherwise (never
+  masking real staleness).
+
+- **[#369](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/369)
+  -- clearer doctor diagnostic for the oversized-leaf FTS shadow**
+  ([`99fb72d4`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/99fb72d4)),
+  and the genuine engine fix (a multi-leaf FTS5 segment writer that partitions an
+  oversized flush across leaves) implemented + tested in frankensqlite (branch
+  `fts5-multileaf-cass369`, commit `30d31d51`), pending a dependency re-pin.
+
+### Added (observability)
+
+- **Half-built canonical FTS shadow surfaced in `status`/`index --json`** (zn1xn
+  F5,
+  [`ee39e37f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ee39e37f)):
+  a skipped/failed derived fallback-FTS repair records a durable marker exposed
+  additively under `/index/fallback_fts_repair`, so agents see a half-rebuilt
+  shadow immediately rather than only when doctor's next parity check catches it.
+
+- **Persistent lexical-repair deferral streak surfaced** (zn1xn F4,
+  [`3ac90b85`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/3ac90b85)):
+  a consecutive-deferral counter + reason under `/index/lexical_repair_deferred`,
+  exposing the recurring full-rebuild amplification that was previously only a
+  stderr warn.
+
+- **Memory-pressure attribution in ingest poison records**
+  ([#364](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/364),
+  [`83346cc4`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/83346cc4)):
+  a quarantine now records whether it was genuine host pressure vs a
+  precautionary large-conversation quarantine.
+
+### Investigated / tracked
+
+- **[#345](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/345)**
+  (FTS dry-run content faults) and
+  **[#349](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/349)**
+  (base-schema migration OOM on legacy internal-content `fts_messages`) are
+  documented with precise findings: both need frankensqlite enhancements
+  (index-only rowid projection; bounded WITHOUT-ROWID teardown) -- the same class
+  as #368 defect 3. #364's chunked single-conversation ingest core (a perf
+  optimization; the conversation is already indexed via a deferred rebuild) has a
+  full implementation design on its tracking bead.
+
+---
+
 ## [v0.6.23] -- 2026-07-30
 
 **Everything landed in the 128 commits between the [v0.6.22 GitHub
