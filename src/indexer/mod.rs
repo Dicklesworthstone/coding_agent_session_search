@@ -16892,7 +16892,10 @@ fn canonical_archive_unhealthy_for_index_error(db_path: &Path, reason: &str) -> 
          (canonical DB vs a checksum-verified raw mirror vs backups) and names the \
          exact next command. If the canonical rows are readable but a derived/FTS5 \
          structure is corrupt, run 'cass doctor --rebuild-canonical-fts --dry-run \
-         --json' and apply its safe parity repair with '--yes'. If the archive \
+         --json' and apply its safe parity repair with '--yes' (if the FTS \
+         corruption blocks the open itself so even that repair cannot read the \
+         archive — GH #368 — treat it as unopenable and use reconstruct below). \
+         If the archive \
          cannot be opened at all, run 'cass doctor reconstruct --json': it rebuilds \
          the canonical archive from the checksum-verified raw-mirror blobs (reading \
          the mirror, not the dead DB) and promotes it behind a coverage gate with a \
