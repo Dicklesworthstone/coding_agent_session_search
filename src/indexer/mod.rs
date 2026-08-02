@@ -27209,15 +27209,7 @@ pub mod persist {
         // allocator work out of every writer's retry window — so conflict
         // retries re-run only SQLite I/O, not the allocation cost. See the
         // matching hoist in the serial persist_conversations_batched path.
-        let internal_convs: Vec<Conversation> = convs
-            .par_iter()
-            .map_init(
-                super::redact_secrets::MemoizingRedactor::new,
-                |redactor, conv| {
-                    map_to_internal_with_redactor_and_heartbeat(conv, Some(redactor), heartbeat)
-                },
-            )
-            .collect();
+        let internal_convs: Vec<Conversation> = map_batch_to_internal(convs, heartbeat);
 
         let indexed_chunks: Vec<Result<ChunkPersistResult>> = convs
             .par_chunks(chunk_size)
@@ -27506,6 +27498,37 @@ pub mod persist {
         redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
     ) -> Conversation {
         map_to_internal_with_redactor_and_heartbeat(conv, redactor, PersistHeartbeat::NONE)
+    }
+
+    /// Map a batch of normalized conversations to internal (redacted)
+    /// form on the rayon pool with one `MemoizingRedactor` per worker.
+    ///
+    /// This is the single shared implementation for BOTH batched persist
+    /// paths (begin-concurrent and serial) — and for the
+    /// `redaction_perf` bench harness via
+    /// [`bench_map_batch_to_internal`] — so benchmark numbers measure
+    /// the exact production transform by construction.
+    pub(crate) fn map_batch_to_internal(
+        convs: &[NormalizedConversation],
+        heartbeat: PersistHeartbeat<'_>,
+    ) -> Vec<Conversation> {
+        convs
+            .par_iter()
+            .map_init(
+                super::redact_secrets::MemoizingRedactor::new,
+                |redactor, conv| {
+                    map_to_internal_with_redactor_and_heartbeat(conv, Some(redactor), heartbeat)
+                },
+            )
+            .collect()
+    }
+
+    /// Bench-only public entry point for the production batch mapping
+    /// path (memoized redaction on the rayon pool). Hidden from docs;
+    /// see `benches/redaction_perf.rs`.
+    #[doc(hidden)]
+    pub fn bench_map_batch_to_internal(convs: &[NormalizedConversation]) -> Vec<Conversation> {
+        map_batch_to_internal(convs, PersistHeartbeat::NONE)
     }
 
     pub(crate) fn map_to_internal_with_redactor_and_heartbeat(
@@ -27867,16 +27890,7 @@ pub mod persist {
         // lock while we burn CPU on it. Running it in parallel via rayon
         // shortens the serial writer-hold window and exploits headroom on
         // many-core hosts. This is the hot path for ingest batches.
-        use rayon::prelude::*;
-        let internal_convs: Vec<Conversation> = convs
-            .par_iter()
-            .map_init(
-                super::redact_secrets::MemoizingRedactor::new,
-                |redactor, conv| {
-                    map_to_internal_with_redactor_and_heartbeat(conv, Some(redactor), heartbeat)
-                },
-            )
-            .collect();
+        let internal_convs: Vec<Conversation> = map_batch_to_internal(convs, heartbeat);
 
         let outcomes = with_ephemeral_writer(
             storage,

@@ -331,6 +331,10 @@ harness = false
 name = "integration_regression"
 harness = false
 
+[[bench]]
+name = "redaction_perf"
+harness = false
+
 [[test]]
 name = "docs"
 path = "tests/docs/mod.rs"
