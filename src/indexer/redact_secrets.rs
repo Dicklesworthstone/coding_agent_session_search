@@ -284,6 +284,19 @@ impl MemoizingRedactor {
     /// eviction kicks in.
     pub(crate) const DEFAULT_CAPACITY: usize = 4096;
 
+    /// Byte ceiling for memoizing a single input (xu3jq round 3).
+    /// Candidate-bearing inputs larger than this are redacted directly
+    /// and never enter the cache: caching them would pin up to
+    /// `capacity x input_size` of message bodies in memory (the
+    /// original giant-rollout incident ran the host into swap), while
+    /// the hit-rate on multi-hundred-KB distinct tool outputs is ~0.
+    /// 64 KiB bounds worst-case cache value memory at
+    /// ~4096 x 64KiB = 256 MiB and still covers every capped codex
+    /// message body (128 KiB content cap applies upstream, but titles,
+    /// metadata blobs, and extra_json strings are typically far
+    /// smaller).
+    pub(crate) const MAX_MEMOIZED_INPUT_BYTES: usize = 64 * 1024;
+
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             text_cache: crate::indexer::memoization::ContentAddressedMemoCache::with_capacity(
@@ -370,6 +383,14 @@ impl MemoizingRedactor {
         let matches = SECRET_REGEX_SET.matches(input);
         if !matches.matched_any() {
             return (input.to_owned(), Vec::new());
+        }
+        // Oversized candidate-bearing inputs: redact directly, never
+        // cache (see MAX_MEMOIZED_INPUT_BYTES for the memory-bound
+        // rationale). Output is identical to the cached path by
+        // construction — both run apply_replacements on the same
+        // matches.
+        if input.len() > Self::MAX_MEMOIZED_INPUT_BYTES {
+            return (apply_replacements(input, &matches).into_owned(), Vec::new());
         }
         let key = self.key_for(input);
         let (lookup, lookup_audit) = self.text_cache.get_with_audit(&key);
@@ -1050,6 +1071,45 @@ mod tests {
             assert_eq!(record.key.algorithm, "redact_text");
             assert!(record.key.algorithm_version.starts_with("redact-v1:"));
         }
+    }
+
+    /// Oversized candidate-bearing inputs (> MAX_MEMOIZED_INPUT_BYTES)
+    /// must be redacted correctly WITHOUT entering the cache — the
+    /// memory bound that prevents the memo cache from pinning
+    /// gigabytes of giant tool outputs (xu3jq round 3).
+    #[test]
+    fn memoizing_redactor_oversized_candidate_input_redacts_without_caching() {
+        let mut redactor = MemoizingRedactor::with_capacity(8);
+        let mut giant = "x".repeat(MemoizingRedactor::MAX_MEMOIZED_INPUT_BYTES);
+        giant.push_str(" sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij tail");
+        assert!(giant.len() > MemoizingRedactor::MAX_MEMOIZED_INPUT_BYTES);
+
+        let (output, audit) = redactor.redact_text_with_audit(&giant);
+        assert!(
+            !output.contains("sk-ABCDE"),
+            "oversized input must still be redacted"
+        );
+        assert_eq!(
+            output,
+            redact_text(&giant).into_owned(),
+            "oversized bypass must match the plain redaction path byte-for-byte"
+        );
+        assert!(
+            audit.is_empty(),
+            "oversized input must not produce cache audit records"
+        );
+        let _ = redactor.redact_text(&giant);
+        let stats = redactor.stats();
+        assert_eq!(stats.misses, 0, "oversized input must never miss the cache");
+        assert_eq!(stats.inserts, 0, "oversized input must never be inserted");
+        assert_eq!(stats.hits, 0, "oversized input must never hit the cache");
+
+        // A small candidate-bearing input still uses the cache.
+        let small = "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+        let _ = redactor.redact_text(small);
+        let _ = redactor.redact_text(small);
+        assert_eq!(redactor.stats().misses, 1);
+        assert_eq!(redactor.stats().hits, 1);
     }
 
     /// Prefilter-first bypass (redaction-perf campaign): inputs with
