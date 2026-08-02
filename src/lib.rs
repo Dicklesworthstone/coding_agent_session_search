@@ -89893,6 +89893,27 @@ const INDEX_STALL_HINT: &str = concat!(
     "and CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=1000 caps WAL growth so the final checkpoint stays small."
 );
 
+/// gh373/oeu5a: phase-2 hint for a stall observed while `persist_in_progress`
+/// is set — the giant-conversation persist window, NOT a finalize-WAL
+/// checkpoint. The generic hint's finalize-WAL guidance sent operators to
+/// `CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES`, which is irrelevant here and
+/// cost a real investigation a decoy environment variable.
+const INDEX_STALL_HINT_PERSIST: &str = concat!(
+    "Indexer counters are frozen but a batched persist is ACTIVE ",
+    "(`persist_in_progress: true`): one very large conversation (multi-MB ",
+    "single-session transcript, tens of thousands of messages) is inside ",
+    "redaction/map or its writer transaction. This is live work, not a wedge ",
+    "— the watchdog grants it the CASS_INDEX_FINALIZE_ABORT_SECS-class grace ",
+    "(default 1800s) and per-message heartbeats normally keep it from even ",
+    "reporting. If this stall repeats with no `activity` movement at all, ",
+    "capture a stack trace (`sudo gdb -batch -ex 'thread apply all bt' -p ",
+    "$(pgrep -f 'cass index')`) and attach it to issue #373. Memory pressure ",
+    "multiplies redaction time on giant conversations; re-running on a ",
+    "quieter machine is the fastest operational fix. ",
+    "CASS_INDEX_STALL_DETECT_SECS / CASS_INDEX_STALL_ABORT_SECS tune or ",
+    "disable detection/abort."
+);
+
 fn index_stall_threshold(progress_interval: Duration) -> Option<Duration> {
     let stall_threshold_secs = dotenvy::var("CASS_INDEX_STALL_DETECT_SECS")
         .ok()
@@ -90240,13 +90261,29 @@ impl IndexStallWatchdog {
         // already requires `current >= total` + quiescence, so a mid-rebuild
         // phase-2 wedge (current < total, or a still-producing pipeline) is NOT
         // a finalize_wedge and continues to abort at the normal threshold.
-        let effective_abort_threshold = if finalize_wedge
+        // gh373 third variant (bead oeu5a): an active batched persist of one
+        // giant conversation (observed: 60-90MB codex rollouts, ~40k
+        // messages) legitimately runs for minutes mid-phase-2 with
+        // `current < total` and a non-quiescent pipeline — a shape neither
+        // the finalize grace nor the #311/#315 early-returns cover. The
+        // per-message persist heartbeat is the primary liveness signal for
+        // that window; `persist_in_progress` grants the finalize-class grace
+        // as defense in depth so any future untick'd blocking stretch inside
+        // persist degrades to the bounded finalize threshold instead of a
+        // 300s exit(70). Liveness stays bounded: a genuinely wedged persist
+        // still aborts once the finalize grace elapses.
+        let persist_grace = phase_code == 2
+            && index_progress
+                .persist_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed);
+        let effective_abort_threshold = if (finalize_wedge
             && (index_progress
                 .finalizing
                 .load(std::sync::atomic::Ordering::Relaxed)
                 || index_progress
                     .is_rebuilding
-                    .load(std::sync::atomic::Ordering::Relaxed))
+                    .load(std::sync::atomic::Ordering::Relaxed)))
+            || persist_grace
         {
             // Finalize aborts disabled (CASS_INDEX_FINALIZE_ABORT_SECS=0):
             // treat the finalize window as report-only.
@@ -90310,7 +90347,21 @@ impl IndexStallWatchdog {
                 "diagnostics".into(),
                 collect_stall_diagnostics(&self.data_dir),
             );
-            m.insert("hint".into(), serde_json::json!(INDEX_STALL_HINT));
+            // gh373/oeu5a: phase-aware hint. A phase-2 stall with an active
+            // batched persist is the giant-conversation window; the generic
+            // finalize-WAL guidance is a decoy there.
+            let phase_code = index_progress
+                .phase
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let persist_active = index_progress
+                .persist_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let hint = if phase_code == 2 && persist_active {
+                INDEX_STALL_HINT_PERSIST
+            } else {
+                INDEX_STALL_HINT
+            };
+            m.insert("hint".into(), serde_json::json!(hint));
         }
         payload
     }
@@ -90744,6 +90795,106 @@ mod stall_diagnostics_tests {
         let abort = watchdog2
             .observe(&progress2, 200)
             .ok_or_else(|| anyhow::anyhow!("non-rebuild phase-2 tail should still abort"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// Regression for gh373 third variant (bead oeu5a): a MID-run phase-2
+    /// stall — `current < total`, pipeline not necessarily quiescent — while
+    /// one giant conversation is inside batched persistence
+    /// (`persist_in_progress` set). That window legitimately runs for
+    /// minutes (allocator-heavy redaction of a 60-90MB conversation before
+    /// the first WAL write), so the watchdog must grant it the
+    /// finalize-class grace instead of exit(70) at the ordinary abort
+    /// threshold; the identical shape WITHOUT an active persist is a genuine
+    /// wedge and must still abort. The stall report during the grace must
+    /// carry the persist-specific hint, not the finalize-WAL decoy.
+    #[test]
+    fn watchdog_grants_finalize_grace_during_active_giant_batch_persist() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let make_watchdog = |tmp: &TempDir| {
+            let mut watchdog = IndexStallWatchdog::with_abort_policy(
+                tmp.path().to_path_buf(),
+                Duration::from_millis(50),
+                IndexStallAbortPolicy::AbortPhaseTwo,
+            );
+            watchdog.threshold = Some(Duration::from_millis(1));
+            watchdog.abort_threshold = Some(Duration::from_millis(2));
+            // Never-abort during the grace (report-only) so it is visible.
+            watchdog.finalize_abort_threshold = None;
+            watchdog.last_phase = 2;
+            watchdog.last_current = 557;
+            watchdog.last_progress_advance =
+                std::time::Instant::now() - Duration::from_millis(100);
+            watchdog
+        };
+
+        // Active persist mid-run: phase 2, current < total, persist flagged.
+        let tmp = TempDir::new()?;
+        let mut watchdog = make_watchdog(&tmp);
+        let progress = Arc::new(IndexingProgress::default());
+        progress.phase.store(2, Ordering::Relaxed);
+        progress.total.store(684, Ordering::Relaxed);
+        progress.current.store(557, Ordering::Relaxed);
+        progress.persist_in_progress.store(true, Ordering::Relaxed);
+
+        let report = watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("active-persist stall did not report"))?;
+        assert_eq!(report["event"], serde_json::json!("stall_detected"));
+        assert_eq!(report["persist_in_progress"], serde_json::json!(true));
+        let hint = report["hint"].as_str().unwrap_or_default();
+        assert!(
+            hint.contains("persist_in_progress: true"),
+            "phase-2 persist stall must carry the persist hint, got: {hint}"
+        );
+        assert!(
+            !hint.contains("WAL_AUTOCHECKPOINT"),
+            "the finalize-WAL decoy guidance must not appear in the persist hint"
+        );
+        assert!(
+            watchdog.observe(&progress, 200).is_none(),
+            "an active giant-batch persist must get the finalize grace, not exit(70)"
+        );
+
+        // Bounded liveness: with a finite grace, a genuinely wedged persist
+        // still aborts once the grace elapses (first observe consumes the
+        // one-shot stall_detected report; the second aborts).
+        let tmp2 = TempDir::new()?;
+        let mut watchdog2 = make_watchdog(&tmp2);
+        watchdog2.finalize_abort_threshold = Some(Duration::from_millis(50));
+        watchdog2.last_progress_advance = std::time::Instant::now() - Duration::from_millis(200);
+        let detected = watchdog2
+            .observe(&progress, 250)
+            .ok_or_else(|| anyhow::anyhow!("wedged persist did not report before aborting"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        let abort = watchdog2
+            .observe(&progress, 300)
+            .ok_or_else(|| anyhow::anyhow!("wedged persist past the grace did not abort"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+
+        // Control: the identical mid-run shape WITHOUT an active persist is a
+        // genuine wedge and aborts at the ordinary threshold.
+        let tmp3 = TempDir::new()?;
+        let mut watchdog3 = make_watchdog(&tmp3);
+        let progress3 = Arc::new(IndexingProgress::default());
+        progress3.phase.store(2, Ordering::Relaxed);
+        progress3.total.store(684, Ordering::Relaxed);
+        progress3.current.store(557, Ordering::Relaxed);
+        assert_eq!(
+            watchdog3.observe(&progress3, 100).map(|r| r["event"].clone()),
+            Some(serde_json::json!("stall_detected"))
+        );
+        let abort = watchdog3
+            .observe(&progress3, 200)
+            .ok_or_else(|| anyhow::anyhow!("mid-run wedge without persist should abort"))?;
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
         Ok(())

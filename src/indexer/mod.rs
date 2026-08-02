@@ -1033,6 +1033,16 @@ pub struct IndexingProgress {
     /// canonical DB malformed to stock SQLite (#296/#321). Liveness is still
     /// bounded: see `index_finalize_abort_threshold` (#319).
     pub finalizing: AtomicBool,
+    /// gh373 third variant (bead oeu5a): true while the streaming consumer is
+    /// inside `persist::persist_conversations_batched*` for one ingest batch.
+    /// A single giant conversation (observed: 60-90MB codex rollouts, ~40k
+    /// messages) makes that call run for many minutes — allocator-heavy
+    /// redaction in `map_to_internal_with_redactor` before the first WAL
+    /// write — during which `current` cannot move and, before the
+    /// per-message heartbeat existed, `activity` did not either. The stall
+    /// watchdog grants this window the finalize-class abort grace as defense
+    /// in depth (the per-message heartbeat is the primary liveness signal).
+    pub persist_in_progress: AtomicBool,
     /// Number of coding agents discovered so far during scanning
     pub discovered_agents: AtomicUsize,
     /// Names of discovered agents (protected by mutex for concurrent access)
@@ -1259,6 +1269,7 @@ impl IndexingProgress {
         let agents = self.discovered_agents.load(Ordering::Relaxed);
         let is_rebuilding = self.is_rebuilding.load(Ordering::Relaxed);
         let finalizing = self.finalizing.load(Ordering::Relaxed);
+        let persist_in_progress = self.persist_in_progress.load(Ordering::Relaxed);
         let agent_names: Vec<String> = self
             .discovered_agent_names
             .lock()
@@ -1463,6 +1474,11 @@ impl IndexingProgress {
             // current==total snapshot with `finalizing: true` is an active
             // final checkpoint, NOT a #297 wedge.
             "finalizing": finalizing,
+            // gh373/oeu5a: true while one ingest batch is inside batched
+            // persistence (redaction/map + writer transaction). A phase-2
+            // snapshot with frozen counters but `persist_in_progress: true`
+            // is an active giant-batch persist, not a wedge.
+            "persist_in_progress": persist_in_progress,
             "elapsed_ms": elapsed_ms,
             "rate_per_sec": rate_per_sec,
             "eta_seconds": eta_seconds,
@@ -13286,6 +13302,17 @@ pub fn run_index(
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
+    // gh373/oeu5a: let connector-internal parse loops (which have no
+    // IndexingProgress handle) tick work-liveness for this run's stall
+    // watchdog. Weak: the sink must never extend the progress lifetime.
+    let _scan_activity_guard = opts.progress.as_ref().map(|progress| {
+        let weak = Arc::downgrade(progress);
+        crate::connectors::scan_activity::register(Box::new(move || {
+            if let Some(progress) = weak.upgrade() {
+                progress.tick_activity();
+            }
+        }))
+    });
     // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
     // flows. Keep routine indexing focused on the canonical conversation store
     // and lexical assets; set CASS_INLINE_ANALYTICS_UPDATES=1 to restore the
@@ -21539,6 +21566,31 @@ fn ingest_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// gh373/oeu5a RAII guard: marks `IndexingProgress::persist_in_progress` for
+/// the duration of one batched-persist call so the stall watchdog can grant
+/// an active giant-batch persist the finalize-class abort grace instead of
+/// killing it at the ordinary 300s no-progress threshold. Cleared on drop —
+/// including the error path — so a failed persist never leaves the grace
+/// stuck on.
+struct PersistInProgressGuard<'a>(Option<&'a IndexingProgress>);
+
+impl<'a> PersistInProgressGuard<'a> {
+    fn engage(progress: Option<&'a IndexingProgress>) -> Self {
+        if let Some(p) = progress {
+            p.persist_in_progress.store(true, Ordering::Relaxed);
+        }
+        Self(progress)
+    }
+}
+
+impl Drop for PersistInProgressGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = self.0 {
+            p.persist_in_progress.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
 fn ingest_batch_detailed(
     storage: &FrankenStorage,
     t_index: Option<&mut TantivyIndex>,
@@ -21554,14 +21606,23 @@ fn ingest_batch_detailed(
     // Persistence now uses short-lived writer connections internally so the
     // long-lived watch/session handle does not accumulate retained MVCC state
     // on older frankensqlite builds that ignore autocommit_retain.
-    let batch_result = persist::persist_conversations_batched_with_raw_mirror_links(
-        storage,
-        t_index,
-        data_dir,
-        convs,
-        lexical_strategy,
-        defer_checkpoints,
-    );
+    //
+    // gh373/oeu5a: thread the work-liveness heartbeat into the persist call
+    // (per-message ticks during redaction/map, per-chunk ticks during write)
+    // and flag `persist_in_progress` for the watchdog's defense-in-depth
+    // grace — one giant conversation legitimately persists for minutes.
+    let batch_result = {
+        let _persist_in_progress = PersistInProgressGuard::engage(progress.as_deref());
+        persist::persist_conversations_batched_with_raw_mirror_links(
+            storage,
+            t_index,
+            data_dir,
+            convs,
+            lexical_strategy,
+            defer_checkpoints,
+            persist::PersistHeartbeat::new(progress.as_deref(), progress_bump),
+        )
+    };
     let batch_outcome = match batch_result {
         Ok(batch_outcome) => batch_outcome,
         Err(error) => {
@@ -21878,6 +21939,11 @@ fn ingest_batch_with_semantic_delta(
         lexical_strategy,
         defer_checkpoints,
     );
+    // gh373/oeu5a: same heartbeat + persist_in_progress treatment as
+    // `ingest_batch_detailed` — watch-session batches can also carry one
+    // giant conversation. No index-run lock bump handle exists on this path.
+    let heartbeat = persist::PersistHeartbeat::new(progress.as_deref(), None);
+    let _persist_in_progress = PersistInProgressGuard::engage(progress.as_deref());
     let batch_result = if semantic_delta.is_some() {
         persist::persist_conversations_batched_with_semantic_delta_and_raw_mirror_links(
             storage,
@@ -21886,6 +21952,7 @@ fn ingest_batch_with_semantic_delta(
             convs,
             lexical_strategy,
             defer_checkpoints,
+            heartbeat,
         )
     } else {
         persist::persist_conversations_batched_with_raw_mirror_links(
@@ -21895,8 +21962,10 @@ fn ingest_batch_with_semantic_delta(
             convs,
             lexical_strategy,
             defer_checkpoints,
+            heartbeat,
         )
     };
+    drop(_persist_in_progress);
     let batch_outcome = match batch_result {
         Ok(batch_outcome) => batch_outcome,
         Err(error) => {
@@ -26176,6 +26245,8 @@ pub mod persist {
     use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicI64;
     use std::time::Duration;
     #[cfg(test)]
     use std::time::Instant;
@@ -27108,6 +27179,7 @@ pub mod persist {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn persist_conversations_batched_begin_concurrent(
         storage: &FrankenStorage,
         db_path: &Path,
@@ -27117,6 +27189,7 @@ pub mod persist {
         defer_checkpoints: bool,
         capture_semantic_delta: bool,
         raw_mirror_data_dir: Option<&Path>,
+        heartbeat: PersistHeartbeat<'_>,
     ) -> Result<PersistBatchOutcome> {
         if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
             && t_index.is_none()
@@ -27140,7 +27213,9 @@ pub mod persist {
             .par_iter()
             .map_init(
                 super::redact_secrets::MemoizingRedactor::new,
-                |redactor, conv| map_to_internal_with_redactor(conv, Some(redactor)),
+                |redactor, conv| {
+                    map_to_internal_with_redactor_and_heartbeat(conv, Some(redactor), heartbeat)
+                },
             )
             .collect();
 
@@ -27195,6 +27270,10 @@ pub mod persist {
                         if let Some(g) = shadow_guard {
                             g.finish_ok();
                         }
+                        // gh373/oeu5a: each persisted chunk is live work even
+                        // while the batch-level `current` bump waits for the
+                        // whole persist call to return.
+                        heartbeat.tick();
                         Ok(outcomes)
                     }
                     Err(err) => {
@@ -27376,9 +27455,63 @@ pub mod persist {
         map_to_internal_with_redactor(conv, None)
     }
 
+    /// gh373 third variant (bead oeu5a): one activity tick per this many
+    /// mapped messages. A single giant conversation (observed: 60-90MB codex
+    /// rollouts, ~40k messages) spends minutes inside
+    /// `map_to_internal_with_redactor` — allocator-heavy secret redaction on
+    /// one thread, zero WAL writes — which froze all three watchdog atomics
+    /// and drew a spurious exit(70) at the 300s abort threshold. The stride
+    /// keeps ticks cheap (one relaxed atomic add per 256 messages) while
+    /// bounding the silent window to well under any sane threshold.
+    const MAP_HEARTBEAT_MESSAGE_STRIDE: usize = 256;
+
+    /// Work-liveness heartbeat threaded through batched persistence
+    /// (gh373/oeu5a). Mirrors the #282/#332/#366 pattern: real work ticks
+    /// `IndexingProgress::activity` for the run-side stall watchdog and bumps
+    /// the index-run lock's `last_progress_at_ms` for the status-side stall
+    /// detector. `NONE` keeps legacy call sites (tests, paths without a
+    /// progress handle) unchanged.
+    #[derive(Clone, Copy)]
+    pub(crate) struct PersistHeartbeat<'a> {
+        progress: Option<&'a super::IndexingProgress>,
+        progress_bump: Option<&'a Arc<AtomicI64>>,
+    }
+
+    impl<'a> PersistHeartbeat<'a> {
+        pub(crate) const NONE: PersistHeartbeat<'static> = PersistHeartbeat {
+            progress: None,
+            progress_bump: None,
+        };
+
+        pub(crate) fn new(
+            progress: Option<&'a super::IndexingProgress>,
+            progress_bump: Option<&'a Arc<AtomicI64>>,
+        ) -> Self {
+            Self {
+                progress,
+                progress_bump,
+            }
+        }
+
+        pub(crate) fn tick(&self) {
+            if let Some(progress) = self.progress {
+                progress.tick_activity();
+            }
+            super::bump_index_run_lock_progress_if_present(self.progress_bump);
+        }
+    }
+
     pub(crate) fn map_to_internal_with_redactor(
         conv: &NormalizedConversation,
+        redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
+    ) -> Conversation {
+        map_to_internal_with_redactor_and_heartbeat(conv, redactor, PersistHeartbeat::NONE)
+    }
+
+    pub(crate) fn map_to_internal_with_redactor_and_heartbeat(
+        conv: &NormalizedConversation,
         mut redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
+        heartbeat: PersistHeartbeat<'_>,
     ) -> Conversation {
         // Extract provenance from metadata (P2.2)
         let (source_id, origin_host) = extract_provenance(&conv.metadata);
@@ -27418,7 +27551,14 @@ pub mod persist {
             messages: conv
                 .messages
                 .iter()
-                .map(|m| {
+                .enumerate()
+                .map(|(mapped_message_index, m)| {
+                    // gh373/oeu5a: heartbeat during the long single-thread
+                    // redaction of one giant conversation, so the stall
+                    // watchdog sees live work between batch publications.
+                    if mapped_message_index % MAP_HEARTBEAT_MESSAGE_STRIDE == 0 {
+                        heartbeat.tick();
+                    }
                     let content = if should_redact {
                         if let Some(r) = redactor.as_mut() {
                             r.redact_text(&m.content)
@@ -27610,9 +27750,16 @@ pub mod persist {
             defer_checkpoints,
             false,
             None,
+            PersistHeartbeat::NONE,
         )
     }
 
+    /// gh373/oeu5a: carries the work-liveness heartbeat for the streaming
+    /// ingest chokepoints, so a minutes-long giant-batch persist keeps
+    /// ticking the stall watchdog and the index-run lock instead of reading
+    /// as a wedge. Callers without a progress handle pass
+    /// `PersistHeartbeat::NONE`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn persist_conversations_batched_with_raw_mirror_links(
         storage: &FrankenStorage,
         t_index: Option<&mut TantivyIndex>,
@@ -27620,6 +27767,7 @@ pub mod persist {
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
+        heartbeat: PersistHeartbeat<'_>,
     ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
@@ -27629,9 +27777,13 @@ pub mod persist {
             defer_checkpoints,
             false,
             Some(data_dir),
+            heartbeat,
         )
     }
 
+    /// gh373/oeu5a: heartbeat-carrying (see
+    /// `persist_conversations_batched_with_raw_mirror_links`).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn persist_conversations_batched_with_semantic_delta_and_raw_mirror_links(
         storage: &FrankenStorage,
         t_index: Option<&mut TantivyIndex>,
@@ -27639,6 +27791,7 @@ pub mod persist {
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
+        heartbeat: PersistHeartbeat<'_>,
     ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
@@ -27648,9 +27801,11 @@ pub mod persist {
             defer_checkpoints,
             true,
             Some(data_dir),
+            heartbeat,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn persist_conversations_batched_inner(
         storage: &FrankenStorage,
         mut t_index: Option<&mut TantivyIndex>,
@@ -27659,6 +27814,7 @@ pub mod persist {
         defer_checkpoints: bool,
         capture_semantic_delta: bool,
         raw_mirror_data_dir: Option<&Path>,
+        heartbeat: PersistHeartbeat<'_>,
     ) -> Result<PersistBatchOutcome> {
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
@@ -27693,6 +27849,7 @@ pub mod persist {
                 defer_checkpoints,
                 capture_semantic_delta,
                 raw_mirror_data_dir,
+                heartbeat,
             );
         }
 
@@ -27715,7 +27872,9 @@ pub mod persist {
             .par_iter()
             .map_init(
                 super::redact_secrets::MemoizingRedactor::new,
-                |redactor, conv| map_to_internal_with_redactor(conv, Some(redactor)),
+                |redactor, conv| {
+                    map_to_internal_with_redactor_and_heartbeat(conv, Some(redactor), heartbeat)
+                },
             )
             .collect();
 
@@ -27780,6 +27939,10 @@ pub mod persist {
                     let end = (start + chunk_size).min(prepared.len());
                     let chunk_refs = &prepared[start..end];
                     outcomes.extend(writer.insert_conversations_batched(chunk_refs)?);
+                    // gh373/oeu5a: each written chunk is live work even while
+                    // the batch-level `current` bump waits for the whole
+                    // persist call to return.
+                    heartbeat.tick();
                 }
 
                 Ok(outcomes)
@@ -27797,6 +27960,10 @@ pub mod persist {
             let mut skip_inline_lexical_updates = false;
             for (internal_conv, outcome) in internal_convs.iter().zip(outcomes.iter()) {
                 batch_outcome.record_insert_outcome(outcome);
+                // gh373/oeu5a: per-conversation liveness through the inline
+                // lexical sink (packet build + Tantivy add can be slow for a
+                // giant conversation).
+                heartbeat.tick();
                 if skip_inline_lexical_updates {
                     continue;
                 }
@@ -27952,6 +28119,57 @@ pub mod persist {
         fn begin_concurrent_chunk_size_parsing() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "7");
             assert_eq!(begin_concurrent_chunk_size(), 7);
+        }
+
+        /// gh373/oeu5a: mapping one giant conversation must tick the
+        /// work-liveness heartbeat per MAP_HEARTBEAT_MESSAGE_STRIDE messages
+        /// so the stall watchdog sees live work during the minutes-long
+        /// redaction window (previously zero ticks until the whole batch
+        /// persisted — the proven exit(70) trigger).
+        #[test]
+        fn map_to_internal_heartbeat_ticks_per_message_stride() {
+            use crate::connectors::NormalizedConversation;
+            use std::sync::atomic::Ordering;
+
+            let message_count = MAP_HEARTBEAT_MESSAGE_STRIDE * 3 + 5;
+            let conv = NormalizedConversation {
+                agent_slug: "codex".to_string(),
+                external_id: Some("giant".to_string()),
+                title: Some("giant conversation".to_string()),
+                workspace: None,
+                source_path: std::path::PathBuf::from("/log/giant.jsonl"),
+                started_at: Some(1000),
+                ended_at: Some(2000),
+                metadata: serde_json::json!({}),
+                messages: (0..message_count)
+                    .map(|j| crate::connectors::NormalizedMessage {
+                        idx: j as i64,
+                        role: "user".to_string(),
+                        author: None,
+                        created_at: Some(1000 + j as i64),
+                        content: format!("msg {j}"),
+                        extra: serde_json::json!({}),
+                        snippets: vec![],
+                        invocations: Vec::new(),
+                    })
+                    .collect(),
+            };
+
+            let progress = super::super::IndexingProgress::default();
+            let heartbeat = PersistHeartbeat::new(Some(&progress), None);
+            let mapped =
+                map_to_internal_with_redactor_and_heartbeat(&conv, None, heartbeat);
+            assert_eq!(mapped.messages.len(), message_count);
+            let ticks = progress.activity.load(Ordering::Relaxed);
+            // Ticks fire at message indices 0, STRIDE, 2*STRIDE, 3*STRIDE.
+            assert_eq!(
+                ticks, 4,
+                "expected one tick per started stride (got {ticks} for {message_count} messages)"
+            );
+
+            // The heartbeat-free path stays a no-op (no progress handle).
+            let unmapped = map_to_internal_with_redactor(&conv, None);
+            assert_eq!(unmapped.messages.len(), message_count);
         }
 
         #[test]
@@ -28359,6 +28577,7 @@ pub mod persist {
                 false,
                 false,
                 None,
+                PersistHeartbeat::NONE,
             )
             .expect("begin-concurrent persist should succeed");
 
@@ -28463,6 +28682,7 @@ pub mod persist {
                 false,
                 false,
                 None,
+                PersistHeartbeat::NONE,
             )
             .expect("single conversation begin-concurrent persist should succeed");
 
@@ -28614,6 +28834,7 @@ pub mod persist {
                 false,
                 false,
                 None,
+                PersistHeartbeat::NONE,
             )
             .expect("begin-concurrent deferred persist should succeed");
 

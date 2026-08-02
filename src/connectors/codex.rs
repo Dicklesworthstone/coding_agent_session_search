@@ -65,6 +65,19 @@ impl Connector for CodexConnector {
     }
 }
 
+/// gh373/oeu5a: heartbeat stride for the rollout line loop below. One
+/// [`scan_activity::tick`] per this many lines keeps the stall watchdog fed
+/// while this second pass re-parses a giant rollout (~40k lines, minutes).
+const AUGMENT_HEARTBEAT_LINE_STRIDE: usize = 1024;
+
+// TODO(gh373/oeu5a follow-up): this function is a full second parse of every
+// rollout — `franken_agent_detection`'s scan already read and parsed the same
+// file to produce `conversation`. Merging this enrichment into FAD's primary
+// parse (single-pass) would roughly halve producer CPU/IO on the codex
+// corpus, but the parse lives in the pinned external FAD crate
+// (Cargo.toml rev pin), so the merge must land there first with cass-side
+// plumbing behind a feature/rev bump. Deferred deliberately; do not attempt
+// by duplicating FAD parse internals here.
 fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
     if conversation
         .source_path
@@ -107,6 +120,11 @@ fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
         .enumerate()
     {
         let line_no = line_no_zero + 1;
+        // gh373/oeu5a: connector-internal liveness during the minutes-long
+        // re-parse of one giant rollout (see AUGMENT_HEARTBEAT_LINE_STRIDE).
+        if line_no_zero % AUGMENT_HEARTBEAT_LINE_STRIDE == 0 {
+            super::scan_activity::tick();
+        }
         let line = line.trim();
         if line.is_empty() {
             continue;
