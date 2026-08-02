@@ -21773,7 +21773,15 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         });
     }
 
-    record_index_poison_conversation(data_dir, conv, &error)?;
+    record_index_poison_conversation(
+        data_dir,
+        conv,
+        &error,
+        Some(PoisonMemoryAttribution {
+            real_memory_pressure: real_pressure,
+            indexed_text_bytes,
+        }),
+    )?;
     if let Some(progress) = progress {
         progress.current.fetch_add(1, Ordering::Relaxed);
     }
@@ -22138,7 +22146,15 @@ fn quarantine_single_watch_conversation(
     indexed_text_bytes: usize,
     real_memory_pressure: Option<bool>,
 ) -> Result<WatchIngestBatchOutcome> {
-    record_watch_poison_conversation(data_dir, conv, error)?;
+    record_watch_poison_conversation(
+        data_dir,
+        conv,
+        error,
+        Some(PoisonMemoryAttribution {
+            real_memory_pressure,
+            indexed_text_bytes,
+        }),
+    )?;
     if let Some(progress) = progress {
         progress.current.fetch_add(1, Ordering::Relaxed);
     }
@@ -22299,10 +22315,47 @@ fn format_error_chain(error: &anyhow::Error) -> String {
     parts.join(" | ")
 }
 
+/// Why a single-conversation OOM became a *quarantine* rather than a defer
+/// (#364). Recorded in the poison record so post-mortem triage (and
+/// `cass diag --quarantine`) can distinguish a genuine host-memory-pressure
+/// OOM from a precautionary quarantine of a large conversation taken when host
+/// pressure could not be determined — the exact confusion behind the "false
+/// OOM quarantine" report.
+#[derive(Debug, Clone, Copy)]
+struct PoisonMemoryAttribution {
+    /// `watch_oom_under_real_memory_pressure()` at quarantine time: `Some(true)`
+    /// = genuine host pressure, `Some(false)` = a bounded-allocation guard with
+    /// no host pressure, `None` = pressure could not be sampled.
+    real_memory_pressure: Option<bool>,
+    /// Indexed text size of the conversation that OOMed.
+    indexed_text_bytes: usize,
+}
+
+impl PoisonMemoryAttribution {
+    fn memory_pressure_label(self) -> &'static str {
+        match self.real_memory_pressure {
+            Some(true) => "real",
+            Some(false) => "none",
+            None => "unknown",
+        }
+    }
+
+    /// The trigger that turned this OOM into a quarantine (mirrors the
+    /// `should_quarantine` decision in the ingest paths).
+    fn quarantine_trigger(self) -> &'static str {
+        match self.real_memory_pressure {
+            Some(true) => "real_host_memory_pressure",
+            Some(false) => "bounded_allocation_guard_no_pressure",
+            None => "unknown_pressure_large_conversation_precaution",
+        }
+    }
+}
+
 fn record_watch_poison_conversation(
     data_dir: &Path,
     conv: &NormalizedConversation,
     error: &anyhow::Error,
+    attribution: Option<PoisonMemoryAttribution>,
 ) -> Result<()> {
     record_poison_conversation(
         data_dir,
@@ -22310,6 +22363,7 @@ fn record_watch_poison_conversation(
         "watch-ingest-out-of-memory",
         conv,
         error,
+        attribution,
     )
 }
 
@@ -22317,6 +22371,7 @@ fn record_index_poison_conversation(
     data_dir: &Path,
     conv: &NormalizedConversation,
     error: &anyhow::Error,
+    attribution: Option<PoisonMemoryAttribution>,
 ) -> Result<()> {
     record_poison_conversation(
         data_dir,
@@ -22324,6 +22379,7 @@ fn record_index_poison_conversation(
         "index-ingest-out-of-memory",
         conv,
         error,
+        attribution,
     )
 }
 
@@ -22339,6 +22395,7 @@ fn record_poison_conversation(
     reason: &str,
     conv: &NormalizedConversation,
     error: &anyhow::Error,
+    attribution: Option<PoisonMemoryAttribution>,
 ) -> Result<()> {
     let quarantine_dir = data_dir.join("quarantine");
     fs::create_dir_all(&quarantine_dir).with_context(|| {
@@ -22395,7 +22452,7 @@ fn record_poison_conversation(
     // `FrankenError::OutOfMemory` is just the bare string "out of memory" and
     // tells us nothing about which subsystem failed.
     let full_error_chain = format_error_chain(error);
-    let record = serde_json::json!({
+    let mut record = serde_json::json!({
         "schema_version": POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION,
         "conversation_id": conversation_id,
         "schema_version_at_quarantine": schema_version_at_quarantine,
@@ -22415,6 +22472,25 @@ fn record_poison_conversation(
         "ended_at": conv.ended_at,
         "message_count": conv.messages.len(),
     });
+    // #364: record WHY this OOM became a quarantine (genuine host pressure vs a
+    // precautionary large-conversation quarantine), additively so pre-#364
+    // records without attribution stay shape-compatible.
+    if let Some(attribution) = attribution
+        && let Some(object) = record.as_object_mut()
+    {
+        object.insert(
+            "memory_pressure".to_string(),
+            serde_json::json!(attribution.memory_pressure_label()),
+        );
+        object.insert(
+            "quarantine_trigger".to_string(),
+            serde_json::json!(attribution.quarantine_trigger()),
+        );
+        object.insert(
+            "indexed_text_bytes".to_string(),
+            serde_json::json!(attribution.indexed_text_bytes),
+        );
+    }
     records.insert(key, record);
 
     let mut file = OpenOptions::new()
@@ -31496,6 +31572,7 @@ mod tests {
             "watch-ingest-out-of-memory",
             &conv,
             &error,
+            None,
         )
         .expect("record poison");
 
@@ -31525,6 +31602,108 @@ mod tests {
         assert!(
             last_error.contains(" | "),
             "last_error must be ` | `-joined chain: {last_error}"
+        );
+    }
+
+    /// #364: the poison record carries the memory-pressure attribution so
+    /// post-mortem triage can tell a genuine host-pressure OOM from a
+    /// precautionary large-conversation quarantine — and omits it entirely
+    /// (pre-#364 shape) when no attribution is supplied.
+    #[test]
+    fn poison_record_carries_memory_pressure_attribution() {
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: Some("attrib-conv".into()),
+            title: None,
+            workspace: None,
+            source_path: std::path::PathBuf::from("/log/attrib.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_010),
+            metadata: serde_json::json!({}),
+            messages: vec![],
+        };
+        let error: anyhow::Error = frankensqlite::FrankenError::OutOfMemory.into();
+        let read_record = |data_dir: &std::path::Path| -> serde_json::Value {
+            let path = data_dir.join("quarantine").join(INDEX_INGEST_POISON_FILE);
+            let contents = std::fs::read_to_string(&path).expect("read quarantine file");
+            let line = contents
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .expect("at least one record");
+            serde_json::from_str(line).expect("parse record")
+        };
+
+        // Genuine host memory pressure.
+        let real = tempfile::tempdir().expect("tempdir");
+        super::record_poison_conversation(
+            real.path(),
+            INDEX_INGEST_POISON_FILE,
+            "index-ingest-out-of-memory",
+            &conv,
+            &error,
+            Some(super::PoisonMemoryAttribution {
+                real_memory_pressure: Some(true),
+                indexed_text_bytes: 12_345,
+            }),
+        )
+        .expect("record poison");
+        let rec = read_record(real.path());
+        assert_eq!(
+            rec.get("memory_pressure").and_then(serde_json::Value::as_str),
+            Some("real")
+        );
+        assert_eq!(
+            rec.get("quarantine_trigger")
+                .and_then(serde_json::Value::as_str),
+            Some("real_host_memory_pressure")
+        );
+        assert_eq!(
+            rec.get("indexed_text_bytes")
+                .and_then(serde_json::Value::as_u64),
+            Some(12_345)
+        );
+
+        // Pressure could not be sampled -> precautionary large-conversation
+        // quarantine trigger.
+        let unknown = tempfile::tempdir().expect("tempdir");
+        super::record_poison_conversation(
+            unknown.path(),
+            INDEX_INGEST_POISON_FILE,
+            "index-ingest-out-of-memory",
+            &conv,
+            &error,
+            Some(super::PoisonMemoryAttribution {
+                real_memory_pressure: None,
+                indexed_text_bytes: 999,
+            }),
+        )
+        .expect("record poison");
+        let rec = read_record(unknown.path());
+        assert_eq!(
+            rec.get("memory_pressure").and_then(serde_json::Value::as_str),
+            Some("unknown")
+        );
+        assert_eq!(
+            rec.get("quarantine_trigger")
+                .and_then(serde_json::Value::as_str),
+            Some("unknown_pressure_large_conversation_precaution")
+        );
+
+        // No attribution -> fields omitted (pre-#364 record shape).
+        let none = tempfile::tempdir().expect("tempdir");
+        super::record_poison_conversation(
+            none.path(),
+            INDEX_INGEST_POISON_FILE,
+            "index-ingest-out-of-memory",
+            &conv,
+            &error,
+            None,
+        )
+        .expect("record poison");
+        let rec = read_record(none.path());
+        assert!(
+            rec.get("memory_pressure").is_none() && rec.get("quarantine_trigger").is_none(),
+            "attribution fields must be omitted when no attribution is supplied"
         );
     }
 
