@@ -11389,8 +11389,11 @@ impl FrankenStorage {
     /// read at open. The FTS5 vtab's destructor is a no-op that never reads
     /// `%_data`, and its backing shadow tables are plain, so `DROP TABLE`
     /// removes the corrupt structure without decoding it. Canonical rows are
-    /// never modified. Failure-atomic: rolls back without publishing a partial
-    /// shadow.
+    /// never modified. NOT fully failure-atomic: the drop+recreate runs in
+    /// autocommit (frankensqlite cannot recreate a virtual table in the same
+    /// transaction as its DROP), so only the repopulate is transactional — a
+    /// failed repopulate leaves an EMPTY (not corrupt) shadow, and re-running
+    /// the repair is safe because the shadow is fully derived from canonical.
     pub(crate) fn rebuild_fts_shadow_via_drop_recreate(&self) -> Result<usize> {
         self.invalidate_fts_messages_present_cache();
 

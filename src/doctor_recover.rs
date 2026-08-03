@@ -498,6 +498,26 @@ pub fn run_doctor_rebuild_canonical_fts(
         // shadow by dropping + recreating it from canonical rows — the shadow is
         // fully derived and canonical rows are never touched.
         Err(open_err) if is_fts5_shadow_open_corruption_error(&open_err) => {
+            if dry_run {
+                // A dry-run must stay read-only and non-locking: report the
+                // planned repair straight from the open error, WITHOUT opening
+                // the archive writable or taking the doctor mutation lock that
+                // `open_deferred_fts5_for_repair` acquires.
+                let envelope = serde_json::json!({
+                    "surface": "doctor_rebuild_canonical_fts_dry_run",
+                    "status": "shadow_structure_corrupt",
+                    "planned_action": "drop_recreate_rebuild_from_canonical",
+                    "detail": format!("{open_err:#}"),
+                });
+                if structured_format.is_some() {
+                    print_json(&envelope)?;
+                } else {
+                    println!(
+                        "Canonical FTS5 dry-run: status=shadow_structure_corrupt, planned_action=drop_recreate_rebuild_from_canonical; re-run with --yes to drop, recreate, and rebuild the corrupt shadow from canonical"
+                    );
+                }
+                return Ok(());
+            }
             let deferred = FrankenStorage::open_deferred_fts5_for_repair(&db_path).map_err(|e| {
                 storage_error(
                     format!(
@@ -507,27 +527,6 @@ pub fn run_doctor_rebuild_canonical_fts(
                     Some("Preserve the archive bundle and run 'cass doctor check --json'."),
                 )
             })?;
-            let canonical = deferred
-                .inspect_search_fallback_fts_parity()
-                .map(|parity| parity.canonical_messages)
-                .unwrap_or(0);
-            if dry_run {
-                let envelope = serde_json::json!({
-                    "surface": "doctor_rebuild_canonical_fts_dry_run",
-                    "status": "shadow_structure_corrupt",
-                    "planned_action": "drop_recreate_rebuild_from_canonical",
-                    "canonical_messages": canonical,
-                    "detail": format!("{open_err:#}"),
-                });
-                if structured_format.is_some() {
-                    print_json(&envelope)?;
-                } else {
-                    println!(
-                        "Canonical FTS5 dry-run: status=shadow_structure_corrupt, planned_action=drop_recreate_rebuild_from_canonical, canonical={canonical}"
-                    );
-                }
-                return Ok(());
-            }
             let inserted = deferred
                 .rebuild_fts_shadow_via_drop_recreate()
                 .map_err(|e| {
