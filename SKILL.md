@@ -5,7 +5,7 @@ description: "Coding Agent Session Search - unified CLI/TUI to index and search 
 
 # CASS - Coding Agent Session Search
 
-Unified, high-performance CLI/TUI to index and search your local coding agent history. Aggregates sessions from **23 agents**, including Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Factory (Droid), OpenHands, Antigravity, and Grok Build.
+Unified, high-performance CLI/TUI to index and search your local coding agent history. Aggregates sessions from **24 agents**, including Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Factory (Droid), OpenHands, Antigravity, and Grok Build.
 
 ## CRITICAL: Robot Mode Required for AI Agents
 
@@ -575,7 +575,7 @@ Final_Score = BM25_Score × Match_Quality + α × Recency_Factor
 
 ---
 
-## Supported Agents (23 Connectors)
+## Supported Agents (24 Connectors)
 
 | Agent | Location | Format |
 |-------|----------|--------|
@@ -597,6 +597,7 @@ Final_Score = BM25_Score × Match_Quality + α × Recency_Factor
 | **Vibe** | `~/.vibe/logs/session` | JSONL |
 | **Crush** | `~/.crush/crush.db` | SQLite |
 | **Hermes** | `~/.hermes` | JSONL |
+| **Goose** | `~/.local/share/goose/sessions` | SQLite / JSONL |
 | **Kimi Code** | `~/.kimi/sessions` | JSONL |
 | **Qwen Code** | `~/.qwen/tmp` | JSON / JSONL |
 | **OpenHands** | `~/.openhands/conversations` | JSON event stream |

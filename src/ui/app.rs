@@ -241,6 +241,7 @@ const INPUT_AUTOCOMPLETE_AGENT_HINTS: &[&str] = &[
     "cursor",
     "factory",
     "gemini",
+    "goose",
     "kimi",
     "opencode",
     "openclaw",
@@ -3084,6 +3085,7 @@ fn legacy_agent_color(agent: &str) -> ftui::PackedRgba {
         "copilot" => ftui::PackedRgba::rgb(92, 200, 120), // blue-green
         "copilot_cli" => ftui::PackedRgba::rgb(80, 170, 230), // navy
         "crush" => ftui::PackedRgba::rgb(255, 120, 80), // coral
+        "goose" => ftui::PackedRgba::rgb(198, 166, 122), // taupe
         "kimi" => ftui::PackedRgba::rgb(190, 220, 80), // yellow-green
         "qwen" => ftui::PackedRgba::rgb(80, 210, 180), // mint
         _ => ftui::PackedRgba::rgb(169, 169, 169),     // gray fallback

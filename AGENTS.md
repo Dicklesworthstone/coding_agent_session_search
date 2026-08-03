@@ -472,6 +472,7 @@ coding_agent_session_search/
 │   │   ├── vibe.rs               # Vibe sessions
 │   │   ├── crush.rs               # Crush sessions
 │   │   ├── hermes.rs              # Hermes sessions
+│   │   ├── goose.rs               # Goose sessions
 │   │   ├── kimi.rs                # Kimi Code sessions
 │   │   ├── qwen.rs                # Qwen Code sessions
 │   │   ├── openhands.rs           # OpenHands sessions
@@ -562,6 +563,7 @@ cass robot-docs guide         # LLM-optimized docs
 | Vibe | `vibe.rs` | JSONL |
 | Crush | `crush.rs` | JSONL |
 | Hermes | `hermes.rs` | JSONL |
+| Goose | `goose.rs` | SQLite / JSONL |
 | Kimi Code | `kimi.rs` | JSONL |
 | Qwen Code | `qwen.rs` | JSONL |
 | Factory (Droid) | `factory.rs` | JSONL |

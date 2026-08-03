@@ -212,6 +212,7 @@ pub mod crush;
 pub mod cursor;
 pub mod factory;
 pub mod gemini;
+pub mod goose;
 pub mod grok;
 pub mod hermes;
 pub mod kimi;

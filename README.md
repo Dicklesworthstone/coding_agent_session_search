@@ -11,7 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, and Grok Build into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Goose, Kimi Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, and Grok Build into a single, searchable timeline.
 
 <div align="center">
 
@@ -360,7 +360,7 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from 23 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
+Ingests history from 24 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
 - **Codex**: `~/.codex/sessions` (Rollout JSONL)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
@@ -380,6 +380,7 @@ Ingests history from 23 local agents, normalizing them into a unified `Conversat
 - **OpenClaw**: `~/.openclaw/agents/*/sessions` (Session JSONL)
 - **Crush**: `~/.crush/crush.db` and per-project `.crush/crush.db` (SQLite)
 - **Hermes**: `~/.hermes/state.db` and project-local `.hermes/state.db` (SQLite)
+- **Goose**: `~/.local/share/goose/sessions/sessions.db` (SQLite, Goose v1.20+), falling back to per-session `*.jsonl` under the same directory or legacy `~/.goose/sessions` (override the base dir with `GOOSE_PATH_ROOT`, or point at a database directly with `GOOSE_SQLITE_DB`)
 - **Kimi Code**: `$KIMI_CODE_HOME/sessions/*/*/agents/*/wire.jsonl` (default `~/.kimi-code`; sub-agents index as `<sessionId>:<agentId>`), plus the legacy `~/.kimi/sessions/*/*/wire.jsonl` layout (Session JSONL)
 - **Qwen Code**: `~/.qwen/tmp/*/chats/session-*.json` (Chat JSON)
 - **Factory (Droid)**: `~/.factory/sessions` (JSONL files organized by workspace slug)
@@ -2145,6 +2146,7 @@ classDiagram
  Connector <|-- OpenClawConnector
  Connector <|-- CrushConnector
  Connector <|-- HermesConnector
+ Connector <|-- GooseConnector
  Connector <|-- KimiConnector
  Connector <|-- QwenConnector
 
@@ -2166,6 +2168,7 @@ classDiagram
  OpenClawConnector ..> NormalizedConversation : emits
  CrushConnector ..> NormalizedConversation : emits
  HermesConnector ..> NormalizedConversation : emits
+ GooseConnector ..> NormalizedConversation : emits
  KimiConnector ..> NormalizedConversation : emits
  QwenConnector ..> NormalizedConversation : emits
 ```
@@ -2180,7 +2183,7 @@ classDiagram
 `cass` uses frankensqlite as the durable source of truth and frankensearch as a derived speed layer, powered by a suite of integrated "franken" libraries.
 
 ### The Pipeline
-1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 23 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi, Qwen, Factory, OpenHands, Antigravity, Grok Build).
+1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 24 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Goose, Kimi, Qwen, Factory, OpenHands, Antigravity, Grok Build).
 2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation with `BEGIN CONCURRENT` support for MVCC multi-writer transactions.
 3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
@@ -2216,6 +2219,7 @@ flowchart LR
  A18[Hermes]:::pastel
  A19[Kimi]:::pastel
  A20[Qwen]:::pastel
+ A21[Goose]:::pastel
  end
 
  subgraph Remote["Remote Sources"]

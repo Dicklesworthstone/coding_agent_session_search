@@ -25,6 +25,20 @@ engine fix for the shipped
 FTS5 leaf-overflow (implemented + tested in frankensqlite, pending a dependency
 re-pin).
 
+### Added
+
+- **Goose connector (24th provider)**. cass now indexes
+  [Goose](https://github.com/block/goose) sessions instead of merely detecting
+  them. The parser already existed upstream in `franken_agent_detection`; cass
+  simply had not enabled the `goose` feature, so `goose` sat in the
+  detection-only set alongside `continue`/`windsurf` — probe paths and
+  `cass diag` entries, but no ingest. Enabling the feature registers
+  `GooseConnector` through the existing factory registry, which reads the
+  v1.20+ SQLite store (`~/.local/share/goose/sessions/sessions.db`) and falls
+  back to the pre-v1.20 per-session `*.jsonl` layout (including legacy
+  `~/.goose/sessions`). `GOOSE_PATH_ROOT` / `GOOSE_SQLITE_DB` override
+  discovery. Connector count assertions move 23 → 24.
+
 ### Fixed
 
 - **[#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368)
