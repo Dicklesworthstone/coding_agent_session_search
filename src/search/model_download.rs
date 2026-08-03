@@ -1012,7 +1012,14 @@ const MODEL_HTTP_BODY_SIZE_MARGIN_BYTES: u64 = 32 * 1024 * 1024;
 fn format_download_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     let mut parts = vec![err.to_string()];
     let mut source = err.source();
+    // Bound the walk: no real error chain is this deep, and the cap guards
+    // against a pathological `source()` cycle looping forever.
+    let mut remaining_depth = 32;
     while let Some(inner) = source {
+        if remaining_depth == 0 {
+            break;
+        }
+        remaining_depth -= 1;
         let msg = inner.to_string();
         if parts.last().map(|last| last != &msg).unwrap_or(true) {
             parts.push(msg);
