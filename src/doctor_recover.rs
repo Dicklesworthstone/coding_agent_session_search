@@ -1217,6 +1217,127 @@ mod tests {
         assert_eq!(parity.indexed_messages, Some(2));
     }
 
+    /// GH #368 (defect 3): when the FTS5 `%_data` *structure* record is corrupt
+    /// enough that the archive cannot be opened normally (the schema reload
+    /// eagerly decodes it), `--rebuild-canonical-fts --yes` must still repair it
+    /// by reopening with FTS5 hydration DEFERRED and dropping + recreating +
+    /// repopulating the shadow from canonical rows. This drives the full doctor
+    /// CLI fallback end-to-end (`is_fts5_shadow_open_corruption_error` detection
+    /// plus the corrupt-shadow branch of `run_doctor_rebuild_canonical_fts`,
+    /// including the read-only dry-run report) — coverage the storage-level test
+    /// `drop_recreate_repairs_corrupt_fts_shadow_structure` does not reach.
+    #[test]
+    fn rebuild_canonical_fts_repairs_structurally_corrupt_shadow_that_blocks_open() {
+        use frankensqlite::Connection as FrankenConnection;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+
+        // Canonical data + a VALID FTS shadow (which we then corrupt).
+        {
+            let storage = FrankenStorage::open(&db_path).expect("open db");
+            let agent_id = seed_agent(&storage);
+            let conversation_id =
+                seed_conversation(&storage, agent_id, "corrupt-shadow", "/orig/corrupt.jsonl");
+            // The FTS rebuild streams `messages.content`, so the matchable token
+            // must land there (the `write_message` helper stores a placeholder
+            // content and would never be queryable for 'needle').
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) \
+                     VALUES(?1, 0, 'user', NULL, 1000, ?2, NULL, NULL)",
+                    &[
+                        ParamValue::from(conversation_id),
+                        ParamValue::from("authentication needle".to_string()),
+                    ] as &[ParamValue],
+                )
+                .expect("insert canonical message");
+            storage
+                .rebuild_fts_via_frankensqlite()
+                .expect("build a valid FTS shadow");
+        }
+
+        // Corrupt the %_data structure record (rowid 10) through a fresh
+        // connection (the FTS is still valid here, so the open succeeds).
+        {
+            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())
+                .expect("open raw franken connection");
+            let garbage = [0xFFu8; 12];
+            conn.execute_compat(
+                "UPDATE fts_messages_data SET block = ?1 WHERE id = ?2",
+                &[ParamValue::from(garbage.as_slice()), ParamValue::from(10_i64)]
+                    as &[ParamValue],
+            )
+            .expect("corrupt the FTS5 structure record");
+        }
+
+        // Both the read-only open (dry-run path) and the schema-only repair open
+        // (apply path) must now fail on the corrupt structure, so the doctor
+        // command is forced through the deferred-open corrupt-shadow fallback
+        // rather than the ordinary parity path.
+        assert!(
+            FrankenStorage::open_readonly(&db_path).is_err(),
+            "read-only open must fail on a corrupt FTS5 %_data structure record"
+        );
+        assert!(
+            FrankenStorage::open_existing_schema_only_for_fts_repair(&db_path).is_err(),
+            "schema-only repair open must fail on a corrupt FTS5 %_data structure record"
+        );
+
+        // Dry-run (even with --yes) must report the planned repair while staying
+        // strictly read-only: it must NOT open the archive writable, take the
+        // doctor mutation lock, or repair anything.
+        let bytes_before_dry_run = std::fs::read(&db_path).expect("snapshot db before dry-run");
+        run_doctor_rebuild_canonical_fts(
+            Some(tmp.path().to_path_buf()),
+            Some(db_path.clone()),
+            true,
+            true,
+            Some(RobotFormat::Json),
+        )
+        .expect("dry-run on a corrupt shadow must succeed read-only");
+        let bytes_after_dry_run = std::fs::read(&db_path).expect("snapshot db after dry-run");
+        assert_eq!(
+            bytes_after_dry_run, bytes_before_dry_run,
+            "corrupt-shadow dry-run must not alter any database bytes"
+        );
+        assert!(
+            FrankenStorage::open_existing_schema_only_for_fts_repair(&db_path).is_err(),
+            "dry-run must not have repaired the corrupt shadow"
+        );
+
+        // Apply: the fallback drops + recreates + rebuilds the shadow from
+        // canonical rows.
+        run_doctor_rebuild_canonical_fts(
+            Some(tmp.path().to_path_buf()),
+            Some(db_path.clone()),
+            false,
+            true,
+            Some(RobotFormat::Json),
+        )
+        .expect("rebuild-canonical-fts must repair a structurally-corrupt shadow (GH #368 defect 3)");
+
+        // The archive now opens normally and the rebuilt shadow reaches exact
+        // parity and is queryable for a token from canonical content.
+        let readonly = FrankenStorage::open_readonly(&db_path).expect("reopen read-only");
+        let parity = readonly
+            .inspect_search_fallback_fts_parity()
+            .expect("inspect rebuilt FTS");
+        assert_eq!(parity.status, FtsShadowParityStatus::Healthy);
+        assert_eq!(parity.canonical_messages, 1);
+        assert_eq!(parity.indexed_messages, Some(1));
+        let matches: i64 = readonly
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'needle'",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .expect("MATCH on rebuilt shadow");
+        assert_eq!(matches, 1, "rebuilt FTS shadow must be queryable for 'needle'");
+    }
+
     /// GH #369: the cumulative oversized-leaf failure (many in-cap terms in one
     /// batch, not a single overlong token) must be recognized so the operator
     /// gets a reassuring "search still works via Tantivy" diagnostic rather than
