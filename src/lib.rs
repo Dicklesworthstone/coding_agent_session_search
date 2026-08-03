@@ -30881,7 +30881,7 @@ struct DoctorSafeAutoRunBuildInput<'a> {
     fs_mutation_receipts: &'a [DoctorFsMutationReceipt],
     operation_state: &'a DoctorOperationStateReport,
     needs_rebuild: bool,
-    db_ok: bool,
+    archive_queryable_for_non_destructive_derived_rebuild: bool,
     db_messages: Option<usize>,
     event_log_reference: String,
 }
@@ -31209,9 +31209,11 @@ fn doctor_anomaly_taxonomy_report() -> Vec<DoctorAnomalyTaxonomyEntry> {
 
 fn doctor_database_integrity_probe(
     conn: &frankensqlite::Connection,
+    set_phase: impl Fn(&'static str),
 ) -> Result<DoctorDatabaseIntegrityProbe, String> {
     use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
 
+    set_phase("quick_check");
     let quick_check_status: String = conn
         .query_row_map("PRAGMA quick_check(1)", &[], |row: &frankensqlite::Row| {
             row.get_typed(0)
@@ -31220,6 +31222,7 @@ fn doctor_database_integrity_probe(
 
     let quick_check_ok = quick_check_status.trim().eq_ignore_ascii_case("ok");
     let integrity_check_diagnostics = if quick_check_ok {
+        set_phase("integrity_check");
         let integrity_sql =
             format!("PRAGMA integrity_check({DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT});");
         let rows = conn
@@ -31295,6 +31298,37 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
         return DoctorAnomaly::Healthy;
     }
 
+    if status == "timeout" {
+        return DoctorAnomaly::RepairBlocked;
+    }
+
+    // An affirmative integrity verdict outranks any accompanying deferral
+    // context (for example, a current cached FAIL used when a live deep probe
+    // is too large).  This is evidence of corruption, not uncertainty.
+    let affirmative_database_integrity_failure = name == "database"
+        && status == "fail"
+        && (message.starts_with("Database failed frankensqlite ")
+            || message.contains("attestation records structural failure"));
+    if affirmative_database_integrity_failure {
+        return DoctorAnomaly::ArchiveDbCorrupt;
+    }
+
+    // A deliberately deferred, known-unbounded integrity/FTS probe is not
+    // evidence that the archive is corrupt or unreadable.  Keep the robot
+    // taxonomy honest: this is a blocked diagnostic, not an archive verdict.
+    if matches!(status, "warn" | "fail")
+        && (message.contains("frankensqlite_full_page_integrity_probe_deferred")
+            || message.contains("archive_wide_collectors_deferred")
+            || message.contains("busy or locked")
+            || message.contains("health is unverified")
+            || message.contains("structural integrity is unchecked")
+            || message.contains("health probe failed via frankensqlite")
+            || message.contains("no integrity verdict was returned")
+            || message == "Database query failed")
+    {
+        return DoctorAnomaly::RepairBlocked;
+    }
+
     match name {
         "data_directory" => DoctorAnomaly::StoragePressure,
         "storage_pressure" => DoctorAnomaly::StoragePressure,
@@ -31307,7 +31341,7 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
             }
         }
         "database" => {
-            if message.contains("quick_check") || message.contains("integrity_check") {
+            if affirmative_database_integrity_failure {
                 DoctorAnomaly::ArchiveDbCorrupt
             } else {
                 DoctorAnomaly::ArchiveDbUnreadable
@@ -31568,7 +31602,7 @@ fn build_doctor_safe_auto_run_report(
         let data_risk = doctor_data_loss_risk_rank(check.data_loss_risk);
         let decision = if check.safe_for_auto_repair
             && input.operation_state.mutating_doctor_allowed
-            && input.db_ok
+            && input.archive_queryable_for_non_destructive_derived_rebuild
         {
             DoctorSafeAutoRunDecisionKind::Eligible
         } else if data_risk >= doctor_data_loss_risk_rank(DoctorDataLossRisk::Medium)
@@ -31663,7 +31697,7 @@ fn build_doctor_safe_auto_run_report(
     }
 
     if input.needs_rebuild
-        && input.db_ok
+        && input.archive_queryable_for_non_destructive_derived_rebuild
         && input.db_messages.unwrap_or(0) > 0
         && report.next_exact_command.is_none()
     {
@@ -38586,6 +38620,19 @@ fn collect_doctor_source_inventory(data_dir: &Path, db_path: &Path) -> DoctorSou
     }
 }
 
+fn doctor_source_inventory_deferred(reason: &str) -> DoctorSourceInventoryReport {
+    DoctorSourceInventoryReport {
+        schema_version: 1,
+        db_available: false,
+        db_query_error: Some(reason.to_string()),
+        notes: vec![
+            "Archive-wide source inventory was not attempted; zero-valued coverage fields are unknown, not evidence of absence."
+                .to_string(),
+        ],
+        ..DoctorSourceInventoryReport::default()
+    }
+}
+
 fn doctor_remote_mirror_top_level_entry_count(
     mirror_dir: &Path,
     limit: usize,
@@ -42513,6 +42560,34 @@ fn collect_doctor_raw_mirror_backfill_report(
     report
 }
 
+fn doctor_raw_mirror_backfill_deferred(
+    apply: bool,
+    reason: &str,
+) -> DoctorRawMirrorBackfillReport {
+    DoctorRawMirrorBackfillReport {
+        schema_version: 1,
+        backfill_generation: DOCTOR_RAW_MIRROR_BACKFILL_GENERATION,
+        mode: if apply {
+            "safe_auto_run".to_string()
+        } else {
+            "check".to_string()
+        },
+        status: "deferred".to_string(),
+        db_available: false,
+        db_query_error: Some(reason.to_string()),
+        read_only_external_source_dirs: true,
+        forensic_bundle: doctor_forensic_bundle_uncaptured("archive_wide_collectors_deferred"),
+        warnings: vec![reason.to_string()],
+        notes: vec![
+            "Archive-wide raw-mirror backfill candidates were not scanned; zero-valued candidate and coverage fields are unknown, not evidence of absence."
+                .to_string(),
+            "No provider source, raw-mirror, archive, or candidate bytes were mutated."
+                .to_string(),
+        ],
+        ..DoctorRawMirrorBackfillReport::default()
+    }
+}
+
 fn doctor_coverage_confidence_tier(
     archive_conversation_count: usize,
     db_projection_only_count: usize,
@@ -42926,6 +43001,31 @@ fn doctor_fast_coverage_risk_unchecked(db_exists: bool) -> DoctorCoverageRiskSum
             "Run 'cass index --full' once before coverage can be assessed.".to_string()
         },
         ..DoctorCoverageRiskSummary::default()
+    }
+}
+
+fn doctor_coverage_summary_deferred(
+    archive_conversation_count: Option<usize>,
+    archived_message_count: Option<usize>,
+    raw_mirror_manifest_count: usize,
+    reason: &str,
+) -> DoctorCoverageSummary {
+    DoctorCoverageSummary {
+        schema_version: 1,
+        confidence_tier: "unchecked".to_string(),
+        archive_conversation_count: archive_conversation_count.unwrap_or_default(),
+        archived_message_count: archived_message_count.unwrap_or_default(),
+        raw_mirror_manifest_count,
+        coverage_reducing_live_source_rebuild_refused: true,
+        recommended_action:
+            "Run process-isolated archive inventory/backfill probes before any archive repair."
+                .to_string(),
+        notes: vec![
+            reason.to_string(),
+            "Only bounded row-count fields are populated; every other zero-valued coverage field is unknown, not evidence of absence."
+                .to_string(),
+        ],
+        ..DoctorCoverageSummary::default()
     }
 }
 
@@ -43547,6 +43647,30 @@ fn build_doctor_source_authority_report(
             "Promotion requires a later non-decreasing coverage check plus checksum-verified receipt.".to_string(),
         ],
     }
+}
+
+fn doctor_refuse_source_authority_when_collectors_deferred(
+    mut report: DoctorSourceAuthorityReport,
+    reason: &str,
+) -> DoctorSourceAuthorityReport {
+    for mut candidate in std::mem::take(&mut report.selected_authorities) {
+        candidate.decision = DoctorSourceAuthorityDecision::Refused;
+        candidate.reason = format!(
+            "archive-wide authority evidence is unchecked; prior provisional selection refused: {reason}"
+        );
+        candidate
+            .evidence
+            .push("archive-wide-collectors-deferred".to_string());
+        report.rejected_authorities.push(candidate);
+    }
+    report.decision = DoctorSourceAuthorityDecision::Refused;
+    report.selected_authority = None;
+    report.notes.push(reason.to_string());
+    report.notes.push(
+        "No zero-valued deferred coverage field may select or promote a repair authority."
+            .to_string(),
+    );
+    report
 }
 
 const DOCTOR_CANDIDATE_SCHEMA_VERSION: u32 = 1;
@@ -54305,6 +54429,9 @@ fn build_doctor_repair_plan_preview(
     initial_failure_marker: &DoctorRepairFailureMarkerReport,
     needs_rebuild: bool,
     db_ok: bool,
+    canonical_archive_queryable_for_non_destructive_derived_rebuild: bool,
+    canonical_candidate_replacement_authorized: bool,
+    archive_wide_collectors_complete: bool,
     db_messages: Option<usize>,
     raw_mirror_backfill: &DoctorRawMirrorBackfillReport,
     coverage_summary: &DoctorCoverageSummary,
@@ -54321,10 +54448,39 @@ fn build_doctor_repair_plan_preview(
         doctor_repair_completed_candidate_fingerprints(candidate_staging);
     let selected_completed_candidate =
         doctor_repair_select_completed_candidate_for_promotion(candidate_staging);
-    let candidate_promotion_candidate = if db_ok {
+    // `db_ok` means a live/cached structural attestation passed.  A large
+    // archive whose deep PRAGMAs were deliberately deferred can instead have
+    // `db_ok == false` even though bounded canonical row reads succeeded.
+    // That uncertainty is never authority to replace canonical bytes: protect
+    // either class from candidate promotion and permit only derived rebuilds.
+    let canonical_archive_protected =
+        db_ok || canonical_archive_queryable_for_non_destructive_derived_rebuild;
+    let candidate_promotion_candidate = if canonical_archive_protected {
         if selected_completed_candidate.is_some() {
             warnings.push(
-                "candidate-promotion-skipped: canonical archive DB is readable; repair apply will not replace a readable archive with a staged candidate"
+                "candidate-promotion-skipped: canonical archive DB is structurally verified or bounded-queryable with deep integrity explicitly deferred; repair apply will not replace it with a staged candidate"
+                    .to_string(),
+            );
+        }
+        None
+    } else if !canonical_candidate_replacement_authorized {
+        if selected_completed_candidate.is_some() {
+            doctor_repair_push_blocker(
+                &mut blocked_reasons,
+                &mut branchable_blocker_codes,
+                "canonical-archive-failure-unproven",
+                "candidate promotion requires an affirmative current integrity failure or an absent canonical DB; timeout, busy, open error, and unverified states are not replacement authority"
+                    .to_string(),
+            );
+        }
+        None
+    } else if !archive_wide_collectors_complete {
+        if selected_completed_candidate.is_some() {
+            doctor_repair_push_blocker(
+                &mut blocked_reasons,
+                &mut branchable_blocker_codes,
+                "archive-authority-collectors-unchecked",
+                "candidate promotion requires completed archive-wide coverage and source-authority collectors; deferred zero-valued fields are not evidence"
                     .to_string(),
             );
         }
@@ -54402,7 +54558,7 @@ fn build_doctor_repair_plan_preview(
         }
     }
 
-    if needs_rebuild && db_ok {
+    if needs_rebuild && canonical_archive_protected {
         planned_actions.push(DoctorRepairPlanActionPreview {
             action_kind: DOCTOR_REPAIR_ACTION_REBUILD_FROM_ARCHIVE_DB.to_string(),
             mode: DoctorRepairMode::RepairApply,
@@ -54504,6 +54660,9 @@ fn build_doctor_repair_plan_preview(
         "allow_repeated_repair": allow_repeated_repair,
         "needs_rebuild": needs_rebuild,
         "db_ok": db_ok,
+        "canonical_archive_queryable_for_non_destructive_derived_rebuild": canonical_archive_queryable_for_non_destructive_derived_rebuild,
+        "canonical_candidate_replacement_authorized": canonical_candidate_replacement_authorized,
+        "archive_wide_collectors_complete": archive_wide_collectors_complete,
         "db_messages": db_messages,
         "live_inventory": live_inventory,
         "operation_lock_state": doctor_repair_lock_fingerprint_state(operation_state),
@@ -66249,6 +66408,31 @@ mod doctor_asset_taxonomy_tests {
         index_path: &Path,
         candidate_staging: &DoctorCandidateStagingReport,
         db_ok: bool,
+        canonical_candidate_replacement_authorized: bool,
+        needs_rebuild: bool,
+    ) -> DoctorRepairPlanPreviewReport {
+        doctor_test_repair_plan_for_candidate_staging_with_queryability(
+            data_dir,
+            db_path,
+            index_path,
+            candidate_staging,
+            db_ok,
+            db_ok,
+            canonical_candidate_replacement_authorized,
+            true,
+            needs_rebuild,
+        )
+    }
+
+    fn doctor_test_repair_plan_for_candidate_staging_with_queryability(
+        data_dir: &Path,
+        db_path: &Path,
+        index_path: &Path,
+        candidate_staging: &DoctorCandidateStagingReport,
+        db_ok: bool,
+        canonical_archive_queryable_for_non_destructive_derived_rebuild: bool,
+        canonical_candidate_replacement_authorized: bool,
+        archive_wide_collectors_complete: bool,
         needs_rebuild: bool,
     ) -> DoctorRepairPlanPreviewReport {
         build_doctor_repair_plan_preview(
@@ -66265,6 +66449,9 @@ mod doctor_asset_taxonomy_tests {
             &doctor_failure_marker_absent_report("doctor-repair"),
             needs_rebuild,
             db_ok,
+            canonical_archive_queryable_for_non_destructive_derived_rebuild,
+            canonical_candidate_replacement_authorized,
+            archive_wide_collectors_complete,
             None,
             &DoctorRawMirrorBackfillReport::default(),
             &DoctorCoverageSummary::default(),
@@ -66301,6 +66488,7 @@ mod doctor_asset_taxonomy_tests {
             &index_path,
             &candidate_staging,
             false,
+            true,
             true,
         );
 
@@ -66361,6 +66549,7 @@ mod doctor_asset_taxonomy_tests {
             &candidate_staging,
             false,
             true,
+            true,
         );
 
         assert!(
@@ -66411,6 +66600,7 @@ mod doctor_asset_taxonomy_tests {
             &index_path,
             &candidate_staging,
             true,
+            false,
             true,
         );
 
@@ -66428,6 +66618,156 @@ mod doctor_asset_taxonomy_tests {
                 .any(|warning| warning.contains("candidate-promotion-skipped")),
             "candidate skip warning should make the conservative choice explicit: {plan:#?}"
         );
+    }
+
+    #[test]
+    fn doctor_repair_plan_never_promotes_candidate_over_deferred_queryable_archive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        std::fs::write(&db_path, b"bounded-queryable archive placeholder")
+            .expect("write live db");
+        let candidate_dir = doctor_candidate_root(&data_dir).join("candidate-deferred-db");
+        write_candidate_promotion_test_manifest(
+            &db_path,
+            &index_path,
+            &candidate_dir,
+            "candidate-deferred-db",
+            b"candidate archive bytes",
+            true,
+        );
+        let candidate_staging =
+            collect_doctor_candidate_staging_report(&data_dir, &db_path, &index_path);
+
+        let plan = doctor_test_repair_plan_for_candidate_staging_with_queryability(
+            &data_dir,
+            &db_path,
+            &index_path,
+            &candidate_staging,
+            false,
+            true,
+            false,
+            false,
+            true,
+        );
+
+        assert!(doctor_repair_plan_has_action(
+            &plan,
+            DOCTOR_REPAIR_ACTION_REBUILD_FROM_ARCHIVE_DB
+        ));
+        assert!(!doctor_repair_plan_has_action(
+            &plan,
+            DOCTOR_REPAIR_ACTION_PROMOTE_RECONSTRUCT_CANDIDATE
+        ));
+        assert_eq!(
+            plan.fingerprint_inputs
+                .pointer("/canonical_archive_queryable_for_non_destructive_derived_rebuild")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            plan.fingerprint_inputs
+                .pointer("/candidate_staging/selected_completed_candidate")
+                .is_some_and(serde_json::Value::is_null),
+            "the staged candidate must not be selected when canonical bounded reads succeeded: {plan:#?}"
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("candidate-promotion-skipped")),
+            "the fail-closed selection must be explicit in the plan: {plan:#?}"
+        );
+    }
+
+    #[test]
+    fn doctor_repair_plan_never_promotes_candidate_after_timeout_unknown_archive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        std::fs::write(&db_path, b"health unknown after timeout").expect("write live db");
+        let candidate_dir = doctor_candidate_root(&data_dir).join("candidate-timeout-db");
+        write_candidate_promotion_test_manifest(
+            &db_path,
+            &index_path,
+            &candidate_dir,
+            "candidate-timeout-db",
+            b"candidate archive bytes",
+            true,
+        );
+        let candidate_staging =
+            collect_doctor_candidate_staging_report(&data_dir, &db_path, &index_path);
+
+        let plan = doctor_test_repair_plan_for_candidate_staging_with_queryability(
+            &data_dir,
+            &db_path,
+            &index_path,
+            &candidate_staging,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+
+        assert!(!doctor_repair_plan_has_action(
+            &plan,
+            DOCTOR_REPAIR_ACTION_PROMOTE_RECONSTRUCT_CANDIDATE
+        ));
+        assert!(
+            plan.branchable_blocker_codes
+                .iter()
+                .any(|code| code == "canonical-archive-failure-unproven"),
+            "timeout/unverified state must block replacement even with a completed candidate: {plan:#?}"
+        );
+        assert_eq!(
+            plan.fingerprint_inputs
+                .pointer("/canonical_candidate_replacement_authorized")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            plan.fingerprint_inputs
+                .pointer("/candidate_staging/selected_completed_candidate")
+                .is_some_and(serde_json::Value::is_null)
+        );
+    }
+
+    #[test]
+    fn doctor_deferred_archive_collectors_are_explicitly_unknown_and_select_no_authority() {
+        let reason = doctor_archive_wide_collectors_deferred_reason(
+            Some("frankensqlite_full_page_integrity_probe_deferred: large archive"),
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .expect("large archive must defer archive-wide collectors");
+        let inventory = doctor_source_inventory_deferred(&reason);
+        assert!(!inventory.db_available);
+        assert!(
+            inventory
+                .db_query_error
+                .as_deref()
+                .is_some_and(|error| error.contains("archive_wide_collectors_deferred"))
+        );
+        let backfill = doctor_raw_mirror_backfill_deferred(false, &reason);
+        assert_eq!(backfill.status, "deferred");
+        assert_eq!(backfill.total_candidate_count, 0);
+        let coverage = doctor_coverage_summary_deferred(Some(17), Some(101), 3, &reason);
+        assert_eq!(coverage.confidence_tier, "unchecked");
+        assert!(coverage.coverage_reducing_live_source_rebuild_refused);
+        let authority = doctor_refuse_source_authority_when_collectors_deferred(
+            doctor_test_source_authority_report(),
+            &reason,
+        );
+        assert_eq!(authority.decision, DoctorSourceAuthorityDecision::Refused);
+        assert_eq!(authority.selected_authority, None);
+        assert!(authority.selected_authorities.is_empty());
     }
 
     #[test]
@@ -77300,6 +77640,7 @@ struct DoctorBoundedArchiveDbProbe {
     conv_count: Option<i64>,
     msg_count: Option<i64>,
     integrity: Option<Result<DoctorDatabaseIntegrityProbe, String>>,
+    integrity_skipped_reason: Option<String>,
     fts_state: Option<DoctorFtsTableState>,
 }
 
@@ -77320,6 +77661,222 @@ fn doctor_archive_db_probe_hard_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+// `PRAGMA quick_check(1)` limits the number of diagnostics returned; it does
+// not limit the number of database pages visited.  FrankenSQLite's synchronous
+// PRAGMA executor also does not currently expose a cancellation handle, so a
+// thread-level `recv_timeout` can stop the doctor from waiting but cannot stop
+// the abandoned worker from continuing to consume CPU and emit trace output.
+// Keep routine doctor checks away from that known-unbounded path once the
+// archive bundle is large enough for a runaway full-page walk to be material.
+// A skipped check is reported as unchecked (or satisfied by a still-current
+// cached attestation), never silently promoted to a pass.
+const DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+fn doctor_franken_deep_integrity_skip_reason_for_bytes(bundle_bytes: u64) -> Option<String> {
+    (bundle_bytes > DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES).then(|| {
+        format!(
+            "frankensqlite_full_page_integrity_probe_deferred: archive bundle is {bundle_bytes} bytes, above the bounded doctor limit of {DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES} bytes"
+        )
+    })
+}
+
+fn doctor_franken_deep_integrity_skip_reason(db_path: &Path) -> Option<String> {
+    let main = match std::fs::symlink_metadata(db_path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
+        Ok(_) => {
+            return Some(
+                "frankensqlite_full_page_integrity_probe_deferred: archive path is not a regular file"
+                    .to_string(),
+            );
+        }
+        Err(err) => {
+            return Some(format!(
+                "frankensqlite_full_page_integrity_probe_deferred: archive size is unavailable ({err})"
+            ));
+        }
+    };
+    let mut bundle_bytes = main;
+    let mut wal_name = db_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    wal_name.push("-wal");
+    let wal_path = db_path.with_file_name(wal_name);
+    match std::fs::symlink_metadata(&wal_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let Some(total) = bundle_bytes.checked_add(metadata.len()) else {
+                return Some(
+                    "frankensqlite_full_page_integrity_probe_deferred: archive bundle size overflowed"
+                        .to_string(),
+                );
+            };
+            bundle_bytes = total;
+        }
+        Ok(_) => {
+            return Some(
+                "frankensqlite_full_page_integrity_probe_deferred: WAL sidecar is not a regular file"
+                    .to_string(),
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Some(format!(
+                "frankensqlite_full_page_integrity_probe_deferred: WAL size is unavailable ({err})"
+            ));
+        }
+    }
+    doctor_franken_deep_integrity_skip_reason_for_bytes(bundle_bytes)
+}
+
+fn doctor_archive_queryable_for_non_destructive_derived_rebuild(
+    db_ok: bool,
+    row_counts_complete: bool,
+    deep_integrity_deferred: bool,
+    cached_integrity_failed: bool,
+) -> bool {
+    db_ok
+        || (row_counts_complete && deep_integrity_deferred && !cached_integrity_failed)
+}
+
+fn doctor_canonical_candidate_replacement_authorized(
+    db_exists: bool,
+    not_initialized: bool,
+    affirmative_integrity_failure: bool,
+) -> bool {
+    affirmative_integrity_failure || (!db_exists && !not_initialized)
+}
+
+fn doctor_archive_wide_collectors_deferred_reason(
+    deep_integrity_skip_reason: Option<&str>,
+    probe_timed_out: bool,
+    db_open_failed: bool,
+    integrity_unverified: bool,
+    integrity_failed: bool,
+    busy_or_locked: bool,
+) -> Option<String> {
+    let cause = if let Some(reason) = deep_integrity_skip_reason {
+        reason.to_string()
+    } else if probe_timed_out {
+        "bounded archive database probe timed out".to_string()
+    } else if busy_or_locked {
+        "archive database is busy or locked".to_string()
+    } else if db_open_failed {
+        "archive database open did not complete successfully".to_string()
+    } else if integrity_unverified {
+        "archive database health is unverified".to_string()
+    } else if integrity_failed {
+        "archive database has an affirmative integrity failure".to_string()
+    } else {
+        return None;
+    };
+    Some(format!(
+        "archive_wide_collectors_deferred: {cause}; source inventory, message-level raw-mirror backfill, coverage, and repair authority remain unchecked"
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_franken_deep_integrity_size_gate_has_an_exact_boundary() {
+    assert!(
+        doctor_franken_deep_integrity_skip_reason_for_bytes(
+            DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES
+        )
+        .is_none()
+    );
+    let reason = doctor_franken_deep_integrity_skip_reason_for_bytes(
+        DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES + 1,
+    )
+    .expect("one byte above the bounded budget must defer the full-page PRAGMA");
+    assert!(reason.contains("full_page_integrity_probe_deferred"));
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_franken_deep_integrity_size_gate_counts_the_wal_bundle() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("agent_search.db");
+    std::fs::File::create(&db_path)
+        .and_then(|file| file.set_len(DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES - 1))
+        .expect("create sparse main DB fixture");
+    assert!(doctor_franken_deep_integrity_skip_reason(&db_path).is_none());
+
+    let wal_path = temp.path().join("agent_search.db-wal");
+    std::fs::File::create(wal_path)
+        .and_then(|file| file.set_len(2))
+        .expect("create sparse WAL fixture");
+    let reason = doctor_franken_deep_integrity_skip_reason(&db_path)
+        .expect("main plus WAL above the budget must defer the full-page PRAGMA");
+    assert!(reason.contains("268435457 bytes"));
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_deferred_integrity_never_implies_corruption_or_destructive_rebuild() {
+    let deferred_message =
+        "frankensqlite_full_page_integrity_probe_deferred: bounded probe skipped";
+    assert_eq!(
+        doctor_anomaly_for_check("database", "warn", deferred_message),
+        DoctorAnomaly::RepairBlocked
+    );
+    assert_eq!(
+        doctor_anomaly_for_check(
+            "database",
+            "fail",
+            "cached quick_check attestation records structural failure; frankensqlite_full_page_integrity_probe_deferred"
+        ),
+        DoctorAnomaly::ArchiveDbCorrupt,
+        "a current cached FAIL must not be hidden by the deferral marker"
+    );
+    assert_eq!(
+        doctor_anomaly_for_check(
+            "database",
+            "fail",
+            "Database failed frankensqlite quick_check: malformed page"
+        ),
+        DoctorAnomaly::ArchiveDbCorrupt,
+        "a completed affirmative live integrity failure remains corruption evidence"
+    );
+    assert!(doctor_archive_queryable_for_non_destructive_derived_rebuild(
+        false, true, true, false
+    ));
+    assert!(!doctor_archive_queryable_for_non_destructive_derived_rebuild(
+        false, true, true, true
+    ));
+    assert!(!doctor_archive_queryable_for_non_destructive_derived_rebuild(
+        false, true, false, false
+    ));
+    assert!(!doctor_canonical_candidate_replacement_authorized(
+        true, false, false
+    ));
+    assert!(doctor_canonical_candidate_replacement_authorized(
+        true, false, true
+    ));
+    assert!(doctor_canonical_candidate_replacement_authorized(
+        false, false, false
+    ));
+    assert_eq!(
+        doctor_anomaly_for_check(
+            "database",
+            "timeout",
+            "Database health probe timed out; archive health is unverified"
+        ),
+        DoctorAnomaly::RepairBlocked,
+        "a timeout is diagnostic uncertainty, not evidence that the archive is unreadable"
+    );
+    for unverified_message in [
+        "Database health probe failed via frankensqlite: running PRAGMA quick_check(1): unsupported page state",
+        "Database health probe failed via frankensqlite: running PRAGMA integrity_check: unsupported page state",
+        "Database row counts completed but no integrity verdict was returned",
+        "Database query failed",
+    ] {
+        assert_eq!(
+            doctor_anomaly_for_check("database", "fail", unverified_message),
+            DoctorAnomaly::RepairBlocked,
+            "an unverified probe is diagnostic uncertainty, not replacement authority: {unverified_message}"
+        );
+    }
+}
+
 /// #287: the doctor's `SELECT COUNT(*)` row counts and
 /// `PRAGMA quick_check`/`integrity_check` probes used to run unbounded on the
 /// main thread, so a wedged or busy-spinning database made
@@ -77327,8 +77884,11 @@ fn doctor_archive_db_probe_hard_timeout() -> Duration {
 /// killed it. Run the connection-consuming probe work on a worker thread with
 /// a hard deadline instead: on timeout the doctor marks the `database` check
 /// `status:"timeout"` (with the phase that was in flight) and continues to a
-/// final JSON verdict. The abandoned worker stays detached — the same
-/// containment contract as `open_franken_cli_read_db_with_hard_timeout`.
+/// final JSON verdict. A Rust thread cannot be force-cancelled, so the size
+/// gate above prevents known-large full-page PRAGMAs from entering this worker
+/// at all. An unexpected timeout on a smaller archive still leaves a detached
+/// worker until process exit; process isolation or an upstream FrankenSQLite
+/// cancellation handle is required to remove that residual limitation.
 fn run_bounded_doctor_archive_db_probe(
     conn: frankensqlite::Connection,
     db_path: &Path,
@@ -77338,6 +77898,7 @@ fn run_bounded_doctor_archive_db_probe(
     let (tx, rx) = std::sync::mpsc::channel();
     let worker_phase = std::sync::Arc::clone(&phase);
     let worker_db_path = db_path.to_path_buf();
+    let deep_integrity_skip_reason = doctor_franken_deep_integrity_skip_reason(db_path);
     let conn = crate::storage::sqlite::SendFrankenConnection::new(conn);
     let _probe_worker = std::thread::spawn(move || {
         use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
@@ -77364,15 +77925,20 @@ fn run_bounded_doctor_archive_db_probe(
             )
             .ok();
         let mut integrity = None;
+        let mut integrity_skipped_reason = None;
         let mut fts_state = None;
         if conv_count.is_some() && msg_count.is_some() {
-            set_phase("integrity_probe");
-            let probe = doctor_database_integrity_probe(&conn);
-            let healthy = matches!(&probe, Ok(result) if result.is_ok());
-            integrity = Some(probe);
-            if healthy {
-                set_phase("fts_probe");
-                fts_state = Some(probe_doctor_fts_table(&conn));
+            if let Some(reason) = deep_integrity_skip_reason {
+                set_phase("integrity_probe_deferred_large_archive");
+                integrity_skipped_reason = Some(reason);
+            } else {
+                let probe = doctor_database_integrity_probe(&conn, &set_phase);
+                let healthy = matches!(&probe, Ok(result) if result.is_ok());
+                integrity = Some(probe);
+                if healthy {
+                    set_phase("fts_probe");
+                    fts_state = Some(probe_doctor_fts_table(&conn));
+                }
             }
         }
         set_phase("connection_close");
@@ -77381,6 +77947,7 @@ fn run_bounded_doctor_archive_db_probe(
             conv_count,
             msg_count,
             integrity,
+            integrity_skipped_reason,
             fts_state,
         });
     });
@@ -77555,6 +78122,7 @@ pub(crate) fn run_doctor_impl(
     let mut storage_db_open_failed = false;
     let mut storage_integrity_failed = false;
     let mut storage_integrity_unverified = false;
+    let mut storage_integrity_skipped_reason: Option<String> = None;
     let mut storage_probe_timed_out = false;
     let mut storage_lexical_index_drifted = false;
     let mut storage_attestation_check_depth: Option<&'static str> = None;
@@ -77563,6 +78131,10 @@ pub(crate) fn run_doctor_impl(
         &db_path,
         Duration::from_millis(100),
     );
+    let matching_cached_integrity_attestation =
+        crate::search::storage_integrity::load_matching_integrity_attestation(
+            &data_dir, &db_path,
+        );
     let mut auto_fix_actions: Vec<String> = Vec::new();
     let mut auto_fix_applied = false;
     let mut fs_mutation_receipts: Vec<DoctorFsMutationReceipt> = Vec::new();
@@ -77853,135 +78425,196 @@ pub(crate) fn run_doctor_impl(
             );
             match db_open_result {
                 Ok(conn) => {
-                    // #287: the row-count and PRAGMA probes run on a deadline-bounded
-                    // worker thread. On timeout the doctor records a `timeout` check
-                    // (with the in-flight phase) and continues, so a wedged database
-                    // can no longer hold the entire doctor run hostage with zero
-                    // stdout output.
+                    // #287: row counts and eligible small-archive PRAGMAs run on a
+                    // deadline-bounded worker. Known-large full-page integrity
+                    // PRAGMAs are deferred before execution because a thread timeout
+                    // cannot cancel FrankenSQLite's synchronous PRAGMA executor.
                     let probe_timeout = doctor_archive_db_probe_hard_timeout();
                     match run_bounded_doctor_archive_db_probe(conn, &db_path, probe_timeout) {
                         DoctorBoundedArchiveDbProbeOutcome::Completed(probe) => {
-                            if let (Some(conv_count), Some(msg_count), Some(integrity_probe)) =
-                                (probe.conv_count, probe.msg_count, probe.integrity)
+                            if let (Some(conv_count), Some(msg_count)) =
+                                (probe.conv_count, probe.msg_count)
                             {
                                 db_conversations = Some(conv_count.max(0) as usize);
                                 db_messages = Some(msg_count.max(0) as usize);
-                                match integrity_probe {
-                                    Ok(integrity) if integrity.is_ok() => {
-                                        storage_attestation_check_depth = Some("integrity_check");
-                                        db_ok = true;
-                                        add_check!(
-                                            "database",
-                                            "pass",
-                                            format!(
-                                                "Database OK ({} conversations, {} messages)",
-                                                conv_count, msg_count
-                                            ),
-                                            false
-                                        );
-
-                                        // Check whether the FTS table is visible through
-                                        // frankensqlite on this connection. Do not auto-register
-                                        // it here: on migrated databases with legacy rootpage=0
-                                        // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
-                                        // can persist duplicate sqlite_master rows.
-                                        match probe.fts_state {
-                                            Some(
-                                                DoctorFtsTableState::QueryableViaFrankensqlite,
-                                            ) => {
-                                                add_check!(
-                                                    "fts_table",
-                                                    "pass",
-                                                    "FTS search table (fts_messages) is queryable via frankensqlite",
-                                                    false
-                                                );
-                                            }
-                                            Some(DoctorFtsTableState::PartialParity {
-                                                indexable_messages,
-                                                indexed_messages,
-                                            }) => {
-                                                // #355: a queryable-but-partial shadow previously
-                                                // reported `pass` here while `index --full` failed
-                                                // on it. Lexical search still works via Tantivy,
-                                                // so this warns rather than fails.
-                                                add_check!(
-                                                    "fts_table",
-                                                    "warn",
-                                                    format!(
-                                                        "Database-resident FTS shadow is queryable but out of parity with the canonical archive ({indexed_messages} indexed vs {indexable_messages} indexable messages); run `cass doctor --rebuild-canonical-fts --yes` to catch it up. Small drift during an active index run is transient — re-check after it completes"
-                                                    ),
-                                                    false
-                                                );
-                                            }
-                                            Some(DoctorFtsTableState::Missing {
-                                                frankensqlite_error,
-                                            }) => {
-                                                // An absent in-DB FTS shadow is benign
-                                                // here (lexical search falls back to
-                                                // Tantivy), so it does NOT feed the
-                                                // storage_state derivation — doctor
-                                                // reports it as a `pass` below.
-                                                add_check!(
-                                                    "fts_table",
-                                                    "pass",
-                                                    format!(
-                                                        "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
-                                                    ),
-                                                    false
-                                                );
-                                            }
-                                            Some(DoctorFtsTableState::ShadowCorrupt {
-                                                frankensqlite_error,
-                                            }) => {
-                                                // A queryable table whose docsize shadow
-                                                // cannot be counted is the #362/#368
-                                                // corruption class — previously buried
-                                                // inside a `pass` message
-                                                // (adversarial-review F6). Lexical
-                                                // search still works via Tantivy, so
-                                                // warn rather than fail.
-                                                add_check!(
-                                                    "fts_table",
-                                                    "warn",
-                                                    format!(
-                                                        "Database-resident FTS shadow is queryable but its docsize shadow table failed to count ({frankensqlite_error}); the shadow structure is likely corrupt — run `cass doctor --rebuild-canonical-fts --yes` to rebuild it. Lexical search continues via the Tantivy index"
-                                                    ),
-                                                    false
-                                                );
-                                            }
-                                            None => {}
+                                if let Some(reason) = probe.integrity_skipped_reason {
+                                    storage_integrity_skipped_reason = Some(reason.clone());
+                                    add_check!(
+                                        "fts_table",
+                                        "warn",
+                                        format!(
+                                            "Database-resident FTS parity probe was intentionally deferred because it performs additional archive-wide counts; {reason}. The Tantivy lexical index is checked separately."
+                                        ),
+                                        false
+                                    );
+                                    match matching_cached_integrity_attestation.as_ref() {
+                                        Some(attestation)
+                                            if attestation.verdict
+                                                == crate::search::storage_integrity::IntegrityAttestationVerdict::Pass =>
+                                        {
+                                            db_ok = true;
+                                            add_check!(
+                                                "database",
+                                                "pass",
+                                                format!(
+                                                    "Database opened and bounded row counts succeeded ({conv_count} conversations, {msg_count} messages); {reason}; structural health is supplied by a current fingerprint-matching cached {} attestation",
+                                                    attestation.check_depth
+                                                ),
+                                                false
+                                            );
+                                        }
+                                        Some(attestation) => {
+                                            storage_integrity_failed = true;
+                                            add_check!(
+                                                "database",
+                                                "fail",
+                                                format!(
+                                                    "Database opened and bounded row counts succeeded ({conv_count} conversations, {msg_count} messages), but a current fingerprint-matching cached {} attestation records structural failure; {reason}",
+                                                    attestation.check_depth
+                                                ),
+                                                true
+                                            );
+                                            needs_rebuild = true;
+                                        }
+                                        None => {
+                                            add_check!(
+                                                "database",
+                                                "warn",
+                                                format!(
+                                                    "Database opened and bounded row counts succeeded ({conv_count} conversations, {msg_count} messages), but structural integrity is unchecked; {reason}. Run a process-isolated SQLite integrity check with its own hard timeout before any archive repair."
+                                                ),
+                                                false
+                                            );
                                         }
                                     }
-                                    Ok(integrity) => {
-                                        storage_integrity_failed = true;
-                                        let failed_pragma = integrity.failed_pragma_name();
-                                        let diagnostic_summary = integrity.diagnostic_summary();
-                                        storage_attestation_check_depth = Some(failed_pragma);
-                                        storage_attestation_detail =
-                                            Some(diagnostic_summary.clone());
-                                        add_check!(
-                                            "database",
-                                            "fail",
-                                            format!(
-                                                "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages)",
-                                                diagnostic_summary, conv_count, msg_count
-                                            ),
-                                            true
-                                        );
-                                        needs_rebuild = true;
+                                } else if let Some(integrity_probe) = probe.integrity {
+                                    match integrity_probe {
+                                        Ok(integrity) if integrity.is_ok() => {
+                                            storage_attestation_check_depth =
+                                                Some("integrity_check");
+                                            db_ok = true;
+                                            add_check!(
+                                                "database",
+                                                "pass",
+                                                format!(
+                                                    "Database OK ({} conversations, {} messages)",
+                                                    conv_count, msg_count
+                                                ),
+                                                false
+                                            );
+
+                                            // Check whether the FTS table is visible through
+                                            // frankensqlite on this connection. Do not auto-register
+                                            // it here: on migrated databases with legacy rootpage=0
+                                            // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
+                                            // can persist duplicate sqlite_master rows.
+                                            match probe.fts_state {
+                                                Some(
+                                                    DoctorFtsTableState::QueryableViaFrankensqlite,
+                                                ) => {
+                                                    add_check!(
+                                                        "fts_table",
+                                                        "pass",
+                                                        "FTS search table (fts_messages) is queryable via frankensqlite",
+                                                        false
+                                                    );
+                                                }
+                                                Some(DoctorFtsTableState::PartialParity {
+                                                    indexable_messages,
+                                                    indexed_messages,
+                                                }) => {
+                                                    // #355: a queryable-but-partial shadow previously
+                                                    // reported `pass` here while `index --full` failed
+                                                    // on it. Lexical search still works via Tantivy,
+                                                    // so this warns rather than fails.
+                                                    add_check!(
+                                                        "fts_table",
+                                                        "warn",
+                                                        format!(
+                                                            "Database-resident FTS shadow is queryable but out of parity with the canonical archive ({indexed_messages} indexed vs {indexable_messages} indexable messages); run `cass doctor --rebuild-canonical-fts --yes` to catch it up. Small drift during an active index run is transient — re-check after it completes"
+                                                        ),
+                                                        false
+                                                    );
+                                                }
+                                                Some(DoctorFtsTableState::Missing {
+                                                    frankensqlite_error,
+                                                }) => {
+                                                    // An absent in-DB FTS shadow is benign
+                                                    // here (lexical search falls back to
+                                                    // Tantivy), so it does NOT feed the
+                                                    // storage_state derivation — doctor
+                                                    // reports it as a `pass` below.
+                                                    add_check!(
+                                                        "fts_table",
+                                                        "pass",
+                                                        format!(
+                                                            "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
+                                                        ),
+                                                        false
+                                                    );
+                                                }
+                                                Some(DoctorFtsTableState::ShadowCorrupt {
+                                                    frankensqlite_error,
+                                                }) => {
+                                                    // A queryable table whose docsize shadow
+                                                    // cannot be counted is the #362/#368
+                                                    // corruption class — previously buried
+                                                    // inside a `pass` message
+                                                    // (adversarial-review F6). Lexical
+                                                    // search still works via Tantivy, so
+                                                    // warn rather than fail.
+                                                    add_check!(
+                                                        "fts_table",
+                                                        "warn",
+                                                        format!(
+                                                            "Database-resident FTS shadow is queryable but its docsize shadow table failed to count ({frankensqlite_error}); the shadow structure is likely corrupt — run `cass doctor --rebuild-canonical-fts --yes` to rebuild it. Lexical search continues via the Tantivy index"
+                                                        ),
+                                                        false
+                                                    );
+                                                }
+                                                None => {}
+                                            }
+                                        }
+                                        Ok(integrity) => {
+                                            storage_integrity_failed = true;
+                                            let failed_pragma = integrity.failed_pragma_name();
+                                            let diagnostic_summary = integrity.diagnostic_summary();
+                                            storage_attestation_check_depth = Some(failed_pragma);
+                                            storage_attestation_detail =
+                                                Some(diagnostic_summary.clone());
+                                            add_check!(
+                                                "database",
+                                                "fail",
+                                                format!(
+                                                    "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages)",
+                                                    diagnostic_summary, conv_count, msg_count
+                                                ),
+                                                true
+                                            );
+                                            needs_rebuild = true;
+                                        }
+                                        Err(err) => {
+                                            storage_integrity_unverified = true;
+                                            add_check!(
+                                                "database",
+                                                "fail",
+                                                format!(
+                                                    "Database health probe failed via frankensqlite: {err}"
+                                                ),
+                                                true
+                                            );
+                                            needs_rebuild = true;
+                                        }
                                     }
-                                    Err(err) => {
-                                        storage_integrity_unverified = true;
-                                        add_check!(
-                                            "database",
-                                            "fail",
-                                            format!(
-                                                "Database health probe failed via frankensqlite: {err}"
-                                            ),
-                                            true
-                                        );
-                                        needs_rebuild = true;
-                                    }
+                                } else {
+                                    storage_integrity_unverified = true;
+                                    add_check!(
+                                        "database",
+                                        "fail",
+                                        "Database row counts completed but no integrity verdict was returned",
+                                        true
+                                    );
+                                    needs_rebuild = true;
                                 }
                             } else {
                                 storage_integrity_unverified = true;
@@ -78040,6 +78673,40 @@ pub(crate) fn run_doctor_impl(
         DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
         vec!["archive DB open, row counts, and integrity-style checks completed or were skipped by state".to_string()],
     );
+    // This predicate means only that canonical rows may be consumed without
+    // modifying the archive.  It deliberately includes a large archive whose
+    // bounded counts succeeded while deep PRAGMAs were deferred, but excludes
+    // any current cached FAIL attestation.  Keep `db_ok` for claims that
+    // structural health itself was actually attested.
+    let archive_queryable_for_non_destructive_derived_rebuild =
+        doctor_archive_queryable_for_non_destructive_derived_rebuild(
+            db_ok,
+            db_conversations.is_some() && db_messages.is_some(),
+            storage_integrity_skipped_reason.is_some(),
+            matching_cached_integrity_attestation.as_ref().is_some_and(|attestation| {
+                attestation.verdict
+                    == crate::search::storage_integrity::IntegrityAttestationVerdict::Fail
+            }),
+        );
+    // Canonical replacement needs affirmative evidence; negating
+    // `archive_queryable...` would incorrectly turn timeout/busy/unknown into
+    // permission to replace precious bytes.
+    let canonical_candidate_replacement_authorized =
+        doctor_canonical_candidate_replacement_authorized(
+            db_path.exists(),
+            not_initialized,
+            storage_integrity_failed,
+        );
+    let archive_wide_collectors_deferred_reason =
+        doctor_archive_wide_collectors_deferred_reason(
+            storage_integrity_skipped_reason.as_deref(),
+            storage_probe_timed_out,
+            storage_db_open_failed,
+            storage_integrity_unverified,
+            storage_integrity_failed,
+            dedicated_storage_probe.busy_or_locked,
+        );
+    let archive_wide_collectors_complete = archive_wide_collectors_deferred_reason.is_none();
 
     // 4. Check Tantivy index exists and is readable
     let lexical_probe_started = Instant::now();
@@ -78055,11 +78722,11 @@ pub(crate) fn run_doctor_impl(
                 );
 
                 // Check if index is empty but database has data. #287: reuse the
-                // message count from the bounded archive-DB probe above (db_ok
-                // implies it succeeded) instead of re-opening the database and
-                // running another unbounded COUNT on the main thread.
+                // message count from the bounded archive-DB probe above instead
+                // of re-opening the database and running another unbounded
+                // COUNT on the main thread.
                 if num_docs == 0
-                    && db_ok
+                    && archive_queryable_for_non_destructive_derived_rebuild
                     && let Some(msg_count) = db_messages.filter(|&count| count > 0)
                 {
                     storage_lexical_index_drifted = true;
@@ -78118,8 +78785,9 @@ pub(crate) fn run_doctor_impl(
     // remains separate because a missing in-DB shadow is a benign fallback.
     let storage_integrity_report = {
         use crate::search::storage_integrity::{
-            DoctorStorageSignals, StorageCheck, apply_dedicated_storage_probe,
-            build_doctor_storage_integrity,
+            ArchiveReadability, DoctorStorageSignals, IntegrityAttestationVerdict, StorageCheck,
+            StorageCheckNotAttempted, StorageIntegrityReport, StorageState,
+            apply_dedicated_storage_probe, build_doctor_storage_integrity,
         };
         let db_file_present = db_path.exists();
         let db_elapsed_ms = archive_db_probe_started.elapsed().as_millis() as i64;
@@ -78134,6 +78802,8 @@ pub(crate) fn run_doctor_impl(
             storage_checks.push(StorageCheck::skipped("archive_integrity", reason));
         } else if storage_probe_timed_out {
             storage_checks.push(StorageCheck::timed_out("archive_integrity", db_elapsed_ms));
+        } else if let Some(reason) = storage_integrity_skipped_reason.as_deref() {
+            storage_checks.push(StorageCheck::skipped("archive_integrity", reason));
         } else {
             storage_checks.push(StorageCheck::ran("archive_integrity", db_elapsed_ms));
         }
@@ -78181,10 +78851,47 @@ pub(crate) fn run_doctor_impl(
         if fix_can_mutate && let Some(attestation) = live_attestation.as_ref() {
             crate::search::storage_integrity::persist_integrity_attestation(&data_dir, attestation);
         }
-        let mut report = apply_dedicated_storage_probe(
-            build_doctor_storage_integrity(signals, storage_checks),
-            dedicated_storage_probe,
-        );
+        let base_report = if let Some(reason) = storage_integrity_skipped_reason.as_deref() {
+            let (state, readability) = match matching_cached_integrity_attestation
+                .as_ref()
+                .map(|attestation| attestation.verdict)
+            {
+                Some(IntegrityAttestationVerdict::Pass) if storage_lexical_index_drifted => (
+                    StorageState::DerivedOnlyDrift,
+                    ArchiveReadability::Readable,
+                ),
+                Some(IntegrityAttestationVerdict::Pass) => {
+                    (StorageState::Ok, ArchiveReadability::Readable)
+                }
+                Some(IntegrityAttestationVerdict::Fail) => (
+                    StorageState::IntegrityFailed,
+                    ArchiveReadability::PartiallyReadable,
+                ),
+                None => (StorageState::Unchecked, ArchiveReadability::Readable),
+            };
+            let mut report = StorageIntegrityReport::derive(state, readability, storage_checks);
+            if let Some(attestation) = matching_cached_integrity_attestation.as_ref() {
+                report.attestation_source = Some("cached".to_string());
+                report.attestation_check_depth = Some(attestation.check_depth.clone());
+                report.attested_at_ms = Some(attestation.checked_at_ms);
+                report.attested_db_fingerprint = Some(
+                    crate::search::storage_integrity::integrity_attestation_fingerprint(
+                        attestation,
+                    ),
+                );
+            } else {
+                report.attestation_source = Some("none".to_string());
+                report.checks_not_attempted.push(StorageCheckNotAttempted {
+                    name: "quick_check".to_string(),
+                    reason: reason.to_string(),
+                });
+            }
+            report
+        } else {
+            build_doctor_storage_integrity(signals, storage_checks)
+        };
+        let mut report =
+            apply_dedicated_storage_probe(base_report, dedicated_storage_probe);
         if let Some(attestation) = live_attestation {
             report.attestation_source = Some("live".to_string());
             report.attestation_check_depth = Some(attestation.check_depth.clone());
@@ -78290,7 +78997,12 @@ pub(crate) fn run_doctor_impl(
     }
 
     let source_inventory_started = Instant::now();
-    let source_inventory = collect_doctor_source_inventory(&data_dir, &db_path);
+    let source_inventory = if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref()
+    {
+        doctor_source_inventory_deferred(reason)
+    } else {
+        collect_doctor_source_inventory(&data_dir, &db_path)
+    };
     doctor_push_timing_span(
         &mut timing_spans,
         "source_ledger_scan",
@@ -78298,10 +79010,12 @@ pub(crate) fn run_doctor_impl(
         "source_ledger_scan",
         source_inventory_started,
         DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
-        vec![
+        vec![if archive_wide_collectors_complete {
             "source ledger and visible provider roots were scanned with bounded reporting"
-                .to_string(),
-        ],
+                .to_string()
+        } else {
+            "archive-wide source ledger scan was explicitly deferred".to_string()
+        }],
     );
     if let Some(error) = source_inventory.db_query_error.as_deref() {
         add_check!(
@@ -78344,8 +79058,16 @@ pub(crate) fn run_doctor_impl(
     }
 
     let remote_source_sync_started = Instant::now();
-    let remote_source_sync =
+    let mut remote_source_sync =
         collect_doctor_remote_source_sync_report(&data_dir, &sources_path, &source_inventory);
+    if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref() {
+        remote_source_sync.status = "deferred".to_string();
+        remote_source_sync.remote_source_state = "unknown".to_string();
+        remote_source_sync
+            .notes
+            .push("Archive-derived remote counts are unknown because archive-wide collectors were deferred; configuration-only observations are not coverage evidence.".to_string());
+        remote_source_sync.notes.push(reason.to_string());
+    }
     doctor_push_timing_span(
         &mut timing_spans,
         "remote_source_sync",
@@ -78358,7 +79080,16 @@ pub(crate) fn run_doctor_impl(
                 .to_string(),
         ],
     );
-    if let Some(error) = remote_source_sync.config_error.as_deref() {
+    if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref() {
+        add_check!(
+            "remote_source_sync",
+            "warn",
+            format!(
+                "Remote source configuration was inspected, but archive reconciliation is unchecked; {reason}"
+            ),
+            false
+        );
+    } else if let Some(error) = remote_source_sync.config_error.as_deref() {
         add_check!(
             "remote_source_sync",
             "warn",
@@ -78410,7 +79141,16 @@ pub(crate) fn run_doctor_impl(
     );
     let raw_mirror_backfill_started = Instant::now();
     let raw_mirror_backfill =
-        collect_doctor_raw_mirror_backfill_report(&data_dir, &db_path, &raw_mirror, fix_can_mutate);
+        if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref() {
+            doctor_raw_mirror_backfill_deferred(fix_can_mutate, reason)
+        } else {
+            collect_doctor_raw_mirror_backfill_report(
+                &data_dir,
+                &db_path,
+                &raw_mirror,
+                fix_can_mutate,
+            )
+        };
     let raw_mirror_backfill_applied =
         matches!(raw_mirror_backfill.status.as_str(), "applied" | "partial")
             && (raw_mirror_backfill.captured_live_source_count > 0
@@ -78431,7 +79171,9 @@ pub(crate) fn run_doctor_impl(
         "raw_mirror_backfill",
         raw_mirror_backfill_started,
         DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
-        vec![if raw_mirror_backfill_applied {
+        vec![if !archive_wide_collectors_complete {
+            "archive-wide raw mirror backfill scan was explicitly deferred".to_string()
+        } else if raw_mirror_backfill_applied {
             "raw mirror backfill applied and raw mirror summary was refreshed".to_string()
         } else {
             "raw mirror backfill plan was evaluated without provider source mutation".to_string()
@@ -78497,6 +79239,13 @@ pub(crate) fn run_doctor_impl(
     let backfill_fix_applied = raw_mirror_backfill_applied;
     let (backfill_check_status, backfill_check_message) = match raw_mirror_backfill.status.as_str()
     {
+        "deferred" => (
+            "warn",
+            raw_mirror_backfill
+                .db_query_error
+                .clone()
+                .unwrap_or_else(|| "archive_wide_collectors_deferred".to_string()),
+        ),
         "skipped" => (
             "pass",
             "Raw mirror backfill skipped until archive rows exist".to_string(),
@@ -78563,15 +79312,44 @@ pub(crate) fn run_doctor_impl(
         fix_available: backfill_fix_available,
         fix_applied: backfill_fix_applied,
     });
-    let sole_copy_warnings = build_doctor_sole_copy_warnings(&raw_mirror_backfill);
-    let coverage_summary = build_doctor_coverage_summary(
-        &source_inventory,
-        &raw_mirror,
-        &raw_mirror_backfill,
-        &sole_copy_warnings,
-    );
-    let coverage_risk = doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len());
-    if !sole_copy_warnings.is_empty() {
+    let sole_copy_warnings = if archive_wide_collectors_complete {
+        build_doctor_sole_copy_warnings(&raw_mirror_backfill)
+    } else {
+        Vec::new()
+    };
+    let coverage_summary =
+        if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref() {
+            doctor_coverage_summary_deferred(
+                db_conversations,
+                db_messages,
+                raw_mirror.summary.manifest_count,
+                reason,
+            )
+        } else {
+            build_doctor_coverage_summary(
+                &source_inventory,
+                &raw_mirror,
+                &raw_mirror_backfill,
+                &sole_copy_warnings,
+            )
+        };
+    let coverage_risk = if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref() {
+        let mut risk = doctor_fast_coverage_risk_unchecked(db_path.exists());
+        risk.recommended_action = format!(
+            "{reason}. Run process-isolated archive coverage probes before archive repair."
+        );
+        risk
+    } else {
+        doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len())
+    };
+    if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref() {
+        add_check!(
+            "source_coverage",
+            "warn",
+            format!("Source coverage is unchecked; {reason}"),
+            false
+        );
+    } else if !sole_copy_warnings.is_empty() {
         add_check!(
             "source_coverage",
             "warn",
@@ -78606,8 +79384,15 @@ pub(crate) fn run_doctor_impl(
         );
     }
     let source_authority_started = Instant::now();
-    let source_authority =
-        build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
+    let source_authority = {
+        let report =
+            build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
+        if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref() {
+            doctor_refuse_source_authority_when_collectors_deferred(report, reason)
+        } else {
+            report
+        }
+    };
     doctor_push_timing_span(
         &mut timing_spans,
         "source_authority",
@@ -78617,13 +79402,22 @@ pub(crate) fn run_doctor_impl(
         DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
         vec!["source-authority matrix selected or rejected repair authorities".to_string()],
     );
+    if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref() {
+        add_check!(
+            "source_authority",
+            "warn",
+            format!("No archive repair authority was selected; {reason}"),
+            false
+        );
+    }
     let candidate_staging_started = Instant::now();
     let mut candidate_staging =
         collect_doctor_candidate_staging_report(&data_dir, &db_path, &index_path);
-    if candidate_staging.total_candidate_count == 0
+    if archive_wide_collectors_complete
+        && candidate_staging.total_candidate_count == 0
         && doctor_candidate_build_should_run(
             fix_can_mutate,
-            db_ok,
+            archive_queryable_for_non_destructive_derived_rebuild,
             needs_rebuild,
             &coverage_risk,
             &source_authority,
@@ -78710,9 +79504,10 @@ pub(crate) fn run_doctor_impl(
         status: candidate_check_status.to_string(),
         message: candidate_check_message,
         fix_available: candidate_staging.total_candidate_count == 0
+            && archive_wide_collectors_complete
             && doctor_candidate_build_should_run(
                 !fix && operation_state.mutating_doctor_allowed,
-                db_ok,
+                archive_queryable_for_non_destructive_derived_rebuild,
                 needs_rebuild,
                 &coverage_risk,
                 &source_authority,
@@ -78735,7 +79530,7 @@ pub(crate) fn run_doctor_impl(
     }
     let suppress_legacy_rebuild_for_verified_candidate = needs_rebuild
         && fix_can_mutate
-        && !db_ok
+        && !archive_queryable_for_non_destructive_derived_rebuild
         && candidate_staging
             .latest_build
             .as_ref()
@@ -78779,7 +79574,7 @@ pub(crate) fn run_doctor_impl(
     let derived_semantic_assets = doctor_build_derived_semantic_asset_report(
         &data_dir,
         &readiness_snapshot,
-        db_ok,
+        archive_queryable_for_non_destructive_derived_rebuild,
         semantic_probe_duration_ms,
     );
     let semantic_status = readiness_snapshot
@@ -78816,6 +79611,9 @@ pub(crate) fn run_doctor_impl(
             &initial_failure_marker,
             needs_rebuild,
             db_ok,
+            archive_queryable_for_non_destructive_derived_rebuild,
+            canonical_candidate_replacement_authorized,
+            archive_wide_collectors_complete,
             db_messages,
             &raw_mirror_backfill,
             &coverage_summary,
@@ -79007,13 +79805,64 @@ pub(crate) fn run_doctor_impl(
         }
     }
 
-    let candidate_promotion_apply_requested = repair_plan.as_ref().is_some_and(|plan| {
+    let candidate_promotion_plan_requested = repair_plan.as_ref().is_some_and(|plan| {
         plan.apply_authorized
             && doctor_repair_plan_has_action(
                 plan,
                 DOCTOR_REPAIR_ACTION_PROMOTE_RECONSTRUCT_CANDIDATE,
             )
     });
+    // Defense in depth: even a malformed/stale plan object must satisfy all
+    // live replacement-authority gates again immediately before mutation.
+    let candidate_promotion_live_blocker = if archive_queryable_for_non_destructive_derived_rebuild
+    {
+        Some((
+            "canonical-archive-queryable",
+            "candidate promotion refused because bounded canonical archive reads succeeded; deferred deep integrity is not replacement authority",
+        ))
+    } else if !canonical_candidate_replacement_authorized {
+        Some((
+            "canonical-archive-failure-unproven",
+            "candidate promotion refused because no affirmative current integrity failure or absent canonical DB authorizes replacement",
+        ))
+    } else if !archive_wide_collectors_complete {
+        Some((
+            "archive-authority-collectors-unchecked",
+            "candidate promotion refused because archive-wide coverage and source-authority collectors are unchecked",
+        ))
+    } else {
+        None
+    };
+    let candidate_promotion_blocked_live =
+        candidate_promotion_plan_requested && candidate_promotion_live_blocker.is_some();
+    if candidate_promotion_blocked_live {
+        fix_can_mutate = false;
+        if let Some(plan) = repair_plan.as_mut() {
+            plan.apply_authorized = false;
+            plan.will_mutate = false;
+            plan.approval_status = "blocked".to_string();
+            let (code, reason) = candidate_promotion_live_blocker
+                .expect("live blocker must exist when candidate promotion is blocked");
+            doctor_repair_push_blocker(
+                &mut plan.blocked_reasons,
+                &mut plan.branchable_blocker_codes,
+                code,
+                reason.to_string(),
+            );
+        }
+        checks.push(Check {
+            name: "candidate_promotion".to_string(),
+            status: "fail".to_string(),
+            message: candidate_promotion_live_blocker
+                .map(|(_, reason)| reason)
+                .unwrap_or("candidate promotion refused by live safety gates")
+                .to_string(),
+            fix_available: false,
+            fix_applied: false,
+        });
+    }
+    let candidate_promotion_apply_requested = candidate_promotion_plan_requested
+        && !candidate_promotion_blocked_live;
     let candidate_promotion_started = Instant::now();
     if candidate_promotion_apply_requested && fix_can_mutate {
         let candidate_promotion_rebuild_planned = repair_plan.as_ref().is_some_and(|plan| {
@@ -79228,10 +80077,26 @@ pub(crate) fn run_doctor_impl(
         }],
     );
 
+    // Promotion may have replaced and re-probed the live archive after the
+    // candidate-planning snapshot above, so refresh this routing predicate
+    // before choosing a repair implementation.
+    let archive_queryable_for_non_destructive_derived_rebuild =
+        doctor_archive_queryable_for_non_destructive_derived_rebuild(
+            db_ok,
+            db_conversations.is_some() && db_messages.is_some(),
+            storage_integrity_skipped_reason.is_some(),
+            matching_cached_integrity_attestation.as_ref().is_some_and(|attestation| {
+                attestation.verdict
+                    == crate::search::storage_integrity::IntegrityAttestationVerdict::Fail
+            }),
+        );
+
     // Apply fix: rebuild index if needed (only when --fix is passed)
     let derived_rebuild_started = Instant::now();
-    let safe_auto_archive_rebuild_refused =
-        safe_auto_run_requested && needs_rebuild && fix_can_mutate && !db_ok;
+    let safe_auto_archive_rebuild_refused = safe_auto_run_requested
+        && needs_rebuild
+        && fix_can_mutate
+        && !archive_queryable_for_non_destructive_derived_rebuild;
     if safe_auto_archive_rebuild_refused {
         checks.push(Check {
             name: "safe_auto_archive_rebuild".to_string(),
@@ -79241,8 +80106,29 @@ pub(crate) fn run_doctor_impl(
             fix_applied: false,
         });
     }
-    let derived_rebuild_attempted =
-        needs_rebuild && fix_can_mutate && !safe_auto_archive_rebuild_refused;
+    let archive_rebuild_authority_refused = needs_rebuild
+        && fix_can_mutate
+        && !archive_queryable_for_non_destructive_derived_rebuild
+        && (!canonical_candidate_replacement_authorized || !archive_wide_collectors_complete);
+    if archive_rebuild_authority_refused {
+        let reason = if !canonical_candidate_replacement_authorized {
+            "canonical archive replacement has no affirmative failure/absence evidence"
+        } else {
+            "archive-wide coverage and source-authority collectors are unchecked"
+        };
+        add_check!(
+            "archive_rebuild_authority",
+            "warn",
+            format!(
+                "Archive move/replacement and source-session rebuild were refused: {reason}; timeout, busy, unverified, and deferred states preserve canonical bytes"
+            ),
+            false
+        );
+    }
+    let derived_rebuild_attempted = needs_rebuild
+        && fix_can_mutate
+        && !safe_auto_archive_rebuild_refused
+        && !archive_rebuild_authority_refused;
     if derived_rebuild_attempted {
         let stderr_is_tty = std::io::stderr().is_terminal();
         let is_robot = output_format.is_some();
@@ -79258,7 +80144,11 @@ pub(crate) fn run_doctor_impl(
         }
 
         let progress = std::sync::Arc::new(indexer::IndexingProgress::default());
-        let rebuild_from_db = db_ok && db_messages.unwrap_or(0) > 0;
+        // A deferred deep integrity probe is not a corruption verdict.  If
+        // bounded row counts succeeded and no current cached attestation says
+        // FAIL, a derived-only Tantivy rebuild may read the canonical archive;
+        // it must never fall through to the branch that moves/replaces it.
+        let rebuild_from_db = archive_queryable_for_non_destructive_derived_rebuild;
 
         if rebuild_from_db {
             let total_convs = db_conversations.unwrap_or(0);
@@ -79799,7 +80689,7 @@ pub(crate) fn run_doctor_impl(
         fs_mutation_receipts: &fs_mutation_receipts,
         operation_state: &operation_state,
         needs_rebuild,
-        db_ok,
+        archive_queryable_for_non_destructive_derived_rebuild,
         db_messages,
         event_log_reference: safe_auto_event_log_reference,
     });
