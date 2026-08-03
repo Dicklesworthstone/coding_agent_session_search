@@ -93,6 +93,19 @@ fn is_fts5_oversized_leaf_error(err: &anyhow::Error) -> bool {
         || (rendered.contains("corrupt %_data record") && rendered.contains("segment leaf"))
 }
 
+/// #368 defect 3: does this error indicate the FTS5 `%_data` shadow structure
+/// is corrupt enough to fail an ordinary open during the schema reload (e.g.
+/// "structure segment count exceeds FTS5 maximum")? Such an archive can't be
+/// opened normally to repair it, but CAN be opened with FTS5 hydration deferred
+/// and then rebuilt by dropping + recreating the shadow from canonical. The
+/// oversized-*leaf* (gh#369) shape is excluded — that is a content-dependent
+/// write-time engine limitation with its own reassuring diagnostic, not a
+/// persisted open-blocking corruption.
+fn is_fts5_shadow_open_corruption_error(err: &anyhow::Error) -> bool {
+    let rendered = format!("{err:#}");
+    rendered.contains("corrupt %_data record") && !is_fts5_oversized_leaf_error(err)
+}
+
 /// The distinct, non-alarming diagnostic for the GH #369 oversized-leaf case:
 /// canonical rows and the Tantivy index are intact and fully serve search; only
 /// the optional SQLite-side FTS5 shadow cannot be materialized for this corpus.
@@ -472,23 +485,85 @@ pub fn run_doctor_rebuild_canonical_fts(
         ));
     }
 
-    let storage = if dry_run {
+    let storage_open = if dry_run {
         FrankenStorage::open_readonly(&db_path)
     } else {
         FrankenStorage::open_existing_schema_only_for_fts_repair(&db_path)
-    }
-    .map_err(|e| {
-        storage_error(
-            format!(
-                "could not open canonical archive {} for FTS5 inspection: {e:#}",
-                db_path.display()
-            ),
-            Some(
-                "If the archive cannot be opened at all, the canonical rows are unreadable — use \
-                 'cass doctor --recover-from-archive <DIR>' to rebuild the source tree instead.",
-            ),
-        )
-    })?;
+    };
+    let storage = match storage_open {
+        Ok(storage) => storage,
+        // #368 defect 3: the FTS5 shadow structure is corrupt enough that the
+        // archive cannot be opened normally (the schema reload decodes the
+        // corrupt %_data). Open with FTS5 hydration DEFERRED and rebuild the
+        // shadow by dropping + recreating it from canonical rows — the shadow is
+        // fully derived and canonical rows are never touched.
+        Err(open_err) if is_fts5_shadow_open_corruption_error(&open_err) => {
+            let deferred = FrankenStorage::open_deferred_fts5_for_repair(&db_path).map_err(|e| {
+                storage_error(
+                    format!(
+                        "opening canonical archive {} with deferred FTS5 validation for corrupt-shadow repair: {e:#}",
+                        db_path.display()
+                    ),
+                    Some("Preserve the archive bundle and run 'cass doctor check --json'."),
+                )
+            })?;
+            let canonical = deferred
+                .inspect_search_fallback_fts_parity()
+                .map(|parity| parity.canonical_messages)
+                .unwrap_or(0);
+            if dry_run {
+                let envelope = serde_json::json!({
+                    "surface": "doctor_rebuild_canonical_fts_dry_run",
+                    "status": "shadow_structure_corrupt",
+                    "planned_action": "drop_recreate_rebuild_from_canonical",
+                    "canonical_messages": canonical,
+                    "detail": format!("{open_err:#}"),
+                });
+                if structured_format.is_some() {
+                    print_json(&envelope)?;
+                } else {
+                    println!(
+                        "Canonical FTS5 dry-run: status=shadow_structure_corrupt, planned_action=drop_recreate_rebuild_from_canonical, canonical={canonical}"
+                    );
+                }
+                return Ok(());
+            }
+            let inserted = deferred
+                .rebuild_fts_shadow_via_drop_recreate()
+                .map_err(|e| {
+                    storage_error(
+                        format!("rebuilding corrupt canonical FTS5 shadow via drop+recreate: {e:#}"),
+                        Some("Preserve the archive bundle and run 'cass doctor check --json'."),
+                    )
+                })?;
+            let envelope = serde_json::json!({
+                "surface": "doctor_rebuild_canonical_fts",
+                "status": "rebuilt_from_corrupt_shadow",
+                "method": "drop_recreate_rebuild_from_canonical",
+                "inserted_messages": inserted,
+            });
+            if structured_format.is_some() {
+                print_json(&envelope)?;
+            } else {
+                println!(
+                    "Canonical FTS5 shadow was structurally corrupt; dropped, recreated, and rebuilt {inserted} message(s) from canonical rows."
+                );
+            }
+            return Ok(());
+        }
+        Err(open_err) => {
+            return Err(storage_error(
+                format!(
+                    "could not open canonical archive {} for FTS5 inspection: {open_err:#}",
+                    db_path.display()
+                ),
+                Some(
+                    "If the archive cannot be opened at all, the canonical rows are unreadable — use \
+                     'cass doctor --recover-from-archive <DIR>' to rebuild the source tree instead.",
+                ),
+            ));
+        }
+    };
     let before = storage.inspect_search_fallback_fts_parity().map_err(|e| {
         storage_error(
             format!("inspecting canonical/FTS5 row parity: {e:#}"),

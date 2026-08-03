@@ -4159,6 +4159,31 @@ impl FrankenStorage {
         Ok(storage)
     }
 
+    /// #368 defect 3: open an archive for FTS repair with FTS5 shadow
+    /// validation/hydration DEFERRED, so a database whose FTS5 `%_data` is
+    /// structurally corrupt (which fails an ordinary open during the schema
+    /// reload) can still be opened to drop+recreate the corrupt shadow. FTS5
+    /// queries on this connection see an empty index until the shadow is
+    /// rebuilt — it is for repair only (see `rebuild_fts_shadow_via_drop_recreate`).
+    pub(crate) fn open_deferred_fts5_for_repair(path: &Path) -> Result<Self> {
+        let path_str = path.to_string_lossy().to_string();
+        let _doctor_guard =
+            acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
+        let conn =
+            FrankenConnection::open_existing_schema_only_deferred_fts5(&path_str).with_context(
+                || {
+                    format!(
+                        "opening frankensqlite db with deferred FTS5 validation for corrupt-shadow repair at {}",
+                        path.display()
+                    )
+                },
+            )?;
+        let storage = Self::new(conn, path.to_path_buf());
+        storage.apply_open_stage_busy_timeout();
+        storage.apply_config()?;
+        Ok(storage)
+    }
+
     /// Open a writer connection that skips migration (assumes DB already migrated).
     ///
     /// Used by the BEGIN CONCURRENT parallel writer pool: each writer needs its
@@ -11350,6 +11375,67 @@ impl FrankenStorage {
                 before.indexed_messages.unwrap_or_default(),
                 before.indexable_messages
             ),
+        }
+    }
+
+    /// #368 defect 3: rebuild the canonical FTS5 shadow by DROPPING the
+    /// (possibly structurally corrupt) shadow and recreating it fresh from
+    /// canonical rows, rather than the DELETE-based clear in
+    /// [`Self::rebuild_fts_via_frankensqlite`], which routes through the FTS5
+    /// vtab update path and hydrates the corrupt `%_data`.
+    ///
+    /// Must be called on a connection opened via
+    /// [`Self::open_deferred_fts5_for_repair`], so the corrupt shadow was never
+    /// read at open. The FTS5 vtab's destructor is a no-op that never reads
+    /// `%_data`, and its backing shadow tables are plain, so `DROP TABLE`
+    /// removes the corrupt structure without decoding it. Canonical rows are
+    /// never modified. Failure-atomic: rolls back without publishing a partial
+    /// shadow.
+    pub(crate) fn rebuild_fts_shadow_via_drop_recreate(&self) -> Result<usize> {
+        self.invalidate_fts_messages_present_cache();
+
+        // Drop + recreate the shadow in autocommit: frankensqlite does not
+        // support recreating a virtual table in the SAME transaction as its
+        // DROP. The corrupt shadow is replaced by a fresh empty one here; the
+        // repopulate below is transactional. Full failure-atomicity (preserving
+        // the ORIGINAL) has no value in this path because the original shadow is
+        // corrupt — if the repopulate fails, the shadow is empty (not corrupt)
+        // and re-running the repair is safe, since it is fully derived from
+        // canonical rows.
+        self.conn
+            .execute("DROP TABLE IF EXISTS fts_messages")
+            .with_context(|| "dropping the corrupt FTS5 shadow before recreate")?;
+        self.conn
+            .execute_compat(FTS5_REGISTER_SQL, fparams![])
+            .with_context(|| "recreating a fresh FTS5 shadow after dropping the corrupt one")?;
+        self.set_fts_messages_present_cache(true);
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE TRANSACTION;")
+            .with_context(|| "starting the corrupt-FTS shadow repopulate transaction")?;
+        let repopulate = (|| -> Result<usize> {
+            let inserted_rows = self.stream_fts_rows_via_frankensqlite(false)?;
+            self.require_healthy_fts_parity("corrupt-FTS drop+recreate rebuild")?;
+            self.record_fts_franken_rebuild_generation()?;
+            self.conn
+                .execute_batch("COMMIT;")
+                .with_context(|| "publishing the corrupt-FTS shadow repopulate")?;
+            Ok(inserted_rows)
+        })();
+
+        match repopulate {
+            Ok(inserted_rows) => {
+                self.set_fts_messages_present_cache(true);
+                Ok(inserted_rows)
+            }
+            Err(err) => {
+                self.invalidate_fts_messages_present_cache();
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(err.context(
+                    "corrupt-FTS shadow repopulate rolled back after the shadow was dropped and \
+                     recreated empty; re-run 'cass doctor --rebuild-canonical-fts --yes' to retry",
+                ))
+            }
         }
     }
 
@@ -26591,6 +26677,98 @@ mod tests {
             )
             .unwrap();
         assert_eq!(auth_rows, 1);
+    }
+
+    #[test]
+    fn drop_recreate_repairs_corrupt_fts_shadow_structure() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("corrupt-fts.db");
+
+        // Canonical data + a valid FTS shadow.
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            let conversation = Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("corrupt-fts".into()),
+                title: Some("corrupt fts".into()),
+                source_path: PathBuf::from("/tmp/corrupt-fts.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_100),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_050),
+                    content: "authentication needle".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &conversation)
+                .unwrap();
+            storage.rebuild_fts_via_frankensqlite().unwrap();
+        }
+
+        // Corrupt the %_data structure record (rowid 10) via a fresh connection
+        // (the FTS is still valid here, so the open succeeds).
+        {
+            let conn =
+                FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let garbage = [0xFFu8; 12];
+            conn.execute_compat(
+                "UPDATE fts_messages_data SET block = ?1 WHERE id = ?2",
+                fparams![garbage.as_slice(), 10_i64],
+            )
+            .unwrap();
+        }
+
+        // #368 defect 3: an ordinary open now fails on the corrupt structure.
+        assert!(
+            SqliteStorage::open(&db_path).is_err(),
+            "ordinary open must fail on a corrupt FTS5 %_data structure record"
+        );
+
+        // The deferred-open repair drops+recreates the shadow and rebuilds it
+        // from canonical.
+        let inserted = {
+            let storage = SqliteStorage::open_deferred_fts5_for_repair(&db_path).unwrap();
+            storage
+                .rebuild_fts_shadow_via_drop_recreate()
+                .unwrap_or_else(|e| panic!("drop+recreate rebuild failed: {e:#}"))
+        };
+        assert!(
+            inserted >= 1,
+            "repair must rebuild the canonical message into the FTS shadow"
+        );
+
+        // The archive now opens normally and the rebuilt shadow is queryable.
+        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let matches: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'needle'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(matches, 1, "rebuilt FTS shadow must be queryable for 'needle'");
     }
 
     #[test]
