@@ -137,10 +137,10 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `=0.1.9` (crates.io; #95 BtCursor + #106 MVCC grow + FTS5 reload + MAX/MIN(rowid) leaf-seek fixes) |
-| `franken-agent-detection` | `a4923d4` |
-| `asupersync` | `=0.3.6` |
-| `frankensearch` | `2eaf7539` (pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308) |
+| `frankensqlite` / `fsqlite-types` | `f6a007b169ccd483f0e4e437f436d81357461718` (`0.1.19` package identity; immutable git pin carrying contentless-FTS5 reopen/catch-up, existing-only schema inspection, and canonical contentless-DDL persistence across stale duplicate repair/reopen; crates.io latest remains `0.1.18`) |
+| `franken-agent-detection` | `6d24c532` (Grok Build connector [cass #328], plus Gemini CLI JSONL discovery, ordered `$set.messages` replay, and current role normalization [cass #341]) |
+| `asupersync` | `=0.3.9` |
+| `frankensearch` | `f7fa7a02` (pure-Rust `native` feature plus architecture-safe HNSW `DistDot` normalization; frankentorch pinned by git rev inside frankensearch — cass #308, #333) |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 

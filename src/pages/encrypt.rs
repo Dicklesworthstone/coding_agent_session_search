@@ -20,6 +20,7 @@ use base64::prelude::*;
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -317,7 +318,19 @@ fn invalid_payload_file_entry(index: usize, actual: &str) -> anyhow::Error {
 }
 
 fn invalid_archive_format(detail: impl Into<String>) -> anyhow::Error {
-    DecryptError::InvalidFormat(detail.into()).into()
+    let detail = detail.into();
+    anyhow::Error::new(DecryptError::InvalidFormat(detail.clone()))
+        .context(format!("Invalid encrypted archive metadata: {detail}"))
+}
+
+fn invalid_archive_format_with_source(
+    detail: impl Into<String>,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> anyhow::Error {
+    let detail = detail.into();
+    anyhow::Error::new(source)
+        .context(DecryptError::InvalidFormat(detail.clone()))
+        .context(format!("Invalid encrypted archive metadata: {detail}"))
 }
 
 fn decode_metadata_field(field: &str, encoded: &str) -> Result<Vec<u8>> {
@@ -1522,9 +1535,134 @@ fn build_chunk_aad(export_id: &[u8; 16], chunk_index: u32) -> Vec<u8> {
 pub fn load_config<P: AsRef<Path>>(dir: P) -> Result<EncryptionConfig> {
     let archive_dir = super::resolve_site_dir(dir.as_ref())?;
     let config_path = archive_dir.join("config.json");
-    let file = File::open(&config_path).context("Failed to open config.json")?;
-    let config: EncryptionConfig = serde_json::from_reader(BufReader::new(file))?;
+    let file = File::open(&config_path).map_err(|error| {
+        invalid_archive_format_with_source("config.json is missing or unreadable", error)
+    })?;
+    let value: Value = serde_json::from_reader(BufReader::new(file)).map_err(|error| {
+        invalid_archive_format_with_source("config.json is not valid JSON", error)
+    })?;
+    validate_serialized_config_metadata(&value)?;
+    let config: EncryptionConfig = serde_json::from_value(value).map_err(|error| {
+        invalid_archive_format_with_source(
+            "config.json does not match the encrypted archive schema",
+            error,
+        )
+    })?;
     Ok(config)
+}
+
+fn validate_serialized_config_metadata(value: &Value) -> Result<()> {
+    let root = config_object(value, "config")?;
+    reject_unknown_config_fields(
+        root,
+        &[
+            "version",
+            "export_id",
+            "base_nonce",
+            "compression",
+            "kdf_defaults",
+            "payload",
+            "key_slots",
+        ],
+        "config",
+    )?;
+
+    if let Some(kdf_defaults) = root.get("kdf_defaults") {
+        let params = config_object(kdf_defaults, "kdf_defaults")?;
+        reject_unknown_config_fields(
+            params,
+            &["memory_kb", "iterations", "parallelism"],
+            "kdf_defaults",
+        )?;
+    }
+
+    if let Some(payload) = root.get("payload") {
+        let payload = config_object(payload, "payload")?;
+        reject_unknown_config_fields(
+            payload,
+            &[
+                "chunk_size",
+                "chunk_count",
+                "total_compressed_size",
+                "total_plaintext_size",
+                "files",
+            ],
+            "payload",
+        )?;
+    }
+
+    if let Some(slots) = root.get("key_slots") {
+        let slots = slots
+            .as_array()
+            .ok_or_else(|| invalid_archive_format("key_slots must be an array"))?;
+        for slot in slots {
+            let slot = config_object(slot, "key_slots")?;
+            reject_unknown_config_fields(
+                slot,
+                &[
+                    "id",
+                    "slot_type",
+                    "kdf",
+                    "salt",
+                    "wrapped_dek",
+                    "nonce",
+                    "argon2_params",
+                ],
+                "key_slots",
+            )?;
+
+            if let Some(slot_type) = slot.get("slot_type").and_then(Value::as_str)
+                && !matches!(slot_type, "password" | "recovery")
+            {
+                return Err(
+                    DecryptError::UnsupportedMetadata("key_slots.slot_type".to_string()).into(),
+                );
+            }
+            if let Some(kdf) = slot.get("kdf").and_then(Value::as_str)
+                && !matches!(kdf, "argon2id" | "hkdf-sha256")
+            {
+                return Err(
+                    DecryptError::UnsupportedMetadata("key_slots.kdf".to_string()).into(),
+                );
+            }
+            if let Some(params) = slot.get("argon2_params")
+                && !params.is_null()
+            {
+                let params = config_object(params, "key_slots.argon2_params")?;
+                reject_unknown_config_fields(
+                    params,
+                    &["memory_kb", "iterations", "parallelism"],
+                    "key_slots.argon2_params",
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn config_object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>> {
+    value
+        .as_object()
+        .ok_or_else(|| invalid_archive_format(format!("{path} must be an object")))
+}
+
+fn reject_unknown_config_fields(
+    object: &Map<String, Value>,
+    allowed: &[&str],
+    path: &str,
+) -> Result<()> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        let metadata_path = format!("{path}.{field}");
+        return Err(
+            anyhow::Error::new(DecryptError::UnsupportedMetadata(metadata_path.clone()))
+                .context(format!("config.json contains unknown field `{metadata_path}`")),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1934,6 +2072,87 @@ mod tests {
             .unwrap();
 
         assert_file_bytes(&decrypted_path, test_data);
+    }
+
+    #[test]
+    fn test_load_config_classifies_unsupported_and_malformed_metadata() -> Result<()> {
+        let (_temp_dir, output_dir, config) = encrypt_test_file();
+        let config_path = output_dir.join("config.json");
+        let mut value = serde_json::to_value(config)?;
+        value["key_slots"][0]["kdf"] = serde_json::json!("scrypt");
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&value)?)?;
+
+        let err = load_config(&output_dir)
+            .err()
+            .context("unknown KDF metadata must fail config loading")?;
+        anyhow::ensure!(
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::UnsupportedMetadata(field)) if field == "key_slots.kdf"
+            ),
+            "unexpected unknown-KDF taxonomy: {err:#}"
+        );
+
+        let (_temp_dir, output_dir, config) = encrypt_test_file();
+        let config_path = output_dir.join("config.json");
+        let mut value = serde_json::to_value(config)?;
+        value
+            .as_object_mut()
+            .context("serialized config must be an object")?
+            .insert(
+                "future_encryption_feature".to_string(),
+                serde_json::json!({"enabled": true}),
+            );
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&value)?)?;
+
+        let err = load_config(&output_dir)
+            .err()
+            .context("unknown top-level metadata must fail config loading")?;
+        anyhow::ensure!(
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::UnsupportedMetadata(field))
+                    if field == "config.future_encryption_feature"
+            ),
+            "unexpected unknown-field taxonomy: {err:#}"
+        );
+
+        let (_temp_dir, output_dir, _config) = encrypt_test_file();
+        std::fs::write(output_dir.join("config.json"), b"{not valid json")?;
+        let err = load_config(&output_dir)
+            .err()
+            .context("malformed config JSON must fail config loading")?;
+        anyhow::ensure!(
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::InvalidFormat(detail))
+                    if detail.contains("config.json is not valid JSON")
+            ),
+            "unexpected malformed-config taxonomy: {err:#}"
+        );
+
+        let (_temp_dir, output_dir, _config) = encrypt_test_file();
+        std::fs::rename(
+            output_dir.join("config.json"),
+            output_dir.join("config.json.parked"),
+        )?;
+        let err = load_config(&output_dir)
+            .err()
+            .context("missing config JSON must fail config loading")?;
+        anyhow::ensure!(
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::InvalidFormat(detail))
+                    if detail.contains("config.json is missing or unreadable")
+            ),
+            "unexpected missing-config taxonomy: {err:#}"
+        );
+        anyhow::ensure!(
+            err.downcast_ref::<std::io::Error>().is_some(),
+            "missing config must preserve the I/O source error: {err:#}"
+        );
+
+        Ok(())
     }
 
     #[test]

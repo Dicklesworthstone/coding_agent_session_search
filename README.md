@@ -3032,7 +3032,7 @@ Update check state is stored in the data directory:
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `=0.1.18` (crates.io; contentless-FTS5 reopen/catch-up support, bounded clean-page reclamation that prevents false `OutOfMemory` failures during large FTS rebuilds, fused equality-run counting for exact bounded parity checks, and the latest corruption/recovery correctness fixes [cass#345 / frankensqlite#131]) |
+| `frankensqlite` / `fsqlite-types` | `f6a007b169ccd483f0e4e437f436d81357461718` (`0.1.19` package identity; immutable git pin because crates.io latest is `0.1.18`; contentless-FTS5 reopen/catch-up support, canonical contentless-DDL persistence after stale duplicate repair, existing-only schema inspection, bounded clean-page reclamation, and fused equality-run counting [cass#345 / frankensqlite#131]) |
 | `franken-agent-detection` | `6d24c532` (Grok Build connector [cass #328], plus Gemini CLI JSONL discovery, ordered `$set.messages` replay, and current role normalization [cass #341]) |
 | `asupersync` | `=0.3.9` |
 | `frankensearch` | `f7fa7a02` (pure-Rust `native` feature plus architecture-safe HNSW `DistDot` normalization; frankentorch pinned by git rev inside frankensearch — cass #308, #333) |

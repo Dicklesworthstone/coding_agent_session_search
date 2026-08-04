@@ -64,7 +64,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "fsqlite",
         manifest_table: "dependencies",
         manifest_key: "frankensqlite",
-        source_kind: "registry",
+        source_kind: "git",
         repo_rel: "../frankensqlite",
         required_tests: &[
             STRICT_CHECK_COMMAND,
@@ -77,7 +77,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "fsqlite-types",
         manifest_table: "dev-dependencies",
         manifest_key: "fsqlite-types",
-        source_kind: "registry",
+        source_kind: "git",
         repo_rel: "../frankensqlite",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
@@ -923,9 +923,9 @@ mod tests {
         let frankensqlite_spec = dependency_spec("frankensqlite")?;
         let frankensqlite = manifest_pin(&manifest, frankensqlite_spec);
         ensure(
-            frankensqlite.status == "version-pinned",
+            frankensqlite.status == "pinned",
             format!(
-                "expected frankensqlite version-pinned, got {}",
+                "expected frankensqlite git-pinned, got {}",
                 frankensqlite.status
             ),
         )?;
@@ -935,7 +935,11 @@ mod tests {
         )?;
         ensure(
             frankensqlite.version.as_deref() == Some("=0.1.19"),
-            "frankensqlite registry version pin should match Cargo.toml",
+            "frankensqlite package version should match Cargo.toml",
+        )?;
+        ensure(
+            frankensqlite.rev.as_deref() == Some("f6a007b169ccd483f0e4e437f436d81357461718"),
+            "frankensqlite git revision should match Cargo.toml",
         )?;
 
         let asupersync = manifest_pin(&manifest, dependency_spec("asupersync")?);

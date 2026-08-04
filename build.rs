@@ -47,17 +47,18 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // crates.io-only exact pin: fsqlite 0.1.19 carries the existing-only,
+        // Immutable git pin: crates.io latest is 0.1.18, while f6a007b1 carries
+        // the 0.1.19 existing-only,
         // schema-only open lane used to keep CASS archive and doctor opens
         // bounded, in addition to the contentless-FTS5 reopen/catch-up fixes,
         // bounded clean-page reclamation (#131), and fused composite-index
-        // equality-run counter used by CASS parity checks. Together these
-        // prevent accidental archive creation, false OutOfMemory failures, and
-        // multi-hour row crossings during multi-million-row FTS rebuilds.
-        // Empty `expected_git` signals
-        // `validate_manifest_dependency_spec` to skip git/rev checks.
-        expected_git: "",
-        expected_rev: "",
+        // equality-run counter used by CASS parity checks, and preserves the
+        // canonical contentless DDL when stale duplicate schema rows are
+        // skipped. Together these prevent accidental archive creation, false
+        // OutOfMemory failures, multi-hour row crossings during multi-million-
+        // row FTS rebuilds, and post-reopen loss of newly caught-up FTS rows.
+        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
+        expected_rev: "f6a007b169ccd483f0e4e437f436d81357461718",
         expected_version: "0.1.19",
         expected_features: &["fts5"],
         expected_default_features: None,
@@ -69,13 +70,31 @@ const CONTRACTS: &[DependencyContract] = &[
     },
     DependencyContract {
         label: "frankensqlite shared types",
+        dep_table: "dependencies",
+        dep_key: "fsqlite-types",
+        crate_package_name: "fsqlite-types",
+        manifest_package_field: Some("fsqlite-types"),
+        // Same immutable source as the facade; the version requirement also
+        // verifies the checked-out package identity.
+        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
+        expected_rev: "f6a007b169ccd483f0e4e437f436d81357461718",
+        expected_version: "0.1.19",
+        expected_features: &[],
+        expected_default_features: None,
+        repo_rel: "../frankensqlite",
+        manifest_rel: "crates/fsqlite-types/Cargo.toml",
+        patch_url: Some("https://github.com/Dicklesworthstone/frankensqlite"),
+        patch_key: Some("fsqlite-types"),
+        mode: ValidationMode::StrictOptIn,
+    },
+    DependencyContract {
+        label: "frankensqlite shared types dev contract",
         dep_table: "dev-dependencies",
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // crates.io-only exact pin aligned with the frankensqlite facade at 0.1.19.
-        expected_git: "",
-        expected_rev: "",
+        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
+        expected_rev: "f6a007b169ccd483f0e4e437f436d81357461718",
         expected_version: "0.1.19",
         expected_features: &[],
         expected_default_features: None,

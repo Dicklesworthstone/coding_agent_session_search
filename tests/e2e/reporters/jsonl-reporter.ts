@@ -21,6 +21,7 @@ import {
   FullResult,
 } from '@playwright/test/reporter';
 import { execSync } from 'child_process';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -59,6 +60,17 @@ interface E2eError {
   stack?: string;
 }
 
+interface E2eAttachmentReference {
+  name: string;
+  content_type: string;
+  source: 'body' | 'path';
+  size_bytes?: number;
+  sha256?: string;
+  path_scope?: 'workspace' | 'external';
+  path_sha256?: string;
+  raw_content_stored: false;
+}
+
 interface E2eMetrics {
   duration_ms?: number;
   memory_bytes?: number;
@@ -78,7 +90,13 @@ interface E2eRunSummary {
 type E2eEvent =
   | { event: 'run_start'; env: E2eEnvironment; config?: Record<string, unknown> }
   | { event: 'test_start'; test: E2eTestInfo }
-  | { event: 'test_end'; test: E2eTestInfo; result: E2eTestResult; error?: E2eError }
+  | {
+      event: 'test_end';
+      test: E2eTestInfo;
+      result: E2eTestResult;
+      error?: E2eError;
+      attachments?: E2eAttachmentReference[];
+    }
   | { event: 'phase_start'; test: E2eTestInfo; phase: E2ePhase }
   | { event: 'phase_end'; test: E2eTestInfo; phase: E2ePhase; duration_ms: number }
   | { event: 'metrics'; test: E2eTestInfo; name: string; metrics: E2eMetrics }
@@ -112,6 +130,14 @@ function slugify(value: string): string {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
   return slug.length > 0 ? slug : 'phase';
+}
+
+function digest(value: string | Buffer): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function sanitizedDiagnostic(value: string, category: string): string {
+  return `${category}:bytes=${Buffer.byteLength(value)}:sha256=${digest(value)}`;
 }
 
 function captureEnvironment(): E2eEnvironment {
@@ -252,21 +278,70 @@ class JsonlReporter implements Reporter {
     let error: E2eError | undefined;
     if (result.error) {
       error = {
-        message: result.error.message || 'Unknown error',
+        message: sanitizedDiagnostic(
+          result.error.message || 'Unknown error',
+          'test-error-message'
+        ),
         type: 'TestError',
-        stack: result.error.stack,
+        stack: result.error.stack
+          ? sanitizedDiagnostic(result.error.stack, 'test-error-stack')
+          : undefined,
       };
     }
+
+    const attachments = this.getAttachmentReferences(result);
 
     this.writeEvent({
       event: 'test_end',
       test: this.getTestInfo(test),
       result: testResult,
       ...(error && { error }),
+      ...(attachments.length > 0 && { attachments }),
     });
 
     // Emit metrics events from attachments
     this.emitMetricsFromAttachments(test, result);
+  }
+
+  private getAttachmentReferences(result: TestResult): E2eAttachmentReference[] {
+    return result.attachments.map((attachment) => {
+      if (attachment.path) {
+        const resolved = path.resolve(attachment.path);
+        const relative = path.relative(process.cwd(), resolved);
+        const inWorkspace =
+          relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..');
+        let sizeBytes: number | undefined;
+        try {
+          sizeBytes = fs.statSync(resolved).size;
+        } catch {
+          sizeBytes = undefined;
+        }
+        return {
+          name: attachment.name,
+          content_type: attachment.contentType,
+          source: 'path',
+          size_bytes: sizeBytes,
+          path_scope: inWorkspace ? 'workspace' : 'external',
+          path_sha256: digest(resolved),
+          raw_content_stored: false,
+        };
+      }
+
+      const body =
+        typeof attachment.body === 'string'
+          ? Buffer.from(attachment.body)
+          : Buffer.isBuffer(attachment.body)
+            ? attachment.body
+            : Buffer.alloc(0);
+      return {
+        name: attachment.name,
+        content_type: attachment.contentType,
+        source: 'body',
+        size_bytes: body.byteLength,
+        sha256: digest(body),
+        raw_content_stored: false,
+      };
+    });
   }
 
   private emitMetricsFromAttachments(test: TestCase, result: TestResult): void {
