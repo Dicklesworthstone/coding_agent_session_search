@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -9,12 +9,9 @@ use frankensearch::index::{
     HNSW_DEFAULT_EF_CONSTRUCTION as FS_HNSW_DEFAULT_EF_CONSTRUCTION,
     HNSW_DEFAULT_M as FS_HNSW_DEFAULT_M, HnswConfig as FsHnswConfig, HnswIndex as FsHnswIndex,
     Quantization as FsQuantization, VectorIndex as FsVectorIndex,
-    VectorIndexWriter as FsVectorIndexWriter, wal_path_for as fsvi_wal_path_for,
+    VectorIndexWriter as FsVectorIndexWriter,
 };
-use frankensqlite::{
-    SqliteValue,
-    compat::{ConnectionExt, ParamValue, RowExt},
-};
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
@@ -29,7 +26,7 @@ use crate::model::conversation_packet::{ConversationPacket, ConversationPacketPr
 use crate::model::types::{Conversation, Message};
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::embedder::Embedder;
-use crate::search::fastembed_embedder::{FastEmbedder, MINILM_VECTOR_SPACE_REVISION};
+use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION, SemanticPolicy};
 use crate::search::semantic_manifest::{
@@ -44,44 +41,18 @@ use crate::search::vector_index::{
 };
 use crate::storage::sqlite::FrankenStorage;
 
-/// Default embedder batch size — the **maximum row count** per embed batch.
-/// 128 is a sweet spot for short messages: big enough to amortize dispatch
-/// overhead and keep the tensor kernels saturated. It is no longer the sole
-/// bound on a batch: [`DEFAULT_SEMANTIC_EMBED_BATCH_CHAR_BUDGET`] additionally
-/// caps `row_count × max_canonical_len` so a batch that happens to contain a
-/// long message holds proportionally fewer rows (cass #309).
+/// Default embedder batch size. 128 is a sweet spot for ONNX MiniLM models on
+/// modern CPUs: big enough to amortize dispatch overhead and keep the tensor
+/// kernels saturated, small enough that one batch fits comfortably in L2 and
+/// memory reservation stays bounded for large corpora.
 const DEFAULT_SEMANTIC_BATCH_SIZE: usize = 128;
-/// Default per-batch canonical-character budget for length-aware embed
-/// batching (cass #309). A fixed-size batch (128) padded to its longest member
-/// makes the ONNX embedder allocate a `batch × max_seq²` attention tensor, so a
-/// single long message in the batch blows RSS to multiple GB (#309 observed
-/// 4.7–9.9 GB on a 67 MB corpus, flat RSS + 1000–1200% CPU = ort inference, not
-/// FSVI staging). Capping `row_count × max_canonical_len ≤ this` bounds that
-/// padded working set; with `MAX_EMBED_CHARS`-capped (~2 KB) messages the worst
-/// case is ≈8 rows — the regime that embeds cleanly (<1 GB) in practice. Set
-/// `CASS_SEMANTIC_EMBED_BATCH_CHAR_BUDGET=0` to disable (fixed `batch_size`
-/// chunks, pre-#309 behavior).
-const DEFAULT_SEMANTIC_EMBED_BATCH_CHAR_BUDGET: usize = 16 * 1024;
 const DEFAULT_SEMANTIC_PREP_MEMO_CAPACITY: usize = 4_096;
 const DEFAULT_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS: u64 = 30_000;
 const DEFAULT_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS: u64 = 300_000;
 const DEFAULT_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT: usize = 10_000;
 const DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT: u64 = 8 * 1024 * 1024;
-const DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS: usize = 64;
 const SEMANTIC_PREP_MEMO_ALGORITHM: &str = "semantic_prepare_window";
 const SEMANTIC_PREP_MEMO_VERSION: &str = "canonicalize_for_embedding:v2:stable-content-hash";
-pub const HASH_VECTOR_SPACE_REVISION: &str = "hash-fnv1a-modular-v1";
-
-/// Return the exact vector-space revision that is safe for a current embedder.
-/// ID and dimension alone are insufficient because inference-engine changes
-/// can preserve both while changing vector values.
-pub fn expected_vector_space_revision(embedder_id: &str) -> Option<&'static str> {
-    match embedder_id {
-        "minilm-384" => Some(MINILM_VECTOR_SPACE_REVISION),
-        "fnv1a-384" => Some(HASH_VECTOR_SPACE_REVISION),
-        _ => None,
-    }
-}
 
 fn resolved_env_usize(key: &str, default: usize) -> usize {
     dotenvy::var(key)
@@ -111,13 +82,6 @@ fn resolved_semantic_prep_memo_capacity() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_SEMANTIC_PREP_MEMO_CAPACITY)
-}
-
-fn resolved_semantic_embed_batch_char_budget() -> usize {
-    resolved_env_usize(
-        "CASS_SEMANTIC_EMBED_BATCH_CHAR_BUDGET",
-        DEFAULT_SEMANTIC_EMBED_BATCH_CHAR_BUDGET,
-    )
 }
 
 fn resolved_semantic_embed_batch_warn_after_ms() -> u64 {
@@ -613,99 +577,6 @@ fn semantic_doc_id_for_embedded(embedded: &EmbeddedMessage) -> String {
     .to_doc_id_string()
 }
 
-pub(crate) fn semantic_doc_id_for_input(input: &EmbeddingInput) -> Option<String> {
-    let canonical = canonicalize_for_embedding(&input.content);
-    if canonical.is_empty() {
-        return None;
-    }
-    Some(
-        SemanticDocId {
-            message_id: input.message_id,
-            chunk_idx: input.chunk_idx,
-            agent_id: input.agent_id,
-            workspace_id: input.workspace_id,
-            source_id: input.source_id,
-            role: input.role,
-            created_at_ms: input.created_at_ms,
-            content_hash: Some(content_hash(&canonical)),
-        }
-        .to_doc_id_string(),
-    )
-}
-
-#[cfg(not(windows))]
-fn publish_reconciled_semantic_index(staging_path: &Path, final_path: &Path) -> Result<()> {
-    fs::rename(staging_path, final_path).with_context(|| {
-        format!(
-            "publishing reconciled semantic index {} to {}",
-            staging_path.display(),
-            final_path.display()
-        )
-    })?;
-    sync_parent_directory(final_path)
-}
-
-#[cfg(windows)]
-fn publish_reconciled_semantic_index(staging_path: &Path, final_path: &Path) -> Result<()> {
-    if !final_path.exists() {
-        fs::rename(staging_path, final_path).with_context(|| {
-            format!(
-                "publishing reconciled semantic index {} to {}",
-                staging_path.display(),
-                final_path.display()
-            )
-        })?;
-        return sync_parent_directory(final_path);
-    }
-
-    let extension = final_path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("fsvi");
-    let backup_path = final_path.with_extension(format!(
-        "{extension}.reconcile-backup-{}-{}",
-        std::process::id(),
-        now_ms()
-    ));
-    fs::rename(final_path, &backup_path).with_context(|| {
-        format!(
-            "staging existing semantic index {} at {} before replacement",
-            final_path.display(),
-            backup_path.display()
-        )
-    })?;
-    match fs::rename(staging_path, final_path) {
-        Ok(()) => {
-            if let Err(err) = fs::remove_file(&backup_path) {
-                tracing::warn!(
-                    backup_path = %backup_path.display(),
-                    error = %err,
-                    "reconciled semantic publish left a recoverable prior-live backup"
-                );
-            }
-            sync_parent_directory(final_path)
-        }
-        Err(publish_err) => match fs::rename(&backup_path, final_path) {
-            Ok(()) => {
-                sync_parent_directory(final_path)?;
-                Err(publish_err).with_context(|| {
-                    format!(
-                        "failed publishing reconciled semantic index {}; restored prior live artifact",
-                        final_path.display()
-                    )
-                })
-            }
-            Err(restore_err) => bail!(
-                "failed publishing reconciled semantic index {}; also failed to restore prior live artifact from {}: {}; staged candidate remains at {}",
-                final_path.display(),
-                backup_path.display(),
-                restore_err,
-                staging_path.display()
-            ),
-        },
-    }
-}
-
 struct CanonicalEmbeddingConversationRow {
     conversation_id: i64,
     agent_slug: String,
@@ -771,269 +642,56 @@ pub(crate) struct CanonicalIncrementalEmbeddingBatch {
     pub raw_max_message_id: Option<i64>,
 }
 
-fn semantic_hot_tail_ids(storage: &FrankenStorage) -> Result<HashSet<i64>> {
-    storage
+fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
+    let hinted_fallback_sql = "SELECT c.id
+             FROM conversations c
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = c.id
+                 LIMIT 1
+             )";
+    let fallback_sql = "SELECT c.id
+             FROM conversations c
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM messages
+                 WHERE conversation_id = c.id
+                 LIMIT 1
+             )";
+    let count: i64 = storage
         .raw()
-        .query_map_collect(
-            "SELECT conversation_id
-             FROM conversation_tail_state
-             WHERE last_message_idx IS NOT NULL
-             ORDER BY conversation_id ASC",
+        .query_row_map(
+            "SELECT COUNT(*) FROM conversations WHERE message_count > 0",
             &[] as &[ParamValue],
             |row| row.get_typed(0),
         )
-        .with_context(|| "listing semantic conversations from hot tail metadata")
-        .map(|ids: Vec<i64>| ids.into_iter().collect())
-}
-
-fn semantic_conversation_has_message_after(
-    storage: &FrankenStorage,
-    conversation_id: i64,
-    after_message_id: Option<i64>,
-) -> Result<bool> {
-    let mut params = vec![SqliteValue::from(conversation_id)];
-    let message_cursor_predicate = if let Some(after_message_id) = after_message_id {
-        params.push(SqliteValue::from(after_message_id));
-        " AND id > ?2"
-    } else {
-        ""
-    };
-    let hinted_probe = format!(
-        "SELECT 1
-         FROM messages INDEXED BY sqlite_autoindex_messages_1
-         WHERE conversation_id = ?1{message_cursor_predicate}
-         LIMIT 1"
-    );
-    let fallback_probe = format!(
-        "SELECT 1
-         FROM messages
-         WHERE conversation_id = ?1{message_cursor_predicate}
-         LIMIT 1"
-    );
-    let mut has_message = false;
-    storage
-        .raw()
-        .query_with_params_for_each(&hinted_probe, &params, |_| {
-            has_message = true;
-            Ok(())
-        })
         .or_else(|err| {
-            if !err
-                .to_string()
-                .contains("no such index: sqlite_autoindex_messages_1")
-            {
+            if !err.to_string().contains("no such column: message_count") {
                 return Err(err);
             }
-            storage
+            let conversation_ids: Vec<i64> = storage
                 .raw()
-                .query_with_params_for_each(&fallback_probe, &params, |_| {
-                    has_message = true;
-                    Ok(())
+                .query_map_collect(hinted_fallback_sql, &[] as &[ParamValue], |row| {
+                    row.get_typed(0)
                 })
-        })
-        .with_context(|| {
-            let cursor = after_message_id.map_or_else(|| "none".to_string(), |id| id.to_string());
-            format!(
-                "probing messages for conversation {conversation_id} after message cursor {cursor}"
-            )
-        })?;
-    Ok(has_message)
-}
-
-fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
-    // `conversation_tail_state.last_message_idx` is the maintained, schema-v18
-    // hot cache for every normal non-empty conversation. Merge that compact
-    // table with the legacy parent-row cache in Rust, then resolve only the
-    // residual legacy/empty rows through point probes on the canonical
-    // `(conversation_id, idx)` autoindex. Keeping the conversation id set in
-    // memory is cheap (roughly one integer per conversation) and, critically,
-    // never materializes message rows or bodies.
-    //
-    // This avoids all three hostile FrankenSQLite 0.1.13 paths found while
-    // reproducing #343: correlated EXISTS under COUNT(*) misses the join-loop
-    // memo; COUNT(DISTINCT ...) uses a linear seen-set; and GROUP BY retains
-    // every source row in per-group vectors.
-    let hot_tail_ids = semantic_hot_tail_ids(storage)?;
-    let mut count = 0_u64;
-    let mut missing_tail_ids = Vec::new();
-    storage
-        .raw()
-        .query_with_params_for_each(
-            "SELECT id, last_message_idx
-             FROM conversations
-             ORDER BY id ASC",
-            &[] as &[SqliteValue],
-            |row| {
-                let conversation_id: i64 = row.get_typed(0)?;
-                let legacy_last_message_idx: Option<i64> = row.get_typed(1)?;
-                if legacy_last_message_idx.is_some() || hot_tail_ids.contains(&conversation_id) {
-                    count = count.saturating_add(1);
-                } else {
-                    missing_tail_ids.push(conversation_id);
-                }
-                Ok(())
-            },
-        )
-        .with_context(|| "listing conversations and legacy tail metadata")?;
-
-    for conversation_id in missing_tail_ids {
-        if semantic_conversation_has_message_after(storage, conversation_id, None)? {
-            count = count.saturating_add(1);
-        }
-    }
-    Ok(count)
-}
-
-fn fetch_bounded_semantic_candidate_conversation_ids(
-    storage: &FrankenStorage,
-    after_conversation_id: i64,
-    after_message_id: Option<i64>,
-    max_candidates: usize,
-) -> Result<(Vec<i64>, usize)> {
-    let max_candidates = max_candidates.max(1);
-    if let Some(after_message_id) = after_message_id {
-        // Resume from the canonical global message cursor, not from the much
-        // wider parent-table gap.  The previous implementation paged
-        // `conversations` and executed one prepared message probe for every
-        // parent.  A legitimate sparse checkpoint in #348 crossed 6,668
-        // ineligible parents and retained more than 2 GiB before finding two
-        // candidates.
-        //
-        // `messages.id` is the canonical INTEGER PRIMARY KEY cursor.  Force a
-        // table/rowid traversal so FrankenSQLite can stream every eligible
-        // post-cursor message through one statement.  A bounded BTreeSet keeps
-        // only the smallest `max_candidates` conversation IDs.  This final
-        // reconciliation is essential: messages may be appended to older
-        // conversations, so global message-id order is not necessarily
-        // conversation-id order, while the durable conversation checkpoint
-        // must advance in ascending order without skipping an older candidate.
-        let mut selected = BTreeSet::new();
-        let mut rows_scanned = 0_usize;
-        storage
-            .raw()
-            .query_with_params_for_each(
-                "SELECT conversation_id
-                 FROM messages NOT INDEXED
-                 WHERE id > ?1 AND conversation_id > ?2",
-                &[
-                    SqliteValue::from(after_message_id),
-                    SqliteValue::from(after_conversation_id),
-                ],
-                |row| {
-                    let conversation_id: i64 = row.get_typed(0)?;
-                    rows_scanned = rows_scanned.saturating_add(1);
-                    if selected.contains(&conversation_id) {
-                        return Ok(());
-                    }
-                    if selected.len() < max_candidates {
-                        selected.insert(conversation_id);
-                        return Ok(());
-                    }
-                    if selected
-                        .last()
-                        .is_some_and(|largest| conversation_id < *largest)
+                .or_else(|err| {
+                    if err
+                        .to_string()
+                        .contains("no such index: sqlite_autoindex_messages_1")
                     {
-                        selected.insert(conversation_id);
-                        if let Some(largest) = selected.last().copied() {
-                            selected.remove(&largest);
-                        }
+                        return storage.raw().query_map_collect(
+                            fallback_sql,
+                            &[] as &[ParamValue],
+                            |row| row.get_typed(0),
+                        );
                     }
-                    Ok(())
-                },
-            )
-            .with_context(|| {
-                format!(
-                    "streaming semantic candidates after conversation {after_conversation_id} and message {after_message_id}"
-                )
-            })?;
-        return Ok((selected.into_iter().collect(), rows_scanned));
-    }
-
-    // Scan the narrow parent table in bounded pages, then issue an indexed
-    // point probe for the message predicate. A correlated EXISTS looks tidy,
-    // but FrankenSQLite 0.1.13's file-backed path clone/substitutes and executes
-    // that subquery per outer row; on #343's 432k-message corpus it consumed
-    // minutes and GiBs. Explicit probes make both bounds visible: at most one
-    // small parent page resident and at most `max_candidates` selected IDs.
-    let page_size = max_candidates.saturating_mul(4).clamp(256, 4_096);
-    let page_size_i64 = i64::try_from(page_size).unwrap_or(i64::MAX);
-    let hot_tail_ids = if after_message_id.is_none() {
-        Some(semantic_hot_tail_ids(storage)?)
-    } else {
-        None
-    };
-    let mut selected = Vec::with_capacity(max_candidates.min(4_096));
-    let mut rows_scanned = 0_usize;
-    let mut page_cursor = after_conversation_id;
-
-    loop {
-        let page: Vec<(i64, Option<i64>)> = storage
-            .raw()
-            .query_map_collect(
-                "SELECT id, last_message_idx
-                 FROM conversations
-                 WHERE id > ?1
-                 ORDER BY id ASC
-                 LIMIT ?2",
-                &[
-                    ParamValue::from(page_cursor),
-                    ParamValue::from(page_size_i64),
-                ],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-            )
-            .with_context(|| {
-                format!("listing bounded semantic candidate page after conversation {page_cursor}")
-            })?;
-        if page.is_empty() {
-            break;
-        }
-        let page_len = page.len();
-        page_cursor = page
-            .last()
-            .map_or(page_cursor, |(conversation_id, _)| *conversation_id);
-
-        for (conversation_id, legacy_last_message_idx) in page {
-            rows_scanned = rows_scanned.saturating_add(1);
-            let has_message = if let Some(hot_tail_ids) = hot_tail_ids.as_ref() {
-                if legacy_last_message_idx.is_some() || hot_tail_ids.contains(&conversation_id) {
-                    true
-                } else {
-                    semantic_conversation_has_message_after(storage, conversation_id, None)?
-                }
-            } else {
-                semantic_conversation_has_message_after(storage, conversation_id, after_message_id)?
-            };
-            if has_message {
-                selected.push(conversation_id);
-                if selected.len() >= max_candidates {
-                    return Ok((selected, rows_scanned));
-                }
-            }
-        }
-
-        if page_len < page_size {
-            break;
-        }
-    }
-
-    Ok((selected, rows_scanned))
-}
-
-fn cached_semantic_total_conversations(
-    manifest: &SemanticManifest,
-    tier: TierKind,
-    embedder_id: &str,
-    db_fingerprint: &str,
-) -> Option<(u64, &'static str)> {
-    manifest
-        .checkpoint
-        .as_ref()
-        .filter(|checkpoint| {
-            checkpoint.tier == tier
-                && checkpoint.embedder_id == embedder_id
-                && checkpoint.is_valid(db_fingerprint)
+                    Err(err)
+                })?;
+            Ok(i64::try_from(conversation_ids.len()).unwrap_or(i64::MAX))
         })
-        .map(|checkpoint| (checkpoint.total_conversations, "checkpoint"))
+        .with_context(|| "counting canonical conversations with semantic messages")?;
+    Ok(u64::try_from(count.max(0)).unwrap_or(u64::MAX))
 }
 
 pub(crate) fn message_id_from_db(raw: i64) -> Option<u64> {
@@ -1243,7 +901,7 @@ pub(crate) struct SemanticPacketContext {
 }
 
 /// Packet-driven counterpart to
-/// [`packet_embedding_inputs_from_storage_with_progress`]: derives the same
+/// [`packet_embedding_inputs_from_storage`]: derives the same
 /// `EmbeddingInput` list a fresh storage replay would produce, but
 /// without re-querying canonical conversation rows.
 ///
@@ -1305,7 +963,6 @@ pub(crate) fn semantic_inputs_from_packets(
     Ok(inputs)
 }
 
-#[cfg(test)]
 fn fetch_canonical_embedding_batch(
     storage: &FrankenStorage,
     after_conversation_id: i64,
@@ -1319,7 +976,6 @@ fn fetch_canonical_embedding_batch(
 /// when set. This is how sub-fix 2 (`last_message_id` cursor) enforces
 /// the "resume MUST advance past `last_message_id`" rule on a partially
 /// embedded conversation.
-#[cfg(test)]
 fn fetch_canonical_embedding_batch_inner(
     storage: &FrankenStorage,
     after_conversation_id: i64,
@@ -1335,7 +991,6 @@ fn fetch_canonical_embedding_batch_inner(
     )
 }
 
-#[cfg(test)]
 fn fetch_canonical_embedding_batch_inner_with_caps(
     storage: &FrankenStorage,
     after_conversation_id: i64,
@@ -1344,79 +999,62 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     caps: SemanticCheckpointCaps,
 ) -> Result<CanonicalEmbeddingBatch> {
     let total_conversations = total_semantic_conversations(storage)?;
-    fetch_canonical_embedding_batch_inner_with_caps_and_total(
-        storage,
-        after_conversation_id,
-        max_conversations,
-        after_message_id,
-        caps,
-        total_conversations,
-        None,
-    )
-}
-
-fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
-    storage: &FrankenStorage,
-    after_conversation_id: i64,
-    max_conversations: usize,
-    after_message_id: Option<i64>,
-    caps: SemanticCheckpointCaps,
-    total_conversations: u64,
-    sink: Option<&SemanticProgressSink>,
-) -> Result<CanonicalEmbeddingBatch> {
     let max_conversations = max_conversations.max(1);
     let query_limit = max_conversations.saturating_add(1);
-    if let Some(sink) = sink
-        && sink.is_active()
-    {
-        sink.emit(
-            SemanticProgressEvent::SelectionCandidatesStart,
-            SemanticProgressFields {
-                batch_rows: Some(saturating_u64_from_usize(query_limit)),
-                rows_total: Some(saturating_u64_from_usize(max_conversations)),
-                last_conversation_id: Some(after_conversation_id),
-                last_message_id: after_message_id,
-                ..Default::default()
-            },
-        );
-    }
-
-    let (mut conversation_ids, candidate_rows_scanned) =
-        fetch_bounded_semantic_candidate_conversation_ids(
-            storage,
-            after_conversation_id,
-            after_message_id,
-            query_limit,
-        )?;
-
-    let candidate_rows_returned = conversation_ids.len();
-    let has_more_from_candidate_limit = conversation_ids.len() > max_conversations;
-    if has_more_from_candidate_limit {
-        conversation_ids.truncate(max_conversations);
-    }
-    if let Some(sink) = sink
-        && sink.is_active()
-    {
-        sink.emit(
-            SemanticProgressEvent::SelectionCandidatesDone,
-            SemanticProgressFields {
-                batch_rows: Some(saturating_u64_from_usize(conversation_ids.len())),
-                rows_processed: Some(saturating_u64_from_usize(candidate_rows_scanned)),
-                rows_total: Some(saturating_u64_from_usize(max_conversations)),
-                last_conversation_id: Some(
-                    conversation_ids
-                        .last()
-                        .copied()
-                        .unwrap_or(after_conversation_id),
-                ),
-                last_message_id: after_message_id,
-                note: Some(format!(
-                    "has_more={has_more_from_candidate_limit};eligible_rows={candidate_rows_returned}"
-                )),
-                ..Default::default()
-            },
-        );
-    }
+    let query_limit_i64 = i64::try_from(query_limit).unwrap_or(i64::MAX);
+    let mut params = vec![
+        ParamValue::from(after_conversation_id),
+        ParamValue::from(query_limit_i64),
+    ];
+    let message_cursor_predicate = if let Some(after_message_id) = after_message_id {
+        params.push(ParamValue::from(after_message_id));
+        " AND id > ?3"
+    } else {
+        ""
+    };
+    let hinted_sql = format!(
+        "SELECT c.id
+         FROM conversations c
+         WHERE c.id > ?1
+           AND EXISTS (
+               SELECT 1
+               FROM messages INDEXED BY sqlite_autoindex_messages_1
+               WHERE conversation_id = c.id{message_cursor_predicate}
+               LIMIT 1
+           )
+         ORDER BY c.id ASC
+         LIMIT ?2"
+    );
+    let fallback_sql = format!(
+        "SELECT c.id
+         FROM conversations c
+         WHERE c.id > ?1
+           AND EXISTS (
+               SELECT 1
+               FROM messages
+               WHERE conversation_id = c.id{message_cursor_predicate}
+               LIMIT 1
+           )
+         ORDER BY c.id ASC
+         LIMIT ?2"
+    );
+    let mut conversation_ids: Vec<i64> = storage
+        .raw()
+        .query_map_collect(&hinted_sql, &params, |row| row.get_typed(0))
+        .or_else(|err| {
+            if err
+                .to_string()
+                .contains("no such index: sqlite_autoindex_messages_1")
+            {
+                return storage
+                    .raw()
+                    .query_map_collect(&fallback_sql, &params, |row| row.get_typed(0));
+            }
+            Err(err)
+        })
+        .with_context(|| {
+            format!("fetching semantic backfill conversation ids after {after_conversation_id}")
+        })?;
 
     if conversation_ids.is_empty() {
         return Ok(CanonicalEmbeddingBatch {
@@ -1426,6 +1064,11 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
             total_conversations,
             cursor_exhausted: true,
         });
+    }
+
+    let has_more_from_sql_limit = conversation_ids.len() > max_conversations;
+    if has_more_from_sql_limit {
+        conversation_ids.truncate(max_conversations);
     }
 
     let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
@@ -1449,7 +1092,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
     );
 
     let conversations_in_batch = u64::try_from(conversations.len()).unwrap_or(u64::MAX);
-    let cursor_exhausted = !has_more_from_candidate_limit && !stopped_before_candidate;
+    let cursor_exhausted = !has_more_from_sql_limit && !stopped_before_candidate;
     tracing::debug!(
         conversations_in_batch,
         cursor_exhausted,
@@ -1540,133 +1183,10 @@ fn select_checkpoint_capped_conversations(
     }
 }
 
-#[cfg(test)]
 pub(crate) fn packet_embedding_inputs_from_storage(
     storage: &FrankenStorage,
 ) -> Result<Vec<EmbeddingInput>> {
     Ok(fetch_canonical_embedding_batch(storage, 0, usize::MAX)?.inputs)
-}
-
-/// Collect every canonical semantic input while reporting bounded replay
-/// progress in conversation units.
-///
-/// The direct `cass index --semantic` path ultimately needs the complete input
-/// vector for embedding, but replaying the canonical database can itself take
-/// long enough to deserve an honest phase counter. Reuse the same bounded
-/// visitor as reconciliation so callers see progress after each fully
-/// materialized conversation batch rather than one synthetic jump after an
-/// unbounded query.
-pub(crate) fn packet_embedding_inputs_from_storage_with_progress<F>(
-    storage: &FrankenStorage,
-    on_progress: F,
-) -> Result<Vec<EmbeddingInput>>
-where
-    F: FnMut(usize, usize),
-{
-    let mut inputs = Vec::new();
-    visit_packet_embedding_inputs_from_storage_with_limits_and_progress(
-        storage,
-        DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS,
-        SemanticCheckpointCaps {
-            max_messages: DEFAULT_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT,
-            max_bytes: DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT,
-        },
-        |input| {
-            inputs.push(input);
-            Ok(())
-        },
-        on_progress,
-    )?;
-    Ok(inputs)
-}
-
-/// Replay canonical semantic inputs in bounded conversation batches.
-///
-/// Reconciliation needs to inspect every canonical document identity, but it
-/// must not retain every message body merely to discover a small repair delta.
-/// The callback therefore receives each input by value while this helper keeps
-/// only one bounded replay batch resident at a time.
-pub(crate) fn visit_packet_embedding_inputs_from_storage<F>(
-    storage: &FrankenStorage,
-    visit: F,
-) -> Result<()>
-where
-    F: FnMut(EmbeddingInput) -> Result<()>,
-{
-    visit_packet_embedding_inputs_from_storage_with_limits(
-        storage,
-        DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS,
-        SemanticCheckpointCaps {
-            max_messages: DEFAULT_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT,
-            max_bytes: DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT,
-        },
-        visit,
-    )
-}
-
-fn visit_packet_embedding_inputs_from_storage_with_limits<F>(
-    storage: &FrankenStorage,
-    max_conversations: usize,
-    caps: SemanticCheckpointCaps,
-    visit: F,
-) -> Result<()>
-where
-    F: FnMut(EmbeddingInput) -> Result<()>,
-{
-    visit_packet_embedding_inputs_from_storage_with_limits_and_progress(
-        storage,
-        max_conversations,
-        caps,
-        visit,
-        |_, _| {},
-    )
-}
-
-fn visit_packet_embedding_inputs_from_storage_with_limits_and_progress<F, P>(
-    storage: &FrankenStorage,
-    max_conversations: usize,
-    caps: SemanticCheckpointCaps,
-    mut visit: F,
-    mut on_progress: P,
-) -> Result<()>
-where
-    F: FnMut(EmbeddingInput) -> Result<()>,
-    P: FnMut(usize, usize),
-{
-    let mut after_conversation_id = 0i64;
-    let total_conversations = total_semantic_conversations(storage)?;
-    let total_conversations_usize = usize::try_from(total_conversations).unwrap_or(usize::MAX);
-    let mut processed_conversations = 0_u64;
-    loop {
-        let batch = fetch_canonical_embedding_batch_inner_with_caps_and_total(
-            storage,
-            after_conversation_id,
-            max_conversations,
-            None,
-            caps,
-            total_conversations,
-            None,
-        )?;
-        for input in batch.inputs {
-            visit(input)?;
-        }
-        processed_conversations =
-            processed_conversations.saturating_add(batch.conversations_in_batch);
-        on_progress(
-            usize::try_from(processed_conversations).unwrap_or(usize::MAX),
-            total_conversations_usize,
-        );
-        if batch.cursor_exhausted {
-            return Ok(());
-        }
-        if batch.last_conversation_id <= after_conversation_id {
-            bail!(
-                "canonical semantic reconciliation scan did not advance beyond conversation \
-                 {after_conversation_id}"
-            );
-        }
-        after_conversation_id = batch.last_conversation_id;
-    }
 }
 
 fn packet_embedding_inputs_from_selected_canonical_messages<F>(
@@ -1931,50 +1451,6 @@ fn prepare_window<'a>(window: &'a [EmbeddingInput], serial: bool) -> Vec<Prepare
     }
 }
 
-/// Split a prepared window into contiguous, length-aware embed batches (cass
-/// #309).
-///
-/// Each returned batch holds at most `max_count` rows AND keeps
-/// `row_count × max_canonical_len ≤ char_budget`, so a batch that contains a
-/// long message stays small and the embedder's padded `batch × max_seq²`
-/// working set stays bounded regardless of corpus content. A single message
-/// longer than `char_budget` becomes its own one-row batch (never dropped).
-/// Order is preserved — callers still zip results back to inputs positionally.
-/// `char_budget == 0` disables the byte bound (fixed `max_count` chunks,
-/// pre-#309 behavior).
-fn length_aware_batches<'p, 'a>(
-    prepared: &'p [Prepared<'a>],
-    max_count: usize,
-    char_budget: usize,
-) -> Vec<&'p [Prepared<'a>]> {
-    let max_count = max_count.max(1);
-    let mut batches: Vec<&'p [Prepared<'a>]> = Vec::new();
-    if prepared.is_empty() {
-        return batches;
-    }
-    let mut start = 0usize;
-    let mut max_len = 0usize;
-    for (i, item) in prepared.iter().enumerate() {
-        let len = item.canonical.len();
-        let count = i - start + 1;
-        let prospective_max = max_len.max(len);
-        // Keep at least one row per batch: only split on the budget once the
-        // in-progress batch already holds a row (`count > 1`), so a lone
-        // over-budget message still forms its own batch rather than looping.
-        let over_budget =
-            char_budget > 0 && count > 1 && count.saturating_mul(prospective_max) > char_budget;
-        if count > max_count || over_budget {
-            batches.push(&prepared[start..i]);
-            start = i;
-            max_len = len;
-        } else {
-            max_len = prospective_max;
-        }
-    }
-    batches.push(&prepared[start..]);
-    batches
-}
-
 fn flush_prepared_batch(
     batch: &[Prepared<'_>],
     embeddings: &mut Vec<EmbeddedMessage>,
@@ -1999,7 +1475,13 @@ fn flush_prepared_batch(
     }
 
     for (prepared, vector) in batch.iter().zip(vectors) {
-        validate_embedding_vector(&vector, embedder.dimension(), prepared.msg.message_id)?;
+        if vector.len() != embedder.dimension() {
+            bail!(
+                "embedding dimension mismatch: expected {}, got {}",
+                embedder.dimension(),
+                vector.len()
+            );
+        }
         embeddings.push(EmbeddedMessage {
             message_id: prepared.msg.message_id,
             created_at_ms: prepared.msg.created_at_ms,
@@ -2017,24 +1499,6 @@ fn flush_prepared_batch(
     Ok(())
 }
 
-fn validate_embedding_vector(
-    vector: &[f32],
-    expected_dimension: usize,
-    message_id: u64,
-) -> Result<()> {
-    if vector.len() != expected_dimension {
-        bail!(
-            "embedding dimension mismatch: expected {}, got {}",
-            expected_dimension,
-            vector.len()
-        );
-    }
-    if vector.iter().any(|value| !value.is_finite()) {
-        bail!("embedding for message {message_id} contains a non-finite value");
-    }
-    Ok(())
-}
-
 pub struct SemanticIndexer {
     embedder: Box<dyn Embedder>,
     batch_size: usize,
@@ -2043,7 +1507,7 @@ pub struct SemanticIndexer {
 impl SemanticIndexer {
     pub fn new(embedder_type: &str, data_dir: Option<&Path>) -> Result<Self> {
         let embedder: Box<dyn Embedder> = match embedder_type {
-            "fastembed" | "minilm" => {
+            "fastembed" | "minilm" | "snowflake-arctic-s" | "nomic-embed" => {
                 let dir = data_dir
                     .ok_or_else(|| anyhow::anyhow!("data_dir required for fastembed embedder"))?;
                 let embedder_name = if embedder_type == "fastembed" {
@@ -2086,35 +1550,8 @@ impl SemanticIndexer {
         self.embedder.dimension()
     }
 
-    fn vector_space_revision(&self) -> Result<&'static str> {
-        expected_vector_space_revision(self.embedder_id()).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no vector-space revision registered for embedder {}",
-                self.embedder_id()
-            )
-        })
-    }
-
     pub fn embed_messages(&self, messages: &[EmbeddingInput]) -> Result<Vec<EmbeddedMessage>> {
         self.embed_messages_with_sink(messages, &SemanticProgressSink::disabled())
-    }
-
-    /// Embed messages while reporting how many input rows have been fully
-    /// handled. Rows rejected during canonical preparation count as handled so
-    /// the caller's phase counter always reaches its declared total.
-    pub(crate) fn embed_messages_with_progress<F>(
-        &self,
-        messages: &[EmbeddingInput],
-        on_progress: F,
-    ) -> Result<Vec<EmbeddedMessage>>
-    where
-        F: FnMut(usize, usize),
-    {
-        self.embed_messages_with_sink_and_progress(
-            messages,
-            &SemanticProgressSink::disabled(),
-            on_progress,
-        )
     }
 
     /// Variant of [`embed_messages`] that emits `embed_batch_*` events
@@ -2126,20 +1563,7 @@ impl SemanticIndexer {
         messages: &[EmbeddingInput],
         sink: &SemanticProgressSink,
     ) -> Result<Vec<EmbeddedMessage>> {
-        self.embed_messages_with_sink_and_progress(messages, sink, |_, _| {})
-    }
-
-    fn embed_messages_with_sink_and_progress<F>(
-        &self,
-        messages: &[EmbeddingInput],
-        sink: &SemanticProgressSink,
-        mut on_progress: F,
-    ) -> Result<Vec<EmbeddedMessage>>
-    where
-        F: FnMut(usize, usize),
-    {
         if messages.is_empty() {
-            on_progress(0, 0);
             return Ok(Vec::new());
         }
 
@@ -2173,10 +1597,6 @@ impl SemanticIndexer {
         let rows_total = u64::try_from(messages.len()).ok();
         let warn_after_ms = resolved_semantic_embed_batch_warn_after_ms();
         let fail_after_ms = resolved_semantic_embed_batch_fail_after_ms();
-        // cass #309: bound `row_count × max_canonical_len` per embed batch so a
-        // long message can't inflate a fixed-128 batch's padded tensor to
-        // multiple GB. Resolved once per call (not per batch).
-        let embed_char_budget = resolved_semantic_embed_batch_char_budget();
         for (window_index, window_slice) in messages.chunks(window).enumerate() {
             let prepared_window = match prep_memo.as_mut() {
                 Some(cache) => {
@@ -2197,16 +1617,9 @@ impl SemanticIndexer {
             let skipped_in_window = window_slice.len() - prepared_window.len();
             if skipped_in_window > 0 {
                 pb.inc(saturating_u64_from_usize(skipped_in_window));
-                rows_processed =
-                    rows_processed.saturating_add(saturating_u64_from_usize(skipped_in_window));
-                on_progress(
-                    usize::try_from(rows_processed).unwrap_or(usize::MAX),
-                    messages.len(),
-                );
             }
 
-            for batch in length_aware_batches(&prepared_window, self.batch_size, embed_char_budget)
-            {
+            for batch in prepared_window.chunks(self.batch_size) {
                 let batch_rows = u64::try_from(batch.len()).unwrap_or(u64::MAX);
                 // Sum the canonicalized byte count so an operator can
                 // distinguish a stalled inference from a stalled query —
@@ -2234,10 +1647,6 @@ impl SemanticIndexer {
                 flush_prepared_batch(batch, &mut embeddings, &pb, self.embedder.as_ref())?;
                 let elapsed_ms = saturating_u64_from_millis(batch_started.elapsed().as_millis());
                 rows_processed = rows_processed.saturating_add(batch_rows);
-                on_progress(
-                    usize::try_from(rows_processed).unwrap_or(usize::MAX),
-                    messages.len(),
-                );
                 if warn_after_ms > 0 && elapsed_ms > warn_after_ms {
                     tracing::warn!(
                         batch_index,
@@ -2301,22 +1710,6 @@ impl SemanticIndexer {
     {
         let index_path = vector_index_path(data_dir, self.embedder_id());
         self.build_and_save_index_at_path(embedded_messages, &index_path)
-    }
-
-    /// Build the direct vector index and report each record only after its
-    /// validated write succeeds.
-    pub(crate) fn build_and_save_index_with_progress<I, F>(
-        &self,
-        embedded_messages: I,
-        data_dir: &Path,
-        on_progress: F,
-    ) -> Result<FsVectorIndex>
-    where
-        I: IntoIterator<Item = EmbeddedMessage>,
-        F: FnMut(usize),
-    {
-        let index_path = vector_index_path(data_dir, self.embedder_id());
-        self.build_and_save_index_at_path_with_progress(embedded_messages, &index_path, on_progress)
     }
 
     pub fn build_and_save_index_shards<I>(
@@ -2505,48 +1898,33 @@ impl SemanticIndexer {
     where
         I: IntoIterator<Item = EmbeddedMessage>,
     {
-        self.build_and_save_index_at_path_with_progress(embedded_messages, index_path, |_| {})
-    }
-
-    fn build_and_save_index_at_path_with_progress<I, F>(
-        &self,
-        embedded_messages: I,
-        index_path: &Path,
-        mut on_progress: F,
-    ) -> Result<FsVectorIndex>
-    where
-        I: IntoIterator<Item = EmbeddedMessage>,
-        F: FnMut(usize),
-    {
         if let Some(parent) = index_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Store as f16 by default (smaller, faster I/O). Validate before the
-        // writer so NaN/Inf never reaches a persisted or staged artifact.
+        // Store as f16 by default (smaller, faster I/O). Embeddings are validated by the writer.
         let mut writer: FsVectorIndexWriter = FsVectorIndex::create_with_revision(
             index_path,
             self.embedder_id(),
-            self.vector_space_revision()?,
+            "1.0",
             self.embedder_dimension(),
             FsQuantization::F16,
         )
         .map_err(|err| anyhow::anyhow!("create fsvi index failed: {err}"))?;
 
-        let mut records_written = 0_usize;
         let write_result: Result<()> = (|| {
             for embedded in embedded_messages {
-                validate_embedding_vector(
-                    &embedded.embedding,
-                    self.embedder_dimension(),
-                    embedded.message_id,
-                )?;
+                if embedded.embedding.len() != self.embedder_dimension() {
+                    bail!(
+                        "embedding dimension mismatch: expected {}, got {}",
+                        self.embedder_dimension(),
+                        embedded.embedding.len()
+                    );
+                }
                 let doc_id = semantic_doc_id_for_embedded(&embedded);
                 writer
                     .write_record(&doc_id, &embedded.embedding)
                     .map_err(|err| anyhow::anyhow!("write fsvi record failed: {err}"))?;
-                records_written = records_written.saturating_add(1);
-                on_progress(records_written);
             }
             Ok(())
         })();
@@ -2595,30 +1973,13 @@ impl SemanticIndexer {
         let mut index = FsVectorIndex::open(index_path)
             .map_err(|err| anyhow::anyhow!("open fsvi index for append: {err}"))?;
 
-        let expected_revision = self.vector_space_revision()?;
-        if index.embedder_id() != self.embedder_id()
-            || index.dimension() != self.embedder_dimension()
-            || index.embedder_revision() != expected_revision
-        {
-            bail!(
-                "semantic index is incompatible with current vector space: expected embedder {} revision {} dimension {}, found embedder {} revision {} dimension {}; rebuild semantic vectors before appending",
-                self.embedder_id(),
-                expected_revision,
-                self.embedder_dimension(),
-                index.embedder_id(),
-                index.embedder_revision(),
-                index.dimension()
-            );
-        }
-
         let entries: Vec<(String, Vec<f32>)> = embedded_messages
             .into_iter()
             .map(|em| {
-                validate_embedding_vector(&em.embedding, self.embedder_dimension(), em.message_id)?;
                 let doc_id = semantic_doc_id_for_embedded(&em);
-                Ok((doc_id, em.embedding))
+                (doc_id, em.embedding)
             })
-            .collect::<Result<_>>()?;
+            .collect();
 
         let count = entries.len();
         if count == 0 {
@@ -2636,238 +1997,6 @@ impl SemanticIndexer {
         }
 
         Ok(count)
-    }
-
-    /// Rebuild a canonical semantic artifact by copying exact still-current
-    /// vectors and writing only newly embedded or changed documents.
-    ///
-    /// The live FSVI is not replaced until the candidate contains exactly the
-    /// current canonical document identities and every vector has been read
-    /// back successfully. The live FSVI and WAL are copied into a private
-    /// same-filesystem staging directory before compaction, so reconciliation
-    /// never mutates the published artifact before the atomic candidate swap.
-    pub fn reconcile_index_with_canonical_documents(
-        &self,
-        embedded_messages: Vec<EmbeddedMessage>,
-        data_dir: &Path,
-        tier: TierKind,
-        db_fingerprint: &str,
-        current_doc_ids: &HashSet<String>,
-    ) -> Result<FsVectorIndex> {
-        let index_path = vector_index_path(data_dir, self.embedder_id());
-
-        let mut replacement_doc_ids = HashSet::with_capacity(embedded_messages.len());
-        for embedded in &embedded_messages {
-            if embedded.embedding.len() != self.embedder_dimension() {
-                bail!(
-                    "embedding dimension mismatch: expected {}, got {}",
-                    self.embedder_dimension(),
-                    embedded.embedding.len()
-                );
-            }
-            if embedded.embedding.iter().any(|value| !value.is_finite()) {
-                bail!("semantic reconciliation replacement contains a non-finite embedding");
-            }
-            let doc_id = semantic_doc_id_for_embedded(embedded);
-            if !current_doc_ids.contains(&doc_id) {
-                bail!(
-                    "semantic reconciliation replacement is not present in the canonical DB: {doc_id}"
-                );
-            }
-            if !replacement_doc_ids.insert(doc_id.clone()) {
-                bail!("semantic reconciliation received duplicate replacement document: {doc_id}");
-            }
-        }
-
-        let index_parent = index_path.parent().with_context(|| {
-            format!(
-                "semantic reconciliation index path has no parent: {}",
-                index_path.display()
-            )
-        })?;
-        fs::create_dir_all(index_parent)?;
-        let temp_prefix = format!(
-            ".reconcile-{}-{}-{:08x}-",
-            tier.as_str(),
-            safe_path_component(self.embedder_id()),
-            crc32fast::hash(db_fingerprint.as_bytes())
-        );
-        let staging_dir = tempfile::Builder::new()
-            .prefix(&temp_prefix)
-            .tempdir_in(index_parent)
-            .with_context(|| {
-                format!(
-                    "create semantic reconciliation staging directory in {}",
-                    index_parent.display()
-                )
-            })?;
-        let staging_path = staging_dir.path().join("candidate.fsvi");
-        fs::copy(&index_path, &staging_path).with_context(|| {
-            format!(
-                "snapshot live semantic index {} at {}",
-                index_path.display(),
-                staging_path.display()
-            )
-        })?;
-        let live_wal_path = fsvi_wal_path_for(&index_path);
-        let live_wal_snapshot_path = staging_dir.path().join("live.wal.snapshot");
-        if live_wal_path.exists() {
-            fs::copy(&live_wal_path, &live_wal_snapshot_path).with_context(|| {
-                format!(
-                    "snapshot live semantic WAL {} at {}",
-                    live_wal_path.display(),
-                    live_wal_snapshot_path.display()
-                )
-            })?;
-            fs::copy(&live_wal_snapshot_path, fsvi_wal_path_for(&staging_path)).with_context(
-                || {
-                    format!(
-                        "attach semantic WAL snapshot to candidate {}",
-                        staging_path.display()
-                    )
-                },
-            )?;
-        }
-
-        let mut staged = FsVectorIndex::open(&staging_path).map_err(|err| {
-            anyhow::anyhow!(
-                "open semantic reconciliation snapshot {}: {err}",
-                staging_path.display()
-            )
-        })?;
-        if staged.embedder_id() != self.embedder_id()
-            || staged.dimension() != self.embedder_dimension()
-            || staged.embedder_revision() != self.vector_space_revision()?
-        {
-            bail!(
-                "semantic reconciliation snapshot is incompatible with embedder {} revision {} dimension {}",
-                self.embedder_id(),
-                self.vector_space_revision()?,
-                self.embedder_dimension()
-            );
-        }
-        if staged.wal_record_count() > 0 {
-            staged.compact().map_err(|err| {
-                anyhow::anyhow!("compact semantic reconciliation snapshot: {err}")
-            })?;
-        }
-        if staged.wal_record_count() > 0 {
-            bail!("semantic reconciliation could not clear the snapshot FSVI WAL");
-        }
-
-        let initial_tombstones = staged.tombstone_count();
-        let mut stale_doc_ids = HashSet::new();
-        for record_index in 0..staged.record_count() {
-            if staged.is_deleted(record_index) {
-                continue;
-            }
-            let doc_id = staged.doc_id_at(record_index).map_err(|err| {
-                anyhow::anyhow!("read semantic document id during reconciliation: {err}")
-            })?;
-            if !current_doc_ids.contains(doc_id) {
-                stale_doc_ids.insert(doc_id.to_owned());
-            }
-        }
-
-        let removed_stale_records = if stale_doc_ids.is_empty() {
-            0
-        } else {
-            let stale_doc_id_refs = stale_doc_ids.iter().map(String::as_str).collect::<Vec<_>>();
-            staged
-                .soft_delete_batch(&stale_doc_id_refs)
-                .map_err(|err| anyhow::anyhow!("remove stale semantic documents: {err}"))?
-        };
-
-        let embedded_docs = embedded_messages.len();
-        if embedded_docs > 0 {
-            let replacement_entries = embedded_messages
-                .into_iter()
-                .map(|embedded| (semantic_doc_id_for_embedded(&embedded), embedded.embedding))
-                .collect::<Vec<_>>();
-            staged
-                .append_batch(&replacement_entries)
-                .map_err(|err| anyhow::anyhow!("append replacement semantic vectors: {err}"))?;
-        }
-        if staged.wal_record_count() > 0 {
-            staged
-                .compact()
-                .map_err(|err| anyhow::anyhow!("compact replacement semantic vectors: {err}"))?;
-        } else if staged.tombstone_count() > 0 {
-            staged
-                .vacuum()
-                .map_err(|err| anyhow::anyhow!("vacuum stale semantic vectors: {err}"))?;
-        }
-        if staged.wal_record_count() > 0 {
-            bail!("reconciled semantic staging index unexpectedly contains WAL records");
-        }
-        if staged.tombstone_count() > 0 {
-            bail!("reconciled semantic staging index unexpectedly contains tombstones");
-        }
-        if staged.record_count() != current_doc_ids.len() {
-            bail!(
-                "reconciled semantic staging count mismatch: expected {}, observed {}",
-                current_doc_ids.len(),
-                staged.record_count()
-            );
-        }
-        let mut staged_doc_ids = HashSet::with_capacity(staged.record_count());
-        for record_index in 0..staged.record_count() {
-            let doc_id = staged.doc_id_at(record_index).map_err(|err| {
-                anyhow::anyhow!("validate reconciled semantic document id: {err}")
-            })?;
-            if !staged_doc_ids.insert(doc_id.to_owned()) {
-                bail!("reconciled semantic staging index contains duplicate document {doc_id}");
-            }
-            if staged
-                .vector_at_f32(record_index)
-                .map_err(|err| anyhow::anyhow!("validate reconciled semantic vector: {err}"))?
-                .iter()
-                .any(|value| !value.is_finite())
-            {
-                bail!("reconciled semantic staging index contains a non-finite vector");
-            }
-        }
-        if !staged_doc_ids.eq(current_doc_ids) {
-            bail!("reconciled semantic staging identities do not match the canonical DB");
-        }
-        drop(staged);
-
-        if live_wal_snapshot_path.exists() {
-            // Publication atomically replaces only the main FSVI. Probe the
-            // exact old live WAL against the completed candidate before that
-            // swap; it must be rejected as stale rather than replayed.
-            fs::copy(&live_wal_snapshot_path, fsvi_wal_path_for(&staging_path)).with_context(
-                || {
-                    format!(
-                        "attach old live WAL to completed semantic candidate {}",
-                        staging_path.display()
-                    )
-                },
-            )?;
-            let generation_probe = FsVectorIndex::open(&staging_path).map_err(|err| {
-                anyhow::anyhow!("validate reconciled semantic WAL generation: {err}")
-            })?;
-            if generation_probe.wal_record_count() > 0 {
-                bail!("reconciled semantic candidate would accept the pre-publication live WAL");
-            }
-            drop(generation_probe);
-        }
-
-        publish_reconciled_semantic_index(&staging_path, &index_path)?;
-        let published = FsVectorIndex::open(&index_path)
-            .map_err(|err| anyhow::anyhow!("open reconciled semantic index: {err}"))?;
-        if published.wal_record_count() > 0 {
-            bail!("published reconciled semantic index accepted a stale live WAL");
-        }
-        tracing::info!(
-            retained_docs = current_doc_ids.len().saturating_sub(embedded_docs),
-            initial_tombstones,
-            removed_stale_records,
-            embedded_docs,
-            published_docs = published.record_count(),
-            "published reconciled semantic index"
-        );
-        Ok(published)
     }
 
     fn write_backfill_staging_index(
@@ -3204,12 +2333,6 @@ impl SemanticIndexer {
         let after_conversation_id = prior_checkpoint.map_or(0, |checkpoint| checkpoint.last_offset);
         let prior_last_message_id =
             prior_checkpoint.and_then(|checkpoint| checkpoint.last_message_id);
-        let cached_total_conversations = cached_semantic_total_conversations(
-            manifest,
-            plan.tier,
-            self.embedder_id(),
-            &plan.db_fingerprint,
-        );
 
         if sink.is_active() {
             sink.emit(
@@ -3222,68 +2345,14 @@ impl SemanticIndexer {
                     ..Default::default()
                 },
             );
-            sink.emit(
-                SemanticProgressEvent::SelectionCountStart,
-                SemanticProgressFields {
-                    last_conversation_id: Some(after_conversation_id),
-                    last_message_id: prior_last_message_id,
-                    note: Some(
-                        cached_total_conversations
-                            .map_or("database", |(_, source)| source)
-                            .to_string(),
-                    ),
-                    ..Default::default()
-                },
-            );
         }
 
-        let total_conversations = match cached_total_conversations {
-            Some((total, _)) => total,
-            None => match total_semantic_conversations(storage) {
-                Ok(total) => total,
-                Err(err) => {
-                    if sink.is_active() {
-                        sink.emit(
-                            SemanticProgressEvent::Error,
-                            SemanticProgressFields {
-                                error: Some(format!("selection count: {err}")),
-                                last_conversation_id: Some(after_conversation_id),
-                                last_message_id: prior_last_message_id,
-                                ..Default::default()
-                            },
-                        );
-                    }
-                    return Err(err);
-                }
-            },
-        };
-
-        if sink.is_active() {
-            sink.emit(
-                SemanticProgressEvent::SelectionCountDone,
-                SemanticProgressFields {
-                    rows_processed: Some(total_conversations),
-                    rows_total: Some(total_conversations),
-                    last_conversation_id: Some(after_conversation_id),
-                    last_message_id: prior_last_message_id,
-                    note: Some(
-                        cached_total_conversations
-                            .map_or("database", |(_, source)| source)
-                            .to_string(),
-                    ),
-                    ..Default::default()
-                },
-            );
-        }
-
-        let batch = match fetch_canonical_embedding_batch_inner_with_caps_and_total(
+        let batch = match fetch_canonical_embedding_batch_inner_with_caps(
             storage,
             after_conversation_id,
             plan.max_conversations,
             prior_last_message_id,
             caps,
-            total_conversations,
-            Some(sink),
         ) {
             Ok(batch) => batch,
             Err(err) => {
@@ -3480,58 +2549,6 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
     use tempfile::tempdir;
-
-    /// cass #309: length-aware embed batching must cap both row count and
-    /// `row_count × max_canonical_len` per batch, never drop or reorder rows,
-    /// and keep a single over-budget message as its own one-row batch.
-    #[test]
-    fn length_aware_batches_bounds_count_and_chars() {
-        fn rows<'a>(inputs: &'a [EmbeddingInput], lens: &[usize]) -> Vec<Prepared<'a>> {
-            lens.iter()
-                .enumerate()
-                .map(|(i, &len)| Prepared {
-                    msg: &inputs[i],
-                    canonical: "a".repeat(len),
-                    hash: [0u8; 32],
-                })
-                .collect()
-        }
-        let inputs: Vec<EmbeddingInput> =
-            (0..6).map(|i| EmbeddingInput::new(i as u64, "")).collect();
-
-        // 1) Count cap only (budget disabled): fixed chunks of max_count.
-        let r = rows(&inputs, &[10, 10, 10, 10, 10]);
-        assert_eq!(
-            length_aware_batches(&r, 2, 0)
-                .iter()
-                .map(|b| b.len())
-                .collect::<Vec<_>>(),
-            vec![2, 2, 1]
-        );
-
-        // 2) Char budget caps batches that hold longer rows (50 each, budget
-        //    100 -> at most 2 rows/batch); order is preserved.
-        let r = rows(&inputs, &[50, 50, 50, 50, 50]);
-        let b = length_aware_batches(&r, 128, 100);
-        assert!(b.iter().all(|s| s.len() <= 2));
-        let flat: Vec<u64> = b
-            .iter()
-            .flat_map(|s| s.iter().map(|p| p.msg.message_id))
-            .collect();
-        assert_eq!(flat, vec![0, 1, 2, 3, 4]);
-
-        // 3) A single over-budget row forms its own batch; nothing is dropped.
-        let r = rows(&inputs, &[10, 500, 10]);
-        let b = length_aware_batches(&r, 128, 100);
-        assert_eq!(b.iter().map(|s| s.len()).sum::<usize>(), 3);
-        assert!(
-            b.iter()
-                .any(|s| s.len() == 1 && s[0].canonical.len() == 500)
-        );
-
-        // 4) Empty input -> no batches.
-        assert!(length_aware_batches(&[], 8, 100).is_empty());
-    }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct ComparableSemanticInput {
@@ -3802,136 +2819,6 @@ mod tests {
     }
 
     #[test]
-    fn embedding_validation_rejects_non_finite_and_wrong_dimension() -> Result<()> {
-        for (vector, expected_message) in [
-            (vec![f32::NAN; 384], "non-finite"),
-            (vec![f32::INFINITY; 384], "non-finite"),
-            (vec![0.0; 383], "dimension mismatch"),
-        ] {
-            let Err(error) = validate_embedding_vector(&vector, 384, 7) else {
-                bail!("invalid vector unexpectedly passed validation");
-            };
-            if !error.to_string().contains(expected_message) {
-                bail!("unexpected validation error: {error:#}");
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn append_rejects_legacy_revision_and_invalid_new_vectors_without_mutation() -> Result<()> {
-        let indexer = SemanticIndexer::new("hash", None)?;
-        let tmp = tempdir()?;
-        let index_path = vector_index_path(tmp.path(), indexer.embedder_id());
-        let Some(index_parent) = index_path.parent() else {
-            bail!("vector index path has no parent");
-        };
-        fs::create_dir_all(index_parent)?;
-
-        let mut base_vectors =
-            indexer.embed_messages(&[EmbeddingInput::new(1, "legacy vector")])?;
-        let Some(base) = base_vectors.pop() else {
-            bail!("embedding produced no vector");
-        };
-        let mut writer = FsVectorIndex::create_with_revision(
-            &index_path,
-            indexer.embedder_id(),
-            "1.0",
-            indexer.embedder_dimension(),
-            FsQuantization::F16,
-        )?;
-        writer
-            .write_record(&semantic_doc_id_for_embedded(&base), &base.embedding)
-            .map_err(|error| anyhow::anyhow!(error))?;
-        writer.finish().map_err(|error| anyhow::anyhow!(error))?;
-
-        let candidate = indexer.embed_messages(&[EmbeddingInput::new(2, "current vector")])?;
-        let Err(error) = indexer.append_to_index(candidate, tmp.path()) else {
-            bail!("legacy revision was accepted");
-        };
-        if !error.to_string().contains("revision 1.0") {
-            bail!("unexpected legacy-revision error: {error:#}");
-        }
-        let unchanged = FsVectorIndex::open(&index_path).map_err(|error| anyhow::anyhow!(error))?;
-        if unchanged.record_count() != 1 || unchanged.wal_record_count() != 0 {
-            bail!("legacy append mutated the index");
-        }
-        drop(unchanged);
-
-        let mut current_writer = FsVectorIndex::create_with_revision(
-            &index_path,
-            indexer.embedder_id(),
-            indexer.vector_space_revision()?,
-            indexer.embedder_dimension(),
-            FsQuantization::F16,
-        )?;
-        current_writer
-            .write_record(&semantic_doc_id_for_embedded(&base), &base.embedding)
-            .map_err(|error| anyhow::anyhow!(error))?;
-        current_writer
-            .finish()
-            .map_err(|error| anyhow::anyhow!(error))?;
-
-        let mut non_finite_vectors =
-            indexer.embed_messages(&[EmbeddingInput::new(3, "invalid append")])?;
-        let Some(mut non_finite) = non_finite_vectors.pop() else {
-            bail!("embedding produced no vector");
-        };
-        non_finite.embedding.fill(f32::NAN);
-        let Err(error) = indexer.append_to_index([non_finite], tmp.path()) else {
-            bail!("non-finite append was accepted");
-        };
-        if !error.to_string().contains("non-finite") {
-            bail!("unexpected non-finite error: {error:#}");
-        }
-
-        let mut wrong_dimension_vectors =
-            indexer.embed_messages(&[EmbeddingInput::new(4, "wrong dimension")])?;
-        let Some(mut wrong_dimension) = wrong_dimension_vectors.pop() else {
-            bail!("embedding produced no vector");
-        };
-        wrong_dimension.embedding.pop();
-        let Err(error) = indexer.append_to_index([wrong_dimension], tmp.path()) else {
-            bail!("wrong-dimension append was accepted");
-        };
-        if !error.to_string().contains("dimension mismatch") {
-            bail!("unexpected dimension error: {error:#}");
-        }
-
-        let unchanged = FsVectorIndex::open(&index_path).map_err(|error| anyhow::anyhow!(error))?;
-        if unchanged.record_count() != 1 || unchanged.wal_record_count() != 0 {
-            bail!("invalid append mutated the current index");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn issue_342_direct_semantic_progress_callbacks_reach_exact_totals() {
-        let indexer = SemanticIndexer::new("hash", None).unwrap();
-        let messages = vec![
-            EmbeddingInput::new(1, "Hello world"),
-            EmbeddingInput::new(2, "Goodbye world"),
-        ];
-        let mut embedding_progress = Vec::new();
-        let embeddings = indexer
-            .embed_messages_with_progress(&messages, |current, total| {
-                embedding_progress.push((current, total));
-            })
-            .unwrap();
-        assert_eq!(embedding_progress.last(), Some(&(2, 2)));
-
-        let tmp = tempdir().unwrap();
-        let mut vector_progress = Vec::new();
-        let index = indexer
-            .build_and_save_index_with_progress(embeddings, tmp.path(), |current| {
-                vector_progress.push(current);
-            })
-            .unwrap();
-        assert_eq!(vector_progress, vec![1, 2]);
-        assert_eq!(index.record_count(), 2);
-    }
-
-    #[test]
     fn test_progress_indicator() {
         let indexer = SemanticIndexer::new("hash", None).unwrap();
         let messages: Vec<_> = (0..1000)
@@ -3958,214 +2845,6 @@ mod tests {
         assert_eq!(index.embedder_id(), indexer.embedder_id());
         assert_eq!(index.dimension(), indexer.embedder_dimension());
         assert_eq!(index.record_count(), 2);
-    }
-
-    #[test]
-    fn semantic_reconciliation_rejects_invalid_replacement_without_mutating_live_fsvi_or_wal() {
-        let indexer = SemanticIndexer::new("hash", None).unwrap();
-        let tmp = tempdir().unwrap();
-        let base_inputs: Vec<_> = (1..=20)
-            .map(|message_id| {
-                EmbeddingInput::new(
-                    message_id,
-                    format!("semantic reconciliation base message {message_id}"),
-                )
-            })
-            .collect();
-        let base_embeddings = indexer.embed_messages(&base_inputs).unwrap();
-        drop(
-            indexer
-                .build_and_save_index(base_embeddings, tmp.path())
-                .unwrap(),
-        );
-
-        let wal_input = EmbeddingInput::new(21, "semantic reconciliation pending WAL message");
-        let wal_embeddings = indexer
-            .embed_messages(std::slice::from_ref(&wal_input))
-            .unwrap();
-        assert_eq!(
-            indexer.append_to_index(wal_embeddings, tmp.path()).unwrap(),
-            1
-        );
-
-        let index_path = vector_index_path(tmp.path(), indexer.embedder_id());
-        let wal_path = fsvi_wal_path_for(&index_path);
-        let live = FsVectorIndex::open(&index_path).unwrap();
-        assert_eq!(live.record_count(), 20);
-        assert_eq!(
-            live.wal_record_count(),
-            1,
-            "the fixture must exercise a real uncompacted WAL"
-        );
-        drop(live);
-        let main_before = fs::read(&index_path).unwrap();
-        let wal_before = fs::read(&wal_path).unwrap();
-
-        let replacement_input =
-            EmbeddingInput::new(22, "semantic reconciliation invalid replacement");
-        let mut invalid_replacement = indexer
-            .embed_messages(std::slice::from_ref(&replacement_input))
-            .unwrap()
-            .pop()
-            .unwrap();
-        invalid_replacement.embedding.pop();
-        let current_doc_ids: HashSet<_> = base_inputs
-            .iter()
-            .chain([&wal_input, &replacement_input])
-            .filter_map(semantic_doc_id_for_input)
-            .collect();
-
-        let err = indexer
-            .reconcile_index_with_canonical_documents(
-                vec![invalid_replacement],
-                tmp.path(),
-                TierKind::Fast,
-                "content-v1:22:22:22",
-                &current_doc_ids,
-            )
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("embedding dimension mismatch"),
-            "unexpected reconciliation error: {err:#}"
-        );
-        assert_eq!(
-            fs::read(&index_path).unwrap(),
-            main_before,
-            "invalid replacements must not rewrite the published FSVI"
-        );
-        assert_eq!(
-            fs::read(&wal_path).unwrap(),
-            wal_before,
-            "invalid replacements must not compact or rewrite the published WAL"
-        );
-        let live_after = FsVectorIndex::open(&index_path).unwrap();
-        assert_eq!(live_after.record_count(), 20);
-        assert_eq!(live_after.wal_record_count(), 1);
-    }
-
-    #[test]
-    fn semantic_reconciliation_publishes_wal_entries_without_replaying_stale_sidecar() {
-        let indexer = SemanticIndexer::new("hash", None).unwrap();
-        let tmp = tempdir().unwrap();
-        let base_inputs: Vec<_> = (1..=20)
-            .map(|message_id| {
-                EmbeddingInput::new(
-                    message_id,
-                    format!("semantic reconciliation base message {message_id}"),
-                )
-            })
-            .collect();
-        let base_embeddings = indexer.embed_messages(&base_inputs).unwrap();
-        drop(
-            indexer
-                .build_and_save_index(base_embeddings, tmp.path())
-                .unwrap(),
-        );
-
-        let wal_input = EmbeddingInput::new(21, "semantic reconciliation pending WAL message");
-        let wal_embeddings = indexer
-            .embed_messages(std::slice::from_ref(&wal_input))
-            .unwrap();
-        assert_eq!(
-            indexer
-                .append_to_index(wal_embeddings.clone(), tmp.path())
-                .unwrap(),
-            1
-        );
-
-        let index_path = vector_index_path(tmp.path(), indexer.embedder_id());
-        let wal_path = fsvi_wal_path_for(&index_path);
-        let before = FsVectorIndex::open(&index_path).unwrap();
-        assert_eq!(before.metadata().compaction_gen, 1);
-        assert_eq!(before.wal_record_count(), 1);
-        assert!(wal_path.exists());
-        drop(before);
-
-        let current_doc_ids: HashSet<_> = base_inputs
-            .iter()
-            .chain([&wal_input])
-            .filter_map(semantic_doc_id_for_input)
-            .collect();
-        let published = indexer
-            .reconcile_index_with_canonical_documents(
-                wal_embeddings,
-                tmp.path(),
-                TierKind::Fast,
-                "content-v1:21:21:21",
-                &current_doc_ids,
-            )
-            .unwrap();
-
-        assert_eq!(published.record_count(), 21);
-        assert_eq!(published.wal_record_count(), 0);
-        assert_eq!(published.tombstone_count(), 0);
-        assert!(
-            !wal_path.exists(),
-            "opening the published generation must discard the old live WAL"
-        );
-        let published_doc_ids: HashSet<_> = (0..published.record_count())
-            .map(|record_index| published.doc_id_at(record_index).unwrap().to_owned())
-            .collect();
-        assert_eq!(published_doc_ids, current_doc_ids);
-    }
-
-    #[test]
-    fn semantic_reconciliation_replaces_duplicates_and_tombstones_in_private_candidate() {
-        let indexer = SemanticIndexer::new("hash", None).unwrap();
-        let tmp = tempdir().unwrap();
-        let inputs = [
-            EmbeddingInput::new(1, "semantic reconciliation duplicated message"),
-            EmbeddingInput::new(2, "semantic reconciliation tombstoned message"),
-        ];
-        let embeddings = indexer.embed_messages(&inputs).unwrap();
-        let doc_ids = inputs
-            .iter()
-            .filter_map(semantic_doc_id_for_input)
-            .collect::<Vec<_>>();
-        let index_path = vector_index_path(tmp.path(), indexer.embedder_id());
-        fs::create_dir_all(index_path.parent().unwrap()).unwrap();
-        let mut writer = FsVectorIndex::create_with_revision(
-            &index_path,
-            indexer.embedder_id(),
-            HASH_VECTOR_SPACE_REVISION,
-            indexer.embedder_dimension(),
-            FsQuantization::F16,
-        )
-        .unwrap();
-        writer
-            .write_record(&doc_ids[0], &embeddings[0].embedding)
-            .unwrap();
-        writer
-            .write_record(&doc_ids[0], &embeddings[0].embedding)
-            .unwrap();
-        writer
-            .write_record(&doc_ids[1], &embeddings[1].embedding)
-            .unwrap();
-        writer.finish().unwrap();
-        let mut live = FsVectorIndex::open(&index_path).unwrap();
-        assert!(live.soft_delete(&doc_ids[1]).unwrap());
-        assert_eq!(live.record_count(), 3);
-        assert_eq!(live.tombstone_count(), 1);
-        drop(live);
-
-        let current_doc_ids = doc_ids.into_iter().collect::<HashSet<_>>();
-        let published = indexer
-            .reconcile_index_with_canonical_documents(
-                embeddings,
-                tmp.path(),
-                TierKind::Fast,
-                "content-v1:2:2:2",
-                &current_doc_ids,
-            )
-            .unwrap();
-
-        assert_eq!(published.record_count(), 2);
-        assert_eq!(published.wal_record_count(), 0);
-        assert_eq!(published.tombstone_count(), 0);
-        let published_doc_ids = (0..published.record_count())
-            .map(|record_index| published.doc_id_at(record_index).unwrap().to_owned())
-            .collect::<HashSet<_>>();
-        assert_eq!(published_doc_ids, current_doc_ids);
     }
 
     #[test]
@@ -5009,502 +3688,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_conversation_total_uses_the_production_schema_aggregate() -> Result<()> {
-        let temp = tempdir()?;
-        let db_path = temp.path().join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path)?;
-        let agent_id = storage.ensure_agent(&Agent {
-            id: None,
-            slug: "codex".to_string(),
-            name: "Codex".to_string(),
-            version: None,
-            kind: AgentKind::Cli,
-        })?;
-        storage.insert_conversation_tree(
-            agent_id,
-            None,
-            &test_conversation("counted-first", "first counted semantic message"),
-        )?;
-        storage.insert_conversation_tree(
-            agent_id,
-            None,
-            &test_conversation("counted-second", "second counted semantic message"),
-        )?;
-        storage.insert_conversation_tree(
-            agent_id,
-            None,
-            &test_conversation_with_messages("empty-not-counted", Vec::new()),
-        )?;
-
-        // Legacy imports may have messages without either tail cache. Preserve
-        // exactness by forcing one populated conversation through the residual
-        // indexed point-probe path.
-        let first_conversation_id: i64 = storage.raw().query_row_map(
-            "SELECT MIN(id) FROM conversations",
-            &[] as &[ParamValue],
-            |row| row.get_typed(0),
-        )?;
-        let params = [ParamValue::from(first_conversation_id)];
-        storage.raw().execute_compat(
-            "UPDATE conversations SET last_message_idx = NULL WHERE id = ?1",
-            &params,
-        )?;
-        storage.raw().execute_compat(
-            "UPDATE conversation_tail_state
-             SET last_message_idx = NULL
-             WHERE conversation_id = ?1",
-            &params,
-        )?;
-
-        let production_columns: Vec<String> = storage.raw().query_map_collect(
-            "PRAGMA table_info(conversations)",
-            &[] as &[ParamValue],
-            |row| row.get_typed(1),
-        )?;
-        assert!(
-            !production_columns
-                .iter()
-                .any(|name| name == "message_count"),
-            "the regression fixture must use the production schema without conversations.message_count"
-        );
-        assert_eq!(total_semantic_conversations(&storage)?, 2);
-        Ok(())
-    }
-
-    #[test]
-    fn semantic_total_cache_is_scoped_to_the_active_build_identity() {
-        let mut manifest = SemanticManifest {
-            checkpoint: Some(BuildCheckpoint {
-                tier: TierKind::Fast,
-                embedder_id: "fnv1a-384".to_string(),
-                last_offset: 91,
-                docs_embedded: 1_247,
-                conversations_processed: 91,
-                total_conversations: 15_246,
-                db_fingerprint: "content-v1:432504:1:432504".to_string(),
-                schema_version: SEMANTIC_SCHEMA_VERSION,
-                chunking_version: CHUNKING_STRATEGY_VERSION,
-                saved_at_ms: 1,
-                last_message_id: Some(1_250),
-                cursor_exhausted: false,
-            }),
-            ..SemanticManifest::default()
-        };
-
-        assert_eq!(
-            cached_semantic_total_conversations(
-                &manifest,
-                TierKind::Fast,
-                "fnv1a-384",
-                "content-v1:432504:1:432504"
-            ),
-            Some((15_246, "checkpoint"))
-        );
-        assert_eq!(
-            cached_semantic_total_conversations(
-                &manifest,
-                TierKind::Quality,
-                "minilm-384",
-                "content-v1:432504:1:432504"
-            ),
-            None,
-            "a different tier/embedder must not inherit an unrelated checkpoint total"
-        );
-        assert_eq!(
-            cached_semantic_total_conversations(
-                &manifest,
-                TierKind::Fast,
-                "fnv1a-384",
-                "content-v1:432505:1:432505"
-            ),
-            None,
-            "a changed DB fingerprint must force a fresh aggregate"
-        );
-        manifest
-            .checkpoint
-            .as_mut()
-            .expect("checkpoint")
-            .schema_version = SEMANTIC_SCHEMA_VERSION.saturating_add(1);
-        assert_eq!(
-            cached_semantic_total_conversations(
-                &manifest,
-                TierKind::Fast,
-                "fnv1a-384",
-                "content-v1:432504:1:432504"
-            ),
-            None,
-            "an incompatible semantic schema must invalidate the cached total"
-        );
-    }
-
-    #[test]
-    fn resumed_semantic_candidate_selection_is_cursor_bounded() -> Result<()> {
-        let temp = tempdir()?;
-        let db_path = temp.path().join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path)?;
-        let agent_id = storage.ensure_agent(&Agent {
-            id: None,
-            slug: "codex".to_string(),
-            name: "Codex".to_string(),
-            version: None,
-            kind: AgentKind::Cli,
-        })?;
-        for index in 0..192 {
-            storage.insert_conversation_tree(
-                agent_id,
-                None,
-                &test_conversation(
-                    &format!("resume-before-{index}"),
-                    &format!("old semantic message {index}"),
-                ),
-            )?;
-        }
-        let checkpoint_conversation_id: i64 = storage.raw().query_row_map(
-            "SELECT MAX(id) FROM conversations",
-            &[] as &[ParamValue],
-            |row| row.get_typed(0),
-        )?;
-        let checkpoint_message_id: i64 = storage.raw().query_row_map(
-            "SELECT MAX(id) FROM messages",
-            &[] as &[ParamValue],
-            |row| row.get_typed(0),
-        )?;
-        for index in 0..128 {
-            storage.insert_conversation_tree(
-                agent_id,
-                None,
-                &test_conversation(
-                    &format!("resume-after-{index}"),
-                    &format!("new semantic message {index}"),
-                ),
-            )?;
-        }
-
-        let total = total_semantic_conversations(&storage)?;
-        assert_eq!(total, 320);
-        let started = Instant::now();
-        let batch = fetch_canonical_embedding_batch_inner_with_caps_and_total(
-            &storage,
-            checkpoint_conversation_id,
-            64,
-            Some(checkpoint_message_id),
-            SemanticCheckpointCaps::unlimited(),
-            total,
-            None,
-        )?;
-
-        assert_eq!(batch.conversations_in_batch, 64);
-        assert_eq!(batch.inputs.len(), 64);
-        assert_eq!(batch.total_conversations, 320);
-        assert!(!batch.cursor_exhausted);
-        assert!(
-            batch.inputs.iter().all(|input| {
-                i64::try_from(input.message_id).unwrap_or(i64::MAX) > checkpoint_message_id
-            }),
-            "every selected message must advance past the durable message cursor"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
-            "a 64-conversation resume must not replay the whole canonical corpus"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resumed_semantic_candidate_selection_streams_across_sparse_parent_gap() -> Result<()> {
-        const CHECKPOINT_CONVERSATION_ID: i64 = 1;
-        const CHECKPOINT_MESSAGE_ID: i64 = 6_669;
-        const FIRST_ELIGIBLE_CONVERSATION_ID: i64 = 6_670;
-        const SECOND_ELIGIBLE_CONVERSATION_ID: i64 = 6_671;
-        const EARLY_MESSAGE_LATE_CONVERSATION_ID: i64 = 6_672;
-
-        fn linux_rss_bytes() -> Option<u64> {
-            let status = std::fs::read_to_string("/proc/self/status").ok()?;
-            let rss_kib = status.lines().find_map(|line| {
-                line.strip_prefix("VmRSS:")?
-                    .split_whitespace()
-                    .next()?
-                    .parse::<u64>()
-                    .ok()
-            })?;
-            rss_kib.checked_mul(1_024)
-        }
-
-        let temp = tempdir()?;
-        let db_path = temp.path().join("agent_search.db");
-        let bootstrap_storage = FrankenStorage::open(&db_path)?;
-        let agent_id = bootstrap_storage.ensure_agent(&Agent {
-            id: None,
-            slug: "codex".to_string(),
-            name: "Codex".to_string(),
-            version: None,
-            kind: AgentKind::Cli,
-        })?;
-        // Reproduce #348's production shape without spending the test budget
-        // on fixture construction through thousands of individual commits.
-        // Conversations 2..=6,669 are newer parents whose messages are all at
-        // or below the durable message cursor: 6,668 consecutive misses before
-        // the first eligible conversation in conversation-id order.
-        // Seed through FrankenSQLite itself (the project's sole SQLite engine).
-        // Multi-row statements are chunked so fixture construction stays
-        // parser-bounded while one outer transaction avoids thousands of
-        // fsyncs. Every interpolated value below is an integer controlled by
-        // this test; no external string enters the SQL.
-        use std::fmt::Write as _;
-        const SEED_ROWS_PER_STATEMENT: i64 = 256;
-        let mut seed_sql = String::from("BEGIN IMMEDIATE;");
-        let mut chunk_start = CHECKPOINT_CONVERSATION_ID;
-        while chunk_start <= EARLY_MESSAGE_LATE_CONVERSATION_ID {
-            let chunk_end =
-                (chunk_start + SEED_ROWS_PER_STATEMENT - 1).min(EARLY_MESSAGE_LATE_CONVERSATION_ID);
-            seed_sql.push_str(
-                "INSERT INTO conversations(
-                     id, agent_id, source_id, external_id, source_path
-                 ) VALUES",
-            );
-            for conversation_id in chunk_start..=chunk_end {
-                if conversation_id > chunk_start {
-                    seed_sql.push(',');
-                }
-                write!(
-                    seed_sql,
-                    "({conversation_id},{agent_id},'local','cass-348-sparse-{conversation_id}',\
-                     '/tmp/cass-348/{conversation_id}.jsonl')"
-                )
-                .expect("writing fixture SQL to String cannot fail");
-            }
-            seed_sql.push(';');
-
-            seed_sql.push_str(
-                "INSERT INTO conversation_tail_state(conversation_id, last_message_idx) VALUES",
-            );
-            for conversation_id in chunk_start..=chunk_end {
-                if conversation_id > chunk_start {
-                    seed_sql.push(',');
-                }
-                write!(seed_sql, "({conversation_id},0)")
-                    .expect("writing fixture SQL to String cannot fail");
-            }
-            seed_sql.push(';');
-            chunk_start = chunk_end + 1;
-        }
-
-        let mut message_chunk_start = 2_i64;
-        while message_chunk_start < FIRST_ELIGIBLE_CONVERSATION_ID {
-            let message_chunk_end = (message_chunk_start + SEED_ROWS_PER_STATEMENT - 1)
-                .min(FIRST_ELIGIBLE_CONVERSATION_ID - 1);
-            seed_sql.push_str(
-                "INSERT INTO messages(
-                     id, conversation_id, idx, role, content
-                 ) VALUES",
-            );
-            for conversation_id in message_chunk_start..=message_chunk_end {
-                if conversation_id > message_chunk_start {
-                    seed_sql.push(',');
-                }
-                let message_id = conversation_id - 1;
-                write!(
-                    seed_sql,
-                    "({message_id},{conversation_id},0,'user','sparse semantic resume row')"
-                )
-                .expect("writing fixture SQL to String cannot fail");
-            }
-            seed_sql.push(';');
-            message_chunk_start = message_chunk_end + 1;
-        }
-
-        // Global message order intentionally disagrees with conversation
-        // order. A correct bounded selector must evict 6,672 and return
-        // 6,670/6,671, otherwise advancing the conversation checkpoint would
-        // permanently skip an older eligible conversation.
-        write!(
-            seed_sql,
-            "INSERT INTO messages(id, conversation_id, idx, role, content) VALUES
-             ({CHECKPOINT_MESSAGE_ID},{CHECKPOINT_CONVERSATION_ID},0,'user','checkpoint row'),
-             ({},{EARLY_MESSAGE_LATE_CONVERSATION_ID},0,'user','eligible row'),
-             ({},{FIRST_ELIGIBLE_CONVERSATION_ID},0,'user','eligible row'),
-             ({},{SECOND_ELIGIBLE_CONVERSATION_ID},0,'user','eligible row');COMMIT;",
-            CHECKPOINT_MESSAGE_ID + 1,
-            CHECKPOINT_MESSAGE_ID + 2,
-            CHECKPOINT_MESSAGE_ID + 3,
-        )
-        .expect("writing fixture SQL to String cannot fail");
-        bootstrap_storage.raw().execute_batch(&seed_sql)?;
-        drop(bootstrap_storage);
-
-        let storage = FrankenStorage::open(&db_path)?;
-        let rss_before = linux_rss_bytes();
-        let started = Instant::now();
-        let (selected, eligible_message_rows_scanned) =
-            fetch_bounded_semantic_candidate_conversation_ids(
-                &storage,
-                CHECKPOINT_CONVERSATION_ID,
-                Some(CHECKPOINT_MESSAGE_ID),
-                2,
-            )?;
-        let elapsed = started.elapsed();
-        let rss_after = linux_rss_bytes();
-
-        assert_eq!(
-            selected,
-            [
-                FIRST_ELIGIBLE_CONVERSATION_ID,
-                SECOND_ELIGIBLE_CONVERSATION_ID
-            ]
-        );
-        assert_eq!(
-            eligible_message_rows_scanned, 3,
-            "the selector should stream only eligible post-cursor messages, not execute 6,668 parent probes"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "sparse-gap selection took {elapsed:?}"
-        );
-        if let (Some(before), Some(after)) = (rss_before, rss_after) {
-            assert!(
-                after.saturating_sub(before) < 256 * 1024 * 1024,
-                "sparse-gap selection grew RSS by {} bytes",
-                after.saturating_sub(before)
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "large 15,246-conversation / 432,504-message acceptance proof for cass#343"]
-    fn resumed_semantic_selection_matches_large_production_shape() -> Result<()> {
-        const CONVERSATION_COUNT: i64 = 15_246;
-        const MESSAGE_COUNT: i64 = 432_504;
-        const CONVERSATIONS_WITH_EXTRA_MESSAGE: i64 = MESSAGE_COUNT - (CONVERSATION_COUNT * 28);
-
-        fn linux_rss_bytes() -> Option<u64> {
-            let status = std::fs::read_to_string("/proc/self/status").ok()?;
-            let rss_kib = status.lines().find_map(|line| {
-                line.strip_prefix("VmRSS:")?
-                    .split_whitespace()
-                    .next()?
-                    .parse::<u64>()
-                    .ok()
-            })?;
-            rss_kib.checked_mul(1_024)
-        }
-
-        let temp = tempdir()?;
-        let db_path = temp.path().join("agent_search.db");
-        let bootstrap_storage = FrankenStorage::open(&db_path)?;
-        let agent_id = bootstrap_storage.ensure_agent(&Agent {
-            id: None,
-            slug: "codex".to_string(),
-            name: "Codex".to_string(),
-            version: None,
-            kind: AgentKind::Cli,
-        })?;
-        drop(bootstrap_storage);
-
-        // Fixture construction is deliberately outside the measured region.
-        // Use the repo's existing C-SQLite interop dependency and prepared
-        // statements so creating 432k rows does not dominate this ignored
-        // acceptance test. The actual count and selection proof below reopens
-        // the database through FrankenStorage/FrankenSQLite.
-        let mut sqlite = rusqlite::Connection::open(&db_path)?;
-        let tx = sqlite.transaction()?;
-        let mut message_id = 1_i64;
-        {
-            let mut insert_conversation = tx.prepare(
-                "INSERT INTO conversations(
-                     id, agent_id, source_id, external_id, source_path
-                 ) VALUES(?1, ?2, 'local', ?3, ?4)",
-            )?;
-            let mut insert_message = tx.prepare(
-                "INSERT INTO messages(
-                     id, conversation_id, idx, role, content
-                 ) VALUES(?1, ?2, ?3, 'user', 'semantic acceptance row')",
-            )?;
-            let mut insert_tail = tx.prepare(
-                "INSERT INTO conversation_tail_state(conversation_id, last_message_idx)
-                 VALUES(?1, ?2)",
-            )?;
-            for conversation_id in 1..=CONVERSATION_COUNT {
-                let external_id = format!("cass-343-large-{conversation_id}");
-                let source_path = format!("/tmp/cass-343/{conversation_id}.jsonl");
-                insert_conversation.execute(rusqlite::params![
-                    conversation_id,
-                    agent_id,
-                    external_id,
-                    source_path
-                ])?;
-                let messages_in_conversation =
-                    28 + i64::from(conversation_id <= CONVERSATIONS_WITH_EXTRA_MESSAGE);
-                for message_index in 0..messages_in_conversation {
-                    insert_message.execute(rusqlite::params![
-                        message_id,
-                        conversation_id,
-                        message_index
-                    ])?;
-                    message_id = message_id.saturating_add(1);
-                }
-                insert_tail.execute(rusqlite::params![
-                    conversation_id,
-                    messages_in_conversation - 1
-                ])?;
-            }
-        }
-        tx.commit()?;
-        drop(sqlite);
-        assert_eq!(message_id - 1, MESSAGE_COUNT);
-
-        let storage = FrankenStorage::open(&db_path)?;
-        let count_started = Instant::now();
-        let total = total_semantic_conversations(&storage)?;
-        let count_elapsed = count_started.elapsed();
-        assert_eq!(total, u64::try_from(CONVERSATION_COUNT)?);
-
-        let rss_before = linux_rss_bytes();
-        let selection_started = Instant::now();
-        let batch = fetch_canonical_embedding_batch_inner_with_caps_and_total(
-            &storage,
-            91,
-            64,
-            Some(1_250),
-            SemanticCheckpointCaps::unlimited(),
-            total,
-            None,
-        )?;
-        let selection_elapsed = selection_started.elapsed();
-        let rss_after = linux_rss_bytes();
-
-        eprintln!(
-            "CASS_343_LARGE_SELECTION conversations={CONVERSATION_COUNT} messages={MESSAGE_COUNT} count_ms={} selection_ms={} rss_before={rss_before:?} rss_after={rss_after:?}",
-            count_elapsed.as_millis(),
-            selection_elapsed.as_millis()
-        );
-        assert_eq!(batch.conversations_in_batch, 64);
-        assert_eq!(batch.inputs.len(), 64 * 29);
-        assert_eq!(batch.total_conversations, 15_246);
-        assert!(!batch.cursor_exhausted);
-        assert!(
-            batch.inputs.iter().all(|input| input.message_id > 1_250),
-            "the durable nonzero message cursor must be applied before materialization"
-        );
-        assert!(
-            count_elapsed < std::time::Duration::from_secs(30),
-            "production-schema aggregate must not clone/execute and materialize per outer row"
-        );
-        assert!(
-            selection_elapsed < std::time::Duration::from_secs(30),
-            "64-conversation candidate selection must stay bounded on the 432k-message shape"
-        );
-        if let (Some(before), Some(after)) = (rss_before, rss_after) {
-            assert!(
-                after.saturating_sub(before) < 256 * 1024 * 1024,
-                "bounded resume selection grew RSS by {} bytes",
-                after.saturating_sub(before)
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
     fn canonical_embedding_batch_reports_unexhausted_cursor_at_sql_limit() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("agent_search.db");
@@ -5548,53 +3731,6 @@ mod tests {
         anyhow::ensure!(
             second.cursor_exhausted,
             "the final page should report cursor exhaustion even when it exactly fills the requested limit"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn canonical_embedding_visitor_replays_every_bounded_page() -> Result<()> {
-        let temp = tempdir()?;
-        let db_path = temp.path().join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path)?;
-        let agent_id = storage.ensure_agent(&Agent {
-            id: None,
-            slug: "codex".to_string(),
-            name: "Codex".to_string(),
-            version: None,
-            kind: AgentKind::Cli,
-        })?;
-        storage.insert_conversation_tree(
-            agent_id,
-            None,
-            &test_conversation("visitor-first", "first visitor semantic message"),
-        )?;
-        storage.insert_conversation_tree(
-            agent_id,
-            None,
-            &test_conversation("visitor-second", "second visitor semantic message"),
-        )?;
-
-        let mut contents = Vec::new();
-        visit_packet_embedding_inputs_from_storage_with_limits(
-            &storage,
-            1,
-            SemanticCheckpointCaps {
-                max_messages: 1,
-                max_bytes: 1,
-            },
-            |input| {
-                contents.push(input.content);
-                Ok(())
-            },
-        )?;
-
-        assert_eq!(
-            contents,
-            [
-                "first visitor semantic message",
-                "second visitor semantic message"
-            ]
         );
         Ok(())
     }
@@ -6179,7 +4315,7 @@ mod tests {
     /// repair flows) can drive the semantic preparation consumer
     /// without a second canonical-row round-trip.
     #[test]
-    fn issue_342_semantic_replay_reports_progress_and_matches_packets() -> Result<()> {
+    fn semantic_inputs_from_packets_matches_storage_replay() -> Result<()> {
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("agent_search.db");
         let storage = FrankenStorage::open(&db_path)?;
@@ -6276,12 +4412,7 @@ mod tests {
 
         // Legacy path: the storage-driven replay that the rebuild
         // pipeline currently uses.
-        let mut replay_progress = Vec::new();
-        let storage_inputs =
-            packet_embedding_inputs_from_storage_with_progress(&storage, |current, total| {
-                replay_progress.push((current, total))
-            })?;
-        assert_eq!(replay_progress.last(), Some(&(2, 2)));
+        let storage_inputs = packet_embedding_inputs_from_storage(&storage)?;
 
         // Packet-driven path: re-fetch the canonical envelopes (so we
         // get the storage-internal agent/workspace ids the rebuild path

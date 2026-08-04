@@ -178,15 +178,25 @@ test.describe('HTML Export - Plain Mode', () => {
     });
   });
 
-  test('export handles unicode content', async ({ page, unicodeExportPath }, testInfo) => {
+  test('export handles unicode and keeps the malicious corpus inert', async ({ page, unicodeExportPath }, testInfo) => {
     test.skip(!unicodeExportPath, 'Unicode export path not configured');
 
     const browserErrors = collectBrowserErrors(page);
     const dialogs: string[] = [];
+    await page.addInitScript(() => {
+      const probeWindow = window as typeof window & {
+        __cassXssHits?: string[];
+        __cassRecordXss?: (marker: string) => void;
+      };
+      probeWindow.__cassXssHits = [];
+      probeWindow.__cassRecordXss = (marker: string) => {
+        probeWindow.__cassXssHits?.push(String(marker));
+      };
+    });
     page.on('dialog', (dialog) => {
       dialogs.push(dialog.message());
-      dialog.dismiss().catch((error) => {
-        browserErrors.pageErrors.push(`dialog dismissal failed: ${String(error)}`);
+      dialog.dismiss().catch(() => {
+        browserErrors.pageErrors.push('dialog-dismissal-failed:redacted');
       });
     });
 
@@ -199,6 +209,90 @@ test.describe('HTML Export - Plain Mode', () => {
       expect(content).not.toContain('\uFFFD');
       expect(content).toContain('<script>');
       expect(content).toContain('XSS');
+      for (const marker of [
+        'ZZINLINEZZ',
+        'ZZIMGZZ',
+        'ZZBREAKZZ',
+        'ZZCLOSEZZ',
+        'ZZSVGZZ',
+        'ZZIFRAMEZZ',
+        'ZZDIVZZ',
+        'ZZSTYLEZZ',
+        'ZZENTITYZZ',
+      ]) {
+        expect(content, `${marker} should render as inert conversation text`).toContain(marker);
+      }
+    });
+
+    await test.step('Verify malicious fixture nodes and URLs are inert', async () => {
+      const domProbe = await page.evaluate(() => {
+        const markers = [
+          'ZZINLINEZZ',
+          'ZZIMGZZ',
+          'ZZBREAKZZ',
+          'ZZCLOSEZZ',
+          'ZZSVGZZ',
+          'ZZIFRAMEZZ',
+          'ZZDIVZZ',
+          'ZZSTYLEZZ',
+          'ZZENTITYZZ',
+          'ZZJSURLZZ',
+          'ZZIMGURLZZ',
+          'ZZDATAZZ',
+        ];
+        const markerIn = (value: string): string | null =>
+          markers.find((marker) => value.includes(marker)) ?? null;
+        const dangerousNodes = Array.from(
+          document.querySelectorAll(
+            '.message-content script, .message-content img, .message-content svg, ' +
+              '.message-content iframe, .message-content style, .message-content [onerror], ' +
+              '.message-content [onload], .message-content [onmouseover]'
+          )
+        ).flatMap((element) => {
+          const marker = markerIn(element.outerHTML);
+          return marker
+            ? [{
+                tag: element.tagName.toLowerCase(),
+                marker,
+                eventAttributes: element
+                  .getAttributeNames()
+                  .filter((name) => name.toLowerCase().startsWith('on')),
+              }]
+            : [];
+        });
+        const dangerousUrls = Array.from(
+          document.querySelectorAll(
+            '.message-content a[href], .message-content img[src], .message-content iframe[src]'
+          )
+        ).flatMap((element) => {
+          const attribute = element.hasAttribute('href') ? 'href' : 'src';
+          const value = element.getAttribute(attribute) ?? '';
+          const normalized = value.trim().toLowerCase();
+          if (
+            !normalized.startsWith('javascript:') &&
+            !normalized.startsWith('vbscript:') &&
+            !normalized.startsWith('data:text/html')
+          ) {
+            return [];
+          }
+          return [{
+            tag: element.tagName.toLowerCase(),
+            attribute,
+            scheme: normalized.split(':', 1)[0],
+            marker: markerIn(value),
+          }];
+        });
+        const probeWindow = window as typeof window & { __cassXssHits?: string[] };
+        return {
+          dangerousNodes,
+          dangerousUrls,
+          executedMarkers: [...(probeWindow.__cassXssHits ?? [])],
+        };
+      });
+
+      expect(domProbe.dangerousNodes).toEqual([]);
+      expect(domProbe.dangerousUrls).toEqual([]);
+      expect(domProbe.executedMarkers).toEqual([]);
       await page.waitForTimeout(500);
       expect(dialogs).toEqual([]);
       expect(browserErrors.pageErrors).toEqual([]);

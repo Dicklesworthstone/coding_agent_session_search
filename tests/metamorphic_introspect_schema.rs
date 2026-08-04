@@ -56,19 +56,6 @@ fn isolated_search_demo_data(test_home: &Path) -> Result<PathBuf, Box<dyn Error>
     let dst_root = test_home.join("search_demo_data");
     for entry in WalkDir::new(&src) {
         let entry = entry?;
-        // Machine-local frankensqlite namespace lock sidecars (created by
-        // any local run that opens the fixture DB) must not reach the
-        // clone: their foreign lock state fails the copied DB's open.
-        if entry
-            .path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.ends_with("-fsqlite-ns-gate") || name.ends_with("-fsqlite-ns-use")
-            })
-        {
-            continue;
-        }
         let rel = entry.path().strip_prefix(&src)?;
         let dst = safe_fixture_destination(&dst_root, rel)?;
         if entry.file_type().is_dir() {
@@ -240,18 +227,6 @@ fn surface_command(
     let empty_data_dir = empty_data_dir.to_str().expect("utf8 data dir");
 
     let args = match surface {
-        "analytics-incidents" => {
-            return Some((
-                vec![
-                    "analytics".to_string(),
-                    "incidents".to_string(),
-                    "--json".to_string(),
-                    "--data-dir".to_string(),
-                    demo_data.to_string(),
-                ],
-                ExpectStatus::ExitOk,
-            ));
-        }
         "api-version" => vec!["api-version", "--json"],
         "capabilities" => vec!["capabilities", "--json"],
         "diag" => vec!["diag", "--json"],

@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SCHEMA_VERSION: &str = "cass.swarm.dependency_drift.v1";
-const STRICT_CHECK_COMMAND: &str = "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation";
+const STRICT_CHECK_COMMAND: &str = "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation";
 const FULL_CHECK_COMMAND: &str =
-    "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo check --all-targets";
-const FSQLITE_REGRESSION_COMMAND: &str = "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-fsqlite-target cargo test --lib cleanup_orphan_fk_rows -- --nocapture";
+    "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo check --all-targets";
+const FSQLITE_REGRESSION_COMMAND: &str = "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-fsqlite-target cargo test --lib cleanup_orphan_fk_rows -- --nocapture";
 
 #[derive(Clone, Copy)]
 struct DependencySpec {
@@ -64,10 +64,6 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "fsqlite",
         manifest_table: "dependencies",
         manifest_key: "frankensqlite",
-        // Git-pinned since the same-version registry archive lacks the
-        // existing-only schema-open contract cass depends on (cass#345);
-        // the compat gates in tests/frankensqlite_compat_gates.rs own the
-        // exact revision.
         source_kind: "git",
         repo_rel: "../frankensqlite",
         required_tests: &[
@@ -937,15 +933,13 @@ mod tests {
             frankensqlite.package.as_deref() == Some(frankensqlite_spec.package),
             "frankensqlite package should match the dependency spec",
         )?;
-        // The exact revision is owned by tests/frankensqlite_compat_gates.rs;
-        // here we only require a well-formed immutable pin so routine pin
-        // bumps do not have to touch this test.
         ensure(
-            frankensqlite
-                .rev
-                .as_deref()
-                .is_some_and(|rev| rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit())),
-            "frankensqlite git pin should carry a full 40-hex revision",
+            frankensqlite.version.as_deref() == Some("=0.1.19"),
+            "frankensqlite package version should match Cargo.toml",
+        )?;
+        ensure(
+            frankensqlite.rev.as_deref() == Some("f6a007b169ccd483f0e4e437f436d81357461718"),
+            "frankensqlite git revision should match Cargo.toml",
         )?;
 
         let asupersync = manifest_pin(&manifest, dependency_spec("asupersync")?);
@@ -957,7 +951,7 @@ mod tests {
             ),
         )?;
         ensure(
-            asupersync.version.as_deref() == Some("=0.3.9"),
+            asupersync.version.as_deref() == Some("=0.3.2"),
             "asupersync version pin should match Cargo.toml",
         )
     }

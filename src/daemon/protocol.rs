@@ -16,7 +16,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub fn default_socket_path() -> PathBuf {
     let user = dotenvy::var("USER").unwrap_or_else(|_| "unknown".into());
     let safe_user = sanitize_socket_user(&user);
-    std::env::temp_dir().join(format!("semantic-daemon-{safe_user}.sock"))
+    PathBuf::from(format!("/tmp/semantic-daemon-{safe_user}.sock"))
 }
 
 fn sanitize_socket_user(user: &str) -> String {
@@ -461,20 +461,12 @@ mod tests {
     #[test]
     fn test_default_socket_path() -> TestResult {
         let path = default_socket_path();
-        ensure_eq(
-            path.parent().map(std::path::Path::to_path_buf),
-            Some(std::env::temp_dir()),
-            "socket parent should honor the platform temp directory",
-        )?;
-        let file_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy())
-            .unwrap_or_default();
+        let path_str = path.to_string_lossy();
         ensure(
-            file_name.starts_with("semantic-daemon-"),
-            "socket file prefix",
+            path_str.starts_with("/tmp/semantic-daemon-"),
+            "socket path prefix",
         )?;
-        ensure(file_name.ends_with(".sock"), "socket path suffix")
+        ensure(path_str.ends_with(".sock"), "socket path suffix")
     }
 
     #[test]

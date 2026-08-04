@@ -43,6 +43,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::search::trust_scoring::{OutcomeMarker, ProofStatus};
 
@@ -573,12 +574,21 @@ fn parse_bead_refs(subject: &str, project_prefix: &str) -> Vec<String> {
 /// Run a read-only git command in `repo_path`, returning trimmed stdout on
 /// success. Fail-open: any spawn error or non-zero exit yields `None`.
 fn git_output(repo_path: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_path)
         .args(args)
-        .output()
-        .ok()?;
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::sources::configure_child_process_group(&mut command);
+    let child = command.spawn().ok()?;
+    let output = crate::sources::wait_for_child_output_with_timeout(
+        child,
+        Duration::from_millis(750),
+    )
+    .ok()??;
     if !output.status.success() {
         return None;
     }

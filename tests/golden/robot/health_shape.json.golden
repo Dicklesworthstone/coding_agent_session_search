@@ -658,32 +658,6 @@
         }
       }
     },
-    "search_completeness": {
-      "type": "object",
-      "properties": {
-        "quarantine_status": {
-          "type": "string"
-        },
-        "quarantined_conversations": {
-          "type": "integer"
-        },
-        "complete": {
-          "type": "boolean"
-        },
-        "can_search": {
-          "type": "boolean"
-        },
-        "coverage_suspect": {
-          "type": "boolean"
-        },
-        "impact": {
-          "type": "string"
-        },
-        "next_command": {
-          "type": "string"
-        }
-      }
-    },
     "responsiveness": {
       "type": "object",
       "properties": {
@@ -902,12 +876,6 @@
             },
             "fresh": {
               "type": "boolean"
-            },
-            "partial": {
-              "type": "boolean"
-            },
-            "partial_reason": {
-              "type": "null"
             },
             "last_indexed_at": {
               "type": "null"
@@ -1190,9 +1158,6 @@
             "progressive_ready": {
               "type": "boolean"
             },
-            "progressive_reason_code": {
-              "type": "null"
-            },
             "feature_compiled_in": {
               "type": "boolean"
             },
@@ -1234,9 +1199,6 @@
                 },
                 "size_bytes": {
                   "type": "null"
-                },
-                "shard_count": {
-                  "type": "null"
                 }
               }
             },
@@ -1268,9 +1230,6 @@
                   "type": "null"
                 },
                 "size_bytes": {
-                  "type": "null"
-                },
-                "shard_count": {
                   "type": "null"
                 }
               }

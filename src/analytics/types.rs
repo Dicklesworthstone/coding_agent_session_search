@@ -7,6 +7,8 @@
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::metric_integrity::MetricOutcome;
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -17,9 +19,29 @@ pub enum AnalyticsError {
     /// The required table does not exist — caller should suggest `cass analytics rebuild`.
     #[error("table '{0}' does not exist — run 'cass analytics rebuild'")]
     MissingTable(String),
+    /// The requested query cannot be answered truthfully by the available
+    /// analytics schema (for example an exact-ms filter with day-only data).
+    #[error("analytics schema incompatible: {0}")]
+    SchemaIncompatible(String),
     /// A database query failed.
     #[error("analytics db error: {0}")]
     Db(String),
+}
+
+impl AnalyticsError {
+    /// Classify the failed query through the shared metric-integrity taxonomy.
+    ///
+    /// Callers can preserve the existing error envelope while still exposing a
+    /// stable machine-readable reason: missing derived tables require rebuild,
+    /// explicit capability mismatches are schema-incompatible, and runtime
+    /// aggregate failures remain distinct from both.
+    pub fn metric_outcome(&self) -> MetricOutcome {
+        match self {
+            Self::MissingTable(_) => MetricOutcome::RebuildRequired,
+            Self::SchemaIncompatible(_) => MetricOutcome::SchemaIncompatible,
+            Self::Db(_) => MetricOutcome::AggregateFailed,
+        }
+    }
 }
 
 /// Convenience alias.
@@ -325,12 +347,26 @@ impl UsageBucket {
             },
             "derived": {
                 "api_tokens_per_assistant_msg": derived.api_tokens_per_assistant_msg,
+                "api_tokens_per_assistant_msg_status": derived.api_tokens_per_assistant_msg_outcome.kind_str(),
+                "api_tokens_per_assistant_msg_display": crate::metric_integrity::chart_cell(derived.api_tokens_per_assistant_msg_outcome),
                 "content_tokens_per_user_msg": derived.content_tokens_per_user_msg,
+                "content_tokens_per_user_msg_status": derived.content_tokens_per_user_msg_outcome.kind_str(),
+                "content_tokens_per_user_msg_display": crate::metric_integrity::chart_cell(derived.content_tokens_per_user_msg_outcome),
                 "tool_calls_per_1k_api_tokens": derived.tool_calls_per_1k_api_tokens,
+                "tool_calls_per_1k_api_tokens_status": derived.tool_calls_per_1k_api_tokens_outcome.kind_str(),
+                "tool_calls_per_1k_api_tokens_display": crate::metric_integrity::chart_cell(derived.tool_calls_per_1k_api_tokens_outcome),
                 "tool_calls_per_1k_content_tokens": derived.tool_calls_per_1k_content_tokens,
+                "tool_calls_per_1k_content_tokens_status": derived.tool_calls_per_1k_content_tokens_outcome.kind_str(),
+                "tool_calls_per_1k_content_tokens_display": crate::metric_integrity::chart_cell(derived.tool_calls_per_1k_content_tokens_outcome),
                 "plan_message_pct": derived.plan_message_pct,
+                "plan_message_pct_status": derived.plan_message_pct_outcome.kind_str(),
+                "plan_message_pct_display": crate::metric_integrity::chart_cell(derived.plan_message_pct_outcome),
                 "plan_token_share_content": derived.plan_token_share_content,
+                "plan_token_share_content_status": derived.plan_token_share_content_outcome.kind_str(),
+                "plan_token_share_content_display": crate::metric_integrity::chart_cell(derived.plan_token_share_content_outcome),
                 "plan_token_share_api": derived.plan_token_share_api,
+                "plan_token_share_api_status": derived.plan_token_share_api_outcome.kind_str(),
+                "plan_token_share_api_display": crate::metric_integrity::chart_cell(derived.plan_token_share_api_outcome),
             },
         })
     }
@@ -354,6 +390,10 @@ pub struct TimeseriesResult {
     pub elapsed_ms: u64,
     /// "rollup" or "slow".
     pub path: String,
+    /// Integrity classification for the primary metric represented by this
+    /// result. Empty evidence, missing rollups, and failed schema assumptions
+    /// must not be inferred from zero-valued totals.
+    pub metric_outcome: MetricOutcome,
 }
 
 impl TimeseriesResult {
@@ -375,6 +415,8 @@ impl TimeseriesResult {
                 "group_by": self.group_by.to_string(),
                 "source_table": self.source_table,
                 "rows_read": self.buckets.len(),
+                "metric_status": self.metric_outcome.kind_str(),
+                "metric_display": crate::metric_integrity::chart_cell(self.metric_outcome),
             }
         })
     }
@@ -395,6 +437,10 @@ pub struct BreakdownRow {
     pub message_count: i64,
     /// Full bucket for this slice (available for derived metric computation).
     pub bucket: UsageBucket,
+    /// Truthful metric classification. `value` remains for compatibility;
+    /// consumers should use `value_numeric` plus this status for new code.
+    #[serde(skip)]
+    pub metric_outcome: MetricOutcome,
 }
 
 impl BreakdownRow {
@@ -404,13 +450,20 @@ impl BreakdownRow {
         serde_json::json!({
             "key": self.key,
             "value": self.value,
+            "value_numeric": self.metric_outcome.as_value(),
+            "value_status": self.metric_outcome.kind_str(),
+            "value_display": crate::metric_integrity::chart_cell(self.metric_outcome),
             "message_count": self.message_count,
             "derived": {
                 "api_coverage_pct": derived.api_coverage_pct.as_value(),
                 "api_coverage_status": derived.api_coverage_pct.kind_str(),
                 "api_coverage_display": crate::metric_integrity::chart_cell(derived.api_coverage_pct),
                 "tool_calls_per_1k_api_tokens": derived.tool_calls_per_1k_api_tokens,
+                "tool_calls_per_1k_api_tokens_status": derived.tool_calls_per_1k_api_tokens_outcome.kind_str(),
+                "tool_calls_per_1k_api_tokens_display": crate::metric_integrity::chart_cell(derived.tool_calls_per_1k_api_tokens_outcome),
                 "plan_message_pct": derived.plan_message_pct,
+                "plan_message_pct_status": derived.plan_message_pct_outcome.kind_str(),
+                "plan_message_pct_display": crate::metric_integrity::chart_cell(derived.plan_message_pct_outcome),
             },
         })
     }
@@ -428,6 +481,8 @@ pub struct BreakdownResult {
     pub source_table: String,
     /// Query wall-time in milliseconds.
     pub elapsed_ms: u64,
+    /// Aggregate integrity classification for the selected metric.
+    pub metric_outcome: MetricOutcome,
 }
 
 impl BreakdownResult {
@@ -442,6 +497,8 @@ impl BreakdownResult {
             "_meta": {
                 "elapsed_ms": self.elapsed_ms,
                 "source_table": self.source_table,
+                "metric_status": self.metric_outcome.kind_str(),
+                "metric_display": crate::metric_integrity::chart_cell(self.metric_outcome),
             }
         })
     }
@@ -493,6 +550,8 @@ pub struct ToolReport {
     pub source_table: String,
     /// Query wall-time in milliseconds.
     pub elapsed_ms: u64,
+    /// Integrity classification for total tool calls.
+    pub metric_outcome: MetricOutcome,
 }
 
 impl ToolReport {
@@ -504,6 +563,11 @@ impl ToolReport {
         } else {
             None
         };
+        let overall_per_1k_outcome = match overall_per_1k {
+            Some(value) if value == 0.0 => MetricOutcome::TrueZero,
+            Some(value) => MetricOutcome::finite(value),
+            None => MetricOutcome::NoData,
+        };
         serde_json::json!({
             "rows": rows_json,
             "row_count": self.rows.len(),
@@ -512,10 +576,14 @@ impl ToolReport {
                 "message_count": self.total_messages,
                 "api_tokens_total": self.total_api_tokens,
                 "tool_calls_per_1k_api_tokens": overall_per_1k,
+                "tool_calls_per_1k_api_tokens_status": overall_per_1k_outcome.kind_str(),
+                "tool_calls_per_1k_api_tokens_display": crate::metric_integrity::chart_cell(overall_per_1k_outcome),
             },
             "_meta": {
                 "elapsed_ms": self.elapsed_ms,
                 "source_table": self.source_table,
+                "metric_status": self.metric_outcome.kind_str(),
+                "metric_display": crate::metric_integrity::chart_cell(self.metric_outcome),
             }
         })
     }
@@ -681,14 +749,28 @@ pub struct UnpricedModelsReport {
 /// Computed ratios from a [`UsageBucket`].
 #[derive(Debug, Clone, Serialize)]
 pub struct DerivedMetrics {
-    pub api_coverage_pct: crate::metric_integrity::MetricOutcome,
+    pub api_coverage_pct: MetricOutcome,
     pub api_tokens_per_assistant_msg: Option<f64>,
+    #[serde(skip)]
+    pub api_tokens_per_assistant_msg_outcome: MetricOutcome,
     pub content_tokens_per_user_msg: Option<f64>,
+    #[serde(skip)]
+    pub content_tokens_per_user_msg_outcome: MetricOutcome,
     pub tool_calls_per_1k_api_tokens: Option<f64>,
+    #[serde(skip)]
+    pub tool_calls_per_1k_api_tokens_outcome: MetricOutcome,
     pub tool_calls_per_1k_content_tokens: Option<f64>,
+    #[serde(skip)]
+    pub tool_calls_per_1k_content_tokens_outcome: MetricOutcome,
     pub plan_message_pct: Option<f64>,
+    #[serde(skip)]
+    pub plan_message_pct_outcome: MetricOutcome,
     pub plan_token_share_content: Option<f64>,
+    #[serde(skip)]
+    pub plan_token_share_content_outcome: MetricOutcome,
     pub plan_token_share_api: Option<f64>,
+    #[serde(skip)]
+    pub plan_token_share_api_outcome: MetricOutcome,
 }
 
 // ---------------------------------------------------------------------------
@@ -736,6 +818,29 @@ mod tests {
         let db = AnalyticsError::Db("query failed".to_string());
         assert_eq!(db.to_string(), "analytics db error: query failed");
         assert!(std::error::Error::source(&db).is_none());
+
+        let schema = AnalyticsError::SchemaIncompatible("day-only timestamps".to_string());
+        assert_eq!(
+            schema.to_string(),
+            "analytics schema incompatible: day-only timestamps"
+        );
+        assert!(std::error::Error::source(&schema).is_none());
+    }
+
+    #[test]
+    fn analytics_errors_have_stable_metric_outcomes() {
+        assert_eq!(
+            AnalyticsError::MissingTable("usage_daily".to_string()).metric_outcome(),
+            MetricOutcome::RebuildRequired
+        );
+        assert_eq!(
+            AnalyticsError::SchemaIncompatible("day-only timestamps".to_string()).metric_outcome(),
+            MetricOutcome::SchemaIncompatible
+        );
+        assert_eq!(
+            AnalyticsError::Db("aggregate failed".to_string()).metric_outcome(),
+            MetricOutcome::AggregateFailed
+        );
     }
 
     #[test]
@@ -797,6 +902,37 @@ mod tests {
         assert!(json["derived"].is_object());
         assert!(json["derived"]["plan_token_share_content"].is_number());
         assert!(json["derived"]["plan_token_share_api"].is_number());
+        assert_eq!(
+            json["derived"]["api_tokens_per_assistant_msg_status"],
+            "value"
+        );
+        assert_eq!(json["derived"]["plan_message_pct_status"], "value");
+        assert_eq!(json["derived"]["plan_token_share_api_status"], "value");
+    }
+
+    #[test]
+    fn usage_bucket_json_distinguishes_missing_ratios_from_true_zero() {
+        let empty = UsageBucket::default().to_json("empty");
+        assert!(empty["derived"]["plan_message_pct"].is_null());
+        assert_eq!(
+            empty["derived"]["plan_message_pct_status"],
+            MetricOutcome::NoData.kind_str()
+        );
+        assert_eq!(empty["derived"]["plan_message_pct_display"], "—");
+
+        let present = UsageBucket {
+            message_count: 2,
+            assistant_message_count: 1,
+            api_tokens_total: 10,
+            ..Default::default()
+        }
+        .to_json("present");
+        assert_eq!(present["derived"]["plan_message_pct"], 0.0);
+        assert_eq!(
+            present["derived"]["plan_message_pct_status"],
+            MetricOutcome::TrueZero.kind_str()
+        );
+        assert_eq!(present["derived"]["plan_message_pct_display"], "0");
     }
 
     #[test]

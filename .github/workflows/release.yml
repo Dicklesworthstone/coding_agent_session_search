@@ -55,39 +55,60 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # cass#308 removed the prebuilt Microsoft ONNX Runtime entirely —
-          # semantic inference is pure Rust (frankensearch/native) with
-          # runtime-dispatched SIMD, so there is no AVX2 static-init hazard
-          # and no separate `-baseline` artifact anymore (cass#256 is moot;
-          # see bead coding_agent_session_search-tg5o9).
-          # Linux x86_64 - ubuntu-24.04 (glibc 2.39): CI builds target the
-          # newer kernel/glibc features used by the frankensqlite storage
-          # engine, so 22.04-era glibc is not supported for prebuilt binaries.
+          # Linux x86_64 - ubuntu-24.04 (glibc 2.39); ort-sys prebuilt ONNX
+          # Runtime binaries require glibc ≥2.38, so 22.04 cannot link.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_name: cass
             asset_name: cass-linux-amd64
-          # Linux ARM64 - same glibc constraint as x86_64.
+            cargo_flags: ""
+          # Linux x86_64 baseline - same target as above but built with
+          # `--no-default-features --features qr,encryption` so the
+          # prebuilt Microsoft ONNX Runtime binary (which carries
+          # AVX/AVX2 dispatch code Rust's RUSTFLAGS cannot reach) is not
+          # linked. Required for pre-AVX2 Linux hosts (Sandy/Ivy Bridge);
+          # see cass#256.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact_name: cass
+            asset_name: cass-linux-amd64-baseline
+            cargo_flags: "--no-default-features --features qr,encryption"
+          # Linux ARM64 - same glibc constraint as x86_64. No baseline
+          # variant: aarch64 has no AVX2 lineage to worry about.
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: cass
             asset_name: cass-linux-arm64
-          # macOS Intel - DISABLED historically; Intel Mac users build from
-          # source (install.sh --from-source).
+            cargo_flags: ""
+          # macOS Intel - DISABLED: ort-sys doesn't provide prebuilt ONNX Runtime binaries
+          # for x86_64-apple-darwin. Intel Mac users can build from source.
           # - os: macos-15
           #   target: x86_64-apple-darwin
           #   artifact_name: cass
           #   asset_name: cass-darwin-amd64
+          # macOS Apple Silicon - no baseline variant needed (Apple
+          # Silicon has no x86 AVX2 exposure).
           - os: macos-15
             target: aarch64-apple-darwin
             artifact_name: cass
             asset_name: cass-darwin-arm64
-          # Windows - x86-64-v2 codegen pin below keeps this single artifact
-          # runnable on pre-AVX2 hosts.
+            cargo_flags: ""
+          # Windows - default (semantic-enabled) build.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: cass.exe
             asset_name: cass-windows-amd64
+            cargo_flags: ""
+          # Windows baseline - `--no-default-features --features
+          # qr,encryption` drops the prebuilt Microsoft ONNX Runtime
+          # binary so pre-AVX2 Windows hosts (Sandy/Ivy Bridge, e.g. the
+          # i7-3770K reporter in cass#256) no longer crash with
+          # STATUS_ILLEGAL_INSTRUCTION at static init.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: cass.exe
+            asset_name: cass-windows-amd64-baseline
+            cargo_flags: "--no-default-features --features qr,encryption"
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -95,9 +116,8 @@ jobs:
       - name: Clone sibling dependencies
         shell: bash
         run: |
-          # Path dependencies reference sibling directories (../repo).
-          # Keep the asupersync sibling checkout aligned with the crates.io
-          # version pinned in Cargo.toml.
+          # Path dependencies reference sibling directories (../repo)
+          # asupersync main transiently broken (trait-breaking API churn upstream); pin last SHA known-good for CASS builds.
           # Windows runners: enable long-path support. frankensqlite's default branch carries
           # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
           # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
@@ -107,7 +127,7 @@ jobs:
           # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
           # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
           # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f v0.3.4
+          git -C ../asupersync checkout --quiet -f db186126b40d9d3028be731ff1bfea47614e2b1b
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
@@ -124,9 +144,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # esaxx-rs requests /MT via cc-rs, while released Rust binaries use
-          # the dynamic MSVC CRT. Disable cc-rs defaults and choose /MD so the
-          # native tokenizer and the rest of the link agree.
+          # esaxx-rs requests /MT via cc-rs, while ONNX Runtime ships /MD objects.
+          # Disable cc-rs defaults and choose /MD explicitly so all linked objects agree.
           "CRATE_CC_NO_DEFAULTS=1" >> $env:GITHUB_ENV
           "CFLAGS=/MD" >> $env:GITHUB_ENV
           "CXXFLAGS=/MD" >> $env:GITHUB_ENV
@@ -155,25 +174,36 @@ jobs:
           echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        # `matrix.cargo_flags` is empty for default builds and
+        # "--no-default-features --features qr,encryption" for the cass#256
+        # `-baseline` builds (Linux/Windows amd64) that ship without
+        # fastembed + the prebuilt Microsoft ONNX Runtime binary.
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_flags }}
 
-      - name: Smoke-test release binary (Unix)
-        if: runner.os != 'Windows'
+      - name: Smoke-test baseline binary (Unix)
+        if: runner.os != 'Windows' && contains(matrix.asset_name, '-baseline')
         shell: bash
         run: |
           set -euo pipefail
           BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          # cass#256: a baseline binary must (1) run `--version` cleanly
+          # and (2) answer a tiny robot-mode command without loading ONNX
+          # Runtime. The JSON feature flag is pinned by the robot golden
+          # tests, where status/health have deterministic fixtures.
           "$BINARY" --version
-          API_VERSION="$("$BINARY" api-version --json | python3 -c 'import json,sys;print(json.load(sys.stdin).get("api_version", -1))')"
-          echo "api_version: ${API_VERSION}"
+          STATUS_FEATURE="$("$BINARY" api-version --json | python3 -c 'import json,sys;print(json.load(sys.stdin).get("api_version", -1))')"
+          echo "api_version (baseline): ${STATUS_FEATURE}"
 
-      - name: Smoke-test release binary (Windows)
-        if: runner.os == 'Windows'
+      - name: Smoke-test baseline binary (Windows)
+        if: runner.os == 'Windows' && contains(matrix.asset_name, '-baseline')
         shell: pwsh
         run: |
           $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          # cass#256: confirm the baseline binary at least answers
+          # `--version` on the Windows runner (which has AVX2 itself -
+          # the real pre-AVX2 validation happens off-CI on user hardware).
           & $binary --version
-          if ($LASTEXITCODE -ne 0) { throw "cass.exe --version failed: exit $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "baseline cass.exe --version failed: exit $LASTEXITCODE" }
 
       - name: Verify binary architecture (Unix)
         if: runner.os != 'Windows'
@@ -292,8 +322,7 @@ jobs:
       - name: Clone sibling dependencies
         shell: bash
         run: |
-          # Keep the asupersync sibling checkout aligned with the crates.io
-          # version pinned in Cargo.toml.
+          # asupersync main transiently broken (trait-breaking API churn upstream); pin last SHA known-good for CASS builds.
           # Windows runners: enable long-path support. frankensqlite's default branch carries
           # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
           # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
@@ -303,7 +332,7 @@ jobs:
           # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
           # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
           # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f v0.3.4
+          git -C ../asupersync checkout --quiet -f db186126b40d9d3028be731ff1bfea47614e2b1b
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
@@ -365,23 +394,7 @@ jobs:
       - name: Create combined checksums file
         run: |
           cd artifacts
-          # Recompute every checksum from the FINAL asset bytes, then derive both
-          # aggregates from that single computation, so they can never drift from
-          # what is published. Compress-Archive is non-deterministic and job
-          # re-runs can replace an asset after its build-time .sha256 was written;
-          # concatenating stale sidecars previously left SHA256SUMS.txt out of
-          # sync with the real bytes (and with the per-asset sidecars / SHA256SUMS
-          # alias). Emitting SHA256SUMS and SHA256SUMS.txt from the same pass also
-          # keeps the two names identical (the installer/self-updater tries both).
-          for f in *; do
-            case "$f" in
-              *.sha256 | *.sig | *.crt | *.spdx.json | SHA256SUMS | SHA256SUMS.txt) continue ;;
-            esac
-            [ -f "$f" ] || continue
-            sha256sum "$f" > "$f.sha256"
-          done
-          cat ./*.sha256 > SHA256SUMS
-          cp SHA256SUMS SHA256SUMS.txt
+          cat ./*.sha256 > SHA256SUMS.txt
 
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@62ad5284b8ced813296287a0b63906cb364b73ee # v0
@@ -503,8 +516,7 @@ jobs:
 
       - name: Clone sibling dependencies
         run: |
-          # Keep the asupersync sibling checkout aligned with the crates.io
-          # version pinned in Cargo.toml.
+          # asupersync main transiently broken (trait-breaking API churn upstream); pin last SHA known-good for CASS builds.
           # Windows runners: enable long-path support. frankensqlite's default branch carries
           # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
           # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
@@ -514,7 +526,7 @@ jobs:
           # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
           # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
           # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f v0.3.4
+          git -C ../asupersync checkout --quiet -f db186126b40d9d3028be731ff1bfea47614e2b1b
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch

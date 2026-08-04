@@ -179,6 +179,9 @@ pub enum HostUpgradeDisposition {
     UpgradeGatedByArchive,
     /// No supported installer/channel for this host: operator must intervene.
     InstallerUnavailable,
+    /// The bounded host probe expired before reachability or version state
+    /// could be established. This is unknown, not proof of unreachability.
+    ProbeTimedOut,
     /// The host could not be reached: nothing can be rehearsed now.
     Unreachable,
 }
@@ -192,6 +195,7 @@ impl HostUpgradeDisposition {
             HostUpgradeDisposition::NeedsManualUpgrade => "needs-manual-upgrade",
             HostUpgradeDisposition::UpgradeGatedByArchive => "upgrade-gated-by-archive",
             HostUpgradeDisposition::InstallerUnavailable => "installer-unavailable",
+            HostUpgradeDisposition::ProbeTimedOut => "probe-timed-out",
             HostUpgradeDisposition::Unreachable => "unreachable",
         }
     }
@@ -533,6 +537,9 @@ pub struct FleetUpgradeRehearsal {
     pub hosts_needing_upgrade: u64,
     /// Hosts that could not be reached.
     pub hosts_unreachable: u64,
+    /// Hosts whose bounded probe expired before reachability was established.
+    #[serde(default)]
+    pub hosts_timed_out: u64,
     /// Hosts whose data-affecting actions are gated by archive risk.
     pub hosts_gated_by_archive: u64,
     /// Hosts with no supported installer/channel.
@@ -790,6 +797,10 @@ fn classify_disposition(
     assessment: &VersionAssessment,
     preflight: &UpgradePreflight,
 ) -> HostUpgradeDisposition {
+    // A timeout is unknown, not evidence that the transport was unreachable.
+    if report.timed_out || matches!(report.status, HostProbeStatus::TimedOut) {
+        return HostUpgradeDisposition::ProbeTimedOut;
+    }
     // Unreachable hosts yield no deep state — nothing can be rehearsed now.
     if report.unreachable || matches!(report.status, HostProbeStatus::Unreachable) {
         return HostUpgradeDisposition::Unreachable;
@@ -833,7 +844,10 @@ pub fn rehearse_host(
 
     // Per-action steps: only build them when the host is reachable. An
     // unreachable host has no actionable plan (only a retry).
-    let reachable = !matches!(disposition, HostUpgradeDisposition::Unreachable);
+    let reachable = !matches!(
+        disposition,
+        HostUpgradeDisposition::Unreachable | HostUpgradeDisposition::ProbeTimedOut
+    );
     let actions: Vec<UpgradeActionStep> = if reachable {
         [
             UpgradeAction::BinaryUpgrade,
@@ -885,7 +899,13 @@ pub fn rehearse_host(
         install_method: assessment.install_hint.method,
         install_command,
         channel,
-        will_check_before_mutation: pre_mutation_checks(&preflight),
+        will_check_before_mutation: if reachable {
+            pre_mutation_checks(&preflight)
+        } else {
+            vec![
+                "confirm remote reachability and binary state before any mutation".to_string(),
+            ]
+        },
         not_touched: not_touched_list(),
         post_checks: PostUpgradeCheckSpec::battery(),
         safe_next_commands,
@@ -907,7 +927,7 @@ fn build_safe_commands(
     actions: &[UpgradeActionStep],
 ) -> Vec<String> {
     match disposition {
-        HostUpgradeDisposition::Unreachable => {
+        HostUpgradeDisposition::Unreachable | HostUpgradeDisposition::ProbeTimedOut => {
             vec!["cass doctor --check --json   # retry the bounded probe".to_string()]
         }
         HostUpgradeDisposition::InstallerUnavailable => {
@@ -974,6 +994,7 @@ pub fn rehearse_fleet(
     let mut hosts_up_to_date = 0u64;
     let mut hosts_needing_upgrade = 0u64;
     let mut hosts_unreachable = 0u64;
+    let mut hosts_timed_out = 0u64;
     let mut hosts_gated_by_archive = 0u64;
     let mut hosts_installer_unavailable = 0u64;
     let mut highest_archive_risk = ArchiveRisk::Unknown;
@@ -983,6 +1004,7 @@ pub fn rehearse_fleet(
         match host.disposition {
             HostUpgradeDisposition::UpToDate => hosts_up_to_date += 1,
             HostUpgradeDisposition::Unreachable => hosts_unreachable += 1,
+            HostUpgradeDisposition::ProbeTimedOut => hosts_timed_out += 1,
             HostUpgradeDisposition::UpgradeGatedByArchive => {
                 hosts_gated_by_archive += 1;
                 hosts_needing_upgrade += 1;
@@ -1025,6 +1047,7 @@ pub fn rehearse_fleet(
         hosts_up_to_date,
         hosts_needing_upgrade,
         hosts_unreachable,
+        hosts_timed_out,
         hosts_gated_by_archive,
         hosts_installer_unavailable,
         recommended_order,
@@ -1250,6 +1273,39 @@ mod tests {
         );
         // Live steps are not "skipped" because there was nothing reachable to do.
         assert!(plan.live_steps_skipped.is_empty());
+    }
+
+    #[test]
+    fn timed_out_host_never_receives_a_mutating_upgrade_plan() {
+        let host = linux_host("slow-host", None, HostProbeStatus::TimedOut);
+        let assessment = assess_host(&host, TARGET);
+        let plan = rehearse_host(&host, &assessment, &fresh_coverage(), RehearsalMode::Live);
+
+        assert_eq!(plan.disposition, HostUpgradeDisposition::ProbeTimedOut);
+        assert!(plan.actions.is_empty());
+        assert!(plan.blocked_next_commands.is_empty());
+        assert!(
+            plan.will_check_before_mutation
+                .iter()
+                .all(|check| !check.contains("reachability confirmed"))
+        );
+        assert!(
+            plan.safe_next_commands
+                .iter()
+                .any(|command| command.contains("doctor --check"))
+        );
+    }
+
+    #[test]
+    fn timed_out_boolean_also_blocks_a_partial_status_host() {
+        let mut host = linux_host("legacy-slow-host", None, HostProbeStatus::Partial);
+        host.timed_out = true;
+        let assessment = assess_host(&host, TARGET);
+        let plan = rehearse_host(&host, &assessment, &fresh_coverage(), RehearsalMode::Live);
+
+        assert_eq!(plan.disposition, HostUpgradeDisposition::ProbeTimedOut);
+        assert!(plan.actions.is_empty());
+        assert!(plan.blocked_next_commands.is_empty());
     }
 
     // --- Acceptance scenario 3: high archive-risk host -------------------------

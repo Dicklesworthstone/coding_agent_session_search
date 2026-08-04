@@ -64,7 +64,11 @@ fn fleet_command(home: &Path, args: &[&str], ignore_sources: bool) -> Command {
         .env("CASS_SEMANTIC_EMBEDDER", "hash")
         .env("NO_COLOR", "1")
         .env_remove("CODEX_HOME")
-        .env_remove("CLAUDE_CONFIG_DIR");
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CASS_FLEET_BUDGET_MS")
+        .env_remove("CASS_FLEET_PER_HOST_BUDGET_MS")
+        .env_remove("CASS_TEST_FLEET_PROBE_SLOW_MS")
+        .env_remove("CASS_TEST_FLEET_VERIFY_SLOW_MS");
     if ignore_sources {
         cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
     }
@@ -144,6 +148,12 @@ fn assert_envelope_invariants(v: &Value, expected_mode: &str) {
         v["target_version"].as_str().is_some_and(|s| !s.is_empty()),
         "target_version must be a non-empty string"
     );
+    assert!(
+        v["budget"].is_object(),
+        "rehearsal must expose its bounded execution contract"
+    );
+    assert!(v["budget"]["elapsed_ms"].as_u64().is_some());
+    assert!(v["budget"]["budget_ms"].as_u64().is_some());
 }
 
 /// A safe next command carries no recommendation-shaped destructive token. It is
@@ -367,6 +377,47 @@ fn verify_drives_the_bounded_local_post_upgrade_battery() {
 }
 
 #[test]
+fn requested_verification_skipped_by_budget_emits_json_and_exits_one() {
+    let home = tempfile::tempdir().expect("temp home");
+    let data_dir = home.path().join("xdg-data").join("coding-agent-search");
+    let mut cmd = fleet_command(
+        home.path(),
+        &["fleet", "upgrade-rehearsal", "--verify", "--json"],
+        true,
+    );
+    cmd.env("CASS_FLEET_BUDGET_MS", "50")
+        .env("CASS_TEST_FLEET_VERIFY_SLOW_MS", "2000");
+    let started = std::time::Instant::now();
+    let out = spawn_with_timeout_or_diag(
+        cmd,
+        "fleet-upgrade-rehearsal-verify-budget",
+        Some(&data_dir),
+        REHEARSAL_TIMEOUT,
+    );
+
+    assert!(
+        started.elapsed() < Duration::from_millis(1200),
+        "verification fixture escaped the configured fleet budget"
+    );
+    assert!(
+        !out.status.success(),
+        "requested verification without proof must exit non-zero"
+    );
+    let payload: Value =
+        serde_json::from_slice(&out.stdout).expect("skipped verification stdout must be JSON");
+    assert_eq!(payload["local_verification"], Value::Null);
+    assert_eq!(payload["budget"]["timed_out"], true);
+    assert!(
+        payload["budget"]["skipped_sections"]
+            .as_array()
+            .is_some_and(|sections| sections
+                .iter()
+                .any(|section| section.as_str() == Some("local_verification"))),
+        "budget must name the unproved verification battery: {payload}"
+    );
+}
+
+#[test]
 fn remote_source_is_named_but_not_contacted_without_live() {
     let home = tempfile::tempdir().expect("temp home");
     // Configure a remote source whose host is in the RFC 6761 `.invalid` TLD, so
@@ -418,6 +469,53 @@ fn remote_source_is_named_but_not_contacted_without_live() {
 }
 
 #[test]
+fn unknown_source_filter_fails_closed_instead_of_rehearsing_only_local() {
+    let home = tempfile::tempdir().expect("temp home");
+    write_unreachable_remote_source(home.path());
+    let data_dir = home.path().join("xdg-data").join("coding-agent-search");
+    let cmd = fleet_command(
+        home.path(),
+        &[
+            "fleet",
+            "upgrade-rehearsal",
+            "--source",
+            "typo-host",
+            "--json",
+        ],
+        false,
+    );
+    let out = spawn_with_timeout_or_diag(
+        cmd,
+        "fleet-upgrade-rehearsal-unknown-source",
+        Some(&data_dir),
+        REHEARSAL_TIMEOUT,
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(13),
+        "an unknown source filter must use the not-found exit code"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "an unknown source must not emit a misleading local-only rehearsal"
+    );
+    let error: Value =
+        serde_json::from_slice(&out.stderr).expect("unknown-source stderr must be pure JSON");
+    assert_eq!(error["error"]["kind"], "not-found");
+    assert_eq!(error["error"]["retryable"], false);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("typo-host"))
+            && error["error"]["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("unreachable-host")),
+        "unknown-source error must identify the typo and list the configured source: {error}"
+    );
+}
+
+#[test]
 fn live_all_unreachable_emits_complete_json_then_exits_one() {
     let home = tempfile::tempdir().expect("temp home");
     write_unreachable_remote_source(home.path());
@@ -430,7 +528,11 @@ fn live_all_unreachable_emits_complete_json_then_exits_one() {
     );
 
     assert_envelope_invariants(&v, "live");
-    assert_eq!(v["probed_remote_hosts"].as_bool(), Some(true));
+    assert_eq!(
+        v["probed_remote_hosts"].as_bool(),
+        Some(false),
+        "an SSH exit-255 transport failure is not confirmed remote contact"
+    );
     assert_eq!(v["rehearsal"]["hosts_unreachable"].as_u64(), Some(1));
     assert!(
         v["rehearsal"]["hosts"]
@@ -440,6 +542,156 @@ fn live_all_unreachable_emits_complete_json_then_exits_one() {
                     && host["disposition"].as_str() == Some("unreachable")
             })),
         "the non-zero payload must preserve the unreachable host evidence"
+    );
+}
+
+#[test]
+fn live_probe_timeout_preserves_host_identity_and_partial_budget() {
+    let home = tempfile::tempdir().expect("temp home");
+    write_unreachable_remote_source(home.path());
+    let data_dir = home.path().join("xdg-data").join("coding-agent-search");
+    let mut cmd = fleet_command(
+        home.path(),
+        &[
+            "fleet",
+            "upgrade-rehearsal",
+            "--live",
+            "--source",
+            "unreachable-host",
+            "--target-version",
+            "9.9.9",
+            "--json",
+            "--budget-ms",
+            "1000",
+            "--per-host-budget-ms",
+            "50",
+        ],
+        false,
+    );
+    cmd.env("CASS_TEST_FLEET_PROBE_SLOW_MS", "2000");
+    let started = std::time::Instant::now();
+    let out = spawn_with_timeout_or_diag(
+        cmd,
+        "fleet-upgrade-rehearsal-budget-timeout",
+        Some(&data_dir),
+        REHEARSAL_TIMEOUT,
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1200),
+        "pre-SSH fixture escaped the configured per-host budget"
+    );
+    assert!(
+        out.status.success(),
+        "a named partial timeout is a valid rehearsal report: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: Value =
+        serde_json::from_slice(&out.stdout).expect("fleet timeout stdout must be JSON");
+    let budget = &payload["budget"];
+    assert_eq!(budget["timed_out"], false);
+    assert!(
+        budget["skipped_sections"]
+            .as_array()
+            .is_some_and(|sections| sections.iter().any(|section| {
+                section.as_str() == Some("source:unreachable-host:remote_probe")
+            })),
+        "fleet budget must name the skipped host probe: {budget}"
+    );
+    let retry = budget["recommended_next_probe"]
+        .as_str()
+        .expect("fleet partial must carry a retry probe");
+    assert!(
+        retry.contains(
+            "fleet upgrade-rehearsal --target-version 9.9.9 --live --source unreachable-host --json"
+        ) && retry.contains("--budget-ms 2000")
+            && retry.contains("--per-host-budget-ms 1000")
+            && retry.contains("--data-dir")
+            && !retry.contains("CASS_FLEET_"),
+        "fleet retry must preserve scope and raise both budgets with cross-platform CLI flags: {retry}"
+    );
+    assert_eq!(
+        payload["probed_remote_hosts"], false,
+        "a host shed before SSH starts must not be reported as contacted"
+    );
+    assert!(
+        payload["rehearsal"]["hosts"]
+            .as_array()
+            .is_some_and(|hosts| hosts.iter().any(|host| {
+                host["host_alias"].as_str() == Some("unreachable-host")
+                    && host["disposition"].as_str() == Some("probe-timed-out")
+                    && host["channel"].as_str() == Some("unsupported")
+            })),
+        "a timed-out host with no platform hint must survive without a fabricated Linux channel: {payload}"
+    );
+    assert_eq!(
+        payload["rehearsal"]["hosts_unreachable"], 0,
+        "a timeout is unknown and must not count as confirmed unreachable"
+    );
+    assert_eq!(
+        payload["rehearsal"]["hosts_timed_out"], 1,
+        "the timed-out host must have its own fleet rollup"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn live_hung_ssh_child_is_killed_within_the_host_budget() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().expect("temp home");
+    write_unreachable_remote_source(home.path());
+    let fixture_bin = home.path().join("fixture-bin");
+    std::fs::create_dir_all(&fixture_bin).expect("create fixture bin");
+    let fake_ssh = fixture_bin.join("ssh");
+    std::fs::write(&fake_ssh, "#!/bin/sh\nsleep 30\n").expect("write fake ssh");
+    std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake ssh executable");
+    let original_path = dotenvy::var("PATH").unwrap_or_default();
+    let data_dir = home.path().join("xdg-data").join("coding-agent-search");
+    let mut cmd = fleet_command(
+        home.path(),
+        &["fleet", "upgrade-rehearsal", "--live", "--json"],
+        false,
+    );
+    cmd.env("PATH", format!("{}:{original_path}", fixture_bin.display()))
+        .env("CASS_FLEET_PER_HOST_BUDGET_MS", "150")
+        .env("CASS_FLEET_BUDGET_MS", "1000");
+    let started = std::time::Instant::now();
+    let out = spawn_with_timeout_or_diag(
+        cmd,
+        "fleet-upgrade-rehearsal-hung-ssh",
+        Some(&data_dir),
+        REHEARSAL_TIMEOUT,
+    );
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "hung SSH child or grandchild escaped the fleet deadline"
+    );
+    assert!(
+        out.status.success(),
+        "a named partial timeout is a valid rehearsal report: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("hung-ssh stdout must be JSON");
+    assert_eq!(
+        payload["probed_remote_hosts"], false,
+        "starting a local ssh child is not proof that the remote command layer was contacted"
+    );
+    assert_eq!(payload["budget"]["timed_out"], false);
+    assert!(
+        payload["budget"]["elapsed_ms"]
+            .as_u64()
+            .is_some_and(|elapsed| elapsed < 1000),
+        "fleet report exceeded its configured total deadline: {payload}"
+    );
+    assert!(
+        payload["budget"]["skipped_sections"]
+            .as_array()
+            .is_some_and(|sections| sections
+                .iter()
+                .any(|section| section.as_str() == Some("source:unreachable-host:remote_probe"))),
+        "the timed-out host probe must be named: {payload}"
     );
 }
 

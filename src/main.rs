@@ -222,22 +222,25 @@ fn apply_default_fsqlite_read_witness_cap() {
 }
 
 fn main() -> anyhow::Result<()> {
-    // (cass #356) Restore the default SIGPIPE disposition so an early-exiting
-    // pipe consumer (`cass ... --json | head`) terminates cass quietly with
-    // the conventional 141 instead of panicking on EPIPE — which, under the
-    // release profile's panic=abort, dumps a SIGABRT crash report per run.
-    // Daemon/socket I/O is unaffected: Rust's std sends with MSG_NOSIGNAL on
-    // Linux and sets SO_NOSIGPIPE on Apple platforms, so only pipe/stdio
-    // writes regain the default kill-on-EPIPE behavior.
-    #[cfg(unix)]
-    sigpipe::reset();
-
-    // (cass #308) The semantic stack is now pure-Rust (frankensearch `native`
-    // frankentorch embedder + reranker), so there is no prebuilt ONNX Runtime and
-    // no AVX/AVX2 static-init hazard. The old pre-AVX2 preflight + `-baseline`
-    // artifact (#256/#307) are obsolete: a single binary runs on any x86_64 CPU,
-    // with NEON (aarch64) / AVX2+FMA-when-present (x86) selected at runtime by the
-    // int8 GEMM kernels.
+    // Check for AVX2 support before anything else. The prebuilt ONNX Runtime
+    // binary linked by semantic builds can execute AVX2 instructions during
+    // startup on x86_64, which crashes pre-AVX2 hosts with SIGILL/STATUS_ILLEGAL_INSTRUCTION.
+    #[cfg(all(target_arch = "x86_64", feature = "semantic"))]
+    {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!(
+                "Error: Your CPU does not support AVX2 instructions, which are required by this semantic-enabled cass build.\n\
+                 \n\
+                 The ONNX Runtime dependency used for semantic search is not safe on pre-AVX2 x86_64 CPUs.\n\
+                 For Sandy Bridge, Ivy Bridge, AMD FX/Phenom/Athlon, or other pre-AVX2 hosts,\n\
+                 install the matching cass -baseline artifact instead.\n\
+                 \n\
+                 Without AVX2, the process would crash with a SIGILL (illegal instruction) signal.\n\
+                 Please run this build on a machine with AVX2, or use the baseline artifact."
+            );
+            std::process::exit(1);
+        }
+    }
 
     // Load .env early; ignore if missing.
     dotenvy::dotenv().ok();

@@ -356,6 +356,36 @@ fn test_custom_evaluation_config() {
 }
 
 #[test]
+fn test_zero_ndcg_k_is_invalid_input_before_corpus_or_model_work() {
+    let harness = EvaluationHarness::with_config(EvaluationConfig {
+        warmup_queries: 1,
+        timing_iterations: 1,
+        ndcg_k: 0,
+    });
+    let corpus = EvaluationCorpus::new("empty");
+    let embedder = FixtureEmbedder::new("test", 16);
+    let metadata = ModelMetadata {
+        id: "test".to_string(),
+        name: "Test".to_string(),
+        source: "test".to_string(),
+        release_date: "2025-12-01".to_string(),
+        dimension: Some(16),
+        size_bytes: Some(0),
+        is_baseline: false,
+    };
+
+    let error = harness
+        .evaluate(&embedder, &corpus, &metadata)
+        .expect_err("NDCG requires a positive ranking cutoff");
+    assert_eq!(error, "invalid-input: ndcg-k-zero");
+    assert_eq!(
+        embedder.calls(),
+        0,
+        "config validation must run before corpus or model work"
+    );
+}
+
+#[test]
 fn test_corpus_hash_stability() {
     let corpus1 = EvaluationCorpus::code_search_sample();
     let corpus2 = EvaluationCorpus::code_search_sample();
@@ -382,9 +412,144 @@ fn test_empty_corpus_error() {
         is_baseline: false,
     };
 
-    let result = harness.evaluate(&embedder, &corpus, &metadata);
-    assert!(result.is_err(), "Empty corpus should return error");
-    assert!(result.unwrap_err().contains("Empty corpus"));
+    let error = harness
+        .evaluate(&embedder, &corpus, &metadata)
+        .expect_err("empty corpus should return an explicit no-data error");
+    assert_eq!(error, "no-data: empty-corpus");
+    assert_eq!(
+        embedder.calls(),
+        0,
+        "corpus validation must run before model work"
+    );
+}
+
+#[test]
+fn test_empty_judgments_are_no_data_before_model_work() {
+    let harness = EvaluationHarness::new();
+    let mut corpus = EvaluationCorpus::new("empty-judgments");
+    corpus.add_document("d1", "document");
+    corpus.add_query("query", vec![]);
+    let embedder = FixtureEmbedder::new("test", 16);
+    let metadata = ModelMetadata {
+        id: "test".to_string(),
+        name: "Test".to_string(),
+        source: "test".to_string(),
+        release_date: "2025-12-01".to_string(),
+        dimension: Some(16),
+        size_bytes: Some(0),
+        is_baseline: false,
+    };
+
+    let error = harness
+        .evaluate(&embedder, &corpus, &metadata)
+        .expect_err("a query without judgments has no evaluation truth");
+    assert_eq!(error, "no-data: empty-judgments:query-index=0");
+    assert_eq!(embedder.calls(), 0);
+}
+
+#[test]
+fn test_non_finite_relevance_is_invalid_input_before_model_work() {
+    let harness = EvaluationHarness::new();
+    let mut corpus = EvaluationCorpus::new("non-finite-relevance");
+    corpus.add_document("d1", "document");
+    corpus.add_query("query", vec![("d1", f64::NAN)]);
+    let embedder = FixtureEmbedder::new("test", 16);
+    let metadata = ModelMetadata {
+        id: "test".to_string(),
+        name: "Test".to_string(),
+        source: "test".to_string(),
+        release_date: "2025-12-01".to_string(),
+        dimension: Some(16),
+        size_bytes: Some(0),
+        is_baseline: false,
+    };
+
+    let error = harness
+        .evaluate(&embedder, &corpus, &metadata)
+        .expect_err("non-finite relevance must not be normalized into zero quality");
+    assert_eq!(
+        error,
+        "invalid-input: non-finite-relevance:query-index=0:judgment-index=0"
+    );
+    assert_eq!(embedder.calls(), 0);
+}
+
+#[test]
+fn test_negative_relevance_is_invalid_input_before_model_work() {
+    let harness = EvaluationHarness::new();
+    let mut corpus = EvaluationCorpus::new("negative-relevance");
+    corpus.add_document("d1", "document");
+    corpus.add_query("query", vec![("d1", -1.0)]);
+    let embedder = FixtureEmbedder::new("test", 16);
+    let metadata = ModelMetadata {
+        id: "test".to_string(),
+        name: "Test".to_string(),
+        source: "test".to_string(),
+        release_date: "2025-12-01".to_string(),
+        dimension: Some(16),
+        size_bytes: Some(0),
+        is_baseline: false,
+    };
+
+    let error = harness
+        .evaluate(&embedder, &corpus, &metadata)
+        .expect_err("negative relevance is outside the documented NDCG label domain");
+    assert_eq!(
+        error,
+        "invalid-input: negative-relevance:query-index=0:judgment-index=0"
+    );
+    assert_eq!(embedder.calls(), 0);
+}
+
+#[test]
+fn test_dangling_judgment_document_is_invalid_input_before_model_work() {
+    let harness = EvaluationHarness::new();
+    let mut corpus = EvaluationCorpus::new("dangling-judgment");
+    corpus.add_document("d1", "document");
+    corpus.add_query("query", vec![("missing", 3.0)]);
+    let embedder = FixtureEmbedder::new("test", 16);
+    let metadata = ModelMetadata {
+        id: "test".to_string(),
+        name: "Test".to_string(),
+        source: "test".to_string(),
+        release_date: "2025-12-01".to_string(),
+        dimension: Some(16),
+        size_bytes: Some(0),
+        is_baseline: false,
+    };
+
+    let error = harness
+        .evaluate(&embedder, &corpus, &metadata)
+        .expect_err("judgments must refer to documents in the evaluated corpus");
+    assert_eq!(
+        error,
+        "invalid-input: unknown-document-id:query-index=0:judgment-index=0"
+    );
+    assert_eq!(embedder.calls(), 0);
+}
+
+#[test]
+fn test_all_zero_judgments_are_no_data_not_successful_zero_quality() {
+    let harness = EvaluationHarness::new();
+    let mut corpus = EvaluationCorpus::new("zero-ground-truth");
+    corpus.add_document("d1", "document");
+    corpus.add_query("query", vec![("d1", 0.0)]);
+    let embedder = FixtureEmbedder::new("test", 16);
+    let metadata = ModelMetadata {
+        id: "test".to_string(),
+        name: "Test".to_string(),
+        source: "test".to_string(),
+        release_date: "2025-12-01".to_string(),
+        dimension: Some(16),
+        size_bytes: Some(0),
+        is_baseline: false,
+    };
+
+    let error = harness
+        .evaluate(&embedder, &corpus, &metadata)
+        .expect_err("all-zero ground truth has no NDCG denominator");
+    assert_eq!(error, "no-data: no-positive-relevance:query-index=0");
+    assert_eq!(embedder.calls(), 0);
 }
 
 #[test]

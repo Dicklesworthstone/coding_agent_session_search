@@ -40,12 +40,6 @@
         "fresh": {
           "type": "boolean"
         },
-        "partial": {
-          "type": "boolean"
-        },
-        "partial_reason": {
-          "type": "null"
-        },
         "last_indexed_at": {
           "type": "null"
         },
@@ -404,9 +398,6 @@
         "progressive_ready": {
           "type": "boolean"
         },
-        "progressive_reason_code": {
-          "type": "null"
-        },
         "feature_compiled_in": {
           "type": "boolean"
         },
@@ -448,9 +439,6 @@
             },
             "size_bytes": {
               "type": "null"
-            },
-            "shard_count": {
-              "type": "null"
             }
           }
         },
@@ -482,9 +470,6 @@
               "type": "null"
             },
             "size_bytes": {
-              "type": "null"
-            },
-            "shard_count": {
               "type": "null"
             }
           }
@@ -779,54 +764,6 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
-        }
-      }
-    },
-    "daemon_runtime": {
-      "type": "object",
-      "properties": {
-        "schema_version": {
-          "type": "integer"
-        },
-        "state": {
-          "type": "string"
-        },
-        "observation": {
-          "type": "object",
-          "properties": {
-            "socket_path": {
-              "type": "string"
-            },
-            "data_dir": {
-              "type": "string"
-            },
-            "run_lock_present": {
-              "type": "boolean"
-            },
-            "socket_present": {
-              "type": "boolean"
-            },
-            "socket_connectable": {
-              "type": "boolean"
-            },
-            "connect_timed_out": {
-              "type": "boolean"
-            }
-          }
-        },
-        "recovery": {
-          "type": "object",
-          "properties": {
-            "action_needed": {
-              "type": "boolean"
-            },
-            "disposable_runtime_artifact": {
-              "type": "boolean"
-            },
-            "why": {
-              "type": "string"
-            }
           }
         }
       }
@@ -1669,98 +1606,6 @@
         }
       }
     },
-    "search_completeness": {
-      "type": "object",
-      "properties": {
-        "quarantine_status": {
-          "type": "string"
-        },
-        "quarantined_conversations": {
-          "type": "integer"
-        },
-        "complete": {
-          "type": "boolean"
-        },
-        "can_search": {
-          "type": "boolean"
-        },
-        "coverage_suspect": {
-          "type": "boolean"
-        },
-        "impact": {
-          "type": "string"
-        },
-        "next_command": {
-          "type": "string"
-        }
-      }
-    },
-    "root_cause": {
-      "type": "object",
-      "properties": {
-        "schema_version": {
-          "type": "integer"
-        },
-        "family": {
-          "type": "string"
-        },
-        "locus": {
-          "type": "string"
-        },
-        "confidence": {
-          "type": "string"
-        },
-        "evidence_refs": {
-          "type": "array",
-          "items": {
-            "type": "unknown"
-          }
-        },
-        "summary": {
-          "type": "string"
-        },
-        "recommended_next_probe": {
-          "type": "string"
-        }
-      }
-    },
-    "storage_integrity": {
-      "type": "object",
-      "properties": {
-        "storage_state": {
-          "type": "string"
-        },
-        "source_of_truth_risk": {
-          "type": "string"
-        },
-        "archive_readability": {
-          "type": "string"
-        },
-        "checks_attempted": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "name": {
-                "type": "string"
-              },
-              "elapsed_ms": {
-                "type": "integer"
-              },
-              "timed_out": {
-                "type": "boolean"
-              },
-              "skipped_reason": {
-                "type": "string"
-              },
-              "read_only": {
-                "type": "boolean"
-              }
-            }
-          }
-        }
-      }
-    },
     "recommended_action": {
       "type": "string"
     },
@@ -1796,29 +1641,6 @@
           "retry_after_ms": {
             "type": "null"
           }
-        }
-      }
-    },
-    "budget": {
-      "type": "object",
-      "properties": {
-        "elapsed_ms": {
-          "type": "integer"
-        },
-        "budget_ms": {
-          "type": "integer"
-        },
-        "timed_out": {
-          "type": "boolean"
-        },
-        "skipped_sections": {
-          "type": "array",
-          "items": {
-            "type": "unknown"
-          }
-        },
-        "recommended_next_probe": {
-          "type": "null"
         }
       }
     },

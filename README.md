@@ -11,7 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, and Grok Build into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi Code, Qwen Code, and Factory (Droid) into a single, searchable timeline.
 
 <div align="center">
 
@@ -86,7 +86,7 @@ cass sources agents include openclaw
 - Lexical search is the required fast path. Missing, stale, or incompatible lexical assets are treated as derived-state problems that cass should rebuild from SQLite instead of asking operators to perform routine manual repair.
 - Hybrid is the default search intent. Robot metadata (`--robot --robot-meta`) reports the requested mode, realized mode, semantic refinement status, and any lexical fallback reason when semantic assets are not ready.
 - Semantic assets are opportunistic background enrichment. Lexical-only results are expected during first indexing, semantic catch-up, disabled semantic policy, or unavailable local model/vector files.
-- Semantic model acquisition is **opt-in**: `cass models install` downloads `all-minilm-l6-v2` (alias `minilm`, ~90 MB) on explicit request; cass never auto-downloads. This is the only embedder topology currently verified by the pure-Rust native backend. Air-gapped installs use `--from-file <dir>`. While it is absent, hybrid search uses lexical-only and reports `fallback_mode="lexical"` in health/status.
+- Semantic model acquisition is **opt-in**: `cass models install` downloads the requested embedder on explicit request; cass never auto-downloads. Three embedders are supported via `--model <name>`: `all-minilm-l6-v2` (alias `minilm`, ~90 MB; the default), `snowflake-arctic-s` (~120 MB), and `nomic-embed` (~270 MB). Air-gapped installs use `--from-file <dir>`. While the chosen model is absent, search silently uses lexical-only and reports `fallback_mode="lexical"` in health/status.
 - `cass triage --json` is the safest first command for agents: it combines readiness, `next_command`, `recommended_commands[]`, docs/schema pointers, starter workflows, and accepted recoveries. `cass health --json` and `cass status --json` remain the narrower truth surfaces for readiness, active rebuilds, and recovery.
 
 **Lexical publish durability (atomic-swap)**
@@ -100,7 +100,7 @@ cass sources agents include openclaw
 - Lexical generation cleanup uses a dispositions + inspection-required-first policy. Operators running `cass doctor --fix` never have a generation reclaimed silently — every quarantine stays on disk until an explicit derived-asset rebuild (`cass models backfill` or an index refresh recommended by `cass health --json`) supersedes it.
 
 **Schema stability guarantees**
-- The JSON contract surfaces (`triage`, `capabilities`, `health`, `status`, `diag`, `models status`, `models verify`, `models check-update`, `introspect`, `doctor`, `api-version`, `stats`, `sessions`, `search`, `pack`, `swarm status`, `swarm work-packet`, `swarm lint`) are pinned by golden-file regression tests under `tests/golden/robot/`. A change to any field name, type, or nullability fails the golden test suite and requires a deliberate regeneration pass (`UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`).
+- The JSON contract surfaces (`triage`, `capabilities`, `health`, `status`, `diag`, `models status`, `models verify`, `models check-update`, `introspect`, `doctor`, `api-version`, `stats`, `sessions`, `search`, `pack`, `swarm status`, `swarm work-packet`, `swarm lint`) are pinned by golden-file regression tests under `tests/golden/robot/`. A change to any field name, type, or nullability fails the golden test suite and requires a deliberate regeneration pass (`UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`).
 - `cass introspect --json`'s `response_schemas` block enumerates every schema in a stable alphabetical order (`BTreeMap`-backed — see bead coding_agent_session_search-8sl73).
 - Error envelopes (`{error: {code, kind, message, hint, retryable}}`) have a fixed shape. `kind` values are kebab-case; branch on `err.kind`, not on the numeric code, for codes ≥ 10 (see the Error Handling section below).
 
@@ -215,21 +215,17 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Zero-Stall Updates**: The background indexer commits changes atomically; `reader.reload()` ensures new messages appear in the search bar immediately without restarting.
 
 ### 🧠 Optional Semantic Search (Local Inference, No Network at Query Time)
-- **Local inference**: Uses frankensearch's pure-Rust native MiniLM implementation with local safetensors weights. Once MiniLM is installed, no network traffic is required to answer queries.
-- **Warm-daemon reuse**: Semantic and hybrid CLI searches automatically use an
-  already-running local embedding daemon (including a socket selected with
-  `CASS_DAEMON_SOCKET`) and only initialize the installed in-process model if
-  daemon inference fails. Pass `--daemon` to permit auto-spawning a missing
-  daemon, or `--no-daemon` to force direct inference. `--fast-only` stays in
-  the deterministic hash-vector space, and daemon responses are accepted only
-  when their reported embedder matches the active vector index. The one-shot
-  CLI's `--two-tier` output is the final quality result set, while the TUI is
-  the surface that displays fast results and refines them in place.
-- **Opt-in acquisition**: `cass models install` downloads `all-minilm-l6-v2` from Hugging Face on explicit request and verifies SHA256 checksums. Nothing is fetched until you run the install command. MiniLM is 384-dimensional and about 90 MB; no other embedder topology is currently installable or runnable.
+- **Local inference**: Uses a FastEmbed embedder running ONNX on-device. Once the chosen model is installed, no network traffic is required to answer queries.
+- **Opt-in acquisition**: `cass models install` downloads the requested embedder from Hugging Face on explicit request and verifies SHA256 checksums. Nothing is fetched until you run the install command. Three embedders are supported:
+  - `all-minilm-l6-v2` — `cass models install --model all-minilm-l6-v2` (alias: `minilm`). 384-dim. ~90 MB. The default; fastest. Best for general English semantic similarity.
+  - `snowflake-arctic-s` — `cass models install --model snowflake-arctic-s`. 384-dim. ~120 MB. Stronger MTEB scores than MiniLM at similar cost; good drop-in replacement for code-heavy corpora.
+  - `nomic-embed` — `cass models install --model nomic-embed` (alias: `nomic-embed-text-v1.5`). 768-dim. ~270 MB. Highest recall on long-context queries; trade off larger index footprint.
 
-- **Air-gapped install**: `cass models install --model minilm --from-file <dir>` accepts a pre-downloaded MiniLM directory so you can bring the assets in yourself.
+  Removal mirrors install: `cass models remove --model <name>` accepts the same alias set. The same alias map is honored by the daemon embedding worker (see `src/daemon/worker.rs::resolve_embedder_kind`) so background indexing accepts whatever the operator installed.
+
+- **Air-gapped install**: `cass models install --model <name> --from-file <dir>` accepts a pre-downloaded model directory so you can bring the assets in yourself.
 - **Required files** (all must be present after install; `cass models verify` checks them):
-  - `model.safetensors`
+  - `model.onnx`
   - `tokenizer.json`
   - `config.json`
   - `special_tokens_map.json`
@@ -237,9 +233,9 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Vector index**: Stored as `vector_index/index-<embedder>.fsvi` in the data directory.
 - **Lexical fail-open**: While the model is absent, `cass` returns lexical-only results and reports `fallback_mode="lexical"` in health/status; search never blocks on semantic assets.
 
-#### Explicit Hash Vector Tier
+#### Hash Embedder Fallback
 
-The deterministic hash embedder is available only when explicitly selected, such as with `--fast-only`, `--embedder hash`, or `CASS_SEMANTIC_EMBEDDER=hash`. It is a separate lexical-feature vector space, not a silent substitute for missing MiniLM vectors:
+When ML model files are not installed, `cass` uses a deterministic hash-based embedder as a fallback. While not "truly" semantic (it captures lexical overlap rather than meaning), it provides useful functionality:
 
 | Feature | ML Model (MiniLM) | Hash Embedder (FNV-1a) |
 |---------|-------------------|------------------------|
@@ -258,7 +254,7 @@ The deterministic hash embedder is available only when explicitly selected, such
 **When to Use**:
 - Quick setup without downloading model files
 - Environments where ML inference overhead is unwanted
-- Fast-tier testing or an explicitly chosen degraded mode
+- Fallback when ML model fails to load
 
 **Override**: Set `CASS_SEMANTIC_EMBEDDER=hash` to force hash mode even when ML model is available.
 
@@ -285,7 +281,7 @@ The deterministic hash embedder is available only when explicitly selected, such
 
 **Lexical Search**: Uses Tantivy's BM25 implementation with edge n-grams for prefix matching. Best when you know the exact terms you're looking for. The lexical index is derived from SQLite; if it is missing, stale, or incompatible, cass reports the state and rebuilds through the normal indexing path from the canonical database.
 
-**Semantic Search**: Computes vector similarity between query and indexed MiniLM embeddings. Finds conceptually related content even without exact term overlap. Explicit semantic mode requires the MiniLM model and a compatible MiniLM vector index; it never substitutes same-dimensional hash vectors.
+**Semantic Search**: Computes vector similarity between query and indexed message embeddings. Finds conceptually related content even without exact term overlap. Requires either the ML model (MiniLM) or falls back to hash embedder.
 
 **Hybrid Search**: The default. It combines lexical and semantic results using Reciprocal Rank Fusion (RRF) when semantic assets are ready, and it fails open to lexical when semantic enrichment is still catching up or disabled:
 ```
@@ -360,7 +356,7 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from 23 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
+Ingests history from 20 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model:
 - **Codex**: `~/.codex/sessions` (Rollout JSONL)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
@@ -374,18 +370,15 @@ Ingests history from 23 local agents, normalizing them into a unified `Conversat
 - **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
 - **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
-- **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content), plus Oh My Pi (`omp`) at `~/.omp/agent/sessions` — same wire format, including per-session sub-agent transcripts
+- **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content)
 - **GitHub Copilot Chat**: VS Code global storage under `github.copilot-chat` (JSON)
 - **Copilot CLI**: `~/.copilot/session-state`, legacy `~/.copilot/history-session-state`, and `gh copilot` config paths (JSONL/JSON)
 - **OpenClaw**: `~/.openclaw/agents/*/sessions` (Session JSONL)
 - **Crush**: `~/.crush/crush.db` and per-project `.crush/crush.db` (SQLite)
 - **Hermes**: `~/.hermes/state.db` and project-local `.hermes/state.db` (SQLite)
-- **Kimi Code**: `$KIMI_CODE_HOME/sessions/*/*/agents/*/wire.jsonl` (default `~/.kimi-code`; sub-agents index as `<sessionId>:<agentId>`), plus the legacy `~/.kimi/sessions/*/*/wire.jsonl` layout (Session JSONL)
+- **Kimi Code**: `~/.kimi/sessions/*/*/wire.jsonl` (Session JSONL)
 - **Qwen Code**: `~/.qwen/tmp/*/chats/session-*.json` (Chat JSON)
 - **Factory (Droid)**: `~/.factory/sessions` (JSONL files organized by workspace slug)
-- **Antigravity (agy)**: `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl` (clean JSONL transcript), with the durable per-conversation `conversations/<uuid>.db` (SQLite) mirrored alongside. Resume with `cass resume <transcript> --agent agy` (`agy --conversation <uuid>`).
-- **OpenHands (OpenDevin)**: `~/.openhands/conversations/<id>/` — `base_state.json` metadata plus an `events/event-NNNNN-<uuid>.json` event stream (JSON)
-- **Grok Build (xAI `grok`)**: `~/.grok/sessions/<percent-encoded-cwd>/<session-uuid>/` — `updates.jsonl` (authoritative ACP session-update stream) with `summary.json` metadata and `chat_history.jsonl` fallback (override the base dir with `GROK_HOME`). Resume with `grok --resume <session-id>`.
 
 Claude Code Desktop sidecars preserve title, workspace, model, and session IDs,
 but not necessarily the full conversation body. If Claude Code has culled an old
@@ -541,13 +534,6 @@ Remote source diagnostics are intentionally local-only. `cass triage --json`,
 `sync_status.json`, the local `remotes/<source>/mirror/` copy, and archive DB
 provenance rows. They do not open SSH sessions, mutate remote machines, or
 rewrite provider session logs while classifying source gaps.
-
-`cass sources doctor` is the explicit networked exception: it performs bounded,
-read-only probes of configured source hosts. Its per-source human summary keeps
-the same native reachability, binary-health, and mirror/sync state codes and
-safe command as the JSON report. It intentionally does not claim local search
-readiness, because a remote host probe cannot establish the controller's local
-SQLite, lexical, or semantic asset state.
 
 This matters because agent harnesses can prune their own logs. If a laptop is
 retired, a remote path disappears, or a provider truncates older sessions, the
@@ -827,7 +813,7 @@ The CLI applies multiple normalization layers:
 3. **Snake-case flag recovery**: `--max_results`, `--data_dir`, and other known snake_case long flags become canonical kebab-case before alias recovery runs
 4. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
 5. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `answer`/`evidence`/`bundle`/`handoff`/`why`/`explain`/`rca`/`root-cause`/`summarize` → `pack`; `html-export`/`html_export`/`exporthtml` → `export-html`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
-6. **Robot-docs topic shorthands**: non-command topics such as `commands`, `schemas`, `examples`, `exit-codes`, and `quickstart` become `robot-docs <topic>` instead of falling through to search; command topics such as `doctor` and `sources` use structured help (`cass help doctor --json`, `cass sources --help --json`). Bare `cass guide` is reserved for the guided-operations planner; use `cass robot-docs guide` for the robot-docs walkthrough.
+6. **Robot-docs topic shorthands**: non-command topics such as `commands`, `schemas`, `examples`, `exit-codes`, and `guide` become `robot-docs <topic>` instead of falling through to search; command topics such as `doctor` and `sources` use structured help (`cass help doctor --json`, `cass sources --help --json`)
 7. **Root robot default**: `cass --json`, `cass --robot`, or `cass --robot-format json` with no subcommand runs read-only `triage`
 8. **Leading structured flag recovery**: `--json`/`--robot` before a robot-capable subcommand is moved onto that subcommand
 9. **Named positional recovery**: `--query`/`--q`/`--text`/`--pattern` for search/pack and `--path`/`--source-path`/`--file`/`--session` for drill-down/export commands become the required positional argument
@@ -868,48 +854,6 @@ cass search "error" --robot-format compact
 cass search "error" --robot --robot-meta
 # → { "hits": [...], "_meta": { "elapsed_ms": 12, "cache_hit": true, "wildcard_fallback": false, ... } }
 
-# Per-hit trust verdict (advisory; --robot-meta only)
-cass search "error" --robot --robot-meta
-# Each hit then carries a metadata-only `trust` block:
-#   "trust": {
-#     "schema_version": 1,
-#     "trust_tier": "unverified",     // trusted | likely | unverified | stale | failed
-#     "confidence": "medium",         // low | medium | high
-#     "provenance_refs": [],          // e.g. ["commit:ab0d12ef90ab", "bead:xyz", "release:v0.6.15"]
-#     "stale_reason": "aged_out",     // present only when not fully trusted
-#     "recommended_followup": "..."   // advisory next step (never a destructive command)
-#   }
-```
-
-**How agents should branch on `trust_tier`** (relevance is not correctness — a
-hit can be a landed fix or a failed attempt):
-
-| `trust_tier` | Meaning | What to do |
-|--------------|---------|------------|
-| `trusted` | Landed, proof-backed, release/bead-contained | Safe to reuse |
-| `likely` | Has provenance (commit/closed bead) but not proof-pinned | Confirm via the cited ref first |
-| `unverified` | Relevant but no provenance link, or lexical-only corroboration | Corroborate before reuse |
-| `stale` | Aged out (`aged_out`) or superseded (`superseded_by_newer`) | Prefer a newer result |
-| `failed` | A failed/reverted attempt (`failed_attempt`) | Do not reuse |
-
-The verdict is **advisory metadata only** — it never changes result ordering.
-It is derived from metadata-only signals (recency, source health, realized
-search mode, cwd-relative workspace match, and — opportunistically — linked
-commit/bead/release provenance); it carries no raw session text. The same
-`trust` block is attached to `cass pack` evidence. Branch on `trust_tier` and
-`stale_reason`, not on `confidence` alone.
-
-Provenance correlation is **project-scoped and explicit-reference anchored**:
-for a hit from the project you are running `cass` in now, cass links it to a
-closed bead / commit / proof / release only when the hit's own indexed text
-references a known identifier (`bead:<id>`, `commit:<sha>`, `release:<tag>`),
-joined against that project's local beads and git history. A temporal or
-workspace coincidence is never enough, so an unrelated conversation never
-inherits another's trust. Off-project hits report `workspace_mismatch`, and a
-hit whose local source file no longer exists on disk reports `source_unhealthy`
-(archive-only) instead of overtrusting a dead path.
-
-```bash
 # Deterministic answer pack for handoff prompts
 cass pack "why did checkout fail" --robot --max-tokens 12000 --limit 40
 
@@ -1127,42 +1071,6 @@ cass search "TODO" --agent claude --robot --aggregate workspace
 ```
 
 Top 10 buckets are returned per field, with `other_count` for remaining items.
-
-#### Bounded incident mining
-
-Mine recurrent CASS operational incidents from the canonical archive without
-dumping raw session text:
-
-```bash
-cass analytics incidents --limit 10 --json
-
-# Tighten the bounded scan for automation or a very large archive
-cass analytics incidents --max-sessions 500 --max-messages 50000 \
-  --max-bytes 67108864 --budget-ms 5000 --json
-```
-
-The response ranks `top_sessions[]` by hit count and category breadth and keeps
-the exact `conversation_id`, agent, host, `source_id`, `source_path`,
-live/archive state, dominant categories, and a structured `cass view` argv.
-That argv carries the effective `--db` path plus `--conversation-id`, so it
-opens the exact ranked archive row even when multiple sessions share a source
-path or the report used a non-default database.
-`total_sessions`, `total_hits`, and `top_sessions_truncated` distinguish the
-bounded ranked result from the totals observed inside the scan scope.
-`discovery.partial` and `stop_reason` explicitly distinguish a bounded partial
-scan from a complete scan. Counts are scoped to scanned candidates whenever the
-scan is partial. `--budget-ms` is a hard wall-clock result guard around the
-independently row-bounded read-only worker. If it expires before a verified
-result arrives, `count_scope="no_verified_results_hard_timeout"` returns an
-empty partial report instead of overstating in-flight observations. Candidate
-discovery is descending archive-row keyset paging;
-`--max-sessions` bounds that newest-row window before dimensional filters, so a
-selective filter can truthfully return a partial empty result instead of scanning
-an unbounded archive. Individual messages are inspected through a bounded 4,096-char
-fragment; an oversized message returns `message-fragment-capped` rather than
-claiming a complete corpus scan. Raw prompt/tool content is always suppressed; evidence carries
-only BLAKE3 fingerprints and basename-redacted paths. The actionable
-`source_path` remains visible solely so the returned view command works.
 
 ### Chained Search (Pipeline Mode)
 
@@ -2180,7 +2088,7 @@ classDiagram
 `cass` uses frankensqlite as the durable source of truth and frankensearch as a derived speed layer, powered by a suite of integrated "franken" libraries.
 
 ### The Pipeline
-1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 23 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi, Qwen, Factory, OpenHands, Antigravity, Grok Build).
+1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 20 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi, Qwen, Factory).
 2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation with `BEGIN CONCURRENT` support for MVCC multi-writer transactions.
 3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
@@ -2512,7 +2420,7 @@ cass completions powershell >> $PROFILE
 
 ## System Requirements
 
-- **CPU**: any x86_64 or ARM64 processor. Semantic search runs on a pure-Rust inference backend (frankensearch/native) with runtime-dispatched SIMD — NEON on Apple Silicon, AVX2/FMA when present on x86, SSE2/scalar fallback otherwise — so there is no AVX requirement and no `SIGILL` hazard (the historical ONNX Runtime dependency was removed in cass#308).
+- **CPU**: x86_64 processor with **AVX** instruction support (any Intel/AMD CPU from ~2011 onwards). The ONNX Runtime dependency used for semantic search requires AVX instructions. On CPUs without AVX support, the binary will crash with a `SIGILL` (illegal instruction) signal. The `cass` binary includes a runtime check and will print a clear error message if AVX is not detected, but note that ONNX Runtime may be loaded before this check in some code paths.
 - **OS**: Linux, macOS, or Windows
 - **Linux glibc**: Pre-built binaries require **glibc 2.38+** (Ubuntu 24.04+, Fedora 39+, Debian 13+). Ubuntu 20.04 (glibc 2.31) and 22.04 (glibc 2.35) are **not supported** with pre-built binaries. Users on older distributions should build from source with `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`. This requirement exists because CI builds target ubuntu-24.04 to access newer kernel features used by the frankensqlite storage engine.
 - **Disk**: Sufficient space for the search index (varies with session history size)
@@ -2831,7 +2739,7 @@ cass models check-update --json
 ```
 
 **Model Files** (stored in `$CASS_DATA_DIR/models/all-MiniLM-L6-v2/`):
-- `model.safetensors` - The neural network weights (~90MB)
+- `model.onnx` - The neural network weights (~90MB)
 - `tokenizer.json` - Vocabulary and tokenization rules
 - `config.json` - Model configuration
 - `special_tokens_map.json` - Special token definitions
@@ -2991,10 +2899,6 @@ Update check state is stored in the data directory:
 | `CASS_DATA_DIR` | Platform default | Override data directory |
 | `CASS_DB_PATH` | `$CASS_DATA_DIR/agent_search.db` | Override database path |
 | `CASS_EXCLUDE_PATHS` | unset | Comma/newline-delimited files or directory prefixes to skip without advancing scan/watch watermarks |
-| **Indexing & Redaction** | | |
-| `CASS_INDEX_REDACTION` | `full` | Index-time secret redaction: `full` scrubs API keys/tokens/passwords/private keys from every persisted message, title, snippet, and metadata blob before they reach SQLite or the lexical index; `off` skips redaction for faster ingest. **`off` means raw text is indexed** — note that the original session files and the cass raw-mirror blobs (`<data_dir>/raw-mirror/v1/`) already contain the same raw text unencrypted on the same disk, so `full` protects the queryable surfaces (search results, exports, robot output), not disk-at-rest secrecy. Unrecognized values warn and behave as `full`. |
-| `CASS_REDACT_SECRETS` | `1` | Legacy redaction toggle (`0`/`false`/`off`/`no` disables). `CASS_INDEX_REDACTION` takes precedence when both are set. |
-| `CASS_REDACT_MEMO_CAPACITY` | 4096 | Entry cap for the per-worker redaction memo cache used during batched persist. Raise on very large, boilerplate-heavy corpora if eviction churn shows up in `cass::redact::memo` debug logs. Only strings the secret prefilter flags as candidate-bearing are memoized, and individual inputs over 64 KiB are never cached (bounds worst-case cache memory). |
 | `CASS_NO_COLOR` | unset | Force monochrome TUI output |
 | `NO_COLOR` | unset | Honored by TUI only when `CASS_RESPECT_NO_COLOR=1` |
 | `CASS_RESPECT_NO_COLOR` | unset | Make TUI inherit global `NO_COLOR` |
@@ -3032,27 +2936,27 @@ Update check state is stored in the data directory:
 
 ## Dependency Source Contract
 
-`cass` pins dependency identities in [`Cargo.toml`](Cargo.toml): exact registry version requirements for crates.io-only dependencies and git revisions for source dependencies. Immutable remote `[patch.crates-io]` entries may unify transitive source identity; local sibling-path overrides stay commented out by default and must never be committed active.
+`cass` pins dependency identities in [`Cargo.toml`](Cargo.toml): exact registry version requirements for crates.io-only dependencies and git revisions for source dependencies. The repo keeps local `[patch]` overrides commented out by default; enable them only for local development and never commit an active sibling path override.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `62a58ee3` (`0.1.19`; branch `fts5-overlong-hotfix-cass362` = the pinned `f9cc3294` family plus only the FTS5 overlong-term skip cap routed through every tokenizer construction [cass#362]. Upstream main has since gone async-first, so the full-forward bump is a separate validated pass. Family features unchanged: the exact Git source containing the existing-only schema-open contract that the same-version registry archive lacks, a `[patch.crates-io]` source override so connector dependencies cannot reintroduce a second registry-backed family, contentless-FTS5 reopen/catch-up, bounded clean-page reclamation, and fused equality-run counting [cass#345 / frankensqlite#131]) |
-| `franken-agent-detection` | `1557300b` (Kimi/omp fresh-eyes hardening: canonical scan-root dedup, prompt-echo dedup across bookkeeping events, first-result-wins tool.result with standalone fallback, `KIMI_CODE_HOME` override replaces defaults, omp slug false-positive guard; plus current Kimi Code layout + `KIMI_CODE_HOME` [cass #351], Oh My Pi probe roots + sub-agent transcripts, OpenCode remote-root scan isolation [cass #357], Grok Build connector [cass #328], Gemini CLI JSONL discovery and role normalization [cass #341]) |
+| `frankensqlite` / `fsqlite-types` | `f6a007b169ccd483f0e4e437f436d81357461718` (`0.1.19` package identity; immutable git pin because crates.io latest is `0.1.18`; contentless-FTS5 reopen/catch-up support, canonical contentless-DDL persistence after stale duplicate repair, existing-only schema inspection, bounded clean-page reclamation, and fused equality-run counting [cass#345 / frankensqlite#131]) |
+| `franken-agent-detection` | `6d24c532` (Grok Build connector [cass #328], plus Gemini CLI JSONL discovery, ordered `$set.messages` replay, and current role normalization [cass #341]) |
 | `asupersync` | `=0.3.9` |
-| `frankensearch` | `ad8e29ea` (pure-Rust `native`, architecture-safe HNSW with native-only read admission that never rebuilds a rejected selected artifact, explicit `cass-compat` → `lexical-tantivy`, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission, cancellation-safe facade opening, generation-pinned Quill hydration, and the restored positionless-term-frequency plumbing; frankentorch remains pinned by git rev inside frankensearch — cass #308, #333, bd-8nqz.5, bd-07os, bd-r65a.1) |
+| `frankensearch` | `f7fa7a02` (pure-Rust `native` feature plus architecture-safe HNSW `DistDot` normalization; frankentorch pinned by git rev inside frankensearch — cass #308, #333) |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 
 **Build-time validation**
 - `build.rs` validates the committed dependency source contract against the expected package name, package version, Cargo feature/default-features contract, and git source where applicable.
 - If an active git-pinned sibling checkout has drifted away from the pinned revision or has a dirty worktree, the build emits a warning instead of silently trusting it. Crates.io-only pins are validated by package version.
-- Enable strict enforcement with `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation` or `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. Strict mode upgrades drift warnings to hard errors and also validates the optional sibling repos before you switch them to local path overrides.
+- Enable strict enforcement with `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation` or `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. Strict mode upgrades drift warnings to hard errors and also validates the optional sibling repos before you switch them to local path overrides.
 - Use `cass swarm dependency-drift --json` for a fast read-only preflight. It reports each manifest pin, optional sibling checkout HEAD/dirty state, upstream status as `not_checked`, and the exact strict-validation commands to run; it never fetches remotes or mutates files.
 
 **Expected interface contract**
 - `frankensqlite` (`fsqlite`): `Connection`, `params!`, and `compat::{ConnectionExt, RowExt}` with `row.get_typed(...)`.
 - `franken-agent-detection`: `AgentDetectOptions` and `detect_installed_agents(...)`.
-- `frankensearch`: the explicit `lexical_tantivy::{cass_open_search_reader, ReloadPolicy}` CASS compatibility surface, plus `ModelCategory` and `ModelTier`.
+- `frankensearch`: `lexical::cass_open_search_reader`, `lexical::ReloadPolicy`, `ModelCategory`, and `ModelTier`.
 - `frankentui`: `ftui::Frame`, `GraphemePool`, `Style`, `ftui-runtime`, `ftui-tty`, and the `ftui-extras` features enabled by cass.
 - `asupersync`: `runtime::RuntimeBuilder` and `http::h1::HttpClient::builder()`.
 - `toon` (`tru`): `toon::encode(...)`.
@@ -3090,16 +2994,16 @@ offload build, test, lint, and snapshot commands with `rch`.
 
 ```bash
 # Format & Lint
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-dev-target cargo fmt --check
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-dev-target cargo clippy --all-targets -- -D warnings
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-dev-target cargo fmt --check
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-dev-target cargo clippy --all-targets -- -D warnings
 
 # Build & Test
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-dev-target cargo build --release
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-dev-target cargo test
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-dev-target cargo build --release
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-dev-target cargo test
 
 # Run End-to-End Tests
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-dev-target cargo test --test e2e_index_tui
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-dev-target cargo test --test install_scripts
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-dev-target cargo test --test e2e_index_tui
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-dev-target cargo test --test install_scripts
 ```
 
 ### Snapshot Baseline Workflow (FrankenTUI)
@@ -3108,12 +3012,12 @@ Use targeted snapshot runs; do not blindly bless everything:
 
 ```bash
 # Verify current baselines
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-snapshot-target cargo test snapshot_baseline_ -- --nocapture
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-snapshot-target cargo test snapshot_search_surface_ -- --nocapture
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-snapshot-target cargo test --test ftui_harness_snapshots -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-target cargo test snapshot_baseline_ -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-target cargo test snapshot_search_surface_ -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-target cargo test --test ftui_harness_snapshots -- --nocapture
 
 # Regenerate only the suite you intentionally changed
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-snapshot-target BLESS=1 cargo test snapshot_baseline_ -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-snapshot-target BLESS=1 cargo test snapshot_baseline_ -- --nocapture
 ```
 
 The full regeneration/review protocol (required reviewer checklist, behavioral guard tests,
@@ -3169,10 +3073,10 @@ The CI pipeline (`.github/workflows/ci.yml`) runs on every PR and push to main:
 ```bash
 # Generate coverage through rch
 # Ensure cargo-llvm-cov is already installed before agent-run gates.
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-coverage-target cargo llvm-cov --all-features --workspace --text
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --all-features --workspace --text
 
 # Run specific e2e tests
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-e2e-target cargo test --test e2e_filters -- --test-threads=1
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-e2e-target cargo test --test e2e_filters -- --test-threads=1
 ```
 
 ## About Contributions

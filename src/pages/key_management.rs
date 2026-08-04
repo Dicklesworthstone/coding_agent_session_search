@@ -20,6 +20,7 @@ use crate::pages::encrypt::{
     Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType, load_config,
     validate_supported_payload_format,
 };
+use crate::pages::errors::DecryptError;
 use crate::pages::qr::RecoverySecret;
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -449,12 +450,17 @@ pub fn key_rotate(
 
 /// Unwrap DEK using password (tries all password slots)
 fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result<[u8; 32]> {
+    if password.is_empty() {
+        return Err(DecryptError::EmptyPassword.into());
+    }
     let export_id = BASE64_STANDARD.decode(&config.export_id)?;
+    let mut password_slot_found = false;
 
     for slot in &config.key_slots {
         if slot.slot_type != SlotType::Password {
             continue;
         }
+        password_slot_found = true;
 
         let salt = BASE64_STANDARD.decode(&slot.salt)?;
         let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
@@ -468,17 +474,26 @@ fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result
         }
     }
 
-    bail!("Invalid password or no matching key slot")
+    if password_slot_found {
+        Err(DecryptError::AuthenticationFailed.into())
+    } else {
+        Err(DecryptError::NoMatchingKeySlot.into())
+    }
 }
 
 /// Unwrap DEK and return which slot was used
 fn unwrap_dek_with_slot_id(config: &EncryptionConfig, password: &str) -> Result<(u8, [u8; 32])> {
+    if password.is_empty() {
+        return Err(DecryptError::EmptyPassword.into());
+    }
     let export_id = BASE64_STANDARD.decode(&config.export_id)?;
+    let mut password_slot_found = false;
 
     for slot in &config.key_slots {
         if slot.slot_type != SlotType::Password {
             continue;
         }
+        password_slot_found = true;
 
         let salt = BASE64_STANDARD.decode(&slot.salt)?;
         let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
@@ -492,7 +507,11 @@ fn unwrap_dek_with_slot_id(config: &EncryptionConfig, password: &str) -> Result<
         }
     }
 
-    bail!("Invalid password or no matching key slot")
+    if password_slot_found {
+        Err(DecryptError::AuthenticationFailed.into())
+    } else {
+        Err(DecryptError::NoMatchingKeySlot.into())
+    }
 }
 
 /// Derive KEK from password using Argon2id
@@ -697,6 +716,18 @@ fn wrap_key(
     Ok((wrapped, nonce))
 }
 
+fn invalid_decrypt_archive(detail: impl Into<String>) -> anyhow::Error {
+    let detail = detail.into();
+    anyhow::Error::new(DecryptError::InvalidFormat(detail.clone()))
+        .context(format!("Invalid encrypted archive metadata: {detail}"))
+}
+
+fn corrupt_decrypt_payload(detail: impl Into<String>) -> anyhow::Error {
+    let detail = detail.into();
+    anyhow::Error::new(DecryptError::CorruptPayload(detail.clone()))
+        .context(format!("Encrypted archive payload is corrupt: {detail}"))
+}
+
 /// Decrypt all chunks and return plaintext
 fn decrypt_all_chunks(
     archive_dir: &Path,
@@ -705,39 +736,40 @@ fn decrypt_all_chunks(
     progress: impl Fn(f32),
 ) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(dek).expect("Invalid key length");
-    let base_nonce_raw = BASE64_STANDARD.decode(&config.base_nonce)?;
+    let base_nonce_raw = BASE64_STANDARD
+        .decode(&config.base_nonce)
+        .map_err(|error| {
+            invalid_decrypt_archive(format!("base_nonce is not valid base64: {error}"))
+        })?;
     let base_nonce: [u8; 12] = base_nonce_raw.as_slice().try_into().map_err(|err| {
-        // [coding_agent_session_search-htiim] Chain TryFromSliceError so
-        // debug chains preserve the source. Length diagnostic is the
-        // operator-facing signal.
-        anyhow::anyhow!(
-            "invalid base_nonce length: expected 12, got {}: {err}",
+        invalid_decrypt_archive(format!(
+            "base_nonce has {} bytes; expected 12: {err}",
             base_nonce_raw.len()
-        )
+        ))
     })?;
-    let export_id_raw = BASE64_STANDARD.decode(&config.export_id)?;
+    let export_id_raw = BASE64_STANDARD.decode(&config.export_id).map_err(|error| {
+        invalid_decrypt_archive(format!("export_id is not valid base64: {error}"))
+    })?;
     let export_id: [u8; 16] = export_id_raw.as_slice().try_into().map_err(|err| {
-        // [coding_agent_session_search-htiim] Chain TryFromSliceError.
-        anyhow::anyhow!(
-            "invalid export_id length: expected 16, got {}: {err}",
+        invalid_decrypt_archive(format!(
+            "export_id has {} bytes; expected 16: {err}",
             export_id_raw.len()
-        )
+        ))
     })?;
-    let canonical_archive_dir = archive_dir.canonicalize().with_context(|| {
-        format!(
-            "Failed to resolve archive root {} before decrypting chunks",
-            archive_dir.display()
-        )
+    let canonical_archive_dir = archive_dir.canonicalize().map_err(|error| {
+        anyhow::Error::new(error).context(DecryptError::CorruptPayload(
+            "archive root is missing or unreadable".to_string(),
+        ))
     })?;
 
     let mut plaintext = Vec::new();
 
     if config.payload.chunk_count != config.payload.files.len() {
-        bail!(
-            "Invalid config: payload chunk_count {} does not match file list length {}",
+        return Err(invalid_decrypt_archive(format!(
+            "payload chunk_count {} does not match file list length {}",
             config.payload.chunk_count,
             config.payload.files.len()
-        );
+        )));
     }
 
     for (chunk_index, chunk_file) in config.payload.files.iter().enumerate() {
@@ -745,42 +777,43 @@ fn decrypt_all_chunks(
 
         let expected_chunk_file = format!("payload/chunk-{chunk_index:05}.bin");
         if chunk_file != &expected_chunk_file {
-            bail!(
-                "Invalid chunk path in config.json: expected {}, got {}",
-                expected_chunk_file,
-                chunk_file
-            );
+            return Err(invalid_decrypt_archive(format!(
+                "payload file entry {chunk_index} is not the canonical chunk path"
+            )));
         }
         let chunk_path = archive_dir.join(chunk_file);
-        let chunk_meta = std::fs::symlink_metadata(&chunk_path).with_context(|| {
-            format!(
-                "Failed to inspect encrypted chunk {} at {}",
-                chunk_index,
-                chunk_path.display()
-            )
+        let chunk_meta = std::fs::symlink_metadata(&chunk_path).map_err(|error| {
+            anyhow::Error::new(error).context(DecryptError::CorruptPayload(format!(
+                "chunk {chunk_index} is missing or unreadable"
+            )))
         })?;
         if chunk_meta.file_type().is_symlink() {
-            bail!("Encrypted chunk must not be a symlink: {}", chunk_file);
+            return Err(corrupt_decrypt_payload(format!(
+                "chunk {chunk_index} is a symlink instead of an encrypted payload file"
+            )));
         }
         if !chunk_meta.file_type().is_file() {
-            bail!("Encrypted chunk must be a regular file: {}", chunk_file);
+            return Err(corrupt_decrypt_payload(format!(
+                "chunk {chunk_index} is not a regular encrypted payload file"
+            )));
         }
 
-        let canonical_chunk_path = chunk_path.canonicalize().with_context(|| {
-            format!(
-                "Failed to resolve encrypted chunk {} at {}",
-                chunk_index,
-                chunk_path.display()
-            )
+        let canonical_chunk_path = chunk_path.canonicalize().map_err(|error| {
+            anyhow::Error::new(error).context(DecryptError::CorruptPayload(format!(
+                "chunk {chunk_index} cannot be resolved"
+            )))
         })?;
         if !canonical_chunk_path.starts_with(&canonical_archive_dir) {
-            bail!(
-                "Encrypted chunk path escapes archive directory: {}",
-                chunk_file
-            );
+            return Err(invalid_decrypt_archive(format!(
+                "payload file entry {chunk_index} escapes the archive directory"
+            )));
         }
 
-        let ciphertext = std::fs::read(&canonical_chunk_path)?;
+        let ciphertext = std::fs::read(&canonical_chunk_path).map_err(|error| {
+            anyhow::Error::new(error).context(DecryptError::CorruptPayload(format!(
+                "chunk {chunk_index} is unreadable"
+            )))
+        })?;
 
         // Derive nonce
         let nonce = derive_chunk_nonce(&base_nonce, chunk_index as u32);
@@ -797,26 +830,23 @@ fn decrypt_all_chunks(
                     aad: &aad,
                 },
             )
-            .map_err(|err| {
-                // [coding_agent_session_search-htiim] Chain the aead error
-                // so operators can correlate: which chunk failed, how
-                // big the ciphertext was, and what the cipher layer
-                // reported. The aead crate keeps the sub-failure type
-                // opaque (timing-attack hardening) but the source is
-                // preserved in the error chain. Mirrors encrypt.rs::
-                // decrypt_all_chunks fix landed in 0b81b601.
-                anyhow::anyhow!(
-                    "Decryption failed for chunk {} ({} bytes ciphertext): {}",
-                    chunk_index,
-                    ciphertext.len(),
-                    err
-                )
+            .map_err(|error| {
+                corrupt_decrypt_payload(format!(
+                    "chunk {chunk_index} authentication failed for {} ciphertext bytes: {error}",
+                    ciphertext.len()
+                ))
             })?;
 
         // Decompress
         let mut decoder = DeflateDecoder::new(&compressed[..]);
         let mut chunk_plaintext = Vec::new();
-        decoder.read_to_end(&mut chunk_plaintext)?;
+        decoder
+            .read_to_end(&mut chunk_plaintext)
+            .map_err(|error| {
+                anyhow::Error::new(error).context(DecryptError::CorruptPayload(format!(
+                    "chunk {chunk_index} deflate stream is invalid"
+                )))
+            })?;
 
         plaintext.extend(chunk_plaintext);
     }
@@ -1468,7 +1498,6 @@ mod tests {
     };
     use crate::pages::bundle::BundleBuilder;
     use crate::pages::encrypt::{DecryptionEngine, EncryptionEngine, MAX_CHUNK_SIZE, PayloadMeta};
-    use crate::pages::errors::DecryptError;
     use crate::pages::verify::verify_bundle;
     use std::cell::Cell;
     use tempfile::TempDir;
@@ -1761,8 +1790,14 @@ mod tests {
     fn test_key_add_wrong_password_fails() {
         let (_temp_dir, archive_dir) = setup_test_archive();
 
-        let result = key_add_password(&archive_dir, "wrong-password", "new-password");
-        assert!(result.is_err());
+        let err = key_add_password(&archive_dir, "wrong-password", "new-password").unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::AuthenticationFailed)
+            ),
+            "unexpected wrong-password taxonomy: {err:#}"
+        );
     }
 
     #[test]
@@ -1830,6 +1865,45 @@ mod tests {
 
         let decrypted = std::fs::read(&decrypted_path).unwrap();
         assert_eq!(decrypted, b"Test data for key management");
+    }
+
+    #[test]
+    fn test_key_rotate_reports_tampered_payload_and_preserves_live_archive() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let chunk_path = site_dir.join("payload/chunk-00000.bin");
+        let mut chunk = std::fs::read(&chunk_path).unwrap();
+        let final_byte = chunk
+            .last_mut()
+            .expect("encrypted test payload must contain an authentication tag");
+        *final_byte ^= 0x5a;
+        std::fs::write(&chunk_path, chunk).unwrap();
+
+        let err =
+            key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::CorruptPayload(detail))
+                    if detail.contains("chunk 0") && detail.contains("authentication failed")
+            ),
+            "unexpected corrupt-payload taxonomy: {err:#}"
+        );
+
+        let config = load_config(&archive_dir).unwrap();
+        assert!(
+            unwrap_dek_with_password(&config, "test-password").is_ok(),
+            "failed rotation must preserve the original password slot"
+        );
+        assert!(
+            matches!(
+                unwrap_dek_with_password(&config, "new-password")
+                    .unwrap_err()
+                    .downcast_ref::<DecryptError>(),
+                Some(DecryptError::AuthenticationFailed)
+            ),
+            "failed rotation must not publish the replacement password slot"
+        );
     }
 
     #[test]
@@ -1948,8 +2022,11 @@ mod tests {
         };
 
         anyhow::ensure!(
-            err.to_string().contains("Invalid password"),
-            "unexpected error: {err:#}"
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::AuthenticationFailed)
+            ),
+            "unexpected wrong-password taxonomy: {err:#}"
         );
         let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js"))?;
         anyhow::ensure!(viewer_metadata.file_type().is_symlink());

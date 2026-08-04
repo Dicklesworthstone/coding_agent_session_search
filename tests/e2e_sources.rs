@@ -1783,6 +1783,309 @@ paths = ["~/.claude/projects"]
     tracker.complete();
 }
 
+#[test]
+fn sources_doctor_budget_sheds_deep_probes_without_dropping_source() {
+    let tmp = tempfile::TempDir::new().expect("temp source-doctor root");
+    let config_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    create_sources_config(
+        &config_dir,
+        r#"
+[[sources]]
+name = "slow-laptop"
+type = "ssh"
+host = "user@slow-laptop.invalid"
+paths = ["~/.claude/projects"]
+platform = "macos"
+"#,
+    );
+    let probe_path = tmp.path().join("probe.json");
+    fs::write(
+        &probe_path,
+        r#"{"host":"user@slow-laptop.invalid","os":"Linux","cass_version":"0.6.22","remote_path":"nonempty"}"#,
+    )
+    .expect("write source-doctor probe fixture");
+
+    let started = std::time::Instant::now();
+    let output = cargo_bin_cmd!("cass")
+        .args([
+            "sources",
+            "doctor",
+            "--json",
+            "--budget-ms",
+            "50",
+            "--per-host-budget-ms",
+            "1000",
+        ])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("CASS_TEST_SOURCES_DOCTOR_PROBE", &probe_path)
+        .env("CASS_TEST_FLEET_PROBE_SLOW_MS", "2000")
+        .output()
+        .expect("run bounded sources doctor");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1200),
+        "source doctor slow fixture escaped the configured fleet budget"
+    );
+    assert!(
+        !output.status.success(),
+        "a timed-out source diagnosis must exit non-zero"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("bounded sources-doctor JSON");
+    let budget = &payload["budget"];
+
+    assert_eq!(budget["timed_out"], true);
+    let retry = budget["recommended_next_probe"]
+        .as_str()
+        .expect("timed-out source doctor should carry a bounded retry");
+    assert!(
+        retry.starts_with("cass sources doctor --json")
+            && retry.contains("--budget-ms 1000")
+            && retry.contains("--per-host-budget-ms 2000")
+            && !retry.contains("CASS_FLEET_"),
+        "source-doctor retry must raise both budgets using cross-platform CLI flags: {retry}"
+    );
+    assert!(
+        budget["skipped_sections"]
+            .as_array()
+            .is_some_and(|sections| sections.iter().any(|section| {
+                section.as_str() == Some("source:slow-laptop:ssh_connectivity")
+            })),
+        "budget must name the skipped source probe: {budget}"
+    );
+    assert_eq!(payload["sources"][0]["source_id"], "slow-laptop");
+    assert_eq!(
+        payload["sources"][0]["host"], "user@slow-laptop.invalid",
+        "timed-out source host identity must survive"
+    );
+    assert_eq!(payload["sources"][0]["state"], "timeout");
+    assert_eq!(
+        payload["diagnostics"][0]["host_report"]["timed_out"], true,
+        "per-host timeout must survive in diagnostics"
+    );
+    assert_eq!(
+        payload["diagnostics"][0]["host_report"]["status"],
+        "timed-out"
+    );
+    assert_eq!(
+        payload["diagnostics"][0]["host_report"]["platform"]["os"], "macos",
+        "a pre-probe timeout may preserve a configured OS hint but must not invent another OS"
+    );
+    assert_eq!(
+        payload["diagnostics"][0]["host_report"]["platform"]["arch"], "",
+        "a configured OS hint does not prove the remote CPU architecture"
+    );
+    assert!(
+        budget["skipped_sections"]
+            .as_array()
+            .is_some_and(|sections| sections
+                .iter()
+                .any(|section| section.as_str() == Some("source:slow-laptop:remote_cass"))),
+        "the never-eligible deep probe must be named as skipped"
+    );
+}
+
+#[test]
+fn sources_doctor_keeps_reachability_when_only_remote_cass_probe_times_out() {
+    let tmp = tempfile::TempDir::new().expect("temp source-doctor root");
+    let config_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    create_sources_config(
+        &config_dir,
+        r#"
+[[sources]]
+name = "reachable-slow-cass"
+type = "ssh"
+host = "user@reachable.test"
+paths = ["~/.claude/projects"]
+platform = "linux"
+"#,
+    );
+    let probe_path = tmp.path().join("probe.json");
+    fs::write(
+        &probe_path,
+        r#"{"host":"user@reachable.test","os":"Linux","cass_version":null,"remote_path":"nonempty","remote_cass_timed_out":true}"#,
+    )
+    .expect("write source-doctor probe fixture");
+
+    let output = cargo_bin_cmd!("cass")
+        .args([
+            "sources",
+            "doctor",
+            "--json",
+            "--budget-ms",
+            "5000",
+            "--per-host-budget-ms",
+            "4000",
+        ])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("CASS_TEST_SOURCES_DOCTOR_PROBE", &probe_path)
+        .output()
+        .expect("run sources doctor with a post-connect timeout");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sources-doctor JSON");
+
+    assert_eq!(payload["sources"][0]["state"], "timeout");
+    assert_eq!(
+        payload["sources"][0]["host_reached"], true,
+        "the successful SSH check must survive a deeper cass timeout"
+    );
+    assert!(
+        payload["sources"][0]["connection_error"].is_null(),
+        "a deeper probe timeout is not an SSH connection failure: {payload}"
+    );
+    assert_eq!(
+        payload["diagnostics"][0]["host_report"]["status"],
+        "timed-out"
+    );
+    assert!(
+        payload["budget"]["skipped_sections"]
+            .as_array()
+            .is_some_and(|sections| sections.iter().any(|section| {
+                section.as_str() == Some("source:reachable-slow-cass:remote_cass")
+            })),
+        "the timed-out deep section must be named: {payload}"
+    );
+}
+
+#[test]
+fn sources_doctor_honors_compact_jsonl_and_toon_encodings() {
+    let tmp = tempfile::TempDir::new().expect("temp source-doctor root");
+    let config_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+
+    for format in ["compact", "jsonl"] {
+        let output = cargo_bin_cmd!("cass")
+            .args(["sources", "doctor", "--robot-format", format])
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("CASS_DATA_DIR", &data_dir)
+            .output()
+            .expect("run sources doctor JSON encoding");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 JSON output");
+        assert_eq!(
+            stdout.lines().count(),
+            1,
+            "{format} must emit exactly one JSON line: {stdout}"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("valid single-line JSON");
+        assert_eq!(payload["sources"], serde_json::json!([]));
+        assert!(payload["budget"].is_object());
+    }
+
+    let toon = cargo_bin_cmd!("cass")
+        .args(["sources", "doctor", "--robot-format", "toon"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .output()
+        .expect("run sources doctor TOON encoding");
+    assert!(toon.status.success());
+    let toon_stdout = String::from_utf8(toon.stdout).expect("UTF-8 TOON output");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&toon_stdout).is_err(),
+        "TOON must not silently fall back to JSON: {toon_stdout}"
+    );
+    assert!(
+        toon_stdout.contains("sources") && toon_stdout.contains("budget"),
+        "TOON output must retain the source-doctor contract: {toon_stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sources_doctor_records_and_kills_an_actual_hung_ssh_probe() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::TempDir::new().expect("temp source-doctor root");
+    let config_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    let fixture_bin = tmp.path().join("fixture-bin");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    fs::create_dir_all(&fixture_bin).expect("create fixture bin");
+    create_sources_config(
+        &config_dir,
+        r#"
+[[sources]]
+name = "hung-laptop"
+type = "ssh"
+host = "user@hung-laptop.invalid"
+paths = ["~/.claude/projects"]
+"#,
+    );
+    let fake_ssh = fixture_bin.join("ssh");
+    fs::write(&fake_ssh, "#!/bin/sh\nsleep 30\n").expect("write fake ssh");
+    fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755))
+        .expect("make fake ssh executable");
+    let original_path = dotenvy::var("PATH").unwrap_or_default();
+
+    let started = std::time::Instant::now();
+    let output = cargo_bin_cmd!("cass")
+        .args([
+            "sources",
+            "doctor",
+            "--json",
+            "--budget-ms",
+            "1000",
+            "--per-host-budget-ms",
+            "150",
+        ])
+        .env("PATH", format!("{}:{original_path}", fixture_bin.display()))
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .output()
+        .expect("run source doctor against hung ssh");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "hung SSH child or grandchild escaped the source-doctor deadline"
+    );
+    assert!(
+        !output.status.success(),
+        "a timed-out source diagnosis must exit non-zero"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("hung source-doctor JSON");
+    let budget = &payload["budget"];
+    assert_eq!(
+        budget["timed_out"], false,
+        "the per-host deadline fired while the total fleet budget still had headroom"
+    );
+    assert!(
+        budget["skipped_sections"]
+            .as_array()
+            .is_some_and(|sections| sections.iter().any(|section| {
+                section.as_str() == Some("source:hung-laptop:ssh_connectivity")
+            })),
+        "actual subprocess timeout must be named in the top-level budget: {budget}"
+    );
+    let retry = budget["recommended_next_probe"]
+        .as_str()
+        .expect("hung source doctor should carry a bounded retry");
+    assert!(
+        retry.starts_with("cass sources doctor --json")
+            && retry.contains("--budget-ms 2000")
+            && retry.contains("--per-host-budget-ms 1000")
+            && !retry.contains("CASS_FLEET_"),
+        "source-doctor retry must raise both budgets using cross-platform CLI flags: {retry}"
+    );
+    assert_eq!(payload["sources"][0]["source_id"], "hung-laptop");
+    assert_eq!(payload["sources"][0]["state"], "timeout");
+    assert_eq!(
+        payload["diagnostics"][0]["host_report"]["status"],
+        "timed-out"
+    );
+    assert_eq!(payload["diagnostics"][0]["host_report"]["timed_out"], true);
+}
+
 /// Bead uojcg.8.6: `sources doctor --json` classifies an unreachable remote into
 /// an explicit *unreached* state (never folded into healthy), offers a
 /// preservation-safe (non-destructive) next command, reports the diagnosis as
@@ -1950,6 +2253,14 @@ paths = ["~/.claude/projects"]
     assert!(
         host_report["platform"].is_object(),
         "platform identity must be present regardless of reachability"
+    );
+    assert_eq!(
+        host_report["platform"]["os"], "other",
+        "an unreachable source without a platform hint must not default to Linux"
+    );
+    assert_eq!(
+        host_report["platform"]["arch"], "",
+        "an unreachable source must not fabricate a CPU architecture"
     );
     tracker.end("verify", Some("Verify no remote-binary overclaim"), start);
 
