@@ -7,7 +7,7 @@
 //! 2. Connector detection round-trip works correctly
 //! 3. Probe script generation uses FAD paths dynamically
 //! 4. Agent counts are consistent across all APIs
-//! 5. Detection-only connectors (goose, continue, windsurf) are properly handled
+//! 5. Detection-only connectors (continue, windsurf) are properly handled
 
 use coding_agent_search::indexer::get_connector_factories;
 use std::collections::HashSet;
@@ -51,7 +51,7 @@ fn probe_slugs() -> HashSet<String> {
 
 /// Detection-only connectors: have probe paths and detection entries but
 /// no parser implementation (no entry in `get_connector_factories()`).
-const DETECTION_ONLY: &[&str] = &["goose", "continue", "windsurf"];
+const DETECTION_ONLY: &[&str] = &["continue", "windsurf"];
 
 /// Extract a function body from source code, including the braces.
 fn extract_function_body(source: &str, fn_prefix: &str) -> String {
