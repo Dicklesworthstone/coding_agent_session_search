@@ -162,9 +162,14 @@ fn robot_meta_flag_adds_meta_object_with_documented_diagnostic_keys() -> TestRes
         "elapsed_ms",
         "fallback_reason",
         "fallback_tier",
+        // Truthful refinement level + typed fallback reason (bead .5.4):
+        // agents branch on these to tell a lexical fail-open apart from a
+        // command failure or missing data.
+        "refinement_level",
         "request_id",
         "requested_search_mode",
         "search_mode",
+        "semantic_fallback_reason",
     ] {
         require_meta_key(required, meta_obj)?;
     }

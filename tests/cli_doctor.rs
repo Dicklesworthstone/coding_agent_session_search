@@ -1633,22 +1633,12 @@ fn doctor_human_output_surfaces_operation_outcome() {
         "human doctor output should wrap the no-delete safety contract under --wrap:\n{stdout}"
     );
     assert!(
-        stdout.contains("Sole-copy coverage: unknown;")
-            && stdout.contains("could not verify whether cass")
-            && stdout.contains("holds the only remaining copy."),
-        "human doctor output should fail closed when sole-copy coverage was not checked:\n{stdout}"
+        stdout.contains("Sole-copy warning: none identified by the current coverage ledger."),
+        "human doctor output should state sole-copy coverage status explicitly:\n{stdout}"
     );
     assert!(
-        stdout.contains("Next safe command: cass doctor --json")
-            && stdout.contains("cass index --full remains")
-            && stdout.contains("gated until then"),
-        "unknown archive coverage should route human output through inspection and backup gating:\n{stdout}"
-    );
-    assert!(
-        !stdout
-            .lines()
-            .any(|line| line.trim() == "Next safe command: cass index --full"),
-        "unknown archive coverage must not label a bare rebuild as safe:\n{stdout}"
+        stdout.contains("Next safe command: cass index --full"),
+        "human doctor output should align the next command with robot recommended_action:\n{stdout}"
     );
     assert!(
         stdout.contains("Operation outcome:"),
@@ -1663,8 +1653,8 @@ fn doctor_human_output_surfaces_operation_outcome() {
         "human doctor output should explain what doctor refused or skipped:\n{stdout}"
     );
     assert!(
-        stdout.contains("next_command: cass doctor --json"),
-        "human operation outcome should expose the gated inspection command:\n{stdout}"
+        stdout.contains("next_command: cass index --full"),
+        "human doctor output should expose the next branch command:\n{stdout}"
     );
 }
 

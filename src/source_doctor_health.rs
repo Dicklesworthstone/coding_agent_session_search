@@ -89,10 +89,8 @@ impl SourceDoctorState {
         }
     }
 
-    /// Conservative reachability inference when only the coarse state is
-    /// available. A timeout alone cannot prove contact; projections that retain
-    /// the underlying observation use `SourceDoctorObservation::host_reachable`
-    /// instead.
+    /// Whether the host answered at all (only the transport-failure states are
+    /// "unreached"; every other state implies the host was contacted).
     pub fn host_reached(self) -> bool {
         !matches!(
             self,
@@ -121,9 +119,6 @@ pub struct SourceDoctorObservation {
     /// Connection error text when the host probe failed (classified for the
     /// transport taxonomy).
     pub connection_error: Option<String>,
-    /// A deeper read-only probe timed out after the SSH host was already
-    /// reached. This is distinct from a transport timeout.
-    pub inspection_timed_out: bool,
     /// Whether the remote `cass` binary was found (when the host was reached).
     pub cass_present: Option<bool>,
     /// Whether the remote `cass` is at/above the required version.
@@ -276,9 +271,6 @@ pub fn classify_source_doctor_state(obs: &SourceDoctorObservation) -> SourceDoct
             None => SourceDoctorState::Unreachable,
         };
     }
-    if obs.inspection_timed_out {
-        return SourceDoctorState::Timeout;
-    }
 
     // 2) Remote binary problems.
     if obs.cass_present == Some(false) {
@@ -398,10 +390,7 @@ impl SourceDoctorEntry {
             source_id: obs.source_id.clone(),
             host: obs.host.clone(),
             state,
-            // A deeper cass/path/sync timeout can occur after the initial SSH
-            // connectivity check succeeded. Preserve that observed reachability
-            // instead of deriving it from the coarser Timeout state.
-            host_reached: obs.host_reachable,
+            host_reached: state.host_reached(),
             connection_error: obs.connection_error.clone(),
             safe_next_command: safe_next_command(state, &obs.source_id),
         }
@@ -569,7 +558,7 @@ impl SourceDoctorReport {
             ..Default::default()
         };
         for entry in &sources {
-            if !entry.host_reached {
+            if !entry.state.host_reached() {
                 summary.unreached += 1;
             } else if entry.state.is_healthy() {
                 summary.healthy += 1;
@@ -611,21 +600,6 @@ mod tests {
             classify_source_doctor_state(&reachable_healthy("ok")),
             SourceDoctorState::Reachable
         );
-
-        // A deeper probe can time out after SSH connectivity succeeded. Keep
-        // the timeout state and the observed host reachability simultaneously.
-        let mut deep_timeout = reachable_healthy("slow");
-        deep_timeout.inspection_timed_out = true;
-        assert_eq!(
-            classify_source_doctor_state(&deep_timeout),
-            SourceDoctorState::Timeout
-        );
-        let deep_timeout_entry = SourceDoctorEntry::from_observation(&deep_timeout);
-        assert!(deep_timeout_entry.host_reached);
-        assert!(deep_timeout_entry.connection_error.is_none());
-        let deep_timeout_report = SourceDoctorReport::build(&[deep_timeout]);
-        assert_eq!(deep_timeout_report.summary.unhealthy, 1);
-        assert_eq!(deep_timeout_report.summary.unreached, 0);
 
         // unreachable (transport)
         let mut o = reachable_healthy("x");

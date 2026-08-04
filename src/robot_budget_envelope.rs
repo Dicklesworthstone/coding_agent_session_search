@@ -19,9 +19,9 @@
 //! function. Per the bead's safety requirement, this type is inert data — it
 //! never launches background work; a read-only probe stays read-only.
 //!
-//! The original 2.2 bead landed this reusable contract. Follow-up bead 2.6 wires
-//! its additive [`BudgetBlock`] projection through the remaining slow robot
-//! surfaces, with deterministic slow-path and per-surface regression coverage.
+//! Wiring each surface to populate and emit this envelope (plus slow-path
+//! fixtures and per-surface E2E) is the remaining work tracked under 2.2; this
+//! commit lands the contract the wiring builds on.
 
 use serde::{Deserialize, Serialize};
 use std::time::Instant;

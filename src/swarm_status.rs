@@ -27,6 +27,14 @@ pub enum SwarmProviderName {
     Evidence,
     Git,
     Process,
+    ResourcePlan,
+    PrivacyExposure,
+    ContextPack,
+    WorkflowAnalytics,
+    ReplayFixture,
+    WorkflowMacros,
+    ReproCapsule,
+    OperationsDashboard,
 }
 
 impl SwarmProviderName {
@@ -41,6 +49,14 @@ impl SwarmProviderName {
             Self::Evidence => "evidence",
             Self::Git => "git",
             Self::Process => "process",
+            Self::ResourcePlan => "resource_plan",
+            Self::PrivacyExposure => "privacy_exposure",
+            Self::ContextPack => "context_pack",
+            Self::WorkflowAnalytics => "workflow_analytics",
+            Self::ReplayFixture => "replay_fixture",
+            Self::WorkflowMacros => "workflow_macros",
+            Self::ReproCapsule => "repro_capsule",
+            Self::OperationsDashboard => "operations_dashboard",
         }
     }
 
@@ -71,8 +87,17 @@ pub const REQUIRED_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
 ];
 
 /// Optional source providers available to richer status/evidence projections.
-pub const OPTIONAL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] =
-    &[SwarmProviderName::DependencyDrift];
+pub const OPTIONAL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
+    SwarmProviderName::DependencyDrift,
+    SwarmProviderName::ResourcePlan,
+    SwarmProviderName::PrivacyExposure,
+    SwarmProviderName::ContextPack,
+    SwarmProviderName::WorkflowAnalytics,
+    SwarmProviderName::ReplayFixture,
+    SwarmProviderName::WorkflowMacros,
+    SwarmProviderName::ReproCapsule,
+    SwarmProviderName::OperationsDashboard,
+];
 
 /// Every fixtureable provider named by the swarm status contract.
 pub const ALL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
@@ -84,6 +109,14 @@ pub const ALL_SWARM_SOURCE_PROVIDERS: &[SwarmProviderName] = &[
     SwarmProviderName::Evidence,
     SwarmProviderName::Git,
     SwarmProviderName::Process,
+    SwarmProviderName::ResourcePlan,
+    SwarmProviderName::PrivacyExposure,
+    SwarmProviderName::ContextPack,
+    SwarmProviderName::WorkflowAnalytics,
+    SwarmProviderName::ReplayFixture,
+    SwarmProviderName::WorkflowMacros,
+    SwarmProviderName::ReproCapsule,
+    SwarmProviderName::OperationsDashboard,
 ];
 
 /// Provider availability normalized for robot output.

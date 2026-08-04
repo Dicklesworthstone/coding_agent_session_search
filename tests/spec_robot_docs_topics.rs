@@ -66,6 +66,24 @@ const DOCUMENTED_TOPICS: &[&str] = &[
     "sources",
     "analytics",
     "doctor",
+    "recipes",
+];
+
+/// Destructive phrases the canonical recipes topic must NEVER recommend. cass
+/// quarantines; it does not delete. (Bead .11.3 acceptance: tests prove docs do
+/// not recommend destructive repair.)
+const FORBIDDEN_RECIPE_PHRASES: &[&str] = &[
+    "rm -rf",
+    "git reset --hard",
+    "git clean",
+    "--force-rebuild",
+    "drop table",
+    "delete the data dir",
+];
+
+/// Issue classes the recipes topic must document (from the 2026-06-08 report).
+const REQUIRED_RECIPE_ISSUES: &[&str] = &[
+    "#110", "#120", "#137", "#196", "#247", "#248", "#250", "#257", "#258",
 ];
 
 struct CmdOutcome {
@@ -136,6 +154,67 @@ fn invalid_robot_docs_topic_returns_exit_two() -> TestResult {
              got exit {code}.\nstdout:\n{}\nstderr:\n{}",
             outcome.stdout, outcome.stderr
         ),
+    )?;
+    Ok(())
+}
+
+/// Bead .11.3 acceptance proof: the canonical `recipes` topic must (a) never
+/// recommend a destructive repair, (b) document every issue class the report
+/// names, (c) use only `--json`/`--robot` example commands, and (d) explicitly
+/// warn against bare interactive `cass`/`bv`. `format!` is kept out of the
+/// loops via the find/filter forms (UBS heuristic).
+#[test]
+fn recipes_topic_is_safe_and_recommends_only_bounded_json_commands() -> TestResult {
+    let outcome = run_cass(&["robot-docs", "recipes"])?;
+    let code = outcome
+        .exit_code
+        .ok_or_else(|| test_error("cass robot-docs recipes killed by signal"))?;
+    ensure(
+        matches!(code.cmp(&0), Ordering::Equal),
+        format!(
+            "`cass robot-docs recipes` should exit 0; got {code}.\nstderr:\n{}",
+            outcome.stderr
+        ),
+    )?;
+    let body = outcome.stdout;
+    let body_lc = body.to_ascii_lowercase();
+
+    // (a) Never recommend a destructive repair.
+    if let Some(phrase) = FORBIDDEN_RECIPE_PHRASES
+        .iter()
+        .find(|p| body_lc.contains(&p.to_ascii_lowercase()))
+    {
+        return Err(test_error(format!(
+            "recipes topic recommends a destructive operation: {phrase:?} — \
+             cass quarantines, it does not delete"
+        )));
+    }
+
+    // (b) Document every issue class from the report.
+    let missing: Vec<&str> = REQUIRED_RECIPE_ISSUES
+        .iter()
+        .copied()
+        .filter(|issue| !body.contains(*issue))
+        .collect();
+    ensure(
+        missing.is_empty(),
+        format!("recipes topic missing issue-class guidance: {missing:?}"),
+    )?;
+
+    // (c) Example commands use the robot/json contract.
+    ensure(
+        body.contains("--json") || body.contains("--robot"),
+        "recipes topic must show machine-first `--json`/`--robot` example commands".to_string(),
+    )?;
+
+    // (d) Explicitly warn against bare interactive cass/bv and hand-deletion.
+    ensure(
+        body_lc.contains("never run bare"),
+        "recipes topic must warn against running bare `cass`/`bv` (both launch a TUI)".to_string(),
+    )?;
+    ensure(
+        body_lc.contains("quarantines") && body_lc.contains("never"),
+        "recipes topic must state that cass quarantines (never silently deletes)".to_string(),
     )?;
     Ok(())
 }

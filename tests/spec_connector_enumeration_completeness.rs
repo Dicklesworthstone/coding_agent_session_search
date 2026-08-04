@@ -1,12 +1,18 @@
 //! INV-cass-19 — `cass diag --json::connectors` enumeration completeness.
 //!
-//! cass advertises support for **20 coding-agent providers**: aider, amp,
-//! chatgpt, claude_code, clawdbot, cline, codex, copilot, copilot_cli,
-//! crush, cursor, factory, gemini, hermes, kimi, openclaw, opencode,
-//! pi_agent, qwen, vibe. Each is a separate `src/connectors/*.rs` re-
-//! export of a `franken_agent_detection::Connector` implementation, and
-//! `cass diag --json` exposes the per-connector detection state agents
-//! and operators use to triage source coverage.
+//! cass advertises support for **23 coding-agent providers**: aider, amp,
+//! antigravity, chatgpt, claude_code, clawdbot, cline, codex, copilot,
+//! copilot_cli, crush, cursor, factory, gemini, grok, hermes, kimi, openclaw,
+//! opencode, openhands, pi_agent, qwen, vibe. Each is a separate
+//! `src/connectors/*.rs` re-export of a `franken_agent_detection::Connector`
+//! implementation, and `cass diag --json` exposes the per-connector detection
+//! state agents and operators use to triage source coverage.
+//!
+//! The runtime set is the single source of truth: it is derived from
+//! `franken_agent_detection::get_connector_factories()` (surfaced by
+//! `cass capabilities --json` / `cass diag --json`). This spec pins the
+//! documented set against it so adding or removing a connector fails here with
+//! a targeted diff until the docs/tests are updated in lockstep.
 //!
 //! Two regressions need to be impossible:
 //!
@@ -22,7 +28,7 @@
 //! Two invariants:
 //!
 //!   1. The set of connector names emitted by `cass diag --json::
-//!      connectors[].name` exactly equals the documented set of 20.
+//!      connectors[].name` exactly equals the documented set of 23.
 //!      Equality is checked via `symmetric_difference` so the
 //!      diagnostic shows exactly what's missing or extra in either
 //!      direction.
@@ -53,12 +59,15 @@ fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
     }
 }
 
-/// The canonical set of 20 documented provider connectors. Sourced from
-/// `src/connectors/mod.rs::pub mod` declarations. A peer adding a new
-/// connector must add it here (and to the diag emission) in lockstep.
+/// The canonical set of 23 documented provider connectors. Sourced from the
+/// runtime registry `franken_agent_detection::get_connector_factories()` (as
+/// surfaced by `cass capabilities --json` / `cass diag --json`) under the
+/// franken-agent-detection features cass enables in Cargo.toml. A peer adding a
+/// new connector must add it here (and to the diag emission) in lockstep.
 const DOCUMENTED_CONNECTOR_NAMES: &[&str] = &[
     "aider",
     "amp",
+    "antigravity",
     "chatgpt",
     "claude_code",
     "clawdbot",
@@ -70,10 +79,13 @@ const DOCUMENTED_CONNECTOR_NAMES: &[&str] = &[
     "cursor",
     "factory",
     "gemini",
+    "goose",
+    "grok",
     "hermes",
     "kimi",
     "openclaw",
     "opencode",
+    "openhands",
     "pi_agent",
     "qwen",
     "vibe",

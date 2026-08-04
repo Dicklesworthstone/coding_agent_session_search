@@ -8,7 +8,7 @@
 //! ## Regenerate
 //!
 //! ```bash
-//! UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-swarm-status-golden-target cargo test --test swarm_status_contract
+//! UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-swarm-status-golden-target cargo test --test swarm_status_contract
 //! git diff -- tests/fixtures/swarm_status tests/golden/swarm_status tests/swarm_status_contract.rs
 //! ```
 
@@ -24,7 +24,7 @@ use tempfile::TempDir;
 
 const FIXTURE_ROOT: &str = "tests/fixtures/swarm_status";
 const MANIFEST_PATH: &str = "tests/fixtures/swarm_status/manifest.json";
-const GOLDEN_UPDATE_COMMAND_SHAPE: &str = "UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-swarm-status-golden-target cargo test --test swarm_status_contract";
+const GOLDEN_UPDATE_COMMAND_SHAPE: &str = "UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-swarm-status-golden-target cargo test --test swarm_status_contract";
 const GOLDEN_REVIEW_COMMAND_SHAPE: &str = "git diff -- tests/fixtures/swarm_status tests/golden/swarm_status tests/swarm_status_contract.rs";
 const STRESS_SAMPLE_COUNT: usize = 5;
 
@@ -670,7 +670,7 @@ fn integrated_clear_proof_sources() -> Value {
                 "kind": "rch-test",
                 "bead_id": "cass-integrated-clear",
                 "commit_id": "abc123",
-                "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo test --test swarm_status_contract",
+                "command_shape": "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-proof cargo test --test swarm_status_contract",
                 "status": "passed",
                 "remote_exit_status": 0,
                 "changed_paths": ["tests/swarm_status_contract.rs"],
@@ -1561,7 +1561,7 @@ fn swarm_evidence_cli_links_committed_bead_to_proof_and_mail() -> Result<(), Box
                     "kind": "rch-test",
                     "bead_id": "cass-proof-1",
                     "commit_id": "abc123",
-                    "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo test --test cli_robot",
+                    "command_shape": "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-proof cargo test --test cli_robot",
                     "status": "passed",
                     "remote_exit_status": 0,
                     "changed_paths": ["src/lib.rs", "tests/cli_robot.rs"],
@@ -1833,7 +1833,7 @@ fn swarm_proof_debt_cli_reports_clear_complete_fixture() -> Result<(), Box<dyn E
                     "kind": "rch-test",
                     "bead_id": "cass-proof-clear",
                     "commit_id": "abc123",
-                    "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo test --test swarm_status_contract",
+                    "command_shape": "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-proof cargo test --test swarm_status_contract",
                     "status": "passed",
                     "remote_exit_status": 0,
                     "changed_paths": ["src/lib.rs", "tests/swarm_status_contract.rs"],
@@ -1929,7 +1929,7 @@ fn swarm_proof_debt_cli_prioritizes_and_suppresses_debt() -> Result<(), Box<dyn 
                         "kind": "rch-clippy",
                         "bead_id": "cass-clippy-only",
                         "commit_id": "bbb222",
-                        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo clippy --all-targets -- -D warnings",
+                        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-proof cargo clippy --all-targets -- -D warnings",
                         "status": "passed",
                         "remote_exit_status": 0,
                         "changed_paths": ["src/clippy.rs"]
@@ -1938,7 +1938,7 @@ fn swarm_proof_debt_cli_prioritizes_and_suppresses_debt() -> Result<(), Box<dyn 
                         "kind": "rch-stress",
                         "bead_id": "cass-ignored-stress",
                         "commit_id": "ccc333",
-                        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo test --test swarm_status_contract swarm_status_large_fixture_stress_artifact_10k -- --ignored",
+                        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-proof cargo test --test swarm_status_contract swarm_status_large_fixture_stress_artifact_10k -- --ignored",
                         "status": "ignored",
                         "changed_paths": ["tests/stress.rs"],
                         "artifact_refs": ["docs/artifacts/swarm/stress-proof.json"],
@@ -1957,7 +1957,7 @@ fn swarm_proof_debt_cli_prioritizes_and_suppresses_debt() -> Result<(), Box<dyn 
                         "kind": "rch-test",
                         "bead_id": "cass-mail-missing",
                         "commit_id": "eee555",
-                        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo test --test swarm_status_contract",
+                        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-proof cargo test --test swarm_status_contract",
                         "status": "passed",
                         "remote_exit_status": 0,
                         "changed_paths": ["src/mail.rs"]
@@ -2094,7 +2094,7 @@ fn swarm_failure_patterns_cli_reports_no_patterns_for_clean_fixture() -> Result<
                     "kind": "rch-test",
                     "bead_id": "cass-pattern-clear",
                     "commit_id": "abc123",
-                    "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-pattern cargo test --test swarm_status_contract",
+                    "command_shape": "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-pattern cargo test --test swarm_status_contract",
                     "status": "passed",
                     "remote_exit_status": 0,
                     "changed_paths": ["src/lib.rs"]
@@ -2198,7 +2198,7 @@ fn swarm_failure_patterns_cli_ranks_test_suggestions_and_redacts_sessions()
                     {
                         "kind": "rch-stress",
                         "bead_id": "cass-flaky",
-                        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-pattern cargo test --test e2e_large_dataset -- --ignored",
+                        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-pattern cargo test --test e2e_large_dataset -- --ignored",
                         "status": "ignored",
                         "failure_signature": "e2e_large_dataset timeout during stress proof"
                     }
@@ -2309,7 +2309,7 @@ fn swarm_dependency_drift_cli_reports_clean_read_only_fixture() -> Result<(), Bo
                     "dirty": false,
                     "sibling_status": "clean",
                     "required_downstream_tests": [
-                        "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation"
+                        "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation"
                     ]
                 }]
             }
@@ -2460,7 +2460,7 @@ fn swarm_dependency_drift_cli_flags_pin_dirty_missing_and_network_risks()
     )?;
     require(
         serde_json::to_string(&output)?.contains(
-            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation",
+            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation",
         ),
         "strict validation command missing",
     )?;
@@ -2470,6 +2470,822 @@ fn swarm_dependency_drift_cli_flags_pin_dirty_missing_and_network_risks()
         "git mutation contract",
     )?;
     assert_no_forbidden_fixture_leaks("dependency-drift-risky", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_resource_plan_reports_many_core_full_index_fixture() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "resource-plan-many-core",
+        json!({
+            "resource_plan": {
+                "host": {
+                    "profile": "many-core",
+                    "cpu_count": 64,
+                    "memory_total_mb": 262144,
+                    "memory_available_mb": 180000,
+                    "disk_available_mb": 500000
+                },
+                "cass": {
+                    "db_size_mb": 4096,
+                    "message_count": 1200000,
+                    "semantic_model_installed": true,
+                    "active_rebuild": false
+                },
+                "build_pressure": {"level": "low"}
+            }
+        }),
+    )?;
+    let output = render_swarm_resource_plan_fixture(&fixture_path, Some("full-index"))?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.resource_plan.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("ok"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("proceed-with-offloaded-window"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "high_risk_count"]),
+        json!(0),
+        "high risk count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "readiness"]),
+        json!("ready"),
+        "summary readiness",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "host_profile"]),
+        json!("many-core"),
+        "host profile",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "action"]),
+        json!("full-index"),
+        "plan action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "action_status"]),
+        json!("estimated"),
+        "plan status",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "interactive_latency_risk"]),
+        json!("medium"),
+        "latency risk",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "estimated_work_units"]),
+        json!(1712),
+        "work units",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "disk_write_mb"]),
+        json!(2048),
+        "disk write budget",
+    )?;
+    require_value_eq(
+        get_path(&output, &["concurrency_caps", "max_index_threads"]),
+        json!(16),
+        "index thread cap",
+    )?;
+    require_value_eq(
+        get_path(&output, &["concurrency_caps", "max_writer_threads"]),
+        json!(4),
+        "writer thread cap",
+    )?;
+    require_value_eq(
+        get_path(&output, &["offload", "target_dir"]),
+        json!("/data/tmp/cass-resource-plan-target"),
+        "target dir",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "schedules_work"]),
+        json!(false),
+        "scheduling contract",
+    )?;
+    assert_no_forbidden_fixture_leaks("resource-plan-many-core", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_resource_plan_blocks_low_disk_active_rebuild_absent_model_fixture()
+-> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "resource-plan-risky",
+        json!({
+            "resource_plan": {
+                "host": {
+                    "profile": "laptop",
+                    "cpu_count": 4,
+                    "memory_total_mb": 16384,
+                    "memory_available_mb": 2048,
+                    "disk_available_mb": 256
+                },
+                "cass": {
+                    "db_size_mb": 8192,
+                    "message_count": 2500000,
+                    "semantic_model_installed": false,
+                    "active_rebuild": true
+                },
+                "build_pressure": {"level": "high"}
+            }
+        }),
+    )?;
+    let output = render_swarm_resource_plan_fixture(&fixture_path, Some("semantic-backfill"))?;
+
+    require_value_eq(get_path(&output, &["status"]), json!("warning"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("free-disk-before-action"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "blocked_count"]),
+        json!(1),
+        "blocked count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "high_risk_count"]),
+        json!(1),
+        "high risk count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "action_status"]),
+        json!("blocked"),
+        "plan status",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "recommended_action"]),
+        json!("free-disk-before-action"),
+        "plan recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["plans", "0", "safer_time_window"]),
+        json!("after-disk-recovery"),
+        "safer time window",
+    )?;
+    require_value_eq(
+        get_path(&output, &["concurrency_caps", "max_index_threads"]),
+        json!(1),
+        "index thread cap",
+    )?;
+    require_value_eq(
+        get_path(&output, &["concurrency_caps", "max_semantic_batches"]),
+        json!(0),
+        "semantic batch cap",
+    )?;
+    let warnings = get_path(&output, &["plans", "0", "warnings"])
+        .and_then(Value::as_array)
+        .ok_or_else(|| test_error("warnings missing"))?;
+    for expected in [
+        "low-disk-headroom",
+        "active-rebuild-in-progress",
+        "high-build-pressure",
+        "semantic-model-absent",
+    ] {
+        require(
+            warnings.iter().any(|warning| warning == expected),
+            format!("warning {expected} missing"),
+        )?;
+    }
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "touches_network"]),
+        json!(false),
+        "network contract",
+    )?;
+    assert_no_forbidden_fixture_leaks("resource-plan-risky", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_privacy_preview_redacts_secrets_and_requires_opt_in() -> Result<(), Box<dyn Error>> {
+    let synthetic_anthropic_key =
+        ["sk-ant-", "api03-", "AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH"].concat();
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "privacy-preview-risky",
+        json!({
+            "privacy_exposure": {
+                "providers": [
+                    {
+                        "name": "claude-code",
+                        "source_class": "local-agent-history",
+                        "enabled": true,
+                        "roots": ["/home/alice/.claude/projects", "/Users/alice/Library/cass"],
+                        "file_count": 1280,
+                        "total_bytes": 524288000u64,
+                        "min_file_bytes": 128,
+                        "max_file_bytes": 8388608u64,
+                        "symlink_count": 2,
+                        "unreadable_count": 1,
+                        "secret_samples": [
+                            synthetic_anthropic_key,
+                            "reach me at alice@example.com",
+                            "GITHUB_TOKEN=supersecretvalue1234567890",
+                            "-----BEGIN RSA PRIVATE KEY-----MIIEpANiceTry"
+                        ]
+                    },
+                    {
+                        "name": "aider",
+                        "source_class": "local-agent-history",
+                        "enabled": false,
+                        "roots": ["/home/alice/.aider"],
+                        "file_count": 12
+                    }
+                ],
+                "excluded_agents": ["cursor"],
+                "raw_mirror": {"enabled": true, "manifest_count": 42, "total_storage_bytes": 104857600u64},
+                "exports": {"chatgpt_encrypted_present": true, "html_export_tier": "redacted"},
+                "support_capsule": {"requested": true},
+                "source_mirror_capture": {"requested": true}
+            }
+        }),
+    )?;
+    let output = render_swarm_privacy_exposure_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.privacy_exposure.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("warning"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "readiness"]),
+        json!("opt-in-required"),
+        "readiness",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "secret_sample_count"]),
+        json!(4),
+        "secret sample count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "provider_count"]),
+        json!(2),
+        "provider count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "reads_file_contents"]),
+        json!(false),
+        "no content reads",
+    )?;
+    require_value_eq(
+        get_path(&output, &["privacy", "redaction_applied"]),
+        json!(true),
+        "redaction applied",
+    )?;
+    // The safety guarantee: no raw secret value or absolute path may appear.
+    assert_no_forbidden_fixture_leaks("privacy-preview-risky", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_privacy_preview_normal_roots_are_ready() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "privacy-preview-normal",
+        json!({
+            "privacy_exposure": {
+                "providers": [
+                    {
+                        "name": "claude-code",
+                        "source_class": "local-agent-history",
+                        "enabled": true,
+                        "roots": ["/var/lib/cass/local"],
+                        "file_count": 200,
+                        "total_bytes": 1048576,
+                        "min_file_bytes": 64,
+                        "max_file_bytes": 65536,
+                        "symlink_count": 0,
+                        "unreadable_count": 0,
+                        "secret_samples": []
+                    }
+                ],
+                "excluded_agents": [],
+                "raw_mirror": {"enabled": false, "manifest_count": 0, "total_storage_bytes": 0},
+                "exports": {"chatgpt_encrypted_present": false, "html_export_tier": "redacted"},
+                "support_capsule": {"requested": false},
+                "source_mirror_capture": {"requested": false}
+            }
+        }),
+    )?;
+    let output = render_swarm_privacy_exposure_fixture(&fixture_path)?;
+
+    require_value_eq(get_path(&output, &["status"]), json!("ok"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "readiness"]),
+        json!("ready"),
+        "readiness",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "secret_sample_count"]),
+        json!(0),
+        "secret sample count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("proceed-with-redaction"),
+        "recommended action",
+    )?;
+    assert_no_forbidden_fixture_leaks("privacy-preview-normal", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_context_pack_selects_under_budget_and_excludes_high_risk() -> Result<(), Box<dyn Error>> {
+    let now_ms: i64 = 1_749_456_000_000;
+    let day_ms: i64 = 86_400_000;
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "context-pack-budget",
+        json!({
+            "context_pack": {
+                "bead_id": "demo-bead",
+                "token_budget": 200,
+                "now_ms": now_ms,
+                "freshness_window_days": 30,
+                "semantic_available": false,
+                "search_assets_ready": true,
+                "candidates": [
+                    {
+                        "id": "fresh-relevant",
+                        "kind": "closeout_note",
+                        "path": "/home/alice/notes/win.md",
+                        "excerpt": "landed fix: prefer unwrap_or for non-lazy defaults",
+                        "created_at_ms": now_ms - day_ms,
+                        "relevance": 0.95, "authority": 0.9, "privacy_risk": "low"
+                    },
+                    {
+                        "id": "stale-doc",
+                        "kind": "doc",
+                        "path": "/home/alice/docs/old.md",
+                        "excerpt": "outdated advice about rusqlite migration",
+                        "created_at_ms": now_ms - 60 * day_ms,
+                        "relevance": 0.6, "authority": 0.5, "privacy_risk": "low"
+                    },
+                    {
+                        "id": "secret-leak",
+                        "kind": "failed_command",
+                        "path": "/home/alice/.env",
+                        "excerpt": "export GITHUB_TOKEN=ghp_supersecretvalue1234567890",
+                        "created_at_ms": now_ms - day_ms,
+                        "relevance": 0.99, "authority": 0.9, "privacy_risk": "high"
+                    },
+                    {
+                        "id": "semantic-pick",
+                        "kind": "prior_session",
+                        "path": "/home/alice/.claude/s.jsonl",
+                        "excerpt": "semantic-only match that should be dropped",
+                        "created_at_ms": now_ms - 2 * day_ms,
+                        "relevance": 0.8, "authority": 0.7, "privacy_risk": "low",
+                        "semantic_only": true
+                    }
+                ]
+            }
+        }),
+    )?;
+    let output = render_swarm_context_pack_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.context_pack.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("warning"), "status")?;
+    // High privacy-risk candidate is excluded, never selected.
+    require_value_eq(
+        get_path(&output, &["summary", "excluded_high_risk_count"]),
+        json!(1),
+        "excluded high risk count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["excluded_high_risk", "0", "id"]),
+        json!("secret-leak"),
+        "excluded id",
+    )?;
+    // Semantic-only candidate is degraded out when semantic is unavailable.
+    require_value_eq(
+        get_path(&output, &["degradation", "mode"]),
+        json!("lexical-only"),
+        "degradation mode",
+    )?;
+    // Fresh/relevant ranks first.
+    require_value_eq(
+        get_path(&output, &["selected", "0", "id"]),
+        json!("fresh-relevant"),
+        "top selected",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    // Budget accounting must not overspend.
+    let used = get_path(&output, &["budget", "used_tokens"]).and_then(Value::as_u64);
+    let evidence = get_path(&output, &["budget", "evidence_budget_tokens"]).and_then(Value::as_u64);
+    require(
+        used.is_some() && evidence.is_some() && used <= evidence,
+        "used tokens must not exceed evidence budget",
+    )?;
+    // Safety: no raw secret value or absolute path may appear.
+    assert_no_forbidden_fixture_leaks("context-pack-budget", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_context_pack_tiny_budget_omits_with_accounting() -> Result<(), Box<dyn Error>> {
+    let now_ms: i64 = 1_749_456_000_000;
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "context-pack-tiny",
+        json!({
+            "context_pack": {
+                "bead_id": "demo-bead",
+                "token_budget": 70,
+                "now_ms": now_ms,
+                "freshness_window_days": 30,
+                "semantic_available": true,
+                "search_assets_ready": true,
+                "candidates": [
+                    {
+                        "id": "a",
+                        "kind": "doc",
+                        "path": "/var/lib/cass/a.md",
+                        "excerpt": "some moderately long evidence excerpt that costs tokens to include",
+                        "created_at_ms": now_ms,
+                        "relevance": 0.9, "authority": 0.8, "privacy_risk": "low"
+                    },
+                    {
+                        "id": "b",
+                        "kind": "doc",
+                        "path": "/var/lib/cass/b.md",
+                        "excerpt": "another moderately long evidence excerpt also costing tokens",
+                        "created_at_ms": now_ms,
+                        "relevance": 0.85, "authority": 0.8, "privacy_risk": "low"
+                    }
+                ]
+            }
+        }),
+    )?;
+    let output = render_swarm_context_pack_fixture(&fixture_path)?;
+
+    let omitted = get_path(&output, &["omitted"]).and_then(Value::as_array);
+    require(
+        omitted.is_some_and(|items| !items.is_empty()),
+        "tiny budget must omit at least one candidate",
+    )?;
+    require_value_eq(
+        get_path(&output, &["omitted", "0", "reason"]),
+        json!("token-budget-exhausted"),
+        "omit reason",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn swarm_workflow_analytics_windows_filters_and_redacts() -> Result<(), Box<dyn Error>> {
+    let now_ms: i64 = 1_749_456_000_000;
+    let day_ms: i64 = 86_400_000;
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "workflow-analytics-basic",
+        json!({
+            "workflow_analytics": {
+                "now_ms": now_ms,
+                "window_days": 30,
+                "records": [
+                    {"ts_ms": now_ms - day_ms, "agent": "cc", "source": "local", "workspace": "cass",
+                     "skill": "ubs", "command": "cargo clippy", "proof_gate": "clippy",
+                     "file_area": "/home/alice/src/swarm", "outcome": "clean_close", "duration_ms": 1000},
+                    {"ts_ms": now_ms - 2 * day_ms, "agent": "cc", "source": "local", "workspace": "cass",
+                     "skill": "ubs", "command": "cargo clippy", "proof_gate": "clippy",
+                     "file_area": "/home/alice/src/swarm", "outcome": "reopen", "duration_ms": 5000},
+                    {"ts_ms": now_ms - 50 * day_ms, "agent": "cod", "source": "local", "workspace": "cass",
+                     "skill": "rch", "command": "cargo test", "proof_gate": "tests",
+                     "file_area": "/home/bob/src/idx", "outcome": "proof_debt", "duration_ms": 9000}
+                ]
+            }
+        }),
+    )?;
+    let output = render_swarm_workflow_analytics_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.workflow_analytics.v1"),
+        "schema version",
+    )?;
+    // 3 records, 1 outside the 30-day window -> 2 in scope.
+    require_value_eq(
+        get_path(&output, &["summary", "total_records"]),
+        json!(3),
+        "total records",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "records_in_scope"]),
+        json!(2),
+        "records in scope",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    require_value_eq(
+        get_path(&output, &["privacy", "aggregate_only"]),
+        json!(true),
+        "aggregate only",
+    )?;
+    // No raw absolute path may appear (file_area redacted as a dimension key).
+    assert_no_forbidden_fixture_leaks("workflow-analytics-basic", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_workflow_analytics_missing_source_is_partial() -> Result<(), Box<dyn Error>> {
+    // Sources present but the workflow_analytics provider is absent -> partial.
+    let (_tmp, fixture_path) =
+        write_swarm_evidence_fixture("workflow-analytics-empty", json!({"git": {"clean": true}}))?;
+    let output = render_swarm_workflow_analytics_fixture(&fixture_path)?;
+    require_value_eq(get_path(&output, &["status"]), json!("partial"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("supply-analytics-fixture"),
+        "recommended action",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn swarm_replay_fixture_scrubs_and_hashes_deterministically() -> Result<(), Box<dyn Error>> {
+    let now_ms: i64 = 1_749_456_000_000;
+    let make = |fixture_id: &str| -> Result<(TempDir, std::path::PathBuf), Box<dyn Error>> {
+        write_swarm_evidence_fixture(
+            fixture_id,
+            json!({
+                "replay_fixture": {
+                    "replay_id": "swarm-2026-06-08",
+                    "events": [
+                        {"seq": 2, "ts_ms": now_ms, "kind": "mail_send", "actor": "cc", "bead": "demo",
+                         "payload": {"to": "cod", "body": "secret talk: sk-ant-supersecret1234567890",
+                                     "path": "/home/alice/.claude/projects/x"}},
+                        {"seq": 1, "ts_ms": now_ms - 1000, "kind": "git_commit", "actor": "cod", "bead": "demo",
+                         "payload": {"sha": "abc123", "message": "fix; contact alice@example.com"}}
+                    ]
+                }
+            }),
+        )
+    };
+
+    let (_tmp, fixture_path) = make("replay-basic")?;
+    let output = render_swarm_replay_fixture_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.replay_fixture.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("ok"), "status")?;
+    require_value_eq(
+        get_path(&output, &["manifest", "event_count"]),
+        json!(2),
+        "event count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["redaction_report", "raw_payload_text_retained"]),
+        json!(false),
+        "no raw payload retained",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "all_assertions_pass"]),
+        json!(true),
+        "all assertions pass",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    // Safety: no raw secret value, email, or absolute path may appear.
+    assert_no_forbidden_fixture_leaks("replay-basic", &output);
+
+    // Deterministic hash is stable across an independent run.
+    let (_tmp2, fixture_path2) = make("replay-basic-2")?;
+    let output2 = render_swarm_replay_fixture_fixture(&fixture_path2)?;
+    require_value_eq(
+        get_path(&output, &["manifest", "deterministic_hash"]),
+        get_path(&output2, &["manifest", "deterministic_hash"])
+            .cloned()
+            .unwrap_or(json!(null)),
+        "deterministic hash stable",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn swarm_replay_fixture_missing_source_is_partial() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) =
+        write_swarm_evidence_fixture("replay-empty", json!({"git": {"clean": true}}))?;
+    let output = render_swarm_replay_fixture_fixture(&fixture_path)?;
+    require_value_eq(get_path(&output, &["status"]), json!("partial"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("supply-replay-timeline-fixture"),
+        "recommended action",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn swarm_macros_healthy_case_is_ready_and_valid() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "macros-healthy",
+        json!({
+            "workflow_macros": {
+                "macro": "create-support-capsule",
+                "facts": {"db_present": true}
+            }
+        }),
+    )?;
+    let output = render_swarm_macros_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.workflow_macros.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("ok"), "status")?;
+    require_value_eq(
+        get_path(&output, &["macros", "0", "readiness"]),
+        json!("ready"),
+        "macro readiness",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "invalid_count"]),
+        json!(0),
+        "no invalid macros",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "apply_mode"]),
+        json!(false),
+        "advisory only",
+    )?;
+    // Registry has at least six macros and no bare cass/bv or destructive recipe.
+    let registry = get_path(&output, &["summary", "registry_size"]).and_then(Value::as_u64);
+    require(
+        registry.is_some_and(|n| n >= 6),
+        "registry must have >= 6 macros",
+    )?;
+    // Scope the bare-command lint to the macro recipes (the envelope's
+    // guided_workflow.surface legitimately names the cass swarm macros command).
+    let text = serde_json::to_string(&output["macros"])?;
+    require(
+        !text.contains("cass "),
+        "macros must not embed bare `cass ` examples",
+    )?;
+    require(
+        !text.contains("rm -rf"),
+        "macros must not embed destructive recipes",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn swarm_macros_blocked_case_lists_missing_facts() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "macros-blocked",
+        json!({
+            "workflow_macros": {
+                "macro": "prepare-release",
+                "facts": {"git_clean_or_known": true}
+            }
+        }),
+    )?;
+    let output = render_swarm_macros_fixture(&fixture_path)?;
+    require_value_eq(get_path(&output, &["status"]), json!("warning"), "status")?;
+    require_value_eq(
+        get_path(&output, &["macros", "0", "readiness"]),
+        json!("blocked"),
+        "macro readiness",
+    )?;
+    let missing = get_path(&output, &["macros", "0", "missing_facts"]).and_then(Value::as_array);
+    require(
+        missing.is_some_and(|m| m.iter().any(|f| f == &json!("version_bumped"))),
+        "blocked macro must list the missing preflight fact",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn swarm_repro_capsule_scrubs_and_emits_real_rerun_surface() -> Result<(), Box<dyn Error>> {
+    let private_session_text = "user secret: my key is sk-ant-AAA and pw hunter2";
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "repro-capsule-redacted",
+        json!({
+            "repro_capsule": {
+                "incident_kind": "panic",
+                "cass_version": "0.6.13",
+                "command": "index --full under /home/alice/.claude",
+                "transcript": "panic at /home/alice/src; TOKEN=supersecretvalue123456 and sk-ant-supersecret1234567890",
+                "env": {"os": "linux", "email": "alice@example.com"},
+                "health_excerpt": {"index_present": false, "path": "/home/alice/.cass"},
+                "evidence_refs": ["/home/alice/.claude/s.jsonl:9"],
+                "expected": "no panic",
+                "actual": "panic",
+                "private_session_text": private_session_text,
+                "privacy_tier": "redacted"
+            }
+        }),
+    )?;
+    let output = render_swarm_repro_capsule_fixture(&fixture_path)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.repro_capsule.v2"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("ok"), "status")?;
+    require_value_eq(
+        get_path(
+            &output,
+            &["redaction_report", "private_session_text_dropped"],
+        ),
+        json!(true),
+        "private text dropped",
+    )?;
+    require_value_eq(
+        get_path(&output, &["rerun", "targets_live_data"]),
+        json!(false),
+        "rerun must not target live data",
+    )?;
+    require_value_eq(
+        get_path(&output, &["rerun", "command_template"]),
+        json!("cass swarm repro-capsule --json --fixture repro-capsule.fixture.json"),
+        "rerun must use the real share-safe fixture surface",
+    )?;
+    require(
+        get_path(&output, &["rerun", "data_dir"]).is_none(),
+        "rerun must not advertise a fictional data directory",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    // Safety: no raw secret, email, or absolute path may appear.
+    assert_no_forbidden_fixture_leaks("repro-capsule-redacted", &output);
+    validate_raw_session_privacy_contract(&output, private_session_text).map_err(test_error)?;
+    Ok(())
+}
+
+#[test]
+fn swarm_repro_capsule_raw_session_metadata_requires_explicit_false() {
+    let raw_session_text = "PRIVATE RAW SESSION CONTENT";
+    let safe = json!({
+        "privacy": {"contains_raw_session_text": false},
+        "capsule": {"summary": "redacted"}
+    });
+    assert!(validate_raw_session_privacy_contract(&safe, raw_session_text).is_ok());
+
+    for unsafe_output in [
+        json!({"privacy": {"contains_raw_session_text": true}}),
+        json!({"privacy": {"contains_raw_session_text": "false"}}),
+        json!({"privacy": {"contains_raw_session_text": null}}),
+        json!({"privacy": {}}),
+        json!({}),
+        json!({
+            "privacy": {"contains_raw_session_text": false},
+            "capsule": {"transcript": raw_session_text}
+        }),
+    ] {
+        assert!(
+            validate_raw_session_privacy_contract(&unsafe_output, raw_session_text).is_err(),
+            "unsafe or ambiguous raw-session state must be rejected: {unsafe_output}"
+        );
+    }
+}
+
+#[test]
+fn swarm_repro_capsule_missing_source_is_partial() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) =
+        write_swarm_evidence_fixture("repro-capsule-empty", json!({"git": {"clean": true}}))?;
+    let output = render_swarm_repro_capsule_fixture(&fixture_path)?;
+    require_value_eq(get_path(&output, &["status"]), json!("partial"), "status")?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("supply-incident-fixture"),
+        "recommended action",
+    )?;
     Ok(())
 }
 
@@ -2604,7 +3420,7 @@ fn swarm_status_large_fixture_stress_artifact_10k() -> Result<(), Box<dyn Error>
     let artifact = json!({
         "schema_version": "cass.swarm.status.large_swarm_perf.v1",
         "fixture_id": "large-stress-10k",
-        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-swarm-large-target cargo test --test swarm_status_contract swarm_status_large_fixture_stress_artifact_10k -- --ignored --nocapture",
+        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-swarm-large-target cargo test --test swarm_status_contract swarm_status_large_fixture_stress_artifact_10k -- --ignored --nocapture",
         "sample_count": samples.len(),
         "scale": {
             "beads": scale.total_bead_count(),
@@ -3391,6 +4207,110 @@ fn run_swarm_dependency_drift_fixture(fixture_path: &Path) -> Result<Value, Box<
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+fn render_swarm_resource_plan_fixture(
+    fixture_path: &Path,
+    action: Option<&str>,
+) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let action_filter =
+        coding_agent_search::resource_plan::validate_action_filter(action).map_err(test_error)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::ResourcePlan);
+    Ok(
+        coding_agent_search::resource_plan::render_resource_plan_fixture(
+            adapter_set.input().fixture_id(),
+            source,
+            action_filter.as_deref(),
+        ),
+    )
+}
+
+fn render_swarm_privacy_exposure_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::PrivacyExposure);
+    Ok(
+        coding_agent_search::privacy_exposure::render_privacy_exposure_fixture(
+            adapter_set.input().fixture_id(),
+            source,
+        ),
+    )
+}
+
+fn render_swarm_context_pack_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::ContextPack);
+    Ok(
+        coding_agent_search::context_pack::render_context_pack_fixture(
+            adapter_set.input().fixture_id(),
+            source,
+        ),
+    )
+}
+
+fn render_swarm_workflow_analytics_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::WorkflowAnalytics);
+    Ok(
+        coding_agent_search::workflow_analytics::render_workflow_analytics_fixture(
+            adapter_set.input().fixture_id(),
+            source,
+        ),
+    )
+}
+
+fn render_swarm_replay_fixture_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::ReplayFixture);
+    Ok(
+        coding_agent_search::swarm_replay_fixture::render_replay_fixture_fixture(
+            adapter_set.input().fixture_id(),
+            source,
+        ),
+    )
+}
+
+fn render_swarm_macros_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::WorkflowMacros);
+    Ok(
+        coding_agent_search::workflow_macros::render_workflow_macros_fixture(
+            adapter_set.input().fixture_id(),
+            source,
+        ),
+    )
+}
+
+fn render_swarm_repro_capsule_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let adapter_set =
+        coding_agent_search::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(fixture_path)?;
+    let source = adapter_set
+        .input()
+        .source_value(coding_agent_search::swarm_status::SwarmProviderName::ReproCapsule);
+    Ok(
+        coding_agent_search::repro_capsule::render_repro_capsule_fixture(
+            adapter_set.input().fixture_id(),
+            source,
+        ),
+    )
+}
+
 fn read_json(path: PathBuf) -> Value {
     let body =
         fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
@@ -3446,7 +4366,6 @@ fn assert_no_forbidden_fixture_leaks(fixture_id: &str, value: &Value) {
         "PRIVATE KEY",
         "SECRET_VALUE",
         "TOKEN=",
-        "raw_session_text",
         "/Users/",
         "alice@example.com",
         "api.example.corp",
@@ -3457,6 +4376,31 @@ fn assert_no_forbidden_fixture_leaks(fixture_id: &str, value: &Value) {
             "{fixture_id} golden leaks forbidden fixture text: {needle}"
         );
     }
+}
+
+fn validate_raw_session_privacy_contract(
+    value: &Value,
+    raw_session_text: &str,
+) -> Result<(), String> {
+    match get_path(value, &["privacy", "contains_raw_session_text"]) {
+        Some(Value::Bool(false)) => {}
+        Some(other) => {
+            return Err(format!(
+                "privacy.contains_raw_session_text must be the JSON boolean false, got {other}"
+            ));
+        }
+        None => {
+            return Err(
+                "privacy.contains_raw_session_text must be present and explicitly false".to_owned(),
+            );
+        }
+    }
+
+    let serialized = serde_json::to_string(value).map_err(|err| err.to_string())?;
+    if serialized.contains(raw_session_text) {
+        return Err("repro capsule contains the raw private-session fixture text".to_owned());
+    }
+    Ok(())
 }
 
 fn get_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {

@@ -44,6 +44,7 @@ fn claude_skips_invalid_json_syntax() {
         data_dir: dir.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -70,6 +71,7 @@ fn claude_skips_missing_type_field() {
         data_dir: dir.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -97,6 +99,7 @@ fn claude_handles_wrong_field_types() {
         data_dir: dir.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -122,6 +125,7 @@ fn claude_handles_truncated_json() {
         data_dir: dir.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -153,6 +157,7 @@ fn claude_handles_binary_in_content() {
         data_dir: dir.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     // Should not panic - gracefully handle the file
     let result = conn.scan(&ctx);
@@ -180,6 +185,7 @@ fn claude_returns_error_on_invalid_utf8() {
         data_dir: dir.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     // The scanner uses BufRead::lines() which returns Err on invalid UTF-8,
     // but the implementation silently skips such lines for resilience.
@@ -212,6 +218,7 @@ fn claude_handles_empty_file() {
         data_dir: dir.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     // Empty file produces no conversations
@@ -233,6 +240,7 @@ fn claude_handles_whitespace_only_file() {
         data_dir: dir.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     // Whitespace-only file produces no conversations
@@ -258,6 +266,7 @@ fn gemini_skips_invalid_json() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     // Invalid file should be skipped, no conversations
@@ -287,6 +296,7 @@ fn gemini_handles_missing_messages() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     // File without messages should produce empty or skipped conversation
@@ -316,6 +326,7 @@ fn gemini_handles_wrong_messages_type() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     // Should not panic
     let result = conn.scan(&ctx);
@@ -345,6 +356,7 @@ fn codex_skips_invalid_json() {
         data_dir: codex_home,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     // Invalid JSON causes read error, which propagates
     let result = conn.scan(&ctx);
@@ -380,6 +392,7 @@ fn codex_handles_missing_events() {
         data_dir: codex_home,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     // Should not panic - gracefully handle missing fields
     let result = conn.scan(&ctx);
@@ -405,6 +418,7 @@ fn cline_skips_invalid_json() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert!(convs.is_empty());
@@ -432,6 +446,7 @@ fn cline_handles_missing_task_history() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     // Should not panic
     let result = conn.scan(&ctx);
@@ -467,6 +482,7 @@ fn claude_processes_valid_files_despite_bad_ones() {
         data_dir: dir.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
 
@@ -501,6 +517,7 @@ fn claude_handles_extremely_long_content() {
         data_dir: dir.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     // Should not panic or hang
     let result = conn.scan(&ctx);
@@ -530,6 +547,7 @@ fn claude_handles_deeply_nested_json() {
         data_dir: dir.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     // Should not panic
     let result = conn.scan(&ctx);

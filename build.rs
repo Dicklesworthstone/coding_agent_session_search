@@ -47,15 +47,13 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // crates.io-only exact pin: fsqlite 0.1.9 carries the upstream #95
-        // BtCursor forward-progress fix plus the #106 MVCC grow fix,
-        // FTS5 reload/lazy-shadow fixes, and the latest large-index repair
-        // surface needed by cass refreshes.
-        // Empty `expected_git` signals
-        // `validate_manifest_dependency_spec` to skip git/rev checks.
-        expected_git: "",
-        expected_rev: "",
-        expected_version: "0.1.9",
+        // The published 0.1.19 archive predates the existing-only schema-open
+        // API that CASS calls. Pin the immutable source that actually contains
+        // that API and its no-create/bounded-open tests; a version-only pin is
+        // ambiguous because both sources declare 0.1.19.
+        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
+        expected_rev: "2351c6c52b9e5fdba6a413865415db0452e660ef",
+        expected_version: "0.1.19",
         expected_features: &["fts5"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -65,15 +63,14 @@ const CONTRACTS: &[DependencyContract] = &[
         mode: ValidationMode::StrictOptIn,
     },
     DependencyContract {
-        label: "frankensqlite shared types",
+        label: "frankensqlite shared types (production)",
         dep_table: "dependencies",
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // Same immutable source as the facade; the version requirement also
-        // verifies the checked-out package identity.
+        // Keep shared types on the identical immutable source as the facade.
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "f6a007b169ccd483f0e4e437f436d81357461718",
+        expected_rev: "2351c6c52b9e5fdba6a413865415db0452e660ef",
         expected_version: "0.1.19",
         expected_features: &[],
         expected_default_features: None,
@@ -84,15 +81,15 @@ const CONTRACTS: &[DependencyContract] = &[
         mode: ValidationMode::StrictOptIn,
     },
     DependencyContract {
-        label: "frankensqlite shared types dev contract",
+        label: "frankensqlite shared types (test)",
         dep_table: "dev-dependencies",
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // crates.io-only exact pin aligned with the frankensqlite facade at 0.1.9.
-        expected_git: "",
-        expected_rev: "",
-        expected_version: "0.1.9",
+        // Keep shared types on the identical immutable source as the facade.
+        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
+        expected_rev: "2351c6c52b9e5fdba6a413865415db0452e660ef",
+        expected_version: "0.1.19",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -108,8 +105,8 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "a4923d4097899e6e9805cefe67bce70e1b04a289",
-        expected_version: "0.1.8",
+        expected_rev: "dd2c694096d959ba87e0f6a44e87450b34144d3f",
+        expected_version: "0.1.10",
         expected_features: &[
             "chatgpt",
             "connectors",
@@ -138,7 +135,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // `validate_manifest_dependency_spec` to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.2",
+        expected_version: "0.3.9",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -154,18 +151,20 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "frankensearch",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        // Bumped from 831b3b13 to pick up bounded cass content-prefix
-        // indexing plus the self-contained Git dependency packaging fix.
-        expected_rev: "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
+        // Pins the frankensearch rev carrying the pure-Rust `native` feature
+        // and the explicit `cass-compat` -> `lexical-tantivy` foreign-index
+        // surface. The latter keeps CASS schema-v8 access independent from
+        // FrankenSearch's swappable generic lexical backend (cass #308,
+        // bd-8nqz.5).
+        expected_rev: "ad8e29eaa03c9f29abc472d895a0ea9bcbe04ff1",
         expected_version: "0.3.2",
-        // cass#256: `fastembed-reranker` no longer appears in the static
-        // `[dependencies]` table; it is enabled by the cass `semantic`
-        // feature so the baseline build (`--no-default-features --features
-        // qr,encryption`) can drop the prebuilt Microsoft ONNX Runtime
-        // binary that crashes pre-AVX2 CPUs. The contract therefore only
-        // pins the always-on features here; the conditional one is
-        // validated by Cargo's own feature graph.
-        expected_features: &["ann", "hash", "lexical"],
+        // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
+        // embedding + reranking are now pure-Rust via frankensearch's `native`
+        // feature, kept always-on here (no AVX/ONNX static-init hazard, so no
+        // separate `-baseline` build is needed). Bead tg5o9 retired the vacuous
+        // cass `semantic` feature; semantic readiness is now determined solely
+        // by runtime model/vector assets.
+        expected_features: &["ann", "cass-compat", "hash", "native"],
         expected_default_features: Some(false),
         repo_rel: "../frankensearch",
         manifest_rel: "frankensearch/Cargo.toml",
@@ -278,8 +277,6 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed={STRICT_PATH_DEP_ENV}");
 
-    emit_platform_link_hints();
-
     let manifest_dir = match env::var("CARGO_MANIFEST_DIR") {
         Ok(value) => PathBuf::from(value),
         Err(err) => fatal(format!(
@@ -304,20 +301,13 @@ fn main() {
     emit_vergen_metadata();
 }
 
-fn emit_platform_link_hints() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        // The aarch64-apple-darwin ONNX Runtime static archive used by ort-sys
-        // references CoreML symbols, but ort-sys only emits Foundation today.
-        println!("cargo:rustc-link-lib=framework=CoreML");
-    }
-}
-
 fn validate_path_dependency_contracts(
     manifest_dir: &Path,
     manifest: &Value,
     packaged_manifest: bool,
 ) {
     let strict_enabled = strict_path_dep_validation_enabled();
+    validate_fsqlite_registry_source_override(manifest, packaged_manifest);
 
     for contract in CONTRACTS {
         validate_manifest_dependency_spec(manifest, contract, packaged_manifest);
@@ -328,6 +318,42 @@ fn validate_path_dependency_contracts(
 
         if contract.mode == ValidationMode::ActivePathOverride || strict_enabled {
             validate_local_contract(manifest_dir, contract, strict_enabled);
+        }
+    }
+}
+
+fn validate_fsqlite_registry_source_override(manifest: &Value, packaged_manifest: bool) {
+    // Cargo omits root patch directives from its normalized publish manifest.
+    // The source-tree contract remains enforced during every ordinary build.
+    if packaged_manifest {
+        return;
+    }
+
+    const EXPECTED_GIT: &str = "https://github.com/Dicklesworthstone/frankensqlite";
+    const EXPECTED_REV: &str = "2351c6c52b9e5fdba6a413865415db0452e660ef";
+
+    let patch_tables = table(manifest, "patch", "manifest root");
+    let crates_io = table_value(Some(patch_tables), "crates-io", "[patch]")
+        .as_table()
+        .unwrap_or_else(|| {
+            fatal("dependency source contract violation: [patch.crates-io] must be a table")
+        });
+    for dependency in ["fsqlite", "fsqlite-types"] {
+        let spec = inline_table(crates_io, dependency, "[patch.crates-io]");
+        let git = string_value(spec, "git", dependency);
+        let revision = string_value(spec, "rev", dependency);
+        if git != EXPECTED_GIT || revision != EXPECTED_REV {
+            fatal(format!(
+                "dependency source contract violation for {dependency}: \
+                 [patch.crates-io].{dependency} must pin git = {EXPECTED_GIT:?}, \
+                 rev = {EXPECTED_REV:?}; found git = {git:?}, rev = {revision:?}"
+            ));
+        }
+        if spec.contains_key("path") || spec.contains_key("branch") || spec.contains_key("tag") {
+            fatal(format!(
+                "dependency source contract violation for {dependency}: \
+                 the committed crates.io override must use only immutable git + rev identity"
+            ));
         }
     }
 }
@@ -736,16 +762,15 @@ fn git_output(repo_root: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn emit_vergen_metadata() {
-    use vergen::{BuildBuilder, CargoBuilder, Emitter};
+    use vergen::{Build, Cargo, Emitter};
 
+    // vergen 10 replaced the `XxxBuilder::all_*()` constructors (which returned a
+    // `Result`) with bon-based config structs whose `all_*()` associated fns
+    // return the value directly. `Build::all_build()` / `Cargo::all_cargo()`
+    // preserve the previous "emit every build/cargo instruction" behavior.
     let mut emitter = Emitter::default();
-
-    if let Ok(build) = BuildBuilder::all_build() {
-        let _ = emitter.add_instructions(&build);
-    }
-    if let Ok(cargo) = CargoBuilder::all_cargo() {
-        let _ = emitter.add_instructions(&cargo);
-    }
+    let _ = emitter.add_instructions(&Build::all_build());
+    let _ = emitter.add_instructions(&Cargo::all_cargo());
 
     if let Err(err) = emitter.emit() {
         eprintln!("vergen emit skipped: {err}");

@@ -14,7 +14,7 @@
 //! binary (not `golden_robot_json.rs`) to keep the file small and lint-clean.
 //!
 //! Regenerate:
-//!   UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target \
+//!   UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target \
 //!     cargo test --test golden_robot_pack
 //!   git diff tests/golden/   # review, then commit
 

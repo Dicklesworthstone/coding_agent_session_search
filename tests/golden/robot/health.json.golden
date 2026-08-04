@@ -281,6 +281,15 @@
     "newest_last_attempt_at_ms": null,
     "recommended_action": null
   },
+  "search_completeness": {
+    "quarantine_status": "ok",
+    "quarantined_conversations": 0,
+    "complete": true,
+    "can_search": true,
+    "coverage_suspect": false,
+    "impact": "search covers all known conversations; nothing is quarantined",
+    "next_command": "cass status --json"
+  },
   "responsiveness": {
     "current_capacity_pct": 100,
     "resource_policy": {
@@ -357,10 +366,12 @@
       "status": "missing",
       "reason": "lexical Tantivy metadata missing",
       "fresh": false,
+      "partial": false,
+      "partial_reason": null,
       "last_indexed_at": null,
       "age_seconds": "[AGE_SECONDS]",
       "stale": false,
-      "stale_threshold_seconds": 300,
+      "stale_threshold_seconds": 1800,
       "rebuilding": false,
       "stalled": false,
       "activity_at": null,
@@ -453,6 +464,7 @@
       "hnsw_path": null,
       "hnsw_ready": false,
       "progressive_ready": false,
+      "progressive_reason_code": null,
       "feature_compiled_in": true,
       "quality_tier_published": false,
       "semantic_only_search_available": false,
@@ -466,7 +478,8 @@
         "embedder_id": null,
         "model_revision": null,
         "completed_at": null,
-        "size_bytes": null
+        "size_bytes": null,
+        "shard_count": null
       },
       "quality_tier": {
         "present": false,
@@ -477,7 +490,8 @@
         "embedder_id": null,
         "model_revision": null,
         "completed_at": null,
-        "size_bytes": null
+        "size_bytes": null,
+        "shard_count": null
       },
       "backlog": {
         "total_conversations": 0,

@@ -1240,21 +1240,38 @@ mod tests {
             ("sk-abc".into(), "sk-abc".into()), // too short
             ("AKIAIOSFODN7EXAMPL".into(), "AKIAIOSFODN7EXAMPL".into()), // 14 chars, not 16
             ("akiaiosfodnn7example".into(), "akiaiosfodnn7example".into()), // lowercase AKIA
-            ("ghx_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij".into(),
-             "ghx_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij".into()), // bad PAT prefix
+            (
+                "ghx_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij".into(),
+                "ghx_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij".into(),
+            ), // bad PAT prefix
             ("eyJhbGciOiJSUzI1NiJ9".into(), "eyJhbGciOiJSUzI1NiJ9".into()), // single JWT segment
             ("Bearer short".into(), "Bearer short".into()), // bearer token too short
-            ("xoxz-123456789-abcdefghij".into(), "xoxz-123456789-abcdefghij".into()), // bad slack prefix
-            (format!("{}_{}", "sk_test", "AAAABBBBCCCCDDDDEEEEFFFFGGGG"),
-             format!("{}_{}", "sk_test", "AAAABBBBCCCCDDDDEEEEFFFFGGGG")), // test-mode stripe key
+            (
+                "xoxz-123456789-abcdefghij".into(),
+                "xoxz-123456789-abcdefghij".into(),
+            ), // bad slack prefix
+            (
+                format!("{}_{}", "sk_test", "AAAABBBBCCCCDDDDEEEEFFFFGGGG"),
+                format!("{}_{}", "sk_test", "AAAABBBBCCCCDDDDEEEEFFFFGGGG"),
+            ), // test-mode stripe key
             ("api_key=short".into(), "api_key=short".into()), // value below 8 chars
-            ("-----BEGIN CERTIFICATE-----".into(), "-----BEGIN CERTIFICATE-----".into()),
-            ("visit https://example.com/path for docs".into(),
-             "visit https://example.com/path for docs".into()),
-            ("plain prose with no secrets at all".into(),
-             "plain prose with no secrets at all".into()),
+            (
+                "-----BEGIN CERTIFICATE-----".into(),
+                "-----BEGIN CERTIFICATE-----".into(),
+            ),
+            (
+                "visit https://example.com/path for docs".into(),
+                "visit https://example.com/path for docs".into(),
+            ),
+            (
+                "plain prose with no secrets at all".into(),
+                "plain prose with no secrets at all".into(),
+            ),
             ("".into(), "".into()),
-            ("🔐 unicode near sk-abc miss 测试".into(), "🔐 unicode near sk-abc miss 测试".into()),
+            (
+                "🔐 unicode near sk-abc miss 测试".into(),
+                "🔐 unicode near sk-abc miss 测试".into(),
+            ),
         ];
 
         let mut warmed = MemoizingRedactor::with_capacity(128);
@@ -1332,12 +1349,11 @@ mod tests {
             ":",
             "=",
         ]);
-        let input_strategy = proptest::collection::vec(fragment, 0..12)
-            .prop_map(|parts| parts.concat());
+        let input_strategy =
+            proptest::collection::vec(fragment, 0..12).prop_map(|parts| parts.concat());
 
-        let mut runner = proptest::test_runner::TestRunner::new(
-            proptest::test_runner::Config::with_cases(512),
-        );
+        let mut runner =
+            proptest::test_runner::TestRunner::new(proptest::test_runner::Config::with_cases(512));
         runner
             .run(&input_strategy, |input| {
                 let reference = redact_text_reference(&input).into_owned();

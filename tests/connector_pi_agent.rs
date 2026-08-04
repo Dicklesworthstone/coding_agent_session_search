@@ -28,6 +28,7 @@ fn pi_agent_connector_reads_session_jsonl() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -88,6 +89,7 @@ fn pi_agent_connector_includes_thinking_content() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -143,6 +145,7 @@ fn pi_agent_connector_handles_tool_calls() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -206,6 +209,7 @@ fn pi_agent_connector_handles_model_change() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -309,6 +313,7 @@ also not valid
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -350,6 +355,7 @@ fn pi_agent_connector_handles_string_content() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -398,6 +404,7 @@ fn pi_agent_connector_filters_empty_content() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -442,6 +449,7 @@ fn pi_agent_connector_extracts_title_from_first_user_message() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -484,6 +492,7 @@ fn pi_agent_connector_truncates_long_title() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -528,6 +537,7 @@ fn pi_agent_connector_assigns_sequential_indices() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -569,6 +579,7 @@ fn pi_agent_connector_metadata_includes_provider_info() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -629,6 +640,7 @@ fn pi_agent_connector_ignores_files_without_underscore() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     // Only the file with underscore pattern should be processed
@@ -656,6 +668,7 @@ fn pi_agent_connector_handles_empty_sessions() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert!(
@@ -688,6 +701,7 @@ fn pi_agent_connector_skips_thinking_level_change() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -735,6 +749,7 @@ fn pi_agent_connector_populates_author_for_assistant_messages() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -817,6 +832,7 @@ fn pi_agent_connector_handles_multiple_model_changes() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -886,6 +902,7 @@ fn pi_agent_connector_handles_empty_thinking_block() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -939,6 +956,7 @@ fn pi_agent_connector_handles_nested_tool_calls() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -1034,6 +1052,7 @@ fn pi_agent_connector_handles_very_long_session() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     let start = std::time::Instant::now();
@@ -1104,6 +1123,7 @@ fn pi_agent_connector_handles_unicode_content() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -1192,6 +1212,7 @@ fn pi_agent_connector_handles_null_thinking_content() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(
@@ -1239,6 +1260,7 @@ fn pi_agent_connector_handles_tool_call_with_null_arguments() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(

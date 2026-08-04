@@ -3,6 +3,8 @@
   "doctor_contract_version": 1,
   "capabilities_url": "cass capabilities --json",
   "status": "not_initialized",
+  "reason_code": null,
+  "degraded_reason_codes": [],
   "health_class": "degraded-archive-risk",
   "risk_level": "high",
   "healthy": false,
@@ -223,6 +225,12 @@
       "Health/status should consume cached summaries rather than rerunning expensive doctor collectors."
     ]
   },
+  "budget": {
+    "elapsed_ms": "[ELAPSED_MS]",
+    "budget_ms": 8000,
+    "timed_out": false,
+    "recommended_next_probe": null
+  },
   "retry_recommendation": {
     "schema_version": 1,
     "policy": "retry-allowed",
@@ -253,6 +261,15 @@
     "receipt_action_ids": [],
     "receipts": [],
     "event_log_reference": "event_log.hash_chain_tip:doctor-event-v1-bb7337c788aba591c12b3b69e5c7eb7cfc687b8f0e671df1bcfd64b598358cb1"
+  },
+  "root_cause": {
+    "schema_version": 1,
+    "family": "unknown",
+    "locus": "unknown",
+    "confidence": "unknown",
+    "evidence_refs": [],
+    "summary": "no evidence signals pointed at any root-cause family",
+    "recommended_next_probe": "cass diag --json && cass doctor check --json"
   },
   "primary_incident_id": "doctor-incident-v1-e74b084c6b952c5cc399b1c717aca0d3c3fe5514b5e7e8bbbe0174cd6194533b",
   "incidents": [
@@ -680,6 +697,8 @@
     "status": "missing",
     "reason": "lexical Tantivy metadata missing",
     "fresh": false,
+    "partial": false,
+    "partial_reason": null,
     "last_indexed_at": null,
     "age_seconds": "[AGE_SECONDS]",
     "stale": false,
@@ -718,6 +737,7 @@
     "hnsw_path": null,
     "hnsw_ready": false,
     "progressive_ready": false,
+    "progressive_reason_code": null,
     "feature_compiled_in": true,
     "quality_tier_published": false,
     "semantic_only_search_available": false,
@@ -731,7 +751,8 @@
       "embedder_id": null,
       "model_revision": null,
       "completed_at": null,
-      "size_bytes": null
+      "size_bytes": null,
+      "shard_count": null
     },
     "quality_tier": {
       "present": false,
@@ -742,7 +763,8 @@
       "embedder_id": null,
       "model_revision": null,
       "completed_at": null,
-      "size_bytes": null
+      "size_bytes": null,
+      "shard_count": null
     },
     "backlog": {
       "total_conversations": 0,
@@ -936,6 +958,65 @@
       "Precious evidence bytes are not cleanup candidates; use verified export, backup, or relocation workflows instead.",
       "Reclaimable derived bytes still require cleanup dry-run approval and a matching fingerprint before apply."
     ]
+  },
+  "storage_integrity": {
+    "storage_state": "ok",
+    "source_of_truth_risk": "none",
+    "archive_readability": "not_checked",
+    "checks_attempted": [
+      {
+        "name": "archive_integrity",
+        "elapsed_ms": "[ELAPSED_MS]",
+        "timed_out": false,
+        "skipped_reason": "database not initialized",
+        "read_only": true
+      },
+      {
+        "name": "lexical_index",
+        "elapsed_ms": "[ELAPSED_MS]",
+        "timed_out": false,
+        "skipped_reason": "index not initialized",
+        "read_only": true
+      },
+      {
+        "name": "contention_classification",
+        "elapsed_ms": "[ELAPSED_MS]",
+        "timed_out": false,
+        "skipped_reason": "database file absent",
+        "read_only": true
+      },
+      {
+        "name": "schema_version",
+        "elapsed_ms": "[ELAPSED_MS]",
+        "timed_out": false,
+        "skipped_reason": "database file absent",
+        "read_only": true
+      },
+      {
+        "name": "wal_sidecar_shape",
+        "elapsed_ms": "[ELAPSED_MS]",
+        "timed_out": false,
+        "skipped_reason": "database file absent",
+        "read_only": true
+      }
+    ]
+  },
+  "daemon_runtime": {
+    "schema_version": 1,
+    "state": "not-running",
+    "observation": {
+      "socket_path": "[DAEMON_SOCKET]",
+      "data_dir": "[TEST_HOME]/cass-data",
+      "run_lock_present": false,
+      "socket_present": false,
+      "socket_connectable": false,
+      "connect_timed_out": false
+    },
+    "recovery": {
+      "action_needed": false,
+      "disposable_runtime_artifact": false,
+      "why": "no daemon is running; an on-demand client will spawn one when needed"
+    }
   },
   "asset_taxonomy": [
     {

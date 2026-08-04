@@ -31,6 +31,7 @@ fn scan_nonexistent_directory_handles_gracefully() {
         data_dir: tmp.path().join("unused-data-dir"),
         scan_roots: vec![ScanRoot::local(nonexistent)],
         since_ts: None,
+        progress_tick: None,
     };
 
     // Should not panic or fall back to scanning the developer's real ~/.claude tree.
@@ -65,6 +66,7 @@ fn file_deleted_mid_scan_handles_gracefully() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     // Should handle missing file gracefully
@@ -88,6 +90,7 @@ fn empty_directory_returns_no_conversations() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     let result = conn.scan(&ctx);
@@ -108,6 +111,7 @@ fn missing_session_file_in_project() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     let result = conn.scan(&ctx);
@@ -145,6 +149,7 @@ fn symlink_to_valid_file_is_followed() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     // Test that symlink doesn't cause a panic - actual behavior depends on
@@ -172,6 +177,7 @@ fn broken_symlink_is_handled_gracefully() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     // Should handle broken symlink gracefully
@@ -207,6 +213,7 @@ fn symlink_to_directory_is_followed() {
         data_dir: fixture_claude,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     // Test that symlinked directory doesn't cause a panic - actual behavior
@@ -237,6 +244,7 @@ fn directory_named_like_session_file() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     // Should not crash when encountering directory with file-like name
@@ -262,6 +270,7 @@ fn zero_byte_file_handles_gracefully() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     let result = conn.scan(&ctx);
@@ -284,6 +293,7 @@ fn newlines_only_file_handles_gracefully() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     let result = conn.scan(&ctx);
@@ -316,6 +326,7 @@ fn path_with_spaces_is_handled() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     let result = conn.scan(&ctx);
@@ -342,6 +353,7 @@ fn path_with_unicode_is_handled() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     let result = conn.scan(&ctx);
@@ -373,6 +385,7 @@ fn deeply_nested_directory_is_handled() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     let result = conn.scan(&ctx);
@@ -401,6 +414,7 @@ fn gemini_handles_missing_chats_dir() {
         // Avoid falling back to the user's real Gemini directory.
         scan_roots: vec![ScanRoot::local(hash_dir)],
         since_ts: None,
+        progress_tick: None,
     };
 
     // Gemini connector should not panic even with incomplete directory structure
@@ -427,6 +441,7 @@ fn codex_handles_missing_sessions_dir() {
         // Avoid falling back to the user's real CODEX_HOME when sessions/ is missing.
         scan_roots: vec![ScanRoot::local(codex_home)],
         since_ts: None,
+        progress_tick: None,
     };
 
     let result = conn.scan(&ctx);
@@ -454,6 +469,7 @@ fn error_contains_path_context() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     let result = conn.scan(&ctx);
@@ -498,6 +514,7 @@ fn multiple_bad_files_dont_prevent_good_file_processing() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     let result = conn.scan(&ctx);
@@ -543,6 +560,7 @@ fn file_readable_with_other_handle() {
         data_dir: tmp.path().join("fixture-claude"),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     // Should still be able to read the file

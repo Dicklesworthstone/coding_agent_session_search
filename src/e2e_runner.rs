@@ -19,24 +19,20 @@
 //! paths. A concise human summary is derived from the same event.
 //!
 //! The execution core is deliberately command-agnostic so it is unit-testable
-//! with portable stand-in commands. The deterministic real-cass matrix drives
-//! it from the integration tier; separately declared live-host scenarios remain
-//! opt-in until an operator adapter is implemented.
+//! with portable stand-in commands; the live cass-surface scenarios
+//! (health/status/search/view/doctor/source/fleet) and the CI/quick/live mode
+//! recipe drive this same runner from the integration tier.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 /// Stable schema version for the run-event wire format.
-pub const E2E_RUNNER_SCHEMA_VERSION: u32 = 2;
-
-/// Stable schema version for the scenario artifact manifest.
-pub const E2E_SCENARIO_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const E2E_RUNNER_SCHEMA_VERSION: u32 = 1;
 
 /// Execution mode. Quick/CI are deterministic and never require live hosts;
 /// Live is opt-in and must never be mandatory for CI.
@@ -191,13 +187,9 @@ pub struct RunEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binary_hash: Option<String>,
     /// Environment overrides applied for isolation (e.g. CASS data/config/model
-    /// dirs). Secret-bearing keys are omitted rather than persisted.
+    /// dirs), redacted to keys+values the caller set.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_overrides: BTreeMap<String, String>,
-    /// Secret-bearing environment keys omitted from `env_overrides`. Values are
-    /// never retained.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub redacted_env_keys: Vec<String>,
     /// Working directory.
     pub cwd: String,
     /// Fixture identifier, when this run used one.
@@ -226,10 +218,6 @@ pub struct RunEvent {
     /// Names of assertions that failed (empty on success).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assertion_failures: Vec<String>,
-    /// Every assertion that actually ran, including passes. An empty vector is
-    /// therefore distinguishable from a generated-only artifact.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub assertion_results: Vec<AssertionResult>,
     /// Artifact paths written for this run (logs, captured output, etc.).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifact_paths: Vec<String>,
@@ -237,23 +225,6 @@ pub struct RunEvent {
     pub stdout_len: usize,
     /// Captured stderr byte length.
     pub stderr_len: usize,
-}
-
-/// One named assertion result retained in a [`RunEvent`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AssertionResult {
-    pub name: String,
-    pub passed: bool,
-}
-
-/// A structured run event plus the captured streams needed to persist proof
-/// artifacts. Existing callers that only need the event continue to use
-/// [`run`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunCapture {
-    pub event: RunEvent,
-    pub stdout: String,
-    pub stderr: String,
 }
 
 impl RunEvent {
@@ -302,432 +273,6 @@ pub struct RunSpec {
     pub phase: String,
     /// Execution mode.
     pub mode: RunMode,
-}
-
-/// Metadata and artifact policy for one scenario command.
-pub struct ArtifactRunSpec<'a> {
-    /// Root beneath which this run writes a new `<run>/<scenario>/<command>/`
-    /// tree. Existing files are never reused or overwritten.
-    pub artifact_root: &'a Path,
-    pub run_id: &'a str,
-    pub scenario_id: &'a str,
-    pub command_id: &'a str,
-    pub issue_ids: &'a [&'a str],
-    pub privacy_note: &'a str,
-    /// Start of the complete suite, in epoch milliseconds.
-    pub suite_started_ms: u64,
-    /// Exit codes that mean the diagnostic command behaved as expected. This
-    /// permits an asserted `doctor`/`sources doctor` exit 1 to be a proof pass
-    /// while preserving the actual exit code in [`RunEvent`].
-    pub accepted_exit_codes: &'a [i32],
-    /// Synthetic private/noise markers that must not appear in captured stdout
-    /// or stderr.
-    pub forbidden_stream_markers: &'a [&'a str],
-    /// Scenario-owned fixture/trace artifacts that must exist and are cited by
-    /// the manifest alongside the runner's standard four files.
-    pub extra_artifact_paths: &'a [PathBuf],
-}
-
-/// One persisted scenario-command proof referenced by
-/// [`ScenarioArtifactManifest`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScenarioArtifactEntry {
-    pub schema_version: u32,
-    pub run_id: String,
-    pub scenario_id: String,
-    pub command_id: String,
-    pub issue_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fixture_id: Option<String>,
-    pub privacy_note: String,
-    pub started_at_ms: u64,
-    pub finished_at_ms: u64,
-    pub actual_exit_code: Option<i32>,
-    pub outcome: RunOutcome,
-    pub proof_status: crate::proof_artifact::ProofStatus,
-    pub assertions_ran: bool,
-    pub generated_only: bool,
-    pub redaction_safe: bool,
-    pub fresh_for_suite: bool,
-    pub stdout_path: String,
-    pub stderr_path: String,
-    pub event_path: String,
-    pub proof_path: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extra_artifact_paths: Vec<String>,
-}
-
-/// Complete proof manifest for a deterministic scenario suite.
-///
-/// `validation_errors()` is deliberately fail-closed: an empty manifest,
-/// missing scenario, stale/reused entry, generated-only entry, unparseable
-/// event/proof file, redaction failure, or any non-pass outcome is an error.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScenarioArtifactManifest {
-    pub schema_version: u32,
-    pub run_id: String,
-    pub mode: RunMode,
-    pub suite_started_ms: u64,
-    pub suite_finished_ms: u64,
-    pub expected_scenario_ids: Vec<String>,
-    /// Exact `<scenario_id>/<command_id>` keys required for this run.
-    pub expected_command_keys: Vec<String>,
-    pub expected_command_count: usize,
-    pub entries: Vec<ScenarioArtifactEntry>,
-}
-
-impl ScenarioArtifactManifest {
-    #[must_use]
-    pub fn new(
-        run_id: impl Into<String>,
-        mode: RunMode,
-        suite_started_ms: u64,
-        expected_scenario_ids: Vec<String>,
-        expected_command_keys: Vec<String>,
-        expected_command_count: usize,
-    ) -> Self {
-        Self {
-            schema_version: E2E_SCENARIO_MANIFEST_SCHEMA_VERSION,
-            run_id: run_id.into(),
-            mode,
-            suite_started_ms,
-            suite_finished_ms: suite_started_ms,
-            expected_scenario_ids,
-            expected_command_keys,
-            expected_command_count,
-            entries: Vec::new(),
-        }
-    }
-
-    pub fn record(&mut self, entry: ScenarioArtifactEntry) {
-        self.suite_finished_ms = self.suite_finished_ms.max(entry.finished_at_ms);
-        self.entries.push(entry);
-    }
-
-    /// Return every reason this manifest is not a current, complete pass.
-    #[must_use]
-    pub fn validation_errors(&self) -> Vec<String> {
-        let mut errors = Vec::new();
-        if self.schema_version != E2E_SCENARIO_MANIFEST_SCHEMA_VERSION {
-            errors.push(format!(
-                "unsupported manifest schema_version {}",
-                self.schema_version
-            ));
-        }
-        if self.entries.is_empty() {
-            errors.push("manifest contains no command records".to_string());
-        }
-        if self.entries.len() != self.expected_command_count {
-            errors.push(format!(
-                "expected {} command records, found {}",
-                self.expected_command_count,
-                self.entries.len()
-            ));
-        }
-        if self.expected_command_count != self.expected_command_keys.len() {
-            errors.push(format!(
-                "manifest contract is ambiguous: expected_command_count={} but {} command keys were declared",
-                self.expected_command_count,
-                self.expected_command_keys.len()
-            ));
-        }
-
-        let expected: BTreeSet<&str> = self
-            .expected_scenario_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-        if expected.len() != self.expected_scenario_ids.len() {
-            errors.push("manifest contract contains duplicate expected scenario ids".to_string());
-        }
-        let actual: BTreeSet<&str> = self
-            .entries
-            .iter()
-            .map(|entry| entry.scenario_id.as_str())
-            .collect();
-        if expected != actual {
-            errors.push(format!(
-                "scenario coverage mismatch: expected={expected:?} actual={actual:?}"
-            ));
-        }
-
-        let expected_command_keys: BTreeSet<&str> = self
-            .expected_command_keys
-            .iter()
-            .map(String::as_str)
-            .collect();
-        if expected_command_keys.len() != self.expected_command_keys.len() {
-            errors.push("manifest contract contains duplicate expected command keys".to_string());
-        }
-        let actual_command_keys = self
-            .entries
-            .iter()
-            .map(|entry| format!("{}/{}", entry.scenario_id, entry.command_id))
-            .collect::<Vec<_>>();
-        let actual_command_key_set: BTreeSet<&str> =
-            actual_command_keys.iter().map(String::as_str).collect();
-        if actual_command_key_set.len() != actual_command_keys.len() {
-            errors.push("manifest contains ambiguous duplicate command records".to_string());
-        }
-        if expected_command_keys != actual_command_key_set {
-            errors.push(format!(
-                "command coverage mismatch: expected={expected_command_keys:?} actual={actual_command_key_set:?}"
-            ));
-        }
-
-        for entry in &self.entries {
-            let label = format!("{}/{}", entry.scenario_id, entry.command_id);
-            if entry.schema_version != E2E_SCENARIO_MANIFEST_SCHEMA_VERSION {
-                errors.push(format!(
-                    "{label}: unsupported entry schema_version {}",
-                    entry.schema_version
-                ));
-            }
-            if entry.run_id != self.run_id {
-                errors.push(format!(
-                    "{label}: entry run_id {:?} does not match manifest {:?}",
-                    entry.run_id, self.run_id
-                ));
-            }
-            if entry.issue_ids.is_empty() {
-                errors.push(format!("{label}: entry cites no owning issue"));
-            }
-            if entry.privacy_note.trim().is_empty() {
-                errors.push(format!("{label}: entry has no privacy note"));
-            }
-            if entry.started_at_ms < self.suite_started_ms
-                || entry.finished_at_ms < entry.started_at_ms
-                || entry.finished_at_ms > self.suite_finished_ms
-                || !entry.fresh_for_suite
-            {
-                errors.push(format!(
-                    "{label}: stale or internally inconsistent timestamps"
-                ));
-            }
-            if !entry.outcome.is_success()
-                || !entry.proof_status.is_trustworthy_pass()
-                || !entry.assertions_ran
-                || entry.generated_only
-            {
-                errors.push(format!(
-                    "{label}: non-pass proof outcome={} status={} assertions_ran={} generated_only={}",
-                    entry.outcome.kind(),
-                    entry.proof_status.as_str(),
-                    entry.assertions_ran,
-                    entry.generated_only
-                ));
-            }
-            if !entry.redaction_safe {
-                errors.push(format!("{label}: artifact redaction scan failed"));
-            }
-
-            let required_paths = [
-                ("stdout", &entry.stdout_path),
-                ("stderr", &entry.stderr_path),
-                ("event", &entry.event_path),
-                ("proof", &entry.proof_path),
-            ];
-            for (kind, path) in required_paths {
-                if !Path::new(path).is_file() {
-                    errors.push(format!("{label}: missing {kind} artifact {path}"));
-                }
-            }
-            for path in &entry.extra_artifact_paths {
-                if !Path::new(path).is_file() {
-                    errors.push(format!("{label}: missing scenario artifact {path}"));
-                }
-            }
-
-            match fs::read(&entry.event_path) {
-                Ok(bytes) => match serde_json::from_slice::<RunEvent>(&bytes) {
-                    Ok(event) => {
-                        if event.outcome != entry.outcome {
-                            errors.push(format!("{label}: event/manifest outcome mismatch"));
-                        }
-                        if event.schema_version != E2E_RUNNER_SCHEMA_VERSION {
-                            errors.push(format!(
-                                "{label}: unsupported event schema_version {}",
-                                event.schema_version
-                            ));
-                        }
-                        if event.start_ms != entry.started_at_ms
-                            || event.end_ms != entry.finished_at_ms
-                            || event.exit_code != entry.actual_exit_code
-                        {
-                            errors.push(format!(
-                                "{label}: event/manifest timing or exit-code mismatch"
-                            ));
-                        }
-                        if event.command_line.is_empty()
-                            || event
-                                .binary_hash
-                                .as_deref()
-                                .is_none_or(|hash| hash.len() != 64)
-                        {
-                            errors.push(format!(
-                                "{label}: event lacks exact command or binary hash provenance"
-                            ));
-                        }
-                        if event.assertion_results.is_empty()
-                            || event.assertion_results.iter().any(|result| !result.passed)
-                        {
-                            errors.push(format!(
-                                "{label}: event has missing or failed assertion results"
-                            ));
-                        }
-                        if event.env_overrides.keys().any(|key| is_secret_env_key(key)) {
-                            errors.push(format!(
-                                "{label}: event retained a secret-bearing environment key"
-                            ));
-                        }
-                    }
-                    Err(error) => {
-                        errors.push(format!("{label}: event artifact is invalid JSON: {error}"));
-                    }
-                },
-                Err(error) => {
-                    errors.push(format!("{label}: event artifact is unreadable: {error}"));
-                }
-            }
-
-            match fs::read(&entry.proof_path) {
-                Ok(bytes) => {
-                    match serde_json::from_slice::<crate::proof_artifact::ProofArtifact>(&bytes) {
-                        Ok(proof)
-                            if proof.status == entry.proof_status
-                                && proof.run.assertions_ran
-                                && proof.run.produced_artifact
-                                && proof.run.completed
-                                && proof.run.stdout_path.as_deref()
-                                    == Some(entry.stdout_path.as_str())
-                                && proof.run.stderr_path.as_deref()
-                                    == Some(entry.stderr_path.as_str()) => {}
-                        Ok(_) => errors.push(format!(
-                            "{label}: proof/manifest status or provenance mismatch"
-                        )),
-                        Err(error) => {
-                            errors
-                                .push(format!("{label}: proof artifact is invalid JSON: {error}"));
-                        }
-                    }
-                }
-                Err(error) => {
-                    errors.push(format!("{label}: proof artifact is unreadable: {error}"));
-                }
-            }
-        }
-        errors
-    }
-
-    #[must_use]
-    pub fn is_clean_pass(&self) -> bool {
-        self.validation_errors().is_empty()
-    }
-
-    /// Persist a pretty JSON manifest without overwriting prior evidence.
-    pub fn write_json(&self, path: &Path) -> io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
-        write_new(path, &bytes)
-    }
-
-    /// Persist one manifest entry per JSONL line without overwriting prior
-    /// evidence.
-    pub fn write_jsonl(&self, path: &Path) -> io::Result<()> {
-        let mut bytes = Vec::new();
-        for entry in &self.entries {
-            serde_json::to_writer(&mut bytes, entry).map_err(io::Error::other)?;
-            bytes.push(b'\n');
-        }
-        write_new(path, &bytes)
-    }
-}
-
-const SECRET_ENV_MARKERS: &[&str] = &[
-    "TOKEN",
-    "SECRET",
-    "PASSWORD",
-    "PASSWD",
-    "API_KEY",
-    "APIKEY",
-    "CREDENTIAL",
-    "PRIVATE_KEY",
-    "SESSION",
-];
-
-fn is_secret_env_key(key: &str) -> bool {
-    let upper = key.to_ascii_uppercase();
-    SECRET_ENV_MARKERS
-        .iter()
-        .any(|marker| upper.contains(marker))
-}
-
-fn sanitized_env(env: &BTreeMap<String, String>) -> (BTreeMap<String, String>, Vec<String>) {
-    let mut retained = BTreeMap::new();
-    let mut redacted = Vec::new();
-    for (key, value) in env {
-        if is_secret_env_key(key) {
-            redacted.push(key.clone());
-        } else {
-            retained.insert(key.clone(), value.clone());
-        }
-    }
-    (retained, redacted)
-}
-
-fn safe_stem(value: &str) -> String {
-    let stem: String = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if stem.is_empty() {
-        "proof".to_string()
-    } else {
-        stem
-    }
-}
-
-fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.flush()
-}
-
-fn binary_hash(path: &str) -> Option<String> {
-    let mut file = fs::File::open(path).ok()?;
-    let mut hasher = blake3::Hasher::new();
-    let mut chunk = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut chunk).ok()?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&chunk[..read]);
-    }
-    Some(hasher.finalize().to_hex().to_string())
-}
-
-fn binary_version(path: &str) -> Option<String> {
-    Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| *name == "cass" || name.starts_with("cass-"))
-        .map(|_| env!("CARGO_PKG_VERSION").to_string())
 }
 
 /// Spawn the command and wait up to `timeout`, draining stdout/stderr on
@@ -835,116 +380,43 @@ fn decode_status(status: &std::process::ExitStatus) -> (Option<i32>, Option<i32>
     (status.code(), None)
 }
 
-fn classify_capture(
-    raw: &RawRun,
-    expect: &RunExpectation<'_>,
-    accepted_exit_codes: &[i32],
-) -> (RunOutcome, bool, Vec<AssertionResult>) {
-    if raw.timed_out {
-        return (RunOutcome::Timeout, false, Vec::new());
-    }
-    match raw.exit_code {
-        Some(code) if accepted_exit_codes.contains(&code) => {}
-        Some(code) => {
-            return (
-                RunOutcome::CommandFailure { exit_code: code },
-                false,
-                Vec::new(),
-            );
-        }
-        None => {
-            return (
-                RunOutcome::CommandFailure {
-                    exit_code: raw.signal.map(|signal| -signal).unwrap_or(-1),
-                },
-                false,
-                Vec::new(),
-            );
-        }
-    }
-
-    let parsed_json_ok =
-        !expect.expect_json || serde_json::from_str::<serde_json::Value>(raw.stdout.trim()).is_ok();
-    if !parsed_json_ok {
-        return (RunOutcome::InvalidJson, false, Vec::new());
-    }
-
-    let assertion_results: Vec<AssertionResult> = expect
-        .assertions
-        .iter()
-        .map(|(name, check)| AssertionResult {
-            name: name.clone(),
-            passed: check(&raw.stdout, &raw.stderr),
-        })
-        .collect();
-    let failed: Vec<String> = assertion_results
-        .iter()
-        .filter(|result| !result.passed)
-        .map(|result| result.name.clone())
-        .collect();
-    let outcome = if failed.is_empty() {
-        RunOutcome::Success
-    } else {
-        RunOutcome::AssertionFailure { failed }
-    };
-    (outcome, parsed_json_ok, assertion_results)
-}
-
-/// Run a command spec under the bounded runner and retain the captured streams.
-/// `accepted_exit_codes` permits diagnostic commands whose contractually
-/// expected result is non-zero to pass only after their JSON assertions run.
-pub fn run_capture_with_exit_codes(
-    spec: &RunSpec,
-    expect: &RunExpectation<'_>,
-    accepted_exit_codes: &[i32],
-    now_ms: u64,
-) -> RunCapture {
+/// Run a command spec under the bounded runner and produce a structured event.
+/// `now_ms` is the caller-supplied wall-clock start (kept out of the runner for
+/// deterministic tests); `expect` drives JSON/assertion classification.
+///
+/// A missing required fixture short-circuits to [`RunOutcome::MissingFixture`]
+/// **without executing** the binary.
+pub fn run(spec: &RunSpec, expect: &RunExpectation<'_>, now_ms: u64) -> RunEvent {
     let command_line = {
         let mut v = vec![spec.binary_path.clone()];
         v.extend(spec.args.iter().cloned());
         v
     };
-    let (env_overrides, redacted_env_keys) = sanitized_env(&spec.env_overrides);
-    let base = |raw: RawRun,
-                outcome: RunOutcome,
-                parsed_json_ok: bool,
-                assertion_results: Vec<AssertionResult>| {
-        let failures = assertion_results
-            .iter()
-            .filter(|result| !result.passed)
-            .map(|result| result.name.clone())
-            .collect();
-        RunCapture {
-            stdout: raw.stdout.clone(),
-            stderr: raw.stderr.clone(),
-            event: RunEvent {
-                schema_version: E2E_RUNNER_SCHEMA_VERSION,
-                mode: spec.mode,
-                command_line: command_line.clone(),
-                binary_path: spec.binary_path.clone(),
-                binary_version: None,
-                binary_hash: None,
-                env_overrides: env_overrides.clone(),
-                redacted_env_keys: redacted_env_keys.clone(),
-                cwd: spec.cwd.display().to_string(),
-                fixture_id: spec.fixture_id.clone(),
-                phase: spec.phase.clone(),
-                start_ms: now_ms,
-                end_ms: now_ms.saturating_add(raw.elapsed_ms),
-                elapsed_ms: raw.elapsed_ms,
-                exit_code: raw.exit_code,
-                timed_out: raw.timed_out,
-                signal: raw.signal,
-                parsed_json_ok,
-                outcome,
-                assertion_failures: failures,
-                assertion_results,
-                artifact_paths: Vec::new(),
-                stdout_len: raw.stdout.len(),
-                stderr_len: raw.stderr.len(),
-            },
-        }
-    };
+    let base =
+        |raw: &RawRun, outcome: RunOutcome, parsed_json_ok: bool, failures: Vec<String>| RunEvent {
+            schema_version: E2E_RUNNER_SCHEMA_VERSION,
+            mode: spec.mode,
+            command_line: command_line.clone(),
+            binary_path: spec.binary_path.clone(),
+            binary_version: None,
+            binary_hash: None,
+            env_overrides: spec.env_overrides.clone(),
+            cwd: spec.cwd.display().to_string(),
+            fixture_id: spec.fixture_id.clone(),
+            phase: spec.phase.clone(),
+            start_ms: now_ms,
+            end_ms: now_ms.saturating_add(raw.elapsed_ms),
+            elapsed_ms: raw.elapsed_ms,
+            exit_code: raw.exit_code,
+            timed_out: raw.timed_out,
+            signal: raw.signal,
+            parsed_json_ok,
+            outcome,
+            assertion_failures: failures,
+            artifact_paths: Vec::new(),
+            stdout_len: raw.stdout.len(),
+            stderr_len: raw.stderr.len(),
+        };
 
     // Fixture precondition: report MissingFixture without executing.
     if let Some(path) = &spec.require_path
@@ -959,7 +431,7 @@ pub fn run_capture_with_exit_codes(
             elapsed_ms: 0,
         };
         return base(
-            raw,
+            &raw,
             RunOutcome::MissingFixture {
                 path: path.display().to_string(),
             },
@@ -980,7 +452,7 @@ pub fn run_capture_with_exit_codes(
                 elapsed_ms: 0,
             };
             return base(
-                raw,
+                &raw,
                 RunOutcome::CommandFailure { exit_code: -1 },
                 true,
                 Vec::new(),
@@ -988,154 +460,17 @@ pub fn run_capture_with_exit_codes(
         }
     };
 
-    let accepted = if accepted_exit_codes.is_empty() {
-        &[0][..]
+    let parsed_json_ok = if expect.expect_json {
+        serde_json::from_str::<serde_json::Value>(raw.stdout.trim()).is_ok()
     } else {
-        accepted_exit_codes
+        true
     };
-    let (outcome, parsed_json_ok, assertion_results) = classify_capture(&raw, expect, accepted);
-    base(raw, outcome, parsed_json_ok, assertion_results)
-}
-
-/// Run a command spec under the bounded runner and retain captured streams.
-pub fn run_capture(spec: &RunSpec, expect: &RunExpectation<'_>, now_ms: u64) -> RunCapture {
-    run_capture_with_exit_codes(spec, expect, &[0], now_ms)
-}
-
-/// Run a command spec under the bounded runner and produce a structured event.
-/// A missing required fixture short-circuits to [`RunOutcome::MissingFixture`]
-/// **without executing** the binary.
-pub fn run(spec: &RunSpec, expect: &RunExpectation<'_>, now_ms: u64) -> RunEvent {
-    run_capture(spec, expect, now_ms).event
-}
-
-/// Execute one scenario command and persist its stdout, stderr, structured
-/// event, and classified proof artifact beneath a never-overwritten run tree.
-pub fn run_with_artifacts(
-    spec: &RunSpec,
-    expect: &RunExpectation<'_>,
-    artifact: &ArtifactRunSpec<'_>,
-    now_ms: u64,
-) -> io::Result<ScenarioArtifactEntry> {
-    let mut capture =
-        run_capture_with_exit_codes(spec, expect, artifact.accepted_exit_codes, now_ms);
-    capture.event.binary_version = binary_version(&spec.binary_path);
-    capture.event.binary_hash = binary_hash(&spec.binary_path);
-
-    let command_dir = artifact
-        .artifact_root
-        .join(safe_stem(artifact.run_id))
-        .join(safe_stem(artifact.scenario_id))
-        .join(safe_stem(artifact.command_id));
-    fs::create_dir_all(&command_dir)?;
-    let stdout_path = command_dir.join("stdout.json");
-    let stderr_path = command_dir.join("stderr.log");
-    let event_path = command_dir.join("event.json");
-    let proof_path = command_dir.join(format!("{}.proof.json", safe_stem(artifact.command_id)));
-    for path in [&stdout_path, &stderr_path, &event_path, &proof_path] {
-        if path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "refusing to reuse existing proof artifact {}",
-                    path.display()
-                ),
-            ));
-        }
-    }
-
-    capture.event.artifact_paths = vec![
-        stdout_path.display().to_string(),
-        stderr_path.display().to_string(),
-        event_path.display().to_string(),
-        proof_path.display().to_string(),
-    ];
-    write_new(&stdout_path, capture.stdout.as_bytes())?;
-    write_new(&stderr_path, capture.stderr.as_bytes())?;
-    let event_bytes = serde_json::to_vec_pretty(&capture.event).map_err(io::Error::other)?;
-    write_new(&event_path, &event_bytes)?;
-
-    let assertions_ran = !capture.event.assertion_results.is_empty();
-    let completed = capture.event.outcome.is_success();
-    let proof_run = crate::proof_artifact::ProofRun {
-        command: capture.event.command_line.join(" "),
-        binary_path: Some(spec.binary_path.clone()),
-        binary_version: capture.event.binary_version.clone(),
-        data_dir_or_fixture: spec.fixture_id.clone(),
-        // An expected non-zero diagnostic is a pass only because its assertions
-        // ran. The actual code remains in RunEvent + ScenarioArtifactEntry.
-        exit_code: if completed {
-            Some(0)
-        } else {
-            capture.event.exit_code
-        },
-        elapsed_ms: capture.event.elapsed_ms,
-        timeout_ms: spec.timeout.as_millis().try_into().unwrap_or(u64::MAX),
-        timed_out: capture.event.timed_out,
-        skipped: matches!(capture.event.outcome, RunOutcome::MissingFixture { .. }),
-        assertions_ran,
-        produced_artifact: true,
-        completed,
-        artifact_age_ms: Some(0),
-        stdout_path: Some(stdout_path.display().to_string()),
-        stderr_path: Some(stderr_path.display().to_string()),
+    let outcome = classify_outcome(&raw, expect);
+    let failures = match &outcome {
+        RunOutcome::AssertionFailure { failed } => failed.clone(),
+        _ => Vec::new(),
     };
-    let emitted =
-        crate::proof_artifact::emit_proof_artifact(&command_dir, artifact.command_id, proof_run)?;
-    if Path::new(&emitted.path) != proof_path {
-        return Err(io::Error::other(format!(
-            "proof path mismatch: expected {}, wrote {}",
-            proof_path.display(),
-            emitted.path
-        )));
-    }
-
-    let stdout_lower = capture.stdout.to_ascii_lowercase();
-    let stderr_lower = capture.stderr.to_ascii_lowercase();
-    let forbidden_found = artifact.forbidden_stream_markers.iter().any(|marker| {
-        let marker = marker.to_ascii_lowercase();
-        !marker.is_empty() && (stdout_lower.contains(&marker) || stderr_lower.contains(&marker))
-    });
-    let redaction_safe = !forbidden_found
-        && capture
-            .event
-            .env_overrides
-            .keys()
-            .all(|key| !is_secret_env_key(key));
-    let fresh_for_suite = capture.event.start_ms >= artifact.suite_started_ms
-        && capture.event.end_ms >= capture.event.start_ms;
-
-    Ok(ScenarioArtifactEntry {
-        schema_version: E2E_SCENARIO_MANIFEST_SCHEMA_VERSION,
-        run_id: artifact.run_id.to_string(),
-        scenario_id: artifact.scenario_id.to_string(),
-        command_id: artifact.command_id.to_string(),
-        issue_ids: artifact
-            .issue_ids
-            .iter()
-            .map(|id| (*id).to_string())
-            .collect(),
-        fixture_id: spec.fixture_id.clone(),
-        privacy_note: artifact.privacy_note.to_string(),
-        started_at_ms: capture.event.start_ms,
-        finished_at_ms: capture.event.end_ms,
-        actual_exit_code: capture.event.exit_code,
-        outcome: capture.event.outcome,
-        proof_status: emitted.status,
-        assertions_ran,
-        generated_only: !assertions_ran,
-        redaction_safe,
-        fresh_for_suite,
-        stdout_path: stdout_path.display().to_string(),
-        stderr_path: stderr_path.display().to_string(),
-        event_path: event_path.display().to_string(),
-        proof_path: proof_path.display().to_string(),
-        extra_artifact_paths: artifact
-            .extra_artifact_paths
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect(),
-    })
+    base(&raw, outcome, parsed_json_ok, failures)
 }
 
 #[cfg(test)]
@@ -1305,207 +640,5 @@ mod tests {
             ),
             RunOutcome::CommandFailure { exit_code: 2 }
         );
-    }
-
-    fn json_expectation() -> RunExpectation<'static> {
-        RunExpectation {
-            expect_json: true,
-            assertions: vec![(
-                "ok-is-true".to_string(),
-                Box::new(|stdout: &str, _stderr: &str| {
-                    serde_json::from_str::<serde_json::Value>(stdout)
-                        .ok()
-                        .and_then(|value| value.get("ok").cloned())
-                        == Some(serde_json::Value::Bool(true))
-                }),
-            )],
-        }
-    }
-
-    #[test]
-    fn expected_nonzero_diagnostic_can_pass_only_after_assertions() {
-        let spec = sh_spec("printf '{\"ok\":true}'; exit 7", 5_000);
-        let capture = run_capture_with_exit_codes(&spec, &json_expectation(), &[7], 10);
-        assert_eq!(capture.event.exit_code, Some(7));
-        assert_eq!(capture.event.outcome, RunOutcome::Success);
-        assert_eq!(
-            capture.event.assertion_results,
-            vec![AssertionResult {
-                name: "ok-is-true".to_string(),
-                passed: true,
-            }]
-        );
-    }
-
-    #[test]
-    fn artifact_run_writes_streams_event_proof_and_complete_manifest() {
-        let temp = tempfile::tempdir().expect("tempdir").keep();
-        let mut spec = sh_spec("printf '{\"ok\":true}'; printf 'diag' 1>&2", 5_000);
-        spec.fixture_id = Some("synthetic-fixture".to_string());
-        spec.env_overrides.insert(
-            "CASS_API_TOKEN".to_string(),
-            "fixture-sensitive-value".to_string(),
-        );
-        let request = ArtifactRunSpec {
-            artifact_root: &temp,
-            run_id: "run-1",
-            scenario_id: "scenario-1",
-            command_id: "command-1",
-            issue_ids: &["bead-1"],
-            privacy_note: "synthetic data only",
-            suite_started_ms: 1_000,
-            accepted_exit_codes: &[0],
-            forbidden_stream_markers: &["fixture-sensitive-value"],
-            extra_artifact_paths: &[],
-        };
-        let entry = run_with_artifacts(&spec, &json_expectation(), &request, 1_000).expect("run");
-        assert_eq!(entry.proof_status, crate::proof_artifact::ProofStatus::Pass);
-        assert!(entry.redaction_safe);
-        let event: RunEvent =
-            serde_json::from_slice(&fs::read(&entry.event_path).expect("read event"))
-                .expect("parse event");
-        assert!(!event.env_overrides.contains_key("CASS_API_TOKEN"));
-        assert_eq!(event.redacted_env_keys, vec!["CASS_API_TOKEN"]);
-        assert!(
-            !fs::read_to_string(&entry.event_path)
-                .expect("event text")
-                .contains("fixture-sensitive-value")
-        );
-
-        let mut manifest = ScenarioArtifactManifest::new(
-            "run-1",
-            RunMode::Quick,
-            1_000,
-            vec!["scenario-1".to_string()],
-            vec!["scenario-1/command-1".to_string()],
-            1,
-        );
-        manifest.record(entry);
-        assert!(
-            manifest.is_clean_pass(),
-            "{:?}",
-            manifest.validation_errors()
-        );
-        let manifest_path = temp.join("run-1.manifest.json");
-        let jsonl_path = temp.join("run-1.manifest.jsonl");
-        manifest.write_json(&manifest_path).expect("manifest");
-        manifest.write_jsonl(&jsonl_path).expect("manifest jsonl");
-        assert!(manifest_path.is_file());
-        assert_eq!(
-            fs::read_to_string(jsonl_path)
-                .expect("jsonl")
-                .lines()
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn completeness_gate_rejects_empty_stale_generated_and_redaction_failures() {
-        let empty = ScenarioArtifactManifest::new(
-            "run",
-            RunMode::Quick,
-            10,
-            vec!["s".to_string()],
-            vec!["s/c".to_string()],
-            1,
-        );
-        assert!(!empty.is_clean_pass());
-
-        let temp = tempfile::tempdir().expect("tempdir").keep();
-        let request = ArtifactRunSpec {
-            artifact_root: &temp,
-            run_id: "run",
-            scenario_id: "s",
-            command_id: "c",
-            issue_ids: &["bead"],
-            privacy_note: "synthetic",
-            suite_started_ms: 10,
-            accepted_exit_codes: &[0],
-            forbidden_stream_markers: &[],
-            extra_artifact_paths: &[],
-        };
-        let entry = run_with_artifacts(
-            &sh_spec("printf '{\"ok\":true}'", 5_000),
-            &json_expectation(),
-            &request,
-            10,
-        )
-        .expect("run");
-
-        let mutations: [fn(&mut ScenarioArtifactEntry); 3] = [
-            |entry: &mut ScenarioArtifactEntry| entry.fresh_for_suite = false,
-            |entry: &mut ScenarioArtifactEntry| entry.generated_only = true,
-            |entry: &mut ScenarioArtifactEntry| entry.redaction_safe = false,
-        ];
-        for mutate in mutations {
-            let mut rejected = ScenarioArtifactManifest::new(
-                "run",
-                RunMode::Quick,
-                10,
-                vec!["s".to_string()],
-                vec!["s/c".to_string()],
-                1,
-            );
-            let mut bad = entry.clone();
-            mutate(&mut bad);
-            rejected.record(bad);
-            assert!(!rejected.is_clean_pass());
-        }
-
-        let mut ambiguous = ScenarioArtifactManifest::new(
-            "run",
-            RunMode::Quick,
-            10,
-            vec!["s".to_string()],
-            vec!["s/c".to_string(), "s/other".to_string()],
-            2,
-        );
-        ambiguous.record(entry.clone());
-        ambiguous.record(entry.clone());
-        assert!(!ambiguous.is_clean_pass());
-
-        let mut wrong_command = ScenarioArtifactManifest::new(
-            "run",
-            RunMode::Quick,
-            10,
-            vec!["s".to_string()],
-            vec!["s/c".to_string()],
-            1,
-        );
-        let mut unexpected = entry.clone();
-        unexpected.command_id = "unexpected".to_string();
-        wrong_command.record(unexpected);
-        assert!(!wrong_command.is_clean_pass());
-
-        let invalid_event_path = temp.join("invalid-event.json");
-        fs::write(&invalid_event_path, b"{not-json").expect("write invalid event fixture");
-        let mut invalid_event = ScenarioArtifactManifest::new(
-            "run",
-            RunMode::Quick,
-            10,
-            vec!["s".to_string()],
-            vec!["s/c".to_string()],
-            1,
-        );
-        let mut invalid_event_entry = entry.clone();
-        invalid_event_entry.event_path = invalid_event_path.display().to_string();
-        invalid_event.record(invalid_event_entry);
-        assert!(!invalid_event.is_clean_pass());
-
-        let invalid_proof_path = temp.join("invalid-proof.json");
-        fs::write(&invalid_proof_path, b"{not-json").expect("write invalid proof fixture");
-        let mut invalid_proof = ScenarioArtifactManifest::new(
-            "run",
-            RunMode::Quick,
-            10,
-            vec!["s".to_string()],
-            vec!["s/c".to_string()],
-            1,
-        );
-        let mut invalid_proof_entry = entry;
-        invalid_proof_entry.proof_path = invalid_proof_path.display().to_string();
-        invalid_proof.record(invalid_proof_entry);
-        assert!(!invalid_proof.is_clean_pass());
     }
 }

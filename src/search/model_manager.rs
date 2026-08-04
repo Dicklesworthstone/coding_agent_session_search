@@ -1,6 +1,6 @@
 //! Semantic model management (local-only detection).
 //!
-//! This module wires the FastEmbed MiniLM embedder into semantic search by:
+//! This module wires the pure-Rust native MiniLM embedder into semantic search by:
 //! - validating the local model files
 //! - loading the vector index
 //! - building filter maps from the SQLite database
@@ -13,8 +13,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::indexer::semantic::expected_vector_space_revision;
+use crate::search::ann_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
-use crate::search::fastembed_embedder::FastEmbedder;
+use crate::search::fastembed_embedder::{FastEmbedder, LazyFastEmbedder};
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_download::{
     ModelAcquisitionPolicy, ModelCacheState, ModelManifest, classify_model_cache,
@@ -22,10 +24,12 @@ use crate::search::model_download::{
 };
 use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
 use crate::search::semantic_manifest::{
-    SemanticShardManifest, SemanticShardRecord, TierKind, semantic_shard_artifact_path_is_safe,
+    SemanticCurrentPointerV1, SemanticShardManifest, SemanticShardRecord, TierKind,
+    semantic_shard_artifact_path_is_safe,
 };
 use crate::search::vector_index::{
-    ROLE_ASSISTANT, ROLE_USER, SemanticFilterMaps, VectorIndex, vector_index_path,
+    ROLE_ASSISTANT, ROLE_USER, SemanticFilterMaps, SemanticIndexArtifact,
+    SemanticProgressiveUnavailableReason, VectorIndex, vector_index_path,
 };
 use crate::storage::sqlite::FrankenStorage;
 
@@ -34,7 +38,7 @@ use crate::storage::sqlite::FrankenStorage;
 /// This enum tracks the full lifecycle of semantic search from the user's perspective:
 /// - Model installation flow (NotInstalled → NeedsConsent → Downloading → Verifying → Ready)
 /// - Index building flow (Ready → IndexBuilding → Ready)
-/// - User preferences (HashFallback, Disabled)
+/// - Explicit user preferences (HashFallback, Disabled)
 /// - Error states (LoadFailed, ModelMissing, etc.)
 #[derive(Debug, Clone)]
 pub enum SemanticAvailability {
@@ -45,7 +49,7 @@ pub enum SemanticAvailability {
     // TUI-centric states for user flow
     // =========================================================================
     /// Model not installed - semantic not available.
-    /// TUI should show option to download or use hash fallback.
+    /// TUI should show an option to download or explicitly choose hash mode.
     NotInstalled,
 
     /// User needs to consent before downloading model.
@@ -76,7 +80,7 @@ pub enum SemanticAvailability {
         total_items: u64,
     },
 
-    /// User opted for hash-based fallback (no ML model).
+    /// User explicitly opted for hash-based degraded mode (no ML model).
     HashFallback,
 
     /// Semantic search disabled by policy or user.
@@ -134,7 +138,7 @@ impl SemanticAvailability {
         matches!(self, SemanticAvailability::NeedsConsent)
     }
 
-    /// Check if hash fallback is active.
+    /// Check if explicit hash mode is active.
     pub fn is_hash_fallback(&self) -> bool {
         matches!(self, SemanticAvailability::HashFallback)
     }
@@ -161,7 +165,7 @@ impl SemanticAvailability {
         )
     }
 
-    /// Check if semantic can be used (ready or hash fallback).
+    /// Check if vector search can be used (native semantic or explicit hash mode).
     pub fn can_search(&self) -> bool {
         matches!(
             self,
@@ -243,7 +247,7 @@ impl SemanticAvailability {
                     format!("building index: {items_indexed}/{total_items}")
                 }
             }
-            SemanticAvailability::HashFallback => "using hash-based fallback".to_string(),
+            SemanticAvailability::HashFallback => "using explicit hash mode".to_string(),
             SemanticAvailability::Disabled { reason } => {
                 format!("semantic disabled: {reason}")
             }
@@ -272,8 +276,17 @@ impl SemanticAvailability {
 
 pub struct SemanticContext {
     pub embedder: Arc<dyn Embedder>,
-    pub index: VectorIndex,
-    pub additional_indexes: Vec<VectorIndex>,
+    /// These owners may come from the monolithic writer path or the prototype
+    /// shard manifest. Exact search consumes the retained owners directly.
+    /// Progressive/two-tier serving remains fail-closed for every source,
+    /// because its current FrankenSearch constructors reopen paths. Do not
+    /// populate these owners by reopening
+    /// `ValidatedSemanticGeneration::artifact_paths`: that map is diagnostic
+    /// resolution only until the immutable-generation validator can hand
+    /// serving code retained FSVI witnesses/owners and FrankenSearch can
+    /// consume those owners without reopening.
+    pub artifacts: Vec<SemanticIndexArtifact>,
+    pub quality_artifact: Option<SemanticIndexArtifact>,
     pub filter_maps: SemanticFilterMaps,
     pub roles: Option<HashSet<u8>>,
 }
@@ -283,8 +296,70 @@ pub struct SemanticSetup {
     pub context: Option<SemanticContext>,
 }
 
+const SEMANTIC_POINTER_PROBE_FAILED_REASON: &str = "semantic_pointer_probe_failed";
+
+fn selected_generation_owner_requirement(data_dir: &Path) -> Option<SemanticAvailability> {
+    match std::fs::symlink_metadata(SemanticCurrentPointerV1::path(data_dir)) {
+        Ok(_) => Some(SemanticAvailability::LoadFailed {
+            context: SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired
+                .code()
+                .to_string(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(SemanticAvailability::LoadFailed {
+            context: SEMANTIC_POINTER_PROBE_FAILED_REASON.to_string(),
+        }),
+    }
+}
+
 fn semantic_sidecar_path(data_dir: &Path, recorded_path: &str) -> Option<PathBuf> {
     semantic_shard_artifact_path_is_safe(recorded_path).then(|| data_dir.join(recorded_path))
+}
+
+fn validate_vector_index_contract(
+    index: &VectorIndex,
+    expected_embedder_id: &str,
+    expected_dimension: usize,
+) -> Result<(), String> {
+    let expected_revision =
+        expected_vector_space_revision(expected_embedder_id).ok_or_else(|| {
+            format!("no current vector-space revision for embedder {expected_embedder_id}")
+        })?;
+    if index.embedder_id() != expected_embedder_id
+        || index.dimension() != expected_dimension
+        || index.embedder_revision() != expected_revision
+    {
+        return Err(format!(
+            "incompatible vector index: expected embedder {expected_embedder_id} revision {expected_revision} dimension {expected_dimension}, found embedder {} revision {} dimension {}; rebuild semantic vectors",
+            index.embedder_id(),
+            index.embedder_revision(),
+            index.dimension()
+        ));
+    }
+    Ok(())
+}
+
+fn open_validated_semantic_artifact(
+    index_path: &Path,
+    ann_path: Option<PathBuf>,
+    expected_embedder_id: &str,
+    expected_dimension: usize,
+) -> Result<SemanticIndexArtifact, String> {
+    let artifact = SemanticIndexArtifact::open(index_path, ann_path)
+        .map_err(|error| format!("vector index: {error}"))?;
+    validate_vector_index_contract(artifact.index(), expected_embedder_id, expected_dimension)?;
+    Ok(artifact)
+}
+
+fn semantic_artifact_candidate_exists(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "inspect semantic artifact candidate {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 fn matching_complete_shard_records(
@@ -332,7 +407,7 @@ fn matching_complete_shard_records(
         let Some(path) = semantic_sidecar_path(data_dir, &shard.index_path) else {
             return Ok(None);
         };
-        if !path.is_file() {
+        if !semantic_artifact_candidate_exists(&path)? {
             return Ok(None);
         }
     }
@@ -340,11 +415,12 @@ fn matching_complete_shard_records(
     Ok(Some(records))
 }
 
-fn load_complete_shard_indexes(
+fn load_complete_shard_artifacts(
     data_dir: &Path,
     embedder_id: &str,
+    expected_dimension: usize,
     db_fingerprint: &str,
-) -> Result<Option<Vec<VectorIndex>>, String> {
+) -> Result<Option<Vec<SemanticIndexArtifact>>, String> {
     for tier in [TierKind::Quality, TierKind::Fast] {
         let Some(records) =
             matching_complete_shard_records(data_dir, tier, embedder_id, db_fingerprint)?
@@ -352,33 +428,66 @@ fn load_complete_shard_indexes(
             continue;
         };
 
-        let mut indexes = Vec::with_capacity(records.len());
+        let mut artifacts = Vec::with_capacity(records.len());
         for shard in records {
             let Some(path) = semantic_sidecar_path(data_dir, &shard.index_path) else {
                 return Ok(None);
             };
-            let index = VectorIndex::open(&path)
+            let ann_path = if shard.ann_ready {
+                shard
+                    .ann_index_path
+                    .as_deref()
+                    .and_then(|recorded| semantic_sidecar_path(data_dir, recorded))
+                    .and_then(|candidate| {
+                        let selected = select_existing_ann_candidate(candidate.clone());
+                        if selected.is_none() {
+                            tracing::warn!(
+                                path = %candidate.display(),
+                                embedder = embedder_id,
+                                shard = shard.shard_index,
+                                "semantic shard manifest marks ANN ready but its exact sidecar is missing"
+                            );
+                        }
+                        selected
+                    })
+            } else {
+                None
+            };
+            let artifact = SemanticIndexArtifact::open(&path, ann_path)
                 .map_err(|err| format!("semantic shard vector index {}: {err}", path.display()))?;
-            if index.embedder_id() != embedder_id || index.dimension() != shard.dimension {
+            if shard.dimension != expected_dimension {
                 return Err(format!(
-                    "semantic shard vector index {} metadata mismatch",
-                    path.display()
+                    "semantic shard manifest {} declares dimension {}, expected {expected_dimension}",
+                    path.display(),
+                    shard.dimension
                 ));
             }
-            indexes.push(index);
+            validate_vector_index_contract(artifact.index(), embedder_id, expected_dimension)
+                .map_err(|error| {
+                    format!("semantic shard vector index {}: {error}", path.display())
+                })?;
+            artifacts.push(artifact);
         }
-        if !indexes.is_empty() {
+        if !artifacts.is_empty() {
             tracing::info!(
                 tier = tier.as_str(),
                 embedder = embedder_id,
-                shard_count = indexes.len(),
+                shard_count = artifacts.len(),
                 "loaded complete semantic shard generation"
             );
-            return Ok(Some(indexes));
+            return Ok(Some(artifacts));
         }
     }
 
     Ok(None)
+}
+
+fn select_existing_ann_candidate(path: PathBuf) -> Option<PathBuf> {
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Some(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(path),
+    }
 }
 
 fn complete_shard_generation_candidate_exists(data_dir: &Path, embedder_id: &str) -> bool {
@@ -409,17 +518,18 @@ fn complete_shard_generation_candidate_exists(data_dir: &Path, embedder_id: &str
         .any(|(tier, db_fingerprint)| manifest.summary(tier, embedder_id, db_fingerprint).complete)
 }
 
-fn load_complete_shard_indexes_for_current_db(
+fn load_complete_shard_artifacts_for_current_db(
     data_dir: &Path,
     db_path: &Path,
     embedder_id: &str,
+    expected_dimension: usize,
     context_label: &'static str,
-) -> Option<Vec<VectorIndex>> {
+) -> Option<Vec<SemanticIndexArtifact>> {
     let db_fingerprint = match crate::indexer::lexical_storage_fingerprint_for_db(db_path) {
         Ok(fingerprint) => fingerprint,
         Err(err) => {
             tracing::debug!(
-                error = %err,
+                error = %format!("{err:#}"),
                 embedder = embedder_id,
                 context = context_label,
                 "semantic shard context unavailable: failed to fingerprint current DB"
@@ -428,8 +538,9 @@ fn load_complete_shard_indexes_for_current_db(
         }
     };
 
-    match load_complete_shard_indexes(data_dir, embedder_id, &db_fingerprint) {
-        Ok(indexes) => indexes,
+    match load_complete_shard_artifacts(data_dir, embedder_id, expected_dimension, &db_fingerprint)
+    {
+        Ok(artifacts) => artifacts,
         Err(err) => {
             tracing::debug!(
                 error = %err,
@@ -450,17 +561,35 @@ pub fn load_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
     load_semantic_context_for_embedder(data_dir, db_path, active_policy_embedder_name())
 }
 
+/// Load the active policy context without initializing its local model yet.
+pub fn load_semantic_context_deferred(data_dir: &Path, db_path: &Path) -> SemanticSetup {
+    load_semantic_context_for_embedder_deferred(data_dir, db_path, active_policy_embedder_name())
+}
+
 pub fn load_semantic_context_for_embedder(
     data_dir: &Path,
     db_path: &Path,
     embedder_name: &str,
 ) -> SemanticSetup {
-    load_semantic_context_inner(data_dir, db_path, true, embedder_name)
+    load_semantic_context_inner(data_dir, db_path, true, embedder_name, false)
 }
 
-/// Probe semantic availability without loading the embedder, vector index, or
-/// DB-backed filter maps. Status/health surfaces use this to report readiness
-/// cheaply; actual semantic search still calls `load_semantic_context`.
+/// Load index/filter metadata now while deferring the local model itself.
+///
+/// This is the daemon-first CLI path: the returned embedder preserves the
+/// vector index's stable id/dimension contract, but initializes local inference
+/// only if the daemon wrapper needs its fallback (#347).
+pub fn load_semantic_context_for_embedder_deferred(
+    data_dir: &Path,
+    db_path: &Path,
+    embedder_name: &str,
+) -> SemanticSetup {
+    load_semantic_context_inner(data_dir, db_path, true, embedder_name, true)
+}
+
+/// Probe semantic availability without loading the embedder or DB-backed
+/// filter maps. The selected FSVI is opened through the same exact-artifact
+/// policy as serving so status cannot advertise an artifact a query rejects.
 pub(crate) fn probe_semantic_availability(data_dir: &Path) -> SemanticAvailability {
     probe_semantic_availability_for_embedder(data_dir, active_policy_embedder_name())
 }
@@ -469,7 +598,14 @@ pub(crate) fn probe_semantic_availability_for_embedder(
     data_dir: &Path,
     embedder_name: &str,
 ) -> SemanticAvailability {
-    let canonical_name = FastEmbedder::canonical_name(embedder_name).unwrap_or("minilm");
+    if let Some(availability) = selected_generation_owner_requirement(data_dir) {
+        return availability;
+    }
+    let Some(canonical_name) = FastEmbedder::canonical_name(embedder_name) else {
+        return SemanticAvailability::LoadFailed {
+            context: format!("unsupported semantic embedder: {embedder_name}; supported: minilm"),
+        };
+    };
     let Some(config) = FastEmbedder::config_for(canonical_name) else {
         return SemanticAvailability::LoadFailed {
             context: format!("unknown semantic embedder: {embedder_name}"),
@@ -493,8 +629,16 @@ pub(crate) fn probe_semantic_availability_for_embedder(
     }
 
     let index_path = vector_index_path(data_dir, &config.embedder_id);
-    if !index_path.is_file() {
-        return SemanticAvailability::IndexMissing { index_path };
+    match semantic_artifact_candidate_exists(&index_path) {
+        Ok(true) => {}
+        Ok(false) => return SemanticAvailability::IndexMissing { index_path },
+        Err(context) => return SemanticAvailability::LoadFailed { context },
+    }
+
+    if let Err(context) =
+        open_validated_semantic_artifact(&index_path, None, &config.embedder_id, config.dimension)
+    {
+        return SemanticAvailability::LoadFailed { context };
     }
 
     SemanticAvailability::Ready {
@@ -502,35 +646,62 @@ pub(crate) fn probe_semantic_availability_for_embedder(
     }
 }
 
-/// Probe hash semantic availability without opening the DB or vector index.
+/// Probe hash semantic availability without opening the DB. The selected FSVI
+/// is admitted through the same exact-artifact policy as serving.
 pub(crate) fn probe_hash_semantic_availability(data_dir: &Path) -> SemanticAvailability {
+    if let Some(availability) = selected_generation_owner_requirement(data_dir) {
+        return availability;
+    }
     let embedder = HashEmbedder::default();
     let index_path = vector_index_path(data_dir, embedder.id());
-    if !index_path.is_file() {
-        SemanticAvailability::IndexMissing { index_path }
-    } else {
-        SemanticAvailability::HashFallback
+    match semantic_artifact_candidate_exists(&index_path) {
+        Ok(false) => SemanticAvailability::IndexMissing { index_path },
+        Err(context) => SemanticAvailability::LoadFailed { context },
+        Ok(true) => match open_validated_semantic_artifact(
+            &index_path,
+            None,
+            embedder.id(),
+            embedder.dimension(),
+        ) {
+            Ok(_) => SemanticAvailability::HashFallback,
+            Err(context) => SemanticAvailability::LoadFailed { context },
+        },
     }
 }
 
 /// Load hash-based semantic context (no model download required).
 pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
+    if let Some(availability) = selected_generation_owner_requirement(data_dir) {
+        return SemanticSetup {
+            availability,
+            context: None,
+        };
+    }
     let embedder = HashEmbedder::default();
     let index_path = vector_index_path(data_dir, embedder.id());
-    let monolithic_present = index_path.is_file();
-    let shard_indexes = if monolithic_present
+    let monolithic_present = match semantic_artifact_candidate_exists(&index_path) {
+        Ok(present) => present,
+        Err(context) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed { context },
+                context: None,
+            };
+        }
+    };
+    let shard_artifacts = if monolithic_present
         || complete_shard_generation_candidate_exists(data_dir, embedder.id())
     {
-        load_complete_shard_indexes_for_current_db(
+        load_complete_shard_artifacts_for_current_db(
             data_dir,
             db_path,
             embedder.id(),
+            embedder.dimension(),
             "hash semantic",
         )
     } else {
         None
     };
-    if !monolithic_present && shard_indexes.is_none() {
+    if !monolithic_present && shard_artifacts.is_none() {
         return SemanticSetup {
             availability: SemanticAvailability::IndexMissing { index_path },
             context: None,
@@ -562,17 +733,21 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
         }
     };
 
-    let (index, additional_indexes) = if let Some(mut indexes) = shard_indexes {
-        let index = indexes.remove(0);
-        (index, indexes)
+    let artifacts = if let Some(artifacts) = shard_artifacts {
+        artifacts
     } else {
-        match VectorIndex::open(&index_path) {
-            Ok(index) => (index, Vec::new()),
-            Err(err) => {
+        let ann_path = hnsw_index_path(data_dir, embedder.id());
+        let ann_path = select_existing_ann_candidate(ann_path);
+        match open_validated_semantic_artifact(
+            &index_path,
+            ann_path,
+            embedder.id(),
+            embedder.dimension(),
+        ) {
+            Ok(artifact) => vec![artifact],
+            Err(context) => {
                 return SemanticSetup {
-                    availability: SemanticAvailability::LoadFailed {
-                        context: format!("vector index: {err}"),
-                    },
+                    availability: SemanticAvailability::LoadFailed { context },
                     context: None,
                 };
             }
@@ -586,8 +761,8 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
         availability: SemanticAvailability::HashFallback,
         context: Some(SemanticContext {
             embedder,
-            index,
-            additional_indexes,
+            artifacts,
+            quality_artifact: None,
             filter_maps,
             roles,
         }),
@@ -599,7 +774,13 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
 /// Use this when you've already acknowledged an update and want to load
 /// the model anyway.
 pub fn load_semantic_context_no_version_check(data_dir: &Path, db_path: &Path) -> SemanticSetup {
-    load_semantic_context_inner(data_dir, db_path, false, active_policy_embedder_name())
+    load_semantic_context_inner(
+        data_dir,
+        db_path,
+        false,
+        active_policy_embedder_name(),
+        false,
+    )
 }
 
 fn load_semantic_context_inner(
@@ -607,8 +788,24 @@ fn load_semantic_context_inner(
     db_path: &Path,
     check_for_updates: bool,
     embedder_name: &str,
+    defer_embedder_load: bool,
 ) -> SemanticSetup {
-    let canonical_name = FastEmbedder::canonical_name(embedder_name).unwrap_or("minilm");
+    if let Some(availability) = selected_generation_owner_requirement(data_dir) {
+        return SemanticSetup {
+            availability,
+            context: None,
+        };
+    }
+    let Some(canonical_name) = FastEmbedder::canonical_name(embedder_name) else {
+        return SemanticSetup {
+            availability: SemanticAvailability::LoadFailed {
+                context: format!(
+                    "unsupported semantic embedder: {embedder_name}; supported: minilm"
+                ),
+            },
+            context: None,
+        };
+    };
     let Some(config) = FastEmbedder::config_for(canonical_name) else {
         return SemanticSetup {
             availability: SemanticAvailability::LoadFailed {
@@ -643,20 +840,29 @@ fn load_semantic_context_inner(
     }
 
     let index_path = vector_index_path(data_dir, &config.embedder_id);
-    let monolithic_present = index_path.is_file();
-    let shard_indexes = if monolithic_present
+    let monolithic_present = match semantic_artifact_candidate_exists(&index_path) {
+        Ok(present) => present,
+        Err(context) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed { context },
+                context: None,
+            };
+        }
+    };
+    let shard_artifacts = if monolithic_present
         || complete_shard_generation_candidate_exists(data_dir, &config.embedder_id)
     {
-        load_complete_shard_indexes_for_current_db(
+        load_complete_shard_artifacts_for_current_db(
             data_dir,
             db_path,
             &config.embedder_id,
+            config.dimension,
             "semantic",
         )
     } else {
         None
     };
-    if !monolithic_present && shard_indexes.is_none() {
+    if !monolithic_present && shard_artifacts.is_none() {
         return SemanticSetup {
             availability: SemanticAvailability::IndexMissing { index_path },
             context: None,
@@ -688,25 +894,35 @@ fn load_semantic_context_inner(
         }
     };
 
-    let (index, additional_indexes) = if let Some(mut indexes) = shard_indexes {
-        let index = indexes.remove(0);
-        (index, indexes)
+    let artifacts = if let Some(artifacts) = shard_artifacts {
+        artifacts
     } else {
-        match VectorIndex::open(&index_path) {
-            Ok(index) => (index, Vec::new()),
-            Err(err) => {
+        let ann_path = hnsw_index_path(data_dir, &config.embedder_id);
+        let ann_path = select_existing_ann_candidate(ann_path);
+        match open_validated_semantic_artifact(
+            &index_path,
+            ann_path,
+            &config.embedder_id,
+            config.dimension,
+        ) {
+            Ok(artifact) => vec![artifact],
+            Err(context) => {
                 return SemanticSetup {
-                    availability: SemanticAvailability::LoadFailed {
-                        context: format!("vector index: {err}"),
-                    },
+                    availability: SemanticAvailability::LoadFailed { context },
                     context: None,
                 };
             }
         }
     };
 
-    let embedder = match FastEmbedder::load_by_name(data_dir, canonical_name) {
-        Ok(embedder) => Arc::new(embedder) as Arc<dyn Embedder>,
+    let embedder: Arc<dyn Embedder> = match if defer_embedder_load {
+        LazyFastEmbedder::new(data_dir, canonical_name)
+            .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
+    } else {
+        FastEmbedder::load_by_name(data_dir, canonical_name)
+            .map(|embedder| Arc::new(embedder) as Arc<dyn Embedder>)
+    } {
+        Ok(embedder) => embedder,
         Err(err) => {
             return SemanticSetup {
                 availability: SemanticAvailability::LoadFailed {
@@ -725,8 +941,8 @@ fn load_semantic_context_inner(
         },
         context: Some(SemanticContext {
             embedder,
-            index,
-            additional_indexes,
+            artifacts,
+            quality_artifact: None,
             filter_maps,
             roles,
         }),
@@ -735,7 +951,7 @@ fn load_semantic_context_inner(
 
 fn active_policy_embedder_name() -> &'static str {
     let semantic_policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-    FastEmbedder::canonical_name(&semantic_policy.quality_tier_embedder).unwrap_or("minilm")
+    FastEmbedder::canonical_name(&semantic_policy.quality_tier_embedder).unwrap_or("unsupported")
 }
 
 fn semantic_availability_from_cache_state(
@@ -825,9 +1041,9 @@ fn semantic_availability_from_cache_state(
 
 /// Check if the vector index needs rebuilding after a model upgrade.
 ///
-/// This compares the embedder ID in the vector index header with the expected
-/// embedder ID. If they differ, the index was built with a different model
-/// and needs to be rebuilt.
+/// This compares the embedder ID, vector-space revision, and dimension in the
+/// vector index header with the current native MiniLM contract. Shape equality
+/// alone cannot prove compatibility across inference-engine generations.
 ///
 /// Returns `true` if rebuild is needed, `false` otherwise.
 pub fn needs_index_rebuild(data_dir: &Path) -> bool {
@@ -841,10 +1057,7 @@ pub fn needs_index_rebuild(data_dir: &Path) -> bool {
     // Try to load the index and check its embedder ID
     match VectorIndex::open(&index_path) {
         Ok(index) => {
-            // Check if the index was built with a different embedder
-            // The vector index stores the embedder ID in its header
-            let expected_id = FastEmbedder::embedder_id_static();
-            index.embedder_id() != expected_id
+            validate_vector_index_contract(&index, FastEmbedder::embedder_id_static(), 384).is_err()
         }
         Err(_) => {
             // Index is corrupted or unreadable, needs rebuild
@@ -1055,7 +1268,7 @@ mod tests {
         let mut writer = VectorIndex::create_with_revision(
             path,
             embedder.id(),
-            "hash",
+            crate::indexer::semantic::HASH_VECTOR_SPACE_REVISION,
             embedder.dimension(),
             frankensearch::index::Quantization::F16,
         )
@@ -1068,6 +1281,301 @@ mod tests {
                 .expect("write hash vector record");
         }
         writer.finish().expect("finish hash vector index");
+    }
+
+    #[test]
+    fn exact_artifact_contract_pairs_only_existing_consumer_owned_ann() {
+        let tmp = tempdir().expect("hash context fixture");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("create cass db");
+        drop(storage);
+
+        let embedder = HashEmbedder::default();
+        let fsvi_path = vector_index_path(tmp.path(), embedder.id());
+        write_hash_vector_index(&fsvi_path, 1);
+
+        let without_ann = load_hash_semantic_context(tmp.path(), &db_path)
+            .context
+            .expect("hash context without ANN");
+        assert_eq!(without_ann.artifacts.len(), 1);
+        assert_eq!(without_ann.artifacts[0].fsvi_path(), fsvi_path);
+        assert_eq!(
+            without_ann.artifacts[0].ann_path(),
+            None,
+            "a synthesized-but-missing ANN filename must not become a serving artifact"
+        );
+
+        let ann_path = hnsw_index_path(tmp.path(), embedder.id());
+        std::fs::write(&ann_path, b"selected CASS ANN sidecar fixture")
+            .expect("write selected ANN sidecar");
+        let with_ann = load_hash_semantic_context(tmp.path(), &db_path)
+            .context
+            .expect("hash context with ANN");
+        assert_eq!(
+            with_ann.artifacts[0].ann_path(),
+            Some(ann_path.as_path()),
+            "an existing CASS-owned ANN path must stay paired with its exact FSVI"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_and_serving_reject_the_same_final_component_fsvi_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempdir().expect("FSVI symlink fixture");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("create cass db");
+        drop(storage);
+
+        let embedder = HashEmbedder::default();
+        let selected_path = vector_index_path(tmp.path(), embedder.id());
+        let target_path = selected_path.with_file_name("unselected-target.fsvi");
+        write_hash_vector_index(&target_path, 1);
+        let target_bytes = std::fs::read(&target_path).expect("read target FSVI before probes");
+        symlink(&target_path, &selected_path).expect("create final-component FSVI symlink");
+
+        let serving_error = SemanticIndexArtifact::open(&selected_path, None)
+            .expect_err("serving must reject a final-component FSVI symlink");
+        assert!(serving_error.to_string().contains("symlink"));
+
+        let readiness = probe_hash_semantic_availability(tmp.path());
+        let readiness_context = match readiness {
+            SemanticAvailability::LoadFailed { context } => context,
+            other => panic!("readiness must reject the same FSVI symlink: {other:?}"),
+        };
+        let serving = load_hash_semantic_context(tmp.path(), &db_path);
+        let serving_context = match serving.availability {
+            SemanticAvailability::LoadFailed { context } => context,
+            other => panic!("semantic serving must reject the same FSVI symlink: {other:?}"),
+        };
+
+        assert_eq!(
+            readiness_context, serving_context,
+            "readiness and serving must use one exact-artifact admission policy"
+        );
+        assert!(readiness_context.contains("symlink"));
+        assert!(
+            serving.context.is_none(),
+            "a rejected exact artifact must never produce a serving context"
+        );
+        assert_eq!(
+            std::fs::read_link(&selected_path).expect("read selected FSVI symlink"),
+            target_path
+        );
+        assert_eq!(
+            std::fs::read(&target_path).expect("read target FSVI after probes"),
+            target_bytes,
+            "readiness and serving probes must not mutate the symlink target"
+        );
+
+        let broken = tempdir().expect("broken FSVI symlink fixture");
+        let broken_db_path = broken.path().join("cass.db");
+        let storage = FrankenStorage::open(&broken_db_path).expect("create broken fixture db");
+        drop(storage);
+        let broken_path = vector_index_path(broken.path(), embedder.id());
+        std::fs::create_dir_all(
+            broken_path
+                .parent()
+                .expect("broken selected FSVI must have a parent"),
+        )
+        .expect("create broken selected FSVI parent");
+        symlink(broken.path().join("absent-target.fsvi"), &broken_path)
+            .expect("create broken final-component FSVI symlink");
+
+        let broken_readiness = probe_hash_semantic_availability(broken.path());
+        let broken_serving = load_hash_semantic_context(broken.path(), &broken_db_path);
+        let broken_readiness_context = match broken_readiness {
+            SemanticAvailability::LoadFailed { context } => context,
+            other => panic!("broken FSVI symlink must be rejected by readiness: {other:?}"),
+        };
+        let broken_serving_context = match broken_serving.availability {
+            SemanticAvailability::LoadFailed { context } => context,
+            other => panic!("broken FSVI symlink must be rejected by serving: {other:?}"),
+        };
+        assert_eq!(broken_readiness_context, broken_serving_context);
+        assert!(broken_readiness_context.contains("symlink"));
+        assert!(broken_serving.context.is_none());
+
+        let non_file = tempdir().expect("non-file FSVI fixture");
+        let non_file_db_path = non_file.path().join("cass.db");
+        let storage = FrankenStorage::open(&non_file_db_path).expect("create non-file fixture db");
+        drop(storage);
+        let non_file_path = vector_index_path(non_file.path(), embedder.id());
+        std::fs::create_dir_all(
+            non_file_path
+                .parent()
+                .expect("non-file selected FSVI must have a parent"),
+        )
+        .expect("create non-file selected FSVI parent");
+        std::fs::create_dir(&non_file_path).expect("create directory at selected FSVI path");
+
+        let non_file_readiness = probe_hash_semantic_availability(non_file.path());
+        let non_file_serving = load_hash_semantic_context(non_file.path(), &non_file_db_path);
+        let non_file_readiness_context = match non_file_readiness {
+            SemanticAvailability::LoadFailed { context } => context,
+            other => panic!("non-file FSVI must be rejected by readiness: {other:?}"),
+        };
+        let non_file_serving_context = match non_file_serving.availability {
+            SemanticAvailability::LoadFailed { context } => context,
+            other => panic!("non-file FSVI must be rejected by serving: {other:?}"),
+        };
+        assert_eq!(non_file_readiness_context, non_file_serving_context);
+        assert!(
+            non_file_readiness_context.contains("open semantic FSVI"),
+            "non-file selection must reach the exact-artifact opener: {non_file_readiness_context}"
+        );
+        assert!(non_file_serving.context.is_none());
+    }
+
+    #[test]
+    fn exact_artifact_contract_ann_selection_preserves_existing_invalid_artifacts() {
+        let tmp = tempdir().expect("ANN selection fixture");
+        let missing = tmp.path().join("missing.chsw");
+        assert_eq!(select_existing_ann_candidate(missing), None);
+
+        let regular = tmp.path().join("regular.chsw");
+        std::fs::write(&regular, b"not necessarily valid ANN metadata")
+            .expect("write ANN candidate");
+        assert_eq!(
+            select_existing_ann_candidate(regular.clone()),
+            Some(regular)
+        );
+
+        let directory = tmp.path().join("directory.chsw");
+        std::fs::create_dir(&directory).expect("create invalid ANN directory");
+        assert_eq!(
+            select_existing_ann_candidate(directory.clone()),
+            Some(directory),
+            "an existing invalid candidate must reach bounded rejection instead of being mislabeled missing"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let broken_symlink = tmp.path().join("broken-symlink.chsw");
+            symlink(tmp.path().join("absent-target"), &broken_symlink)
+                .expect("create broken ANN symlink");
+            assert_eq!(
+                select_existing_ann_candidate(broken_symlink.clone()),
+                Some(broken_symlink),
+                "a selected final-component symlink must reach explicit rejection"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_artifact_contract_pointer_selected_generation_requires_retained_owner() {
+        let tmp = tempdir().expect("pointer-selected fixture");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("create cass db");
+        drop(storage);
+
+        let embedder = HashEmbedder::default();
+        let legacy_path = vector_index_path(tmp.path(), embedder.id());
+        write_hash_vector_index(&legacy_path, 1);
+        let legacy_bytes = std::fs::read(&legacy_path).expect("read legacy FSVI");
+        let legacy_mtime = std::fs::metadata(&legacy_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("legacy FSVI mtime");
+
+        let pointer = SemanticCurrentPointerV1 {
+            schema_version: 1,
+            generation_id: "gen-selected-owner-contract".to_string(),
+            manifest_sha256: "a".repeat(64),
+            selection_epoch: 1,
+            selected_at_ms: 1_733_100_000_000,
+        };
+        let pointer_path = SemanticCurrentPointerV1::path(tmp.path());
+        std::fs::create_dir_all(pointer_path.parent().expect("pointer parent"))
+            .expect("create pointer parent");
+        std::fs::write(
+            &pointer_path,
+            serde_json::to_vec(&pointer).expect("serialize selected pointer"),
+        )
+        .expect("write selected pointer");
+        let mut entries_before = std::fs::read_dir(tmp.path())
+            .expect("list fixture before load")
+            .map(|entry| entry.expect("fixture entry").file_name())
+            .collect::<Vec<_>>();
+        entries_before.sort();
+
+        for availability in [
+            probe_hash_semantic_availability(tmp.path()),
+            probe_semantic_availability(tmp.path()),
+            load_hash_semantic_context(tmp.path(), &db_path).availability,
+            load_semantic_context(tmp.path(), &db_path).availability,
+        ] {
+            assert!(
+                matches!(
+                    &availability,
+                    SemanticAvailability::LoadFailed { context }
+                        if context
+                            == SemanticProgressiveUnavailableReason::OwnerBackedReaderRequired
+                                .code()
+                ),
+                "pointer-selected generation must fail closed with the stable owner reason: {availability:?}"
+            );
+        }
+        assert!(
+            load_hash_semantic_context(tmp.path(), &db_path)
+                .context
+                .is_none(),
+            "a valid legacy file must not bypass the selected-generation owner requirement"
+        );
+        assert_eq!(
+            std::fs::read(&legacy_path).expect("read legacy FSVI after rejected load"),
+            legacy_bytes
+        );
+        assert_eq!(
+            std::fs::metadata(&legacy_path)
+                .and_then(|metadata| metadata.modified())
+                .expect("legacy FSVI mtime after rejected load"),
+            legacy_mtime
+        );
+        let mut entries_after = std::fs::read_dir(tmp.path())
+            .expect("list fixture after load")
+            .map(|entry| entry.expect("fixture entry").file_name())
+            .collect::<Vec<_>>();
+        entries_after.sort();
+        assert_eq!(
+            entries_after, entries_before,
+            "fail-closed pointer handling must not create serving aliases"
+        );
+    }
+
+    #[test]
+    fn same_id_and_dimension_with_legacy_revision_requires_rebuild() -> anyhow::Result<()> {
+        let tmp = tempdir()?;
+        let index_path = vector_index_path(tmp.path(), FastEmbedder::embedder_id_static());
+        let Some(parent) = index_path.parent() else {
+            anyhow::bail!("vector index path has no parent");
+        };
+        std::fs::create_dir_all(parent)?;
+
+        let writer = VectorIndex::create_with_revision(
+            &index_path,
+            FastEmbedder::embedder_id_static(),
+            "1.0",
+            384,
+            frankensearch::index::Quantization::F16,
+        )?;
+        writer.finish()?;
+        assert!(needs_index_rebuild(tmp.path()));
+
+        let expected_revision = expected_vector_space_revision(FastEmbedder::embedder_id_static())
+            .ok_or_else(|| anyhow::anyhow!("MiniLM vector-space revision is not registered"))?;
+        let writer = VectorIndex::create_with_revision(
+            &index_path,
+            FastEmbedder::embedder_id_static(),
+            expected_revision,
+            384,
+            frankensearch::index::Quantization::F16,
+        )?;
+        writer.finish()?;
+        assert!(!needs_index_rebuild(tmp.path()));
+        Ok(())
     }
 
     fn semantic_shard_record(
@@ -1220,16 +1728,15 @@ mod tests {
             .context
             .expect("complete current shards should load a semantic context");
         assert_eq!(
-            context.additional_indexes.len(),
-            1,
+            context.artifacts.len(),
+            2,
             "complete current shards must not be shadowed by an older monolithic vector file"
         );
-        let loaded_records = context.index.record_count()
-            + context
-                .additional_indexes
-                .iter()
-                .map(VectorIndex::record_count)
-                .sum::<usize>();
+        let loaded_records = context
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.index().record_count())
+            .sum::<usize>();
         assert_eq!(loaded_records, 2);
     }
 }

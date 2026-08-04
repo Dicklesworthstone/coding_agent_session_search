@@ -35,6 +35,7 @@ fn codex_connector_reads_modern_envelope_jsonl() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -90,6 +91,7 @@ fn codex_connector_includes_agent_reasoning() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -148,6 +150,7 @@ fn codex_connector_parses_real_tool_call_fixture() {
         data_dir: fixture_home.clone(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     let conv = convs
@@ -241,6 +244,7 @@ fn codex_connector_indexes_modern_response_items() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -317,6 +321,7 @@ fn codex_connector_scans_explicit_rollout_file_root() {
         data_dir: dir.path().join(".codex"),
         scan_roots: vec![ScanRoot::local(file.clone())],
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -357,6 +362,7 @@ fn codex_connector_ignores_unmatched_token_count() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -412,6 +418,7 @@ fn codex_connector_respects_since_ts_at_file_level_only() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: Some(1_700_000_000_000),
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -469,6 +476,7 @@ fn codex_connector_reads_legacy_json_format() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -548,6 +556,7 @@ fn codex_connector_handles_user_message_event() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -586,6 +595,7 @@ also not valid
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -622,6 +632,7 @@ fn codex_connector_handles_multiple_sessions() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 3);
@@ -656,6 +667,7 @@ fn codex_connector_filters_empty_content() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -691,6 +703,7 @@ fn codex_connector_extracts_title() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -725,6 +738,7 @@ fn codex_connector_assigns_sequential_indices() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -759,6 +773,7 @@ fn codex_connector_sets_external_id_from_filename() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -789,6 +804,7 @@ fn codex_connector_handles_empty_sessions() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
@@ -819,6 +835,7 @@ fn codex_connector_parses_millis_timestamp() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -856,6 +873,7 @@ fn codex_connector_flattens_tool_use_blocks() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -894,6 +912,7 @@ fn codex_connector_handles_missing_cwd() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -937,6 +956,7 @@ fn codex_connector_ignores_non_rollout_files() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     // Only the rollout- prefixed file should be processed
@@ -977,6 +997,7 @@ fn codex_connector_handles_legacy_json_missing_session() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -1011,6 +1032,7 @@ fn codex_connector_title_fallback_to_first_message() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -1043,6 +1065,7 @@ fn codex_connector_handles_nested_directories() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -1074,6 +1097,7 @@ fn codex_connector_filters_turn_aborted() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -1112,6 +1136,7 @@ fn codex_connector_truncates_long_title() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -1158,6 +1183,7 @@ fn codex_connector_sets_source_path() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -1195,6 +1221,7 @@ fn codex_connector_metadata_indicates_format() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 2);

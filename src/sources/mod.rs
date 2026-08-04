@@ -194,8 +194,6 @@ fn finish_child_pipe(
 }
 
 #[cfg(unix)]
-/// Put a spawned command in its own process group so a later timeout can stop
-/// the command and any descendants that inherited its stdout/stderr handles.
 pub(crate) fn configure_child_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
 
@@ -203,9 +201,6 @@ pub(crate) fn configure_child_process_group(cmd: &mut Command) {
 }
 
 #[cfg(not(unix))]
-/// No-op outside Unix: the standard library has no portable child-tree/job
-/// primitive. Timeout handling on these targets is deliberately scoped to the
-/// direct child process.
 pub(crate) fn configure_child_process_group(_cmd: &mut Command) {}
 
 #[cfg(unix)]
@@ -229,13 +224,6 @@ fn kill_child_process_group(_pid: u32) {}
 /// [`configure_child_process_group`] before `spawn()`. Without that, the direct
 /// child can be killed but shell grandchildren may keep inherited pipe FDs open
 /// until they exit naturally.
-///
-/// On Unix, timeout cleanup targets the isolated process group before killing
-/// and reaping the direct child. On non-Unix targets, cleanup is truthfully
-/// best-effort and direct-child-only: the direct child is killed and reaped, but
-/// this helper does not claim that an arbitrary descendant tree was terminated.
-/// Pipe collection still observes the same deadline and never blocks the caller
-/// waiting for descendant-held handles.
 pub(crate) fn wait_for_child_output_with_timeout(
     mut child: Child,
     timeout: Duration,
@@ -273,33 +261,6 @@ pub(crate) fn wait_for_child_output_with_timeout(
             let _ = child.wait();
             Ok(None)
         }
-    }
-}
-
-/// Convert a configured source-platform hint into the fleet-doctor platform
-/// shape without inventing an architecture.
-///
-/// A source hint identifies only the OS family used for default paths. It does
-/// not prove CPU architecture or remote tool availability, so those fields stay
-/// empty. When no hint exists, `Other` is the schema's honest unknown OS value;
-/// `Posix` is used only because the v1 fleet schema has no unknown path-style
-/// variant.
-pub(crate) fn fleet_platform_from_source_hint(
-    hint: Option<config::Platform>,
-) -> crate::fleet_doctor_schema::Platform {
-    use crate::fleet_doctor_schema::{HostOs, PathStyle, Platform as FleetPlatform};
-
-    let (os, path_style) = match hint {
-        Some(config::Platform::Macos) => (HostOs::MacOs, PathStyle::Posix),
-        Some(config::Platform::Linux) => (HostOs::Linux, PathStyle::Posix),
-        Some(config::Platform::Windows) => (HostOs::Windows, PathStyle::Windows),
-        None => (HostOs::Other, PathStyle::Posix),
-    };
-    FleetPlatform {
-        os,
-        arch: String::new(),
-        path_style,
-        tool_notes: Vec::new(),
     }
 }
 
@@ -424,63 +385,5 @@ mod tests {
 
         assert!(!tokens.contains(&"-F".to_string()));
         assert!(!command.contains(" -F "));
-    }
-
-    #[test]
-    fn fleet_platform_hint_never_fabricates_an_architecture() {
-        use crate::fleet_doctor_schema::{HostOs, PathStyle};
-
-        let cases = [
-            (
-                Some(config::Platform::Macos),
-                HostOs::MacOs,
-                PathStyle::Posix,
-            ),
-            (
-                Some(config::Platform::Linux),
-                HostOs::Linux,
-                PathStyle::Posix,
-            ),
-            (
-                Some(config::Platform::Windows),
-                HostOs::Windows,
-                PathStyle::Windows,
-            ),
-            (None, HostOs::Other, PathStyle::Posix),
-        ];
-        for (hint, expected_os, expected_path_style) in cases {
-            let platform = fleet_platform_from_source_hint(hint);
-            assert_eq!(platform.os, expected_os);
-            assert_eq!(platform.path_style, expected_path_style);
-            assert!(
-                platform.arch.is_empty(),
-                "a source OS hint must not invent a CPU architecture"
-            );
-            assert!(
-                platform.tool_notes.is_empty(),
-                "an unprobed source hint must not invent tool facts"
-            );
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_direct_child_timeout_is_bounded() -> anyhow::Result<()> {
-        let mut cmd = Command::new("ping");
-        cmd.args(["-n", "30", "127.0.0.1"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        configure_child_process_group(&mut cmd);
-        let child = cmd.spawn()?;
-
-        let started = Instant::now();
-        let output = wait_for_child_output_with_timeout(child, Duration::from_millis(50))?;
-
-        anyhow::ensure!(output.is_none(), "stalled direct child should time out");
-        anyhow::ensure!(
-            started.elapsed() < Duration::from_secs(2),
-            "direct-child timeout must not wait for the command's natural exit"
-        );
-        Ok(())
     }
 }

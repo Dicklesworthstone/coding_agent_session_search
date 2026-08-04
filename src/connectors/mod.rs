@@ -269,8 +269,11 @@ pub mod scan_activity {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// Registered liveness sinks: `(registration id, tick callback)`.
+    type SinkRegistry = Vec<(u64, Box<dyn Fn() + Send + Sync>)>;
+
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-    static SINKS: Mutex<Vec<(u64, Box<dyn Fn() + Send + Sync>)>> = Mutex::new(Vec::new());
+    static SINKS: Mutex<SinkRegistry> = Mutex::new(Vec::new());
 
     /// Unregisters its sink on drop. Hold for the duration of an index run.
     pub struct ScanActivityGuard {

@@ -6,7 +6,7 @@
 //! and verifies the file contains a reasonable sequence of events.
 //!
 //! We use the `hash` embedder rather than fastembed so the test does
-//! not depend on a downloaded model. The 16 named transition events
+//! not depend on a downloaded model. The 20 named transition events
 //! and their carried fields are exercised by unit tests in
 //! `src/indexer/semantic_progress.rs::tests`; this file is the
 //! integration proof that the CLI path actually opens the sink and
@@ -189,6 +189,10 @@ fn semantic_backfill_emits_progress_jsonl_with_named_events_when_env_var_is_set(
     // and bracket event must appear.
     let must_contain = [
         "selection_start",
+        "selection_count_start",
+        "selection_count_done",
+        "selection_candidates_start",
+        "selection_candidates_done",
         "selection_done",
         "packet_replay_start",
         "packet_replay_done",
@@ -220,6 +224,28 @@ fn semantic_backfill_emits_progress_jsonl_with_named_events_when_env_var_is_set(
     assert!(
         selection_idx < embed_idx,
         "selection_start must precede embed_batch_start; got {events:?}"
+    );
+    let count_done_idx = events
+        .iter()
+        .position(|event| event == "selection_count_done")
+        .unwrap();
+    let candidates_start_idx = events
+        .iter()
+        .position(|event| event == "selection_candidates_start")
+        .unwrap();
+    let candidates_done_idx = events
+        .iter()
+        .position(|event| event == "selection_candidates_done")
+        .unwrap();
+    let selection_done_idx = events
+        .iter()
+        .position(|event| event == "selection_done")
+        .unwrap();
+    assert!(
+        count_done_idx < candidates_start_idx
+            && candidates_start_idx < candidates_done_idx
+            && candidates_done_idx < selection_done_idx,
+        "count and bounded-candidate telemetry must bracket the real SQL stages; got {events:?}"
     );
     // publish_done must come strictly before complete on a successful run.
     let publish_done_idx = events

@@ -24,6 +24,7 @@ fn amp_parses_minimal_cache() {
         data_dir: fixture_root.clone(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty(), "expected at least one conversation");
@@ -64,6 +65,7 @@ fn amp_includes_all_messages_when_file_modified() {
         data_dir: fixture_root.clone(),
         scan_roots: Vec::new(),
         since_ts: Some(1_700_000_000_000),
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert_eq!(convs.len(), 1);
@@ -111,6 +113,7 @@ fn amp_skips_malformed_json() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     // Should not panic, should return only the valid session
@@ -156,6 +159,7 @@ fn amp_parses_alternate_fields() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -203,6 +207,7 @@ fn amp_handles_timestamp_formats() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -250,6 +255,7 @@ fn amp_extracts_workspace() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 2);
@@ -299,6 +305,7 @@ fn amp_handles_nested_structure() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -338,6 +345,7 @@ fn amp_extracts_title() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
 
@@ -376,6 +384,7 @@ fn amp_detects_valid_files() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
 
@@ -407,6 +416,7 @@ fn amp_normalizes_roles() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -449,6 +459,7 @@ fn amp_extracts_external_id() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
 
@@ -499,6 +510,7 @@ fn amp_filters_empty_content() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -534,6 +546,7 @@ fn amp_extracts_author_field() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -560,6 +573,7 @@ fn amp_handles_empty_directory() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert!(convs.is_empty());
@@ -585,6 +599,7 @@ fn amp_sets_correct_agent_slug() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -608,6 +623,7 @@ fn amp_sets_source_path() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -638,6 +654,7 @@ fn amp_computes_started_ended_at() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -672,6 +689,7 @@ fn amp_assigns_sequential_indices() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -748,6 +766,7 @@ fn amp_workspace_from_alternate_keys() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 5);
@@ -819,6 +838,7 @@ fn amp_skips_json_without_messages() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
 
@@ -854,6 +874,7 @@ fn amp_handles_camel_case_timestamps() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -893,6 +914,7 @@ fn amp_scans_nested_directories() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
 
@@ -933,6 +955,7 @@ fn amp_filters_whitespace_content() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -978,6 +1001,7 @@ fn amp_skips_empty_content_conversations() {
         data_dir: amp_dir,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).unwrap();
 

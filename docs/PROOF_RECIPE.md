@@ -8,11 +8,10 @@ the integrated resilience gate (`.11.5`) unable to pass by doing nothing.
 
 Pairs with:
 - **`.12.1`** — [`RESILIENCE_TEST_MATRIX.md`](RESILIENCE_TEST_MATRIX.md): which proof each family owes.
-- **`.12.3`** — `src/search/proof_log.rs`: the reusable proof-log record + retention.
+- **`.12.3`** — `src/search/proof_log.rs`: the proof-log record + retention.
 - **`.12.4`** — `UNIT_TEST_HARNESS_REQUIREMENTS.md`: unit cases per family.
-- **`.12.5`** — `src/search/e2e_scenarios.rs`: the executable CI/live scenario contract.
-- **`.12.2`** — `src/e2e_runner.rs`: the bounded runner, retained streams,
-  per-command event/proof writer, and suite manifest validator.
+- **`.12.5`** — `src/search/e2e_scenarios.rs`: the CI/live scenarios.
+- **`.12.2`** — `src/e2e_runner.rs`: the bounded runner.
 
 All commands follow `AGENTS.md`: remote compilation via `rch`, an isolated
 `CARGO_TARGET_DIR`, and `-D warnings` on clippy.
@@ -36,7 +35,7 @@ rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo check --all-t
 # Lint, warnings-as-errors, crate-wide:
 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo clippy --all-targets -- -D warnings
 # Format check:
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo fmt --check
+cargo fmt --check
 # Bug scan on changed files (exit 0 required; #[cfg(test)] helper panics and
 # intentional fake-secret fixtures are acceptable, triaged, criticals):
 ubs <changed-files> --ci
@@ -88,71 +87,45 @@ A `UPDATE_GOLDENS=1` diff must be reviewed as an intentional contract change
 (it is a wire-format break otherwise). The default (unset) run asserts
 goldens unchanged.
 
-## 4. Shared E2E runner (deterministic quick matrix)
+## 4. Shared E2E runner (quick / full)
 
-The integration test consumes `.12.5`'s machine-readable commands directly
-and executes every deterministic scenario against the real test-built `cass`
-binary through the bounded `.12.2` runner. It writes a new, never-overwritten
-artifact tree with raw stdout/stderr, the schema-v2 `RunEvent`, a classified
-lightweight proof artifact, scenario fixture/trace evidence, and the
-suite-level manifest:
+The `.12.2` runner executes the `.12.5` scenarios against the real `cass`
+binary into an artifact directory under a bounded timeout, emitting one
+`.12.3` `ProofLogRecord` per command:
 
 ```sh
-# Local and CI use the same deterministic eight-scenario command. Keep the
-# retained proof root outside the checkout so repo .env discovery is isolated.
-rch exec -- env \
-  CARGO_TARGET_DIR=/data/tmp/cass-resilience-proof-target \
-  CASS_RESILIENCE_PROOF_DIR=/data/tmp/cass-resilience-proof-artifacts \
-  cargo test --test e2e_resilience_scenario_runner \
-    deterministic_resilience_matrix_emits_complete_current_redacted_proof \
-    -- --nocapture
+# quick: the CI scenario set (no live host) — the default gate.
+cass-e2e-runner --mode quick --artifacts <dir> --timeout-ms <budget>
+# full: quick + opt-in live-host scenarios (operator only; never CI-required).
+cass-e2e-runner --mode full --live-hosts <hosts> --artifacts <dir>
 ```
 
-The test runs exactly `e2e_scenarios::ci_scenarios()`: the eight named
-fleet/archive states, deterministically, with no live SSH dependency. Each
-scenario carries its own timeout and accepted exit-code contract. A
-diagnostic command that intentionally exits nonzero is a proof pass only when
-its JSON identity and all scenario assertions pass; the event and manifest
-still preserve the actual exit code.
-
-`e2e_scenarios::live_scenarios()` remains an explicit operator-only contract.
-There is no separate live-host command in this release; do not cite an
-unimplemented `full` mode as proof.
+`--mode quick` runs exactly `e2e_scenarios::ci_scenarios()` (every named
+fleet/archive state, deterministically, no live host). Live scenarios
+(`requires_live_host=true`) run only under `--mode full`.
 
 ## 5. Log-completeness gate (the integrated gate cannot pass by doing nothing)
 
-Before the test reports success it calls
-`ScenarioArtifactManifest::validation_errors()` and then reparses and
-revalidates the persisted `scenario-manifest.json`. The manifest is
-**complete**, not merely "no failures observed":
+After a runner pass, the gate asserts the artifact directory's
+`ProofLogRecord`s are **complete**, not merely "no failures observed":
 
 1. **Coverage:** the set of `scenario_id`s with a record equals
-   `e2e_scenarios::ci_scenarios()` — a missing scenario is a gate
+   `e2e_scenarios::ci_scenarios()` (quick) — a missing scenario is a gate
    failure, not a silent skip.
-2. **Exact command identity/count:** `<scenario>/<command>` keys exactly equal
-   the registered matrix and contain no duplicates. Missing, unexpected,
-   ambiguous duplicate, or zero records fail the gate.
-3. **Outcome integrity:** every runner outcome and lightweight proof status
-   is a trustworthy pass; assertions must have run and all named assertion
-   results must be present and true. Timeout, missing fixture, invalid JSON,
-   assertion failure, command failure, generated-only, partial, stale, or
-   skipped evidence fails.
-4. **Freshness and provenance:** each entry carries this run id, starts within
-   the suite window, and cites an existing fixture manifest plus any required
-   trace/probe artifact. Existing standard artifact paths are never reused or
-   overwritten.
-5. **Redaction:** secret-bearing environment variables are omitted from the
-   retained event and named in `redacted_env_keys`; scenario-specific private
-   markers are forbidden from retained stdout/stderr. The incident scenario
-   also verifies that its synthetic private message marker is absent from every
-   retained stream/event/proof file and both persisted suite manifests.
-6. **Artifact validity:** every command has four standard files
-   (`stdout.json`, `stderr.log`, `event.json`, and `<command>.proof.json`);
-   event/proof JSON is reparsed and cross-checked against the manifest.
+2. **No empty pass:** the record count is ≥ the expected scenario×command
+   count; zero records fails the gate (cannot pass by doing nothing).
+3. **Outcome integrity:** every record's `outcome` is `passed`. Any
+   `timed_out_partial`, `stale_artifact_reused`, `invalid_json`,
+   `did_not_run`, or `failed` fails the gate — these are distinguished by the
+   `.12.3` schema precisely so a timeout/stale/skip can never read as a pass.
+4. **Freshness:** records are from this run (`finished_at_ms` within the run
+   window), not a reused stale artifact.
+5. **Redaction:** `RetentionPolicy::is_redaction_safe` holds for every
+   retained record (no secret-bearing `sanitized_env` keys).
 
 A closure report cites the artifact directory + the per-scenario
-manifest entries; "tests pass" prose without cited artifacts does not satisfy
-the closure checklist in `RESILIENCE_TEST_MATRIX.md`.
+`ProofLogRecord` outcomes; "tests pass" prose without cited artifacts does
+not satisfy the closure checklist in `RESILIENCE_TEST_MATRIX.md`.
 
 ## 6. The named suite (one command surface)
 
@@ -160,12 +133,12 @@ Implementers and CI invoke the same logical suite:
 
 1. §1 compile/lint/format gate.
 2. §2 targeted family tests for changed families (or all, in CI).
-3. §4 real-binary deterministic matrix into a fresh artifact root.
-4. §5 integrated manifest completeness gate over those artifacts.
+3. §4 `--mode quick` E2E runner into an artifact dir.
+4. §5 log-completeness gate over the artifacts.
 
-Local and CI use the same eight-scenario assertions; only target-directory and
-artifact-root locations differ. This is the recipe a closure must cite by
-exact command + printed `resilience_scenario_manifest=...` path.
+Local and CI differ only in scope (`--mode quick` vs a nightly `--mode full`)
+and target-dir isolation — never in the assertions. This is the recipe a
+closure must cite by exact command + artifact path.
 
 ## 7. Real-binary robot dispatch smoke gate (`.2.4`)
 
@@ -208,10 +181,10 @@ Surface signatures are pinned against the golden robot JSON under
 
 ## 8. Lightweight proof artifacts (`.11.4`)
 
-Bead `…uojcg.11.4`. Section §4 combines the bounded runner's detailed
-`RunEvent` with `src/proof_artifact.rs`'s **lightweight classifier**, which any
-test, gauntlet, or smoke gate can also emit independently. It exists so the
-five-plus confusable outcomes — `pass`,
+Bead `…uojcg.11.4`. Where §4's `.12.3` `ProofLogRecord` is the heavyweight
+record emitted by the bounded runner, `src/proof_artifact.rs` is the **lightweight
+classifier** that any test, gauntlet, or smoke gate can emit without standing up
+the full runner. It exists so the five-plus confusable outcomes — `pass`,
 `fail`, `timeout`, `skipped`, `stale-artifact`, `generated-only`,
 `partial-proof` — are recorded distinctly, with the safety-first precedence that
 **a timeout outranks a zero exit** (the 7200s-timeout-before-tests trap can never

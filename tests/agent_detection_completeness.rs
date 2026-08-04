@@ -134,19 +134,19 @@ fn connector_factories_all_instantiate_and_detect() {
     }
 }
 
-/// Feature-gated connectors (chatgpt, cursor, opencode, crush, hermes) are
-/// available because cass enables those features in Cargo.toml.
+/// Feature-gated connectors (chatgpt, cursor, opencode, crush, goose, hermes)
+/// are available because cass enables those features in Cargo.toml.
 #[test]
 fn feature_gated_connectors_available() {
     let slugs = factory_fad_slugs();
-    for gated in ["chatgpt", "cursor", "opencode", "crush", "hermes"] {
+    for gated in ["chatgpt", "cursor", "opencode", "crush", "goose", "hermes"] {
         assert!(
             slugs.contains(gated),
             "Feature-gated connector '{gated}' not found. \
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 23, "Expected 23 connector factories");
+    assert_eq!(slugs.len(), 24, "Expected 24 connector factories");
 }
 
 // ---------------------------------------------------------------------------

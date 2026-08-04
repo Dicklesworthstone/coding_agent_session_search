@@ -35,7 +35,7 @@
 //! cargo bench --bench redaction_perf
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use coding_agent_search::connectors::{NormalizedConversation, ScanContext, ScanRoot};
@@ -50,14 +50,18 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn load_fixture_conversations(dir: &PathBuf) -> Vec<NormalizedConversation> {
+fn load_fixture_conversations(dir: &Path) -> Vec<NormalizedConversation> {
     let factories = get_connector_factories();
     let (_slug, build_codex) = factories
         .iter()
         .find(|(slug, _)| *slug == "codex")
         .expect("codex factory registered");
     let connector = build_codex();
-    let ctx = ScanContext::with_roots(dir.clone(), vec![ScanRoot::local(dir.clone())], None);
+    let ctx = ScanContext::with_roots(
+        dir.to_path_buf(),
+        vec![ScanRoot::local(dir.to_path_buf())],
+        None,
+    );
     let mut convs = Vec::new();
     connector
         .scan_with_callback(&ctx, &mut |conversation| {
@@ -72,12 +76,7 @@ fn corpus_stats(convs: &[NormalizedConversation]) -> (usize, usize) {
     let msgs: usize = convs.iter().map(|c| c.messages.len()).sum();
     let bytes: usize = convs
         .iter()
-        .map(|c| {
-            c.messages
-                .iter()
-                .map(|m| m.content.len())
-                .sum::<usize>()
-        })
+        .map(|c| c.messages.iter().map(|m| m.content.len()).sum::<usize>())
         .sum();
     (msgs, bytes)
 }
@@ -120,7 +119,13 @@ fn output_digest(convs: &[coding_agent_search::model::types::Conversation]) -> S
             );
             hasher.update(&[0]);
             for snippet in &msg.snippets {
-                hasher.update(snippet.snippet_text.as_deref().unwrap_or("\u{0}").as_bytes());
+                hasher.update(
+                    snippet
+                        .snippet_text
+                        .as_deref()
+                        .unwrap_or("\u{0}")
+                        .as_bytes(),
+                );
                 hasher.update(&[0]);
             }
         }
@@ -177,7 +182,8 @@ fn run_mode(
 
 fn main() {
     let dir = PathBuf::from(
-        dotenvy::var("CASS_REDACT_BENCH_DIR").expect("CASS_REDACT_BENCH_DIR must point at fixture dir"),
+        dotenvy::var("CASS_REDACT_BENCH_DIR")
+            .expect("CASS_REDACT_BENCH_DIR must point at fixture dir"),
     );
     let iters = env_usize("CASS_REDACT_BENCH_ITERS", 5);
     let warmup = env_usize("CASS_REDACT_BENCH_WARMUP", 1);
@@ -199,7 +205,11 @@ fn main() {
     );
     assert!(!convs.is_empty(), "fixture dir produced no conversations");
 
-    for mode in modes_raw.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+    for mode in modes_raw
+        .split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
         // Drive redaction through the PRIMARY switch and clear the legacy
         // one: CASS_INDEX_REDACTION outranks CASS_REDACT_SECRETS, so an
         // ambient value of either could otherwise silently corrupt a mode

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::metric_integrity::{MetricOutcome, bakeoff_quality_ratio, safe_ratio};
+use crate::metric_integrity::{MetricOutcome, bakeoff_quality_ratio};
 
 /// Hard eligibility cutoff: models must be released on/after this date.
 /// Format: YYYY-MM-DD
@@ -215,74 +215,41 @@ impl BakeoffComparison {
 }
 
 /// Compute NDCG@k for a list of relevances in rank order.
+/// Non-finite or <= 0 relevances are treated as non-relevant.
 ///
 /// `all_ground_truth` should contain ALL ground-truth relevances for the query
 /// (not just those that appeared in the results). The IDCG is computed from
 /// the ideal ranking of these values. Passing only the returned-doc relevances
 /// would inflate NDCG scores for poor retrievers.
-///
-/// A zero score with a positive ideal ranking is [`MetricOutcome::TrueZero`].
-/// Missing rankings or an all-zero ideal ranking are [`MetricOutcome::NoData`],
-/// while any non-finite or negative relevance is
-/// [`MetricOutcome::InvalidInput`]. This prevents malformed evaluation input
-/// from becoming a successful `0.0`.
-pub fn ndcg_at_k(relevances: &[f64], k: usize, all_ground_truth: &[f64]) -> MetricOutcome {
-    if k == 0 || relevances.is_empty() || all_ground_truth.is_empty() {
-        return MetricOutcome::NoData;
+pub fn ndcg_at_k(relevances: &[f64], k: usize, all_ground_truth: &[f64]) -> f64 {
+    if k == 0 || relevances.is_empty() {
+        return 0.0;
     }
-
-    let dcg = match dcg_at_k(relevances, k) {
-        MetricOutcome::Value(value) => value,
-        MetricOutcome::TrueZero => 0.0,
-        outcome => return outcome,
-    };
-    if all_ground_truth
-        .iter()
-        .any(|relevance| !relevance.is_finite() || *relevance < 0.0)
-    {
-        return MetricOutcome::InvalidInput;
+    let dcg = dcg_at_k(relevances, k);
+    if dcg == 0.0 {
+        return 0.0;
     }
-
     let mut ideal: Vec<f64> = all_ground_truth
         .iter()
-        .map(|relevance| relevance.max(0.0))
+        .map(|rel| if rel.is_finite() { rel.max(0.0) } else { 0.0 })
         .collect();
-    ideal.sort_by(|a, b| b.total_cmp(a));
-    let idcg = match dcg_at_k(&ideal, k) {
-        MetricOutcome::Value(value) if value > 0.0 => value,
-        MetricOutcome::Value(_) | MetricOutcome::TrueZero => return MetricOutcome::NoData,
-        outcome => return outcome,
-    };
-
-    safe_ratio(dcg, idcg)
+    ideal.sort_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
+    let idcg = dcg_at_k(&ideal, k);
+    if idcg == 0.0 { 0.0 } else { dcg / idcg }
 }
 
-fn dcg_at_k(relevances: &[f64], k: usize) -> MetricOutcome {
-    let mut count = 0_u64;
-    let mut sum = 0.0;
-    for (index, relevance) in relevances.iter().take(k).enumerate() {
-        count += 1;
-        if !relevance.is_finite() {
-            return MetricOutcome::InvalidInput;
-        }
-        if *relevance < 0.0 {
-            return MetricOutcome::InvalidInput;
-        }
-        let denominator = (index as f64 + 2.0).log2();
-        let contribution = (2.0_f64.powf(*relevance) - 1.0) / denominator;
-        if !contribution.is_finite() {
-            return MetricOutcome::InvalidInput;
-        }
-        sum += contribution;
-    }
-
-    if count == 0 {
-        MetricOutcome::NoData
-    } else if sum == 0.0 {
-        MetricOutcome::TrueZero
-    } else {
-        MetricOutcome::finite(sum)
-    }
+fn dcg_at_k(relevances: &[f64], k: usize) -> f64 {
+    relevances
+        .iter()
+        .take(k)
+        .enumerate()
+        .map(|(idx, rel)| {
+            let rel = if rel.is_finite() { *rel } else { 0.0 };
+            let rel = rel.max(0.0);
+            let denom = (idx as f64 + 2.0).log2();
+            (2.0_f64.powf(rel) - 1.0) / denom
+        })
+        .sum()
 }
 
 // ==================== Evaluation Harness ====================
@@ -377,61 +344,6 @@ impl EvaluationCorpus {
             }
         }
         format!("{:016x}", hasher.finish())
-    }
-
-    /// Validate the portions of the corpus that define evaluation truth.
-    ///
-    /// Errors carry stable metric-integrity prefixes so callers and tests can
-    /// distinguish missing evidence (`no-data`) from malformed evidence
-    /// (`invalid-input`) without parsing prose.
-    fn validate_for_evaluation(&self) -> Result<(), String> {
-        if self.documents.is_empty() {
-            return Err("no-data: empty-corpus".to_string());
-        }
-        if self.queries.is_empty() {
-            return Err("no-data: empty-query-set".to_string());
-        }
-
-        let document_ids: std::collections::HashSet<&str> = self
-            .documents
-            .iter()
-            .map(|document| document.id.as_str())
-            .collect();
-        for (query_index, query) in self.queries.iter().enumerate() {
-            if query.judgments.is_empty() {
-                return Err(format!(
-                    "no-data: empty-judgments:query-index={query_index}"
-                ));
-            }
-
-            let mut has_positive_relevance = false;
-            for (judgment_index, judgment) in query.judgments.iter().enumerate() {
-                if !judgment.relevance.is_finite() {
-                    return Err(format!(
-                        "invalid-input: non-finite-relevance:query-index={query_index}:judgment-index={judgment_index}"
-                    ));
-                }
-                if judgment.relevance < 0.0 {
-                    return Err(format!(
-                        "invalid-input: negative-relevance:query-index={query_index}:judgment-index={judgment_index}"
-                    ));
-                }
-                if !document_ids.contains(judgment.doc_id.as_str()) {
-                    return Err(format!(
-                        "invalid-input: unknown-document-id:query-index={query_index}:judgment-index={judgment_index}"
-                    ));
-                }
-                has_positive_relevance |= judgment.relevance > 0.0;
-            }
-
-            if !has_positive_relevance {
-                return Err(format!(
-                    "no-data: no-positive-relevance:query-index={query_index}"
-                ));
-            }
-        }
-
-        Ok(())
     }
 
     /// Create a sample corpus for testing embedders on code search scenarios.
@@ -600,12 +512,11 @@ impl EvaluationHarness {
         corpus: &EvaluationCorpus,
         metadata: &ModelMetadata,
     ) -> Result<ValidationReport, String> {
-        if self.config.ndcg_k == 0 {
-            return Err("invalid-input: ndcg-k-zero".to_string());
-        }
-        corpus.validate_for_evaluation()?;
         let corpus_hash = corpus.compute_hash();
-        let first_doc = &corpus.documents[0];
+        let first_doc = corpus.documents.first().ok_or("no-data: empty-corpus")?;
+        if corpus.queries.is_empty() {
+            return Err("no-data: empty-query-set".to_string());
+        }
 
         // Measure cold start (first embedding)
         let cold_start = Instant::now();
@@ -680,17 +591,7 @@ impl EvaluationHarness {
 
             // All ground-truth relevances (for ideal DCG computation)
             let all_gt: Vec<f64> = relevance_map.values().copied().collect();
-            let ndcg = match ndcg_at_k(&relevances, self.config.ndcg_k, &all_gt) {
-                MetricOutcome::Value(value) => value,
-                MetricOutcome::TrueZero => 0.0,
-                outcome => {
-                    return Err(format!(
-                        "{}: ndcg-unavailable:query-index={}",
-                        outcome.kind_str(),
-                        query_results.len()
-                    ));
-                }
-            };
+            let ndcg = ndcg_at_k(&relevances, self.config.ndcg_k, &all_gt);
 
             query_results.push(QueryEvalResult {
                 query: query_with_judgments.query.clone(),
@@ -701,19 +602,10 @@ impl EvaluationHarness {
         }
 
         // Compute aggregate metrics
-        let ndcg_sum = query_results
-            .iter()
-            .map(|result| result.ndcg_at_10)
-            .sum::<f64>();
-        let avg_ndcg = match safe_ratio(ndcg_sum, query_results.len() as f64) {
-            MetricOutcome::Value(value) => value,
-            MetricOutcome::TrueZero => 0.0,
-            outcome => {
-                return Err(format!(
-                    "{}: aggregate-ndcg-unavailable",
-                    outcome.kind_str()
-                ));
-            }
+        let avg_ndcg = if query_results.is_empty() {
+            0.0
+        } else {
+            query_results.iter().map(|r| r.ndcg_at_10).sum::<f64>() / query_results.len() as f64
         };
 
         let latency_stats = LatencyStats::from_durations(&latencies);
@@ -895,55 +787,23 @@ mod tests {
     #[test]
     fn ndcg_perfect_is_one() {
         let relevances = vec![3.0, 2.0, 1.0];
-        let ndcg = ndcg_at_k(&relevances, 3, &relevances)
-            .as_value()
-            .expect("perfect ranking has a numeric NDCG");
+        let ndcg = ndcg_at_k(&relevances, 3, &relevances);
         assert!((ndcg - 1.0).abs() < 1e-9);
     }
 
     #[test]
-    fn ndcg_is_no_data_when_ground_truth_has_no_positive_relevance() {
+    fn ndcg_zero_when_no_relevance() {
         let relevances = vec![0.0, 0.0, 0.0];
-        assert_eq!(
-            ndcg_at_k(&relevances, 3, &relevances),
-            MetricOutcome::NoData
-        );
+        let ndcg = ndcg_at_k(&relevances, 3, &relevances);
+        assert_eq!(ndcg, 0.0);
     }
 
     #[test]
     fn ndcg_handles_partial_relevance() {
         let all_gt = vec![2.0, 1.0, 0.0];
         let returned = vec![1.0, 0.0, 2.0]; // out of ideal order
-        let ndcg = ndcg_at_k(&returned, 3, &all_gt)
-            .as_value()
-            .expect("partial ranking has a numeric NDCG");
+        let ndcg = ndcg_at_k(&returned, 3, &all_gt);
         assert!(ndcg > 0.0 && ndcg < 1.0);
-    }
-
-    #[test]
-    fn ndcg_rejects_non_finite_relevance_instead_of_manufacturing_zero() {
-        let returned = vec![f64::NAN, 0.0];
-        let all_gt = vec![1.0, 0.0];
-        assert_eq!(
-            ndcg_at_k(&returned, 2, &all_gt),
-            MetricOutcome::InvalidInput
-        );
-        assert_eq!(
-            ndcg_at_k(&all_gt, 2, &[f64::INFINITY, 0.0]),
-            MetricOutcome::InvalidInput
-        );
-    }
-
-    #[test]
-    fn ndcg_rejects_negative_relevance_instead_of_clamping_it_to_zero() {
-        assert_eq!(
-            ndcg_at_k(&[-1.0, 0.0], 2, &[1.0, 0.0]),
-            MetricOutcome::InvalidInput
-        );
-        assert_eq!(
-            ndcg_at_k(&[1.0, 0.0], 2, &[1.0, -1.0]),
-            MetricOutcome::InvalidInput
-        );
     }
 
     #[test]

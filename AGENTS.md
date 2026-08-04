@@ -106,7 +106,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | `rusqlite` | SQLite database (bundled) — legacy, retained during frankensqlite migration |
 | `frankensearch` | Unified search engine: lexical BM25 + semantic + RRF fusion |
 | `franken_agent_detection` | Agent session auto-detection across 15+ providers |
-| `fastembed` | ONNX-based text embeddings |
+| `frankentorch` (via `frankensearch`) | Pure-Rust native MiniLM embeddings and reranking |
 | `hnsw_rs` | HNSW approximate nearest neighbors |
 | `half` + `wide` + `memmap2` | f16 quantized vectors, portable SIMD, memory-mapped I/O |
 | `ftui` + `ftui-extras` | FrankenTUI terminal interface |
@@ -137,10 +137,10 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `f6a007b169ccd483f0e4e437f436d81357461718` (`0.1.19` package identity; immutable git pin carrying contentless-FTS5 reopen/catch-up, existing-only schema inspection, and canonical contentless-DDL persistence across stale duplicate repair/reopen; crates.io latest remains `0.1.18`) |
-| `franken-agent-detection` | `6d24c532` (Grok Build connector [cass #328], plus Gemini CLI JSONL discovery, ordered `$set.messages` replay, and current role normalization [cass #341]) |
+| `frankensqlite` / `fsqlite-types` | `62a58ee3` (git branch `fts5-overlong-hotfix-cass362`; `f9cc3294` family + FTS5 overlong-term skip cap [cass#362]) |
+| `franken-agent-detection` | `1557300b` |
 | `asupersync` | `=0.3.9` |
-| `frankensearch` | `f7fa7a02` (pure-Rust `native` feature plus architecture-safe HNSW `DistDot` normalization; frankentorch pinned by git rev inside frankensearch — cass #308, #333) |
+| `frankensearch` | `ad8e29ea` (pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308) |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 
@@ -227,13 +227,13 @@ All console output should be **informative, detailed, stylish, and colorful** by
 
 ```bash
 # Check for compiler errors and warnings
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo check --all-targets
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo check --all-targets
 
 # Check for clippy lints
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo clippy --all-targets -- -D warnings
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo clippy --all-targets -- -D warnings
 
 # Verify formatting
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo fmt --check
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo fmt --check
 ```
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
@@ -362,16 +362,16 @@ Integration and E2E tests live in the `tests/` directory. Benchmarks live in `be
 
 ```bash
 # Run all tests
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-target cargo test
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target cargo test
 
 # Run with output
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-target cargo test -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target cargo test -- --nocapture
 
 # Run a specific test
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-target cargo test test_name
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target cargo test test_name
 
 # Run tests with all features enabled
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-target cargo test --all-features
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target cargo test --all-features
 ```
 
 ### Test Categories
@@ -440,7 +440,7 @@ Provides unified full-text and semantic search across all local coding agent ses
 ### Schema Stability and Golden-Freeze Gates
 
 - Every JSON contract surface is pinned by golden-file regression tests under `tests/golden/robot/` (JSON) and `tests/golden/robot_docs/` (plain-text docs topics). The full set: capabilities, health, status, diag, diag_quarantine, models_status, models_verify, models_check_update, introspect, doctor, doctor_quarantine, api_version, stats (missing-db error envelope), robot_docs topics (paths, env, exit-codes, schemas, guide, robot_help).
-- **If you add a new field or change a type**, run `UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`, review the diff via `git diff tests/golden/`, and commit both the code + golden in one change. Do not regenerate goldens without reviewing — every diff is either an intentional schema change or a bug.
+- **If you add a new field or change a type**, run `UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`, review the diff via `git diff tests/golden/`, and commit both the code + golden in one change. Do not regenerate goldens without reviewing — every diff is either an intentional schema change or a bug.
 - `cass introspect --json`'s `response_schemas` is `BTreeMap`-backed so the serialized key order is alphabetical and deterministic (bead 8sl73).
 - Error envelopes use **kebab-case `err.kind`** values. For codes 0-9 the numeric code is sufficient; for codes ≥ 10 the code is ambiguous (e.g. 10 covers both `config` and `timeout`) — always branch on `err.kind`. Full taxonomy in src/lib.rs `CliError` literals + the Exit Codes table below (bead wan21).
 
@@ -458,6 +458,7 @@ coding_agent_session_search/
 │   │   ├── codex.rs              # Codex sessions
 │   │   ├── cursor.rs             # Cursor sessions
 │   │   ├── gemini.rs             # Gemini sessions
+│   │   ├── grok.rs               # Grok Build sessions
 │   │   ├── aider.rs              # Aider sessions
 │   │   ├── amp.rs                # Amp sessions
 │   │   ├── chatgpt.rs            # ChatGPT sessions (encrypted)
@@ -465,10 +466,17 @@ coding_agent_session_search/
 │   │   ├── opencode.rs           # OpenCode sessions
 │   │   ├── pi_agent.rs           # Pi Agent sessions
 │   │   ├── copilot.rs            # Copilot sessions
+│   │   ├── copilot_cli.rs        # Copilot CLI sessions
 │   │   ├── openclaw.rs           # OpenClaw sessions
 │   │   ├── clawdbot.rs           # ClawdBot sessions
 │   │   ├── vibe.rs               # Vibe sessions
-│   │   └── factory.rs            # Connector factory
+│   │   ├── crush.rs               # Crush sessions
+│   │   ├── hermes.rs              # Hermes sessions
+│   │   ├── kimi.rs                # Kimi Code sessions
+│   │   ├── qwen.rs                # Qwen Code sessions
+│   │   ├── openhands.rs           # OpenHands sessions
+│   │   ├── antigravity.rs         # Antigravity sessions
+│   │   └── factory.rs             # Factory (Droid) sessions
 │   ├── search/                   # Search engine (delegates to frankensearch)
 │   │   ├── query.rs              # Query parsing and execution
 │   │   ├── tantivy.rs            # BM25 full-text search (via frankensearch)
@@ -476,7 +484,7 @@ coding_agent_session_search/
 │   │   ├── two_tier_search.rs    # Progressive 2-tier hybrid search
 │   │   ├── ann_index.rs          # HNSW approximate nearest neighbors
 │   │   ├── hash_embedder.rs      # FNV-1a hash embedder (fast, zero-dep)
-│   │   ├── fastembed_embedder.rs # ONNX-based quality embedder
+│   │   ├── fastembed_embedder.rs # Native MiniLM quality embedder (legacy filename)
 │   │   ├── embedder.rs           # Embedder trait
 │   │   ├── embedder_registry.rs  # Embedder auto-detection
 │   │   ├── reranker.rs           # Cross-encoder reranking
@@ -548,9 +556,18 @@ cass robot-docs guide         # LLM-optimized docs
 | OpenCode | `opencode.rs` | JSONL |
 | Pi Agent | `pi_agent.rs` | JSONL |
 | Copilot | `copilot.rs` | JSONL |
+| Copilot CLI | `copilot_cli.rs` | JSONL |
 | OpenClaw | `openclaw.rs` | JSONL |
 | ClawdBot | `clawdbot.rs` | JSONL |
 | Vibe | `vibe.rs` | JSONL |
+| Crush | `crush.rs` | JSONL |
+| Hermes | `hermes.rs` | JSONL |
+| Kimi Code | `kimi.rs` | JSONL |
+| Qwen Code | `qwen.rs` | JSONL |
+| Factory (Droid) | `factory.rs` | JSONL |
+| OpenHands | `openhands.rs` | JSON event stream |
+| Antigravity | `antigravity.rs` | JSONL / SQLite |
+| Grok Build | `grok.rs` | ACP updates JSONL |
 
 ### HTML Export (Robot Mode)
 
@@ -985,9 +1002,9 @@ RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation 
 
 To manually offload a build:
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-rch-target cargo build --release
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-rch-target cargo test
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-rch-target cargo clippy
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-rch-target cargo build --release
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-rch-target cargo test
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-rch-target cargo clippy
 ```
 
 Quick commands:

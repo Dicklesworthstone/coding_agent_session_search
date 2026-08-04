@@ -1,9 +1,7 @@
 //! Derived metric computation for analytics buckets.
 //!
-//! All division operations use the shared metric-integrity taxonomy so a real
-//! zero remains distinct from no data or invalid input. Legacy `Option<f64>`
-//! projections are retained for wire compatibility, but are always derived
-//! from the corresponding [`MetricOutcome`].
+//! All division operations are safe against zero denominators and produce
+//! `None` (rendered as JSON `null`) rather than NaN / Infinity.
 
 use super::types::{DerivedMetrics, UsageBucket};
 use crate::metric_integrity::{MetricOutcome, safe_ratio};
@@ -12,76 +10,45 @@ use crate::metric_integrity::{MetricOutcome, safe_ratio};
 pub fn compute_derived(bucket: &UsageBucket) -> DerivedMetrics {
     let api_coverage_pct = safe_pct(bucket.api_coverage_message_count, bucket.message_count);
 
-    let api_tokens_per_assistant_msg_outcome =
-        safe_count_ratio(bucket.api_tokens_total, bucket.assistant_message_count, 1.0);
-    let api_tokens_per_assistant_msg = api_tokens_per_assistant_msg_outcome.as_value();
+    let api_tokens_per_assistant_msg =
+        safe_div(bucket.api_tokens_total, bucket.assistant_message_count);
 
-    let content_tokens_per_user_msg_outcome = safe_count_ratio(
-        bucket.content_tokens_est_total,
-        bucket.user_message_count,
-        1.0,
-    );
-    let content_tokens_per_user_msg = content_tokens_per_user_msg_outcome.as_value();
+    let content_tokens_per_user_msg =
+        safe_div(bucket.content_tokens_est_total, bucket.user_message_count);
 
-    let tool_calls_per_1k_api_tokens_outcome =
-        safe_count_ratio(bucket.tool_call_count, bucket.api_tokens_total, 1000.0);
-    let tool_calls_per_1k_api_tokens = tool_calls_per_1k_api_tokens_outcome.as_value();
+    let tool_calls_per_1k_api_tokens = if bucket.api_tokens_total > 0 {
+        Some(bucket.tool_call_count as f64 / (bucket.api_tokens_total as f64 / 1000.0))
+    } else {
+        None
+    };
 
-    let tool_calls_per_1k_content_tokens_outcome = safe_count_ratio(
-        bucket.tool_call_count,
-        bucket.content_tokens_est_total,
-        1000.0,
-    );
-    let tool_calls_per_1k_content_tokens = tool_calls_per_1k_content_tokens_outcome.as_value();
+    let tool_calls_per_1k_content_tokens = if bucket.content_tokens_est_total > 0 {
+        Some(bucket.tool_call_count as f64 / (bucket.content_tokens_est_total as f64 / 1000.0))
+    } else {
+        None
+    };
 
-    let plan_message_pct_outcome =
-        safe_count_ratio(bucket.plan_message_count, bucket.message_count, 100.0);
-    let plan_message_pct = plan_message_pct_outcome.as_value();
+    let plan_message_pct = if bucket.message_count > 0 {
+        Some((bucket.plan_message_count as f64 / bucket.message_count as f64) * 100.0)
+    } else {
+        None
+    };
 
-    let plan_token_share_content_outcome = safe_count_ratio(
+    let plan_token_share_content = safe_div(
         bucket.plan_content_tokens_est_total,
         bucket.content_tokens_est_total,
-        1.0,
     );
-    let plan_token_share_content = plan_token_share_content_outcome.as_value();
-    let plan_token_share_api_outcome =
-        safe_count_ratio(bucket.plan_api_tokens_total, bucket.api_tokens_total, 1.0);
-    let plan_token_share_api = plan_token_share_api_outcome.as_value();
+    let plan_token_share_api = safe_div(bucket.plan_api_tokens_total, bucket.api_tokens_total);
 
     DerivedMetrics {
         api_coverage_pct,
         api_tokens_per_assistant_msg,
-        api_tokens_per_assistant_msg_outcome,
         content_tokens_per_user_msg,
-        content_tokens_per_user_msg_outcome,
         tool_calls_per_1k_api_tokens,
-        tool_calls_per_1k_api_tokens_outcome,
         tool_calls_per_1k_content_tokens,
-        tool_calls_per_1k_content_tokens_outcome,
         plan_message_pct,
-        plan_message_pct_outcome,
         plan_token_share_content,
-        plan_token_share_content_outcome,
         plan_token_share_api,
-        plan_token_share_api_outcome,
-    }
-}
-
-/// Safely scale a ratio over non-negative count inputs.
-///
-/// Negative counters indicate corrupt or incompatible aggregate input and are
-/// therefore invalid rather than a successful negative metric. A zero
-/// denominator is no-data; a zero numerator over a positive denominator is a
-/// genuine true-zero.
-fn safe_count_ratio(numerator: i64, denominator: i64, scale: f64) -> MetricOutcome {
-    if numerator < 0 || denominator < 0 || !scale.is_finite() || scale <= 0.0 {
-        return MetricOutcome::InvalidInput;
-    }
-
-    match safe_ratio(numerator as f64, denominator as f64) {
-        MetricOutcome::Value(value) => MetricOutcome::finite(value * scale),
-        MetricOutcome::TrueZero => MetricOutcome::TrueZero,
-        other => other,
     }
 }
 
@@ -89,9 +56,11 @@ fn safe_count_ratio(numerator: i64, denominator: i64, scale: f64) -> MetricOutco
 /// denominator is `no-data`, not a manufactured `0`; a genuine zero numerator
 /// over present rows is `true-zero`. Numeric results are rounded to 2 places.
 pub fn safe_pct(numerator: i64, denominator: i64) -> MetricOutcome {
-    let outcome = safe_count_ratio(numerator, denominator, 100.0);
+    let outcome = safe_ratio(numerator as f64, denominator as f64);
     match outcome {
-        MetricOutcome::Value(value) => MetricOutcome::finite((value * 100.0).round() / 100.0),
+        MetricOutcome::Value(value) => {
+            MetricOutcome::finite(((value * 100.0) * 100.0).round() / 100.0)
+        }
         MetricOutcome::TrueZero => MetricOutcome::TrueZero,
         other => other,
     }
@@ -164,12 +133,6 @@ mod tests {
     }
 
     #[test]
-    fn safe_pct_rejects_negative_counters() {
-        assert_eq!(safe_pct(-1, 10), MetricOutcome::InvalidInput);
-        assert_eq!(safe_pct(1, -10), MetricOutcome::InvalidInput);
-    }
-
-    #[test]
     fn compute_derived_empty_bucket() {
         let bucket = UsageBucket::default();
         let d = compute_derived(&bucket);
@@ -181,22 +144,6 @@ mod tests {
         assert_eq!(d.plan_message_pct, None);
         assert_eq!(d.plan_token_share_content, None);
         assert_eq!(d.plan_token_share_api, None);
-        assert_eq!(
-            d.api_tokens_per_assistant_msg_outcome,
-            MetricOutcome::NoData
-        );
-        assert_eq!(d.content_tokens_per_user_msg_outcome, MetricOutcome::NoData);
-        assert_eq!(
-            d.tool_calls_per_1k_api_tokens_outcome,
-            MetricOutcome::NoData
-        );
-        assert_eq!(
-            d.tool_calls_per_1k_content_tokens_outcome,
-            MetricOutcome::NoData
-        );
-        assert_eq!(d.plan_message_pct_outcome, MetricOutcome::NoData);
-        assert_eq!(d.plan_token_share_content_outcome, MetricOutcome::NoData);
-        assert_eq!(d.plan_token_share_api_outcome, MetricOutcome::NoData);
     }
 
     #[test]
@@ -224,20 +171,6 @@ mod tests {
         assert!((d.plan_message_pct.unwrap() - 5.0).abs() < 0.01);
         assert_eq!(d.plan_token_share_content, Some(0.05));
         assert_eq!(d.plan_token_share_api, Some(0.05));
-        assert_eq!(
-            d.api_tokens_per_assistant_msg_outcome,
-            MetricOutcome::Value(1200.0)
-        );
-        assert_eq!(
-            d.content_tokens_per_user_msg_outcome,
-            MetricOutcome::Value(1000.0)
-        );
-        assert_eq!(d.plan_message_pct_outcome, MetricOutcome::Value(5.0));
-        assert_eq!(
-            d.plan_token_share_content_outcome,
-            MetricOutcome::Value(0.05)
-        );
-        assert_eq!(d.plan_token_share_api_outcome, MetricOutcome::Value(0.05));
     }
 
     #[test]
@@ -251,34 +184,5 @@ mod tests {
         };
         let d = compute_derived(&bucket);
         assert_eq!(d.api_coverage_pct, MetricOutcome::NoData);
-    }
-
-    #[test]
-    fn compute_derived_distinguishes_true_zero_from_missing_and_invalid() {
-        let true_zero = compute_derived(&UsageBucket {
-            message_count: 4,
-            user_message_count: 2,
-            assistant_message_count: 2,
-            api_tokens_total: 10,
-            content_tokens_est_total: 20,
-            ..Default::default()
-        });
-        assert_eq!(
-            true_zero.tool_calls_per_1k_api_tokens_outcome,
-            MetricOutcome::TrueZero
-        );
-        assert_eq!(true_zero.plan_message_pct_outcome, MetricOutcome::TrueZero);
-
-        let invalid = compute_derived(&UsageBucket {
-            message_count: 1,
-            assistant_message_count: 1,
-            api_tokens_total: -1,
-            ..Default::default()
-        });
-        assert_eq!(
-            invalid.api_tokens_per_assistant_msg_outcome,
-            MetricOutcome::InvalidInput
-        );
-        assert_eq!(invalid.api_tokens_per_assistant_msg, None);
     }
 }

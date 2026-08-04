@@ -56,6 +56,7 @@ fn create_goose_db(path: &Path) -> Connection {
     conn
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_session(
     conn: &Connection,
     id: &str,
@@ -97,7 +98,13 @@ fn insert_text_message(
         "INSERT INTO messages
             (session_id, role, content_json, created_timestamp, tokens, metadata_json, message_id)
          VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5)",
-        params![session_id, role, content_json, created_timestamp, message_id],
+        params![
+            session_id,
+            role,
+            content_json,
+            created_timestamp,
+            message_id
+        ],
     )
     .expect("insert goose message");
 }
@@ -197,9 +204,30 @@ fn goose_messages_are_ordered_by_created_timestamp() {
         None,
     );
     // Insert out of chronological order; scan must sort ascending.
-    insert_text_message(&conn, "sess-order", "m-late", "assistant", "third", 1_700_000_090);
-    insert_text_message(&conn, "sess-order", "m-first", "user", "first", 1_700_000_010);
-    insert_text_message(&conn, "sess-order", "m-mid", "assistant", "second", 1_700_000_050);
+    insert_text_message(
+        &conn,
+        "sess-order",
+        "m-late",
+        "assistant",
+        "third",
+        1_700_000_090,
+    );
+    insert_text_message(
+        &conn,
+        "sess-order",
+        "m-first",
+        "user",
+        "first",
+        1_700_000_010,
+    );
+    insert_text_message(
+        &conn,
+        "sess-order",
+        "m-mid",
+        "assistant",
+        "second",
+        1_700_000_050,
+    );
     drop(conn);
 
     let convs = scan_db(&db_path);

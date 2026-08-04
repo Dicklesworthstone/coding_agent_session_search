@@ -12,6 +12,7 @@ fn gemini_parses_jsonl_fixture() {
         data_dir: fixture_root.clone(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(
@@ -48,6 +49,7 @@ fn gemini_replays_current_jsonl_session_format() {
             data_dir: tmp.path().to_path_buf(),
             scan_roots: Vec::new(),
             since_ts: None,
+            progress_tick: None,
         })
         .expect("scan current Gemini JSONL");
 
@@ -68,6 +70,7 @@ fn gemini_maps_model_role_to_assistant() {
         data_dir: fixture_root,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());
@@ -87,6 +90,7 @@ fn gemini_extracts_metadata() {
         data_dir: fixture_root,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());
@@ -108,6 +112,7 @@ fn gemini_parses_timestamps() {
         data_dir: fixture_root,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());
@@ -203,6 +208,7 @@ fn gemini_includes_all_messages_when_file_modified() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: Some(since_ts),
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());
@@ -250,6 +256,7 @@ fn gemini_extracts_workspace_from_agents_md_content() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());
@@ -291,6 +298,7 @@ fn gemini_extracts_workspace_from_working_directory() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());
@@ -339,6 +347,7 @@ fn gemini_filters_empty_messages() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());
@@ -385,6 +394,7 @@ fn gemini_skips_malformed_json() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     // Should not panic, should return only the valid session
@@ -417,6 +427,7 @@ fn gemini_skips_sessions_without_messages() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     let convs = conn.scan(&ctx).expect("scan");
@@ -458,6 +469,7 @@ fn gemini_extracts_title_from_first_user_message() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());
@@ -509,6 +521,7 @@ fn gemini_assigns_sequential_message_indices() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());
@@ -529,6 +542,7 @@ fn gemini_sets_agent_slug() {
         data_dir: fixture_root,
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());
@@ -547,6 +561,7 @@ fn gemini_sets_source_path() {
         data_dir: fixture_root.clone(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());
@@ -589,6 +604,7 @@ fn gemini_handles_multiple_sessions() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert_eq!(convs.len(), 3);
@@ -625,6 +641,7 @@ fn gemini_falls_back_to_hash_directory_for_workspace() {
         data_dir: tmp.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert!(!convs.is_empty());

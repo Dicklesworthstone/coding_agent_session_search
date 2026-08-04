@@ -531,7 +531,9 @@ pub fn run_doctor_rebuild_canonical_fts(
                 .rebuild_fts_shadow_via_drop_recreate()
                 .map_err(|e| {
                     storage_error(
-                        format!("rebuilding corrupt canonical FTS5 shadow via drop+recreate: {e:#}"),
+                        format!(
+                            "rebuilding corrupt canonical FTS5 shadow via drop+recreate: {e:#}"
+                        ),
                         Some("Preserve the archive bundle and run 'cass doctor check --json'."),
                     )
                 })?;
@@ -1266,8 +1268,10 @@ mod tests {
             let garbage = [0xFFu8; 12];
             conn.execute_compat(
                 "UPDATE fts_messages_data SET block = ?1 WHERE id = ?2",
-                &[ParamValue::from(garbage.as_slice()), ParamValue::from(10_i64)]
-                    as &[ParamValue],
+                &[
+                    ParamValue::from(garbage.as_slice()),
+                    ParamValue::from(10_i64),
+                ] as &[ParamValue],
             )
             .expect("corrupt the FTS5 structure record");
         }
@@ -1316,7 +1320,9 @@ mod tests {
             true,
             Some(RobotFormat::Json),
         )
-        .expect("rebuild-canonical-fts must repair a structurally-corrupt shadow (GH #368 defect 3)");
+        .expect(
+            "rebuild-canonical-fts must repair a structurally-corrupt shadow (GH #368 defect 3)",
+        );
 
         // The archive now opens normally and the rebuilt shadow reaches exact
         // parity and is queryable for a token from canonical content.
@@ -1335,7 +1341,10 @@ mod tests {
                 |row| row.get_typed(0),
             )
             .expect("MATCH on rebuilt shadow");
-        assert_eq!(matches, 1, "rebuilt FTS shadow must be queryable for 'needle'");
+        assert_eq!(
+            matches, 1,
+            "rebuilt FTS shadow must be queryable for 'needle'"
+        );
     }
 
     /// GH #369: the cumulative oversized-leaf failure (many in-cap terms in one

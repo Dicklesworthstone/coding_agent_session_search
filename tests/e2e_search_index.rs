@@ -8,14 +8,13 @@
 //!
 //! Part of bead: coding_agent_session_search-0jt (TST.11)
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use chrono::{SecondsFormat, Utc};
 use coding_agent_search::search::tantivy::{
     Fields, SearchableIndexSummary, expected_index_dir, index_dir, open_federated_search_readers,
     searchable_index_summary,
 };
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensearch::lexical::{
+use frankensearch::lexical_tantivy::{
     CassQueryFilters, CassSourceFilter, Count, IndexReader, ReloadPolicy, cass_build_tantivy_query,
     cass_open_search_reader,
 };
@@ -33,8 +32,7 @@ use std::time::{Duration, Instant};
 
 #[macro_use]
 mod util;
-use util::EnvGuard;
-use util::e2e_log::{E2ePerformanceMetrics, PhaseTracker};
+use util::e2e_log::{E2eCommandEnvironment, E2ePerformanceMetrics, PhaseTracker};
 
 // =============================================================================
 // E2E Logger Support
@@ -312,11 +310,9 @@ fn force_federated_publish_env(cmd: &mut assert_cmd::Command) {
 }
 
 #[cfg(target_os = "linux")]
-fn cass_std_cmd(home: &Path, codex_home: &Path) -> StdCommand {
-    let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("cass"));
+fn cass_std_cmd(command_env: &E2eCommandEnvironment, home: &Path) -> StdCommand {
+    let mut cmd = command_env.cass_std_command();
     cmd.current_dir(home);
-    cmd.env("CODEX_HOME", codex_home);
-    cmd.env("HOME", home);
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
     cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
     cmd
@@ -378,15 +374,15 @@ struct SearchLoopStats {
 #[serial]
 fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
     let tracker = tracker_for("duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     let ts = 1_732_118_400_000u64;
     make_codex_session(
@@ -398,7 +394,8 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
     );
     let session_file = codex_home.join("sessions/2024/11/20/rollout-fts-repair.jsonl");
 
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)
@@ -462,7 +459,8 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         "the injected duplicate schema row should reproduce the unreadable pre-fix SQLite state"
     );
 
-    let existing_search = cargo_bin_cmd!("cass")
+    let existing_search = command_env
+        .cass_assert_command()
         .args([
             "search",
             "fts_repair_initial_token",
@@ -492,7 +490,8 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         "the Tantivy index should remain authoritative for search results"
     );
 
-    let incremental_index = cargo_bin_cmd!("cass")
+    let incremental_index = command_env
+        .cass_assert_command()
         .args(["index", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)
@@ -507,7 +506,8 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         String::from_utf8_lossy(&incremental_index.stderr)
     );
 
-    let health = cargo_bin_cmd!("cass")
+    let health = command_env
+        .cass_assert_command()
         .args(["health", "--json", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)
@@ -533,7 +533,8 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
     append_codex_session(&session_file, "fts_repair_appended_token", ts + 10_000);
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)
@@ -549,7 +550,8 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
         "incremental writes should resume after repair and append the new turn"
     );
 
-    let appended = cargo_bin_cmd!("cass")
+    let appended = command_env
+        .cass_assert_command()
         .args([
             "search",
             "fts_repair_appended_token",
@@ -586,15 +588,15 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
 #[serial]
 fn concurrent_search_processes_do_not_block_incremental_index_json() {
     let tracker = tracker_for("concurrent_search_processes_do_not_block_incremental_index_json");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().to_path_buf();
     let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_codex_home(&codex_home);
 
     tracker.phase(
         "seed_initial_fixture",
@@ -608,7 +610,8 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
                 1_732_118_400_000,
             );
 
-            cargo_bin_cmd!("cass")
+            command_env
+                .cass_assert_command()
                 .args(["index", "--full", "--json", "--data-dir"])
                 .arg(&data_dir)
                 .current_dir(&home)
@@ -624,7 +627,8 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
         "verify_baseline_search_fixture",
         "Confirm the baseline lexical query is searchable before starting concurrent readers",
         || {
-            let baseline_output = cargo_bin_cmd!("cass")
+            let mut baseline_command = command_env.cass_assert_command();
+            baseline_command
                 .args([
                     "search",
                     "baselinelockanchor",
@@ -641,7 +645,8 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
                 .current_dir(&home)
                 .env("CODEX_HOME", &codex_home)
                 .env("HOME", &home)
-                .timeout(Duration::from_secs(20))
+                .timeout(Duration::from_secs(20));
+            let baseline_output = baseline_command
                 .output()
                 .expect("baseline lexical search should run");
             assert!(
@@ -680,6 +685,7 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
     let stop_search_worker = Arc::clone(&stop_search);
     let index_running_worker = Arc::clone(&index_running);
     let search_attempts_during_index_worker = Arc::clone(&search_attempts_during_index);
+    let search_command_env = command_env.clone();
 
     let search_handle = std::thread::spawn(move || {
         let mut stats = SearchLoopStats::default();
@@ -695,7 +701,8 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
             }
 
             let search_start = Instant::now();
-            let output = cargo_bin_cmd!("cass")
+            let mut search_command = search_command_env.cass_assert_command();
+            search_command
                 .args([
                     "search",
                     "baselinelockanchor",
@@ -712,7 +719,8 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
                 .current_dir(&search_home)
                 .env("CODEX_HOME", &search_codex_home)
                 .env("HOME", &search_home)
-                .timeout(Duration::from_secs(20))
+                .timeout(Duration::from_secs(20));
+            let output = search_command
                 .output()
                 .expect("spawn concurrent cass search");
             let elapsed_ms = search_start.elapsed().as_millis() as u64;
@@ -785,7 +793,8 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
         Some("Run cass index --json while concurrent cass search processes read the same DB"),
     );
     index_running.store(true, Ordering::Relaxed);
-    let index_output = cargo_bin_cmd!("cass")
+    let index_output = command_env
+        .cass_assert_command()
         .args(["index", "--json", "--data-dir"])
         .arg(&data_dir)
         .current_dir(&home)
@@ -840,7 +849,8 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
         "incremental index should ingest the staged batch: expected at least {expected_min_messages} messages, got {after_messages}"
     );
 
-    let verify_search = cargo_bin_cmd!("cass")
+    let mut verify_command = command_env.cass_assert_command();
+    verify_command
         .args([
             "search",
             "incrementalloadanchor",
@@ -857,7 +867,8 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
         .current_dir(&home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", &home)
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(20));
+    let verify_search = verify_command
         .output()
         .expect("search for newly indexed batch");
     assert!(
@@ -905,15 +916,15 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
     let tracker = tracker_for(
         "force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publish",
     );
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().to_path_buf();
     let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_codex_home(&codex_home);
 
     const QUERY: &str = "atomicswapsearchanchor";
 
@@ -929,7 +940,8 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
                 1_732_300_000_000,
             );
 
-            cargo_bin_cmd!("cass")
+            command_env
+                .cass_assert_command()
                 .args(["index", "--full", "--json", "--data-dir"])
                 .arg(&data_dir)
                 .current_dir(&home)
@@ -951,7 +963,8 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
         "baseline index should contain at least one doc"
     );
 
-    let baseline_search = cargo_bin_cmd!("cass")
+    let mut baseline_command = command_env.cass_assert_command();
+    baseline_command
         .args([
             "search",
             QUERY,
@@ -968,7 +981,8 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
         .current_dir(&home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", &home)
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(20));
+    let baseline_search = baseline_command
         .output()
         .expect("run baseline lexical search");
     assert!(
@@ -1018,6 +1032,7 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
     let search_home = home.clone();
     let search_codex_home = codex_home.clone();
     let search_data_dir = data_dir.clone();
+    let search_command_env = command_env.clone();
     let search_handle = std::thread::spawn(move || {
         let _ = search_ready_tx.send("search");
         let mut stats = SearchLoopStats::default();
@@ -1025,7 +1040,8 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
             let search_started = Instant::now();
             search_in_flight_thread.store(true, Ordering::Relaxed);
             let started_during_rebuild = search_rebuild_running.load(Ordering::Relaxed);
-            let output = cargo_bin_cmd!("cass")
+            let mut search_command = search_command_env.cass_assert_command();
+            search_command
                 .args([
                     "search",
                     QUERY,
@@ -1042,9 +1058,8 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
                 .current_dir(&search_home)
                 .env("CODEX_HOME", &search_codex_home)
                 .env("HOME", &search_home)
-                .timeout(Duration::from_secs(20))
-                .output()
-                .expect("run concurrent cass search");
+                .timeout(Duration::from_secs(20));
+            let output = search_command.output().expect("run concurrent cass search");
             search_in_flight_thread.store(false, Ordering::Relaxed);
             let search_finished = Instant::now();
             if started_during_rebuild || search_rebuild_running.load(Ordering::Relaxed) {
@@ -1097,7 +1112,8 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
     let publish_pause_sentinel = home.join("atomic-publish-overlap-sentinel.json");
     let mut attempt = 0usize;
     let rebuild_output = loop {
-        let output = cargo_bin_cmd!("cass")
+        let output = command_env
+            .cass_assert_command()
             .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
             .arg(&data_dir)
             .current_dir(&home)
@@ -1189,7 +1205,8 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
         "force rebuild on unchanged content should preserve the live doc count"
     );
 
-    let after_search = cargo_bin_cmd!("cass")
+    let mut after_command = command_env.cass_assert_command();
+    after_command
         .args([
             "search",
             QUERY,
@@ -1206,7 +1223,8 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
         .current_dir(&home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", &home)
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(20));
+    let after_search = after_command
         .output()
         .expect("run post-rebuild lexical search");
     assert!(
@@ -1248,15 +1266,15 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
     let tracker = tracker_for(
         "force_rebuild_preserves_search_results_and_reader_surface_during_federated_atomic_publish",
     );
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().to_path_buf();
     let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_codex_home(&codex_home);
 
     const QUERY: &str = "federatedatomicswapsearchanchor";
     for (filename, content, ts) in [
@@ -1283,7 +1301,7 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
         "seed_and_index_federated_fixture",
         "Create three sessions and force a federated lexical publish bundle",
         || {
-            let mut initial_index = cargo_bin_cmd!("cass");
+            let mut initial_index = command_env.cass_assert_command();
             force_federated_publish_env(&mut initial_index);
             initial_index
                 .args(["index", "--full", "--json", "--data-dir"])
@@ -1315,7 +1333,8 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
         "forced shard planner settings should produce a federated live index"
     );
 
-    let baseline_search = cargo_bin_cmd!("cass")
+    let mut baseline_command = command_env.cass_assert_command();
+    baseline_command
         .args([
             "search",
             QUERY,
@@ -1332,7 +1351,8 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
         .current_dir(&home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", &home)
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(20));
+    let baseline_search = baseline_command
         .output()
         .expect("run baseline federated lexical search");
     assert!(
@@ -1382,6 +1402,7 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
     let search_home = home.clone();
     let search_codex_home = codex_home.clone();
     let search_data_dir = data_dir.clone();
+    let search_command_env = command_env.clone();
     let search_handle = std::thread::spawn(move || {
         let _ = search_ready_tx.send("search");
         let mut stats = SearchLoopStats::default();
@@ -1389,7 +1410,8 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
             let search_started = Instant::now();
             search_in_flight_thread.store(true, Ordering::Relaxed);
             let started_during_rebuild = search_rebuild_running.load(Ordering::Relaxed);
-            let output = cargo_bin_cmd!("cass")
+            let output = search_command_env
+                .cass_assert_command()
                 .args([
                     "search",
                     QUERY,
@@ -1458,7 +1480,7 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
     if search_in_flight.load(Ordering::Relaxed) {
         search_attempts_during_rebuild.fetch_add(1, Ordering::Relaxed);
     }
-    let mut rebuild = cargo_bin_cmd!("cass");
+    let mut rebuild = command_env.cass_assert_command();
     force_federated_publish_env(&mut rebuild);
     let publish_pause_sentinel = home.join("federated-atomic-publish-overlap-sentinel.json");
     let rebuild_output = rebuild
@@ -1552,7 +1574,8 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
         "post-rebuild live surface should remain a federated lexical bundle"
     );
 
-    let after_search = cargo_bin_cmd!("cass")
+    let after_search = command_env
+        .cass_assert_command()
         .args([
             "search",
             QUERY,
@@ -1614,15 +1637,15 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
 fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
     let tracker =
         tracker_for("repeated_force_rebuild_preserves_federated_reader_and_search_stability");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().to_path_buf();
     let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_codex_home(&codex_home);
 
     const QUERY: &str = "federatedrebuildstabilityanchor";
     const REBUILD_CYCLES: usize = 20;
@@ -1650,7 +1673,7 @@ fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
         "seed_and_index_repeated_federated_fixture",
         "Create three sessions and force an initial federated lexical publish bundle",
         || {
-            let mut initial_index = cargo_bin_cmd!("cass");
+            let mut initial_index = command_env.cass_assert_command();
             force_federated_publish_env(&mut initial_index);
             initial_index
                 .args(["index", "--full", "--json", "--data-dir"])
@@ -1683,7 +1706,8 @@ fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
         "forced shard planner settings should produce a federated live index"
     );
 
-    let baseline_search = cargo_bin_cmd!("cass")
+    let baseline_search = command_env
+        .cass_assert_command()
         .args([
             "search",
             QUERY,
@@ -1722,7 +1746,7 @@ fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
     let mut max_rebuild_duration_ms = 0_u64;
     for cycle in 0..REBUILD_CYCLES {
         let rebuild_started = Instant::now();
-        let mut rebuild = cargo_bin_cmd!("cass");
+        let mut rebuild = command_env.cass_assert_command();
         force_federated_publish_env(&mut rebuild);
         let rebuild_output = rebuild
             .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
@@ -1774,7 +1798,8 @@ fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
             cycle_federated_readers.len()
         );
 
-        let cycle_search = cargo_bin_cmd!("cass")
+        let cycle_search = command_env
+            .cass_assert_command()
             .args([
                 "search",
                 QUERY,
@@ -1834,15 +1859,15 @@ fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
 fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() {
     let tracker =
         tracker_for("force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().to_path_buf();
     let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_codex_home(&codex_home);
 
     const QUERY: &str = "killrelaunchpublishanchor";
 
@@ -1858,7 +1883,8 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
                 1_732_320_000_000,
             );
 
-            cargo_bin_cmd!("cass")
+            command_env
+                .cass_assert_command()
                 .args(["index", "--full", "--json", "--data-dir"])
                 .arg(&data_dir)
                 .current_dir(&home)
@@ -1882,7 +1908,8 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
         "baseline index should contain at least one doc"
     );
 
-    let baseline_search = cargo_bin_cmd!("cass")
+    let baseline_search = command_env
+        .cass_assert_command()
         .args([
             "search",
             QUERY,
@@ -1921,7 +1948,7 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
             "Spawn cass index --full --force-rebuild, pause after NEW is live and OLD is parked, then SIGKILL the process",
         ),
     );
-    let mut child = cass_std_cmd(&home, &codex_home);
+    let mut child = cass_std_cmd(&command_env, &home);
     child.env(
         "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
         &sentinel_path,
@@ -1968,7 +1995,8 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
         "paused publish window must still expose the stable live doc count"
     );
 
-    let paused_search = cargo_bin_cmd!("cass")
+    let paused_search = command_env
+        .cass_assert_command()
         .args([
             "search",
             QUERY,
@@ -2028,7 +2056,8 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
             "Relaunch cass index --full --force-rebuild and prove recovery finalizes the stranded sidecar cleanly",
         ),
     );
-    let relaunch_output = cargo_bin_cmd!("cass")
+    let relaunch_output = command_env
+        .cass_assert_command()
         .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
         .arg(&data_dir)
         .current_dir(&home)
@@ -2080,7 +2109,8 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
         "relaunch recovery must preserve the stable live doc count"
     );
 
-    let after_search = cargo_bin_cmd!("cass")
+    let after_search = command_env
+        .cass_assert_command()
         .args([
             "search",
             QUERY,
@@ -2131,17 +2161,17 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
 fn index_full_creates_artifacts() {
     verbose!("Starting index_full_creates_artifacts test");
     let tracker = tracker_for("index_full_creates_artifacts");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     verbose!("Created temp directory at {:?}", home);
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
     verbose!("Data directory: {:?}", data_dir);
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Create fixture data
     let phase_start = tracker.start("create_fixtures", Some("Create Codex session fixture"));
@@ -2164,7 +2194,8 @@ fn index_full_creates_artifacts() {
 
     // Run index --full
     let phase_start = tracker.start("index_full", Some("Execute full index command"));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
@@ -2229,15 +2260,15 @@ fn index_full_creates_artifacts() {
 #[serial]
 fn incremental_reindex_preserves_and_appends_messages() {
     let tracker = tracker_for("incremental_reindex_preserves_and_appends_messages");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Initial session
     let phase_start = tracker.start(
@@ -2261,7 +2292,8 @@ fn incremental_reindex_preserves_and_appends_messages() {
 
     // Full index
     let phase_start = tracker.start("index_full", Some("Run initial full index"));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
@@ -2280,7 +2312,8 @@ fn incremental_reindex_preserves_and_appends_messages() {
         "search_baseline",
         Some("Verify initial content is searchable"),
     );
-    let baseline = cargo_bin_cmd!("cass")
+    let baseline = command_env
+        .cass_assert_command()
         .args(["search", "initial_keep_token", "--robot", "--data-dir"])
         .arg(&data_dir)
         // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
@@ -2320,7 +2353,8 @@ fn incremental_reindex_preserves_and_appends_messages() {
 
     // Incremental re-index (no --full)
     let phase_start = tracker.start("index_incremental", Some("Run incremental reindex"));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--data-dir"])
         .arg(&data_dir)
         // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
@@ -2340,7 +2374,8 @@ fn incremental_reindex_preserves_and_appends_messages() {
         "search_preserved",
         Some("Verify original content preserved"),
     );
-    let preserved = cargo_bin_cmd!("cass")
+    let preserved = command_env
+        .cass_assert_command()
         .args(["search", "initial_keep_token", "--robot", "--data-dir"])
         .arg(&data_dir)
         // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
@@ -2367,7 +2402,8 @@ fn incremental_reindex_preserves_and_appends_messages() {
 
     // New content must be discoverable
     let phase_start = tracker.start("search_appended", Some("Verify appended content indexed"));
-    let appended = cargo_bin_cmd!("cass")
+    let appended = command_env
+        .cass_assert_command()
         .args(["search", "appended_token_beta", "--robot", "--data-dir"])
         .arg(&data_dir)
         // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
@@ -2400,19 +2436,19 @@ fn incremental_reindex_preserves_and_appends_messages() {
 #[serial]
 fn reindex_does_not_drop_messages_in_db_or_search() {
     let tracker = tracker_for("reindex_does_not_drop_messages_in_db_or_search");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
     let xdg_data = home.join(".local/share");
     let xdg_config = home.join(".config");
     fs::create_dir_all(&xdg_data).unwrap();
     fs::create_dir_all(&xdg_config).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Seed a rollout with two messages
     let ts = 1_732_118_400_000u64;
@@ -2425,7 +2461,8 @@ fn reindex_does_not_drop_messages_in_db_or_search() {
     );
     let session_file = codex_home.join("sessions/2024/11/20/rollout-drop-guard.jsonl");
 
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
@@ -2447,7 +2484,8 @@ fn reindex_does_not_drop_messages_in_db_or_search() {
     // Append another turn and reindex incrementally
     append_codex_session(&session_file, "persist_me_again", ts + 5_000);
     std::thread::sleep(std::time::Duration::from_millis(50));
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--data-dir"])
         .arg(&data_dir)
         // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
@@ -2468,7 +2506,8 @@ fn reindex_does_not_drop_messages_in_db_or_search() {
 
     // Verify both old and new content are searchable (Tantivy layer)
     for term in ["persist_me", "persist_me_again"] {
-        let out = cargo_bin_cmd!("cass")
+        let out = command_env
+            .cass_assert_command()
             .args(["search", term, "--robot", "--data-dir"])
             .arg(&data_dir)
             // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
@@ -2494,15 +2533,15 @@ fn reindex_does_not_drop_messages_in_db_or_search() {
 #[serial]
 fn search_returns_hits_with_match_type() {
     let tracker = tracker_for("search_returns_hits_with_match_type");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Create fixture with unique content
     make_codex_session(
@@ -2514,7 +2553,8 @@ fn search_returns_hits_with_match_type() {
     );
 
     // Index first
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -2523,7 +2563,8 @@ fn search_returns_hits_with_match_type() {
         .success();
 
     // Search and verify JSON output
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "unique_search_term_alpha",
@@ -2573,16 +2614,16 @@ fn search_returns_hits_with_match_type() {
 #[serial]
 fn search_aggregations_include_agents() {
     let tracker = tracker_for("search_aggregations_include_agents");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let claude_home = home.join(".claude");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Create fixtures from multiple connectors
     make_codex_session(
@@ -2601,7 +2642,8 @@ fn search_aggregations_include_agents() {
     );
 
     // Index
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -2610,7 +2652,8 @@ fn search_aggregations_include_agents() {
         .success();
 
     // Search with aggregations
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "aggregation_test_content",
@@ -2657,15 +2700,15 @@ fn search_aggregations_include_agents() {
 #[serial]
 fn watch_once_indexes_specified_path() {
     let tracker = tracker_for("watch_once_indexes_specified_path");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Create initial data
     make_codex_session(
@@ -2677,7 +2720,8 @@ fn watch_once_indexes_specified_path() {
     );
 
     // Initial index
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -2703,7 +2747,8 @@ fn watch_once_indexes_specified_path() {
     fs::write(&watch_file, sample).unwrap();
 
     // Run watch-once with specific path
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--watch-once"])
         .arg(&watch_file)
         .arg("--data-dir")
@@ -2714,7 +2759,8 @@ fn watch_once_indexes_specified_path() {
         .success();
 
     // Verify new content is searchable
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["search", "watch_once_new_content", "--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -2735,15 +2781,15 @@ fn watch_once_indexes_specified_path() {
 #[serial]
 fn search_with_filters() {
     let tracker = tracker_for("search_with_filters");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Create multiple sessions with distinct content
     make_codex_session(
@@ -2762,7 +2808,8 @@ fn search_with_filters() {
     );
 
     // Index
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -2771,7 +2818,8 @@ fn search_with_filters() {
         .success();
 
     // Search with agent filter
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "filter_test_content",
@@ -2804,15 +2852,15 @@ fn search_with_filters() {
 #[serial]
 fn search_returns_pagination_info() {
     let tracker = tracker_for("search_returns_pagination_info");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Create multiple sessions
     for i in 1..=5 {
@@ -2826,7 +2874,8 @@ fn search_returns_pagination_info() {
     }
 
     // Index
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -2835,7 +2884,8 @@ fn search_returns_pagination_info() {
         .success();
 
     // Search with limit
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "pagination_test_term",
@@ -2880,15 +2930,15 @@ fn search_returns_pagination_info() {
 #[serial]
 fn force_rebuild_recreates_index() {
     let tracker = tracker_for("force_rebuild_recreates_index");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Create initial data
     make_codex_session(
@@ -2900,7 +2950,8 @@ fn force_rebuild_recreates_index() {
     );
 
     // Initial index
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -2946,7 +2997,8 @@ fn force_rebuild_recreates_index() {
     );
 
     // Force rebuild
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--force-rebuild", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -2969,7 +3021,8 @@ fn force_rebuild_recreates_index() {
     );
 
     // Verify content is still searchable
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["search", "rebuild_test_initial", "--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -3004,15 +3057,15 @@ fn force_rebuild_recreates_index() {
 #[serial]
 fn index_json_output_mode() {
     let tracker = tracker_for("index_json_output_mode");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Create fixture
     make_codex_session(
@@ -3024,7 +3077,8 @@ fn index_json_output_mode() {
     );
 
     // Index with --json
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["index", "--full", "--json", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -3057,8 +3111,9 @@ fn index_json_output_mode() {
 #[serial]
 fn index_help_includes_options() {
     let tracker = tracker_for("index_help_includes_options");
-    let _trace_guard = tracker.trace_env_guard();
-    let output = cargo_bin_cmd!("cass")
+    let command_env = tracker.command_environment();
+    let output = command_env
+        .cass_assert_command()
         .args(["index", "--help"])
         .output()
         .expect("help command");
@@ -3091,8 +3146,9 @@ fn index_help_includes_options() {
 #[serial]
 fn search_help_includes_options() {
     let tracker = tracker_for("search_help_includes_options");
-    let _trace_guard = tracker.trace_env_guard();
-    let output = cargo_bin_cmd!("cass")
+    let command_env = tracker.command_environment();
+    let output = command_env
+        .cass_assert_command()
         .args(["search", "--help"])
         .output()
         .expect("help command");
@@ -3114,15 +3170,15 @@ fn search_help_includes_options() {
 #[serial]
 fn search_wildcard_query() {
     let tracker = tracker_for("search_wildcard_query");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Create fixture with unique prefix
     make_codex_session(
@@ -3134,7 +3190,8 @@ fn search_wildcard_query() {
     );
 
     // Index
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -3143,7 +3200,8 @@ fn search_wildcard_query() {
         .success();
 
     // Search with wildcard prefix
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["search", "wildcardtest*", "--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -3180,18 +3238,17 @@ fn search_wildcard_query() {
 #[serial]
 fn trace_logging_to_file() {
     let tracker = tracker_for("trace_logging_to_file");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     let trace_dir = home.join("traces");
     fs::create_dir_all(&data_dir).unwrap();
     fs::create_dir_all(&trace_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
-    let _guard_trace = EnvGuard::set("CASS_TRACE_DIR", trace_dir.to_string_lossy());
 
     // Create fixture
     make_codex_session(
@@ -3203,7 +3260,8 @@ fn trace_logging_to_file() {
     );
 
     // Index with tracing enabled
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -3221,15 +3279,15 @@ fn trace_logging_to_file() {
 #[serial]
 fn empty_query_returns_recent() {
     let tracker = tracker_for("empty_query_returns_recent");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     // Create fixture
     make_codex_session(
@@ -3241,7 +3299,8 @@ fn empty_query_returns_recent() {
     );
 
     // Index
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -3250,7 +3309,8 @@ fn empty_query_returns_recent() {
         .success();
 
     // Search with empty query (should show recent)
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["search", "", "--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -3291,15 +3351,15 @@ fn empty_query_returns_recent() {
 #[serial]
 fn large_message_minimal_search_stays_on_the_tantivy_fast_path() {
     let tracker = tracker_for("large_message_minimal_search_stays_on_the_tantivy_fast_path");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     let large_content = format!(
         "tantivy_large_anchor {}",
@@ -3324,7 +3384,8 @@ fn large_message_minimal_search_stays_on_the_tantivy_fast_path() {
         "index_large_message_fixture",
         "Build the real index before searching the large message",
         || {
-            cargo_bin_cmd!("cass")
+            command_env
+                .cass_assert_command()
                 .args(["index", "--full", "--json", "--data-dir"])
                 .arg(&data_dir)
                 .current_dir(home)
@@ -3340,7 +3401,8 @@ fn large_message_minimal_search_stays_on_the_tantivy_fast_path() {
         "search_large_message_minimal",
         Some("Run a real lexical cass search against the multi-megabyte session"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "tantivy_large_anchor",
@@ -3398,15 +3460,15 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
     let tracker = tracker_for(
         "incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_new_files",
     );
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().to_path_buf();
     let codex_home = home.to_path_buf();
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_codex_home(&codex_home);
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
     tracker.phase(
         "seed_baseline_archive",
@@ -3422,7 +3484,8 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
                 4,
             );
 
-            cargo_bin_cmd!("cass")
+            command_env
+                .cass_assert_command()
                 .args(["index", "--full", "--json", "--data-dir"])
                 .arg(&data_dir)
                 .current_dir(&home)
@@ -3458,7 +3521,8 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
                 1_732_450_000_000,
             );
 
-            cargo_bin_cmd!("cass")
+            command_env
+                .cass_assert_command()
                 .args(["index", "--full", "--json", "--data-dir"])
                 .arg(&sparse_data_dir)
                 .current_dir(&sparse_home)
@@ -3506,7 +3570,8 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
         "repair_sparse_tantivy_then_incremental_scan",
         Some("Run plain cass index --json and require canonical repair plus new-session ingestion"),
     );
-    let repair_output = cargo_bin_cmd!("cass")
+    let repair_output = command_env
+        .cass_assert_command()
         .args(["index", "--json", "--data-dir"])
         .arg(&data_dir)
         .current_dir(&home)
@@ -3557,7 +3622,8 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
         "plain incremental index should still ingest the newly added session after repairing Tantivy"
     );
 
-    let repaired_old_search = cargo_bin_cmd!("cass")
+    let repaired_old_search = command_env
+        .cass_assert_command()
         .args([
             "search",
             "repairoldanchor",
@@ -3588,7 +3654,8 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
         "repair should restore baseline archive hits from the canonical DB"
     );
 
-    let repaired_new_search = cargo_bin_cmd!("cass")
+    let repaired_new_search = command_env
+        .cass_assert_command()
         .args([
             "search",
             "repairnewanchor",

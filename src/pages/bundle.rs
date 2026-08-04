@@ -1334,12 +1334,10 @@ mod tests {
         let chunk_count = files.len();
         EncryptionConfig {
             version: crate::pages::encrypt::SCHEMA_VERSION,
-            // Keep the shared fixture cryptographically well-shaped even in
-            // tests that only exercise manifest/path handling. Production
-            // validation requires a base64-encoded 16-byte export id and
-            // 12-byte base nonce before it inspects payload paths.
-            export_id: "AAAAAAAAAAAAAAAAAAAAAA==".to_string(),
-            base_nonce: "AAAAAAAAAAAAAAAA".to_string(),
+            // The shared payload-format validation decodes these as base64
+            // and requires exactly 16 / 12 bytes.
+            export_id: BASE64_STANDARD.encode([0u8; 16]),
+            base_nonce: BASE64_STANDARD.encode([0u8; 12]),
             compression: "deflate".to_string(),
             kdf_defaults: crate::pages::encrypt::Argon2Params::default(),
             payload: crate::pages::encrypt::PayloadMeta {

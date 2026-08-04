@@ -147,6 +147,7 @@ fn opencode_parses_json_fixture() {
         data_dir: fixture_root.clone(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = conn.scan(&ctx).expect("scan");
     assert_eq!(convs.len(), 1);
@@ -210,6 +211,7 @@ fn opencode_parses_drizzle_sqlite_schema() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector
         .scan(&ctx)
@@ -271,6 +273,7 @@ fn opencode_parses_created_storage() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -337,6 +340,7 @@ fn opencode_handles_multiple_sessions() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 2);
@@ -385,6 +389,7 @@ fn opencode_handles_tool_parts() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -434,6 +439,7 @@ fn opencode_handles_reasoning_parts() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -476,6 +482,7 @@ fn opencode_sets_correct_agent_slug() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -494,6 +501,7 @@ fn opencode_handles_empty_storage() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
@@ -509,6 +517,7 @@ fn opencode_handles_missing_storage() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
@@ -570,6 +579,7 @@ fn opencode_orders_messages_by_timestamp() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -636,6 +646,7 @@ fn opencode_assigns_sequential_indices() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -678,6 +689,7 @@ fn opencode_title_fallback_to_first_message() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -734,6 +746,7 @@ fn opencode_computes_started_ended_at() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -772,6 +785,7 @@ fn opencode_skips_sessions_without_messages() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
 
@@ -811,6 +825,7 @@ fn opencode_metadata_contains_session_id() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -858,6 +873,7 @@ fn opencode_external_id_is_session_id() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -891,6 +907,7 @@ fn opencode_handles_corrupted_session_json() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     // Should not panic, just skip the corrupted file
     let convs = connector.scan(&ctx).unwrap();
@@ -952,6 +969,7 @@ fn opencode_handles_partial_session_data() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -1024,6 +1042,7 @@ fn opencode_handles_unicode_content() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -1098,6 +1117,7 @@ fn opencode_handles_very_long_session() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
 
     let start = std::time::Instant::now();
@@ -1161,6 +1181,7 @@ fn opencode_handles_empty_message_parts() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -1214,6 +1235,7 @@ fn opencode_handles_null_text_parts() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
@@ -1280,6 +1302,7 @@ fn opencode_handles_deeply_nested_project_dirs() {
         data_dir: dir.path().to_path_buf(),
         scan_roots: Vec::new(),
         since_ts: None,
+        progress_tick: None,
     };
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);

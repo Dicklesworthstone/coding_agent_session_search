@@ -33,7 +33,7 @@ pub const ENV_PROGRESS_JSONL: &str = "CASS_SEMANTIC_PROGRESS_JSONL";
 /// breaking change to event names or fields.
 pub const PROGRESS_JSONL_SCHEMA: &str = "cass.semantic.progress.v1";
 
-/// The 16 named transition events. Strings deliberately mirror the
+/// The 20 named transition events. Strings deliberately mirror the
 /// `phase` + `sub_phase` columns in each emitted record so a `jq` user
 /// can filter on event name OR phase as they prefer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -41,6 +41,15 @@ pub const PROGRESS_JSONL_SCHEMA: &str = "cass.semantic.progress.v1";
 pub enum SemanticProgressEvent {
     /// Backfill is about to materialize the message-selection query.
     SelectionStart,
+    /// Backfill is about to resolve the stable canonical conversation total.
+    SelectionCountStart,
+    /// The stable canonical conversation total is available, either from the
+    /// current checkpoint/manifest or from a database aggregate.
+    SelectionCountDone,
+    /// Backfill is about to run the bounded cursor candidate query.
+    SelectionCandidatesStart,
+    /// The bounded cursor candidate query returned.
+    SelectionCandidatesDone,
     /// Selection finished; downstream knows how many candidate rows
     /// will be considered for this batch.
     SelectionDone,
@@ -85,6 +94,10 @@ impl SemanticProgressEvent {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SelectionStart => "selection_start",
+            Self::SelectionCountStart => "selection_count_start",
+            Self::SelectionCountDone => "selection_count_done",
+            Self::SelectionCandidatesStart => "selection_candidates_start",
+            Self::SelectionCandidatesDone => "selection_candidates_done",
             Self::SelectionDone => "selection_done",
             Self::PacketReplayStart => "packet_replay_start",
             Self::PacketReplayProgress => "packet_replay_progress",
@@ -108,7 +121,12 @@ impl SemanticProgressEvent {
     /// staging / checkpoint / publish without enumerating every event.
     pub fn phase(self) -> &'static str {
         match self {
-            Self::SelectionStart | Self::SelectionDone => "selection",
+            Self::SelectionStart
+            | Self::SelectionCountStart
+            | Self::SelectionCountDone
+            | Self::SelectionCandidatesStart
+            | Self::SelectionCandidatesDone
+            | Self::SelectionDone => "selection",
             Self::PacketReplayStart | Self::PacketReplayProgress | Self::PacketReplayDone => {
                 "packet_replay"
             }
@@ -126,12 +144,16 @@ impl SemanticProgressEvent {
     pub fn sub_phase(self) -> &'static str {
         match self {
             Self::SelectionStart
+            | Self::SelectionCountStart
+            | Self::SelectionCandidatesStart
             | Self::PacketReplayStart
             | Self::EmbedBatchStart
             | Self::StagingWriteStart
             | Self::CheckpointSaveStart
             | Self::PublishStart => "start",
             Self::SelectionDone
+            | Self::SelectionCountDone
+            | Self::SelectionCandidatesDone
             | Self::PacketReplayDone
             | Self::EmbedBatchDone
             | Self::StagingWriteDone
@@ -501,6 +523,10 @@ mod tests {
         use SemanticProgressEvent::*;
         let all = [
             SelectionStart,
+            SelectionCountStart,
+            SelectionCountDone,
+            SelectionCandidatesStart,
+            SelectionCandidatesDone,
             SelectionDone,
             PacketReplayStart,
             PacketReplayProgress,
@@ -517,7 +543,7 @@ mod tests {
             Cancelled,
             Complete,
         ];
-        assert_eq!(all.len(), 16);
+        assert_eq!(all.len(), 20);
         for event in all {
             assert!(!event.as_str().is_empty(), "{:?}", event);
             assert!(!event.phase().is_empty(), "{:?}", event);
@@ -537,6 +563,192 @@ mod tests {
         }
         let sink = SemanticProgressSink::open("quality", "minilm-384");
         assert!(!sink.is_active());
+        // SAFETY: tests serialized via ENV_LOCK.
+        unsafe {
+            std::env::remove_var(ENV_PROGRESS_JSONL);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // .5.2: agent-facing progress-sink acceptance — ordering, required
+    // fields, failure events, schema stability, best-effort write failure.
+    // -----------------------------------------------------------------
+
+    /// Emit one record for `event` to a fresh sink and return its parsed
+    /// JSON. Serializes env access via `ENV_LOCK`.
+    fn one_record(
+        event: SemanticProgressEvent,
+        fields: SemanticProgressFields,
+    ) -> serde_json::Value {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("progress.jsonl");
+        // SAFETY: tests serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(ENV_PROGRESS_JSONL, &path);
+        }
+        let sink = SemanticProgressSink::open("quality", "minilm-384");
+        sink.emit(event, fields);
+        drop(sink);
+        let lines = read_lines(&path);
+        // SAFETY: tests serialized via ENV_LOCK.
+        unsafe {
+            std::env::remove_var(ENV_PROGRESS_JSONL);
+        }
+        assert_eq!(lines.len(), 1, "expected exactly one record");
+        serde_json::from_str(&lines[0]).expect("record is valid JSON")
+    }
+
+    #[test]
+    fn full_backfill_lifecycle_emits_events_in_phase_order() {
+        use SemanticProgressEvent::*;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("progress.jsonl");
+        // SAFETY: tests serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(ENV_PROGRESS_JSONL, &path);
+        }
+        let sink = SemanticProgressSink::open("quality", "minilm-384");
+        // The canonical #257 backfill lifecycle.
+        let sequence = [
+            SelectionStart,
+            SelectionCountStart,
+            SelectionCountDone,
+            SelectionCandidatesStart,
+            SelectionCandidatesDone,
+            SelectionDone,
+            PacketReplayStart,
+            PacketReplayProgress,
+            PacketReplayDone,
+            EmbedBatchStart,
+            EmbedBatchDone,
+            StagingWriteStart,
+            StagingWriteDone,
+            CheckpointSaveStart,
+            CheckpointSaveDone,
+            PublishStart,
+            PublishDone,
+            Complete,
+        ];
+        for ev in sequence {
+            sink.emit_bare(ev);
+        }
+        drop(sink);
+
+        let lines = read_lines(&path);
+        // SAFETY: tests serialized via ENV_LOCK.
+        unsafe {
+            std::env::remove_var(ENV_PROGRESS_JSONL);
+        }
+        assert_eq!(lines.len(), sequence.len(), "one line per emitted event");
+        let emitted: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let expected: Vec<String> = sequence.iter().map(|e| e.as_str().to_string()).collect();
+        assert_eq!(emitted, expected, "events must persist in emit order");
+        assert_eq!(emitted.first().unwrap(), "selection_start");
+        assert_eq!(emitted.last().unwrap(), "complete");
+    }
+
+    #[test]
+    fn every_record_carries_the_required_stable_fields() {
+        let v = one_record(
+            SemanticProgressEvent::EmbedBatchDone,
+            SemanticProgressFields {
+                batch_index: Some(1),
+                rows_processed: Some(64),
+                ..Default::default()
+            },
+        );
+        for key in [
+            "schema",
+            "event",
+            "phase",
+            "sub_phase",
+            "ts_ms",
+            "elapsed_ms",
+            "tier",
+            "embedder_id",
+        ] {
+            assert!(
+                v.get(key).is_some(),
+                "record missing required field {key}: {v}"
+            );
+        }
+        assert_eq!(v["event"], "embed_batch_done");
+        assert_eq!(v["phase"], "embed");
+        assert_eq!(v["tier"], "quality");
+        assert_eq!(v["embedder_id"], "minilm-384");
+    }
+
+    #[test]
+    fn failure_events_serialize_with_their_detail() {
+        let err = one_record(
+            SemanticProgressEvent::Error,
+            SemanticProgressFields {
+                error: Some("embed batch OOM".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(err["event"], "error");
+        assert_eq!(err["phase"], "error");
+        assert_eq!(err["error"], "embed batch OOM");
+
+        let cancelled = one_record(
+            SemanticProgressEvent::Cancelled,
+            SemanticProgressFields {
+                note: Some("operator interrupt".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cancelled["event"], "cancelled");
+        assert_eq!(cancelled["note"], "operator interrupt");
+    }
+
+    #[test]
+    fn jsonl_schema_version_is_pinned_and_present_in_records() {
+        // Pin the schema string so any wire-format change is a deliberate,
+        // reviewed break (the .5.2 "schema remains stable" requirement).
+        assert_eq!(PROGRESS_JSONL_SCHEMA, "cass.semantic.progress.v1");
+        let v = one_record(
+            SemanticProgressEvent::SelectionStart,
+            SemanticProgressFields::default(),
+        );
+        assert_eq!(v["schema"], "cass.semantic.progress.v1");
+    }
+
+    #[test]
+    fn open_failure_degrades_to_disabled_without_panic() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        // Point the sink at a path whose PARENT is a regular file, so
+        // create_dir_all (and the open) fail: the sink must degrade to a
+        // disabled no-op, and emitting must not panic (best-effort).
+        let file_as_parent = dir.path().join("not-a-dir");
+        std::fs::write(&file_as_parent, b"x").unwrap();
+        let bad_path = file_as_parent.join("progress.jsonl");
+        // SAFETY: tests serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(ENV_PROGRESS_JSONL, &bad_path);
+        }
+        let sink = SemanticProgressSink::open("quality", "minilm-384");
+        assert!(!sink.is_active(), "open failure must degrade to disabled");
+        // Emitting against the degraded sink is a safe no-op.
+        sink.emit_bare(SemanticProgressEvent::SelectionStart);
+        sink.emit(
+            SemanticProgressEvent::Error,
+            SemanticProgressFields {
+                error: Some("ignored".to_string()),
+                ..Default::default()
+            },
+        );
         // SAFETY: tests serialized via ENV_LOCK.
         unsafe {
             std::env::remove_var(ENV_PROGRESS_JSONL);
