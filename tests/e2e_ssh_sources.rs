@@ -20,7 +20,6 @@
 //!
 //! # br: coding_agent_session_search-3cv7
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -28,7 +27,6 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 mod util;
-use util::EnvGuard;
 use util::e2e_log::PhaseTracker;
 
 // =============================================================================
@@ -334,7 +332,6 @@ fn ssh_sources_sync_rsync() {
     }
 
     let tracker = tracker_for("ssh_sources_sync_rsync");
-    let _trace_guard = tracker.trace_env_guard();
 
     // Start Docker SSH server
     let start = tracker.start("docker_start", Some("Start Docker SSH server"));
@@ -375,14 +372,12 @@ fn ssh_sources_sync_rsync() {
         server.key_path(),
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
-    let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp directories and config"), start);
 
     // Run sources sync
     let start = tracker.start("sources_sync", Some("Run sources sync with rsync"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "sync", "--verbose"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -440,7 +435,6 @@ fn ssh_sources_provenance_tracking() {
     }
 
     let tracker = tracker_for("ssh_sources_provenance_tracking");
-    let _trace_guard = tracker.trace_env_guard();
 
     // Start Docker SSH server
     let start = tracker.start("docker_start", Some("Start Docker SSH server"));
@@ -479,14 +473,12 @@ fn ssh_sources_provenance_tracking() {
         server.key_path(),
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
-    let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp directories and config"), start);
 
     // Sync the data
     let start = tracker.start("sources_sync", Some("Run sources sync"));
-    let sync_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let sync_output = command
         .args(["sources", "sync"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -503,7 +495,8 @@ fn ssh_sources_provenance_tracking() {
 
     // Index the synced data
     let start = tracker.start("index", Some("Run index to build search database"));
-    let index_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let index_output = command
         .args(["index", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -520,7 +513,8 @@ fn ssh_sources_provenance_tracking() {
 
     // Search and verify provenance
     let start = tracker.start("search_verify", Some("Search and verify provenance"));
-    let search_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let search_output = command
         .args(["search", "hello", "--json", "--robot-meta"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -559,7 +553,6 @@ fn ssh_sources_sync_sftp_fallback() {
     }
 
     let tracker = tracker_for("ssh_sources_sync_sftp_fallback");
-    let _trace_guard = tracker.trace_env_guard();
 
     // Start Docker SSH server
     let start = tracker.start("docker_start", Some("Start Docker SSH server"));
@@ -593,19 +586,10 @@ fn ssh_sources_sync_sftp_fallback() {
 
     create_ssh_config(&home_dir, "sftp-test", server.port(), server.key_path());
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
-    let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
-
     // Override PATH to hide rsync, forcing SFTP fallback
     let fixture_bin = tmp.path().join("fixture_bin");
     fs::create_dir_all(&fixture_bin).unwrap();
     let original_path = std::env::var("PATH").unwrap_or_default();
-    let _guard_path = EnvGuard::set(
-        "PATH",
-        format!("{}:{}", fixture_bin.display(), original_path),
-    );
-
     // Create a fixture rsync that always fails (forces SFTP fallback)
     let fixture_rsync = fixture_bin.join("rsync");
     fs::write(&fixture_rsync, "#!/bin/bash\nexit 1\n").unwrap();
@@ -621,7 +605,8 @@ fn ssh_sources_sync_sftp_fallback() {
         "sources_sync_sftp",
         Some("Run sources sync with SFTP fallback"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "sync", "--verbose"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -685,7 +670,6 @@ fn ssh_sources_sync_multiple_paths() {
     }
 
     let tracker = tracker_for("ssh_sources_sync_multiple_paths");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("docker_start", Some("Start Docker SSH server"));
     let server = match DockerSshServer::start() {
@@ -727,13 +711,11 @@ fn ssh_sources_sync_multiple_paths() {
         server.key_path(),
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
-    let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp directories and config"), start);
 
     let start = tracker.start("sources_sync", Some("Run sources sync for multiple paths"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "sync", "--verbose"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -793,7 +775,6 @@ fn ssh_sources_path_rewriting() {
     }
 
     let tracker = tracker_for("ssh_sources_path_rewriting");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("docker_start", Some("Start Docker SSH server"));
     let server = match DockerSshServer::start() {
@@ -845,15 +826,13 @@ to = "/home/localuser"
         server.key_path(),
     );
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
-    let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with path mappings"), start);
 
     // Sync and index
     let start = tracker.start("sync_and_index", Some("Sync and index with path mappings"));
 
-    let _ = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let _ = command
         .args(["sources", "sync"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -861,7 +840,8 @@ to = "/home/localuser"
         .timeout(Duration::from_secs(60))
         .output();
 
-    let _ = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let _ = command
         .args(["index"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -880,7 +860,8 @@ to = "/home/localuser"
         "verify_rewrite",
         Some("Verify path rewriting in search results"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["search", "hello", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -919,7 +900,6 @@ fn ssh_sources_doctor() {
     }
 
     let tracker = tracker_for("ssh_sources_doctor");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("docker_start", Some("Start Docker SSH server"));
     let server = match DockerSshServer::start() {
@@ -951,14 +931,12 @@ fn ssh_sources_doctor() {
 
     create_ssh_config(&home_dir, "doctor-test", server.port(), server.key_path());
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
-    let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp directories and config"), start);
 
     // Run sources doctor
     let start = tracker.start("sources_doctor", Some("Run sources doctor"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "doctor", "--verbose"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -1020,7 +998,6 @@ fn ssh_sources_setup_dry_run() {
     }
 
     let tracker = tracker_for("ssh_sources_setup_dry_run");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("docker_start", Some("Start Docker SSH server"));
     let server = match DockerSshServer::start() {
@@ -1043,9 +1020,6 @@ fn ssh_sources_setup_dry_run() {
 
     create_ssh_config(&home_dir, "docker-test", server.port(), server.key_path());
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
-    let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
     tracker.end(
         "setup",
         Some("Create temp directories and SSH config"),
@@ -1053,7 +1027,8 @@ fn ssh_sources_setup_dry_run() {
     );
 
     let start = tracker.start("sources_setup_dry_run", Some("Run sources setup --dry-run"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "setup",
@@ -1106,7 +1081,6 @@ fn ssh_sources_mappings_list() {
     }
 
     let tracker = tracker_for("ssh_sources_mappings_list");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("docker_start", Some("Start Docker SSH server"));
     let server = match DockerSshServer::start() {
@@ -1152,13 +1126,11 @@ to = "/home/testuser"
 
     create_ssh_config(&home_dir, "mapping-test", server.port(), server.key_path());
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
-    let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
     tracker.end("setup", Some("Create config with path mappings"), start);
 
     let start = tracker.start("mappings_list", Some("Run sources mappings list"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "mappings", "list"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -1199,7 +1171,6 @@ fn ssh_sources_full_e2e_flow() {
     }
 
     let tracker = tracker_for("ssh_sources_full_e2e_flow");
-    let _trace_guard = tracker.trace_env_guard();
 
     let start = tracker.start("docker_start", Some("Start Docker SSH server"));
     let server = match DockerSshServer::start() {
@@ -1222,14 +1193,12 @@ fn ssh_sources_full_e2e_flow() {
 
     create_ssh_config(&home_dir, "e2e-test", server.port(), server.key_path());
 
-    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
-    let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
     tracker.end("setup", Some("Create temp directories"), start);
 
     // Step 1: Add source
     let start = tracker.start("add_source", Some("Add SSH source"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args([
             "sources",
             "add",
@@ -1263,7 +1232,8 @@ fn ssh_sources_full_e2e_flow() {
 
     // Step 2: List sources
     let start = tracker.start("list_sources", Some("List sources"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "list", "--verbose"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -1281,7 +1251,8 @@ fn ssh_sources_full_e2e_flow() {
 
     // Step 3: Doctor
     let start = tracker.start("doctor", Some("Run sources doctor"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "doctor", "--verbose"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -1299,7 +1270,8 @@ fn ssh_sources_full_e2e_flow() {
 
     // Step 4: Sync
     let start = tracker.start("sync", Some("Run sources sync"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["sources", "sync", "--verbose"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -1317,7 +1289,8 @@ fn ssh_sources_full_e2e_flow() {
 
     // Step 5: Index
     let start = tracker.start("index", Some("Run index"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["index", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
@@ -1335,7 +1308,8 @@ fn ssh_sources_full_e2e_flow() {
 
     // Step 6: Search
     let start = tracker.start("search", Some("Search and verify"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .args(["search", "hello", "--json"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)

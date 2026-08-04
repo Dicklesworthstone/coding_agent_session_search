@@ -9,13 +9,13 @@
 //!
 //! Part of bead: coding_agent_session_search-2vvg
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use chrono::{SecondsFormat, Utc};
+use coding_agent_search::search::ann_index::hnsw_index_path;
+use frankensearch::index::VectorIndex;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod util;
-use util::EnvGuard;
 use util::e2e_log::PhaseTracker;
 
 // =============================================================================
@@ -118,6 +118,371 @@ fn has_hnsw_index(data_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn first_vector_index_path(data_dir: &Path) -> PathBuf {
+    let vector_dir = data_dir.join("vector_index");
+    let mut paths = fs::read_dir(&vector_dir)
+        .expect("read vector index directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "fsvi"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+        .into_iter()
+        .next()
+        .expect("semantic indexing must publish an FSVI")
+}
+
+fn selected_hnsw_index_path(data_dir: &Path) -> PathBuf {
+    let exact_path = first_vector_index_path(data_dir);
+    let exact = VectorIndex::open(&exact_path).expect("open selected exact FSVI");
+    hnsw_index_path(data_dir, exact.embedder_id())
+}
+
+fn write_same_doc_ids_different_vectors(source_path: &Path, replacement_path: &Path) {
+    let source = VectorIndex::open(source_path).expect("open selected exact FSVI");
+    let mut writer = VectorIndex::create_with_revision(
+        replacement_path,
+        source.embedder_id(),
+        source.embedder_revision(),
+        source.dimension(),
+        source.quantization(),
+    )
+    .expect("create replacement exact FSVI");
+
+    for index in 0..source.record_count() {
+        let doc_id = source.doc_id_at(index).expect("selected semantic doc ID");
+        let mut vector = source
+            .vector_at_f32(index)
+            .expect("selected semantic vector");
+        assert!(
+            vector.iter().any(|value| *value != 0.0),
+            "same-ID stale fixture requires a non-zero source vector"
+        );
+        for value in &mut vector {
+            *value = -*value;
+        }
+        writer
+            .write_record(doc_id, &vector)
+            .expect("write same-ID different-vector record");
+    }
+    writer.finish().expect("finish replacement exact FSVI");
+
+    let replacement = VectorIndex::open(replacement_path).expect("open replacement exact FSVI");
+    assert_eq!(replacement.record_count(), source.record_count());
+    for index in 0..source.record_count() {
+        assert_eq!(
+            replacement
+                .doc_id_at(index)
+                .expect("replacement semantic doc ID"),
+            source.doc_id_at(index).expect("source semantic doc ID"),
+            "replacement must preserve the exact ordered document identity"
+        );
+        assert_ne!(
+            replacement
+                .vector_at_f32(index)
+                .expect("replacement semantic vector"),
+            source.vector_at_f32(index).expect("source semantic vector"),
+            "replacement must change vector content behind the same document ID"
+        );
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ArtifactTreeEntrySnapshot {
+    relative_path: PathBuf,
+    file_kind: &'static str,
+    contents: Option<Vec<u8>>,
+    modified: std::time::SystemTime,
+    readonly: bool,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+fn artifact_tree_snapshot(root: &Path) -> Vec<ArtifactTreeEntrySnapshot> {
+    let mut snapshot = Vec::new();
+    for entry in walkdir::WalkDir::new(root).min_depth(1).follow_links(false) {
+        let entry = entry.expect("walk semantic artifact tree");
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(path).expect("stat semantic artifact");
+        let file_type = metadata.file_type();
+        let (file_kind, contents) = if file_type.is_file() {
+            (
+                "file",
+                Some(fs::read(path).expect("read semantic artifact")),
+            )
+        } else if file_type.is_dir() {
+            ("directory", None)
+        } else if file_type.is_symlink() {
+            (
+                "symlink",
+                Some(
+                    fs::read_link(path)
+                        .expect("read semantic artifact symlink")
+                        .to_string_lossy()
+                        .as_bytes()
+                        .to_vec(),
+                ),
+            )
+        } else {
+            ("other", None)
+        };
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode()
+        };
+        snapshot.push(ArtifactTreeEntrySnapshot {
+            relative_path: path
+                .strip_prefix(root)
+                .expect("artifact path under root")
+                .to_path_buf(),
+            file_kind,
+            contents,
+            modified: metadata.modified().expect("artifact mtime"),
+            readonly: metadata.permissions().readonly(),
+            #[cfg(unix)]
+            mode,
+        });
+    }
+    snapshot.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    snapshot
+}
+
+#[test]
+fn parallel_cass_children_keep_corpus_and_trace_artifacts_isolated() {
+    #[derive(Debug)]
+    struct LaneWitness {
+        trace_id: String,
+        trace_path: PathBuf,
+        home: PathBuf,
+        codex_home: PathBuf,
+        trace_events: usize,
+        command_summaries: usize,
+    }
+
+    fn run_lane(
+        lane_root: PathBuf,
+        test_name: &'static str,
+        own_token: &'static str,
+        other_token: &'static str,
+        timestamp: u64,
+    ) -> Result<LaneWitness, String> {
+        let tracker = tracker_for(test_name);
+        let home = lane_root.join("home");
+        let codex_home = lane_root.join("codex");
+        let data_dir = lane_root.join("cass_data");
+        fs::create_dir_all(&home).map_err(|error| format!("create HOME: {error}"))?;
+        fs::create_dir_all(&data_dir).map_err(|error| format!("create data dir: {error}"))?;
+        make_codex_session(
+            &codex_home,
+            "2024/11/25",
+            "rollout-isolation.jsonl",
+            own_token,
+            timestamp,
+        );
+        let command_env = tracker
+            .command_environment()
+            .with_home(&home)
+            .with_codex_home(&codex_home);
+
+        let index = command_env
+            .cass_assert_command()
+            .args([
+                "index",
+                "--full",
+                "--semantic",
+                "--embedder",
+                "hash",
+                "--json",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .current_dir(&home)
+            .output()
+            .map_err(|error| format!("run isolated index: {error}"))?;
+        if !index.status.success() {
+            return Err(format!(
+                "isolated index failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&index.stdout),
+                String::from_utf8_lossy(&index.stderr)
+            ));
+        }
+
+        let search = command_env
+            .cass_assert_command()
+            .args([
+                "search",
+                own_token,
+                "--robot",
+                "--mode",
+                "lexical",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .current_dir(&home)
+            .output()
+            .map_err(|error| format!("run isolated search: {error}"))?;
+        if !search.status.success() {
+            return Err(format!(
+                "isolated search failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&search.stdout),
+                String::from_utf8_lossy(&search.stderr)
+            ));
+        }
+        let payload: serde_json::Value = serde_json::from_slice(&search.stdout)
+            .map_err(|error| format!("parse isolated search JSON: {error}"))?;
+        let hits = payload["hits"]
+            .as_array()
+            .ok_or_else(|| format!("isolated search lacks hits array: {payload}"))?;
+        if !hits.iter().any(|hit| {
+            hit["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(own_token))
+        }) {
+            return Err(format!(
+                "isolated search did not read its own corpus token `{own_token}`: {payload}"
+            ));
+        }
+        if hits.iter().any(|hit| {
+            hit["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(other_token))
+        }) {
+            return Err(format!(
+                "isolated search leaked the peer corpus token `{other_token}`: {payload}"
+            ));
+        }
+
+        let trace_path = tracker.artifacts().trace_path.clone();
+        let trace = fs::read_to_string(&trace_path)
+            .map_err(|error| format!("read isolated trace {}: {error}", trace_path.display()))?;
+        let mut trace_events = 0usize;
+        let mut command_summaries = 0usize;
+        for (line_number, line) in trace.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+                format!(
+                    "parse isolated trace {}:{}: {error}",
+                    trace_path.display(),
+                    line_number + 1
+                )
+            })?;
+            if event["schema_version"] != "cass-trace-v1"
+                || event["trace_id"].as_str() != Some(tracker.trace_id())
+                || !event["test_id"]
+                    .as_str()
+                    .is_some_and(|test_id| test_id.contains(test_name))
+            {
+                return Err(format!(
+                    "cross-routed or malformed isolated trace event in {}:{}: {event}",
+                    trace_path.display(),
+                    line_number + 1
+                ));
+            }
+            if event
+                .pointer("/fields/event")
+                .and_then(serde_json::Value::as_str)
+                == Some("command_summary")
+            {
+                command_summaries += 1;
+            }
+            trace_events += 1;
+        }
+        if trace_events == 0 {
+            return Err(format!(
+                "isolated CASS children wrote no cass-trace-v1 events to {}",
+                trace_path.display()
+            ));
+        }
+        if command_summaries < 2 {
+            return Err(format!(
+                "isolated CASS lane recorded {command_summaries} command summaries in {}; \
+                 index and search must both finalize",
+                trace_path.display()
+            ));
+        }
+
+        let witness = LaneWitness {
+            trace_id: tracker.trace_id().to_owned(),
+            trace_path,
+            home,
+            codex_home,
+            trace_events,
+            command_summaries,
+        };
+        tracker.complete();
+        Ok(witness)
+    }
+
+    let tracker = tracker_for("parallel_cass_children_keep_corpus_and_trace_artifacts_isolated");
+    let tracked_keys = ["HOME", "CODEX_HOME", "CASS_TRACE_FILE", "CASS_TRACE_ID"];
+    let process_before = tracked_keys.map(std::env::var_os);
+    let tmp = tempfile::TempDir::new().expect("parallel environment root");
+    let left_root = tmp.path().join("left");
+    let right_root = tmp.path().join("right");
+    let left = std::thread::spawn(move || {
+        run_lane(
+            left_root,
+            "parallel_semantic_environment_left",
+            "left_corpus_isolation_anchor",
+            "right_corpus_isolation_anchor",
+            1_732_600_000_000,
+        )
+    });
+    let right = std::thread::spawn(move || {
+        run_lane(
+            right_root,
+            "parallel_semantic_environment_right",
+            "right_corpus_isolation_anchor",
+            "left_corpus_isolation_anchor",
+            1_732_600_100_000,
+        )
+    });
+    let left = left
+        .join()
+        .expect("left isolated CASS lane panicked")
+        .expect("left isolated CASS lane failed");
+    let right = right
+        .join()
+        .expect("right isolated CASS lane panicked")
+        .expect("right isolated CASS lane failed");
+
+    assert_ne!(left.trace_id, right.trace_id, "trace IDs must be unique");
+    assert_ne!(
+        left.trace_path, right.trace_path,
+        "trace paths must be unique"
+    );
+    assert_ne!(left.home, right.home, "HOME values must be unique");
+    assert_ne!(
+        left.codex_home, right.codex_home,
+        "CODEX_HOME values must be unique"
+    );
+    assert!(
+        left.command_summaries >= 2 && right.command_summaries >= 2,
+        "each lane must finalize both index and search: left={}, right={}",
+        left.command_summaries,
+        right.command_summaries
+    );
+    assert_eq!(
+        tracked_keys.map(std::env::var_os),
+        process_before,
+        "parallel CASS child environments must not mutate the test process"
+    );
+    tracker.metrics(
+        "parallel_child_environment_isolation",
+        &util::e2e_log::E2ePerformanceMetrics::new()
+            .with_custom("left_trace_events", left.trace_events as u64)
+            .with_custom("right_trace_events", right.trace_events as u64)
+            .with_custom("left_command_summaries", left.command_summaries as u64)
+            .with_custom("right_command_summaries", right.command_summaries as u64)
+            .with_custom("isolated_corpora", 2),
+    );
+    tracker.complete();
+}
+
 // =============================================================================
 // Semantic Index Build Tests
 // =============================================================================
@@ -126,16 +491,16 @@ fn has_hnsw_index(data_dir: &Path) -> bool {
 #[test]
 fn semantic_index_builds_vector_file() {
     let tracker = tracker_for("semantic_index_builds_vector_file");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     let ps = tracker.start(
         "create_fixtures",
@@ -162,7 +527,8 @@ fn semantic_index_builds_vector_file() {
     );
 
     let ps = tracker.start("run_semantic_index", Some("Run index --full --semantic"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "index",
             "--full",
@@ -172,8 +538,6 @@ fn semantic_index_builds_vector_file() {
             "--data-dir",
         ])
         .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .output()
         .expect("index command");
     tracker.end(
@@ -241,16 +605,16 @@ fn semantic_index_builds_vector_file() {
 #[test]
 fn semantic_index_builds_hnsw() {
     let tracker = tracker_for("semantic_index_builds_hnsw");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     let ps = tracker.start("create_fixtures", Some("Create sessions for HNSW index"));
     // Create enough sessions for meaningful HNSW testing
@@ -270,7 +634,8 @@ fn semantic_index_builds_hnsw() {
     );
 
     let ps = tracker.start("run_hnsw_index", Some("Run index --semantic --build-hnsw"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "index",
             "--full",
@@ -281,8 +646,6 @@ fn semantic_index_builds_hnsw() {
             "--data-dir",
         ])
         .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .output()
         .expect("index command");
     tracker.end(
@@ -317,16 +680,16 @@ fn semantic_index_builds_hnsw() {
 #[test]
 fn search_semantic_mode_returns_results() {
     let tracker = tracker_for("search_semantic_mode_returns_results");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Setup: Create and index content
     let ps = tracker.start("setup", Some("Create and index semantic content"));
@@ -345,7 +708,8 @@ fn search_semantic_mode_returns_results() {
         1732204800000,
     );
 
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args([
             "index",
             "--full",
@@ -355,20 +719,25 @@ fn search_semantic_mode_returns_results() {
             "--data-dir",
         ])
         .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .assert()
         .success();
     tracker.end("setup", Some("Create and index semantic content"), ps);
 
     // Test semantic search
     let ps = tracker.start("search_semantic", Some("Search with --mode semantic"));
-    let output = cargo_bin_cmd!("cass")
-        .args(["search", "--robot", "--mode", "semantic", "--data-dir"])
+    let output = command_env
+        .cass_assert_command()
+        .args([
+            "search",
+            "--robot",
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--data-dir",
+        ])
         .arg(&data_dir)
         .arg("deep learning AI")
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .output()
         .expect("search command");
     tracker.end("search_semantic", Some("Search with --mode semantic"), ps);
@@ -406,6 +775,412 @@ fn search_semantic_mode_returns_results() {
     tracker.complete();
 }
 
+/// Test: a fresh search process opens the exact CASS writer artifact and never
+/// falls back to FrankenSearch's historical fixed basenames.
+///
+/// This is the restart boundary that the old contract missed: indexing writes
+/// `vector_index/index-<embedder>.fsvi`, while an independently started search
+/// process used to probe `vector.fast.idx`, `vector.idx`, and
+/// `vector.quality.idx`. Corrupt decoys at all three fixed names make the
+/// selected path observable without mocks.
+#[test]
+fn exact_artifact_contract_restart_uses_writer_path_and_ignores_decoys() {
+    let tracker =
+        tracker_for("semantic_restart_uses_exact_writer_artifact_and_ignores_fixed_name_decoys");
+    let tmp = tempfile::TempDir::new().expect("semantic restart fixture");
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).expect("create CASS data directory");
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
+
+    let target_phrase = "cobalt narwhal exact artifact rendezvous";
+    let ps = tracker.start(
+        "create_restart_fixture",
+        Some("Create one exact semantic target and disjoint distractors"),
+    );
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-exact-artifact-target.jsonl",
+        target_phrase,
+        1732118400000,
+    );
+    make_codex_session(
+        &codex_home,
+        "2024/11/21",
+        "rollout-exact-artifact-distractor-a.jsonl",
+        "database transaction isolation and durable write scheduling",
+        1732204800000,
+    );
+    make_codex_session(
+        &codex_home,
+        "2024/11/22",
+        "rollout-exact-artifact-distractor-b.jsonl",
+        "terminal rendering keyboard navigation and color palettes",
+        1732291200000,
+    );
+    tracker.end(
+        "create_restart_fixture",
+        Some("Create one exact semantic target and disjoint distractors"),
+        ps,
+    );
+
+    let ps = tracker.start(
+        "write_exact_semantic_artifact",
+        Some("Run the real CASS semantic writer with the hash embedder"),
+    );
+    let index_output = command_env
+        .cass_assert_command()
+        .args([
+            "index",
+            "--full",
+            "--semantic",
+            "--embedder",
+            "hash",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .output()
+        .expect("semantic index process");
+    tracker.end(
+        "write_exact_semantic_artifact",
+        Some("Run the real CASS semantic writer with the hash embedder"),
+        ps,
+    );
+    assert!(
+        index_output.status.success(),
+        "semantic indexing failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&index_output.stdout),
+        String::from_utf8_lossy(&index_output.stderr)
+    );
+
+    let vector_dir = data_dir.join("vector_index");
+    let exact_path = vector_dir.join("index-fnv1a-384.fsvi");
+    assert!(
+        exact_path.is_file(),
+        "the CASS writer must publish its selected artifact at {}",
+        exact_path.display()
+    );
+
+    let ps = tracker.start(
+        "plant_corrupt_fixed_name_decoys",
+        Some("Plant corrupt historical FrankenSearch basenames beside the exact artifact"),
+    );
+    let decoys = [
+        (
+            vector_dir.join("vector.fast.idx"),
+            b"corrupt-fast-fixed-name-decoy".as_slice(),
+        ),
+        (
+            vector_dir.join("vector.idx"),
+            b"corrupt-fallback-fixed-name-decoy".as_slice(),
+        ),
+        (
+            vector_dir.join("vector.quality.idx"),
+            b"corrupt-quality-fixed-name-decoy".as_slice(),
+        ),
+    ];
+    for (path, bytes) in &decoys {
+        fs::write(path, bytes).expect("write corrupt fixed-name decoy");
+    }
+    tracker.end(
+        "plant_corrupt_fixed_name_decoys",
+        Some("Plant corrupt historical FrankenSearch basenames beside the exact artifact"),
+        ps,
+    );
+
+    let exact_bytes_before = fs::read(&exact_path).expect("read exact artifact before search");
+    let exact_modified_before = fs::metadata(&exact_path)
+        .and_then(|metadata| metadata.modified())
+        .expect("read exact artifact mtime before search");
+    let decoy_snapshots = decoys
+        .iter()
+        .map(|(path, _)| {
+            let bytes = fs::read(path).expect("read decoy before search");
+            let modified = fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .expect("read decoy mtime before search");
+            (path.clone(), bytes, modified)
+        })
+        .collect::<Vec<_>>();
+    let mut entries_before = fs::read_dir(&vector_dir)
+        .expect("read vector directory before search")
+        .map(|entry| entry.expect("vector directory entry").file_name())
+        .collect::<Vec<_>>();
+    entries_before.sort();
+
+    let ps = tracker.start(
+        "restart_and_search_exact_artifact",
+        Some("Start a fresh CASS process and run fast-only semantic search"),
+    );
+    let search_output = command_env
+        .cass_assert_command()
+        .args([
+            "search",
+            "--robot",
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--fast-only",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .arg(target_phrase)
+        .output()
+        .expect("fresh semantic search process");
+    tracker.end(
+        "restart_and_search_exact_artifact",
+        Some("Start a fresh CASS process and run fast-only semantic search"),
+        ps,
+    );
+    assert!(
+        search_output.status.success(),
+        "fresh-process semantic search failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&search_output.stdout),
+        String::from_utf8_lossy(&search_output.stderr)
+    );
+
+    let response: serde_json::Value =
+        serde_json::from_slice(&search_output.stdout).expect("semantic search robot JSON");
+    let hits = response
+        .get("hits")
+        .and_then(serde_json::Value::as_array)
+        .expect("semantic search hits array");
+    let first_content = hits
+        .first()
+        .and_then(|hit| hit.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .expect("semantic search must return a first hit with content");
+    assert!(
+        first_content.contains(target_phrase),
+        "the exact writer artifact must rank the unique target first; got {first_content:?}"
+    );
+
+    let ps = tracker.start(
+        "verify_read_only_artifact_contract",
+        Some("Verify exact artifact, decoys, and directory inventory are unchanged"),
+    );
+    assert_eq!(
+        fs::read(&exact_path).expect("read exact artifact after search"),
+        exact_bytes_before,
+        "serving must not rewrite the selected FSVI"
+    );
+    assert_eq!(
+        fs::metadata(&exact_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("read exact artifact mtime after search"),
+        exact_modified_before,
+        "serving must preserve the selected FSVI mtime"
+    );
+    for (path, bytes_before, modified_before) in decoy_snapshots {
+        assert_eq!(
+            fs::read(&path).expect("read decoy after search"),
+            bytes_before,
+            "search must not read-repair or replace fixed-name decoy {}",
+            path.display()
+        );
+        assert_eq!(
+            fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .expect("read decoy mtime after search"),
+            modified_before,
+            "search must not touch fixed-name decoy {}",
+            path.display()
+        );
+    }
+    let mut entries_after = fs::read_dir(&vector_dir)
+        .expect("read vector directory after search")
+        .map(|entry| entry.expect("vector directory entry").file_name())
+        .collect::<Vec<_>>();
+    entries_after.sort();
+    assert_eq!(
+        entries_after, entries_before,
+        "search must not synthesize, repair, or rename vector artifacts"
+    );
+    tracker.end(
+        "verify_read_only_artifact_contract",
+        Some("Verify exact artifact, decoys, and directory inventory are unchanged"),
+        ps,
+    );
+
+    tracker.complete();
+}
+
+/// Readiness and serving must reject the same final-component FSVI symlink.
+///
+/// A readiness probe that follows the alias while serving rejects it would
+/// advertise a semantic capability that a fresh query process cannot use.
+#[cfg(unix)]
+#[test]
+fn fsvi_symlink_is_rejected_by_readiness_and_serving_without_mutation() {
+    use std::os::unix::fs::symlink;
+
+    let tracker = tracker_for("fsvi_symlink_is_rejected_by_readiness_and_serving_without_mutation");
+    let tmp = tempfile::TempDir::new().expect("FSVI readiness fixture");
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).expect("create CASS data directory");
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
+
+    let ps = tracker.start(
+        "build_exact_source",
+        Some("Build the authoritative hash FSVI with the real CASS writer"),
+    );
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-fsvi-symlink.jsonl",
+        "final component aliases must not become semantic capabilities",
+        1732118400000,
+    );
+    command_env
+        .cass_assert_command()
+        .args([
+            "index",
+            "--full",
+            "--semantic",
+            "--embedder",
+            "hash",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    tracker.end(
+        "build_exact_source",
+        Some("Build the authoritative hash FSVI with the real CASS writer"),
+        ps,
+    );
+
+    let ps = tracker.start(
+        "install_fsvi_symlink",
+        Some("Move the exact bytes to an unselected target and alias the selected name"),
+    );
+    let selected_path = first_vector_index_path(&data_dir);
+    let target_path = selected_path.with_file_name("unselected-exact-target.fsvi");
+    fs::rename(&selected_path, &target_path).expect("move exact FSVI to alias target");
+    symlink(&target_path, &selected_path).expect("create selected final-component FSVI symlink");
+    let vector_dir = data_dir.join("vector_index");
+    let artifacts_before = artifact_tree_snapshot(&vector_dir);
+    tracker.end(
+        "install_fsvi_symlink",
+        Some("Move the exact bytes to an unselected target and alias the selected name"),
+        ps,
+    );
+
+    let ps = tracker.start(
+        "probe_readiness",
+        Some("Run status in an isolated fresh process with explicit hash policy"),
+    );
+    let status_output = command_env
+        .cass_assert_command()
+        .args(["status", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_SEMANTIC_EMBEDDER", "hash")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("fresh-process semantic readiness probe");
+    tracker.end(
+        "probe_readiness",
+        Some("Run status in an isolated fresh process with explicit hash policy"),
+        ps,
+    );
+    assert!(
+        status_output.status.success(),
+        "status must report a rejected semantic artifact without crashing\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&status_output.stdout),
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status_output.stdout).expect("status readiness JSON");
+    assert_eq!(
+        status_json
+            .pointer("/semantic/availability")
+            .and_then(serde_json::Value::as_str),
+        Some("load_failed"),
+        "readiness must not follow the selected FSVI symlink: {status_json}"
+    );
+    assert_eq!(
+        status_json
+            .pointer("/semantic/can_search")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    assert!(
+        status_json
+            .pointer("/semantic/summary")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|summary| summary.contains("symlink")),
+        "readiness must expose the exact-artifact rejection: {status_json}"
+    );
+
+    let ps = tracker.start(
+        "attempt_serving",
+        Some("Run explicit hash semantic search in a second fresh process"),
+    );
+    let search_output = command_env
+        .cass_assert_command()
+        .args([
+            "search",
+            "--robot",
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .arg("final component aliases")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("fresh-process semantic serving attempt");
+    tracker.end(
+        "attempt_serving",
+        Some("Run explicit hash semantic search in a second fresh process"),
+        ps,
+    );
+    assert!(
+        !search_output.status.success(),
+        "serving must reject the same FSVI symlink\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&search_output.stdout),
+        String::from_utf8_lossy(&search_output.stderr)
+    );
+    let serving_diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&search_output.stdout),
+        String::from_utf8_lossy(&search_output.stderr)
+    );
+    assert!(
+        serving_diagnostic.contains("symlink"),
+        "serving and readiness must expose the same rejection class: {serving_diagnostic}"
+    );
+
+    let ps = tracker.start(
+        "verify_immutable_rejection",
+        Some("Verify readiness and serving did not rewrite either alias role"),
+    );
+    assert_eq!(
+        artifact_tree_snapshot(&vector_dir),
+        artifacts_before,
+        "readiness and serving rejection must preserve bytes, mtimes, permissions, links, and inventory"
+    );
+    tracker.end(
+        "verify_immutable_rejection",
+        Some("Verify readiness and serving did not rewrite either alias role"),
+        ps,
+    );
+    tracker.complete();
+}
+
 // =============================================================================
 // Hybrid Search Mode Tests
 // =============================================================================
@@ -414,16 +1189,16 @@ fn search_semantic_mode_returns_results() {
 #[test]
 fn search_hybrid_mode_combines_results() {
     let tracker = tracker_for("search_hybrid_mode_combines_results");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Setup
     let ps = tracker.start("setup", Some("Create and index hybrid content"));
@@ -442,7 +1217,8 @@ fn search_hybrid_mode_combines_results() {
         1732204800000,
     );
 
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args([
             "index",
             "--full",
@@ -452,20 +1228,25 @@ fn search_hybrid_mode_combines_results() {
             "--data-dir",
         ])
         .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .assert()
         .success();
     tracker.end("setup", Some("Create and index hybrid content"), ps);
 
     // Test hybrid search
     let ps = tracker.start("search_hybrid", Some("Search with --mode hybrid"));
-    let output = cargo_bin_cmd!("cass")
-        .args(["search", "--robot", "--mode", "hybrid", "--data-dir"])
+    let output = command_env
+        .cass_assert_command()
+        .args([
+            "search",
+            "--robot",
+            "--mode",
+            "hybrid",
+            "--model",
+            "hash",
+            "--data-dir",
+        ])
         .arg(&data_dir)
         .arg("hybrid search lexical semantic")
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .output()
         .expect("search command");
     tracker.end("search_hybrid", Some("Search with --mode hybrid"), ps);
@@ -505,16 +1286,16 @@ fn search_hybrid_mode_combines_results() {
 #[test]
 fn search_approximate_uses_hnsw() {
     let tracker = tracker_for("search_approximate_uses_hnsw");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Setup: Create sessions and build HNSW index
     let ps = tracker.start("setup", Some("Create sessions and build HNSW"));
@@ -528,7 +1309,8 @@ fn search_approximate_uses_hnsw() {
         );
     }
 
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args([
             "index",
             "--full",
@@ -539,8 +1321,6 @@ fn search_approximate_uses_hnsw() {
             "--data-dir",
         ])
         .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .assert()
         .success();
     tracker.end("setup", Some("Create sessions and build HNSW"), ps);
@@ -550,22 +1330,26 @@ fn search_approximate_uses_hnsw() {
         has_hnsw_index(&data_dir),
         "HNSW index should exist before approximate search"
     );
+    let vector_dir = data_dir.join("vector_index");
+    let artifacts_before = artifact_tree_snapshot(&vector_dir);
 
     // Test approximate search
     let ps = tracker.start("search_approximate", Some("Search with --approximate"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "--robot",
+            "--robot-meta",
             "--mode",
             "semantic",
+            "--model",
+            "hash",
             "--approximate",
             "--data-dir",
         ])
         .arg(&data_dir)
         .arg("nearest neighbor")
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .output()
         .expect("search command");
     tracker.end("search_approximate", Some("Search with --approximate"), ps);
@@ -590,6 +1374,19 @@ fn search_approximate_uses_hnsw() {
         "hits must be an array for approximate search. Got: {}",
         json
     );
+    assert!(
+        json.pointer("/_meta/ann_stats").is_some(),
+        "native ANN execution must expose ANN stats: {json}"
+    );
+    assert!(
+        json.pointer("/_meta/ann_unavailable_reason").is_none(),
+        "native ANN execution must not report an exact-fallback reason: {json}"
+    );
+    assert_eq!(
+        artifact_tree_snapshot(&vector_dir),
+        artifacts_before,
+        "fresh-process native ANN search must preserve bytes, mtimes, permissions, and inventory"
+    );
     tracker.end(
         "verify_results",
         Some("Verify approximate search results"),
@@ -607,16 +1404,16 @@ fn search_approximate_uses_hnsw() {
 #[test]
 fn semantic_without_index_reports_error() {
     let tracker = tracker_for("semantic_without_index_reports_error");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Setup: Index WITHOUT semantic
     let ps = tracker.start("setup", Some("Index without --semantic"));
@@ -628,11 +1425,10 @@ fn semantic_without_index_reports_error() {
         1732118400000,
     );
 
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .assert()
         .success();
     tracker.end("setup", Some("Index without --semantic"), ps);
@@ -645,12 +1441,19 @@ fn semantic_without_index_reports_error() {
 
     // Test semantic search fails gracefully
     let ps = tracker.start("search_semantic", Some("Try semantic search without index"));
-    let output = cargo_bin_cmd!("cass")
-        .args(["search", "--robot", "--mode", "semantic", "--data-dir"])
+    let output = command_env
+        .cass_assert_command()
+        .args([
+            "search",
+            "--robot",
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--data-dir",
+        ])
         .arg(&data_dir)
         .arg("query")
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .output()
         .expect("search command");
     tracker.end(
@@ -685,20 +1488,20 @@ fn semantic_without_index_reports_error() {
     tracker.complete();
 }
 
-/// Test: Approximate search without HNSW index reports informative error.
+/// Test: Approximate search without HNSW stays useful via exact fallback.
 #[test]
-fn approximate_without_hnsw_reports_error() {
-    let tracker = tracker_for("approximate_without_hnsw_reports_error");
-    let _trace_guard = tracker.trace_env_guard();
+fn approximate_without_hnsw_falls_back_exact_with_typed_reason() {
+    let tracker = tracker_for("approximate_without_hnsw_falls_back_exact_with_typed_reason");
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Setup: Index with semantic but WITHOUT HNSW
     let ps = tracker.start("setup", Some("Index with semantic but no HNSW"));
@@ -710,7 +1513,8 @@ fn approximate_without_hnsw_reports_error() {
         1732118400000,
     );
 
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args([
             "index",
             "--full",
@@ -720,8 +1524,6 @@ fn approximate_without_hnsw_reports_error() {
             "--data-dir",
         ])
         .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .assert()
         .success();
     tracker.end("setup", Some("Index with semantic but no HNSW"), ps);
@@ -729,50 +1531,436 @@ fn approximate_without_hnsw_reports_error() {
     // Verify vector exists but HNSW does not
     assert!(has_vector_index(&data_dir), "Vector index should exist");
     assert!(!has_hnsw_index(&data_dir), "HNSW index should not exist");
+    let vector_dir = data_dir.join("vector_index");
+    let artifacts_before = artifact_tree_snapshot(&vector_dir);
 
-    // Test approximate search
-    let ps = tracker.start("search_approximate", Some("Try approximate without HNSW"));
-    let output = cargo_bin_cmd!("cass")
+    // Test approximate request in a fresh process.
+    let ps = tracker.start(
+        "search_approximate",
+        Some("Request approximate search without HNSW and require exact fallback"),
+    );
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "--robot",
+            "--robot-meta",
             "--mode",
             "semantic",
+            "--model",
+            "hash",
             "--approximate",
             "--data-dir",
         ])
         .arg(&data_dir)
-        .arg("query")
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
+        .arg("vector index without hnsw")
         .output()
         .expect("search command");
     tracker.end(
         "search_approximate",
-        Some("Try approximate without HNSW"),
+        Some("Request approximate search without HNSW and require exact fallback"),
         ps,
     );
 
-    // Should report error about missing HNSW
-    let ps = tracker.start("verify_error", Some("Verify HNSW error message"));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Should mention HNSW or build-hnsw in error
-    let combined = format!("{}{}", stdout, stderr);
-    assert!(
-        combined.contains("HNSW")
-            || combined.contains("hnsw")
-            || combined.contains("approximate")
-            || combined.contains("build-hnsw")
-            || !output.status.success(),
-        "Should mention HNSW requirement or fail: stdout={}, stderr={}",
-        stdout,
-        stderr
+    let verify_ps = tracker.start(
+        "verify_exact_fallback",
+        Some("Verify hits, bounded reason, and immutable artifacts"),
     );
-    tracker.end("verify_error", Some("Verify HNSW error message"), ps);
+    assert!(
+        output.status.success(),
+        "an absent ANN must not make semantic search fail\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("fallback output should be valid JSON");
+    assert!(
+        json.get("hits")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|hits| !hits.is_empty()),
+        "exact fallback must return the indexed semantic hit: {json}"
+    );
+    assert_eq!(
+        json.pointer("/_meta/ann_unavailable_reason")
+            .and_then(serde_json::Value::as_str),
+        Some("ann_sidecar_missing"),
+        "robot metadata must explain why exact fallback was selected"
+    );
+    assert!(
+        json.pointer("/_meta/ann_stats").is_none(),
+        "exact fallback must not claim ANN execution: {json}"
+    );
+
+    let human_search_ps = tracker.start(
+        "search_approximate_human",
+        Some("Verify the human fallback notice uses the same bounded reason"),
+    );
+    let human_output = command_env
+        .cass_assert_command()
+        .args([
+            "search",
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--approximate",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .arg("vector index without hnsw")
+        .output()
+        .expect("human fallback search command");
+    tracker.end(
+        "search_approximate_human",
+        Some("Verify the human fallback notice uses the same bounded reason"),
+        human_search_ps,
+    );
+    assert!(
+        human_output.status.success(),
+        "human exact fallback must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&human_output.stdout),
+        String::from_utf8_lossy(&human_output.stderr)
+    );
+    let human_stderr = String::from_utf8_lossy(&human_output.stderr);
+    assert!(
+        human_stderr.contains("ann_sidecar_missing")
+            && human_stderr.contains("exact semantic search"),
+        "human and robot fallback diagnostics must agree: {human_stderr}"
+    );
+    assert_eq!(
+        artifact_tree_snapshot(&vector_dir),
+        artifacts_before,
+        "robot and human missing-ANN fallbacks must preserve bytes, mtimes, permissions, and inventory"
+    );
+    tracker.end(
+        "verify_exact_fallback",
+        Some("Verify hits, bounded reason, and immutable artifacts"),
+        verify_ps,
+    );
 
     tracker.complete();
+}
+
+/// A fresh process must reject an ANN built from the same ordered document IDs
+/// but different vector contents, then answer from the selected exact FSVI.
+#[test]
+fn approximate_stale_same_doc_ids_falls_back_exact_without_mutation() {
+    let tracker = tracker_for("approximate_stale_same_doc_ids_falls_back_exact_without_mutation");
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
+
+    let ps = tracker.start(
+        "build_selected_generation",
+        Some("Build the selected exact FSVI and native ANN from corpus A"),
+    );
+    for i in 0..4 {
+        make_codex_session(
+            &codex_home,
+            &format!("2024/11/{:02}", 10 + i),
+            &format!("rollout-{i}.jsonl"),
+            &format!("authoritative corpus alpha document {i}"),
+            1731196800000 + (i as u64 * 86400000),
+        );
+    }
+    command_env
+        .cass_assert_command()
+        .args([
+            "index",
+            "--full",
+            "--semantic",
+            "--build-hnsw",
+            "--embedder",
+            "hash",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    tracker.end(
+        "build_selected_generation",
+        Some("Build the selected exact FSVI and native ANN from corpus A"),
+        ps,
+    );
+
+    let ps = tracker.start(
+        "install_stale_exact_source",
+        Some("Replace only vector payloads behind the exact same ordered document IDs"),
+    );
+    let selected_exact = first_vector_index_path(&data_dir);
+    let replacement_exact = home.join("same-doc-ids-different-vectors.fsvi");
+    write_same_doc_ids_different_vectors(&selected_exact, &replacement_exact);
+    fs::copy(&replacement_exact, &selected_exact).expect("install different-vector exact FSVI");
+    let vector_dir = data_dir.join("vector_index");
+    let artifacts_before = artifact_tree_snapshot(&vector_dir);
+    tracker.end(
+        "install_stale_exact_source",
+        Some("Replace only vector payloads behind the exact same ordered document IDs"),
+        ps,
+    );
+
+    let ps = tracker.start(
+        "fresh_process_stale_ann_search",
+        Some("Request approximate search and require exact fallback"),
+    );
+    let output = command_env
+        .cass_assert_command()
+        .args([
+            "search",
+            "--robot",
+            "--robot-meta",
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--approximate",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .arg("authoritative semantic query")
+        .output()
+        .expect("fresh-process stale ANN search");
+    tracker.end(
+        "fresh_process_stale_ann_search",
+        Some("Request approximate search and require exact fallback"),
+        ps,
+    );
+
+    let ps = tracker.start(
+        "verify_stale_fallback",
+        Some("Verify exact hits, bounded reason, and immutable artifacts"),
+    );
+    assert!(
+        output.status.success(),
+        "a stale ANN must fall back instead of failing\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stale fallback robot JSON");
+    assert!(
+        json.get("hits")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|hits| !hits.is_empty()),
+        "exact fallback must return semantic hits: {json}"
+    );
+    assert_eq!(
+        json.pointer("/_meta/ann_unavailable_reason")
+            .and_then(serde_json::Value::as_str),
+        Some("ann_sidecar_not_native"),
+        "same-doc/different-vector ANN must be rejected as non-native"
+    );
+    assert!(
+        json.pointer("/_meta/ann_stats").is_none(),
+        "stale ANN fallback must not claim ANN execution: {json}"
+    );
+    assert_eq!(
+        artifact_tree_snapshot(&vector_dir),
+        artifacts_before,
+        "stale ANN fallback must preserve bytes, mtimes, permissions, and inventory"
+    );
+    tracker.end(
+        "verify_stale_fallback",
+        Some("Verify exact hits, bounded reason, and immutable artifacts"),
+        ps,
+    );
+
+    tracker.complete();
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InvalidAnnInstallation {
+    CorruptMetadata,
+    Directory,
+    CrossRoleAlias,
+    #[cfg(unix)]
+    FinalComponentSymlink,
+    #[cfg(unix)]
+    BrokenFinalComponentSymlink,
+}
+
+fn exercise_invalid_ann_fresh_process_fallback(case: InvalidAnnInstallation) {
+    let tracker = tracker_for(&format!(
+        "approximate_invalid_ann_falls_back_exact_without_mutation::{case:?}"
+    ));
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
+
+    let ps = tracker.start(
+        "build_exact_source",
+        Some("Build the authoritative exact FSVI without an ANN"),
+    );
+    make_codex_session(
+        &codex_home,
+        "2024/11/10",
+        "rollout-invalid-ann.jsonl",
+        "authoritative exact fallback document",
+        1731196800000,
+    );
+    command_env
+        .cass_assert_command()
+        .args([
+            "index",
+            "--full",
+            "--semantic",
+            "--embedder",
+            "hash",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    tracker.end(
+        "build_exact_source",
+        Some("Build the authoritative exact FSVI without an ANN"),
+        ps,
+    );
+
+    let exact_path = first_vector_index_path(&data_dir);
+    let ann_path = selected_hnsw_index_path(&data_dir);
+    assert!(!ann_path.exists(), "fixture must start without an ANN");
+    let ps = tracker.start(
+        "install_invalid_ann",
+        Some("Install a selected but inadmissible optional ANN artifact"),
+    );
+    match case {
+        InvalidAnnInstallation::CorruptMetadata => {
+            fs::write(&ann_path, b"not HNSW metadata").expect("write corrupt ANN metadata");
+        }
+        InvalidAnnInstallation::Directory => {
+            fs::create_dir(&ann_path).expect("create non-regular ANN directory");
+        }
+        InvalidAnnInstallation::CrossRoleAlias => {
+            fs::hard_link(&exact_path, &ann_path).expect("create cross-role ANN hard link");
+        }
+        #[cfg(unix)]
+        InvalidAnnInstallation::FinalComponentSymlink => {
+            use std::os::unix::fs::symlink;
+
+            let target = ann_path.with_extension("target");
+            fs::write(&target, b"unselected ANN target").expect("write ANN symlink target");
+            symlink(&target, &ann_path).expect("create final-component ANN symlink");
+        }
+        #[cfg(unix)]
+        InvalidAnnInstallation::BrokenFinalComponentSymlink => {
+            use std::os::unix::fs::symlink;
+
+            let absent_target = ann_path.with_extension("absent");
+            assert!(
+                !absent_target.exists(),
+                "broken ANN fixture target must remain absent"
+            );
+            symlink(&absent_target, &ann_path).expect("create broken final-component ANN symlink");
+        }
+    }
+    tracker.end(
+        "install_invalid_ann",
+        Some("Install a selected but inadmissible optional ANN artifact"),
+        ps,
+    );
+
+    let vector_dir = data_dir.join("vector_index");
+    let artifacts_before = artifact_tree_snapshot(&vector_dir);
+    let ps = tracker.start(
+        "fresh_process_invalid_ann_search",
+        Some("Request approximate search and require exact fallback"),
+    );
+    let output = command_env
+        .cass_assert_command()
+        .args([
+            "search",
+            "--robot",
+            "--robot-meta",
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--approximate",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .arg("authoritative exact fallback")
+        .output()
+        .expect("fresh-process invalid ANN search");
+    tracker.end(
+        "fresh_process_invalid_ann_search",
+        Some("Request approximate search and require exact fallback"),
+        ps,
+    );
+
+    let ps = tracker.start(
+        "verify_invalid_ann_fallback",
+        Some("Verify exact hits, bounded reason, and immutable artifacts"),
+    );
+    assert!(
+        output.status.success(),
+        "an invalid optional ANN must not make semantic search fail for {case:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("invalid ANN fallback robot JSON");
+    assert!(
+        json.get("hits")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|hits| !hits.is_empty()),
+        "exact fallback must return semantic hits for {case:?}: {json}"
+    );
+    assert_eq!(
+        json.pointer("/_meta/ann_unavailable_reason")
+            .and_then(serde_json::Value::as_str),
+        Some("ann_sidecar_open_failed"),
+        "invalid optional ANN reason disagreed for {case:?}"
+    );
+    assert!(
+        json.pointer("/_meta/ann_stats").is_none(),
+        "invalid ANN fallback must not claim ANN execution for {case:?}: {json}"
+    );
+    assert_eq!(
+        artifact_tree_snapshot(&vector_dir),
+        artifacts_before,
+        "invalid ANN fallback must preserve bytes, mtimes, permissions, and inventory for {case:?}"
+    );
+    tracker.end(
+        "verify_invalid_ann_fallback",
+        Some("Verify exact hits, bounded reason, and immutable artifacts"),
+        ps,
+    );
+    tracker.complete();
+}
+
+/// Invalid optional ANN artifacts must never disable exact semantic search.
+#[test]
+fn approximate_invalid_ann_falls_back_exact_without_mutation() {
+    let mut cases = vec![
+        InvalidAnnInstallation::CorruptMetadata,
+        InvalidAnnInstallation::Directory,
+        InvalidAnnInstallation::CrossRoleAlias,
+    ];
+    #[cfg(unix)]
+    cases.extend([
+        InvalidAnnInstallation::FinalComponentSymlink,
+        InvalidAnnInstallation::BrokenFinalComponentSymlink,
+    ]);
+
+    for case in cases {
+        exercise_invalid_ann_fresh_process_fallback(case);
+    }
 }
 
 // =============================================================================
@@ -783,16 +1971,16 @@ fn approximate_without_hnsw_reports_error() {
 #[test]
 fn semantic_search_emits_timing() {
     let tracker = tracker_for("semantic_search_emits_timing");
-    let _trace_guard = tracker.trace_env_guard();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Setup
     let ps = tracker.start("setup", Some("Create and index content"));
@@ -804,7 +1992,8 @@ fn semantic_search_emits_timing() {
         1732118400000,
     );
 
-    cargo_bin_cmd!("cass")
+    command_env
+        .cass_assert_command()
         .args([
             "index",
             "--full",
@@ -814,8 +2003,6 @@ fn semantic_search_emits_timing() {
             "--data-dir",
         ])
         .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .assert()
         .success();
     tracker.end("setup", Some("Create and index content"), ps);
@@ -823,12 +2010,19 @@ fn semantic_search_emits_timing() {
     // Run search with timing
     let ps = tracker.start("search_timed", Some("Search and capture timing"));
     let start = std::time::Instant::now();
-    let output = cargo_bin_cmd!("cass")
-        .args(["search", "--robot", "--mode", "semantic", "--data-dir"])
+    let output = command_env
+        .cass_assert_command()
+        .args([
+            "search",
+            "--robot",
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--data-dir",
+        ])
         .arg(&data_dir)
         .arg("timing test")
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
         .output()
         .expect("search command");
     let duration_ms = start.elapsed().as_millis() as u64;

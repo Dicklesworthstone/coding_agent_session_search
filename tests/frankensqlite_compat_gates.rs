@@ -40,6 +40,301 @@ fn rusqlite_is_dev_dependency_only() {
     );
 }
 
+/// The registry archive and the required Git source both declare version
+/// 0.1.19, but only the immutable Git revision contains CASS's
+/// existing-schema-only open contract. Freeze the complete source identity
+/// across the manifest, lockfile, build-time validator, and user-facing
+/// dependency contract so a version-only update cannot silently regress it.
+#[test]
+fn frankensqlite_existing_only_source_identity_is_exact_and_coherent() {
+    // 62a58ee3 = branch `fts5-overlong-hotfix-cass362`: the f9cc3294 family
+    // plus only the FTS5 overlong-term skip cap (cass#362). Upstream main has
+    // moved to an async-first API, so the full-forward bump is a separate
+    // validated porting pass.
+    const REVISION: &str = "62a58ee388775ffdf133c069372a6d01e3a589b4";
+    const REPOSITORY: &str = "https://github.com/Dicklesworthstone/frankensqlite";
+
+    let manifest: toml::Table =
+        toml::from_str(include_str!("../Cargo.toml")).expect("parse Cargo.toml");
+    for (table_name, dependency_name, package_name) in [
+        ("dependencies", "frankensqlite", "fsqlite"),
+        ("dependencies", "fsqlite-types", "fsqlite-types"),
+        ("dev-dependencies", "fsqlite-types", "fsqlite-types"),
+    ] {
+        let dependency = manifest
+            .get(table_name)
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.get(dependency_name))
+            .and_then(toml::Value::as_table)
+            .expect("missing structured dependency entry");
+        assert_eq!(
+            dependency.get("package").and_then(toml::Value::as_str),
+            Some(package_name),
+            "{dependency_name} package identity drifted in [{table_name}]"
+        );
+        assert_eq!(
+            dependency.get("version").and_then(toml::Value::as_str),
+            Some("0.1.19"),
+            "{dependency_name} declared version drifted in [{table_name}]"
+        );
+        assert_eq!(
+            dependency.get("git").and_then(toml::Value::as_str),
+            Some(REPOSITORY),
+            "{dependency_name} Git source drifted in [{table_name}]"
+        );
+        assert_eq!(
+            dependency.get("rev").and_then(toml::Value::as_str),
+            Some(REVISION),
+            "{dependency_name} revision drifted in [{table_name}]"
+        );
+    }
+
+    let crates_io_patch = manifest
+        .get("patch")
+        .and_then(toml::Value::as_table)
+        .and_then(|patches| patches.get("crates-io"))
+        .and_then(toml::Value::as_table)
+        .expect("[patch.crates-io] source override");
+    for dependency_name in ["fsqlite", "fsqlite-types"] {
+        let dependency = crates_io_patch
+            .get(dependency_name)
+            .and_then(toml::Value::as_table)
+            .expect("missing crates.io source override");
+        assert_eq!(
+            dependency.get("git").and_then(toml::Value::as_str),
+            Some(REPOSITORY)
+        );
+        assert_eq!(
+            dependency.get("rev").and_then(toml::Value::as_str),
+            Some(REVISION)
+        );
+        assert!(
+            dependency.get("path").is_none()
+                && dependency.get("branch").is_none()
+                && dependency.get("tag").is_none(),
+            "{dependency_name} override must be immutable and clean-clone-safe"
+        );
+    }
+
+    let lockfile: toml::Value =
+        toml::from_str(include_str!("../Cargo.lock")).expect("parse Cargo.lock");
+    let packages = lockfile
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .expect("Cargo.lock package array");
+    let expected_source = format!("git+{REPOSITORY}?rev={REVISION}#{REVISION}");
+    let resolved_fsqlite: Vec<_> = packages
+        .iter()
+        .filter(|package| {
+            package
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|name| name == "fsqlite" || name.starts_with("fsqlite-"))
+        })
+        .collect();
+    assert!(
+        !resolved_fsqlite.is_empty(),
+        "Cargo.lock must contain the FrankenSQLite package family"
+    );
+    for package in resolved_fsqlite {
+        let name = package["name"].as_str().expect("locked package name");
+        assert_eq!(
+            package.get("source").and_then(toml::Value::as_str),
+            Some(expected_source.as_str()),
+            "{name} resolved from a different source despite sharing version 0.1.19"
+        );
+        assert!(
+            package.get("checksum").is_none(),
+            "Git-resolved package {name} must not retain a registry checksum"
+        );
+    }
+
+    let build_contract = include_str!("../build.rs");
+    assert!(
+        build_contract.contains(&format!("expected_rev: \"{REVISION}\""))
+            && build_contract.contains(&format!("expected_git: \"{REPOSITORY}\"")),
+        "build.rs must validate the exact FrankenSQLite source identity"
+    );
+    let readme = include_str!("../README.md");
+    assert!(
+        readme.contains(&REVISION[..8])
+            && readme.contains("existing-only schema-open contract")
+            && readme.contains("registry archive lacks")
+            && readme.contains("[patch.crates-io]"),
+        "README must explain why equal version numbers are not interchangeable"
+    );
+}
+
+/// Exercise the exact API that disappeared from the same-version registry
+/// archive. A missing database must remain missing, while an existing database
+/// must reopen without schema initialization and retain its rows.
+#[test]
+fn frankensqlite_existing_schema_only_open_never_creates_and_reopens_exact_data() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let missing_path = dir.path().join("must-remain-missing.db");
+    let missing = missing_path.to_string_lossy();
+    let error = match FrankenConnection::open_existing_schema_only(missing.as_ref()) {
+        Err(error) => error,
+        Ok(_) => unreachable!("existing-only open must reject a missing database"),
+    };
+    assert!(
+        !missing_path.exists(),
+        "existing-only open must not create or zero-initialize a missing path"
+    );
+    assert!(
+        !error.to_string().trim().is_empty(),
+        "missing-path rejection must be actionable"
+    );
+
+    let database_path = dir.path().join("existing.db");
+    {
+        let path = database_path.to_string_lossy();
+        let conn = FrankenConnection::open(path.as_ref()).expect("create fixture database");
+        conn.execute("CREATE TABLE exact_rows(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+            .expect("create exact_rows");
+        conn.execute("INSERT INTO exact_rows(id, value) VALUES (7, 'preserved')")
+            .expect("insert exact row");
+    }
+    let size_before = std::fs::metadata(&database_path)
+        .expect("fixture database metadata")
+        .len();
+    {
+        let path = database_path.to_string_lossy();
+        let reopened = FrankenConnection::open_existing_schema_only(path.as_ref())
+            .expect("reopen existing database without schema initialization");
+        let rows = reopened
+            .query("SELECT id, value FROM exact_rows")
+            .expect("query exact preserved row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(7)));
+        assert_eq!(rows[0].get(1), Some(&SqliteValue::Text("preserved".into())));
+    }
+    assert_eq!(
+        std::fs::metadata(&database_path)
+            .expect("reopened database metadata")
+            .len(),
+        size_before,
+        "schema-only reopen must not replace or truncate the database"
+    );
+}
+
+/// Exercise the existing-only contract beyond a toy single-page fixture. The
+/// durable database/WAL bundle spans thousands of pages so an implementation
+/// that accidentally recreates, truncates, or only partially reopens the
+/// archive cannot satisfy the count, sentinel, and artifact checks.
+#[test]
+fn frankensqlite_existing_schema_only_reopens_large_archive_without_truncation() {
+    const ROW_COUNT: i64 = 2_048;
+    const PAYLOAD_BYTES: usize = 4_096;
+    const MINIMUM_DATABASE_BYTES: u64 = 8 * 1024 * 1024;
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let database_path = dir.path().join("large-existing.db");
+    {
+        let path = database_path.to_string_lossy();
+        let conn = FrankenConnection::open(path.as_ref()).expect("create large fixture database");
+        conn.execute(
+            "CREATE TABLE archive_rows(
+                id INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL
+            )",
+        )
+        .expect("create archive_rows");
+        conn.execute("BEGIN")
+            .expect("begin large fixture transaction");
+        for id in 0..ROW_COUNT {
+            let payload = format!("{id:08}:{}", "x".repeat(PAYLOAD_BYTES.saturating_sub(9)));
+            conn.execute_with_params(
+                "INSERT INTO archive_rows(id, payload) VALUES (?1, ?2)",
+                &[SqliteValue::Integer(id), SqliteValue::Text(payload.into())],
+            )
+            .expect("insert large fixture row");
+        }
+        conn.execute("COMMIT")
+            .expect("commit large fixture transaction");
+    }
+
+    let suffixed_path = |suffix: &str| {
+        let mut path = database_path.as_os_str().to_owned();
+        path.push(suffix);
+        std::path::PathBuf::from(path)
+    };
+    let durable_artifact_paths = [
+        database_path.clone(),
+        suffixed_path("-journal"),
+        suffixed_path("-wal"),
+        suffixed_path("-wal-fec"),
+    ];
+    let snapshot_durable_artifacts = || -> std::io::Result<Vec<Option<Vec<u8>>>> {
+        durable_artifact_paths
+            .iter()
+            .map(|artifact_path| match std::fs::read(artifact_path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "snapshot durable artifact {}: {error}",
+                        artifact_path.display()
+                    ),
+                )),
+            })
+            .collect()
+    };
+    let durable_before =
+        snapshot_durable_artifacts().expect("snapshot durable artifacts before reopen");
+    let size_before = durable_before
+        .iter()
+        .filter_map(|artifact| artifact.as_ref())
+        .map(Vec::len)
+        .sum::<usize>();
+    assert!(
+        size_before
+            >= usize::try_from(MINIMUM_DATABASE_BYTES).expect("minimum database size fits usize"),
+        "large reopen fixture's durable database/WAL bundle must span at least \
+         {MINIMUM_DATABASE_BYTES} bytes, got {size_before}"
+    );
+
+    {
+        let path = database_path.to_string_lossy();
+        let reopened = FrankenConnection::open_existing_schema_only(path.as_ref())
+            .expect("reopen large database without schema initialization");
+        let count = reopened
+            .query("SELECT COUNT(*) FROM archive_rows")
+            .expect("count reopened large archive rows");
+        assert_eq!(
+            count.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Integer(ROW_COUNT)),
+            "existing-only reopen lost archive rows"
+        );
+
+        for id in [0, ROW_COUNT / 2, ROW_COUNT - 1] {
+            let rows = reopened
+                .query_with_params(
+                    "SELECT payload FROM archive_rows WHERE id = ?1",
+                    &[SqliteValue::Integer(id)],
+                )
+                .expect("query reopened large archive sentinel");
+            assert_eq!(rows.len(), 1, "missing sentinel row {id}");
+            let expected = SqliteValue::Text(
+                format!("{id:08}:{}", "x".repeat(PAYLOAD_BYTES.saturating_sub(9))).into(),
+            );
+            assert_eq!(
+                rows.first().and_then(|row| row.get(0)),
+                Some(&expected),
+                "sentinel payload changed for row {id}"
+            );
+        }
+    }
+
+    assert_eq!(
+        snapshot_durable_artifacts().expect("snapshot durable artifacts after reopen"),
+        durable_before,
+        "existing-only large-archive reopen must not replace, truncate, or rewrite \
+         the database's durable main/journal/WAL artifact bundle"
+    );
+}
+
 // ============================================================================
 // GATE 1: FTS5 Compatibility
 // ============================================================================

@@ -5415,8 +5415,7 @@ fn robot_docs_topic_shorthands_route_to_robot_docs() {
         ("contracts", "contracts:"),
         ("exit-codes", "exit-codes:"),
         ("exit_codes", "exit-codes:"),
-        ("quickstart", "guide:"),
-        ("quick-start", "guide:"),
+        ("guide", "guide:"),
     ] {
         let mut cmd = base_cmd();
         cmd.args([alias, "--json", "--color=never"]);
@@ -5447,41 +5446,6 @@ fn robot_docs_topic_shorthands_route_to_robot_docs() {
     assert!(
         serde_json::from_str::<Value>(stdout.trim()).is_err(),
         "leading --json schemas should emit robot-docs text, not search JSON"
-    );
-}
-
-#[test]
-fn guide_planner_and_robot_docs_guide_are_unambiguous() {
-    let mut planner = base_cmd();
-    planner.args(["guide", "--json", "--color=never"]);
-    let planner_output = planner.assert().success().get_output().clone();
-    let planner_stdout = String::from_utf8_lossy(&planner_output.stdout);
-    let planner_json: Value = serde_json::from_str(planner_stdout.trim())
-        .expect("bare cass guide should emit the guided-operations planner JSON");
-    assert_eq!(
-        planner_json["schema_version"], "cass.guide.plan.v1",
-        "bare cass guide must remain the dedicated planner"
-    );
-    assert!(
-        !planner_stdout.contains('\u{1b}'),
-        "guide planner should honor --color=never"
-    );
-
-    let mut docs = base_cmd();
-    docs.args(["robot-docs", "guide", "--color=never"]);
-    let docs_output = docs.assert().success().get_output().clone();
-    let docs_stdout = String::from_utf8_lossy(&docs_output.stdout);
-    assert!(
-        docs_stdout.contains("guide:"),
-        "explicit cass robot-docs guide must retain the documentation topic"
-    );
-    assert!(
-        serde_json::from_str::<Value>(docs_stdout.trim()).is_err(),
-        "robot-docs guide should remain deterministic documentation text"
-    );
-    assert!(
-        !docs_stdout.contains('\u{1b}'),
-        "robot-docs guide should honor --color=never"
     );
 }
 

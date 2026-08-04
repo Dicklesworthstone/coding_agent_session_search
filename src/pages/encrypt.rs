@@ -26,8 +26,6 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use super::errors::DecryptError;
-
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct AeadSourceError(aes_gcm::Error);
@@ -135,7 +133,7 @@ pub struct KeySlot {
 }
 
 /// Argon2 parameters for config.json
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Argon2Params {
     pub memory_kb: u32,
@@ -179,85 +177,46 @@ pub struct EncryptionConfig {
 
 pub(crate) fn validate_supported_payload_format(config: &EncryptionConfig) -> Result<()> {
     if config.version != SCHEMA_VERSION {
-        return Err(DecryptError::UnsupportedVersion(config.version).into());
+        bail!(
+            "Unsupported archive schema version {}; expected {}",
+            config.version,
+            SCHEMA_VERSION
+        );
     }
 
     if config.compression != "deflate" {
-        return Err(DecryptError::UnsupportedMetadata("compression".to_string()).into());
+        bail!(
+            "Unsupported archive compression '{}'. The current encrypted pages format supports only deflate.",
+            config.compression
+        );
     }
 
     if config.payload.chunk_size == 0 {
-        return Err(invalid_archive_format(
-            "payload chunk_size must be greater than zero",
-        ));
+        bail!("Invalid archive chunk_size 0: must be > 0");
     }
 
     if config.payload.chunk_size > MAX_CHUNK_SIZE {
-        return Err(DecryptError::UnsupportedMetadata("payload.chunk_size".to_string()).into());
+        bail!(
+            "Invalid archive chunk_size {}: must be <= {} bytes",
+            config.payload.chunk_size,
+            MAX_CHUNK_SIZE
+        );
     }
 
     if config.payload.chunk_count != config.payload.files.len() {
-        return Err(invalid_archive_format(format!(
-            "payload chunk_count {} does not match file list length {}",
+        bail!(
+            "Invalid archive payload metadata: chunk_count {} does not match file list length {}",
             config.payload.chunk_count,
             config.payload.files.len()
-        )));
+        );
     }
 
     if config.payload.chunk_count > u32::MAX as usize {
-        return Err(DecryptError::UnsupportedMetadata("payload.chunk_count".to_string()).into());
-    }
-
-    require_metadata_len("export_id", &config.export_id, 16)?;
-    require_metadata_len("base_nonce", &config.base_nonce, 12)?;
-
-    let supported_argon2_params = Argon2Params::default();
-    if config.kdf_defaults != supported_argon2_params {
-        return Err(DecryptError::UnsupportedMetadata("kdf_defaults".to_string()).into());
-    }
-
-    let mut slot_ids = std::collections::BTreeSet::new();
-    for slot in &config.key_slots {
-        if !slot_ids.insert(slot.id) {
-            return Err(invalid_archive_format(format!(
-                "duplicate key slot id {}",
-                slot.id
-            )));
-        }
-        let expected_kdf = match slot.slot_type {
-            SlotType::Password => KdfAlgorithm::Argon2id,
-            SlotType::Recovery => KdfAlgorithm::HkdfSha256,
-        };
-        if slot.kdf != expected_kdf {
-            return Err(DecryptError::UnsupportedMetadata("key_slots.kdf".to_string()).into());
-        }
-        match slot.slot_type {
-            SlotType::Password => match &slot.argon2_params {
-                Some(params) if params == &supported_argon2_params => {}
-                Some(_) => {
-                    return Err(DecryptError::UnsupportedMetadata(
-                        "key_slots.argon2_params".to_string(),
-                    )
-                    .into());
-                }
-                None => {
-                    return Err(invalid_archive_format(
-                        "password key slot is missing argon2_params",
-                    ));
-                }
-            },
-            SlotType::Recovery if slot.argon2_params.is_some() => {
-                return Err(invalid_archive_format(
-                    "recovery key slot must not contain argon2_params",
-                ));
-            }
-            SlotType::Recovery => {}
-        }
-        if decode_metadata_field("key_slots.salt", &slot.salt)?.is_empty() {
-            return Err(invalid_archive_format("key slot salt must not be empty"));
-        }
-        require_metadata_len("key_slots.wrapped_dek", &slot.wrapped_dek, 48)?;
-        require_metadata_len("key_slots.nonce", &slot.nonce, 12)?;
+        bail!(
+            "Invalid archive payload metadata: chunk_count {} exceeds maximum {}",
+            config.payload.chunk_count,
+            u32::MAX
+        );
     }
 
     for (index, file) in config.payload.files.iter().enumerate() {
@@ -993,28 +952,19 @@ impl DecryptionEngine {
     /// Unlock with password
     pub fn unlock_with_password(config: EncryptionConfig, password: &str) -> Result<Self> {
         validate_supported_payload_format(&config)?;
-        if password.is_empty() {
-            return Err(DecryptError::EmptyPassword.into());
-        }
 
-        let mut password_slot_found = false;
         for slot in &config.key_slots {
             if slot.slot_type != SlotType::Password {
                 continue;
             }
-            password_slot_found = true;
 
-            let salt = decode_metadata_field("key_slots.salt", &slot.salt)?;
-            let wrapped_dek = decode_metadata_field("key_slots.wrapped_dek", &slot.wrapped_dek)?;
-            let nonce = decode_metadata_field("key_slots.nonce", &slot.nonce)?;
+            let salt = BASE64_STANDARD.decode(&slot.salt)?;
+            let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
+            let nonce = BASE64_STANDARD.decode(&slot.nonce)?;
 
-            let kek = derive_kek_argon2id(password, &salt).map_err(|error| {
-                invalid_archive_format(format!(
-                    "password key-derivation metadata is invalid: {error}"
-                ))
-            })?;
+            let kek = derive_kek_argon2id(password, &salt)?;
 
-            let export_id = decode_metadata_field("export_id", &config.export_id)?;
+            let export_id = BASE64_STANDARD.decode(&config.export_id)?;
             if let Ok(dek) = unwrap_key(&kek, &wrapped_dek, &nonce, &export_id, slot.id) {
                 return Ok(Self {
                     dek: SecretKey::from_bytes(dek),
@@ -1023,11 +973,7 @@ impl DecryptionEngine {
             }
         }
 
-        if password_slot_found {
-            Err(DecryptError::AuthenticationFailed.into())
-        } else {
-            Err(DecryptError::NoMatchingKeySlot.into())
-        }
+        bail!("Invalid password or no matching key slot")
     }
 
     /// Unlock with recovery secret
@@ -1039,17 +985,13 @@ impl DecryptionEngine {
                 continue;
             }
 
-            let salt = decode_metadata_field("key_slots.salt", &slot.salt)?;
-            let wrapped_dek = decode_metadata_field("key_slots.wrapped_dek", &slot.wrapped_dek)?;
-            let nonce = decode_metadata_field("key_slots.nonce", &slot.nonce)?;
+            let salt = BASE64_STANDARD.decode(&slot.salt)?;
+            let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
+            let nonce = BASE64_STANDARD.decode(&slot.nonce)?;
 
-            let kek = derive_kek_hkdf(secret, &salt).map_err(|error| {
-                invalid_archive_format(format!(
-                    "recovery key-derivation metadata is invalid: {error}"
-                ))
-            })?;
+            let kek = derive_kek_hkdf(secret, &salt)?;
 
-            let export_id = decode_metadata_field("export_id", &config.export_id)?;
+            let export_id = BASE64_STANDARD.decode(&config.export_id)?;
             if let Ok(dek) = unwrap_key(&kek, &wrapped_dek, &nonce, &export_id, slot.id) {
                 return Ok(Self {
                     dek: SecretKey::from_bytes(dek),
@@ -1058,7 +1000,7 @@ impl DecryptionEngine {
             }
         }
 
-        Err(DecryptError::NoMatchingKeySlot.into())
+        bail!("Invalid recovery secret or no matching key slot")
     }
 
     /// Decrypt all chunks to output file
@@ -1074,13 +1016,15 @@ impl DecryptionEngine {
 
         let cipher = Aes256Gcm::new_from_slice(self.dek.as_bytes()).expect("Invalid key length");
 
-        let base_nonce = decode_metadata_field("base_nonce", &self.config.base_nonce)?;
-        let export_id = decode_metadata_field("export_id", &self.config.export_id)?;
+        let base_nonce = BASE64_STANDARD.decode(&self.config.base_nonce)?;
+        let export_id = BASE64_STANDARD.decode(&self.config.export_id)?;
 
         // Validate chunk count doesn't exceed u32 to prevent nonce truncation
         if self.config.payload.files.len() > u32::MAX as usize {
-            return Err(
-                DecryptError::UnsupportedMetadata("payload.chunk_count".to_string()).into(),
+            bail!(
+                "Invalid config: chunk count {} exceeds maximum {}",
+                self.config.payload.files.len(),
+                u32::MAX
             );
         }
 
@@ -1092,32 +1036,17 @@ impl DecryptionEngine {
 
             // Prevent directory traversal
             if chunk_file.contains("..") || Path::new(chunk_file).is_absolute() {
-                return Err(invalid_archive_format(format!(
-                    "payload file entry {chunk_index} is not a canonical relative chunk path"
-                )));
+                bail!("Invalid chunk path: potential directory traversal");
             }
 
             let chunk_path = encrypted_dir.join(chunk_file);
-            let ciphertext = std::fs::read(&chunk_path).map_err(|error| {
-                let taxonomy = DecryptError::CorruptPayload(format!(
-                    "chunk {chunk_index} is missing or unreadable: {error}"
-                ));
-                anyhow::Error::new(error).context(taxonomy)
-            })?;
+            let ciphertext = std::fs::read(&chunk_path)?;
 
             // Derive nonce
-            let base_nonce: &[u8; 12] = base_nonce
-                .as_slice()
-                .try_into()
-                .map_err(|_| invalid_archive_format("base_nonce must contain exactly 12 bytes"))?;
-            let nonce = derive_chunk_nonce(base_nonce, chunk_index as u32);
+            let nonce = derive_chunk_nonce(base_nonce.as_slice().try_into()?, chunk_index as u32);
 
             // Build AAD
-            let export_id: &[u8; 16] = export_id
-                .as_slice()
-                .try_into()
-                .map_err(|_| invalid_archive_format("export_id must contain exactly 16 bytes"))?;
-            let aad = build_chunk_aad(export_id, chunk_index as u32);
+            let aad = build_chunk_aad(export_id.as_slice().try_into()?, chunk_index as u32);
 
             // Decrypt
             let compressed = cipher
@@ -1128,23 +1057,31 @@ impl DecryptionEngine {
                         aad: &aad,
                     },
                 )
-                .map_err(|error| {
-                    let taxonomy = DecryptError::CorruptPayload(format!(
-                        "chunk {chunk_index} authentication failed for {} ciphertext bytes: {error}",
-                        ciphertext.len()
-                    ));
-                    anyhow::Error::new(AeadSourceError(error)).context(taxonomy)
+                .map_err(|err| {
+                    // [coding_agent_session_search-b64fe] Chain the underlying
+                    // aead error so operators can distinguish "decryption
+                    // failed at chunk N because the AES-GCM tag did not
+                    // verify" (corrupt ciphertext / wrong DEK / tampered
+                    // AAD) from a downstream decompression / writer
+                    // failure that surfaces with a different error chain.
+                    // The aead crate's Display impl deliberately stays
+                    // opaque about whether MAC vs auth-tag verification
+                    // failed (timing-attack hardening), so we still don't
+                    // leak that — but the source error type IS preserved
+                    // in the chain for debug-mode inspection.
+                    let context = format!(
+                        "Decryption failed for chunk {} ({} bytes ciphertext): {}",
+                        chunk_index,
+                        ciphertext.len(),
+                        err
+                    );
+                    anyhow::Error::new(AeadSourceError(err)).context(context)
                 })?;
 
             // Decompress
             let mut decoder = DeflateDecoder::new(&compressed[..]);
             let mut plaintext = Vec::new();
-            decoder.read_to_end(&mut plaintext).map_err(|error| {
-                let taxonomy = DecryptError::CorruptPayload(format!(
-                    "chunk {chunk_index} deflate stream is invalid: {error}"
-                ));
-                anyhow::Error::new(error).context(taxonomy)
-            })?;
+            decoder.read_to_end(&mut plaintext)?;
 
             writer.write_all(&plaintext)?;
         }
@@ -2160,117 +2097,50 @@ mod tests {
         let (_temp_dir, _output_dir, mut config) = encrypt_test_file();
         config.compression = "zstd".to_string();
 
-        let err = DecryptionEngine::unlock_with_password(config, "password")
-            .err()
-            .context("unsupported compression must fail before unlock")?;
-        anyhow::ensure!(
-            matches!(
-                err.downcast_ref::<DecryptError>(),
-                Some(DecryptError::UnsupportedMetadata(field)) if field == "compression"
-            ),
-            "unexpected unsupported-metadata taxonomy: {err:#}"
+        let err = match DecryptionEngine::unlock_with_password(config, "password") {
+            Ok(_) => panic!("unsupported compression must fail before unlock"),
+            Err(err) => err,
+        };
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("supports only deflate") && rendered.contains("zstd"),
+            "unexpected unsupported-compression error: {err:#}"
         );
-        Ok(())
     }
 
     #[test]
-    fn test_decrypt_rejects_unsupported_schema_version_before_unlock() -> Result<()> {
+    fn test_decrypt_rejects_unsupported_schema_version_before_unlock() {
         let (_temp_dir, _output_dir, mut config) = encrypt_test_file();
         config.version = 1;
 
-        let err = DecryptionEngine::unlock_with_password(config, "password")
-            .err()
-            .context("unsupported schema version must fail before unlock")?;
-        anyhow::ensure!(
-            matches!(
-                err.downcast_ref::<DecryptError>(),
-                Some(DecryptError::UnsupportedVersion(1))
-            ),
-            "unexpected unsupported-version taxonomy: {err:#}"
+        let err = match DecryptionEngine::unlock_with_password(config, "password") {
+            Ok(_) => panic!("unsupported schema version must fail before unlock"),
+            Err(err) => err,
+        };
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("schema version") && rendered.contains("expected 2"),
+            "unexpected unsupported-version error: {err:#}"
         );
-        Ok(())
     }
 
     #[test]
-    fn test_decrypt_rejects_mismatched_chunk_count_before_unlock() -> Result<()> {
+    fn test_decrypt_rejects_mismatched_chunk_count_before_unlock() {
         let (_temp_dir, _output_dir, mut config) = encrypt_test_file();
         config.payload.chunk_count += 1;
 
-        let err = DecryptionEngine::unlock_with_password(config, "password")
-            .err()
-            .context("mismatched chunk count must fail before unlock")?;
-        anyhow::ensure!(
-            matches!(
-                err.downcast_ref::<DecryptError>(),
-                Some(DecryptError::InvalidFormat(detail))
-                    if detail.contains("chunk_count") && detail.contains("file list length")
-            ),
-            "unexpected invalid-metadata taxonomy: {err:#}"
-        );
-        Ok(())
-    }
+        let err = match DecryptionEngine::unlock_with_password(config, "password") {
+            Ok(_) => panic!("mismatched chunk count must fail before unlock"),
+            Err(err) => err,
+        };
 
-    #[test]
-    fn test_decrypt_distinguishes_empty_and_wrong_passwords() -> Result<()> {
-        let (_temp_dir, _output_dir, config) = encrypt_test_file();
-        let empty = DecryptionEngine::unlock_with_password(config.clone(), "")
-            .err()
-            .context("empty password must fail")?;
-        anyhow::ensure!(
-            matches!(
-                empty.downcast_ref::<DecryptError>(),
-                Some(DecryptError::EmptyPassword)
-            ),
-            "unexpected empty-password taxonomy: {empty:#}"
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("chunk_count") && rendered.contains("file list length"),
+            "unexpected mismatched-chunk-count error: {err:#}"
         );
-
-        let wrong = DecryptionEngine::unlock_with_password(config, "wrong-password")
-            .err()
-            .context("wrong password must fail")?;
-        anyhow::ensure!(
-            matches!(
-                wrong.downcast_ref::<DecryptError>(),
-                Some(DecryptError::AuthenticationFailed)
-            ),
-            "unexpected wrong-password taxonomy: {wrong:#}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_decrypt_rejects_unsupported_argon2_metadata_before_authentication() -> Result<()> {
-        let (_temp_dir, _output_dir, mut config) = encrypt_test_file();
-        config.kdf_defaults.iterations += 1;
-
-        let err = DecryptionEngine::unlock_with_password(config, "password")
-            .err()
-            .context("unsupported default KDF parameters must fail before authentication")?;
-        anyhow::ensure!(
-            matches!(
-                err.downcast_ref::<DecryptError>(),
-                Some(DecryptError::UnsupportedMetadata(field)) if field == "kdf_defaults"
-            ),
-            "unexpected unsupported-KDF taxonomy: {err:#}"
-        );
-
-        let (_temp_dir, _output_dir, mut config) = encrypt_test_file();
-        config.key_slots[0]
-            .argon2_params
-            .as_mut()
-            .context("password fixture should include Argon2 parameters")?
-            .memory_kb += 1;
-        let err = DecryptionEngine::unlock_with_password(config, "password")
-            .err()
-            .context("unsupported slot KDF parameters must fail before authentication")?;
-        anyhow::ensure!(
-            matches!(
-                err.downcast_ref::<DecryptError>(),
-                Some(DecryptError::UnsupportedMetadata(field))
-                    if field == "key_slots.argon2_params"
-            ),
-            "unexpected unsupported-slot-KDF taxonomy: {err:#}"
-        );
-        Ok(())
     }
 
     #[test]
@@ -2286,21 +2156,18 @@ mod tests {
         let err = validate_supported_payload_format(&config)
             .err()
             .context("unexpected payload file name must fail validation")?;
-        anyhow::ensure!(
-            matches!(
-                err.downcast_ref::<DecryptError>(),
-                Some(DecryptError::InvalidFormat(detail))
-                    if detail.contains("payload file entry 0")
-                        && detail.contains("payload/chunk-00000.bin")
-            ),
-            "unexpected payload-file-name taxonomy: {err:#}"
-        );
+        let rendered = err.to_string();
+        if !rendered.contains("payload file entry 0")
+            || !rendered.contains("payload/chunk-00000.bin")
+        {
+            bail!("unexpected payload-file-name error: {err:#}");
+        }
 
         Ok(())
     }
 
     #[test]
-    fn test_tampered_chunk_fails_with_corrupt_payload_taxonomy() -> Result<()> {
+    fn test_tampered_chunk_fails() {
         let temp_dir = TempDir::new().unwrap();
         let input_path = temp_dir.path().join("input.txt");
         let output_dir = temp_dir.path().join("encrypted");
@@ -2323,51 +2190,11 @@ mod tests {
 
         // Decryption should fail due to auth tag mismatch
         let decryptor = DecryptionEngine::unlock_with_password(config, "password").unwrap();
-        let err = decryptor
-            .decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
-            .err()
-            .context("tampered ciphertext must fail authentication")?;
-        anyhow::ensure!(
-            matches!(
-                err.downcast_ref::<DecryptError>(),
-                Some(DecryptError::CorruptPayload(detail))
-                    if detail.contains("chunk 0") && detail.contains("authentication failed")
-            ),
-            "unexpected corrupt-payload taxonomy: {err:#}"
+        assert!(
+            decryptor
+                .decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
+                .is_err()
         );
-        anyhow::ensure!(
-            err.downcast_ref::<AeadSourceError>().is_some(),
-            "tampered ciphertext must preserve the AEAD source error: {err:#}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_missing_chunk_fails_with_corrupt_payload_taxonomy() -> Result<()> {
-        let (_temp_dir, output_dir, config) = encrypt_test_file();
-        let chunk_path = output_dir.join("payload/chunk-00000.bin");
-        let parked_chunk_path = output_dir.join("payload/chunk-00000.bin.parked");
-        std::fs::rename(&chunk_path, &parked_chunk_path)?;
-
-        let decrypted_path = output_dir.join("decrypted.txt");
-        let decryptor = DecryptionEngine::unlock_with_password(config, "password")?;
-        let err = decryptor
-            .decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
-            .err()
-            .context("missing encrypted chunk must fail")?;
-        anyhow::ensure!(
-            matches!(
-                err.downcast_ref::<DecryptError>(),
-                Some(DecryptError::CorruptPayload(detail))
-                    if detail.contains("chunk 0") && detail.contains("missing or unreadable")
-            ),
-            "unexpected missing-payload taxonomy: {err:#}"
-        );
-        anyhow::ensure!(
-            err.downcast_ref::<std::io::Error>().is_some(),
-            "missing chunk must preserve the I/O source error: {err:#}"
-        );
-        Ok(())
     }
 
     #[test]
@@ -2404,12 +2231,8 @@ mod tests {
             .decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
             .expect_err("tampered later chunk must fail");
         assert!(
-            matches!(
-                err.downcast_ref::<DecryptError>(),
-                Some(DecryptError::CorruptPayload(detail))
-                    if detail.contains("chunk 1") && detail.contains("authentication failed")
-            ),
-            "unexpected corrupt-payload taxonomy: {err:#}"
+            err.to_string().contains("Decryption failed for chunk 1"),
+            "unexpected decrypt error: {err:#}"
         );
         assert_file_bytes(&decrypted_path, existing_output);
 

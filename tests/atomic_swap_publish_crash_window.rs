@@ -31,7 +31,7 @@ use assert_cmd::Command;
 use coding_agent_search::search::tantivy::{
     SearchableIndexSummary, open_federated_search_readers, searchable_index_summary,
 };
-use frankensearch::lexical::ReloadPolicy;
+use frankensearch::lexical_tantivy::ReloadPolicy;
 use serde_json::json;
 use std::fs;
 use std::sync::Arc;

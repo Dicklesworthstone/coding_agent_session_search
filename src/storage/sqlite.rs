@@ -1112,39 +1112,21 @@ pub const FTS5_REGISTER_SQL: &str = "\
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
         content, title, agent, workspace, source_path, \
         created_at UNINDEXED, \
-        content='', contentless_delete=1, tokenize='porter'\
+        content='', tokenize='porter'\
     )";
 
 const FTS_FRANKEN_REBUILD_META_KEY: &str = "fts_frankensqlite_rebuild_generation";
 const FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY: &str = "fts_frankensqlite_archive_fingerprint";
 const FTS_FRANKEN_REBUILD_GENERATION: i64 = 1;
-/// Exact canonical cardinality driven by the compact parent-rowid domain.
-/// FrankenSQLite 0.1.19 lowers this shape to `CountIndexEqRun`: each real
-/// conversation rowid counts its complete equality-prefix run in the
-/// `(conversation_id, idx)` uniqueness index without opening the message table,
-/// crossing the Rust row handler per message, or admitting orphan parent IDs.
-const FTS_INDEXABLE_MESSAGE_COUNT_SQL: &str = "SELECT COUNT(*) \
-     FROM messages INDEXED BY sqlite_autoindex_messages_1 \
-     WHERE conversation_id IN (SELECT rowid FROM conversations)";
-/// Exact intersection stream driven by the (potentially much smaller) derived
-/// shadow. The supported two-table join scans `fts_messages_docsize` once and
-/// point-seeks canonical messages by integer primary key. Only the compact
-/// parent ID crosses into Rust, where a bounded parent-ID set excludes orphan
-/// messages exactly. No TEMP writes are required, which is essential for
-/// read-only doctor dry-runs.
-const FTS_INDEXED_CANONICAL_INTERSECTION_SQL: &str = "SELECT m.conversation_id \
-     FROM fts_messages_docsize f NOT INDEXED \
-     INNER JOIN messages m NOT INDEXED ON m.id = f.id";
 const DAILY_STATS_HEALTH_META_KEY: &str = "daily_stats_archive_fingerprint";
 const DAILY_STATS_HEALTH_GENERATION_META_KEY: &str = "daily_stats_health_generation";
 const DAILY_STATS_HEALTH_GENERATION: i64 = 1;
 
 /// SQL to clear all rows from the contentless `fts_messages` table.
 ///
-/// New shadows are created with `contentless_delete=1`, which makes this
-/// ordinary delete transactional. Legacy shadows without that option reject
-/// the statement, preserving their published contents through rollback.
-pub const FTS5_DELETE_ALL_SQL: &str = "DELETE FROM fts_messages;";
+/// Contentless FTS5 tables reject ordinary `DELETE FROM ...` statements.
+pub const FTS5_DELETE_ALL_SQL: &str =
+    "INSERT INTO fts_messages(fts_messages) VALUES('delete-all');";
 
 pub const FTS_MESSAGES_REQUIRED_SHADOW_TABLES: [&str; 5] = [
     "fts_messages_config",
@@ -1222,17 +1204,12 @@ pub fn fts_messages_integrity_error_from_message(
         return None;
     }
 
-    let mentions_required_shadow_table = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
-        .iter()
-        .any(|table| lower.contains(&table.to_ascii_lowercase()));
     let mentions_structural_fts_failure = lower.contains("shadow table")
         || lower.contains("vtable constructor failed")
         || lower.contains("sqlite_corrupt")
         || lower.contains("databasecorrupt")
         || lower.contains("database corrupt")
-        || lower.contains("missing required")
-        || (mentions_required_shadow_table
-            && (lower.contains("table not found") || lower.contains("no such table")));
+        || lower.contains("missing required");
     if !mentions_structural_fts_failure {
         return None;
     }
@@ -1771,41 +1748,6 @@ pub(crate) enum FtsConsistencyRepair {
     Rebuilt {
         inserted_rows: usize,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FtsShadowParityStatus {
-    Absent,
-    Healthy,
-    Partial,
-    Excess,
-    Divergent,
-    Unqueryable,
-}
-
-impl FtsShadowParityStatus {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Absent => "absent",
-            Self::Healthy => "healthy",
-            Self::Partial => "partial",
-            Self::Excess => "excess",
-            Self::Divergent => "divergent",
-            Self::Unqueryable => "unqueryable",
-        }
-    }
-}
-
-/// Exact parity between canonical, indexable messages and the contentless FTS
-/// shadow. `indexable_messages` excludes orphaned message rows because the FTS
-/// projection intentionally inner-joins `conversations`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FtsShadowParity {
-    pub(crate) status: FtsShadowParityStatus,
-    pub(crate) canonical_messages: i64,
-    pub(crate) indexable_messages: i64,
-    pub(crate) indexed_messages: Option<i64>,
-    pub(crate) detail: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -2929,24 +2871,6 @@ fn historical_raw_json(value: &serde_json::Value) -> Option<&str> {
     }
 }
 
-/// Render a single preserved message envelope back into one source JSONL line.
-///
-/// `extra_json` here is the value already decoded by
-/// [`franken_read_message_extra_compat`] (msgpack `extra_bin` takes precedence
-/// over the `extra_json` text column). When the envelope is the historical
-/// raw-line wrapper, the verbatim original line is returned unchanged; when it
-/// is a decoded event object, it is re-serialized as compact JSON; a `null`
-/// envelope (no preserved event) yields `None`.
-pub(crate) fn message_extra_to_source_jsonl_line(extra_json: &serde_json::Value) -> Option<String> {
-    if let Some(raw) = historical_raw_json(extra_json) {
-        return Some(raw.to_string());
-    }
-    if extra_json.is_null() {
-        return None;
-    }
-    serde_json::to_string(extra_json).ok()
-}
-
 fn parse_historical_json_column(value: Option<String>) -> serde_json::Value {
     match value {
         Some(raw) if raw.trim().is_empty() => serde_json::Value::Null,
@@ -3044,7 +2968,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 
 /// Public schema version constant for external checks.
 pub const CURRENT_SCHEMA_VERSION: i64 = 20;
-pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
+const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
 #[derive(Debug, Clone)]
@@ -3771,93 +3695,6 @@ pub struct LexicalRebuildGroupedMessageRow {
 
 pub type LexicalRebuildGroupedMessageRows = SmallVec<[LexicalRebuildGroupedMessageRow; 32]>;
 
-/// Default per-conversation lexical-content byte ceiling (#290).
-///
-/// The staged lexical-rebuild shard cap
-/// (`CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES`) defaults to 64 MiB with
-/// a 16 MiB floor. An indivisible single conversation whose materialized content
-/// exceeds the per-shard cap forces the OOM→bisect→quarantine path because the
-/// dominant resident cost is cass-side materialization of the whole conversation's
-/// text. We cap per-conversation indexed content at 8 MiB —
-/// `min(shard_cap/2, 8 MiB)` for the default 64 MiB shard cap, and comfortably
-/// below even the 16 MiB shard floor — so a normally-large (image/base64-heavy)
-/// conversation is admitted with a truncated lexical body instead of quarantined.
-/// 8 MiB of text is far more than lexical search needs (tokens, not raw blobs)
-/// while leaving headroom for the Tantivy arena and concurrent shard builders.
-pub const LEXICAL_MAX_CONVERSATION_CONTENT_BYTES_DEFAULT: usize = 8 * 1024 * 1024;
-
-/// Per-conversation lexical-content byte ceiling, overridable via
-/// `CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES` (#290).
-///
-/// `0` is rejected (treated as "use default") so the cap can never be disabled
-/// into the OOM-quarantine regime by accident; set a large value to effectively
-/// disable it.
-pub fn lexical_max_conversation_content_bytes() -> usize {
-    dotenvy::var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(LEXICAL_MAX_CONVERSATION_CONTENT_BYTES_DEFAULT)
-}
-
-/// Largest byte length `<= cap` that ends on a UTF-8 char boundary of `content`.
-fn lexical_content_truncation_boundary(content: &str, cap: usize) -> usize {
-    if content.len() <= cap {
-        return content.len();
-    }
-    let mut boundary = cap;
-    while boundary > 0 && !content.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    boundary
-}
-
-/// Cap the cumulative per-conversation lexical content at `cap` bytes (#290).
-///
-/// Messages are visited in `idx` order (earliest first); once the running total
-/// reaches the cap, the message that straddles the boundary is truncated to the
-/// remaining budget on a UTF-8 char boundary and every later message's content is
-/// cleared. Message rows are preserved (count/structure unchanged) so the rest of
-/// the rebuild pipeline's per-message accounting stays consistent — only indexed
-/// text is dropped. Emits one `lexical_content_truncated` diagnostic per affected
-/// conversation. No-op when total content is within the cap.
-fn truncate_lexical_rebuild_conversation_content(
-    conversation_id: i64,
-    messages: &mut [Message],
-    cap: usize,
-) {
-    let original_bytes: usize = messages.iter().map(|message| message.content.len()).sum();
-    if original_bytes <= cap {
-        return;
-    }
-
-    let mut used = 0usize;
-    for message in messages.iter_mut() {
-        if used >= cap {
-            message.content.clear();
-            continue;
-        }
-        let remaining = cap - used;
-        if message.content.len() <= remaining {
-            used += message.content.len();
-        } else {
-            let boundary = lexical_content_truncation_boundary(&message.content, remaining);
-            message.content.truncate(boundary);
-            used += boundary;
-        }
-    }
-
-    let capped_bytes: usize = messages.iter().map(|message| message.content.len()).sum();
-    tracing::warn!(
-        diagnostic = "lexical_content_truncated",
-        conversation_id,
-        original_bytes,
-        capped_bytes,
-        cap,
-        "lexical rebuild conversation content exceeded the per-conversation cap; truncated indexed text to stay within budget instead of OOM-quarantining (#290)"
-    );
-}
-
 /// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
 pub type SqliteStorage = FrankenStorage;
 
@@ -4069,60 +3906,14 @@ impl FrankenStorage {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard =
             acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
-        let existing_archive = match fs::metadata(path) {
-            Ok(metadata) => metadata.len() > 0,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("inspecting frankensqlite db path at {}", path.display())
-                });
-            }
-        };
-        let conn = if existing_archive {
-            // `open_existing_schema_only` never creates or zero-initializes
-            // the archive path. FrankenSQLite 0.1.19 loads only the schema
-            // image for this writable existing-only lane (rows stay
-            // pager-backed; the compatibility `MemDatabase` is not hydrated
-            // eagerly), so ordinary opens stay bounded on multi-gigabyte
-            // archives.
-            FrankenConnection::open_existing_schema_only(&path_str).with_context(|| {
-                format!("opening existing frankensqlite db at {}", path.display())
-            })?
-        } else {
-            FrankenConnection::open(&path_str)
-                .with_context(|| format!("creating frankensqlite db at {}", path.display()))?
-        };
+        let conn = FrankenConnection::open(&path_str)
+            .with_context(|| format!("opening frankensqlite db at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_open_stage_busy_timeout();
         storage.run_migrations()?;
         storage.repair_missing_current_schema_objects()?;
         storage.apply_config()?;
         storage.set_fts_messages_present_cache(true);
-        Ok(storage)
-    }
-
-    /// Open an existing archive for a narrowly scoped derived-FTS repair.
-    ///
-    /// Unlike [`Self::open`], this uses FrankenSQLite's existing-only
-    /// read-write lane: the path must already exist (never created or
-    /// zero-initialized), and 0.1.19 keeps canonical rows pager-backed
-    /// instead of hydrating them into the compatibility `MemDatabase`. It
-    /// intentionally does not run migrations or repair canonical schema
-    /// objects. The caller may inspect ordinary B-trees and mutate only the
-    /// rebuildable FTS shadow under an explicit doctor repair contract.
-    pub(crate) fn open_existing_schema_only_for_fts_repair(path: &Path) -> Result<Self> {
-        let path_str = path.to_string_lossy().to_string();
-        let _doctor_guard =
-            acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
-        let conn = FrankenConnection::open_existing_schema_only(&path_str).with_context(|| {
-            format!(
-                "opening existing frankensqlite db for FTS repair at {}",
-                path.display()
-            )
-        })?;
-        let storage = Self::new(conn, path.to_path_buf());
-        storage.apply_open_stage_busy_timeout();
-        storage.apply_config()?;
         Ok(storage)
     }
 
@@ -7656,250 +7447,6 @@ impl FrankenStorage {
         })
     }
 
-    /// `cass forget` (#292 ask #2): prune an already-indexed subset of
-    /// conversations whose `source_path` matches a glob pattern, from the
-    /// canonical DB. Child rows (messages, snippets, tags, etc.) cascade via
-    /// `ON DELETE CASCADE`; the two non-cascading external-lookup tables are
-    /// deleted explicitly, mirroring [`purge_agent_archive_data`].
-    ///
-    /// `dry_run=true` (the CLI default) inspects only — it returns the matched
-    /// conversation/message counts and a bounded sample of matched source paths
-    /// without mutating anything. `dry_run=false` performs the deletion in a
-    /// single transaction. The caller is responsible for rebuilding derived
-    /// assets (FTS/analytics) afterward, exactly as the agent-purge path does.
-    ///
-    /// Matching is done in Rust with the `glob` crate (not a SQL `GLOB`
-    /// operator) so the semantics are portable and deterministic across the
-    /// frankensqlite backend.
-    pub fn forget_conversations_by_source_glob(
-        &self,
-        pattern: &str,
-        dry_run: bool,
-    ) -> Result<ForgetConversationsResult> {
-        let trimmed = pattern.trim();
-        if trimmed.is_empty() {
-            return Err(anyhow!("forget source-glob pattern cannot be empty"));
-        }
-        let glob = glob::Pattern::new(trimmed)
-            .with_context(|| format!("invalid forget source-glob pattern: {trimmed}"))?;
-
-        // Pull (id, source_path) for every conversation and match the glob in
-        // Rust. source_path may be NULL on legacy rows; those never match a
-        // path glob.
-        let rows: Vec<(i64, Option<String>)> = self.conn.query_map_collect(
-            "SELECT id, source_path FROM conversations ORDER BY id",
-            fparams![],
-            |row| {
-                Ok((
-                    row.get_typed::<i64>(0)?,
-                    row.get_typed::<Option<String>>(1)?,
-                ))
-            },
-        )?;
-
-        let mut matched_ids: Vec<i64> = Vec::new();
-        let mut sample_paths: Vec<String> = Vec::new();
-        for (id, source_path) in rows {
-            let Some(path) = source_path else { continue };
-            if glob.matches(&path) {
-                matched_ids.push(id);
-                if sample_paths.len() < 20 {
-                    sample_paths.push(path);
-                }
-            }
-        }
-
-        if matched_ids.is_empty() {
-            return Ok(ForgetConversationsResult {
-                pattern: trimmed.to_string(),
-                dry_run,
-                conversations_matched: 0,
-                messages_matched: 0,
-                conversations_deleted: 0,
-                sample_source_paths: Vec::new(),
-            });
-        }
-
-        let id_list = matched_ids
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let messages_matched: i64 = self.conn.query_row_map(
-            &format!("SELECT COUNT(*) FROM messages WHERE conversation_id IN ({id_list})"),
-            fparams![],
-            |row| row.get_typed(0),
-        )?;
-
-        if dry_run {
-            return Ok(ForgetConversationsResult {
-                pattern: trimmed.to_string(),
-                dry_run,
-                conversations_matched: matched_ids.len(),
-                messages_matched: messages_matched.max(0) as usize,
-                conversations_deleted: 0,
-                sample_source_paths: sample_paths,
-            });
-        }
-
-        let mut tx = self.conn.transaction()?;
-        // Non-cascading external-lookup tables first (mirrors agent purge).
-        tx.execute_compat(
-            &format!(
-                "DELETE FROM conversation_external_lookup WHERE conversation_id IN ({id_list})"
-            ),
-            fparams![],
-        )?;
-        tx.execute_compat(
-            &format!(
-                "DELETE FROM conversation_external_tail_lookup WHERE conversation_id IN ({id_list})"
-            ),
-            fparams![],
-        )?;
-        // The remaining child tables (messages, snippets, tags, ...) cascade.
-        tx.execute_compat(
-            &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
-            fparams![],
-        )?;
-        tx.commit()?;
-
-        Ok(ForgetConversationsResult {
-            pattern: trimmed.to_string(),
-            dry_run,
-            conversations_matched: matched_ids.len(),
-            messages_matched: messages_matched.max(0) as usize,
-            conversations_deleted: matched_ids.len(),
-            sample_source_paths: sample_paths,
-        })
-    }
-
-    /// `coding_agent_session_search-uhhxy` (gh #302 ask #2): collapse
-    /// PRE-EXISTING duplicate conversation rows created before the
-    /// external_id `projects/` canonicalization fix. The watcher and
-    /// full-rebuild ingest paths historically derived `external_id` with
-    /// and without a leading `projects/` segment for the SAME session file,
-    /// so a single `source_path` accumulated two conversation rows that
-    /// differ only by that prefix. This collapses each such pair: it keeps
-    /// the bare (canonical, `projects/`-free) row and drops the
-    /// `projects/`-prefixed twin AND all of its child rows (messages cascade
-    /// via the FK, plus the non-cascading external-lookup tables deleted
-    /// explicitly). The lexical FTS index is NOT rebuilt here — the caller
-    /// rebuilds it after `--apply` so callers can batch.
-    ///
-    /// `dry_run=true` (the default at the CLI) inspects only: it reports the
-    /// duplicate pairs and the row/message counts that WOULD be removed
-    /// without mutating anything. `dry_run=false` performs the deletion in a
-    /// single transaction.
-    pub fn collapse_external_id_prefix_duplicates(
-        &self,
-        dry_run: bool,
-    ) -> Result<ExternalIdDuplicateCleanupResult> {
-        // Find every (source_id, agent_id, source_path) group that holds BOTH
-        // a `projects/`-prefixed external_id row and a bare twin whose
-        // external_id equals the prefixed id with the leading `projects/`
-        // stripped. We match the twin by value so we never drop a prefixed row
-        // that lacks a real bare counterpart (that would be data loss, not
-        // dedup). Only the prefixed row is a deletion candidate.
-        let candidate_rows: Vec<ExternalIdDuplicateCandidate> = self.conn.query_map_collect(
-            "SELECT dup.id, keep.id, dup.source_path, dup.external_id, keep.external_id
-             FROM conversations dup
-             JOIN conversations keep
-               ON keep.source_id = dup.source_id
-              AND keep.agent_id = dup.agent_id
-              AND keep.source_path = dup.source_path
-              AND keep.id <> dup.id
-             WHERE dup.external_id LIKE 'projects/%'
-               AND keep.external_id = SUBSTR(dup.external_id, 10)
-             ORDER BY dup.id",
-            fparams![],
-            |row| {
-                Ok(ExternalIdDuplicateCandidate {
-                    drop_conversation_id: row.get_typed(0)?,
-                    keep_conversation_id: row.get_typed(1)?,
-                    source_path: row.get_typed(2)?,
-                    drop_external_id: row.get_typed(3)?,
-                    keep_external_id: row.get_typed(4)?,
-                })
-            },
-        )?;
-
-        let mut result = ExternalIdDuplicateCleanupResult {
-            dry_run,
-            ..Default::default()
-        };
-
-        if candidate_rows.is_empty() {
-            return Ok(result);
-        }
-
-        // Tally the message rows that belong to the drop candidates so the
-        // dry-run report is faithful to what `--apply` would remove.
-        let drop_ids: Vec<i64> = candidate_rows
-            .iter()
-            .map(|candidate| candidate.drop_conversation_id)
-            .collect();
-        let mut messages_affected: i64 = 0;
-        for drop_id in &drop_ids {
-            let count: i64 = self.conn.query_row_map(
-                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
-                fparams![*drop_id],
-                |row| row.get_typed(0),
-            )?;
-            messages_affected = messages_affected.saturating_add(count);
-        }
-        result.conversations_affected = candidate_rows.len();
-        result.messages_affected = messages_affected.max(0) as usize;
-        result.pairs = candidate_rows;
-
-        if dry_run {
-            return Ok(result);
-        }
-
-        // Apply: delete each prefixed twin and its children in one
-        // transaction. Messages, snippets, conversation_tags, token_usage,
-        // etc. carry `ON DELETE CASCADE`; the two external-lookup tables do
-        // not, so delete them explicitly first (mirrors `purge_agent_archive`).
-        let mut tx = self.conn.transaction()?;
-        for candidate in &result.pairs {
-            let drop_id = candidate.drop_conversation_id;
-            tx.execute_compat(
-                "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            tx.execute_compat(
-                "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            // Explicit message delete (do not rely solely on cascade) so the
-            // operation is correct even if FK enforcement is toggled off.
-            tx.execute_compat(
-                "DELETE FROM messages WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            tx.execute_compat(
-                "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            tx.execute_compat(
-                "DELETE FROM token_usage WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            // NOTE: `embedding_jobs` is a per-(db_path, model_id) job table,
-            // NOT a per-conversation table — it has no conversation_id column,
-            // so there is nothing conversation-scoped to delete there.
-            tx.execute_compat("DELETE FROM conversations WHERE id = ?1", fparams![drop_id])?;
-        }
-        tx.commit()?;
-
-        // The derived FTS shadow rows for the dropped messages are now stale.
-        // Invalidate the presence cache; the caller is responsible for the
-        // actual lexical rebuild (so multi-step cleanups rebuild once).
-        self.invalidate_fts_messages_present_cache();
-
-        Ok(result)
-    }
-
     /// List all registered workspaces.
     pub fn list_workspaces(&self) -> Result<Vec<crate::model::types::Workspace>> {
         self.conn
@@ -8523,65 +8070,12 @@ impl FrankenStorage {
             .with_context(|| format!("fetching messages for conversation {conversation_id}"))
     }
 
-    /// Reconstruct the source JSONL lines for a single conversation from the
-    /// canonical archive's preserved per-message envelopes.
-    ///
-    /// cass stores the verbatim original source event for every message as
-    /// `extra_json` (a `{__cass_historical_raw_json__: "<line>"}` wrapper) or
-    /// `extra_bin` (the same event MessagePack-encoded). That makes the
-    /// canonical archive self-sufficient for regenerating the on-disk source
-    /// file of any session whose original file is gone or whose derived
-    /// structures are corrupt — no stock-sqlite `.recover` is needed.
-    ///
-    /// Returns one `String` per message in `idx` order. Each string is a single
-    /// JSONL line (no trailing newline): the preserved verbatim line when one
-    /// exists, otherwise the decoded event re-serialized as compact JSON.
-    /// Messages whose envelope decodes to `null` (no preserved event) are
-    /// skipped, since they carry no source line to regenerate.
-    pub fn reconstruct_source_jsonl_for_conversation(
-        &self,
-        conversation_id: i64,
-    ) -> Result<Vec<String>> {
-        let messages = self.fetch_messages(conversation_id)?;
-        let mut lines = Vec::with_capacity(messages.len());
-        for message in messages {
-            if let Some(line) = message_extra_to_source_jsonl_line(&message.extra_json) {
-                lines.push(line);
-            }
-        }
-        Ok(lines)
-    }
-
     /// Fetch messages for lexical index rebuilds without deserializing extra metadata.
     ///
     /// Tantivy only needs message text and core envelope fields, so avoiding
     /// `extra_json` here prevents rebuilds from rehydrating enormous historical
     /// payloads that are irrelevant to lexical search.
-    ///
-    /// The assembled per-conversation content is additionally capped at
-    /// [`lexical_max_conversation_content_bytes`] (see #290): an image/base64-heavy
-    /// conversation that materializes 10-40 MiB of indexed text would otherwise
-    /// exceed the per-shard byte budget and force the OOM→bisect→quarantine path.
-    /// Capping the *content* (not the message count/structure) admits the
-    /// conversation within budget with a truncated lexical body — lexical search
-    /// needs tokens, not the full multi-megabyte blob.
     pub fn fetch_messages_for_lexical_rebuild(&self, conversation_id: i64) -> Result<Vec<Message>> {
-        let mut messages = self.fetch_messages_for_lexical_rebuild_uncapped(conversation_id)?;
-        truncate_lexical_rebuild_conversation_content(
-            conversation_id,
-            &mut messages,
-            lexical_max_conversation_content_bytes(),
-        );
-        Ok(messages)
-    }
-
-    /// Inner fetch without the per-conversation content cap. Kept separate so the
-    /// cap is applied at exactly one chokepoint (every lexical-rebuild content
-    /// load — batch and streaming — funnels through `fetch_messages_for_lexical_rebuild`).
-    fn fetch_messages_for_lexical_rebuild_uncapped(
-        &self,
-        conversation_id: i64,
-    ) -> Result<Vec<Message>> {
         let hinted_sql = "SELECT id, idx, role, author, created_at, content \
                  FROM messages INDEXED BY sqlite_autoindex_messages_1 \
                  WHERE conversation_id = ?1 ORDER BY idx";
@@ -10648,12 +10142,7 @@ impl FrankenStorage {
         })
     }
 
-    /// Rebuild the FTS5 index from scratch in one failure-atomic transaction.
-    ///
-    /// Row materialization remains chunked to bound memory, but the old
-    /// queryable shadow is not published away until the replacement has exact
-    /// canonical parity and the transaction commits. A process interruption
-    /// rolls the create-or-clear operation and every insert back together.
+    /// Rebuild the FTS5 index from scratch (chunked to avoid OOM on large databases, #110).
     pub fn rebuild_fts(&self) -> Result<()> {
         self.rebuild_fts_via_frankensqlite().map(|_| ())
     }
@@ -10791,463 +10280,163 @@ impl FrankenStorage {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn fetch_indexable_message_id_parity_page(
-        &self,
-        after: Option<i64>,
-        page_rows: i64,
-    ) -> Result<Vec<i64>> {
-        match after {
-            Some(after) => self.conn.query_map_collect(
-                "SELECT m.id
-                 FROM messages m
-                 INNER JOIN conversations c ON c.id = m.conversation_id
-                 WHERE m.id > ?1
-                 ORDER BY m.id
-                 LIMIT ?2",
-                fparams![after, page_rows],
-                |row| row.get_typed(0),
-            ),
-            None => self.conn.query_map_collect(
-                "SELECT m.id
-                 FROM messages m
-                 INNER JOIN conversations c ON c.id = m.conversation_id
-                 ORDER BY m.id
-                 LIMIT ?1",
-                fparams![page_rows],
-                |row| row.get_typed(0),
-            ),
-        }
-        .with_context(|| "streaming bounded canonical message IDs for exact FTS parity")
-    }
-
-    #[cfg(test)]
-    fn fetch_fts_docsize_id_parity_page(
-        &self,
-        after: Option<i64>,
-        page_rows: i64,
-    ) -> Result<Vec<i64>> {
-        match after {
-            Some(after) => self.conn.query_map_collect(
-                "SELECT id
-                 FROM fts_messages_docsize
-                 WHERE id > ?1
-                 ORDER BY id
-                 LIMIT ?2",
-                fparams![after, page_rows],
-                |row| row.get_typed(0),
-            ),
-            None => self.conn.query_map_collect(
-                "SELECT id
-                 FROM fts_messages_docsize
-                 ORDER BY id
-                 LIMIT ?1",
-                fparams![page_rows],
-                |row| row.get_typed(0),
-            ),
-        }
-        .with_context(|| "streaming bounded FTS docsize IDs for exact parity")
-    }
-
-    /// Test oracle for the aggregate parity classifier. The production path
-    /// deliberately avoids this exact-but-expensive repeated keyset traversal;
-    /// keeping it available in tests lets small fixtures compare both methods.
-    #[cfg(test)]
-    fn inspect_fts_rowid_set_difference_bounded(&self) -> Result<(bool, bool)> {
-        self.inspect_fts_rowid_set_difference_with_page_rows(4_096)
-    }
-
-    #[cfg(test)]
-    fn inspect_fts_rowid_set_difference_with_page_rows(
-        &self,
-        page_rows: usize,
-    ) -> Result<(bool, bool)> {
-        anyhow::ensure!(page_rows > 0, "FTS parity page size must be positive");
-        let page_limit = i64::try_from(page_rows).unwrap_or(i64::MAX);
-        let mut canonical_page = self.fetch_indexable_message_id_parity_page(None, page_limit)?;
-        let mut indexed_page = self.fetch_fts_docsize_id_parity_page(None, page_limit)?;
-        let mut canonical_index = 0usize;
-        let mut indexed_index = 0usize;
-        let mut canonical_done = false;
-        let mut indexed_done = false;
-        let mut has_missing = false;
-        let mut has_excess = false;
-
-        loop {
-            if canonical_index == canonical_page.len() && !canonical_done {
-                if canonical_page.len() < page_rows {
-                    canonical_done = true;
-                } else {
-                    let after = canonical_page.last().copied().ok_or_else(|| {
-                        anyhow::anyhow!("non-empty canonical parity page lost its cursor")
-                    })?;
-                    canonical_page =
-                        self.fetch_indexable_message_id_parity_page(Some(after), page_limit)?;
-                    canonical_index = 0;
-                    if canonical_page.is_empty() {
-                        canonical_done = true;
-                    }
+    fn ensure_fts_consistency_via_frankensqlite(&self) -> Result<FtsConsistencyRepair> {
+        if self.read_fts_franken_rebuild_generation()? != Some(FTS_FRANKEN_REBUILD_GENERATION) {
+            // Before triggering an expensive full rebuild, probe whether
+            // fts_messages is already populated and consistent.  On large
+            // databases the rebuild can take hours and OOM — skip it when
+            // the only thing missing is the generation marker (#184).
+            let fts_already_healthy = (|| -> Result<bool> {
+                let fts_exists: i64 = self.conn.query_row_map(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )?;
+                if fts_exists != 1 {
+                    return Ok(false);
                 }
-            }
-            if indexed_index == indexed_page.len() && !indexed_done {
-                if indexed_page.len() < page_rows {
-                    indexed_done = true;
-                } else {
-                    let after = indexed_page.last().copied().ok_or_else(|| {
-                        anyhow::anyhow!("non-empty FTS parity page lost its cursor")
-                    })?;
-                    indexed_page =
-                        self.fetch_fts_docsize_id_parity_page(Some(after), page_limit)?;
-                    indexed_index = 0;
-                    if indexed_page.is_empty() {
-                        indexed_done = true;
-                    }
+                let total: i64 = self.conn.query_row_map(
+                    "SELECT COUNT(*) FROM messages",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )?;
+                if total == 0 {
+                    return Ok(false);
                 }
-            }
+                let indexed: i64 = self.conn.query_row_map(
+                    "SELECT COUNT(*) FROM fts_messages",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )?;
+                // Consider healthy if >=90% of messages are indexed
+                Ok(indexed > 0 && indexed * 100 >= total * 90)
+            })()
+            .unwrap_or(false);
 
-            let canonical_id = if canonical_done {
-                None
+            if fts_already_healthy {
+                tracing::info!(
+                    target: "cass::fts_rebuild",
+                    "FTS already populated and consistent; setting generation marker without rebuild"
+                );
+                self.record_fts_franken_rebuild_generation()?;
+                self.set_fts_messages_present_cache(true);
             } else {
-                canonical_page.get(canonical_index).copied()
-            };
-            let indexed_id = if indexed_done {
-                None
-            } else {
-                indexed_page.get(indexed_index).copied()
-            };
-            match (canonical_id, indexed_id) {
-                (Some(canonical_id), Some(indexed_id)) => {
-                    match canonical_id.cmp(&indexed_id) {
-                        std::cmp::Ordering::Less => {
-                            has_missing = true;
-                            canonical_index = canonical_index.saturating_add(1);
-                        }
-                        std::cmp::Ordering::Equal => {
-                            canonical_index = canonical_index.saturating_add(1);
-                            indexed_index = indexed_index.saturating_add(1);
-                        }
-                        std::cmp::Ordering::Greater => {
-                            has_excess = true;
-                            indexed_index = indexed_index.saturating_add(1);
-                        }
-                    }
-                    if has_missing && has_excess {
-                        return Ok((true, true));
-                    }
-                }
-                (Some(_), None) => return Ok((true, has_excess)),
-                (None, Some(_)) => return Ok((has_missing, true)),
-                (None, None) => return Ok((has_missing, has_excess)),
+                let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
+                self.record_fts_franken_rebuild_generation()?;
+                return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
             }
         }
-    }
 
-    fn load_fts_conversation_id_set(&self) -> Result<HashSet<i64>> {
-        self.conn
-            .query_map_collect(
-                "SELECT id FROM conversations NOT INDEXED",
+        let inspection = (|| -> Result<(i64, bool)> {
+            let fts_schema_rows = self.conn.query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
                 fparams![],
-                |row| row.get_typed(0),
-            )
-            .with_context(|| "loading bounded canonical conversation IDs for FTS parity")
-            .map(|ids| ids.into_iter().collect())
-    }
+                |row| row.get_typed::<i64>(0),
+            )?;
+            let fts_queryable = fts_schema_rows == 1
+                && self.conn.query("SELECT COUNT(*) FROM fts_messages").is_ok();
+            Ok((fts_schema_rows, fts_queryable))
+        })();
 
-    /// Compute exact canonical/FTS rowid intersection in one bounded-memory,
-    /// shadow-driven pass. A partial 39k-row shadow performs 39k primary-key
-    /// probes rather than streaming the multi-million-row canonical message
-    /// table; a complete shadow remains exact and read-only. Memory scales
-    /// with parent conversations, not messages or the FTS rowid domain.
-    fn count_fts_indexed_canonical_intersection(&self) -> Result<i64> {
-        let conversation_ids = self.load_fts_conversation_id_set()?;
-        let mut intersection_messages = 0_i64;
-        let mut count_overflowed = false;
-        self.conn
-            .query_with_params_for_each(FTS_INDEXED_CANONICAL_INTERSECTION_SQL, &[], |row| {
-                let conversation_id = row.get_typed::<i64>(0)?;
-                if conversation_ids.contains(&conversation_id) {
-                    match intersection_messages.checked_add(1) {
-                        Some(next) => intersection_messages = next,
-                        None => count_overflowed = true,
-                    }
-                }
-                Ok(())
-            })
-            .with_context(|| "streaming exact shadow-driven canonical/FTS intersection")?;
-        anyhow::ensure!(!count_overflowed, "FTS parity row count exceeds i64::MAX");
-        Ok(intersection_messages)
-    }
+        let (fts_schema_rows, fts_queryable) = match inspection {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "frankensqlite FTS consistency probe failed; rebuilding authoritative FTS"
+                );
+                let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
+                self.record_fts_franken_rebuild_generation()?;
+                return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+            }
+        };
 
-    fn count_fts_indexable_messages(&self) -> Result<i64> {
-        self.conn
-            .query_row_map(FTS_INDEXABLE_MESSAGE_COUNT_SQL, fparams![], |row| {
-                row.get_typed::<i64>(0)
-            })
-            .with_context(|| "counting exact canonical FTS messages by parent index runs")
-    }
+        if fts_schema_rows != 1 || !fts_queryable {
+            let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
+            self.record_fts_franken_rebuild_generation()?;
+            return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+        }
 
-    pub(crate) fn inspect_search_fallback_fts_parity(&self) -> Result<FtsShadowParity> {
-        let canonical_messages =
+        let total_messages =
             self.conn
                 .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
                     row.get_typed::<i64>(0)
                 })?;
-        let fts_schema_rows = self.conn.query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            fparams![],
-            |row| row.get_typed::<i64>(0),
-        )?;
+        let indexed_messages =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+                    row.get_typed::<i64>(0)
+                })?;
 
-        if fts_schema_rows == 0 {
-            return Ok(FtsShadowParity {
-                status: FtsShadowParityStatus::Absent,
-                canonical_messages,
-                indexable_messages: self.count_fts_indexable_messages()?,
-                indexed_messages: None,
-                detail: None,
-            });
-        }
-        if fts_schema_rows != 1 {
-            return Ok(FtsShadowParity {
-                status: FtsShadowParityStatus::Unqueryable,
-                canonical_messages,
-                indexable_messages: self.count_fts_indexable_messages()?,
-                indexed_messages: None,
-                detail: Some(format!(
-                    "sqlite_master contains {fts_schema_rows} fts_messages rows; expected exactly one"
-                )),
+        if indexed_messages == total_messages {
+            self.set_fts_messages_present_cache(true);
+            return Ok(FtsConsistencyRepair::AlreadyHealthy {
+                rows: usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX),
             });
         }
 
-        // The docsize shadow has one row per contentless FTS document and is
-        // much cheaper to count than asking the virtual table to materialize a
-        // multi-million-row scan. Failure is itself a corruption signal.
-        let indexed_messages = match self.conn.query_row_map(
-            "SELECT COUNT(*) FROM fts_messages_docsize",
-            fparams![],
-            |row| row.get_typed::<i64>(0),
-        ) {
-            Ok(count) => count,
-            Err(err) => {
-                return Ok(FtsShadowParity {
-                    status: FtsShadowParityStatus::Unqueryable,
-                    canonical_messages,
-                    indexable_messages: self.count_fts_indexable_messages()?,
-                    indexed_messages: None,
-                    detail: Some(format!("counting fts_messages_docsize failed: {err}")),
-                });
-            }
-        };
-        anyhow::ensure!(
-            indexed_messages >= 0,
-            "invalid FTS docsize count: {indexed_messages}"
-        );
-        let indexable_messages = self.count_fts_indexable_messages()?;
-        let intersection_messages = self.count_fts_indexed_canonical_intersection()?;
-        anyhow::ensure!(
-            intersection_messages >= 0
-                && intersection_messages <= indexable_messages
-                && intersection_messages <= indexed_messages,
-            "invalid canonical/FTS intersection cardinality: intersection={intersection_messages}, indexable={indexable_messages}, indexed={indexed_messages}"
-        );
-        let missing_messages = indexable_messages.saturating_sub(intersection_messages);
-        let excess_messages = indexed_messages.saturating_sub(intersection_messages);
-        let (status, detail) = match indexed_messages.cmp(&indexable_messages) {
-            std::cmp::Ordering::Less => {
-                if excess_messages > 0 {
-                    (
-                        FtsShadowParityStatus::Divergent,
-                        Some(format!(
-                            "FTS contains {excess_messages} non-canonical rowids while {missing_messages} canonical rowids are missing (intersection={intersection_messages})"
-                        )),
-                    )
-                } else {
-                    (FtsShadowParityStatus::Partial, None)
-                }
-            }
-            std::cmp::Ordering::Equal => {
-                if missing_messages > 0 || excess_messages > 0 {
-                    (
-                        FtsShadowParityStatus::Divergent,
-                        Some(format!(
-                            "equal counts conceal rowid divergence (missing_canonical_rowids={missing_messages}, excess_fts_rowids={excess_messages}, intersection={intersection_messages})"
-                        )),
-                    )
-                } else {
-                    (FtsShadowParityStatus::Healthy, None)
-                }
-            }
-            std::cmp::Ordering::Greater => {
-                if missing_messages > 0 {
-                    (
-                        FtsShadowParityStatus::Divergent,
-                        Some(format!(
-                            "FTS has {excess_messages} excess non-canonical rowids while {missing_messages} canonical rowids are missing (intersection={intersection_messages})"
-                        )),
-                    )
-                } else {
-                    (FtsShadowParityStatus::Excess, None)
-                }
-            }
-        };
-        Ok(FtsShadowParity {
-            status,
-            canonical_messages,
-            indexable_messages,
-            indexed_messages: Some(indexed_messages),
-            detail,
-        })
-    }
+        if indexed_messages > total_messages {
+            let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
+            self.record_fts_franken_rebuild_generation()?;
+            return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+        }
 
-    fn rebuild_unusable_fts_shadow(&self, before: &FtsShadowParity) -> Result<usize> {
-        if before.status != FtsShadowParityStatus::Absent {
-            anyhow::bail!(
-                "refusing destructive FTS recreation for a {} shadow; preserve the complete database bundle",
-                before.status.as_str()
+        let inserted_rows = self
+            .stream_fts_rows_via_frankensqlite(true)
+            .with_context(|| "incrementally repairing missing FTS rows via frankensqlite")?;
+        let repaired_rows =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+                    row.get_typed::<i64>(0)
+                })?;
+        if repaired_rows == total_messages {
+            self.set_fts_messages_present_cache(true);
+            return Ok(FtsConsistencyRepair::IncrementalCatchUp {
+                inserted_rows,
+                total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
+            });
+        }
+
+        // The incremental catch-up found nothing to insert, yet the gap
+        // between total_messages (all rows, including orphans) and
+        // indexed_messages (only rows with valid conversation_id, since the
+        // FTS INSERT inner-joins on conversations) remains.  A full rebuild
+        // cannot close this gap either — the orphaned messages will be
+        // excluded again — so falling through to one would just re-do ~5 min
+        // of work on every startup.  Accept the current state.
+        if inserted_rows == 0 {
+            tracing::debug!(
+                target: "cass::fts_rebuild",
+                indexed_messages = repaired_rows,
+                total_messages,
+                un_indexable_gap = total_messages.saturating_sub(repaired_rows),
+                "FTS catch-up inserted 0 rows; remaining gap is un-indexable (likely orphaned messages with dangling conversation_id)"
             );
+            self.set_fts_messages_present_cache(true);
+            return Ok(FtsConsistencyRepair::IncrementalCatchUp {
+                inserted_rows: 0,
+                total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
+            });
         }
-        self.rebuild_fts_via_frankensqlite()
-    }
 
-    fn require_healthy_fts_parity(&self, context: &str) -> Result<FtsShadowParity> {
-        let parity = self.inspect_search_fallback_fts_parity()?;
-        if parity.status != FtsShadowParityStatus::Healthy {
-            anyhow::bail!(
-                "{context} did not reach canonical/FTS parity: status={}, canonical_messages={}, indexable_messages={}, indexed_messages={:?}, detail={:?}",
-                parity.status.as_str(),
-                parity.canonical_messages,
-                parity.indexable_messages,
-                parity.indexed_messages,
-                parity.detail
-            );
-        }
-        Ok(parity)
-    }
-
-    fn ensure_fts_consistency_via_frankensqlite(&self) -> Result<FtsConsistencyRepair> {
-        let before = self.inspect_search_fallback_fts_parity()?;
-        match before.status {
-            FtsShadowParityStatus::Healthy => {
-                self.record_fts_franken_rebuild_generation()?;
-                self.set_fts_messages_present_cache(true);
-                Ok(FtsConsistencyRepair::AlreadyHealthy {
-                    rows: usize::try_from(before.indexable_messages.max(0)).unwrap_or(usize::MAX),
-                })
-            }
-            FtsShadowParityStatus::Partial => {
-                let inserted_rows = self
-                    .stream_fts_rows_via_frankensqlite(true)
-                    .with_context(|| "resuming missing FTS rows via frankensqlite")?;
-                let after = self.require_healthy_fts_parity("resumable FTS catch-up")?;
-                self.record_fts_franken_rebuild_generation()?;
-                self.set_fts_messages_present_cache(true);
-                Ok(FtsConsistencyRepair::IncrementalCatchUp {
-                    inserted_rows,
-                    total_rows: usize::try_from(after.indexable_messages.max(0))
-                        .unwrap_or(usize::MAX),
-                })
-            }
-            FtsShadowParityStatus::Absent => {
-                let inserted_rows = self.rebuild_unusable_fts_shadow(&before)?;
-                self.require_healthy_fts_parity("FTS recreation")?;
-                self.record_fts_franken_rebuild_generation()?;
-                self.set_fts_messages_present_cache(true);
-                Ok(FtsConsistencyRepair::Rebuilt { inserted_rows })
-            }
-            FtsShadowParityStatus::Unqueryable => anyhow::bail!(
-                "refusing to replace an unqueryable FTS shadow in place because its prior artifact cannot be proven restorable; preserve the complete database bundle for staged recovery"
-            ),
-            FtsShadowParityStatus::Excess | FtsShadowParityStatus::Divergent => anyhow::bail!(
-                "refusing to drop a queryable {} FTS shadow (indexed={}, indexable={}); preserve the current artifact and use a failure-atomic staged rebuild",
-                before.status.as_str(),
-                before.indexed_messages.unwrap_or_default(),
-                before.indexable_messages
-            ),
-        }
+        // Incremental made progress but didn't fully close the gap — something
+        // is genuinely inconsistent, so do a full rebuild.
+        let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
+        self.record_fts_franken_rebuild_generation()?;
+        Ok(FtsConsistencyRepair::Rebuilt { inserted_rows })
     }
 
     pub(crate) fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
         self.invalidate_fts_messages_present_cache();
-        let before = self
-            .inspect_search_fallback_fts_parity()
-            .with_context(|| "inspecting the published FTS shadow before atomic rebuild")?;
         self.conn
-            .execute_batch("BEGIN IMMEDIATE TRANSACTION;")
-            .with_context(|| "starting failure-atomic FTS rebuild transaction")?;
+            .execute("DROP TABLE IF EXISTS fts_messages;")
+            .with_context(|| "dropping derived fts_messages before frankensqlite rebuild")?;
+        self.conn
+            .execute_compat(FTS5_REGISTER_SQL, fparams![])
+            .with_context(|| "creating derived fts_messages via frankensqlite rebuild")?;
+        self.set_fts_messages_present_cache(true);
 
-        let rebuild_result = (|| -> Result<usize> {
-            match before.status {
-                FtsShadowParityStatus::Absent => {
-                    self.conn
-                        .execute_compat(FTS5_REGISTER_SQL, fparams![])
-                        .with_context(|| "creating fts_messages inside atomic rebuild")?;
-                }
-                FtsShadowParityStatus::Healthy
-                | FtsShadowParityStatus::Partial
-                | FtsShadowParityStatus::Excess
-                | FtsShadowParityStatus::Divergent => {
-                    self.conn.execute(FTS5_DELETE_ALL_SQL).with_context(|| {
-                        "clearing the queryable FTS shadow transactionally; a legacy shadow \
-                         without contentless_delete=1 is preserved and requires resumable \
-                         repair instead"
-                    })?;
-                }
-                FtsShadowParityStatus::Unqueryable => anyhow::bail!(
-                    "refusing to replace an unqueryable FTS shadow in place because its \
-                     prior artifact cannot be proven restorable; preserve the complete \
-                     database bundle for staged recovery"
-                ),
-            }
-            self.set_fts_messages_present_cache(true);
-            #[cfg(test)]
-            injected_fts_rebuild_interruption(1)?;
-
-            let inserted_rows = self.stream_fts_rows_via_frankensqlite(false)?;
-            self.require_healthy_fts_parity("transactional FTS rebuild")?;
-            self.record_fts_franken_rebuild_generation()?;
-            self.conn
-                .execute_batch("COMMIT;")
-                .with_context(|| "publishing failure-atomic FTS rebuild transaction")?;
-            Ok(inserted_rows)
-        })();
-
-        match rebuild_result {
-            Ok(inserted_rows) => {
-                self.set_fts_messages_present_cache(true);
-                Ok(inserted_rows)
-            }
-            Err(err) => {
-                self.invalidate_fts_messages_present_cache();
-                match self.conn.execute_batch("ROLLBACK;") {
-                    Ok(()) => Err(err.context(
-                        "failure-atomic FTS rebuild rolled back without publishing a partial shadow",
-                    )),
-                    Err(rollback_err) => {
-                        tracing::error!(
-                            error = %err,
-                            rollback_error = %rollback_err,
-                            "FTS rebuild failed and explicit rollback could not be confirmed"
-                        );
-                        Err(err.context(format!(
-                            "FTS rebuild failed and rollback could not be confirmed: \
-                             {rollback_err}. Preserve the complete database bundle and inspect \
-                             exact FTS parity before any retry"
-                        )))
-                    }
-                }
-            }
-        }
-    }
-
-    /// `coding_agent_session_search-uhhxy`: rebuild the in-DB FTS5 shadow
-    /// (`fts_messages`) after `cass dedup --apply` drops duplicate
-    /// conversation rows, so the canonical-DB-backed full-text shadow no
-    /// longer references messages that were deleted. The separate on-disk
-    /// lexical search index (frankensearch) is rebuilt by the blessed
-    /// `cass index --full` path; this wrapper only reconciles the in-DB
-    /// shadow that the dedup deletion left stale.
-    pub fn rebuild_lexical_index_after_dedup(&self) -> Result<()> {
-        self.rebuild_fts_via_frankensqlite().map(|_| ())
+        self.stream_fts_rows_via_frankensqlite(false)
     }
 
     fn stream_fts_rows_via_frankensqlite(&self, missing_only: bool) -> Result<usize> {
@@ -11260,30 +10449,27 @@ impl FrankenStorage {
         let conversation_by_id = self.load_fts_conversation_projection_map()?;
         let agent_slug_by_id = self.load_fts_agent_slug_map()?;
         let workspace_path_by_id = self.load_fts_workspace_path_map()?;
+        let existing_fts_rowids = if missing_only {
+            Some(self.load_fts_message_rowid_set()?)
+        } else {
+            None
+        };
         let mut entries = Vec::new();
         let mut pending_chars = 0usize;
 
         loop {
-            let page = self.fetch_fts_rebuild_message_page(last_rowid, batch_limit)?;
-            let fetched_count = page.rows.len();
-            if fetched_count == 0 && page.exhausted {
+            let rows = self.fetch_fts_rebuild_message_rows(last_rowid, batch_limit)?;
+            let fetched_count = rows.len();
+            if fetched_count == 0 {
                 break;
             }
-            // Keep resumable repair bounded by the canonical page size. The
-            // previous implementation loaded every existing FTS rowid into a
-            // process-wide HashSet, which scaled with a multi-million-message
-            // archive before the first repair batch could make progress.
-            let existing_fts_rowids = if missing_only {
-                Some(self.load_fts_message_rowid_set_for_batch(&page.rows)?)
-            } else {
-                None
-            };
 
             let inserted_before_batch = total_inserted;
             let skipped_before_batch = total_skipped_orphans;
             let existing_before_batch = total_skipped_existing;
 
-            for row in page.rows {
+            for row in rows {
+                last_rowid = row.rowid;
                 if existing_fts_rowids
                     .as_ref()
                     .is_some_and(|rowids| rowids.contains(&row.message_id))
@@ -11344,32 +10530,12 @@ impl FrankenStorage {
                 total_inserted,
                 total_skipped_orphans,
                 total_skipped_existing,
-                last_rowid = page.last_rowid,
-                planned_body_bytes = page.planned_body_bytes,
-                oversized_single_body = page.oversized_single_body,
+                last_rowid,
                 missing_only,
                 "FTS streaming maintenance batch complete"
             );
 
-            // Planning and body retrieval share one savepoint snapshot, so
-            // this is the exact prefix boundary whose row/byte invariants were
-            // checked before any FTS insert.
-            last_rowid = page.last_rowid;
-
-            #[cfg(test)]
-            emit_fts_page_diagnostics(
-                self,
-                &format!(
-                    "stream_batch_complete last_rowid={last_rowid} total_inserted={total_inserted}"
-                ),
-            );
-
-            #[cfg(test)]
-            if total_inserted > 0 {
-                injected_fts_rebuild_interruption(2)?;
-            }
-
-            if page.exhausted {
+            if fetched_count < batch_size {
                 break;
             }
         }
@@ -11377,214 +10543,40 @@ impl FrankenStorage {
         Ok(total_inserted)
     }
 
-    fn fetch_fts_rebuild_message_page(
+    fn fetch_fts_rebuild_message_rows(
         &self,
         last_rowid: i64,
         batch_limit: i64,
-    ) -> Result<FtsRebuildMessagePage> {
-        self.fetch_fts_rebuild_message_page_with_cap(
-            last_rowid,
-            batch_limit,
-            FTS_ENTRY_BATCH_MAX_CHARS,
-        )
-    }
-
-    fn fetch_fts_rebuild_message_page_with_cap(
-        &self,
-        last_rowid: i64,
-        batch_limit: i64,
-        max_body_bytes: usize,
-    ) -> Result<FtsRebuildMessagePage> {
-        const PAGE_SAVEPOINT: &str = "cass_fts_rebuild_page";
+    ) -> Result<Vec<FtsRebuildMessageRow>> {
         self.conn
-            .execute("SAVEPOINT cass_fts_rebuild_page")
-            .with_context(|| "starting coherent FTS page read snapshot")?;
-        let page = self.fetch_fts_rebuild_message_page_in_snapshot(
-            last_rowid,
-            batch_limit,
-            max_body_bytes,
-        );
-        match page {
-            Ok(page) => {
-                if let Err(release_err) = self.conn.execute("RELEASE cass_fts_rebuild_page") {
-                    let rollback = self.conn.execute_batch(
-                        "ROLLBACK TO SAVEPOINT cass_fts_rebuild_page; \
-                         RELEASE SAVEPOINT cass_fts_rebuild_page;",
-                    );
-                    anyhow::bail!(
-                        "releasing coherent FTS page read snapshot {PAGE_SAVEPOINT} failed: \
-                         {release_err}; rollback={rollback:?}"
-                    );
-                }
-                Ok(page)
-            }
-            Err(err) => {
-                let rollback = self.conn.execute_batch(
-                    "ROLLBACK TO SAVEPOINT cass_fts_rebuild_page; \
-                     RELEASE SAVEPOINT cass_fts_rebuild_page;",
-                );
-                if let Err(rollback_err) = rollback {
-                    return Err(err.context(format!(
-                        "rolling back coherent FTS page read snapshot {PAGE_SAVEPOINT} also failed: {rollback_err}"
-                    )));
-                }
-                Err(err)
-            }
-        }
-    }
-
-    fn fetch_fts_rebuild_message_page_in_snapshot(
-        &self,
-        last_rowid: i64,
-        batch_limit: i64,
-        max_body_bytes: usize,
-    ) -> Result<FtsRebuildMessagePage> {
-        // Plan the page without materializing message bodies. The previous
-        // LIMIT-only query could load 5,000 arbitrarily large strings before
-        // the downstream 32 MiB entry-flush cap had a chance to run.
-        let headers: Vec<(i64, usize)> = self
-            .conn
             .query_map_collect(
-                "SELECT m.rowid, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
+                "SELECT m.rowid, m.id, m.conversation_id, m.content, m.created_at
                  FROM messages m
                  WHERE m.rowid > ?1
                  ORDER BY m.rowid
                  LIMIT ?2",
                 fparams![last_rowid, batch_limit],
                 |row| {
-                    let body_bytes = row.get_typed::<i64>(1)?.max(0);
-                    Ok((
-                        row.get_typed(0)?,
-                        usize::try_from(body_bytes).unwrap_or(usize::MAX),
-                    ))
-                },
-            )
-            .with_context(|| {
-                format!("planning bounded FTS maintenance page after rowid {last_rowid}")
-            })?;
-        let Some(plan) = plan_fts_rebuild_message_page(&headers, max_body_bytes) else {
-            return Ok(FtsRebuildMessagePage {
-                rows: Vec::new(),
-                last_rowid,
-                exhausted: true,
-                planned_body_bytes: 0,
-                oversized_single_body: false,
-            });
-        };
-        #[cfg(test)]
-        run_fts_page_after_plan_hook();
-        let batch_limit = usize::try_from(batch_limit).unwrap_or(usize::MAX);
-        let exhausted = plan.selected_rows == headers.len() && headers.len() < batch_limit;
-        let rows = self
-            .conn
-            .query_map_collect(
-                "SELECT m.id, m.conversation_id, m.content, m.created_at
-                 FROM messages m
-                 WHERE m.rowid > ?1 AND m.rowid <= ?2
-                 ORDER BY m.rowid
-                ",
-                fparams![last_rowid, plan.last_rowid],
-                |row| {
                     Ok(FtsRebuildMessageRow {
-                        message_id: row.get_typed(0)?,
-                        conversation_id: row.get_typed(1)?,
-                        content: row.get_typed::<Option<String>>(2)?.unwrap_or_default(),
-                        created_at: row.get_typed(3)?,
+                        rowid: row.get_typed(0)?,
+                        message_id: row.get_typed(1)?,
+                        conversation_id: row.get_typed(2)?,
+                        content: row.get_typed::<Option<String>>(3)?.unwrap_or_default(),
+                        created_at: row.get_typed(4)?,
                     })
                 },
             )
-            .with_context(|| {
-                format!(
-                    "fetching byte-bounded FTS maintenance messages after rowid {last_rowid} through {}",
-                    plan.last_rowid
-                )
-            })?;
-        let materialized_body_bytes = rows
-            .iter()
-            .fold(0usize, |total, row| total.saturating_add(row.content.len()));
-        if rows.len() != plan.selected_rows || materialized_body_bytes != plan.body_bytes {
-            anyhow::bail!(
-                "coherent FTS page violated its metadata/body snapshot invariant: \
-                 planned_rows={}, materialized_rows={}, planned_body_bytes={}, \
-                 materialized_body_bytes={materialized_body_bytes}",
-                plan.selected_rows,
-                rows.len(),
-                plan.body_bytes
-            );
-        }
-        Ok(FtsRebuildMessagePage {
-            rows,
-            last_rowid: plan.last_rowid,
-            exhausted,
-            planned_body_bytes: plan.body_bytes,
-            oversized_single_body: plan.body_bytes > max_body_bytes,
-        })
+            .with_context(|| format!("fetching FTS maintenance messages after rowid {last_rowid}"))
     }
 
-    fn load_fts_message_rowid_set_for_batch(
-        &self,
-        rows: &[FtsRebuildMessageRow],
-    ) -> Result<HashSet<i64>> {
-        if rows.is_empty() {
-            return Ok(HashSet::new());
-        }
-
-        // A rowid range is not bounded by `rows.len()`: imported archives can
-        // have sparse message IDs, so MIN..MAX could materialize millions of
-        // unrelated docsize rows for a 5,000-row repair page. A plain IN-list
-        // is not suitable on the pinned frankensqlite either: its current VDBE
-        // plan rewinds the table and evaluates the list as a residual filter.
-        // Compound UNION ALL probes are also unsafe on that version because
-        // its prepared SELECT path compiles only the first compound arm.
-        //
-        // Materialize only this page's IDs in a connection-local TEMP table,
-        // then drive a join from that bounded table into the docsize shadow.
-        // FrankenSQLite's multi-join lookup path rewinds the small driver and
-        // emits one SeekRowid into the large table for each requested ID. That
-        // keeps work and memory O(page size) without 5,000 query dispatches;
-        // the ignored two-million-row regression below measures the complete
-        // page and the plan tests pin the driver/seek cursor assignments.
-        self.conn
-            .execute(
-                "CREATE TEMP TABLE IF NOT EXISTS cass_fts_repair_probe_ids(
-                     id INTEGER PRIMARY KEY
-                 )",
-            )
-            .with_context(|| "creating connection-local FTS rowid probe table")?;
-        self.conn
-            .execute("DELETE FROM cass_fts_repair_probe_ids")
-            .with_context(|| "clearing connection-local FTS rowid probe table")?;
-        for chunk in rows.chunks(FTS_EXACT_ROWID_PROBE_INSERT_CHUNK_SIZE) {
-            let sql = fts_exact_rowid_probe_insert_sql(chunk.len());
-            let params: Vec<SqliteValue> = chunk
-                .iter()
-                .map(|row| SqliteValue::from(row.message_id))
-                .collect();
-            self.conn
-                .execute_with_params(&sql, &params)
-                .with_context(|| "loading bounded FTS rowid probe page")?;
-        }
-
-        let mut existing = HashSet::with_capacity(rows.len());
-        let statement = self
+    fn load_fts_message_rowid_set(&self) -> Result<HashSet<i64>> {
+        let rows: Vec<i64> = self
             .conn
-            .prepare(
-                "SELECT f.id
-                 FROM cass_fts_repair_probe_ids requested
-                 INNER JOIN fts_messages_docsize f ON f.id = requested.id",
-            )
-            .with_context(|| "preparing bounded exact FTS docsize rowid join")?;
-        let matched = statement
-            .query_with_params(&[])
-            .with_context(|| "probing bounded exact FTS docsize rowids")?;
-        for matched_row in matched {
-            existing.insert(
-                matched_row
-                    .get_typed::<i64>(0)
-                    .with_context(|| "decoding exact FTS docsize rowid probe result")?,
-            );
-        }
-        Ok(existing)
+            .query_map_collect("SELECT rowid FROM fts_messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .with_context(|| "loading existing FTS message rowids")?;
+        Ok(rows.into_iter().collect())
     }
 
     fn load_fts_conversation_projection_map(
@@ -14099,11 +13091,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
 }
 
 /// Batch insert FTS5 entries within a frankensqlite transaction.
-fn franken_batch_insert_fts(
-    storage: &FrankenStorage,
-    tx: &FrankenTransaction<'_>,
-    entries: &[FtsEntry],
-) -> Result<usize> {
+fn franken_batch_insert_fts(tx: &FrankenTransaction<'_>, entries: &[FtsEntry]) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
@@ -14150,25 +13138,11 @@ fn franken_batch_insert_fts(
                 inserted += chunk.len();
             }
             Err(err) => {
-                if err.to_string().contains("no such table") {
-                    // Fresh DB / Tantivy-authoritative path (#295): the FTS5
-                    // shadow tables are not materialized yet. db-resident FTS
-                    // is best-effort here, so stop probing/inserting for the
-                    // rest of this process instead of emitting a warning on
-                    // every batch (which pegged a core on large corpora).
-                    storage.set_fts_messages_present_cache(false);
-                    tracing::debug!(
-                        error = %err,
-                        chunk_docs = chunk.len(),
-                        "fts_messages not materialized yet; skipping db-resident FTS maintenance (Tantivy is authoritative)"
-                    );
-                } else {
-                    tracing::warn!(
-                        error = %err,
-                        chunk_docs = chunk.len(),
-                        "frankensqlite FTS batch insert failed; skipping db-resident FTS maintenance because Tantivy is authoritative"
-                    );
-                }
+                tracing::warn!(
+                    error = %err,
+                    chunk_docs = chunk.len(),
+                    "frankensqlite FTS batch insert failed; skipping db-resident FTS maintenance because Tantivy is authoritative"
+                );
                 return Ok(inserted);
             }
         }
@@ -14429,111 +13403,26 @@ fn franken_update_daily_stats_batched_in_tx(
     tx: &FrankenTransaction<'_>,
     entries: &[(i64, String, String, StatsDelta)],
 ) -> Result<usize> {
-    franken_update_daily_stats_batched_in_tx_for_target(
-        tx,
-        entries,
-        DailyStatsBatchTarget::Canonical,
-    )
-}
-
-#[derive(Debug, Clone, Copy)]
-enum DailyStatsBatchTarget {
-    Canonical,
-    RebuildStage,
-}
-
-impl DailyStatsBatchTarget {
-    fn upsert_sql(self) -> &'static str {
-        match self {
-            Self::Canonical => {
-                "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)
-                 ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
-                     session_count = session_count + excluded.session_count,
-                     message_count = message_count + excluded.message_count,
-                     total_chars = total_chars + excluded.total_chars,
-                     last_updated = excluded.last_updated"
-            }
-            Self::RebuildStage => {
-                "INSERT INTO daily_stats_rebuild_stage (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)
-                 ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
-                     session_count = session_count + excluded.session_count,
-                     message_count = message_count + excluded.message_count,
-                     total_chars = total_chars + excluded.total_chars,
-                     last_updated = excluded.last_updated"
-            }
-        }
-    }
-}
-
-fn franken_update_daily_stats_batched_in_tx_for_target(
-    tx: &FrankenTransaction<'_>,
-    entries: &[(i64, String, String, StatsDelta)],
-    target: DailyStatsBatchTarget,
-) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
 
     let now = FrankenStorage::now_millis();
     let mut total_affected = 0;
-    let upsert_sql = target.upsert_sql();
 
     // Keep frankensqlite UPSERTs row-wise inside the transaction. The
     // multi-row VALUES ... ON CONFLICT form still falls back through
     // INSERT...SELECT in fsqlite-core, which rejects UPSERT/RETURNING during
     // real cass indexing.
     for (day_id, agent, source, delta) in entries {
-        // The rebuild stage is connection-local and already serialized by the
-        // caller. Avoid routing its repeated aggregate keys through
-        // `INSERT ... ON CONFLICT`: FrankenSQLite currently reports the
-        // primary-key conflict before applying the DO UPDATE arm for this TEMP
-        // table shape. An explicit update-then-insert keeps the same additive
-        // semantics without extending the legacy SQLite fallback.
-        if matches!(target, DailyStatsBatchTarget::RebuildStage) {
-            let rows_changed = tx.execute_compat(
-                "UPDATE daily_stats_rebuild_stage
-                 SET session_count = session_count + ?4,
-                     message_count = message_count + ?5,
-                     total_chars = total_chars + ?6,
-                     last_updated = ?7
-                 WHERE day_id = ?1 AND agent_slug = ?2 AND source_id = ?3",
-                fparams![
-                    *day_id,
-                    agent.as_str(),
-                    source.as_str(),
-                    delta.session_count_delta,
-                    delta.message_count_delta,
-                    delta.total_chars_delta,
-                    now
-                ],
-            )?;
-            if rows_changed > 0 {
-                total_affected += rows_changed;
-                continue;
-            }
-
-            total_affected += tx.execute_compat(
-                "INSERT INTO daily_stats_rebuild_stage (
-                     day_id, agent_slug, source_id, session_count,
-                     message_count, total_chars, last_updated
-                 ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                fparams![
-                    *day_id,
-                    agent.as_str(),
-                    source.as_str(),
-                    delta.session_count_delta,
-                    delta.message_count_delta,
-                    delta.total_chars_delta,
-                    now
-                ],
-            )?;
-            continue;
-        }
-
         total_affected += tx.execute_compat(
-            upsert_sql,
+            "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+                 session_count = session_count + excluded.session_count,
+                 message_count = message_count + excluded.message_count,
+                 total_chars = total_chars + excluded.total_chars,
+                 last_updated = excluded.last_updated",
             fparams![
                 *day_id,
                 agent.as_str(),
@@ -15335,18 +14224,16 @@ impl FrankenStorage {
             DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE,
         );
 
-        let total_messages: i64 = self
-            .conn
-            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .with_context(|| "daily_stats phase=count_messages table=messages")?;
-        let message_metrics_rows: i64 = self
-            .conn
-            .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .with_context(|| "daily_stats phase=count_messages table=message_metrics")?;
+        let total_messages: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
+        let message_metrics_rows: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
         let use_message_metrics = total_messages > 0 && total_messages == message_metrics_rows;
 
         tracing::info!(
@@ -15357,29 +14244,8 @@ impl FrankenStorage {
             "daily_stats rebuild selected message source"
         );
 
-        // Build into a connection-local staging table and commit every bounded
-        // aggregate batch. Holding one write transaction for the entire archive
-        // makes the engine retain transaction state proportional to the full
-        // message corpus, defeating the bounded query batches above. The live
-        // materialization remains untouched until the final atomic publish, so
-        // an interrupted rebuild leaves the last known-good stats available.
-        self.conn
-            .execute(
-                "CREATE TEMP TABLE IF NOT EXISTS daily_stats_rebuild_stage (
-                day_id INTEGER NOT NULL,
-                agent_slug TEXT NOT NULL,
-                source_id TEXT NOT NULL,
-                session_count INTEGER NOT NULL DEFAULT 0,
-                message_count INTEGER NOT NULL DEFAULT 0,
-                total_chars INTEGER NOT NULL DEFAULT 0,
-                last_updated INTEGER NOT NULL,
-                PRIMARY KEY (day_id, agent_slug, source_id)
-            )",
-            )
-            .with_context(|| "daily_stats phase=create_stage")?;
-        self.conn
-            .execute("DELETE FROM daily_stats_rebuild_stage")
-            .with_context(|| "daily_stats phase=clear_stage")?;
+        let mut tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM daily_stats")?;
 
         let mut last_conversation_id = 0_i64;
         let mut conversation_batch_count = 0_usize;
@@ -15390,30 +14256,20 @@ impl FrankenStorage {
         let mut expanded_entries_flushed = 0_usize;
         let message_scan_sql = if use_message_metrics {
             "SELECT m.idx, mm.content_chars
-             FROM messages m INDEXED BY sqlite_autoindex_messages_1
+             FROM messages m
              JOIN message_metrics mm ON mm.message_id = m.id
              WHERE m.conversation_id = ?1
                AND m.idx > ?2
-             ORDER BY m.idx
+             ORDER BY m.conversation_id, m.idx
              LIMIT ?3"
         } else {
             "SELECT m.idx, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
-             FROM messages m INDEXED BY sqlite_autoindex_messages_1
+             FROM messages m
              WHERE m.conversation_id = ?1
                AND m.idx > ?2
-             ORDER BY m.idx
+             ORDER BY m.conversation_id, m.idx
              LIMIT ?3"
         };
-        // #329: prepare this once and stream each bounded page through the row
-        // handler. Re-preparing and materializing one Vec per conversation/page
-        // retained engine execution state until the 967k-message field corpus
-        // reached ~10.4 GiB RSS and failed with an internal OOM. The explicit
-        // uniqueness-index hint pins the `(conversation_id, idx)` keyset walk;
-        // neither memory nor planner work scales with unrelated messages.
-        let message_scan_statement = self
-            .conn
-            .prepare(message_scan_sql)
-            .with_context(|| "preparing daily_stats bounded message scan")?;
 
         loop {
             // Avoid the 2-table JOIN with LIMIT that triggers frankensqlite's
@@ -15446,13 +14302,7 @@ impl FrankenStorage {
                     );
                     continue;
                 }
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!(
-                            "daily_stats phase=conversation_scan last_conversation_id={last_conversation_id} batch_size={conversation_batch_size}"
-                        )
-                    });
-                }
+                Err(err) => return Err(err.into()),
             };
             if conversation_rows.is_empty() {
                 break;
@@ -15478,26 +14328,7 @@ impl FrankenStorage {
             let entries = aggregate.expand();
             expanded_entries_flushed += entries.len();
             if !entries.is_empty() {
-                let mut batch_tx = self.conn.transaction().with_context(|| {
-                    format!(
-                        "daily_stats phase=conversation_stage_begin last_conversation_id={last_conversation_id}"
-                    )
-                })?;
-                franken_update_daily_stats_batched_in_tx_for_target(
-                    &batch_tx,
-                    &entries,
-                    DailyStatsBatchTarget::RebuildStage,
-                )
-                .with_context(|| {
-                    format!(
-                        "daily_stats phase=conversation_stage_upsert last_conversation_id={last_conversation_id}"
-                    )
-                })?;
-                batch_tx.commit().with_context(|| {
-                    format!(
-                        "daily_stats phase=conversation_stage_commit last_conversation_id={last_conversation_id}"
-                    )
-                })?;
+                franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
             }
             if conversation_batch_count.is_multiple_of(25) {
                 tracing::info!(
@@ -15516,33 +14347,15 @@ impl FrankenStorage {
             for (conversation_id, day_id, agent_slug, source_id) in conversation_batch_meta {
                 let mut cursor_message_idx = -1_i64;
                 loop {
-                    let page_start_message_idx = cursor_message_idx;
-                    let mut next_message_idx = cursor_message_idx;
-                    let mut page_rows = 0_usize;
-                    let mut aggregate = StatsAggregator::new();
-                    let scan_params = [
-                        SqliteValue::from(conversation_id),
-                        SqliteValue::from(page_start_message_idx),
-                        SqliteValue::from(message_batch_size as i64),
-                    ];
-                    let scan_result =
-                        message_scan_statement.query_with_params_for_each(&scan_params, |row| {
-                            let message_idx: i64 = row.get_typed(0)?;
-                            let content_len: i64 = row.get_typed(1)?;
-                            next_message_idx = message_idx;
-                            page_rows = page_rows.saturating_add(1);
-                            aggregate.record_delta(
-                                &agent_slug,
-                                &source_id,
-                                day_id,
-                                0,
-                                1,
-                                content_len,
-                            );
-                            Ok(())
-                        });
-                    match scan_result {
-                        Ok(()) => cursor_message_idx = next_message_idx,
+                    let message_rows = match self.conn.query_with_params(
+                        message_scan_sql,
+                        &params_from_iter([
+                            ParamValue::from(conversation_id),
+                            ParamValue::from(cursor_message_idx),
+                            ParamValue::from(message_batch_size as i64),
+                        ]),
+                    ) {
+                        Ok(rows) => rows,
                         Err(err) if is_out_of_memory_error(&err) && message_batch_size > 1 => {
                             let previous_batch_size = message_batch_size;
                             message_batch_size = (message_batch_size / 2).max(1);
@@ -15550,51 +14363,32 @@ impl FrankenStorage {
                                 previous_batch_size,
                                 message_batch_size,
                                 conversation_id,
-                                cursor_message_idx = page_start_message_idx,
-                                phase = "message_scan",
+                                cursor_message_idx,
                                 "daily_stats message scan ran out of memory; retrying with smaller batch"
                             );
                             continue;
                         }
-                        Err(err) => {
-                            return Err(err).with_context(|| {
-                                format!(
-                                    "daily_stats phase=message_scan conversation_id={conversation_id} cursor_message_idx={page_start_message_idx} batch_size={message_batch_size}"
-                                )
-                            });
-                        }
-                    }
-                    if page_rows == 0 {
+                        Err(err) => return Err(err.into()),
+                    };
+                    if message_rows.is_empty() {
                         break;
                     }
 
-                    messages_processed = messages_processed.saturating_add(page_rows);
+                    let mut aggregate = StatsAggregator::new();
+                    for row in &message_rows {
+                        let message_idx: i64 = row.get_typed(0)?;
+                        let content_len: i64 = row.get_typed(1)?;
+                        cursor_message_idx = message_idx;
+                        aggregate.record_delta(&agent_slug, &source_id, day_id, 0, 1, content_len);
+                        messages_processed += 1;
+                    }
 
                     message_batch_count += 1;
                     raw_entries_flushed += aggregate.raw_entry_count();
                     let entries = aggregate.expand();
                     expanded_entries_flushed += entries.len();
                     if !entries.is_empty() {
-                        let mut batch_tx = self.conn.transaction().with_context(|| {
-                            format!(
-                                "daily_stats phase=message_stage_begin conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
-                            )
-                        })?;
-                        franken_update_daily_stats_batched_in_tx_for_target(
-                            &batch_tx,
-                            &entries,
-                            DailyStatsBatchTarget::RebuildStage,
-                        )
-                        .with_context(|| {
-                            format!(
-                                "daily_stats phase=message_stage_upsert conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
-                            )
-                        })?;
-                        batch_tx.commit().with_context(|| {
-                            format!(
-                                "daily_stats phase=message_stage_commit conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
-                            )
-                        })?;
+                        franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
                     }
                     if message_batch_count.is_multiple_of(50) {
                         tracing::info!(
@@ -15612,52 +14406,21 @@ impl FrankenStorage {
                             "daily_stats rebuild message scan progress"
                         );
                     }
-                    if page_rows < message_batch_size {
-                        break;
-                    }
                 }
             }
         }
 
-        let rows_created: i64 = self
-            .conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM daily_stats_rebuild_stage",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .with_context(|| "daily_stats phase=stage_count metric=rows_created")?;
-        let total_sessions: i64 = self
-            .conn
-            .query_row_map(
-                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats_rebuild_stage WHERE agent_slug = 'all' AND source_id = 'all'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .with_context(|| "daily_stats phase=stage_count metric=total_sessions")?;
+        let rows_created: i64 =
+            tx.query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
+                row.get_typed(0)
+            })?;
+        let total_sessions: i64 = tx.query_row_map(
+            "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
 
-        let mut publish_tx = self
-            .conn
-            .transaction()
-            .with_context(|| "daily_stats phase=publish_begin")?;
-        publish_tx
-            .execute("DELETE FROM daily_stats")
-            .with_context(|| "daily_stats phase=publish_delete")?;
-        publish_tx
-            .execute(
-                "INSERT INTO daily_stats (
-                day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
-             )
-             SELECT day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
-             FROM daily_stats_rebuild_stage",
-            )
-            .with_context(|| "daily_stats phase=publish_insert")?;
-        publish_tx
-            .commit()
-            .with_context(|| "daily_stats phase=publish_commit")?;
-        self.conn
-            .execute("DELETE FROM daily_stats_rebuild_stage")
-            .with_context(|| "daily_stats phase=clear_stage_after_publish")?;
+        tx.commit()?;
 
         tracing::info!(
             target: "cass::perf::daily_stats",
@@ -16764,7 +15527,7 @@ pub struct AnalyticsRebuildResult {
 }
 
 /// Result of rebuilding daily stats.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct DailyStatsRebuildResult {
     pub rows_created: i64,
     pub total_sessions: i64,
@@ -16775,52 +15538,6 @@ pub struct DailyStatsRebuildResult {
 pub struct AgentArchivePurgeResult {
     pub conversations_deleted: usize,
     pub messages_deleted: usize,
-}
-
-/// Result of a `cass forget` source-glob prune (#292 ask #2). On a dry run the
-/// `*_deleted` fields are zero and the `*_matched` fields report what WOULD be
-/// removed.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct ForgetConversationsResult {
-    pub pattern: String,
-    pub dry_run: bool,
-    pub conversations_matched: usize,
-    pub messages_matched: usize,
-    pub conversations_deleted: usize,
-    /// Bounded (<= 20) sample of matched source paths, for operator review.
-    pub sample_source_paths: Vec<String>,
-}
-
-/// A single PRE-EXISTING duplicate conversation pair detected by
-/// `collapse_external_id_prefix_duplicates`: a `projects/`-prefixed row
-/// (the drop candidate) and its bare canonical twin (kept), both pointing
-/// at the same `source_path`. See gh #302 ask #2 / bead uhhxy.
-#[derive(Debug, Clone, Serialize)]
-pub struct ExternalIdDuplicateCandidate {
-    /// Conversation row id of the `projects/`-prefixed twin to drop.
-    pub drop_conversation_id: i64,
-    /// Conversation row id of the bare canonical row to keep.
-    pub keep_conversation_id: i64,
-    /// Shared source path of the duplicated pair.
-    pub source_path: String,
-    /// external_id of the dropped (prefixed) row.
-    pub drop_external_id: String,
-    /// external_id of the kept (bare) row.
-    pub keep_external_id: String,
-}
-
-/// Result of `collapse_external_id_prefix_duplicates`. In `dry_run` mode
-/// the counts/pairs describe what WOULD be removed; otherwise they describe
-/// what was removed.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ExternalIdDuplicateCleanupResult {
-    pub dry_run: bool,
-    /// Number of `projects/`-prefixed conversation rows collapsed.
-    pub conversations_affected: usize,
-    /// Number of message rows belonging to the dropped twins.
-    pub messages_affected: usize,
-    /// The detected duplicate pairs (drop + keep ids, paths, external_ids).
-    pub pairs: Vec<ExternalIdDuplicateCandidate>,
 }
 
 /// Health status of daily stats table.
@@ -16838,48 +15555,18 @@ pub struct DailyStatsHealth {
 // FTS5 Batch Insert (P2 Opt 2.1)
 // -------------------------------------------------------------------------
 
-/// Rows per FTS5 INSERT statement during db-resident `fts_messages`
-/// maintenance/rebuild. Each row binds 7 columns (rowid + 6 cols), and
-/// frankensqlite's `MAX_VARIABLE_NUMBER` is 32766, so the hard ceiling is
-/// 32766 / 7 = 4680 rows per statement; 4096 leaves margin (28672 params).
-///
-/// This value is performance-critical, NOT just a memory knob
-/// (`coding_agent_session_search-nhqw0` / gh #301): `fts_messages` is a
-/// contentless FTS5 table (`content=''`), which routes every INSERT through
-/// frankensqlite's `persist_rootpage_zero_fts5_shadow_rows` full-table
-/// re-encode (`build_pending_hash` re-tokenizes *all* rows). The cost of one
-/// INSERT is therefore O(rows-so-far) regardless of the statement's row count,
-/// so the total rebuild cost is (number of INSERT statements) × O(table). The
-/// old value of 100 fragmented a single ~512-row flush into ~6 statements and
-/// turned a multi-MB rebuild into ~120 whole-table re-encodes (O(N²)), which
-/// wedged `cass index --full` above ~15-30 MB of content. Issuing one large
-/// param-safe statement per flush collapses that to a handful of re-encodes.
-/// The asymptotic fix (incremental contentless persistence) is tracked in
-/// frankensqlite bd-sf8dx.
-const FTS5_BATCH_SIZE: usize = 4096;
+/// Batch size for FTS5 inserts. With 7 columns per row (rowid + 6 cols) and
+/// SQLite's SQLITE_MAX_VARIABLE_NUMBER default of 999, max batch is ~142 rows.
+/// Using 100 for safety margin and memory efficiency.
+const FTS5_BATCH_SIZE: usize = 100;
 
 #[derive(Debug, Clone)]
 struct FtsRebuildMessageRow {
+    rowid: i64,
     message_id: i64,
     conversation_id: i64,
     content: String,
     created_at: Option<i64>,
-}
-
-#[derive(Debug)]
-struct FtsRebuildMessagePage {
-    rows: Vec<FtsRebuildMessageRow>,
-    last_rowid: i64,
-    exhausted: bool,
-    planned_body_bytes: usize,
-    oversized_single_body: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FtsRebuildPagePlan {
-    last_rowid: i64,
-    selected_rows: usize,
-    body_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -16921,172 +15608,14 @@ impl FtsEntry {
     }
 }
 
-// Per-flush accumulation caps for the streaming FTS rebuild/maintenance paths.
-// A flush is emitted once either cap is hit, then handed to
-// `franken_batch_insert_fts_on_connection`, which splits it into
-// `FTS5_BATCH_SIZE`-row INSERT statements. Because each contentless-FTS INSERT
-// re-encodes the whole table (see `FTS5_BATCH_SIZE` above /
-// `coding_agent_session_search-nhqw0`), these caps must be large enough that a
-// flush is a single param-safe statement — keeping the doc cap at/under
-// `FTS5_BATCH_SIZE` means one flush == one INSERT == one re-encode. The
-// historically named `MAX_CHARS` cap is intentionally measured with
-// `String::len()` / `LENGTH(CAST(... AS BLOB))`: it is a UTF-8 byte cap, not a
-// Unicode scalar count, and bounds message-body buffer memory.
-const FTS_ENTRY_BATCH_MAX_DOCS: usize = 4000;
-const FTS_ENTRY_BATCH_MAX_CHARS: usize = 32 * 1024 * 1024;
+const FTS_ENTRY_BATCH_MAX_DOCS: usize = 512;
+const FTS_ENTRY_BATCH_MAX_CHARS: usize = 1024 * 1024;
 
 /// Default batch size for the FTS rebuild INSERT (Bug #168).  When
 /// `fts_messages` is empty but `messages` has 100K+ rows, a single unbounded
 /// INSERT-SELECT OOMs.  This constant caps each batch so peak memory stays
 /// bounded.  Override via `CASS_FTS_REBUILD_BATCH_SIZE` for tuning.
 const FTS_REBUILD_BATCH_SIZE_DEFAULT: usize = 5_000;
-
-/// Bound parameter count and SQL text while loading the TEMP driver used for
-/// exact docsize membership probes. The page itself remains capped at 5,000.
-const FTS_EXACT_ROWID_PROBE_INSERT_CHUNK_SIZE: usize = 512;
-
-/// Choose the largest ordered prefix whose message bodies fit `max_body_bytes`.
-///
-/// At least one row is selected whenever input is non-empty. That single-row
-/// escape hatch is necessary for a canonical message that is itself larger
-/// than the cap: correctness forbids truncation, while selecting it alone
-/// ensures the cursor still progresses and bounds all other pages.
-fn plan_fts_rebuild_message_page(
-    headers: &[(i64, usize)],
-    max_body_bytes: usize,
-) -> Option<FtsRebuildPagePlan> {
-    let mut selected_rows = 0usize;
-    let mut body_bytes = 0usize;
-    let mut last_rowid = 0i64;
-    for &(rowid, row_body_bytes) in headers {
-        if selected_rows > 0 && body_bytes.saturating_add(row_body_bytes) > max_body_bytes {
-            break;
-        }
-        selected_rows = selected_rows.saturating_add(1);
-        body_bytes = body_bytes.saturating_add(row_body_bytes);
-        last_rowid = rowid;
-    }
-    (selected_rows > 0).then_some(FtsRebuildPagePlan {
-        last_rowid,
-        selected_rows,
-        body_bytes,
-    })
-}
-
-fn fts_exact_rowid_probe_insert_sql(count: usize) -> String {
-    debug_assert!(count > 0 && count <= FTS_EXACT_ROWID_PROBE_INSERT_CHUNK_SIZE);
-    let mut sql = String::from("INSERT INTO cass_fts_repair_probe_ids(id) VALUES");
-    for index in 0..count {
-        if index > 0 {
-            sql.push(',');
-        }
-        sql.push_str("(?");
-        sql.push_str(&(index + 1).to_string());
-        sql.push(')');
-    }
-    sql
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static TEST_FTS_REBUILD_INTERRUPTION_PHASE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-    static TEST_FTS_PAGE_AFTER_PLAN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        std::cell::RefCell::new(None);
-    static TEST_FTS_PAGE_DIAGNOSTIC_PATH: std::cell::RefCell<Option<PathBuf>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-fn arm_fts_page_diagnostics(db_path: &Path) {
-    TEST_FTS_PAGE_DIAGNOSTIC_PATH.with(|path| {
-        *path.borrow_mut() = Some(db_path.to_path_buf());
-    });
-}
-
-#[cfg(test)]
-fn emit_fts_page_diagnostics(storage: &FrankenStorage, stage: &str) {
-    let enabled = TEST_FTS_PAGE_DIAGNOSTIC_PATH.with(|path| {
-        path.borrow()
-            .as_deref()
-            .is_some_and(|path| path == storage.db_path)
-    });
-    if !enabled {
-        return;
-    }
-
-    let query_i64 = |sql: &str| {
-        storage
-            .raw()
-            .query_row_map(sql, fparams![], |row| row.get_typed::<i64>(0))
-            .map_err(|error| error.to_string())
-    };
-    let page_count = query_i64("PRAGMA page_count");
-    let page_size = query_i64("PRAGMA page_size");
-    let temp_probe_root = query_i64(
-        "SELECT rootpage FROM temp.sqlite_master WHERE name = 'cass_fts_repair_probe_ids'",
-    );
-    let docsize_root =
-        query_i64("SELECT rootpage FROM main.sqlite_master WHERE name = 'fts_messages_docsize'");
-    let file_len = std::fs::metadata(&storage.db_path)
-        .map(|metadata| metadata.len())
-        .map_err(|error| error.to_string());
-    let header_page_count = (|| -> std::io::Result<u32> {
-        use std::io::Read as _;
-
-        let mut file = std::fs::File::open(&storage.db_path)?;
-        let mut header = [0_u8; 32];
-        file.read_exact(&mut header)?;
-        Ok(u32::from_be_bytes([
-            header[28], header[29], header[30], header[31],
-        ]))
-    })()
-    .map_err(|error| error.to_string());
-
-    eprintln!(
-        "CASS_FTS_PAGE_DIAG stage={stage:?} pragma_page_count={page_count:?} \
-         pragma_page_size={page_size:?} header_page_count={header_page_count:?} \
-         file_len={file_len:?} temp_probe_root={temp_probe_root:?} \
-         docsize_root={docsize_root:?}"
-    );
-}
-
-#[cfg(test)]
-fn arm_fts_rebuild_interruption(phase: u8) {
-    TEST_FTS_REBUILD_INTERRUPTION_PHASE.with(|armed| armed.set(phase));
-}
-
-#[cfg(test)]
-fn injected_fts_rebuild_interruption(phase: u8) -> Result<()> {
-    let should_interrupt = TEST_FTS_REBUILD_INTERRUPTION_PHASE.with(|armed| {
-        if armed.get() == phase {
-            armed.set(0);
-            true
-        } else {
-            false
-        }
-    });
-    if should_interrupt {
-        anyhow::bail!("injected FTS rebuild interruption at test phase {phase}");
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn arm_fts_page_after_plan_hook(hook: impl FnOnce() + 'static) {
-    TEST_FTS_PAGE_AFTER_PLAN_HOOK.with(|slot| {
-        let previous = slot.replace(Some(Box::new(hook)));
-        assert!(previous.is_none(), "FTS page test hook already armed");
-    });
-}
-
-#[cfg(test)]
-fn run_fts_page_after_plan_hook() {
-    TEST_FTS_PAGE_AFTER_PLAN_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook();
-        }
-    });
-}
 
 /// Read the FTS rebuild batch size from the environment, falling back to the
 /// compiled-in default.
@@ -17110,7 +15639,7 @@ fn flush_pending_fts_entries(
     }
 
     if storage.fts_messages_present_cached(tx) {
-        *inserted_total += franken_batch_insert_fts(storage, tx, entries)?;
+        *inserted_total += franken_batch_insert_fts(tx, entries)?;
     }
     entries.clear();
     *pending_chars = 0;
@@ -17292,1035 +15821,6 @@ mod tests {
             source_id: LOCAL_SOURCE_ID.into(),
             origin_host: None,
         }
-    }
-
-    fn seed_atomic_fts_rebuild_fixture(storage: &FrankenStorage) {
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).expect("seed FTS agent");
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/tmp/fts-atomic")),
-            external_id: Some("fts-atomic".into()),
-            title: Some("FTS atomic fixture".into()),
-            source_path: PathBuf::from("/tmp/fts-atomic.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_001),
-            approx_tokens: None,
-            metadata_json: serde_json::Value::Null,
-            messages: vec![Message {
-                id: None,
-                idx: 0,
-                role: MessageRole::User,
-                author: Some("user".into()),
-                created_at: Some(1_700_000_000_001),
-                content: "atomic shadow survives interruption".into(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-        storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .expect("seed FTS conversation");
-        storage
-            .rebuild_fts()
-            .expect("materialize healthy FTS shadow");
-        assert_eq!(
-            storage
-                .inspect_search_fallback_fts_parity()
-                .expect("inspect seeded FTS")
-                .status,
-            FtsShadowParityStatus::Healthy
-        );
-    }
-
-    fn reference_indexable_message_count(storage: &FrankenStorage) -> i64 {
-        storage
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*)
-                 FROM messages m
-                 INNER JOIN conversations c ON c.id = m.conversation_id",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .expect("count indexable messages with the unforced reference join")
-    }
-
-    #[test]
-    fn fts_indexable_count_and_intersection_plans_are_bounded_and_exact() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-indexable-count-plan.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_atomic_fts_rebuild_fixture(&storage);
-
-        let message_rootpage: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT rootpage FROM sqlite_master WHERE name = 'messages'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .expect("load messages table rootpage");
-        let message_index_rootpage: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT rootpage FROM sqlite_master WHERE name = 'sqlite_autoindex_messages_1'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .expect("load messages uniqueness-index rootpage");
-        let conversation_rootpage: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT rootpage FROM sqlite_master WHERE name = 'conversations'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .expect("load conversations table rootpage");
-        let docsize_rootpage: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT rootpage FROM sqlite_master WHERE name = 'fts_messages_docsize'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .expect("load FTS docsize rootpage");
-        let count_opcodes: Vec<(String, i64)> = storage
-            .raw()
-            .query_map_collect(
-                &format!("EXPLAIN {FTS_INDEXABLE_MESSAGE_COUNT_SQL}"),
-                fparams![],
-                |row| Ok((row.get_typed(1)?, row.get_typed(3)?)),
-            )
-            .expect("explain fused indexable-message parent-run count");
-        assert!(
-            count_opcodes
-                .iter()
-                .any(|(opcode, _)| opcode == "CountIndexEqRun"),
-            "parity cardinality must use fused duplicate-prefix run counting: {count_opcodes:?}"
-        );
-        assert!(
-            !count_opcodes.iter().any(|(opcode, _)| matches!(
-                opcode.as_str(),
-                "OpenAutoindex" | "Count" | "AggStep" | "AggFinal"
-            )),
-            "parent-run cardinality must avoid probe materialization and generic aggregate counting: {count_opcodes:?}"
-        );
-        let open_read_rootpages: Vec<i64> = count_opcodes
-            .iter()
-            .filter_map(|(opcode, rootpage)| (opcode == "OpenRead").then_some(*rootpage))
-            .collect();
-        assert!(
-            open_read_rootpages.contains(&message_index_rootpage)
-                && open_read_rootpages.contains(&conversation_rootpage)
-                && !open_read_rootpages.contains(&message_rootpage)
-                && open_read_rootpages.len() == 2,
-            "parity cardinality must open only the composite index and parent table: roots={open_read_rootpages:?}, opcodes={count_opcodes:?}"
-        );
-        assert_eq!(
-            storage.count_fts_indexable_messages().unwrap(),
-            reference_indexable_message_count(&storage),
-            "the forced access path must preserve the reference join's exact result"
-        );
-
-        assert_eq!(
-            storage
-                .count_fts_indexed_canonical_intersection()
-                .expect("count the one-row healthy intersection"),
-            1
-        );
-        let intersection_opcodes: Vec<(String, i64, i64)> = storage
-            .raw()
-            .query_map_collect(
-                &format!("EXPLAIN {FTS_INDEXED_CANONICAL_INTERSECTION_SQL}"),
-                fparams![],
-                |row| Ok((row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
-            )
-            .expect("explain read-only shadow-driven canonical intersection");
-        let cursor_for_rootpage = |rootpage: i64| {
-            intersection_opcodes.iter().find_map(|(opcode, p1, p2)| {
-                (opcode == "OpenRead" && *p2 == rootpage).then_some(*p1)
-            })
-        };
-        let docsize_cursor = cursor_for_rootpage(docsize_rootpage)
-            .expect("intersection must open the FTS docsize table");
-        let message_cursor =
-            cursor_for_rootpage(message_rootpage).expect("intersection must open messages");
-        assert!(
-            intersection_opcodes
-                .iter()
-                .any(|(opcode, p1, _)| opcode == "Rewind" && *p1 == docsize_cursor)
-                && intersection_opcodes
-                    .iter()
-                    .any(|(opcode, p1, _)| opcode == "SeekRowid" && *p1 == message_cursor)
-                && !intersection_opcodes.iter().any(|(opcode, p1, _)| {
-                    matches!(opcode.as_str(), "Rewind" | "Next") && *p1 == message_cursor
-                })
-                && intersection_opcodes
-                    .iter()
-                    .any(|(opcode, _, _)| opcode == "ResultRow")
-                && !intersection_opcodes.iter().any(|(opcode, _, _)| matches!(
-                    opcode.as_str(),
-                    "SorterOpen" | "OpenEphemeral"
-                )),
-            "intersection must scan only the derived shadow, point-seek canonical messages, and stream one compact parent ID without materialization: {intersection_opcodes:?}"
-        );
-
-        let conversation_id: i64 = storage
-            .raw()
-            .query_row_map("SELECT id FROM conversations LIMIT 1", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        for idx in 1_i64..5 {
-            storage
-                .raw()
-                .execute_compat(
-                    "INSERT INTO messages(conversation_id, idx, role, content)
-                     VALUES(?1, ?2, 'assistant', 'count-index equality-run regression')",
-                    fparams![conversation_id, idx],
-                )
-                .unwrap();
-        }
-        assert_eq!(
-            storage.count_fts_indexable_messages().unwrap(),
-            5,
-            "a five-row equality run must count five rows, not the triangular sum 5+4+3+2+1"
-        );
-        assert_eq!(
-            storage.count_fts_indexable_messages().unwrap(),
-            reference_indexable_message_count(&storage),
-            "fused equality-run counting must remain exact beyond a one-row proof"
-        );
-
-        storage.raw().execute("PRAGMA foreign_keys = OFF").unwrap();
-        storage
-            .raw()
-            .execute(
-                "INSERT INTO messages(id, conversation_id, idx, role, content)
-                 VALUES(9999999, 9999999, 0, 'user', 'deliberate orphan')",
-            )
-            .unwrap();
-        storage.raw().execute("PRAGMA foreign_keys = ON").unwrap();
-        assert_eq!(
-            storage
-                .raw()
-                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                    row.get_typed::<i64>(0)
-                })
-                .unwrap(),
-            6,
-            "the fixture must contain five canonical messages and one orphan"
-        );
-        assert_eq!(
-            storage.count_fts_indexable_messages().unwrap(),
-            reference_indexable_message_count(&storage),
-            "prepared parent counts must exclude orphan IDs exactly"
-        );
-        let canonical_id: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT id FROM messages WHERE conversation_id != 9999999 LIMIT 1",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        storage
-            .raw()
-            .execute_compat(
-                "INSERT INTO fts_messages_docsize(id, sz)
-                 SELECT 9999999, sz FROM fts_messages_docsize WHERE id = ?1",
-                fparams![canonical_id],
-            )
-            .unwrap();
-        assert_eq!(
-            storage.count_fts_indexed_canonical_intersection().unwrap(),
-            1,
-            "intersection must reject an indexed message whose parent conversation is absent"
-        );
-        drop(storage);
-        let readonly = FrankenStorage::open_readonly(&db_path).unwrap();
-        assert_eq!(
-            readonly.count_fts_indexed_canonical_intersection().unwrap(),
-            1,
-            "exact intersection must require no TEMP or canonical writes on a read-only doctor connection"
-        );
-    }
-
-    #[test]
-    fn transactional_fts_rebuild_interruptions_preserve_the_published_shadow() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-atomic-interruption.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_atomic_fts_rebuild_fixture(&storage);
-
-        // Change canonical content without touching the already-published FTS
-        // row so rollback can be distinguished from a leaked replacement.
-        storage
-            .raw()
-            .execute("UPDATE messages SET content = 'replacement canonical content' WHERE idx = 0")
-            .unwrap();
-        let search_count = |term: &str| {
-            storage
-                .raw()
-                .query_row_map(
-                    "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?1",
-                    fparams![term],
-                    |row| row.get_typed::<i64>(0),
-                )
-                .unwrap()
-        };
-        assert_eq!(search_count("survives"), 1);
-        assert_eq!(search_count("replacement"), 0);
-
-        for phase in [1, 2] {
-            arm_fts_rebuild_interruption(phase);
-            let error = storage
-                .rebuild_fts()
-                .expect_err("injected rebuild interruption must fail");
-            let error_chain = format!("{error:#}");
-            assert!(
-                error_chain.contains("rolled back"),
-                "rebuild failure must state rollback semantics: {error:#}"
-            );
-            assert!(
-                error_chain.contains(&format!(
-                    "injected FTS rebuild interruption at test phase {phase}"
-                )),
-                "phase {phase} must reach the intended interruption point: {error:#}"
-            );
-            assert_eq!(
-                search_count("survives"),
-                1,
-                "phase {phase} must preserve the previously published FTS content"
-            );
-            assert_eq!(
-                search_count("replacement"),
-                0,
-                "phase {phase} must not leak the uncommitted replacement shadow"
-            );
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn interrupted_partial_fts_catch_up_resumes_from_committed_batches() {
-        let _batch_size = set_env_var("CASS_FTS_REBUILD_BATCH_SIZE", "2");
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-partial-resume.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_atomic_fts_rebuild_fixture(&storage);
-        let conversation_id: i64 = storage
-            .raw()
-            .query_row_map("SELECT id FROM conversations LIMIT 1", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        for (idx, content) in [
-            "resumecommitted sentinel",
-            "resumependingtwo sentinel",
-            "resumependingthree sentinel",
-            "resumependingfour sentinel",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            storage
-                .raw()
-                .execute_compat(
-                    "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, ?2, 'assistant', ?3)",
-                    fparams![conversation_id, i64::try_from(idx + 1).unwrap(), content],
-                )
-                .unwrap();
-        }
-        assert_eq!(
-            storage.inspect_search_fallback_fts_parity().unwrap().status,
-            FtsShadowParityStatus::Partial
-        );
-        arm_fts_page_diagnostics(&db_path);
-
-        // The first page contains the already-indexed row plus the first
-        // missing row. Its autocommit INSERT is durable before the injected
-        // interruption, which models a process dying between catch-up pages.
-        arm_fts_rebuild_interruption(2);
-        let error = storage
-            .ensure_search_fallback_fts_consistency()
-            .expect_err("partial catch-up interruption must surface");
-        assert!(
-            error.to_string().contains("resuming missing FTS rows"),
-            "unexpected partial catch-up error: {error:#}"
-        );
-        emit_fts_page_diagnostics(&storage, "after_initial_interruption");
-        drop(storage);
-
-        let reopened = FrankenStorage::open_existing_schema_only_for_fts_repair(&db_path).unwrap();
-        emit_fts_page_diagnostics(&reopened, "immediately_after_reopen");
-        let search_count = |term: &str| {
-            reopened
-                .raw()
-                .query_row_map(
-                    "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?1",
-                    fparams![term],
-                    |row| row.get_typed::<i64>(0),
-                )
-                .unwrap()
-        };
-        let interrupted_parity = reopened.inspect_search_fallback_fts_parity().unwrap();
-        assert_eq!(interrupted_parity.status, FtsShadowParityStatus::Partial);
-        assert_eq!(interrupted_parity.indexable_messages, 5);
-        assert_eq!(interrupted_parity.indexed_messages, Some(2));
-        assert_eq!(search_count("survives"), 1);
-        assert_eq!(search_count("resumecommitted"), 1);
-        assert_eq!(search_count("resumependingtwo"), 0);
-
-        let repair = match reopened.ensure_search_fallback_fts_consistency() {
-            Ok(repair) => repair,
-            Err(error) => {
-                emit_fts_page_diagnostics(&reopened, "after_resumed_repair_failure");
-                let canonical_ids: Vec<i64> = reopened
-                    .raw()
-                    .query_map_collect("SELECT id FROM messages ORDER BY id", fparams![], |row| {
-                        row.get_typed(0)
-                    })
-                    .unwrap();
-                let indexed_ids: Vec<i64> = reopened
-                    .raw()
-                    .query_map_collect(
-                        "SELECT id FROM fts_messages_docsize ORDER BY id",
-                        fparams![],
-                        |row| row.get_typed(0),
-                    )
-                    .unwrap();
-                panic!(
-                    "resume partial catch-up after reopen failed: {error:#}; canonical={canonical_ids:?}; indexed={indexed_ids:?}"
-                );
-            }
-        };
-        assert_eq!(
-            repair,
-            FtsConsistencyRepair::IncrementalCatchUp {
-                inserted_rows: 3,
-                total_rows: 5,
-            }
-        );
-        let repaired_parity = reopened.inspect_search_fallback_fts_parity().unwrap();
-        let canonical_ids: Vec<i64> = reopened
-            .raw()
-            .query_map_collect("SELECT id FROM messages ORDER BY id", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        let indexed_ids: Vec<i64> = reopened
-            .raw()
-            .query_map_collect(
-                "SELECT id FROM fts_messages_docsize ORDER BY id",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            repaired_parity.status,
-            FtsShadowParityStatus::Healthy,
-            "resumed repair must preserve exact rowids: parity={repaired_parity:?}, canonical={canonical_ids:?}, indexed={indexed_ids:?}"
-        );
-        assert_eq!(repaired_parity.indexed_messages, Some(5));
-        assert_eq!(
-            reopened
-                .inspect_fts_rowid_set_difference_with_page_rows(2)
-                .expect("compare exact FTS parity across multiple tiny pages"),
-            (false, false),
-            "equal five-row ID sets must remain equal across 2-row keyset page boundaries"
-        );
-        for term in [
-            "survives",
-            "resumecommitted",
-            "resumependingtwo",
-            "resumependingthree",
-            "resumependingfour",
-        ] {
-            assert_eq!(search_count(term), 1, "missing or duplicate term {term}");
-        }
-        let distinct_rowids: i64 = reopened
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(DISTINCT id) FROM fts_messages_docsize",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(distinct_rowids, 5);
-
-        let second_repair = reopened
-            .ensure_search_fallback_fts_consistency()
-            .expect("healthy repeat repair must be idempotent");
-        assert_eq!(
-            second_repair,
-            FtsConsistencyRepair::AlreadyHealthy { rows: 5 }
-        );
-        assert_eq!(
-            reopened
-                .inspect_search_fallback_fts_parity()
-                .unwrap()
-                .indexed_messages,
-            Some(5)
-        );
-        drop(reopened);
-
-        let ordinary = FrankenStorage::open(&db_path)
-            .expect("ordinary post-doctor open must retain lazy contentless FTS support");
-        assert_eq!(
-            ordinary
-                .inspect_search_fallback_fts_parity()
-                .expect("inspect parity after ordinary reopen")
-                .status,
-            FtsShadowParityStatus::Healthy
-        );
-        for term in [
-            "survives",
-            "resumecommitted",
-            "resumependingtwo",
-            "resumependingthree",
-            "resumependingfour",
-        ] {
-            let count: i64 = ordinary
-                .raw()
-                .query_row_map(
-                    "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?1",
-                    fparams![term],
-                    |row| row.get_typed(0),
-                )
-                .unwrap();
-            assert_eq!(count, 1, "ordinary reopen lost term {term}");
-        }
-    }
-
-    #[test]
-    fn fts_rebuild_page_planner_caps_bodies_before_materialization() {
-        let headers = [(10, 4usize), (20, 6), (30, 1)];
-        assert_eq!(
-            plan_fts_rebuild_message_page(&headers, 10),
-            Some(FtsRebuildPagePlan {
-                last_rowid: 20,
-                selected_rows: 2,
-                body_bytes: 10,
-            })
-        );
-        assert_eq!(plan_fts_rebuild_message_page(&[], 10), None);
-
-        let oversized = plan_fts_rebuild_message_page(&[(40, 12), (50, 1)], 10)
-            .expect("an oversized first row must still advance the cursor");
-        assert_eq!(
-            oversized,
-            FtsRebuildPagePlan {
-                last_rowid: 40,
-                selected_rows: 1,
-                body_bytes: 12,
-            }
-        );
-    }
-
-    #[test]
-    fn fts_rebuild_page_uses_coherent_snapshot_and_utf8_byte_lengths() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-page-snapshot.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_atomic_fts_rebuild_fixture(&storage);
-        let unicode_body = "é🙂";
-        storage
-            .raw()
-            .execute_compat(
-                "UPDATE messages SET id = 100, content = ?1 WHERE idx = 0",
-                fparams![unicode_body],
-            )
-            .unwrap();
-        let conversation_id: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT conversation_id FROM messages WHERE id = 100",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        let sql_body_bytes: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT LENGTH(CAST(content AS BLOB)) FROM messages WHERE id = 100",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            usize::try_from(sql_body_bytes).unwrap(),
-            unicode_body.len(),
-            "SQL BLOB length must use the same UTF-8 byte metric as String::len"
-        );
-
-        let concurrent = FrankenStorage::open(&db_path).unwrap();
-        arm_fts_page_after_plan_hook(move || {
-            concurrent
-                .raw()
-                .execute(
-                    "UPDATE messages SET content = 'this body grew after planning' WHERE id = 100",
-                )
-                .expect("concurrent content growth must commit outside the read snapshot");
-            concurrent
-                .raw()
-                .execute_compat(
-                    "INSERT INTO messages(id, conversation_id, idx, role, content)
-                     VALUES(50, ?1, 1, 'assistant', 'inserted inside the planned rowid range')",
-                    fparams![conversation_id],
-                )
-                .expect("concurrent explicit-rowid insert must commit outside the read snapshot");
-        });
-
-        let page = storage
-            .fetch_fts_rebuild_message_page_with_cap(0, 5_000, 8)
-            .expect("fetch page from one coherent read snapshot");
-        assert_eq!(page.planned_body_bytes, unicode_body.len());
-        assert_eq!(page.rows.len(), 1);
-        assert_eq!(page.rows[0].message_id, 100);
-        assert_eq!(page.rows[0].content, unicode_body);
-        assert!(
-            page.planned_body_bytes <= 8,
-            "a concurrent writer must not enlarge the materialized snapshot page"
-        );
-
-        let current_rows: i64 = storage
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(
-            current_rows, 2,
-            "the writer did commit; its inserted row was merely excluded from the older page snapshot"
-        );
-    }
-
-    #[test]
-    fn fts_batch_rowid_lookup_does_not_load_unrelated_sparse_range_rows() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-sparse-rowid-lookup.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_atomic_fts_rebuild_fixture(&storage);
-        let first_id: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT id FROM fts_messages_docsize LIMIT 1",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        let unrelated_id = 500_000_i64;
-        let sparse_requested_id = 1_000_000_i64;
-        for id in [unrelated_id, sparse_requested_id] {
-            storage
-                .raw()
-                .execute_compat(
-                    "INSERT INTO fts_messages_docsize(id, sz)
-                     SELECT ?1, sz FROM fts_messages_docsize WHERE id = ?2",
-                    fparams![id, first_id],
-                )
-                .unwrap();
-        }
-
-        // Deliberately reverse numeric order. The unrelated row lies between
-        // the requested IDs and would be loaded by the former MIN..MAX query.
-        let rows = vec![
-            FtsRebuildMessageRow {
-                message_id: sparse_requested_id,
-                conversation_id: 1,
-                content: String::new(),
-                created_at: None,
-            },
-            FtsRebuildMessageRow {
-                message_id: first_id,
-                conversation_id: 1,
-                content: String::new(),
-                created_at: None,
-            },
-        ];
-        let found = storage
-            .load_fts_message_rowid_set_for_batch(&rows)
-            .expect("load exact sparse FTS rowids");
-        let lookup_opcodes: Vec<(String, i64)> = storage
-            .raw()
-            .query_map_collect(
-                "EXPLAIN
-                 SELECT f.id
-                 FROM cass_fts_repair_probe_ids requested
-                 INNER JOIN fts_messages_docsize f ON f.id = requested.id",
-                fparams![],
-                |row| Ok((row.get_typed(1)?, row.get_typed(2)?)),
-            )
-            .expect("explain the actual bounded-driver FTS rowid join");
-        assert!(
-            lookup_opcodes
-                .iter()
-                .any(|(opcode, cursor)| opcode == "Rewind" && *cursor == 0)
-                && lookup_opcodes
-                    .iter()
-                    .any(|(opcode, cursor)| opcode == "SeekRowid" && *cursor == 1)
-                && !lookup_opcodes.iter().any(|(opcode, cursor)| matches!(
-                    opcode.as_str(),
-                    "Rewind" | "Next"
-                ) && *cursor == 1),
-            "the bounded TEMP driver may scan itself but must point-seek the large shadow: {lookup_opcodes:?}"
-        );
-
-        assert_eq!(
-            found,
-            HashSet::from([first_id, sparse_requested_id]),
-            "exact lookup must not materialize unrelated rowids inside the sparse numeric range"
-        );
-        assert!(!found.contains(&unrelated_id));
-    }
-
-    #[test]
-    fn fts_exact_rowid_probe_crosses_insert_chunks_and_seeks_the_shadow() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-rowid-probe-plan.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_atomic_fts_rebuild_fixture(&storage);
-        let first_id: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT id FROM fts_messages_docsize LIMIT 1",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        let rows: Vec<FtsRebuildMessageRow> = (0..=FTS_EXACT_ROWID_PROBE_INSERT_CHUNK_SIZE)
-            .map(|offset| FtsRebuildMessageRow {
-                message_id: first_id + i64::try_from(offset).unwrap(),
-                conversation_id: 1,
-                content: String::new(),
-                created_at: None,
-            })
-            .collect();
-        let found = storage
-            .load_fts_message_rowid_set_for_batch(&rows)
-            .expect("probe more IDs than one TEMP insert chunk");
-        assert_eq!(found, HashSet::from([first_id]));
-
-        let opcodes: Vec<(String, i64)> = storage
-            .raw()
-            .query_map_collect(
-                "EXPLAIN
-                 SELECT f.id
-                 FROM cass_fts_repair_probe_ids requested
-                 INNER JOIN fts_messages_docsize f ON f.id = requested.id",
-                fparams![],
-                |row| Ok((row.get_typed(1)?, row.get_typed(2)?)),
-            )
-            .expect("explain bounded TEMP-driver exact-rowid join");
-        assert_eq!(
-            opcodes
-                .iter()
-                .filter(|(opcode, cursor)| opcode == "SeekRowid" && *cursor == 1)
-                .count(),
-            1,
-            "the join loop must use one direct shadow seek opcode: {opcodes:?}"
-        );
-        assert!(
-            !opcodes.iter().any(
-                |(opcode, cursor)| matches!(opcode.as_str(), "Rewind" | "Next") && *cursor == 1
-            ),
-            "bounded exact-rowid probes must not scan the shadow cursor: {opcodes:?}"
-        );
-    }
-
-    #[test]
-    #[ignore = "explicit two-million-row FTS membership latency/RSS proof"]
-    fn fts_exact_rowid_probe_5k_is_bounded_against_two_million_unrelated_rows() {
-        const UNRELATED_ROWS: i64 = 2_000_000;
-        const REQUESTED_ROWS: usize = 5_000;
-        const UNRELATED_BASE: i64 = 10_000_000;
-        const REQUESTED_BASE: i64 = 20_000_000;
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-rowid-probe-perf.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_atomic_fts_rebuild_fixture(&storage);
-
-        // Grow the two synthetic ranges geometrically. FrankenSQLite caps a
-        // recursive CTE at 1,000 iterations, so a recursive 2M-row fixture
-        // silently measured the wrong corpus. This needs only O(log N) INSERT
-        // statements and proves the actual requested cardinality below.
-        let seed_geometric_range = |base: i64, count: i64, stride: i64| {
-            storage
-                .raw()
-                .execute(&format!(
-                    "INSERT INTO fts_messages_docsize(id, sz)
-                     SELECT {base}, sz FROM fts_messages_docsize ORDER BY id LIMIT 1"
-                ))
-                .expect("seed first synthetic FTS docsize row");
-            let mut seeded = 1_i64;
-            while seeded < count {
-                let copied = seeded.min(count - seeded);
-                storage
-                    .raw()
-                    .execute(&format!(
-                        "INSERT INTO fts_messages_docsize(id, sz)
-                         SELECT id + {}, sz
-                         FROM fts_messages_docsize
-                         WHERE id >= {base} AND id < {}",
-                        seeded * stride,
-                        base + copied * stride
-                    ))
-                    .expect("geometrically extend synthetic FTS docsize range");
-                seeded += copied;
-            }
-            let actual: i64 = storage
-                .raw()
-                .query_row_map(
-                    &format!(
-                        "SELECT COUNT(*) FROM fts_messages_docsize
-                         WHERE id >= {base} AND id < {} AND (id - {base}) % {stride} = 0",
-                        base + count * stride
-                    ),
-                    fparams![],
-                    |row| row.get_typed(0),
-                )
-                .expect("count synthetic FTS docsize range");
-            assert_eq!(actual, count, "synthetic performance fixture cardinality");
-        };
-        seed_geometric_range(UNRELATED_BASE, UNRELATED_ROWS, 1);
-        seed_geometric_range(
-            REQUESTED_BASE,
-            i64::try_from(REQUESTED_ROWS / 2).unwrap(),
-            2,
-        );
-
-        let rows: Vec<FtsRebuildMessageRow> = (0..REQUESTED_ROWS)
-            .map(|offset| FtsRebuildMessageRow {
-                message_id: REQUESTED_BASE + i64::try_from(offset).unwrap(),
-                conversation_id: 1,
-                content: String::new(),
-                created_at: None,
-            })
-            .collect();
-        let rss_before = crate::indexer::responsiveness::process_resident_memory_bytes();
-        let started = Instant::now();
-        let found = storage
-            .load_fts_message_rowid_set_for_batch(&rows)
-            .expect("probe realistic 5k FTS repair page");
-        let elapsed = started.elapsed();
-        let rss_after = crate::indexer::responsiveness::process_resident_memory_bytes();
-
-        assert_eq!(found.len(), REQUESTED_ROWS / 2);
-        assert!(
-            elapsed < Duration::from_secs(15),
-            "5k exact-ID page took {elapsed:?} against {UNRELATED_ROWS} unrelated rows"
-        );
-        if let (Some(before), Some(after)) = (rss_before, rss_after) {
-            let growth = after.saturating_sub(before);
-            assert!(
-                growth <= 32 * 1024 * 1024,
-                "5k exact-ID page grew RSS by {growth} bytes against {UNRELATED_ROWS} unrelated rows"
-            );
-        }
-        eprintln!(
-            "FTS_EXACT_ROWID_PROBE_PERF unrelated_rows={UNRELATED_ROWS} requested_rows={REQUESTED_ROWS} matched_rows={} elapsed_ms={} rss_before={rss_before:?} rss_after={rss_after:?}",
-            found.len(),
-            elapsed.as_millis()
-        );
-    }
-
-    #[test]
-    fn fts_shadow_parity_classifies_partial_shadow_exactly_without_marker_heuristics() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-partial-parity.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_atomic_fts_rebuild_fixture(&storage);
-        let conversation_id: i64 = storage
-            .raw()
-            .query_row_map("SELECT id FROM conversations LIMIT 1", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        storage
-            .raw()
-            .execute_compat(
-                "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, 1, 'assistant', 'missing from the interrupted shadow')",
-                fparams![conversation_id],
-            )
-            .unwrap();
-        storage
-            .raw()
-            .execute_compat(
-                "DELETE FROM meta WHERE key = ?1",
-                fparams![FTS_FRANKEN_REBUILD_META_KEY],
-            )
-            .unwrap();
-
-        let parity = storage.inspect_search_fallback_fts_parity().unwrap();
-        assert_eq!(parity.status, FtsShadowParityStatus::Partial);
-        assert_eq!(parity.canonical_messages, 2);
-        assert_eq!(parity.indexable_messages, 2);
-        assert_eq!(parity.indexed_messages, Some(1));
-        assert_eq!(
-            storage.count_fts_indexable_messages().unwrap(),
-            reference_indexable_message_count(&storage),
-            "partial-shadow classification must use an exact indexable-message count"
-        );
-    }
-
-    #[test]
-    fn fts_shadow_parity_rejects_equal_counts_with_offsetting_rowids() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-divergent-rowids.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_atomic_fts_rebuild_fixture(&storage);
-        let conversation_id: i64 = storage
-            .raw()
-            .query_row_map("SELECT id FROM conversations LIMIT 1", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        storage
-            .raw()
-            .execute_compat(
-                "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, 1, 'assistant', 'second canonical row')",
-                fparams![conversation_id],
-            )
-            .unwrap();
-        storage.rebuild_fts().unwrap();
-        let message_ids: Vec<i64> = storage
-            .raw()
-            .query_map_collect("SELECT id FROM messages ORDER BY id", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(message_ids.len(), 2);
-        storage
-            .raw()
-            .execute_compat(
-                "DELETE FROM fts_messages_docsize WHERE id = ?1",
-                fparams![message_ids[0]],
-            )
-            .unwrap();
-        storage
-            .raw()
-            .execute_compat(
-                "INSERT INTO fts_messages_docsize(id, sz)
-                 SELECT ?1, sz FROM fts_messages_docsize WHERE id = ?2",
-                fparams![9_999_999_i64, message_ids[1]],
-            )
-            .unwrap();
-
-        let parity = storage.inspect_search_fallback_fts_parity().unwrap();
-        assert_eq!(parity.canonical_messages, 2);
-        assert_eq!(parity.indexable_messages, 2);
-        assert_eq!(parity.indexed_messages, Some(2));
-        assert_eq!(parity.status, FtsShadowParityStatus::Divergent);
-        assert_eq!(
-            storage
-                .inspect_fts_rowid_set_difference_with_page_rows(1)
-                .expect("compare divergent FTS IDs across one-row pages"),
-            (true, true),
-            "offsetting rowids must report one missing and one excess ID even at every page boundary"
-        );
-        assert!(
-            parity
-                .detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("equal counts conceal rowid divergence"))
-        );
-    }
-
-    #[test]
-    fn fts_shadow_parity_intersection_matches_exact_merge_for_excess_and_divergence() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-intersection-cardinality.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_atomic_fts_rebuild_fixture(&storage);
-
-        let canonical_id: i64 = storage
-            .raw()
-            .query_row_map("SELECT id FROM messages LIMIT 1", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        let first_excess_id = canonical_id.saturating_add(1_000_000);
-        storage
-            .raw()
-            .execute_compat(
-                "INSERT INTO fts_messages_docsize(id, sz)
-                 SELECT ?1, sz FROM fts_messages_docsize WHERE id = ?2",
-                fparams![first_excess_id, canonical_id],
-            )
-            .unwrap();
-
-        let excess = storage.inspect_search_fallback_fts_parity().unwrap();
-        assert_eq!(excess.indexable_messages, 1);
-        assert_eq!(excess.indexed_messages, Some(2));
-        assert_eq!(excess.status, FtsShadowParityStatus::Excess);
-        assert_eq!(
-            storage
-                .inspect_fts_rowid_set_difference_bounded()
-                .expect("compare one-row canonical set with a strict FTS superset"),
-            (false, true),
-            "the exact merge oracle must agree that only an excess rowid exists"
-        );
-
-        let conversation_id: i64 = storage
-            .raw()
-            .query_row_map("SELECT id FROM conversations LIMIT 1", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        storage
-            .raw()
-            .execute_compat(
-                "INSERT INTO messages(conversation_id, idx, role, content)
-                 VALUES(?1, 1, 'assistant', 'missing from divergent shadow')",
-                fparams![conversation_id],
-            )
-            .unwrap();
-        let second_excess_id = first_excess_id.saturating_add(1);
-        storage
-            .raw()
-            .execute_compat(
-                "INSERT INTO fts_messages_docsize(id, sz)
-                 SELECT ?1, sz FROM fts_messages_docsize WHERE id = ?2",
-                fparams![second_excess_id, canonical_id],
-            )
-            .unwrap();
-
-        let divergent = storage.inspect_search_fallback_fts_parity().unwrap();
-        assert_eq!(divergent.indexable_messages, 2);
-        assert_eq!(divergent.indexed_messages, Some(3));
-        assert_eq!(divergent.status, FtsShadowParityStatus::Divergent);
-        assert_eq!(
-            storage.count_fts_indexable_messages().unwrap(),
-            reference_indexable_message_count(&storage),
-            "divergent-shadow classification must use an exact indexable-message count"
-        );
-        assert!(
-            divergent.detail.as_deref().is_some_and(|detail| {
-                detail.contains("2 excess non-canonical rowids")
-                    && detail.contains("1 canonical rowids are missing")
-                    && detail.contains("intersection=1")
-            }),
-            "divergent detail must expose exact intersection-derived counts: {divergent:?}"
-        );
-        assert_eq!(
-            storage
-                .inspect_fts_rowid_set_difference_bounded()
-                .expect("compare missing-plus-excess rowid domains"),
-            (true, true),
-            "the exact merge oracle must agree that both missing and excess rowids exist"
-        );
     }
 
     #[test]
@@ -18899,326 +16399,6 @@ mod tests {
             !opcodes.iter().any(|opcode| opcode == "SorterOpen"),
             "expected lexical rebuild message fetch to avoid sorter temp b-trees, got {opcodes:?}"
         );
-    }
-
-    /// `coding_agent_session_search-uhhxy` (gh #302 ask #2): the dedup
-    /// cleanup must detect a `projects/<rel>` twin of a bare `<rel>`
-    /// conversation sharing one source_path, report it on dry-run without
-    /// mutating, and on apply drop ONLY the prefixed twin + its message rows
-    /// while leaving the canonical row and its messages intact.
-    #[test]
-    fn collapse_external_id_prefix_duplicates_drops_prefixed_twin_only() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use std::path::PathBuf;
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("agent_search.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-
-        let agent = Agent {
-            id: None,
-            slug: "claude_code".into(),
-            name: "Claude Code".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-
-        let make_conv = |external_id: &str| Conversation {
-            id: None,
-            agent_slug: "claude_code".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            external_id: Some(external_id.to_string()),
-            title: Some("Dedup".into()),
-            source_path: PathBuf::from("/home/u/.claude/projects/-proj/abc.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_100),
-            approx_tokens: None,
-            metadata_json: serde_json::Value::Null,
-            messages: vec![
-                Message {
-                    id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: Some("user".into()),
-                    created_at: Some(1_700_000_000_010),
-                    content: format!("first {external_id}"),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                },
-                Message {
-                    id: None,
-                    idx: 1,
-                    role: MessageRole::Agent,
-                    author: Some("assistant".into()),
-                    created_at: Some(1_700_000_000_020),
-                    content: format!("second {external_id}"),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                },
-            ],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-
-        // Bare canonical row (kept) + projects/-prefixed twin (dropped).
-        storage
-            .insert_conversation_tree(agent_id, None, &make_conv("-proj/abc.jsonl"))
-            .unwrap();
-        storage
-            .insert_conversation_tree(agent_id, None, &make_conv("projects/-proj/abc.jsonl"))
-            .unwrap();
-
-        let conv_count = |storage: &FrankenStorage| -> i64 {
-            storage
-                .conn
-                .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
-                    row.get_typed(0)
-                })
-                .unwrap()
-        };
-        let msg_count = |storage: &FrankenStorage| -> i64 {
-            storage
-                .conn
-                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                    row.get_typed(0)
-                })
-                .unwrap()
-        };
-        assert_eq!(conv_count(&storage), 2, "two rows seeded");
-        assert_eq!(msg_count(&storage), 4, "two messages per row");
-
-        // Dry-run: detects the pair, mutates nothing.
-        let dry = storage
-            .collapse_external_id_prefix_duplicates(true)
-            .unwrap();
-        assert!(dry.dry_run);
-        assert_eq!(dry.conversations_affected, 1);
-        assert_eq!(dry.messages_affected, 2);
-        assert_eq!(dry.pairs.len(), 1);
-        assert_eq!(dry.pairs[0].drop_external_id, "projects/-proj/abc.jsonl");
-        assert_eq!(dry.pairs[0].keep_external_id, "-proj/abc.jsonl");
-        assert_eq!(conv_count(&storage), 2, "dry-run must not delete rows");
-        assert_eq!(msg_count(&storage), 4, "dry-run must not delete messages");
-
-        // Apply: drops the prefixed twin + its 2 messages; keeps canonical.
-        let applied = storage
-            .collapse_external_id_prefix_duplicates(false)
-            .unwrap();
-        assert!(!applied.dry_run);
-        assert_eq!(applied.conversations_affected, 1);
-        assert_eq!(applied.messages_affected, 2);
-        assert_eq!(conv_count(&storage), 1, "twin row dropped");
-        assert_eq!(msg_count(&storage), 2, "twin's messages dropped");
-
-        let surviving: String = storage
-            .conn
-            .query_row_map("SELECT external_id FROM conversations", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(
-            surviving, "-proj/abc.jsonl",
-            "the bare canonical row must survive, not the projects/ twin"
-        );
-
-        // Idempotent: a second apply finds nothing.
-        let again = storage
-            .collapse_external_id_prefix_duplicates(false)
-            .unwrap();
-        assert_eq!(again.conversations_affected, 0);
-        assert!(again.pairs.is_empty());
-    }
-
-    #[test]
-    fn lexical_content_truncation_caps_cumulative_bytes_and_keeps_message_count() {
-        use crate::model::types::{Message, MessageRole};
-
-        let cap = 100usize;
-        let mut messages = vec![
-            Message {
-                id: Some(1),
-                idx: 0,
-                role: MessageRole::User,
-                author: None,
-                created_at: Some(1),
-                content: "a".repeat(60),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            },
-            Message {
-                id: Some(2),
-                idx: 1,
-                role: MessageRole::Agent,
-                author: None,
-                created_at: Some(2),
-                content: "b".repeat(60),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            },
-            Message {
-                id: Some(3),
-                idx: 2,
-                role: MessageRole::Agent,
-                author: None,
-                created_at: Some(3),
-                content: "c".repeat(60),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            },
-        ];
-
-        truncate_lexical_rebuild_conversation_content(42, &mut messages, cap);
-
-        // Structure (message count + ids) preserved; only indexed text trimmed.
-        assert_eq!(messages.len(), 3, "message rows must be preserved");
-        assert_eq!(
-            messages.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![Some(1), Some(2), Some(3)]
-        );
-        let total: usize = messages.iter().map(|m| m.content.len()).sum();
-        assert_eq!(
-            total, cap,
-            "cumulative content is capped exactly at the cap"
-        );
-        // Earliest content is kept in full; the straddling message is truncated;
-        // later content is dropped.
-        assert_eq!(messages[0].content.len(), 60);
-        assert_eq!(messages[1].content.len(), 40);
-        assert!(messages[2].content.is_empty());
-    }
-
-    #[test]
-    fn lexical_content_truncation_is_noop_within_cap() {
-        use crate::model::types::{Message, MessageRole};
-
-        let mut messages = vec![Message {
-            id: Some(1),
-            idx: 0,
-            role: MessageRole::User,
-            author: None,
-            created_at: Some(1),
-            content: "short".to_string(),
-            extra_json: serde_json::Value::Null,
-            snippets: Vec::new(),
-        }];
-        truncate_lexical_rebuild_conversation_content(7, &mut messages, 1024);
-        assert_eq!(messages[0].content, "short", "within-cap content untouched");
-    }
-
-    #[test]
-    fn lexical_content_truncation_respects_utf8_char_boundaries() {
-        use crate::model::types::{Message, MessageRole};
-
-        // Each "é" is 2 bytes; a cap of 5 must not split a code point.
-        let mut messages = vec![Message {
-            id: Some(1),
-            idx: 0,
-            role: MessageRole::User,
-            author: None,
-            created_at: Some(1),
-            content: "ééé".to_string(), // 6 bytes
-            extra_json: serde_json::Value::Null,
-            snippets: Vec::new(),
-        }];
-        truncate_lexical_rebuild_conversation_content(1, &mut messages, 5);
-        // Largest char boundary <= 5 is 4 bytes ("éé").
-        assert_eq!(messages[0].content, "éé");
-        assert!(
-            messages[0]
-                .content
-                .is_char_boundary(messages[0].content.len())
-        );
-    }
-
-    /// #290: a conversation whose content exceeds the cap is admitted through the
-    /// lexical-rebuild fetch with truncated content, not OOM-quarantined.
-    #[test]
-    fn fetch_messages_for_lexical_rebuild_truncates_oversized_conversation_content() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use std::path::PathBuf;
-
-        // Force a small, deterministic cap independent of host memory.
-        // SAFETY: single-threaded test; the env var is read on each fetch call.
-        unsafe {
-            std::env::set_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "1024");
-        }
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("agent_search.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-
-        let agent = Agent {
-            id: None,
-            slug: "claude_code".into(),
-            name: "Claude Code".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-
-        // Three messages of 2 KiB each => 6 KiB total content, well over the
-        // 1 KiB cap. This models an image/base64-heavy conversation.
-        let big = "x".repeat(2048);
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "claude_code".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            external_id: Some("conv-big".into()),
-            title: Some("Oversized".into()),
-            source_path: PathBuf::from("/tmp/conv-big.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_100),
-            approx_tokens: None,
-            metadata_json: serde_json::Value::Null,
-            messages: (0..3)
-                .map(|idx| Message {
-                    id: None,
-                    idx,
-                    role: MessageRole::Agent,
-                    author: Some("assistant".into()),
-                    created_at: Some(1_700_000_000_010 + idx),
-                    content: big.clone(),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                })
-                .collect(),
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-        storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .unwrap();
-        let conversation_id = storage
-            .conn
-            .query_row_map(
-                "SELECT id FROM conversations WHERE external_id = ?1",
-                fparams!["conv-big"],
-                |row| row.get_typed::<i64>(0),
-            )
-            .unwrap();
-
-        let messages = storage
-            .fetch_messages_for_lexical_rebuild(conversation_id)
-            .unwrap();
-
-        // All message rows survive (count/structure intact) ...
-        assert_eq!(messages.len(), 3, "message rows preserved");
-        // ... but the cumulative indexed content is capped, never the raw 6 KiB.
-        let total: usize = messages.iter().map(|m| m.content.len()).sum();
-        assert_eq!(
-            total, 1024,
-            "cumulative content capped at the configured cap"
-        );
-        assert!(
-            !messages[0].content.is_empty(),
-            "earliest content is retained for lexical tokens"
-        );
-
-        // SAFETY: single-threaded test cleanup.
-        unsafe {
-            std::env::remove_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES");
-        }
     }
 
     #[test]
@@ -21517,11 +18697,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn rebuild_daily_stats_recomputes_materialized_totals_without_monolithic_group_by() {
-        let _conversation_batch =
-            set_env_var("CASS_DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE", "1");
-        let _message_batch = set_env_var("CASS_DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE", "1");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -21666,15 +18842,7 @@ mod tests {
                 .unwrap();
         }
 
-        storage
-            .conn
-            .execute_compat(
-                "INSERT INTO daily_stats (
-                    day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                fparams![999_i64, "stale", "stale", 99_i64, 99_i64, 99_i64, 0_i64],
-            )
-            .unwrap();
+        storage.conn.execute("DELETE FROM daily_stats").unwrap();
 
         let rebuilt = storage.rebuild_daily_stats().unwrap();
         assert_eq!(rebuilt.total_sessions, 2);
@@ -21690,32 +18858,9 @@ mod tests {
                 "SELECT message_count FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
                 fparams![],
                 |row| row.get_typed(0),
-        )
+            )
             .unwrap();
         assert_eq!(total_messages, 3);
-
-        let stale_rows: i64 = storage
-            .conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM daily_stats WHERE agent_slug = 'stale'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            stale_rows, 0,
-            "atomic publish must replace stale live stats"
-        );
-
-        let staged_rows: i64 = storage
-            .conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM daily_stats_rebuild_stage",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(staged_rows, 0, "successful publish must clear staging rows");
     }
 
     #[test]
@@ -21929,132 +19074,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rebuilt_total, expected_bytes);
-    }
-
-    #[test]
-    #[serial]
-    fn rebuild_daily_stats_reuses_streaming_statement_across_large_message_pages() {
-        const MESSAGE_COUNT: i64 = 512;
-        const CONTENT_BYTES: usize = 8 * 1024;
-
-        fn linux_rss_bytes() -> Option<u64> {
-            let status = std::fs::read_to_string("/proc/self/status").ok()?;
-            let rss_kib = status.lines().find_map(|line| {
-                line.strip_prefix("VmRSS:")?
-                    .split_whitespace()
-                    .next()?
-                    .parse::<u64>()
-                    .ok()
-            })?;
-            rss_kib.checked_mul(1_024)
-        }
-
-        let _conversation_batch =
-            set_env_var("CASS_DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE", "1");
-        let _message_batch = set_env_var("CASS_DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE", "1");
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("daily-stats-many-pages.db");
-        let bootstrap = SqliteStorage::open(&db_path).unwrap();
-
-        // Build the fixture outside the measured region through the same
-        // FrankenSQLite compatibility transaction used by production storage.
-        // Batch size one forces
-        // 512 executions of the same prepared FrankenSQLite statement; the
-        // pre-#329 ad-hoc materialization path retained enough per-execution
-        // state to reach ~10.4 GiB on the 967k-message field corpus.
-        let mut fixture_tx = bootstrap.conn.transaction().unwrap();
-        fixture_tx
-            .execute(
-                "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
-             VALUES(1, 'codex', 'Codex', 'cli', 0, 0)",
-            )
-            .unwrap();
-        fixture_tx
-            .execute_compat(
-                "INSERT INTO conversations(
-                     id, agent_id, source_id, external_id, source_path, started_at
-                 ) VALUES(1, 1, 'local', 'cass-329-many-pages', '/tmp/cass-329.jsonl', ?1)",
-                fparams![1_700_000_000_000_i64],
-            )
-            .unwrap();
-        let content = "x".repeat(CONTENT_BYTES);
-        for message_id in 1..=MESSAGE_COUNT {
-            fixture_tx
-                .execute_compat(
-                    "INSERT INTO messages(id, conversation_id, idx, role, content)
-                     VALUES(?1, 1, ?2, 'user', ?3)",
-                    fparams![message_id, message_id - 1, content.as_str()],
-                )
-                .unwrap();
-        }
-        fixture_tx.commit().unwrap();
-        drop(fixture_tx);
-        drop(bootstrap);
-
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        let plan_details: Vec<String> = storage
-            .conn
-            .query_map_collect(
-                "EXPLAIN QUERY PLAN \
-                 SELECT m.idx, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0) \
-                 FROM messages m INDEXED BY sqlite_autoindex_messages_1 \
-                 WHERE m.conversation_id = ?1 AND m.idx > ?2 \
-                 ORDER BY m.idx \
-                 LIMIT ?3",
-                fparams![1_i64, -1_i64, 1_i64],
-                |row| row.get_typed(3),
-            )
-            .unwrap();
-        assert!(
-            plan_details
-                .iter()
-                .any(|detail| detail.contains("sqlite_autoindex_messages_1")),
-            "daily_stats message scan must use the conversation_id/idx autoindex: {plan_details:?}"
-        );
-        assert!(
-            !plan_details
-                .iter()
-                .any(|detail| detail.contains("TEMP B-TREE")),
-            "daily_stats message scan must not materialize a sorter: {plan_details:?}"
-        );
-
-        let rss_before = linux_rss_bytes();
-        let started = std::time::Instant::now();
-        let rebuilt = storage.rebuild_daily_stats().unwrap();
-        let elapsed = started.elapsed();
-        let rss_after = linux_rss_bytes();
-        assert_eq!(rebuilt.total_sessions, 1);
-
-        let totals: (i64, i64) = storage
-            .conn
-            .query_row_map(
-                "SELECT message_count, total_chars
-                 FROM daily_stats
-                 WHERE agent_slug = 'all' AND source_id = 'all'",
-                fparams![],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-            )
-            .unwrap();
-        assert_eq!(totals.0, MESSAGE_COUNT);
-        assert_eq!(
-            totals.1,
-            MESSAGE_COUNT * i64::try_from(CONTENT_BYTES).unwrap()
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(60),
-            "512 prepared streaming pages took {elapsed:?}"
-        );
-        if let (Some(before), Some(after)) = (rss_before, rss_after) {
-            assert!(
-                after.saturating_sub(before) < 256 * 1024 * 1024,
-                "prepared streaming rebuild grew RSS by {} bytes",
-                after.saturating_sub(before)
-            );
-        }
-
-        // The staging/publish sequence must be idempotent, not additive.
-        let repeated = storage.rebuild_daily_stats().unwrap();
-        assert_eq!(repeated, rebuilt);
     }
 
     #[test]
@@ -26379,11 +23398,6 @@ mod tests {
             fparams![conversation_id],
         )
         .unwrap();
-        conn.execute_compat(
-            "DELETE FROM meta WHERE key = ?1",
-            fparams![FTS_FRANKEN_REBUILD_META_KEY],
-        )
-        .unwrap();
         drop(conn);
 
         let repair = ensure_fts_consistency_via_rusqlite(&db_path).unwrap();
@@ -26472,14 +23486,7 @@ mod tests {
         drop(conn);
 
         let inserted = rebuild_fts_via_rusqlite(&db_path).unwrap();
-        // The frankensqlite loader discards the stale rootpage-zero duplicate
-        // while retaining the independently reloadable canonical FTS5 table.
-        // Depending on whether that retained table is already hydrated, the
-        // explicit rebuild either observes exact parity (zero inserted) or
-        // repopulates the sole canonical row. The exact postcondition below,
-        // rather than the internal repair route, is the compatibility
-        // contract this regression protects.
-        assert!(inserted <= 1, "one canonical message bounds repair work");
+        assert_eq!(inserted, 1);
 
         let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
         let schema_rows = franken_fts_schema_rows(&conn).unwrap();
@@ -27671,92 +24678,6 @@ mod tests {
         let value = parse_historical_json_column(Some(raw.clone()));
 
         assert_eq!(historical_raw_json(&value), Some(raw.as_str()));
-    }
-
-    #[test]
-    fn message_extra_to_source_jsonl_line_round_trips_all_envelope_shapes() {
-        // #285: the salvage path that rebuilds source JSONL from the canonical
-        // archive's preserved per-message envelopes.
-
-        // 1. Historical raw-line wrapper → verbatim line, byte-for-byte.
-        let verbatim = r#"{"type":"user","uuid":"u1","text":"hi","ws":  "kept"}"#;
-        let wrapped = wrap_historical_raw_json(verbatim.to_string());
-        assert_eq!(
-            message_extra_to_source_jsonl_line(&wrapped).as_deref(),
-            Some(verbatim)
-        );
-
-        // 2. A decoded event object (the shape after msgpack/JSON decode) →
-        //    compact JSON re-serialization.
-        let event = serde_json::json!({"type": "assistant", "uuid": "a1"});
-        let line = message_extra_to_source_jsonl_line(&event).expect("line");
-        let reparsed: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(reparsed, event);
-        assert!(!line.contains('\n'));
-
-        // 3. A null envelope (no preserved event) → skipped.
-        assert_eq!(
-            message_extra_to_source_jsonl_line(&serde_json::Value::Null),
-            None
-        );
-    }
-
-    #[test]
-    fn reconstruct_source_jsonl_for_conversation_orders_by_idx() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-
-        // Seed one agent + one conversation with two raw-line messages.
-        storage
-            .conn
-            .execute_compat(
-                "INSERT INTO agents(slug, name, version, kind, created_at, updated_at) \
-                 VALUES('claude', 'Claude Code', NULL, 'cli', 1000, 1000)",
-                fparams![],
-            )
-            .unwrap();
-        let agent_id: i64 = storage
-            .conn
-            .query_row_map("SELECT last_insert_rowid()", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        storage
-            .conn
-            .execute_compat(
-                "INSERT INTO conversations(agent_id, external_id, title, source_path, started_at) \
-                 VALUES(?1, 'sess-1', 't', '/orig/a.jsonl', 1000)",
-                fparams![agent_id],
-            )
-            .unwrap();
-        let cid: i64 = storage
-            .conn
-            .query_row_map("SELECT last_insert_rowid()", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        // Insert out of idx order to prove ORDER BY idx in fetch_messages.
-        for (idx, line) in [(1_i64, r#"{"u":"a1"}"#), (0_i64, r#"{"u":"u1"}"#)] {
-            let wrapped =
-                serde_json::to_string(&wrap_historical_raw_json(line.to_string())).unwrap();
-            storage
-                .conn
-                .execute_compat(
-                    "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) \
-                     VALUES(?1, ?2, 'user', NULL, ?3, 'c', ?4, NULL)",
-                    fparams![cid, idx, 1000_i64 + idx, wrapped],
-                )
-                .unwrap();
-        }
-
-        let lines = storage
-            .reconstruct_source_jsonl_for_conversation(cid)
-            .unwrap();
-        assert_eq!(
-            lines,
-            vec![r#"{"u":"u1"}"#.to_string(), r#"{"u":"a1"}"#.to_string()]
-        );
     }
 
     #[test]
@@ -29040,15 +25961,6 @@ mod tests {
 
     #[test]
     fn fts_messages_integrity_reports_missing_shadow_tables() {
-        let direct_missing_shadow = fts_messages_integrity_error_from_message(
-            "inserting 10000 rows into fallback FTS: table not found: fts_messages_data",
-        )
-        .expect("a missing required shadow table must be classified as derived FTS damage");
-        assert_eq!(
-            direct_missing_shadow.missing_shadow_tables(),
-            &["fts_messages_data"]
-        );
-
         let dir = TempDir::new().unwrap();
         let healthy_db_path = dir.path().join("healthy_fts.db");
 
@@ -29690,114 +26602,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(openclaw_token_rows, 0);
-    }
-
-    /// #292 ask #2: `cass forget --source-glob` prunes the matching subset of
-    /// conversations from the canonical DB (dry-run reports, --apply deletes),
-    /// leaving non-matching conversations and their messages intact.
-    #[test]
-    fn forget_conversations_by_source_glob_dry_run_then_apply() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use std::path::PathBuf;
-
-        fn seed(storage: &FrankenStorage, agent_slug: &str, source_path: &str, marker: &str) {
-            let agent = Agent {
-                id: None,
-                slug: agent_slug.into(),
-                name: agent_slug.into(),
-                version: None,
-                kind: AgentKind::Cli,
-            };
-            let agent_id = storage.ensure_agent(&agent).unwrap();
-            let conversation = Conversation {
-                id: None,
-                agent_slug: agent_slug.into(),
-                workspace: Some(PathBuf::from("/tmp/workspace")),
-                external_id: Some(format!("{agent_slug}-{marker}")),
-                title: Some(format!("{agent_slug} {marker}")),
-                source_path: PathBuf::from(source_path),
-                started_at: Some(1_700_000_000_000),
-                ended_at: Some(1_700_000_000_100),
-                approx_tokens: None,
-                metadata_json: serde_json::Value::Null,
-                messages: vec![Message {
-                    id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: Some("user".into()),
-                    created_at: Some(1_700_000_000_010),
-                    content: format!("{marker} content"),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                }],
-                source_id: LOCAL_SOURCE_ID.into(),
-                origin_host: None,
-            };
-            storage
-                .insert_conversation_tree(agent_id, None, &conversation)
-                .unwrap();
-        }
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("forget.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-
-        // Two subagent transcripts (match the glob) + one top-level session.
-        seed(
-            &storage,
-            "claude",
-            "/home/u/.claude/projects/p/sess-1/subagents/agent-aaa.jsonl",
-            "sub-a",
-        );
-        seed(
-            &storage,
-            "claude",
-            "/home/u/.claude/projects/p/sess-2/subagents/agent-bbb.jsonl",
-            "sub-b",
-        );
-        seed(
-            &storage,
-            "claude",
-            "/home/u/.claude/projects/p/sess-3/session.jsonl",
-            "top",
-        );
-        assert_eq!(storage.total_conversation_count().unwrap(), 3);
-
-        let glob = "**/subagents/*.jsonl";
-
-        // Dry-run: reports matches, deletes nothing.
-        let dry = storage
-            .forget_conversations_by_source_glob(glob, true)
-            .unwrap();
-        assert!(dry.dry_run);
-        assert_eq!(dry.conversations_matched, 2);
-        assert_eq!(dry.messages_matched, 2);
-        assert_eq!(dry.conversations_deleted, 0);
-        assert_eq!(storage.total_conversation_count().unwrap(), 3);
-
-        // Apply: deletes the two subagent conversations, keeps the top-level one.
-        let applied = storage
-            .forget_conversations_by_source_glob(glob, false)
-            .unwrap();
-        assert!(!applied.dry_run);
-        assert_eq!(applied.conversations_matched, 2);
-        assert_eq!(applied.conversations_deleted, 2);
-        assert_eq!(storage.total_conversation_count().unwrap(), 1);
-        // The surviving top-level session's message is intact.
-        assert_eq!(storage.total_message_count().unwrap(), 1);
-
-        // An empty pattern is rejected; a non-matching glob is a clean no-op.
-        assert!(
-            storage
-                .forget_conversations_by_source_glob("   ", true)
-                .is_err()
-        );
-        let none = storage
-            .forget_conversations_by_source_glob("**/nope/*.jsonl", false)
-            .unwrap();
-        assert_eq!(none.conversations_matched, 0);
-        assert_eq!(none.conversations_deleted, 0);
-        assert_eq!(storage.total_conversation_count().unwrap(), 1);
     }
 
     /// Regression for cass#202: a `Connection` dropped mid-transaction can

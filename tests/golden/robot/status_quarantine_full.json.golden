@@ -11,8 +11,6 @@
     "status": "missing",
     "reason": "lexical Tantivy metadata missing",
     "fresh": false,
-    "partial": false,
-    "partial_reason": null,
     "last_indexed_at": null,
     "age_seconds": "[AGE_SECONDS]",
     "stale": false,
@@ -296,23 +294,6 @@
       "CPU budgets prefer physical cores and LLC/NUMA locality over SMT oversubscription",
       "RAM caps scale only when MemAvailable is large enough to preserve broad host headroom"
     ]
-  },
-  "daemon_runtime": {
-    "schema_version": 1,
-    "state": "not-running",
-    "observation": {
-      "socket_path": "[REPO]/.rch-tmp/semantic-daemon-ubuntu.sock",
-      "data_dir": "[TEST_HOME]/cass-data",
-      "run_lock_present": false,
-      "socket_present": false,
-      "socket_connectable": false,
-      "connect_timed_out": false
-    },
-    "recovery": {
-      "action_needed": false,
-      "disposable_runtime_artifact": false,
-      "why": "no daemon is running; an on-demand client will spawn one when needed"
-    }
   },
   "doctor_summary": {
     "schema_version": 2,
@@ -829,59 +810,6 @@
     },
     "warnings": []
   },
-  "search_completeness": {
-    "quarantine_status": "ok",
-    "quarantined_conversations": 0,
-    "complete": true,
-    "can_search": true,
-    "coverage_suspect": false,
-    "impact": "search covers all known conversations; nothing is quarantined",
-    "next_command": "cass status --json"
-  },
-  "root_cause": {
-    "schema_version": 1,
-    "family": "unknown",
-    "locus": "unknown",
-    "confidence": "unknown",
-    "evidence_refs": [],
-    "summary": "no evidence signals pointed at any root-cause family",
-    "recommended_next_probe": "cass diag --json && cass doctor check --json"
-  },
-  "storage_integrity": {
-    "storage_state": "ok",
-    "source_of_truth_risk": "none",
-    "archive_readability": "not_checked",
-    "checks_attempted": [
-      {
-        "name": "db_open",
-        "elapsed_ms": "[ELAPSED_MS]",
-        "timed_out": false,
-        "skipped_reason": "database not initialized",
-        "read_only": true
-      },
-      {
-        "name": "contention_classification",
-        "elapsed_ms": "[ELAPSED_MS]",
-        "timed_out": false,
-        "skipped_reason": "database file absent",
-        "read_only": true
-      },
-      {
-        "name": "schema_version",
-        "elapsed_ms": "[ELAPSED_MS]",
-        "timed_out": false,
-        "skipped_reason": "database file absent",
-        "read_only": true
-      },
-      {
-        "name": "wal_sidecar_shape",
-        "elapsed_ms": "[ELAPSED_MS]",
-        "timed_out": false,
-        "skipped_reason": "database file absent",
-        "read_only": true
-      }
-    ]
-  },
   "recommended_action": "Run 'cass index --full' once to discover local sessions and build the initial archive.",
   "recommended_commands": [
     {
@@ -916,13 +844,6 @@
       "retry_after_ms": null
     }
   ],
-  "budget": {
-    "elapsed_ms": "[ELAPSED_MS]",
-    "budget_ms": 8000,
-    "timed_out": false,
-    "skipped_sections": [],
-    "recommended_next_probe": null
-  },
   "_meta": {
     "timestamp": "[TIMESTAMP]",
     "data_dir": "[TEST_HOME]/cass-data",

@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
@@ -214,19 +215,16 @@ async fn check_for_updates_async_impl(current_version: &str, force: bool) -> Opt
         }
     };
 
-    let info = build_update_info(current_version, release, &state);
+    let info = build_update_info(current_version, release, &state)?;
 
-    // Persist cadence after any *successful fetch* — including when the
-    // release metadata is unusable (non-semver tag, untrusted URL) — so a
-    // bad upstream release cannot bypass the hourly throttle and turn every
-    // startup into a fresh network request. Transient network errors above
-    // still skip persistence so they do not suppress future checks.
+    // Persist cadence only after a successful fetch + parse so transient
+    // network or server errors do not suppress future checks for an hour.
     state.mark_checked();
     if let Err(e) = state.save_async().await {
         warn!("update check: failed to save state: {e}");
     }
 
-    info
+    Some(info)
 }
 
 /// Force a check regardless of interval (for manual refresh)
@@ -823,19 +821,16 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
         }
     };
 
-    let info = build_update_info(current_version, release, &state);
+    let info = build_update_info(current_version, release, &state)?;
 
-    // Persist cadence after any *successful fetch* — including when the
-    // release metadata is unusable (non-semver tag, untrusted URL) — so a
-    // bad upstream release cannot bypass the hourly throttle and turn every
-    // startup into a fresh network request. Transient network errors above
-    // still skip persistence so they do not suppress future checks.
+    // Persist cadence only after a successful fetch + parse so transient
+    // network or server errors do not suppress future checks for an hour.
     state.mark_checked();
     if let Err(e) = state.save() {
         warn!("update check: failed to save state: {e}");
     }
 
-    info
+    Some(info)
 }
 
 fn build_update_info(
@@ -875,33 +870,70 @@ fn build_update_info(
     })
 }
 
-/// Fetch latest release without letting HTTP transport stalls block the async executor.
+/// Fetch latest release using the native asupersync HTTP client.
 async fn fetch_latest_release() -> Result<GitHubRelease> {
-    asupersync::runtime::spawn_blocking(fetch_latest_release_blocking).await
+    if let Some(handle) = asupersync::runtime::Runtime::current_handle() {
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        handle
+            .try_spawn_with_cx(move |cx| async move {
+                let _ = tx.send(fetch_latest_release_with_cx(&cx).await);
+            })
+            .context("spawning update check task")?;
+
+        loop {
+            match rx.try_recv() {
+                Ok(result) => return result,
+                Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
+                Err(TryRecvError::Disconnected) => {
+                    anyhow::bail!("update check task exited before returning a result");
+                }
+            }
+        }
+    }
+
+    let cx = asupersync::Cx::current().context("update check requires an active asupersync Cx")?;
+    fetch_latest_release_with_cx(&cx).await
 }
 
-/// Fetch latest release using a short-timeout blocking HTTP client.
-fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
+async fn fetch_latest_release_with_cx(cx: &asupersync::Cx) -> Result<GitHubRelease> {
     let url = format!("{}/releases/latest", release_api_base_url());
-    let client = reqwest::blocking::Client::builder()
+    let client = asupersync::http::h1::HttpClient::builder()
         .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .build()
-        .context("building update-check HTTP client")?;
+        .build();
+    let response = asupersync::time::timeout(
+        cx.now(),
+        Duration::from_secs(HTTP_TIMEOUT_SECS),
+        client.request(
+            cx,
+            asupersync::http::h1::Method::Get,
+            &url,
+            vec![(
+                "Accept".to_string(),
+                "application/vnd.github.v3+json".to_string(),
+            )],
+            Vec::new(),
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("timed out fetching release: {e}"))?
+    .context("fetching release")?;
 
-    let response = client
-        .get(&url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github.v3+json")
-        .send()
-        .with_context(|| format!("fetching release metadata from {url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        anyhow::bail!("GitHub API returned {}", status.as_u16());
+    if !response.is_success() {
+        anyhow::bail!("GitHub API returned {}", response.status);
     }
 
     response
         .json::<GitHubRelease>()
         .context("parsing release JSON")
+}
+
+/// Fetch latest release using a dedicated synchronous runtime.
+fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .context("building update-check runtime")?
+        .block_on(fetch_latest_release())
 }
 
 /// Start a background thread to check for updates.
@@ -1243,42 +1275,35 @@ mod tests {
     }
 
     #[test]
-    fn update_state_sidecar_paths_use_pid_timestamp_and_nonce_namespace() -> anyhow::Result<()> {
+    fn update_state_sidecar_paths_use_pid_timestamp_and_nonce_namespace() {
         let sidecar = unique_update_state_temp_path(Path::new("/tmp/update_state.json"));
         let next_sidecar = unique_update_state_temp_path(Path::new("/tmp/update_state.json"));
         let file_name = sidecar
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("sidecar path has no UTF-8 file name"))?;
+            .expect("sidecar path has UTF-8 file name");
         let suffix = file_name
             .strip_prefix(".update_state.json.tmp.")
-            .ok_or_else(|| anyhow::anyhow!("sidecar path lacks expected hidden temp prefix"))?;
+            .expect("sidecar path uses the expected hidden temp prefix");
         let mut parts = suffix.split('.');
-        let pid = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("sidecar suffix lacks process id"))?;
-        let timestamp = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("sidecar suffix lacks timestamp"))?;
-        let nonce = parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("sidecar suffix lacks nonce"))?;
+        let pid = parts.next().expect("sidecar includes a process id");
+        let timestamp = parts.next().expect("sidecar includes a timestamp");
+        let nonce = parts.next().expect("sidecar includes a nonce");
 
-        anyhow::ensure!(
+        assert!(
             parts.next().is_none(),
             "unexpected sidecar suffix shape: {file_name:?}"
         );
-        anyhow::ensure!(
-            pid.parse::<u32>()? == std::process::id(),
-            "sidecar process id should match this process"
+        assert_eq!(
+            pid.parse::<u32>().expect("process id is numeric"),
+            std::process::id()
         );
-        let _timestamp = timestamp.parse::<u128>()?;
-        let _nonce = nonce.parse::<u64>()?;
-        anyhow::ensure!(
-            sidecar != next_sidecar,
-            "successive sidecar names should differ",
+        timestamp.parse::<u128>().expect("timestamp is numeric");
+        nonce.parse::<u64>().expect("nonce is numeric");
+        assert_ne!(
+            sidecar, next_sidecar,
+            "successive sidecar names should differ"
         );
-        Ok(())
     }
 
     #[test]

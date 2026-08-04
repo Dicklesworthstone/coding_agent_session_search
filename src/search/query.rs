@@ -39,7 +39,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1831,7 +1831,7 @@ pub fn rrf_fuse_hits(
         // Prefer lexical hit details (snippets highlight query terms).
         hit_by_doc_id.insert(doc_id.clone(), hit.clone());
         lexical_scored.push(FsScoredResult {
-            doc_id: doc_id.into(),
+            doc_id,
             score: hit.score,
             source: FsScoreSource::Lexical,
             index: None,
@@ -1852,7 +1852,7 @@ pub fn rrf_fuse_hits(
         semantic_scored.push(FsVectorHit {
             index: u32::try_from(idx).unwrap_or(u32::MAX),
             score: hit.score,
-            doc_id: doc_id.into(),
+            doc_id,
         });
     }
 
@@ -1911,7 +1911,7 @@ pub fn rrf_fuse_hits(
     };
 
     for fused_hit in fused {
-        let mut hit = match hit_by_doc_id.remove(fused_hit.doc_id.as_str()) {
+        let mut hit = match hit_by_doc_id.remove(&fused_hit.doc_id) {
             Some(hit) => hit,
             None => continue,
         };
@@ -2477,7 +2477,7 @@ impl FsLexicalSearch for CassProgressiveLexicalAdapter {
                         ProgressiveLexicalHit::from_search_hit(hit, self.field_mask)
                     });
                 scored.push(FsScoredResult {
-                    doc_id: resolved_doc.doc_id.into(),
+                    doc_id: resolved_doc.doc_id,
                     score: hit.score,
                     source: FsScoreSource::Lexical,
                     index: None,
@@ -2573,10 +2573,6 @@ pub struct CacheStats {
     pub cache_hits: u64,
     pub cache_miss: u64,
     pub cache_shortfall: u64,
-    /// Outcome taxonomy for generation-aware searcher/cache behavior. Unlike
-    /// the legacy aggregate fields, this keeps forced reloads, stale
-    /// generations, reload failures, and degraded fallback distinct.
-    pub searcher_cache: crate::daemon_runtime_state::SearcherCacheMetrics,
     pub reloads: u64,
     pub reload_ms_total: u128,
     pub total_cap: usize,
@@ -2607,7 +2603,6 @@ impl Default for CacheStats {
             cache_hits: 0,
             cache_miss: 0,
             cache_shortfall: 0,
-            searcher_cache: crate::daemon_runtime_state::SearcherCacheMetrics::default(),
             reloads: 0,
             reload_ms_total: 0,
             total_cap: 0,
@@ -3038,79 +3033,6 @@ struct FederatedIndexReader {
 static FEDERATED_SEARCH_READERS: Lazy<RwLock<HashMap<String, Arc<Vec<FederatedIndexReader>>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 static SEARCH_CLIENT_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-static SEARCHER_RELOAD_TIMEOUT: Lazy<Duration> = Lazy::new(|| {
-    dotenvy::var("CASS_SEARCHER_RELOAD_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(1))
-});
-
-struct ReloadInFlightGuard(Arc<AtomicBool>);
-
-impl Drop for ReloadInFlightGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-fn reload_index_readers_bounded(
-    readers: Vec<IndexReader>,
-    reload_in_flight: Arc<AtomicBool>,
-) -> Result<()> {
-    run_reload_bounded(
-        move || {
-            readers
-                .iter()
-                .try_for_each(IndexReader::reload)
-                .map_err(|error| error.to_string())
-        },
-        reload_in_flight,
-        *SEARCHER_RELOAD_TIMEOUT,
-    )
-}
-
-fn run_reload_bounded<F>(
-    reload: F,
-    reload_in_flight: Arc<AtomicBool>,
-    timeout: Duration,
-) -> Result<()>
-where
-    F: FnOnce() -> std::result::Result<(), String> + Send + 'static,
-{
-    reload_in_flight
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| anyhow!("a bounded searcher reload is already in flight"))?;
-    let (tx, rx) = mpsc::bounded(1);
-    let worker_reload_in_flight = Arc::clone(&reload_in_flight);
-    if let Err(error) = std::thread::Builder::new()
-        .name("cass-searcher-reload".to_string())
-        .spawn(move || {
-            let _in_flight = ReloadInFlightGuard(worker_reload_in_flight);
-            let _ = tx.send(reload());
-        })
-    {
-        // The worker did not take ownership, so clear the single-flight flag.
-        // This path is rare, but without it every future search would report a
-        // phantom reload in progress.
-        reload_in_flight.store(false, Ordering::Release);
-        return Err(anyhow!("failed to start bounded searcher reload: {error}"));
-    }
-
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(anyhow!("searcher reload failed: {error}")),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!(
-            "searcher reload exceeded {} ms",
-            timeout.as_millis()
-        )),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err(anyhow!("searcher reload worker disconnected"))
-        }
-    }
-}
 
 /// Calculate Levenshtein edit distance between two strings.
 /// Used for typo detection in did-you-mean suggestions.
@@ -6058,38 +5980,13 @@ impl SearchClient {
         }
 
         let reload_started = Instant::now();
-        let cached_generation = self.federated_generation_signature(readers);
-        if let Err(error) = reload_index_readers_bounded(
-            readers.iter().map(|shard| shard.reader.clone()).collect(),
-            Arc::clone(&self.metrics.reload_in_flight),
-        ) {
-            self.metrics
-                .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-                    cache_hit: true,
-                    cached_generation: Some(self.federated_generation_signature(readers)),
-                    current_generation: self.federated_generation_signature(readers),
-                    reload_attempted: true,
-                    reload_succeeded: false,
-                    served_fallback: false,
-                });
-            return Err(error);
+        for shard in readers {
+            shard.reader.reload()?;
         }
         let elapsed = reload_started.elapsed();
         *guard = Some(now);
         let epoch = self.reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.metrics.record_reload(elapsed);
-        let current_generation = self.federated_generation_signature(readers);
-        if cached_generation != current_generation {
-            self.metrics
-                .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-                    cache_hit: true,
-                    cached_generation: Some(cached_generation),
-                    current_generation,
-                    reload_attempted: true,
-                    reload_succeeded: true,
-                    served_fallback: false,
-                });
-        }
         tracing::debug!(
             duration_ms = elapsed.as_millis() as u64,
             reload_epoch = epoch,
@@ -6118,19 +6015,9 @@ impl SearchClient {
             .unwrap_or_else(|e| e.into_inner());
         if let Some(prev) = *guard
             && prev != generation
+            && let Ok(mut cache) = self.prefix_cache.lock()
         {
-            self.metrics
-                .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-                    cache_hit: true,
-                    cached_generation: Some(prev),
-                    current_generation: generation,
-                    reload_attempted: false,
-                    reload_succeeded: false,
-                    served_fallback: false,
-                });
-            if let Ok(mut cache) = self.prefix_cache.lock() {
-                cache.clear();
-            }
+            cache.clear();
         }
         *guard = Some(generation);
     }
@@ -7952,11 +7839,10 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
 #[derive(Default, Clone)]
 struct Metrics {
     cache_hits: Arc<AtomicU64>,
-    cache_outcomes: Arc<Mutex<crate::daemon_runtime_state::SearcherCacheMetrics>>,
+    cache_miss: Arc<AtomicU64>,
     cache_shortfall: Arc<AtomicU64>,
     reloads: Arc<AtomicU64>,
     reload_ms_total: Arc<AtomicU64>,
-    reload_in_flight: Arc<AtomicBool>,
     prewarm_scheduled: Arc<AtomicU64>,
     prewarm_skipped_pressure: Arc<AtomicU64>,
 }
@@ -7964,34 +7850,9 @@ struct Metrics {
 impl Metrics {
     fn inc_cache_hits(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
-        self.record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-            cache_hit: true,
-            cached_generation: Some(0),
-            current_generation: 0,
-            reload_attempted: false,
-            reload_succeeded: false,
-            served_fallback: false,
-        });
     }
     fn inc_cache_miss(&self) {
-        self.record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-            cache_hit: false,
-            cached_generation: None,
-            current_generation: 0,
-            reload_attempted: false,
-            reload_succeeded: false,
-            served_fallback: false,
-        });
-    }
-    fn record_cache_lookup(
-        &self,
-        lookup: crate::daemon_runtime_state::CacheLookup,
-    ) -> crate::daemon_runtime_state::SearcherCacheOutcome {
-        let outcome = crate::daemon_runtime_state::classify_cache_outcome(&lookup);
-        if let Ok(mut metrics) = self.cache_outcomes.lock() {
-            metrics.record(outcome);
-        }
-        outcome
+        self.cache_miss.fetch_add(1, Ordering::Relaxed);
     }
     fn inc_cache_shortfall(&self) {
         self.cache_shortfall.fetch_add(1, Ordering::Relaxed);
@@ -8012,23 +7873,10 @@ impl Metrics {
             .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
     }
 
-    fn snapshot_all(
-        &self,
-    ) -> (
-        u64,
-        crate::daemon_runtime_state::SearcherCacheMetrics,
-        u64,
-        u64,
-        u128,
-    ) {
-        let cache_outcomes = self
-            .cache_outcomes
-            .lock()
-            .map(|metrics| *metrics)
-            .unwrap_or_default();
+    fn snapshot_all(&self) -> (u64, u64, u64, u64, u128) {
         (
             self.cache_hits.load(Ordering::Relaxed),
-            cache_outcomes,
+            self.cache_miss.load(Ordering::Relaxed),
             self.cache_shortfall.load(Ordering::Relaxed),
             self.reloads.load(Ordering::Relaxed),
             self.reload_ms_total.load(Ordering::Relaxed) as u128,
@@ -8046,13 +7894,10 @@ impl Metrics {
     #[allow(dead_code)]
     fn reset(&self) {
         self.cache_hits.store(0, Ordering::Relaxed);
-        if let Ok(mut metrics) = self.cache_outcomes.lock() {
-            *metrics = crate::daemon_runtime_state::SearcherCacheMetrics::default();
-        }
+        self.cache_miss.store(0, Ordering::Relaxed);
         self.cache_shortfall.store(0, Ordering::Relaxed);
         self.reloads.store(0, Ordering::Relaxed);
         self.reload_ms_total.store(0, Ordering::Relaxed);
-        self.reload_in_flight.store(false, Ordering::Relaxed);
         self.prewarm_scheduled.store(0, Ordering::Relaxed);
         self.prewarm_skipped_pressure.store(0, Ordering::Relaxed);
     }
@@ -8483,38 +8328,11 @@ impl SearchClient {
             .unwrap_or(true)
         {
             let reload_started = Instant::now();
-            let cached_generation = reader.searcher().generation().generation_id();
-            if let Err(error) = reload_index_readers_bounded(
-                vec![reader.clone()],
-                Arc::clone(&self.metrics.reload_in_flight),
-            ) {
-                self.metrics
-                    .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-                        cache_hit: true,
-                        cached_generation: Some(cached_generation),
-                        current_generation: cached_generation,
-                        reload_attempted: true,
-                        reload_succeeded: false,
-                        served_fallback: false,
-                    });
-                return Err(error);
-            }
+            reader.reload()?;
             let elapsed = reload_started.elapsed();
             *guard = Some(now);
             let epoch = self.reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
             self.metrics.record_reload(elapsed);
-            let current_generation = reader.searcher().generation().generation_id();
-            if cached_generation != current_generation {
-                self.metrics
-                    .record_cache_lookup(crate::daemon_runtime_state::CacheLookup {
-                        cache_hit: true,
-                        cached_generation: Some(cached_generation),
-                        current_generation,
-                        reload_attempted: true,
-                        reload_succeeded: true,
-                        served_fallback: false,
-                    });
-            }
             tracing::debug!(
                 duration_ms = elapsed.as_millis() as u64,
                 reload_epoch = epoch,
@@ -8534,10 +8352,6 @@ impl SearchClient {
             hits = stats.cache_hits,
             miss = stats.cache_miss,
             shortfall = stats.cache_shortfall,
-            stale_generation_miss = stats.searcher_cache.stale_generation_miss,
-            forced_reload = stats.searcher_cache.forced_reload,
-            reload_failure = stats.searcher_cache.reload_failure,
-            fallback = stats.searcher_cache.fallback,
             reloads = stats.reloads,
             reload_ms_total = stats.reload_ms_total,
             total_cap = stats.total_cap,
@@ -8691,8 +8505,7 @@ impl SearchClient {
     }
 
     pub fn cache_stats(&self) -> CacheStats {
-        let (hits, searcher_cache, shortfall, reloads, reload_ms_total) =
-            self.metrics.snapshot_all();
+        let (hits, miss, shortfall, reloads, reload_ms_total) = self.metrics.snapshot_all();
         let (prewarm_scheduled, prewarm_skipped_pressure) = self.metrics.snapshot_prewarm();
         let reader_generation = self.last_generation.lock().ok().and_then(|guard| *guard);
         let (
@@ -8720,11 +8533,8 @@ impl SearchClient {
         };
         CacheStats {
             cache_hits: hits,
-            cache_miss: searcher_cache
-                .cold_miss
-                .saturating_add(searcher_cache.stale_generation_miss),
+            cache_miss: miss,
             cache_shortfall: shortfall,
-            searcher_cache,
             reloads,
             reload_ms_total,
             total_cap,
@@ -10727,90 +10537,8 @@ mod tests {
         metrics.inc_cache_miss();
         metrics.inc_cache_shortfall();
         metrics.inc_reload();
-        let (hits, outcomes, shortfall, reloads, _) = metrics.snapshot_all();
-        assert_eq!((hits, outcomes.cold_miss, shortfall, reloads), (1, 1, 1, 1));
-    }
-
-    #[test]
-    fn b7tb0_bounded_reload_times_out_without_starting_parallel_reloads() {
-        let reload_in_flight = Arc::new(AtomicBool::new(false));
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let started = Instant::now();
-        let error = run_reload_bounded(
-            move || {
-                release_rx.recv().map_err(|error| error.to_string())?;
-                Ok(())
-            },
-            Arc::clone(&reload_in_flight),
-            Duration::from_millis(20),
-        )
-        .expect_err("blocked reload must hit its deadline");
-        assert!(error.to_string().contains("exceeded 20 ms"));
-        assert!(started.elapsed() < Duration::from_millis(250));
-        assert!(reload_in_flight.load(Ordering::Acquire));
-
-        let parallel = run_reload_bounded(
-            || Ok(()),
-            Arc::clone(&reload_in_flight),
-            Duration::from_millis(20),
-        )
-        .expect_err("single-flight guard must reject a parallel reload");
-        assert!(parallel.to_string().contains("already in flight"));
-
-        release_tx.send(()).expect("release reload worker");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while reload_in_flight.load(Ordering::Acquire) && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(!reload_in_flight.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn b7tb0_metrics_keep_stale_reload_failure_and_fallback_distinct() {
-        let metrics = Metrics::default();
-        for lookup in [
-            crate::daemon_runtime_state::CacheLookup {
-                cache_hit: true,
-                cached_generation: Some(1),
-                current_generation: 2,
-                reload_attempted: false,
-                reload_succeeded: false,
-                served_fallback: false,
-            },
-            crate::daemon_runtime_state::CacheLookup {
-                cache_hit: true,
-                cached_generation: Some(1),
-                current_generation: 2,
-                reload_attempted: true,
-                reload_succeeded: false,
-                served_fallback: false,
-            },
-            crate::daemon_runtime_state::CacheLookup {
-                cache_hit: false,
-                cached_generation: None,
-                current_generation: 2,
-                reload_attempted: false,
-                reload_succeeded: false,
-                served_fallback: true,
-            },
-            crate::daemon_runtime_state::CacheLookup {
-                cache_hit: true,
-                cached_generation: Some(1),
-                current_generation: 2,
-                reload_attempted: true,
-                reload_succeeded: true,
-                served_fallback: false,
-            },
-        ] {
-            metrics.record_cache_lookup(lookup);
-        }
-
-        let (_, outcomes, _, _, _) = metrics.snapshot_all();
-        assert_eq!(outcomes.stale_generation_miss, 1);
-        assert_eq!(outcomes.reload_failure, 1);
-        assert_eq!(outcomes.fallback, 1);
-        assert_eq!(outcomes.forced_reload, 1);
-        assert_eq!(outcomes.total(), 4);
+        let (hits, miss, shortfall, reloads, _) = metrics.snapshot_all();
+        assert_eq!((hits, miss, shortfall, reloads), (1, 1, 1, 1));
     }
 
     #[test]
@@ -10898,7 +10626,7 @@ mod tests {
 
         let hash_hex = "00".repeat(32);
         let results = vec![FsScoredResult {
-            doc_id: format!("m|42|0|1|1|1|1|1700000000000|{hash_hex}").into(),
+            doc_id: format!("m|42|0|1|1|1|1|1700000000000|{hash_hex}"),
             score: 0.91,
             source: FsScoreSource::Lexical,
             index: None,
@@ -13901,9 +13629,6 @@ mod tests {
             let cache = client.prefix_cache.lock().unwrap();
             assert!(cache.shards.is_empty());
         }
-        let stats = client.cache_stats();
-        assert_eq!(stats.searcher_cache.stale_generation_miss, 1);
-        assert_eq!(stats.cache_miss, 1);
     }
 
     #[test]
@@ -13988,8 +13713,6 @@ mod tests {
         assert_eq!(stats.cache_hits, 1);
         assert_eq!(stats.cache_miss, 1);
         assert_eq!(stats.cache_shortfall, 1);
-        assert_eq!(stats.searcher_cache.hit, 1);
-        assert_eq!(stats.searcher_cache.cold_miss, 1);
         assert_eq!(stats.reloads, 1);
         assert_eq!(stats.reload_ms_total, 10);
         assert_eq!(stats.total_cap, *CACHE_TOTAL_CAP);
@@ -17878,8 +17601,8 @@ mod tests {
         };
 
         // Initial metrics should be zero
-        let (hits, outcomes, shortfall, reloads, _) = client.metrics.snapshot_all();
-        assert_eq!((hits, outcomes.cold_miss, shortfall, reloads), (0, 0, 0, 0));
+        let (hits, miss, shortfall, reloads, _) = client.metrics.snapshot_all();
+        assert_eq!((hits, miss, shortfall, reloads), (0, 0, 0, 0));
 
         // Simulate operations
         client.metrics.inc_cache_hits();
@@ -17888,9 +17611,9 @@ mod tests {
         client.metrics.inc_cache_shortfall();
         client.metrics.inc_reload();
 
-        let (hits, outcomes, shortfall, reloads, _) = client.metrics.snapshot_all();
+        let (hits, miss, shortfall, reloads, _) = client.metrics.snapshot_all();
         assert_eq!(hits, 2);
-        assert_eq!(outcomes.cold_miss, 1);
+        assert_eq!(miss, 1);
         assert_eq!(shortfall, 1);
         assert_eq!(reloads, 1);
     }
@@ -18631,7 +18354,7 @@ mod tests {
 
         let results = vec![
             FsScoredResult {
-                doc_id: fixture.doc_ids[0].clone().into(),
+                doc_id: fixture.doc_ids[0].clone(),
                 score: 1.0,
                 source: FsScoreSource::SemanticFast,
                 index: None,
@@ -18643,7 +18366,7 @@ mod tests {
                 metadata: None,
             },
             FsScoredResult {
-                doc_id: fixture.doc_ids[1].clone().into(),
+                doc_id: fixture.doc_ids[1].clone(),
                 score: 0.9,
                 source: FsScoreSource::SemanticFast,
                 index: None,
@@ -18655,7 +18378,7 @@ mod tests {
                 metadata: None,
             },
             FsScoredResult {
-                doc_id: fixture.doc_ids[2].clone().into(),
+                doc_id: fixture.doc_ids[2].clone(),
                 score: 0.8,
                 source: FsScoreSource::SemanticFast,
                 index: None,

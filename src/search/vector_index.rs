@@ -7,8 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use frankensqlite::Connection as FrankenConnection;
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use half::f16;
@@ -67,6 +68,217 @@ pub fn vector_index_path(data_dir: &Path, embedder_id: &str) -> PathBuf {
     data_dir
         .join(VECTOR_INDEX_DIR)
         .join(format!("index-{embedder_id}.fsvi"))
+}
+
+/// Stable, bounded reasons why an exact semantic artifact set cannot provide
+/// progressive/two-tier serving.
+///
+/// These codes are shared by query-time fallback and the human/JSON readiness
+/// surfaces so operators never have to infer topology failures from paths or
+/// free-form error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticProgressiveUnavailableReason {
+    /// Exact serving retains an opened FSVI owner, but the requested
+    /// progressive/two-tier constructor cannot consume that owner without
+    /// reopening a pathname and risking post-validation replacement.
+    OwnerBackedReaderRequired,
+    /// Exact search owns multiple shards and no ordered multi-shard two-tier
+    /// implementation is available.
+    MultipleExactShards,
+    /// A quality artifact exists without a selected fast artifact to provide
+    /// the initial phase.
+    FastArtifactMissing,
+    /// The selected fast artifact has no explicitly paired quality artifact.
+    QualityArtifactMissing,
+    /// Fast and quality artifacts are visible in metadata, but the serving
+    /// setup has not retained them as one constructor-owned pair.
+    ExactTierPairingRequired,
+    /// The selected fast and quality roles resolve to the same filesystem
+    /// object.
+    ExactArtifactRoleAlias,
+    /// One of the explicitly paired FSVI artifacts could not be opened by the
+    /// two-tier reader.
+    ExactArtifactOpenFailed,
+}
+
+impl SemanticProgressiveUnavailableReason {
+    /// Stable diagnostic code used by logs and JSON/human status surfaces.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::OwnerBackedReaderRequired => "owner_backed_reader_required",
+            Self::MultipleExactShards => "multiple_exact_shards",
+            Self::FastArtifactMissing => "fast_artifact_missing",
+            Self::QualityArtifactMissing => "quality_artifact_missing",
+            Self::ExactTierPairingRequired => "exact_tier_pairing_required",
+            Self::ExactArtifactRoleAlias => "exact_artifact_role_alias",
+            Self::ExactArtifactOpenFailed => "exact_artifact_open_failed",
+        }
+    }
+}
+
+/// Stable, bounded reasons why a semantic artifact cannot serve its selected
+/// HNSW sidecar.
+///
+/// Approximate search is an optimization over the exact FSVI source of truth.
+/// Callers use this reason to report a truthful exact-search fallback without
+/// exposing paths, parser errors, or other unbounded artifact details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticAnnUnavailableReason {
+    /// More than one exact shard is active, but no sharded ANN topology was
+    /// explicitly selected.
+    MultipleExactShards,
+    /// The selected exact artifact has no explicitly paired ANN sidecar.
+    SidecarMissing,
+    /// The ANN metadata or native sidecars could not be opened or validated.
+    SidecarOpenFailed,
+    /// The selected persisted ANN metadata was readable, but its graph was
+    /// legacy, stale, incomplete, corrupt, or otherwise could not be admitted
+    /// as the exact native graph.
+    SidecarNotNative,
+}
+
+impl SemanticAnnUnavailableReason {
+    /// Stable diagnostic code used by logs and status/search metadata.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MultipleExactShards => "multiple_exact_shards",
+            Self::SidecarMissing => "ann_sidecar_missing",
+            Self::SidecarOpenFailed => "ann_sidecar_open_failed",
+            Self::SidecarNotNative => "ann_sidecar_not_native",
+        }
+    }
+}
+
+/// One opened semantic index inseparably paired with the exact path that
+/// selected it and its optional CASS-owned ANN sidecar.
+///
+/// The constructor opens the FSVI itself and all fields are private, so a
+/// reader from one file cannot be relabelled with another file's path. Relative
+/// inputs are frozen against one current-directory snapshot before the open.
+#[derive(Debug, Clone)]
+pub struct SemanticIndexArtifact {
+    index: Arc<VectorIndex>,
+    fsvi_path: PathBuf,
+    ann_path: Option<PathBuf>,
+    ann_unavailable_reason: Option<SemanticAnnUnavailableReason>,
+    owner_backed_progressive_reader: bool,
+}
+
+impl SemanticIndexArtifact {
+    /// Open an FSVI artifact and retain its exact serving paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current directory cannot be captured for a
+    /// relative input or when the selected FSVI cannot be opened. An invalid
+    /// optional ANN sidecar never prevents the exact FSVI from opening; its
+    /// bounded rejection reason is retained for exact-search fallback.
+    pub fn open(fsvi_path: impl Into<PathBuf>, ann_path: Option<PathBuf>) -> Result<Self> {
+        let current_dir =
+            std::env::current_dir().context("capture semantic artifact current directory")?;
+        let freeze = |path: PathBuf| {
+            if path.is_absolute() {
+                path
+            } else {
+                current_dir.join(path)
+            }
+        };
+        let fsvi_path = freeze(fsvi_path.into());
+        let ann_path = ann_path.map(freeze);
+        reject_final_component_symlink("FSVI", &fsvi_path)?;
+        let index = VectorIndex::open(&fsvi_path)
+            .with_context(|| format!("open semantic FSVI {}", fsvi_path.display()))?;
+        let ann_unavailable_reason =
+            ann_path
+                .as_deref()
+                .and_then(|path| match std::fs::symlink_metadata(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Some(SemanticAnnUnavailableReason::SidecarMissing)
+                    }
+                    Err(_) => Some(SemanticAnnUnavailableReason::SidecarOpenFailed),
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        Some(SemanticAnnUnavailableReason::SidecarOpenFailed)
+                    }
+                    Ok(metadata) if !metadata.file_type().is_file() => {
+                        Some(SemanticAnnUnavailableReason::SidecarOpenFailed)
+                    }
+                    Ok(_) => match same_file::is_same_file(&fsvi_path, path) {
+                        Ok(true) | Err(_) => Some(SemanticAnnUnavailableReason::SidecarOpenFailed),
+                        Ok(false) => None,
+                    },
+                });
+        Ok(Self {
+            index: Arc::new(index),
+            fsvi_path,
+            ann_path,
+            ann_unavailable_reason,
+            // `VectorIndex::open` retains the exact FSVI owner used by CASS
+            // exact search, but FrankenSearch's current two-tier constructors
+            // still reopen a pathname. Keep those lanes fail-closed until an
+            // owner-accepting constructor can set this capability true.
+            owner_backed_progressive_reader: false,
+        })
+    }
+
+    /// Opened FSVI reader.
+    #[must_use]
+    pub fn index(&self) -> &VectorIndex {
+        self.index.as_ref()
+    }
+
+    /// Clone the opened reader owner for a search operation.
+    #[must_use]
+    pub(crate) fn index_owner(&self) -> Arc<VectorIndex> {
+        Arc::clone(&self.index)
+    }
+
+    /// Exact FSVI path used by [`Self::open`].
+    #[must_use]
+    pub fn fsvi_path(&self) -> &Path {
+        &self.fsvi_path
+    }
+
+    /// Optional CASS-owned HNSW sidecar paired with this FSVI.
+    #[must_use]
+    pub fn ann_path(&self) -> Option<&Path> {
+        self.ann_path.as_deref()
+    }
+
+    /// Bounded reason the explicitly paired ANN sidecar was rejected before
+    /// query-time native admission.
+    #[must_use]
+    pub fn ann_unavailable_reason(&self) -> Option<SemanticAnnUnavailableReason> {
+        self.ann_unavailable_reason
+    }
+
+    /// Whether progressive/two-tier constructors can consume this retained
+    /// owner without reopening [`Self::fsvi_path`].
+    ///
+    /// Path-opened artifacts deliberately return false. A future
+    /// owner-accepting FrankenSearch API must be wired through a distinct
+    /// constructor before this capability can become true.
+    #[must_use]
+    pub fn has_owner_backed_progressive_reader(&self) -> bool {
+        self.owner_backed_progressive_reader
+    }
+}
+
+fn reject_final_component_symlink(role: &str, path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(anyhow!(
+            "semantic {role} artifact must not be a final-component symlink: {}",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect semantic {role} path {}", path.display()))
+        }
+    }
 }
 
 /// Semantic doc_id fields encoded into FSVI records.
@@ -489,6 +701,141 @@ mod tests {
         let dir = Path::new("/tmp/cass");
         let p = vector_index_path(dir, "fnv1a-384");
         assert!(p.ends_with("vector_index/index-fnv1a-384.fsvi"));
+    }
+
+    #[test]
+    fn exact_artifact_contract_retains_selected_paths_without_mutation() {
+        let dir = tempfile::tempdir().expect("artifact fixture");
+        let fsvi_path = dir.path().join("nonconventional-fast-name.fsvi");
+        let ann_path = dir.path().join("consumer-owned-ann.chsw");
+        let writer = VectorIndex::create_with_revision(
+            &fsvi_path,
+            "fnv1a-2",
+            "artifact-rev",
+            2,
+            Quantization::F16,
+        )
+        .expect("create exact FSVI");
+        writer.finish().expect("finish exact FSVI");
+        std::fs::write(&ann_path, b"consumer-owned ANN fixture").expect("write ANN fixture");
+        let metadata_before = std::fs::metadata(&fsvi_path).expect("metadata before open");
+        let bytes_before = std::fs::read(&fsvi_path).expect("bytes before open");
+        let mut entries_before = std::fs::read_dir(dir.path())
+            .expect("entries before open")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        entries_before.sort();
+
+        let artifact =
+            SemanticIndexArtifact::open(&fsvi_path, Some(ann_path.clone())).expect("open artifact");
+
+        assert_eq!(artifact.fsvi_path(), fsvi_path);
+        assert_eq!(artifact.ann_path(), Some(ann_path.as_path()));
+        assert_eq!(artifact.index().embedder_id(), "fnv1a-2");
+        assert_eq!(artifact.index().dimension(), 2);
+        assert!(
+            !artifact.has_owner_backed_progressive_reader(),
+            "a path-opened artifact must not authorize a later pathname reopen"
+        );
+        let metadata_after = std::fs::metadata(&fsvi_path).expect("metadata after open");
+        assert_eq!(metadata_after.len(), metadata_before.len());
+        assert_eq!(
+            std::fs::read(&fsvi_path).expect("bytes after open"),
+            bytes_before,
+            "opening a serving artifact must not rewrite the FSVI bytes"
+        );
+        assert_eq!(
+            metadata_after.modified().expect("mtime after"),
+            metadata_before.modified().expect("mtime before"),
+            "opening a serving artifact must not rewrite the FSVI"
+        );
+        let mut entries_after = std::fs::read_dir(dir.path())
+            .expect("entries after open")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        entries_after.sort();
+        assert_eq!(
+            entries_after, entries_before,
+            "opening an artifact must not create conventional aliases or ANN sidecars"
+        );
+    }
+
+    #[test]
+    fn exact_artifact_contract_rejects_missing_and_corrupt_paths() {
+        let dir = tempfile::tempdir().expect("artifact fixture");
+        let missing = dir.path().join("missing-selected.fsvi");
+        let missing_error =
+            SemanticIndexArtifact::open(&missing, None).expect_err("missing path must fail");
+        assert!(missing_error.to_string().contains("missing-selected.fsvi"));
+
+        let corrupt = dir.path().join("corrupt-selected.fsvi");
+        std::fs::write(&corrupt, b"not an fsvi").expect("write corrupt FSVI");
+        let corrupt_error =
+            SemanticIndexArtifact::open(&corrupt, None).expect_err("corrupt path must fail");
+        assert!(corrupt_error.to_string().contains("corrupt-selected.fsvi"));
+
+        let valid = dir.path().join("valid-selected.fsvi");
+        VectorIndex::create_with_revision(&valid, "fnv1a-2", "artifact-rev", 2, Quantization::F16)
+            .expect("create valid FSVI")
+            .finish()
+            .expect("finish valid FSVI");
+        let missing_ann = dir.path().join("missing-selected.chsw");
+        let artifact = SemanticIndexArtifact::open(&valid, Some(missing_ann.clone()))
+            .expect("a missing optional ANN must preserve exact FSVI serving");
+        assert_eq!(artifact.ann_path(), Some(missing_ann.as_path()));
+        assert_eq!(
+            artifact.ann_unavailable_reason(),
+            Some(SemanticAnnUnavailableReason::SidecarMissing)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_artifact_contract_rejects_fsvi_symlink_and_degrades_invalid_ann_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("artifact alias fixture");
+        let fsvi_path = dir.path().join("selected.fsvi");
+        VectorIndex::create_with_revision(
+            &fsvi_path,
+            "fnv1a-2",
+            "artifact-rev",
+            2,
+            Quantization::F16,
+        )
+        .expect("create selected FSVI")
+        .finish()
+        .expect("finish selected FSVI");
+
+        let fsvi_symlink = dir.path().join("selected-symlink.fsvi");
+        symlink(&fsvi_path, &fsvi_symlink).expect("create FSVI symlink");
+        let fsvi_symlink_error = SemanticIndexArtifact::open(&fsvi_symlink, None)
+            .expect_err("final-component FSVI symlink must fail closed");
+        assert!(fsvi_symlink_error.to_string().contains("symlink"));
+
+        let ann_target = dir.path().join("selected-ann-target.chsw");
+        std::fs::write(&ann_target, b"ANN fixture").expect("write ANN target");
+        let ann_symlink = dir.path().join("selected-ann-symlink.chsw");
+        symlink(&ann_target, &ann_symlink).expect("create ANN symlink");
+        let ann_symlink_artifact =
+            SemanticIndexArtifact::open(&fsvi_path, Some(ann_symlink.clone()))
+                .expect("an ANN symlink must not disable exact FSVI serving");
+        assert_eq!(ann_symlink_artifact.ann_path(), Some(ann_symlink.as_path()));
+        assert_eq!(
+            ann_symlink_artifact.ann_unavailable_reason(),
+            Some(SemanticAnnUnavailableReason::SidecarOpenFailed)
+        );
+
+        let ann_hard_link = dir.path().join("selected-ann-hard-link.chsw");
+        std::fs::hard_link(&fsvi_path, &ann_hard_link).expect("create cross-role hard link");
+        let hard_link_artifact =
+            SemanticIndexArtifact::open(&fsvi_path, Some(ann_hard_link.clone()))
+                .expect("an aliased ANN role must not disable exact FSVI serving");
+        assert_eq!(hard_link_artifact.ann_path(), Some(ann_hard_link.as_path()));
+        assert_eq!(
+            hard_link_artifact.ann_unavailable_reason(),
+            Some(SemanticAnnUnavailableReason::SidecarOpenFailed)
+        );
     }
 
     #[test]

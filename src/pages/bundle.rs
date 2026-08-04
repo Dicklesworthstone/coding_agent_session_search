@@ -1330,6 +1330,7 @@ mod tests {
     }
 
     fn encrypted_config_for_files(files: Vec<&str>) -> EncryptionConfig {
+        use base64::prelude::*;
         let chunk_count = files.len();
         EncryptionConfig {
             version: crate::pages::encrypt::SCHEMA_VERSION,

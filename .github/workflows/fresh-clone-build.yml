@@ -57,22 +57,29 @@ jobs:
           echo "=== [patch] sections in Cargo.toml ==="
           awk '/^[[:space:]]*\[patch/,/^[[:space:]]*$/' Cargo.toml || true
 
-      - name: Assert no active [patch] blocks for sibling repos
+      - name: Assert no sibling-path [patch] overrides
         working-directory: cass
         run: |
           set -euo pipefail
-          # Any uncommented [patch."..."] line is a regression risk for #181.
-          # TOML table headers may have leading whitespace (cargo honors this),
-          # so match `^[[:space:]]*\[patch` rather than `^\[patch`.
-          # Comments start with `#`, so they still won't match this pattern.
-          if grep -nE '^[[:space:]]*\[patch' Cargo.toml; then
+          # Committed [patch] blocks with git/registry sources resolve fine on
+          # a fresh clone (e.g. the intentional [patch.crates-io] fsqlite git
+          # pin). What breaks fresh clones (#181) is a patch entry pointing at
+          # a local sibling *path*. TOML table headers may have leading
+          # whitespace (cargo honors this), and comment lines start with `#`.
+          if awk '
+            /^[[:space:]]*#/            { next }
+            /^[[:space:]]*\[patch/      { inpatch = 1; next }
+            /^[[:space:]]*\[/           { inpatch = 0 }
+            inpatch && /path[[:space:]]*=/ { print FILENAME ":" FNR ": " $0; bad = 1 }
+            END { exit bad ? 0 : 1 }
+          ' Cargo.toml; then
             echo ""
-            echo "ERROR: Cargo.toml has active [patch] block(s)."
-            echo "These point at local sibling paths and break fresh-clone builds (#181)."
+            echo "ERROR: Cargo.toml has a [patch] entry pointing at a local path."
+            echo "These sibling-path overrides break fresh-clone builds (#181)."
             echo "Re-comment them before merging. See the note in Cargo.toml."
             exit 1
           fi
-          echo "OK: no active [patch] blocks."
+          echo "OK: no sibling-path [patch] overrides."
 
       - name: cargo metadata (full resolution, no siblings present)
         working-directory: cass

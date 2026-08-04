@@ -80,7 +80,6 @@ impl SearchMaintenanceMode {
 pub(crate) enum SearchMaintenanceJobKind {
     LexicalRefresh,
     SemanticAcquire,
-    SemanticRebuild,
 }
 
 impl SearchMaintenanceJobKind {
@@ -88,7 +87,6 @@ impl SearchMaintenanceJobKind {
         match self {
             Self::LexicalRefresh => "lexical_refresh",
             Self::SemanticAcquire => "semantic_acquire",
-            Self::SemanticRebuild => "semantic_rebuild",
         }
     }
 
@@ -96,7 +94,6 @@ impl SearchMaintenanceJobKind {
         match raw.trim() {
             "lexical_refresh" => Some(Self::LexicalRefresh),
             "semantic_acquire" => Some(Self::SemanticAcquire),
-            "semantic_rebuild" => Some(Self::SemanticRebuild),
             _ => None,
         }
     }
@@ -392,17 +389,6 @@ pub(crate) fn maintenance_stall_age_ms(
         || !snapshot
             .mode
             .is_some_and(SearchMaintenanceMode::rebuild_active)
-    {
-        return None;
-    }
-    // The native HNSW builder is one opaque, CPU-bound call without a
-    // progress callback. Its owner heartbeat still proves the process is
-    // alive, but treating an unchanged forward-progress cursor as a stalled
-    // *lexical* rebuild during this explicitly labelled phase is misleading.
-    // All other semantic phases expose real counters and remain eligible for
-    // stale-progress reporting.
-    if snapshot.job_kind == Some(SearchMaintenanceJobKind::SemanticRebuild)
-        && snapshot.phase.as_deref() == Some("semantic:hnsw")
     {
         return None;
     }
@@ -2151,35 +2137,12 @@ mod tests {
         for kind in [
             SearchMaintenanceJobKind::LexicalRefresh,
             SearchMaintenanceJobKind::SemanticAcquire,
-            SearchMaintenanceJobKind::SemanticRebuild,
         ] {
             assert_eq!(
                 SearchMaintenanceJobKind::parse_lock_value(kind.as_lock_value()),
                 Some(kind)
             );
         }
-    }
-
-    #[test]
-    fn issue_342_semantic_hnsw_is_not_mislabeled_as_stalled_lexical_work() {
-        let now_ms = 1_733_000_300_000_i64;
-        let mut snapshot = SearchMaintenanceSnapshot {
-            active: true,
-            mode: Some(SearchMaintenanceMode::Index),
-            job_kind: Some(SearchMaintenanceJobKind::SemanticRebuild),
-            phase: Some("semantic:hnsw".to_string()),
-            last_progress_at_ms: Some(now_ms - 300_000),
-            ..SearchMaintenanceSnapshot::default()
-        };
-
-        assert_eq!(maintenance_stall_age_ms(&snapshot, now_ms), None);
-
-        snapshot.phase = Some("semantic:embedding".to_string());
-        assert_eq!(
-            maintenance_stall_age_ms(&snapshot, now_ms),
-            Some(300_000),
-            "measured semantic phases must retain stale-progress diagnostics"
-        );
     }
 
     #[test]

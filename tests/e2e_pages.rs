@@ -16,7 +16,6 @@
 //! cargo test --test e2e_pages test_full_export_pipeline_password_only
 //! ```
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::model::types::{Agent, AgentKind};
 use coding_agent_search::pages::bundle::{BundleBuilder, BundleResult};
 use coding_agent_search::pages::encrypt::{DecryptionEngine, EncryptionEngine, load_config};
@@ -30,7 +29,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -331,7 +330,6 @@ fn build_full_pipeline(
     include_recovery: bool,
 ) -> PipelineArtifacts {
     let tracker = tracker_for("build_full_pipeline");
-    let _trace_guard = tracker.trace_env_guard();
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let data_dir = temp_dir.path().join("data");
     fs::create_dir_all(&data_dir).expect("Failed to create data directory");
@@ -436,7 +434,6 @@ fn build_full_pipeline(
 #[test]
 fn test_full_export_pipeline_password_only() {
     let tracker = tracker_for("test_full_export_pipeline_password_only");
-    let _trace_guard = tracker.trace_env_guard();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_full_export_pipeline_password_only\",\"status\":\"START\"}}");
 
@@ -535,7 +532,6 @@ fn test_full_export_pipeline_dual_auth() {
 #[test]
 fn test_integrity_decrypt_roundtrip_password() {
     let tracker = tracker_for("test_integrity_decrypt_roundtrip_password");
-    let _trace_guard = tracker.trace_env_guard();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_integrity_decrypt_roundtrip_password\",\"status\":\"START\"}}");
 
@@ -579,7 +575,6 @@ fn test_integrity_decrypt_roundtrip_password() {
 #[test]
 fn test_integrity_decrypt_roundtrip_recovery() {
     let tracker = tracker_for("test_integrity_decrypt_roundtrip_recovery");
-    let _trace_guard = tracker.trace_env_guard();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_integrity_decrypt_roundtrip_recovery\",\"status\":\"START\"}}");
 
@@ -636,7 +631,6 @@ fn test_integrity_decrypt_roundtrip_recovery() {
 #[test]
 fn test_tampering_fails_authentication() {
     let tracker = tracker_for("test_tampering_fails_authentication");
-    let _trace_guard = tracker.trace_env_guard();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_tampering_fails_authentication\",\"status\":\"START\"}}");
 
@@ -706,7 +700,7 @@ fn test_tampering_fails_authentication() {
 #[test]
 fn test_cli_verify_command() {
     let tracker = tracker_for("test_cli_verify_command");
-    let _trace_guard = tracker.trace_env_guard();
+    let command_env = tracker.command_environment();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_cli_verify_command\",\"status\":\"START\"}}");
 
@@ -714,7 +708,7 @@ fn test_cli_verify_command() {
 
     // Run cass pages --verify
     let phase_start = tracker.start("cli_verify", Some("Execute cass pages --verify command"));
-    let mut cmd = cargo_bin_cmd!("cass");
+    let mut cmd = command_env.cass_assert_command();
     let assert = cmd
         .arg("pages")
         .arg("--verify")
@@ -741,7 +735,7 @@ fn test_cli_verify_command() {
 #[test]
 fn test_cli_pages_full_workflow_end_to_end() {
     let tracker = tracker_for("test_cli_pages_full_workflow_end_to_end");
-    let _trace_guard = tracker.trace_env_guard();
+    let command_env = tracker.command_environment();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_cli_pages_full_workflow_end_to_end\",\"status\":\"START\"}}");
 
@@ -757,7 +751,8 @@ fn test_cli_pages_full_workflow_end_to_end() {
         "cli_export",
         Some("Run cass pages --config end-to-end export"),
     );
-    let export_output = Command::new(cass_bin_path())
+    let export_output = command_env
+        .cass_std_command()
         .arg("--db")
         .arg(&db_path)
         .arg("pages")
@@ -810,7 +805,8 @@ fn test_cli_pages_full_workflow_end_to_end() {
     );
 
     let phase_start = tracker.start("cli_verify", Some("Run cass pages --verify on bundle"));
-    let verify_output = Command::new(cass_bin_path())
+    let verify_output = command_env
+        .cass_std_command()
         .arg("pages")
         .arg("--verify")
         .arg(&site_dir)
@@ -834,7 +830,8 @@ fn test_cli_pages_full_workflow_end_to_end() {
 
     let preview_port = pick_unused_local_port();
     let phase_start = tracker.start("cli_preview", Some("Run preview server and fetch bundle"));
-    let mut preview_child = Command::new(cass_bin_path())
+    let mut preview_child = command_env
+        .cass_std_command()
         .arg("pages")
         .arg("--preview")
         .arg(&site_dir)
@@ -953,7 +950,7 @@ fn test_cli_pages_full_workflow_end_to_end() {
 fn test_pages_wizard_pty_respects_db_override_and_writes_bundle_root() {
     let _wizard_guard = pages_wizard_guard();
     let tracker = tracker_for("test_pages_wizard_pty_respects_db_override_and_writes_bundle_root");
-    let _trace_guard = tracker.trace_env_guard();
+    let command_env = tracker.command_environment();
     let test_start = Instant::now();
     eprintln!(
         "{{\"test\":\"test_pages_wizard_pty_respects_db_override_and_writes_bundle_root\",\"status\":\"START\"}}"
@@ -987,6 +984,7 @@ fn test_pages_wizard_pty_respects_db_override_and_writes_bundle_root() {
 
     let phase_start = tracker.start("wizard_launch", Some("Launch interactive pages wizard"));
     let mut cmd = CommandBuilder::new(cass_bin_path());
+    command_env.apply_to_pty(&mut cmd);
     cmd.arg("--db");
     cmd.arg(db_path.to_string_lossy().as_ref());
     cmd.arg("pages");
@@ -1197,7 +1195,6 @@ fn test_pages_wizard_pty_respects_db_override_and_writes_bundle_root() {
 #[test]
 fn test_search_in_decrypted_archive() {
     let tracker = tracker_for("test_search_in_decrypted_archive");
-    let _trace_guard = tracker.trace_env_guard();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_search_in_decrypted_archive\",\"status\":\"START\"}}");
 
@@ -1281,7 +1278,6 @@ fn test_summary_generation_multi_agent_fixtures() {
     use coding_agent_search::pages::summary::SummaryGenerator;
 
     let tracker = tracker_for("test_summary_generation_multi_agent_fixtures");
-    let _trace_guard = tracker.trace_env_guard();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_summary_generation_multi_agent_fixtures\",\"status\":\"START\"}}");
 
@@ -1400,7 +1396,6 @@ fn test_summary_with_agent_filter() {
     use coding_agent_search::pages::summary::{SummaryFilters, SummaryGenerator};
 
     let tracker = tracker_for("test_summary_with_agent_filter");
-    let _trace_guard = tracker.trace_env_guard();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_summary_with_agent_filter\",\"status\":\"START\"}}");
 
@@ -1501,7 +1496,6 @@ fn test_summary_with_workspace_exclusions() {
     use coding_agent_search::pages::summary::{ExclusionSet, SummaryGenerator};
 
     let tracker = tracker_for("test_summary_with_workspace_exclusions");
-    let _trace_guard = tracker.trace_env_guard();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_summary_with_workspace_exclusions\",\"status\":\"START\"}}");
 
@@ -1625,7 +1619,6 @@ fn test_export_filter_date_range() {
     use coding_agent_search::pages::summary::{SummaryFilters, SummaryGenerator};
 
     let tracker = tracker_for("test_export_filter_date_range");
-    let _trace_guard = tracker.trace_env_guard();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_export_filter_date_range\",\"status\":\"START\"}}");
 
@@ -1747,7 +1740,6 @@ fn test_exclusion_pattern_matching() {
     use coding_agent_search::pages::summary::ExclusionSet;
 
     let tracker = tracker_for("test_exclusion_pattern_matching");
-    let _trace_guard = tracker.trace_env_guard();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_exclusion_pattern_matching\",\"status\":\"START\"}}");
 
@@ -1845,7 +1837,6 @@ fn test_prepublish_summary_render() {
     use coding_agent_search::pages::summary::SummaryGenerator;
 
     let tracker = tracker_for("test_prepublish_summary_render");
-    let _trace_guard = tracker.trace_env_guard();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_prepublish_summary_render\",\"status\":\"START\"}}");
 
@@ -1956,7 +1947,6 @@ fn test_size_estimation_accuracy() {
     use coding_agent_search::pages::summary::{estimate_compressed_size, format_size};
 
     let tracker = tracker_for("test_size_estimation_accuracy");
-    let _trace_guard = tracker.trace_env_guard();
     let test_start = Instant::now();
     eprintln!("{{\"test\":\"test_size_estimation_accuracy\",\"status\":\"START\"}}");
 

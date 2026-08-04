@@ -187,7 +187,7 @@ fn json_format_parses_as_a_single_json_document() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
     let stdout = run_search(&data_dir, &[NO_MATCH_QUERY, "--robot"])?;
-    let payload = serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|err| {
+    serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|err| {
         test_error(format!(
             "pretty --robot output is not a single JSON doc: {err}"
         ))

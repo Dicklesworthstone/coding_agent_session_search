@@ -3,75 +3,37 @@
 pub mod analytics;
 pub mod bakeoff;
 pub mod bookmarks;
-pub mod connector_ingest_diagnostics;
 pub mod connectors;
-pub mod context_pack;
 pub mod crash_replay;
 #[cfg(unix)]
 pub mod daemon;
-pub mod daemon_runtime_state;
 pub mod dependency_drift;
-pub mod dependency_pin_correlation;
 pub mod doctor;
 pub(crate) mod doctor_chokepoint;
-pub mod doctor_recover;
 pub(crate) mod doctor_robot_docs;
 pub(crate) mod doctor_runs;
 pub(crate) mod doctor_undo;
-pub mod e2e_runner;
 pub mod encryption;
 pub mod evidence_bundle;
 pub mod explainability;
 pub mod export;
-pub mod fleet_archive_coverage;
-pub mod fleet_doctor_schema;
-pub mod fleet_platform_compat;
-pub mod fleet_probe;
-pub mod fleet_upgrade_rehearsal;
-pub mod fleet_version_skew;
 pub mod ftui_harness;
-pub mod guide_planner;
-pub mod guide_runner;
 pub mod html_export;
-pub mod incident_discovery;
 pub mod indexer;
-pub mod lessons;
-pub mod lessons_extraction;
-pub mod metric_integrity;
 pub mod model;
-pub mod operations_dashboard;
 pub mod pages;
 pub mod perf_evidence;
 pub mod policy_registry;
-pub mod privacy_exposure;
-pub mod proof_artifact;
 pub mod query_cost_planner;
 pub mod raw_mirror;
-pub(crate) mod recipes_robot_docs;
-pub(crate) mod recovery_support_bundle;
-pub mod release_verify;
-pub mod repro_capsule;
-pub mod resource_plan;
-pub mod robot_budget_envelope;
-pub mod root_cause_projection;
-pub mod root_cause_taxonomy;
 pub mod search;
-pub mod search_defaults;
-pub mod search_quality_eval;
-pub mod source_doctor_health;
-pub mod source_onboarding;
 pub mod sources;
 pub mod storage;
-pub mod subsystem_coverage_matrix;
-pub mod swarm_replay_fixture;
 pub mod swarm_status;
-pub mod top_session_summary;
 pub mod topology_budget;
 pub mod tui_asciicast;
 pub mod ui;
 pub mod update_check;
-pub mod workflow_analytics;
-pub mod workflow_macros;
 
 use anyhow::Result;
 use base64::prelude::*;
@@ -344,19 +306,12 @@ pub enum Commands {
         #[arg(long, default_value_t = 30)]
         watch_interval: u64,
 
-        /// Build semantic vector index after text indexing. Progress reports
-        /// canonical replay, embedding, vector publish, optional HNSW,
-        /// manifest publish, and finalization as distinct phases. Set
-        /// CASS_INDEX_STALL_DETECT_SECS=0 to disable stall diagnostics, or
-        /// CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls
-        /// report-only while still reporting semantic phase progress.
+        /// Build semantic vector index after text indexing
         #[arg(long)]
         semantic: bool,
 
         /// Build HNSW index for approximate nearest neighbor search (requires --semantic).
-        /// Enables O(log n) search with `--approximate` at query time. Native
-        /// HNSW construction is an opaque phase: cass reports its vector total
-        /// but does not synthesize forward progress the backend cannot expose.
+        /// Enables O(log n) search with `--approximate` flag at query time.
         #[arg(long, default_value_t = false)]
         build_hnsw: bool,
 
@@ -526,9 +481,8 @@ pub enum Commands {
         #[arg(long)]
         reranker: Option<String>,
 
-        /// Auto-spawn the warm-model daemon when one is not already running.
-        /// Search discovers and uses an existing daemon by default; if daemon
-        /// inference is unavailable, it lazily falls back to direct inference.
+        /// Use daemon for warm model inference (faster repeated queries).
+        /// If daemon is unavailable, falls back to direct inference.
         #[arg(long, default_value_t = false)]
         daemon: bool,
 
@@ -539,9 +493,9 @@ pub enum Commands {
         // ==========================================================================
         // Two-tier progressive search flags (bd-3dcw)
         // ==========================================================================
-        /// Request the quality-refined tier of the two-tier search pipeline.
-        /// The one-shot CLI emits the final quality result set; the interactive TUI
-        /// is the surface that displays fast results first and refines them in place.
+        /// Enable two-tier progressive search: fast results immediately, refined via daemon.
+        /// Returns initial results from fast embedder (~1ms), then refines with quality
+        /// embedder via daemon (~130ms). Best of both worlds for interactive search.
         #[arg(long, default_value_t = false)]
         two_tier: bool,
 
@@ -551,8 +505,8 @@ pub enum Commands {
         fast_only: bool,
 
         /// Quality-only search: wait for full transformer model results.
-        /// Uses an existing daemon when available and lazily falls back to the
-        /// installed local model; higher latency than --fast-only, but more accurate.
+        /// Higher latency (~130ms) but most accurate semantic matching.
+        /// Requires daemon to be available; falls back to fast if unavailable.
         #[arg(long, default_value_t = false)]
         quality_only: bool,
 
@@ -687,30 +641,6 @@ pub enum Commands {
         #[arg(long, short)]
         verbose: bool,
     },
-    /// On-disk storage footprint breakdown by component (DB, WAL, lexical index, raw mirror, semantic, quarantine)
-    Storage {
-        /// Override data dir
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-    },
-    /// Collapse pre-existing duplicate conversation rows (projects/<rel> vs <rel> external_id twins) created before the dedup fix
-    Dedup {
-        /// Override data dir
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-
-        /// Actually delete the duplicate rows. Without this, runs as a dry-run (inspect only, no mutation).
-        #[arg(long, default_value_t = false)]
-        apply: bool,
-    },
     /// Quick health check for agents: index freshness, db stats, recommended action
     Status {
         /// Override data dir
@@ -752,28 +682,6 @@ pub enum Commands {
         #[arg(long, value_name = "MILLISECONDS")]
         timeout: Option<u64>,
     },
-    /// Assemble a redacted, share-safe recovery/support evidence bundle
-    SupportBundle {
-        /// Override data dir
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-
-        /// Staleness threshold in seconds (default: 300)
-        #[arg(long, default_value_t = 300)]
-        stale_threshold: u64,
-
-        /// Include full filesystem paths in the bundle (default: basename-only)
-        #[arg(long, default_value_t = false)]
-        include_full_paths: bool,
-
-        /// Include raw session/tool payloads in the bundle (default: suppressed)
-        #[arg(long, default_value_t = false)]
-        include_raw_evidence: bool,
-    },
     /// Quick state/health check (alias of status)
     State {
         /// Override data dir
@@ -810,9 +718,6 @@ pub enum Commands {
         /// Exact source_id from search output (e.g. 'local', 'work-laptop')
         #[arg(long, alias = "source-id", alias = "source_id")]
         source: Option<String>,
-        /// Exact canonical archive conversation row id
-        #[arg(long, alias = "conversation_id", value_parser = clap::value_parser!(i64).range(1..))]
-        conversation_id: Option<i64>,
         /// Line number to show (1-indexed)
         #[arg(long, short = 'n', alias = "line-number", alias = "line_number")]
         line: Option<usize>,
@@ -841,70 +746,6 @@ pub enum Commands {
         /// Staleness threshold in seconds (default: 300)
         #[arg(long, default_value_t = 300)]
         stale_threshold: u64,
-    },
-    /// First-run source onboarding + readiness wizard. Read-only: explains what
-    /// CASS found, what it will index, what is missing, and the single safest
-    /// next command. Scriptable via `--json`; never launches a bare TUI.
-    Onboarding {
-        /// Override data dir
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        /// Output as JSON (for automation)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-    },
-    /// Intent-to-command planner and gated runner for guided safe workflows.
-    /// Dry-run is the default. `--apply` automatically evaluates only closed,
-    /// read-only proof adapters and requires an explicit confirmation for each
-    /// mutating step; macro strings are never evaluated by a shell. Maps an
-    /// operator intent (fix-ci, investigate-search-miss, prepare-release,
-    /// repair-assets, export-session, onboard-source, support-capsule) to an
-    /// exact safe command plan — steps, prerequisites, proof gates, forbidden
-    /// shortcuts, rch target-dir hints, cost/risk, privacy notes, and stop
-    /// conditions. Never launches a bare TUI. Omit the intent to list the known
-    /// intents.
-    Guide {
-        /// Operator intent to plan (omit to list the known intents). Multiple
-        /// words are joined, e.g. `cass guide rebuild index`.
-        intent: Vec<String>,
-        /// Deterministic preflight-facts source: a JSON file shaped like
-        /// `{ "facts": { "<fact>": true, ... }, "intent"?: "<intent>" }`.
-        #[arg(long)]
-        fixture: Option<PathBuf>,
-        /// Override data dir
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        /// Enter gated apply mode (`--run` is an alias). Without this flag the
-        /// transcript is a deterministic, fully read-only dry-run.
-        #[arg(long, visible_alias = "run", default_value_t = false)]
-        apply: bool,
-        /// Confirm one exact mutating step number. Repeat for multiple steps;
-        /// confirmation never carries across steps.
-        #[arg(long, value_delimiter = ',')]
-        confirm_step: Vec<usize>,
-        /// Confirm an operator-context preflight fact as true. Repeatable; the
-        /// confirmation is recorded in the robot transcript.
-        #[arg(long)]
-        confirm_fact: Vec<String>,
-        /// Accept the exact declared privacy tier (`redacted` or `sensitive`).
-        /// A generic yes is intentionally not accepted.
-        #[arg(long)]
-        accept_privacy_tier: Option<String>,
-        /// Accept the exact declared cost-risk band (`medium` or `high`) after
-        /// reviewing the resource what-if result.
-        #[arg(long)]
-        accept_cost_risk: Option<String>,
-        /// Permit steps whose macro policy requires rch offload. This does not
-        /// permit a shell or an unallowlisted executable.
-        #[arg(long, default_value_t = false)]
-        allow_rch: bool,
-        /// Assert that every declared stop condition was checked and is clear.
-        /// An observed triggered stop condition always wins over this assertion.
-        #[arg(long, default_value_t = false)]
-        confirm_stop_conditions_clear: bool,
-        /// Output as JSON (for automation)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
     },
     /// Diagnose cass installation issues. Legacy `cass doctor --json` maps to the read-only check surface.
     /// Legacy `--fix` maps to safe-auto-run and may only apply contract-declared safe repairs.
@@ -1070,29 +911,6 @@ pub enum Commands {
         /// env_vars[] — in one envelope. Read-only.
         #[arg(long, default_value_t = false, hide = true)]
         emit_capabilities: bool,
-
-        // --- #285 corrupt-archive recovery surfaces ---
-        /// Rebuild the source JSONL tree from the canonical archive's preserved
-        /// `extra_json`/`extra_bin` events into `<DIR>`, so a corrupt archive
-        /// can be re-ingested from cass's own data with `cass index --full`
-        /// (no stock-sqlite `.recover` needed). Opens the archive read-only.
-        #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
-        recover_from_archive: Option<PathBuf>,
-
-        /// Safely inspect or repair the canonical FTS5 shadow. Exact dry-run
-        /// parity uses fused covering-index parent-run counts plus bounded
-        /// primary-key probes; partial shadows resume in bounded batches and
-        /// recreation is failure-atomic. Supports `--dry-run`; mutation
-        /// requires `--yes` and never modifies canonical rows.
-        #[arg(long, default_value_t = false)]
-        rebuild_canonical_fts: bool,
-
-        /// Quarantine interrupted `raw_mirror_capture` staging artifacts that
-        /// block doctor mutation, instead of forcing a manual `rm` inside the
-        /// data dir. Requires `--yes`; artifacts are renamed into a quarantine
-        /// dir, never deleted.
-        #[arg(long, default_value_t = false)]
-        cleanup_interrupted_artifacts: bool,
     },
     /// Find related sessions for a given source path
     Context {
@@ -1123,12 +941,6 @@ pub enum Commands {
         /// Maximum sessions to return (defaults: 10, or 1 with --current)
         #[arg(long)]
         limit: Option<usize>,
-        /// Only sessions active since this ISO date (YYYY-MM-DD or
-        /// YYYY-MM-DDTHH:MM:SS), keyword (`today`, `yesterday`), or relative
-        /// offset (`-7d`, `-24h`). Filters on the session's recorded
-        /// last-activity timestamp (ended_at, falling back to started_at).
-        #[arg(long, allow_hyphen_values = true)]
-        since: Option<String>,
         /// Output as JSON (for automation)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -1136,9 +948,8 @@ pub enum Commands {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
-    /// Resolve a session path into a ready-to-run resume command for its
-    /// native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini,
-    /// Antigravity).
+    /// Resolve a session path into a ready-to-run resume command for
+    /// its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini).
     ///
     /// By default, the resolved command is printed to stdout, one
     /// argv token per line, so the caller can wrap it however they like:
@@ -1162,8 +973,7 @@ pub enum Commands {
                 \x20 pi_agent | pi-agent     (let path inference pick `pi` vs `omp`)\n\
                 \x20 pi                      (force the pi-mono binary)\n\
                 \x20 omp | oh-my-pi | ohmypi (force the Oh My Pi binary)\n\
-                \x20 gemini\n\
-                \x20 antigravity | agy       (resume via `agy --conversation <uuid>`)"
+                \x20 gemini"
         )]
         agent: Option<String>,
         /// Replace the current process with the resolved resume command.
@@ -1461,30 +1271,6 @@ pub enum Commands {
         #[arg(long)]
         example_config: bool,
     },
-    /// Inspect and manage the conversation-ingest quarantine (list / clear)
-    #[command(subcommand)]
-    Quarantine(QuarantineCommand),
-    /// Prune an already-indexed subset of conversations by source-path glob
-    /// (dry-run by default; `--apply` to commit). Removes matching rows from the
-    /// canonical DB and rebuilds derived search/analytics assets.
-    Forget {
-        /// Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`).
-        #[arg(long = "source-glob")]
-        source_glob: String,
-
-        /// Override db path
-        #[arg(long)]
-        db: Option<PathBuf>,
-
-        /// Actually delete the matching conversations. Without this, runs as a
-        /// dry-run (inspect only).
-        #[arg(long, default_value_t = false)]
-        apply: bool,
-
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-    },
     /// Inspect and prune raw-mirror evidence under explicit operator control
     #[command(subcommand)]
     Mirror(MirrorCommand),
@@ -1494,12 +1280,6 @@ pub enum Commands {
     /// Manage semantic search models
     #[command(subcommand)]
     Models(ModelsCommand),
-    /// Fleet-safe upgrade rehearsal and bounded post-upgrade verification
-    #[command(subcommand)]
-    Fleet(FleetCommand),
-    /// Mine and query durable lessons from local evidence (commits, beads, proofs)
-    #[command(subcommand)]
-    Lessons(LessonsCommand),
     /// Read-only swarm operations status, work packets, and coordination lint
     #[command(subcommand)]
     Swarm(SwarmCommand),
@@ -1508,7 +1288,7 @@ pub enum Commands {
     Import(ImportCommand),
     /// Token usage, tool, and model analytics
     ///
-    /// Subcommands: status, tokens, tools, models, incidents, rebuild, validate.
+    /// Subcommands: status, tokens, tools, models, rebuild, validate.
     /// All subcommands share time-range, dimensional, and output flags.
     ///
     /// # Examples
@@ -1520,46 +1300,6 @@ pub enum Commands {
     /// ```
     #[command(subcommand)]
     Analytics(AnalyticsCommand),
-
-    /// Verify release distribution channels (GitHub, Homebrew, Scoop, crates.io, installer).
-    ///
-    /// Robot-safe: `--from <file|->` evaluates a recorded observation JSON
-    /// offline (CI/agents), while `--live` gathers per-channel observations over
-    /// the network. Prints a ReleaseVerificationReport as JSON.
-    ReleaseVerify {
-        /// Read a ReleaseVerifyRequest JSON from a file (or `-` for stdin) and
-        /// evaluate it offline. Mutually exclusive with --live.
-        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "live")]
-        from: Option<String>,
-
-        /// Gather live per-channel observations over the network (explicit opt-in).
-        #[arg(long)]
-        live: bool,
-
-        /// Expected release version under test (required for --live).
-        #[arg(long)]
-        expected_version: Option<String>,
-
-        /// GitHub owner/repo for the release channel (defaults to the cass repo).
-        #[arg(long)]
-        repo: Option<String>,
-
-        /// crates.io crate name (defaults to the cass crate).
-        #[arg(long)]
-        crate_name: Option<String>,
-
-        /// Raw URL of the Homebrew formula file (enables the homebrew channel).
-        #[arg(long)]
-        homebrew_formula_url: Option<String>,
-
-        /// Raw URL of the Scoop manifest JSON (enables the scoop channel).
-        #[arg(long)]
-        scoop_manifest_url: Option<String>,
-
-        /// Output as JSON (`--robot` also works). Default for this command.
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-    },
 
     /// Run the semantic model daemon (Unix only)
     #[cfg(unix)]
@@ -1576,68 +1316,6 @@ pub enum Commands {
         /// Override data dir for model storage
         #[arg(long)]
         data_dir: Option<PathBuf>,
-    },
-}
-
-/// Conversation-ingest quarantine inspection and management (#292 ask #3).
-#[derive(Subcommand, Debug, Clone)]
-pub enum QuarantineCommand {
-    /// List quarantined conversations: id, schema version, attempt count, reason, age.
-    List {
-        /// Override data dir
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-    },
-    /// Remove quarantine entries (dry-run by default; `--apply` to clear). Optionally filter by a conversation-id substring.
-    Clear {
-        /// Override data dir
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-
-        /// Only clear entries whose conversation_id contains this substring. Omit to target all entries.
-        #[arg(long)]
-        filter: Option<String>,
-
-        /// Actually remove the matching entries. Without this, runs as a dry-run (inspect only).
-        #[arg(long, default_value_t = false)]
-        apply: bool,
-
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-    },
-    /// Re-attempt retry-eligible quarantined conversations (bounded; dry-run by
-    /// default). Apply reparses each exact source conversation and clears it
-    /// only after persistence succeeds; irreducible same-version entries are
-    /// reported but never attempted unless `--force-irreducible`.
-    Retry {
-        /// Override data dir
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-
-        /// Cap the number of entries attempted in this pass (bounded, resumable).
-        /// Omit to attempt every eligible entry. Deferred entries are reported,
-        /// never dropped — re-run to resume.
-        #[arg(long)]
-        max_attempts: Option<usize>,
-
-        /// Also retry irreducible same-version entries (an explicit operator
-        /// override of the safe eligible-only default).
-        #[arg(long, default_value_t = false)]
-        force_irreducible: bool,
-
-        /// Targeted re-ingest eligible entries now. Without this, emit a
-        /// read-only retry plan.
-        #[arg(long, default_value_t = false)]
-        apply: bool,
-
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
     },
 }
 
@@ -1829,158 +1507,6 @@ pub enum SwarmCommand {
         #[arg(long, default_value = "healthy")]
         fixture_id: String,
     },
-    /// Estimate read-only resource impact for indexing, exports, and verification.
-    ResourcePlan {
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-
-        /// Read provider input from a single swarm fixture file.
-        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
-        fixture: Option<PathBuf>,
-
-        /// Read provider input from a swarm fixture directory.
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        fixture_dir: Option<PathBuf>,
-
-        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
-        #[arg(long, default_value = "healthy")]
-        fixture_id: String,
-
-        /// Limit the what-if output to one action.
-        #[arg(long)]
-        action: Option<String>,
-    },
-    /// Preview privacy exposure before indexing, exporting, or support capture.
-    PrivacyPreview {
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-
-        /// Read provider input from a single swarm fixture file.
-        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
-        fixture: Option<PathBuf>,
-
-        /// Read provider input from a swarm fixture directory.
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        fixture_dir: Option<PathBuf>,
-
-        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
-        #[arg(long, default_value = "healthy")]
-        fixture_id: String,
-    },
-    /// Select the smallest useful bead-scoped context pack under a token budget.
-    ContextPack {
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-
-        /// Read provider input from a single swarm fixture file.
-        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
-        fixture: Option<PathBuf>,
-
-        /// Read provider input from a swarm fixture directory.
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        fixture_dir: Option<PathBuf>,
-
-        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
-        #[arg(long, default_value = "healthy")]
-        fixture_id: String,
-    },
-    /// Aggregate workflow outcome analytics (skills, commands, proof gates, closures).
-    WorkflowAnalytics {
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-
-        /// Read provider input from a single swarm fixture file.
-        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
-        fixture: Option<PathBuf>,
-
-        /// Read provider input from a swarm fixture directory.
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        fixture_dir: Option<PathBuf>,
-
-        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
-        #[arg(long, default_value = "healthy")]
-        fixture_id: String,
-    },
-    /// Generate a scrubbed, deterministic replay fixture from a raw swarm timeline.
-    ReplayFixture {
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-
-        /// Read provider input from a single swarm fixture file.
-        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
-        fixture: Option<PathBuf>,
-
-        /// Read provider input from a swarm fixture directory.
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        fixture_dir: Option<PathBuf>,
-
-        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
-        #[arg(long, default_value = "healthy")]
-        fixture_id: String,
-    },
-    /// List advisory workflow macros for repeatable operator journeys.
-    Macros {
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-
-        /// Read provider input from a single swarm fixture file.
-        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
-        fixture: Option<PathBuf>,
-
-        /// Read provider input from a swarm fixture directory.
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        fixture_dir: Option<PathBuf>,
-
-        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
-        #[arg(long, default_value = "healthy")]
-        fixture_id: String,
-    },
-    /// Generate a redacted reproduction capsule for a failure or search hit.
-    ReproCapsule {
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-
-        /// Read provider input from a single swarm fixture file.
-        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
-        fixture: Option<PathBuf>,
-
-        /// Read provider input from a swarm fixture directory.
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        fixture_dir: Option<PathBuf>,
-
-        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
-        #[arg(long, default_value = "healthy")]
-        fixture_id: String,
-    },
-    /// Render a local read-only operations dashboard over guided-workflow robot JSON.
-    Dashboard {
-        /// Output the normalized dashboard model as JSON (`--robot` also works).
-        #[arg(long, visible_alias = "robot", conflicts_with = "html")]
-        json: bool,
-
-        /// Output a self-contained offline HTML report to stdout.
-        #[arg(long, conflicts_with = "json")]
-        html: bool,
-
-        /// Read child robot payloads from a single swarm fixture file.
-        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
-        fixture: Option<PathBuf>,
-
-        /// Read child robot payloads from a swarm fixture directory.
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        fixture_dir: Option<PathBuf>,
-
-        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
-        #[arg(long, default_value = "healthy")]
-        fixture_id: String,
-    },
 }
 
 /// Subcommands for importing external data
@@ -2071,32 +1597,6 @@ pub enum SourcesCommand {
         /// Dry run - show what would be synced without actually syncing
         #[arg(long)]
         dry_run: bool,
-        /// Output as JSON (`--robot` also works)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-    },
-    /// Re-ingest an already-synced mirror into the canonical archive WITHOUT
-    /// re-running the rsync transfer.
-    ///
-    /// `cass sources sync` only triggers an ingest pass when new files are
-    /// transferred, so a mirror that is already current (or whose sessions were
-    /// never promoted to canonical) has no way to reach the searchable archive
-    /// without a wasteful re-transfer. This forces an ingest pass over the
-    /// existing mirror root(s), which `cass index` discovers via the same
-    /// remote scan-root machinery used after a sync.
-    Reingest {
-        /// Re-ingest from the existing mirror without re-running rsync. This is
-        /// the default and only mode today; the flag documents intent and keeps
-        /// the `cass sources reingest --from-mirror` spelling explicit.
-        #[arg(long, default_value_t = true)]
-        from_mirror: bool,
-        /// Re-ingest only specific source(s) (defaults to all remote sources)
-        #[arg(long, short)]
-        source: Option<Vec<String>>,
-        /// Rebuild the full index from the mirror (cass index --full) instead of
-        /// an incremental ingest pass
-        #[arg(long)]
-        full: bool,
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -2521,7 +2021,7 @@ impl std::fmt::Display for AnalyticsBucketing {
     }
 }
 
-/// Subcommands for analytics (token/tool/model breakdowns and bounded incident mining).
+/// Subcommands for analytics (token usage, tool, and model breakdowns).
 ///
 /// All subcommands share time-range, dimensional-filter, and output flags
 /// via clap's `flatten` on [`AnalyticsCommon`].
@@ -2559,26 +2059,6 @@ pub enum AnalyticsCommand {
         /// Time bucket for aggregation
         #[arg(long, value_enum, default_value_t = AnalyticsBucketing::Day)]
         group_by: AnalyticsBucketing,
-    },
-    /// Mine recurrent CASS incident categories from the canonical archive under strict caps
-    Incidents {
-        #[command(flatten)]
-        common: AnalyticsCommon,
-        /// Maximum ranked incident sessions returned
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
-        /// Maximum archive conversations scanned (hard ceiling: 10,000)
-        #[arg(long, default_value_t = crate::incident_discovery::DEFAULT_MAX_FILES)]
-        max_sessions: u64,
-        /// Maximum archive messages inspected
-        #[arg(long, default_value_t = crate::incident_discovery::DEFAULT_MAX_LINES)]
-        max_messages: u64,
-        /// Maximum UTF-8 message-content bytes inspected
-        #[arg(long, default_value_t = crate::incident_discovery::DEFAULT_MAX_BYTES)]
-        max_bytes: u64,
-        /// Wall-clock scan budget in milliseconds
-        #[arg(long, default_value_t = crate::incident_discovery::DEFAULT_BUDGET_MS)]
-        budget_ms: u64,
     },
     /// Rebuild / backfill analytics rollup tables with progress output
     Rebuild {
@@ -2739,9 +2219,6 @@ pub enum RobotTopic {
     /// `cass doctor` agent handbook (added in world-class-doctor pass-2).
     /// Body lives in `src/doctor_robot_docs.rs`.
     Doctor,
-    /// Canonical recovery + workflow recipes from the 2026-06-08 fleet report
-    /// (bead .11.3). Body lives in `src/recipes_robot_docs.rs`.
-    Recipes,
 }
 
 /// Output format for robot/automation mode
@@ -3034,23 +2511,17 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
             | "api-version"
             | "capabilities"
             | "context"
-            | "dedup"
             | "diag"
             | "doctor"
             | "expand"
             | "export-html"
-            | "fleet"
-            | "guide"
             | "health"
             | "import"
             | "index"
             | "introspect"
-            | "lessons"
             | "models"
-            | "onboarding"
             | "pack"
             | "pages"
-            | "release-verify"
             | "resume"
             | "robot-docs"
             | "search"
@@ -3059,8 +2530,6 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
             | "state"
             | "stats"
             | "status"
-            | "storage"
-            | "support-bundle"
             | "swarm"
             | "timeline"
             | "triage"
@@ -3072,9 +2541,10 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
 fn data_dir_insertion_index(rest: &[String], command_index: usize) -> Option<usize> {
     let command = rest.get(command_index)?.to_ascii_lowercase();
     match command.as_str() {
-        "tui" | "index" | "search" | "pack" | "stats" | "diag" | "storage" | "dedup" | "status"
-        | "triage" | "support-bundle" | "state" | "health" | "onboarding" | "guide" | "doctor"
-        | "context" | "sessions" | "timeline" | "daemon" => Some(command_index + 1),
+        "tui" | "index" | "search" | "pack" | "stats" | "diag" | "status" | "triage" | "state"
+        | "health" | "doctor" | "context" | "sessions" | "timeline" | "daemon" => {
+            Some(command_index + 1)
+        }
         "mirror" => rest
             .get(command_index + 1)
             .is_some_and(|action| action.eq_ignore_ascii_case("prune"))
@@ -3091,24 +2561,12 @@ fn data_dir_insertion_index(rest: &[String], command_index: usize) -> Option<usi
                     .any(|candidate| action.eq_ignore_ascii_case(candidate))
             })
             .then_some(command_index + 2),
-        "fleet" => rest
-            .get(command_index + 1)
-            .is_some_and(|action| action.eq_ignore_ascii_case("upgrade-rehearsal"))
-            .then_some(command_index + 2),
         "analytics" => rest
             .get(command_index + 1)
             .is_some_and(|action| {
-                [
-                    "status",
-                    "tokens",
-                    "tools",
-                    "models",
-                    "incidents",
-                    "rebuild",
-                    "validate",
-                ]
-                .iter()
-                .any(|candidate| action.eq_ignore_ascii_case(candidate))
+                ["status", "tokens", "tools", "models", "rebuild", "validate"]
+                    .iter()
+                    .any(|candidate| action.eq_ignore_ascii_case(candidate))
             })
             .then_some(command_index + 2),
         _ => None,
@@ -3204,7 +2662,7 @@ fn robot_docs_topic_shorthand(arg: &str) -> Option<&'static str> {
         "analytics" | "metrics" => Some("analytics"),
         "doctor" | "diagnostics" | "diag" => Some("doctor"),
         "exit-codes" | "exit_codes" | "exitcodes" | "codes" => Some("exit-codes"),
-        "quickstart" | "quick-start" => Some("guide"),
+        "guide" | "quickstart" | "quick-start" => Some("guide"),
         _ => None,
     }
 }
@@ -3252,7 +2710,7 @@ mod robot_docs_shorthand_regression_tests {
 
     #[test]
     fn other_real_subcommands_are_not_rewritten() {
-        for sub in &["diag", "sources", "analytics", "health", "Doctor", "guide"] {
+        for sub in &["diag", "sources", "analytics", "health", "Doctor"] {
             let mut rest = vec![sub.to_string(), "--json".to_string()];
             let mut corrections = Vec::new();
             recover_robot_docs_topic_shorthands(&mut rest, &mut corrections);
@@ -3270,16 +2728,12 @@ mod robot_docs_shorthand_regression_tests {
 
     #[test]
     fn topic_shorthand_still_fires_for_non_subcommands() {
-        // Note: `guide` is intentionally absent — it is now a real top-level
-        // subcommand (`cass guide <intent>`), so the shorthand must NOT fire for
-        // it (covered by `other_real_subcommands_are_not_rewritten`).
         for (alias, expected_topic) in &[
             ("schemas", "schemas"),
             ("exit-codes", "exit-codes"),
+            ("guide", "guide"),
             ("examples", "examples"),
             ("env", "env"),
-            ("quickstart", "guide"),
-            ("quick-start", "guide"),
         ] {
             let mut rest = vec![alias.to_string(), "--json".to_string()];
             let mut corrections = Vec::new();
@@ -4573,9 +4027,7 @@ fn recover_structured_format_aliases(rest: &mut Vec<String>, corrections: &mut V
 
 fn command_accepts_limit_alias(rest: &[String]) -> bool {
     match rest.first().map(String::as_str) {
-        Some("analytics") => rest
-            .get(1)
-            .is_some_and(|arg| matches!(arg.as_str(), "tools" | "incidents")),
+        Some("analytics") => rest.get(1).is_some_and(|arg| arg == "tools"),
         Some("context" | "pack" | "search" | "sessions") => true,
         _ => false,
     }
@@ -5008,9 +4460,6 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "fixture-id",
         "repair",
         "cleanup",
-        "recover-from-archive",
-        "rebuild-canonical-fts",
-        "cleanup-interrupted-artifacts",
         "archive-scan",
         "archive-normalize",
         "check",
@@ -5475,44 +4924,6 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         .first()
         .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
         && rest.get(1).is_some_and(|arg| {
-            arg.eq_ignore_ascii_case("recover-from-archive")
-                || arg.eq_ignore_ascii_case("recover_from_archive")
-                || arg.eq_ignore_ascii_case("recover-from-canonical-events")
-        })
-    {
-        // #285: 'doctor recover-from-archive <DIR>' → '--recover-from-archive <DIR>'.
-        // The next bare positional (if any) is the recovery target dir.
-        let target = rest.get(2).filter(|arg| !arg.starts_with('-')).cloned();
-        if target.is_some() {
-            rest.remove(2);
-        }
-        rest.remove(1);
-        rest.insert(1, "--recover-from-archive".to_string());
-        if let Some(target) = target {
-            rest.insert(2, target);
-        }
-        corrections.push(
-            "'doctor recover-from-archive <DIR>' → 'doctor --recover-from-archive <DIR>' (rebuild source JSONL from preserved archive events)"
-                .into(),
-        );
-    } else if rest
-        .first()
-        .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
-        && rest.get(1).is_some_and(|arg| {
-            arg.eq_ignore_ascii_case("rebuild-canonical-fts")
-                || arg.eq_ignore_ascii_case("rebuild_canonical_fts")
-        })
-    {
-        rest.remove(1);
-        rest.insert(1, "--rebuild-canonical-fts".to_string());
-        corrections.push(
-            "'doctor rebuild-canonical-fts' → 'doctor --rebuild-canonical-fts' (safe canonical FTS5 parity repair)"
-                .into(),
-        );
-    } else if rest
-        .first()
-        .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
-        && rest.get(1).is_some_and(|arg| {
             arg.eq_ignore_ascii_case("archive-scan") || arg.eq_ignore_ascii_case("archive_scan")
         })
     {
@@ -5594,19 +5005,10 @@ fn format_missing_subcommand_error(args: &[String]) -> String {
 
     let (subcommands, examples): (&[&str], &[&str]) = match group {
         "analytics" => (
-            &[
-                "status",
-                "tokens",
-                "tools",
-                "models",
-                "incidents",
-                "rebuild",
-                "validate",
-            ],
+            &["status", "tokens", "tools", "models", "rebuild", "validate"],
             &[
                 "cass analytics status --json",
                 "cass analytics tokens --days 7 --group-by day --json",
-                "cass analytics incidents --limit 10 --json",
                 "cass analytics rebuild --json",
             ],
         ),
@@ -5934,8 +5336,6 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "state",
     "health",
     "diag",
-    "storage",
-    "dedup",
     "doctor",
     "sessions",
     "view",
@@ -5944,17 +5344,10 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "index",
     "capabilities",
     "triage",
-    "support-bundle",
-    "onboarding",
-    "guide",
     "introspect",
     "api-version",
-    "release-verify",
     "robot-docs",
     "models",
-    "fleet",
-    "lessons",
-    "quarantine",
     "sources",
     "analytics",
     "context",
@@ -6488,13 +5881,71 @@ async fn execute_cli(
     // consumers that merge stderr into stdout (e.g., `cass index --json 2>&1`).
     // Only errors are important enough to surface in machine-readable mode.
     let robot_mode = is_robot_mode(&command, cli);
-    // Single enforcement chokepoint for stdout/stderr hygiene: robot/quiet
-    // output is machine-consumed, so the tracing filter is pinned to `error`
-    // (overriding RUST_LOG) to guarantee no dependency INFO/WARN logging can
-    // interleave with JSON. See `robot_aware_log_directive` and the regression
-    // suite in tests/cli_robot_log_hygiene.rs
-    // (coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.1).
-    let filter = build_robot_aware_log_filter(robot_mode, cli.verbose, cli.quiet);
+    let filter = if cli.quiet || robot_mode {
+        // Robot mode implies quiet unless verbose is explicitly requested
+        if cli.verbose {
+            EnvFilter::new("debug")
+        } else {
+            EnvFilter::new("error")
+        }
+    } else if cli.verbose {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            // Suppress frankensqlite internal telemetry that spams at INFO level.
+            // EnvFilter uses "::" as the hierarchy separator, so "fsqlite=warn" covers
+            // fsqlite::runtime, fsqlite::cx, etc.  Crate-level targets like fsqlite_vdbe
+            // and fsqlite_core need their own directives.  Custom dot-separated targets
+            // (fsqlite.statement_reuse, fsqlite.compat, etc.) are NOT matched by the
+            // hierarchical prefix, so each must be listed explicitly.
+            EnvFilter::new(concat!(
+                "info",
+                // Hierarchical (::) targets
+                ",fsqlite=warn",
+                ",fsqlite_core=warn",
+                ",fsqlite_vdbe=warn",
+                ",fsqlite_mvcc=warn",
+                ",fsqlite_pager=warn",
+                ",fsqlite_func=warn",
+                ",fsqlite_vfs=warn",
+                ",fsqlite_wal=warn",
+                ",fsqlite_c_api=warn",
+                ",fsqlite_planner=warn",
+                ",fsqlite_types=warn",
+                ",fsqlite_observability=warn",
+                // Dot-separated custom targets
+                ",fsqlite.compat=warn",
+                ",fsqlite.compat_trace=warn",
+                ",fsqlite.statement_reuse=warn",
+                ",fsqlite.statement=warn",
+                ",fsqlite.execution=warn",
+                ",fsqlite.execute_path=warn",
+                ",fsqlite.plan=warn",
+                ",fsqlite.planner=warn",
+                ",fsqlite.planner_runtime=warn",
+                ",fsqlite.parse=warn",
+                ",fsqlite.provenance=warn",
+                ",fsqlite.dp=warn",
+                ",fsqlite.udf=warn",
+                ",fsqlite.vdbe=warn",
+                ",fsqlite.rcu=warn",
+                ",fsqlite.seqlock=warn",
+                ",fsqlite.left_right=warn",
+                ",fsqlite.flat_combine=warn",
+                ",fsqlite.commit_combine=warn",
+                ",fsqlite.snapshot_publication=warn",
+                ",fsqlite.wal_publication=warn",
+                ",fsqlite.storage_wiring=warn",
+                ",fsqlite.cx_propagation=warn",
+                ",fsqlite.sketch_telemetry=warn",
+                ",fsqlite.time_travel=warn",
+                ",fsqlite.trace_export=warn",
+                ",fsqlite.txn_slot=warn",
+                ",fsqlite.evidence=warn",
+                ",fsqlite.lab_schedule=warn",
+            ))
+        })
+    };
 
     match &command {
         Commands::Tui { data_dir, .. } => {
@@ -6631,22 +6082,21 @@ async fn execute_cli(
         | Commands::Pack { .. }
         | Commands::Stats { .. }
         | Commands::Diag { .. }
-        | Commands::Storage { .. }
-        | Commands::Dedup { .. }
         | Commands::Status { .. }
         | Commands::Triage { .. }
-        | Commands::SupportBundle { .. }
         | Commands::View { .. }
         | Commands::Pages { .. }
         | Commands::Analytics(..) => {
-            // Robot-safe stderr hygiene + optional explicit --trace-file sink
-            // (uojcg.2.1 / uojcg.2.5). Keep the guard alive for the command run.
-            let _trace_guard = init_cli_tracing(
-                filter,
-                cli.trace_file.as_deref(),
-                matches!(cli.color, ColorPref::Always)
-                    || (matches!(cli.color, ColorPref::Auto) && stderr_is_tty),
-            );
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .compact()
+                .with_target(false)
+                .with_ansi(
+                    matches!(cli.color, ColorPref::Always)
+                        || (matches!(cli.color, ColorPref::Auto) && stderr_is_tty),
+                )
+                .init();
 
             match command {
                 Commands::Index {
@@ -6769,16 +6219,11 @@ async fn execute_cli(
                         crate::search::query::SemanticTierMode::Single
                     };
 
-                    let daemon_policy = semantic_daemon_policy(daemon, no_daemon);
                     let semantic_opts = SemanticSearchOptions {
                         model: model.clone(),
                         rerank,
                         reranker: reranker.clone(),
-                        // #347: an already-running daemon is the inexpensive
-                        // default. `--daemon` additionally permits auto-spawn;
-                        // `--no-daemon` is the explicit direct-inference escape.
-                        use_daemon: daemon_policy.use_existing,
-                        auto_spawn_daemon: daemon_policy.auto_spawn,
+                        use_daemon: daemon && !no_daemon,
                         approximate,
                         tier_mode,
                     };
@@ -6791,20 +6236,11 @@ async fn execute_cli(
                     // no structured format was asked for.
                     let effective_format = cli.robot_format.or_else(robot_format_from_env);
 
-                    // Resolve configurable search defaults (#303): the explicit
-                    // CLI flag wins, then the env var, then `~/.config/cass/cass.toml`
-                    // `[search]`, then the built-in default. This lets agents set a
-                    // default timeout/limit/mode once instead of appending flags to
-                    // every invocation. A broken config file or a malformed env value
-                    // is a clear usage error rather than a silent fall-through.
-                    let (eff_timeout, eff_limit, eff_mode) =
-                        resolve_search_defaults(timeout, limit, mode)?;
-
                     run_cli_search(
                         &query,
                         &agent,
                         &workspace,
-                        &eff_limit,
+                        &limit,
                         &offset,
                         &json,
                         effective_format,
@@ -6831,11 +6267,11 @@ async fn execute_cli(
                         aggregate,
                         explain,
                         dry_run,
-                        eff_timeout,
+                        timeout,
                         highlight,
                         source,
                         sessions_from,
-                        eff_mode,
+                        mode,
                         semantic_opts,
                         refresh,
                     )?;
@@ -6872,16 +6308,11 @@ async fn execute_cli(
                     timeout,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
-                    // Apply the configurable search defaults (#303) to pack too,
-                    // so a configured default timeout/limit/mode covers the
-                    // pack path (which runs the same search underneath).
-                    let (eff_timeout, eff_limit, eff_mode) =
-                        resolve_search_defaults(timeout, limit, mode)?;
                     run_cli_pack(
                         &query,
                         &agent,
                         &workspace,
-                        eff_limit,
+                        limit,
                         structured_format,
                         fields,
                         max_tokens,
@@ -6903,13 +6334,13 @@ async fn execute_cli(
                         ),
                         source,
                         sessions_from,
-                        eff_mode,
+                        mode,
                         &freshness_policy,
                         freshness_window_seconds,
                         require_evidence,
                         explain_selection,
                         refresh,
-                        eff_timeout,
+                        timeout,
                         wrap,
                     )?;
                 }
@@ -6943,18 +6374,6 @@ async fn execute_cli(
                         verbose,
                     )?;
                 }
-                Commands::Storage { data_dir, json } => {
-                    let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_storage(&data_dir, cli.db.clone(), structured_format)?;
-                }
-                Commands::Dedup {
-                    data_dir,
-                    json,
-                    apply,
-                } => {
-                    let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_dedup(&data_dir, cli.db.clone(), structured_format, apply)?;
-                }
                 Commands::Status {
                     data_dir,
                     json,
@@ -6985,27 +6404,9 @@ async fn execute_cli(
                         timeout,
                     )?;
                 }
-                Commands::SupportBundle {
-                    data_dir,
-                    json,
-                    stale_threshold,
-                    include_full_paths,
-                    include_raw_evidence,
-                } => {
-                    let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_support_bundle(
-                        &data_dir,
-                        cli.db.clone(),
-                        structured_format,
-                        stale_threshold,
-                        include_full_paths,
-                        include_raw_evidence,
-                    )?;
-                }
                 Commands::View {
                     path,
                     source,
-                    conversation_id,
                     line,
                     context,
                     json,
@@ -7016,7 +6417,6 @@ async fn execute_cli(
                         &path,
                         cli.db.clone(),
                         source.as_deref(),
-                        conversation_id,
                         line,
                         context,
                         structured_format,
@@ -7539,12 +6939,16 @@ async fn execute_cli(
             }
         }
         _ => {
-            let _trace_guard = init_cli_tracing(
-                filter,
-                cli.trace_file.as_deref(),
-                matches!(cli.color, ColorPref::Always)
-                    || (matches!(cli.color, ColorPref::Auto) && stderr_is_tty),
-            );
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .compact()
+                .with_target(false)
+                .with_ansi(
+                    matches!(cli.color, ColorPref::Always)
+                        || (matches!(cli.color, ColorPref::Auto) && stderr_is_tty),
+                )
+                .init();
 
             match command {
                 Commands::Completions { shell } => {
@@ -7564,29 +6968,6 @@ async fn execute_cli(
                 Commands::ApiVersion { json } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_api_version(structured_format)?;
-                }
-                Commands::ReleaseVerify {
-                    from,
-                    live,
-                    expected_version,
-                    repo,
-                    crate_name,
-                    homebrew_formula_url,
-                    scoop_manifest_url,
-                    json,
-                } => {
-                    let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_release_verify(
-                        structured_format,
-                        from.as_deref(),
-                        live,
-                        expected_version.as_deref(),
-                        repo.as_deref(),
-                        crate_name.as_deref(),
-                        homebrew_formula_url.as_deref(),
-                        scoop_manifest_url.as_deref(),
-                    )
-                    .await?;
                 }
                 Commands::State {
                     data_dir,
@@ -7620,39 +7001,6 @@ async fn execute_cli(
                         structured_format,
                         stale_threshold,
                         robot_meta,
-                    )?;
-                }
-                Commands::Onboarding { data_dir, json } => {
-                    let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_onboarding(&data_dir, cli.db.clone(), structured_format)?;
-                }
-                Commands::Guide {
-                    intent,
-                    fixture,
-                    data_dir,
-                    apply,
-                    confirm_step,
-                    confirm_fact,
-                    accept_privacy_tier,
-                    accept_cost_risk,
-                    allow_rch,
-                    confirm_stop_conditions_clear,
-                    json,
-                } => {
-                    let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_guide(
-                        &intent,
-                        fixture.as_deref(),
-                        &data_dir,
-                        cli.db.clone(),
-                        structured_format,
-                        apply,
-                        &confirm_step,
-                        &confirm_fact,
-                        accept_privacy_tier.as_deref(),
-                        accept_cost_risk.as_deref(),
-                        allow_rch,
-                        confirm_stop_conditions_clear,
                     )?;
                 }
                 Commands::Doctor {
@@ -7699,9 +7047,6 @@ async fn execute_cli(
                     watch_iterations,
                     explain,
                     emit_capabilities,
-                    recover_from_archive,
-                    rebuild_canonical_fts,
-                    cleanup_interrupted_artifacts,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     // Pass-12 fix (P2): the new pass-1+ flags have no clap-level
@@ -7746,40 +7091,6 @@ async fn execute_cli(
                     // World-class-doctor pass-8: `cass doctor --emit-capabilities`.
                     if emit_capabilities {
                         run_doctor_emit_capabilities(structured_format)?;
-                        return Ok(());
-                    }
-                    // #285: `cass doctor --recover-from-archive <DIR>` — rebuild
-                    // the source JSONL tree from the canonical archive's
-                    // preserved events so a corrupt archive can be re-ingested.
-                    if let Some(target_dir) = recover_from_archive {
-                        doctor_recover::run_doctor_recover_from_archive(
-                            data_dir,
-                            cli.db.clone(),
-                            target_dir,
-                            structured_format,
-                        )?;
-                        return Ok(());
-                    }
-                    // #285: `cass doctor --rebuild-canonical-fts --yes` — drop
-                    // and rebuild the canonical FTS5 shadow tables in place.
-                    if rebuild_canonical_fts {
-                        doctor_recover::run_doctor_rebuild_canonical_fts(
-                            data_dir,
-                            cli.db.clone(),
-                            dry_run,
-                            yes,
-                            structured_format,
-                        )?;
-                        return Ok(());
-                    }
-                    // #285: `cass doctor --cleanup-interrupted-artifacts --yes`
-                    // — quarantine interrupted raw_mirror_capture artifacts.
-                    if cleanup_interrupted_artifacts {
-                        doctor_recover::run_doctor_cleanup_interrupted_artifacts(
-                            data_dir,
-                            yes,
-                            structured_format,
-                        )?;
                         return Ok(());
                     }
                     // World-class-doctor pass-2: read-only `cass doctor --ls`.
@@ -7947,7 +7258,6 @@ async fn execute_cli(
                     workspace,
                     current,
                     limit,
-                    since,
                     json,
                     data_dir,
                 } => {
@@ -7956,7 +7266,6 @@ async fn execute_cli(
                         workspace.as_ref(),
                         current,
                         limit,
-                        since.as_deref(),
                         &data_dir,
                         cli.db.clone(),
                         structured_format,
@@ -8078,18 +7387,6 @@ async fn execute_cli(
                         source,
                     )?;
                 }
-                Commands::Quarantine(subcmd) => {
-                    run_quarantine_command(subcmd, cli)?;
-                }
-                Commands::Forget {
-                    source_glob,
-                    db,
-                    apply,
-                    json,
-                } => {
-                    let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_forget_command(source_glob, db, apply, cli, structured_format)?;
-                }
                 Commands::Mirror(subcmd) => {
                     run_mirror_command(subcmd, cli)?;
                 }
@@ -8107,18 +7404,6 @@ async fn execute_cli(
                     })
                     .await;
                     result?;
-                }
-                Commands::Fleet(subcmd) => {
-                    let subcmd = subcmd.clone();
-                    let cli_clone = cli.clone();
-                    let result = asupersync::runtime::spawn_blocking(move || {
-                        run_fleet_command(subcmd, &cli_clone)
-                    })
-                    .await;
-                    result?;
-                }
-                Commands::Lessons(subcmd) => {
-                    run_lessons_command(subcmd, cli)?;
                 }
                 Commands::Import(subcmd) => {
                     handle_import(subcmd, cli).await?;
@@ -8173,488 +7458,6 @@ fn run_mirror_command(cmd: MirrorCommand, cli: &Cli) -> CliResult<()> {
             )
         }
     }
-}
-
-/// `cass quarantine` (#292 ask #3): inspect and manage the
-/// conversation-ingest quarantine without hand-editing
-/// `quarantine_state.json`. `list` is read-only; `clear` is dry-run by
-/// default and only mutates with `--apply`.
-fn run_quarantine_command(cmd: QuarantineCommand, cli: &Cli) -> CliResult<()> {
-    match cmd {
-        QuarantineCommand::List { data_dir, json } => {
-            let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_quarantine_list(data_dir, structured_format)
-        }
-        QuarantineCommand::Clear {
-            data_dir,
-            filter,
-            apply,
-            json,
-        } => {
-            let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_quarantine_clear(data_dir, filter, apply, structured_format)
-        }
-        QuarantineCommand::Retry {
-            data_dir,
-            max_attempts,
-            force_irreducible,
-            apply,
-            json,
-        } => {
-            let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_quarantine_retry_command(
-                data_dir,
-                max_attempts,
-                force_irreducible,
-                apply,
-                structured_format,
-            )
-        }
-    }
-}
-
-/// `cass quarantine retry`: a bounded, resumable retry of retry-eligible
-/// quarantined conversations (#292 ask #3). Dry-run emits the exact plan;
-/// `--apply` reparses and persists each planned conversation by quarantine key.
-fn run_quarantine_retry_command(
-    data_dir_override: Option<PathBuf>,
-    max_attempts: Option<usize>,
-    force_irreducible: bool,
-    apply: bool,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let config = crate::indexer::quarantine_retry::RetryConfig {
-        max_attempts,
-        eligible_only: !force_irreducible,
-    };
-
-    if !apply {
-        let plan = crate::indexer::plan_quarantine_retry(&data_dir, &config);
-        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-            if matches!(fmt, RobotFormat::Sessions) {
-                RobotFormat::Compact
-            } else {
-                fmt
-            }
-        });
-        if let Some(fmt) = structured_format {
-            let mut payload = serde_json::to_value(&plan).unwrap_or_else(|_| serde_json::json!({}));
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert("schema_version".to_string(), serde_json::json!(1));
-                obj.insert("applied".to_string(), serde_json::json!(false));
-                obj.insert("dry_run".to_string(), serde_json::json!(true));
-                obj.insert(
-                    "data_dir".to_string(),
-                    serde_json::json!(data_dir.display().to_string()),
-                );
-            }
-            return output_structured_value(payload, fmt);
-        }
-
-        println!("CASS Quarantine Retry");
-        println!("=====================");
-        println!();
-        println!("Mode: dry-run (read-only plan)");
-        println!();
-        println!("{}", plan.summary);
-        println!(
-            "  planned attempts: {}, irreducible: {}, source-missing: {}",
-            plan.planned_attempts, plan.skip_irreducible, plan.skip_source_missing
-        );
-        if plan.resume_recommended {
-            println!("  (budget reached — re-run to plan the remaining eligible entries)");
-        }
-        println!();
-        println!("Next: {}", plan.next_safe_command);
-        return Ok(());
-    }
-
-    let report =
-        crate::indexer::run_quarantine_retry(&data_dir, &config, true).map_err(|err| CliError {
-            code: 9,
-            kind: "quarantine",
-            message: format!("quarantine retry failed: {err}"),
-            hint: Some(
-                "Run `cass quarantine list --json` to inspect entries, then retry.".to_string(),
-            ),
-            retryable: false,
-        })?;
-
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    if let Some(fmt) = structured_format {
-        let mut payload = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("schema_version".to_string(), serde_json::json!(1));
-            obj.insert("applied".to_string(), serde_json::json!(true));
-            obj.insert("dry_run".to_string(), serde_json::json!(false));
-            obj.insert(
-                "data_dir".to_string(),
-                serde_json::json!(data_dir.display().to_string()),
-            );
-        }
-        return output_structured_value(payload, fmt);
-    }
-
-    println!("CASS Quarantine Retry");
-    println!("=====================");
-    println!();
-    println!("Mode: APPLY (targeted re-ingest by quarantine key)");
-    println!();
-    println!("{}", report.summary);
-    println!(
-        "  re-ingested and cleared: {}, remaining quarantined: {}",
-        report.cleared, report.remaining_quarantined
-    );
-    if report.resume_recommended {
-        println!("  (budget reached — re-run to resume the remaining eligible entries)");
-    }
-    println!();
-    println!("Next: {}", report.next_safe_command);
-    Ok(())
-}
-
-/// Build the deterministic per-entry JSON view used by both `list` and the
-/// `clear` plan. Each entry reports its conversation_id, schema version,
-/// attempt count, last reason, the wall-clock timestamps, and whether it is
-/// retry-eligible under the current binary (version-stale/legacy).
-fn quarantine_entries_json(data_dir: &Path) -> Vec<serde_json::Value> {
-    use crate::indexer::quarantine::QuarantineState;
-    let state = QuarantineState::load(data_dir);
-    let current_version = env!("CARGO_PKG_VERSION");
-    state
-        .iter()
-        .map(|(key, record)| {
-            serde_json::json!({
-                "conversation_id": key.conversation_id,
-                "schema_version": key.schema_version,
-                "attempt_count": record.attempt_count,
-                "last_reason": record.last_reason,
-                "first_attempt_at": record.first_attempt_at.to_rfc3339(),
-                "last_attempt_at": record.last_attempt_at.to_rfc3339(),
-                "cass_version_at_quarantine": record.cass_version_at_quarantine,
-                "retry_eligible": record.is_version_stale_for_retry(current_version),
-            })
-        })
-        .collect()
-}
-
-fn run_quarantine_list(
-    data_dir_override: Option<PathBuf>,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let entries = quarantine_entries_json(&data_dir);
-    let summary = crate::indexer::conversation_ingest_quarantine_summary(&data_dir);
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    if let Some(fmt) = structured_format {
-        let payload = serde_json::json!({
-            "schema_version": 1,
-            "data_dir": data_dir.display().to_string(),
-            "quarantined_conversations": entries.len(),
-            "circuit_breaker_active": summary.circuit_breaker_active,
-            "recommended_action": summary.recommended_action,
-            "entries": entries,
-        });
-        return output_structured_value(payload, fmt);
-    }
-
-    println!("CASS Conversation Quarantine");
-    println!("============================");
-    println!();
-    if entries.is_empty() {
-        println!("No quarantined conversations.");
-        return Ok(());
-    }
-    println!("Quarantined conversations: {}", entries.len());
-    if summary.circuit_breaker_active {
-        println!("Circuit breaker: ACTIVE (a recent burst of quarantines tripped the breaker)");
-    }
-    println!();
-    for entry in &entries {
-        println!(
-            "  {} (schema v{}, attempts={}, retry_eligible={})",
-            entry
-                .get("conversation_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("<unknown>"),
-            entry
-                .get("schema_version")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            entry
-                .get("attempt_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            entry
-                .get("retry_eligible")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-        );
-        if let Some(reason) = entry.get("last_reason").and_then(|v| v.as_str()) {
-            println!("      reason: {reason}");
-        }
-    }
-    Ok(())
-}
-
-fn run_quarantine_clear(
-    data_dir_override: Option<PathBuf>,
-    filter: Option<String>,
-    apply: bool,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
-    use crate::indexer::quarantine::{QuarantineKey, QuarantineState};
-
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let mut state = QuarantineState::load(&data_dir);
-
-    // Collect the keys that match the optional conversation-id substring
-    // filter. With no filter, every entry is targeted.
-    let matched: Vec<QuarantineKey> = state
-        .iter()
-        .filter(|(key, _)| {
-            filter
-                .as_deref()
-                .is_none_or(|needle| key.conversation_id.contains(needle))
-        })
-        .map(|(key, _)| key)
-        .collect();
-
-    let mut cleared = 0usize;
-    let mut save_error: Option<String> = None;
-    if apply && !matched.is_empty() {
-        for key in &matched {
-            if state.clear(key) {
-                cleared += 1;
-            }
-        }
-        if let Err(err) = state.save(&data_dir) {
-            save_error = Some(err.to_string());
-        }
-    }
-
-    let matched_json: Vec<serde_json::Value> = matched
-        .iter()
-        .map(|key| {
-            serde_json::json!({
-                "conversation_id": key.conversation_id,
-                "schema_version": key.schema_version,
-            })
-        })
-        .collect();
-
-    let recommended_action = if matched.is_empty() {
-        "No quarantine entries match. Nothing to clear.".to_string()
-    } else if apply {
-        if let Some(err) = &save_error {
-            format!("Cleared {cleared} entr(ies) in memory but failed to persist: {err}")
-        } else {
-            format!(
-                "Cleared {cleared} quarantine entr(ies). They will be re-attempted on the next index/watch pass."
-            )
-        }
-    } else {
-        format!(
-            "{} quarantine entr(ies) match. Re-run with --apply to clear them.",
-            matched.len()
-        )
-    };
-
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    if let Some(fmt) = structured_format {
-        let payload = serde_json::json!({
-            "schema_version": 1,
-            "applied": apply,
-            "dry_run": !apply,
-            "data_dir": data_dir.display().to_string(),
-            "filter": filter,
-            "matched": matched.len(),
-            "cleared": cleared,
-            "persist_error": save_error,
-            "entries": matched_json,
-            "recommended_action": recommended_action,
-        });
-        return output_structured_value(payload, fmt);
-    }
-
-    println!("CASS Quarantine Clear");
-    println!("=====================");
-    println!();
-    println!(
-        "Mode: {}",
-        if apply {
-            "APPLY (mutating)"
-        } else {
-            "dry-run (inspect only)"
-        }
-    );
-    if let Some(needle) = &filter {
-        println!("Filter: conversation_id contains {needle:?}");
-    }
-    println!();
-    if matched.is_empty() {
-        println!("No matching quarantine entries.");
-        return Ok(());
-    }
-    println!("Matching entries: {}", matched.len());
-    for key in matched.iter().take(20) {
-        println!("  {} (schema v{})", key.conversation_id, key.schema_version);
-    }
-    if matched.len() > 20 {
-        println!("  ... and {} more", matched.len() - 20);
-    }
-    println!();
-    println!("{recommended_action}");
-    Ok(())
-}
-
-/// `cass forget --source-glob <pat>`: prune an already-indexed subset of
-/// conversations by source-path glob (#292 ask #2). Dry-run by default;
-/// `--apply` deletes the matching rows from the canonical DB and rebuilds the
-/// derived search/analytics assets so search coverage stays consistent.
-fn run_forget_command(
-    source_glob: String,
-    db_override: Option<PathBuf>,
-    apply: bool,
-    cli: &Cli,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
-    use crate::storage::sqlite::FrankenStorage;
-
-    let db_path = db_override
-        .or_else(|| cli.db.clone())
-        .unwrap_or_else(default_db_path);
-    if !db_path.is_file() {
-        return Err(CliError {
-            code: 5,
-            kind: "forget",
-            message: format!("no canonical database at {}", db_path.display()),
-            hint: Some("Run `cass index` first, or pass --db <path>.".to_string()),
-            retryable: false,
-        });
-    }
-
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
-        code: 5,
-        kind: "forget",
-        message: format!("failed to open canonical database: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    let report = storage
-        .forget_conversations_by_source_glob(&source_glob, !apply)
-        .map_err(|e| CliError {
-            code: 5,
-            kind: "forget",
-            message: format!("forget failed: {e}"),
-            hint: Some(
-                "Run `cass forget --source-glob <pat> --json` (dry-run) first to inspect matches."
-                    .to_string(),
-            ),
-            retryable: false,
-        })?;
-
-    // After an actual deletion, rebuild derived assets so search/analytics stay
-    // consistent (mirrors the agent-purge path). The lexical index also
-    // self-heals on next search, but rebuilding FTS now keeps DB-resident
-    // surfaces correct.
-    if apply && report.conversations_deleted > 0 {
-        if let Err(e) = storage.rebuild_fts() {
-            tracing::warn!(error = %e, "forget: failed to rebuild FTS after deletion");
-        }
-        if let Err(e) = storage.rebuild_analytics() {
-            tracing::warn!(error = %e, "forget: failed to rebuild analytics after deletion");
-        }
-        if let Err(e) = storage.rebuild_daily_stats() {
-            tracing::warn!(error = %e, "forget: failed to rebuild daily stats after deletion");
-        }
-    }
-
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    if let Some(fmt) = structured_format {
-        let mut payload = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("schema_version".to_string(), serde_json::json!(1));
-            obj.insert("applied".to_string(), serde_json::json!(apply));
-            obj.insert(
-                "db_path".to_string(),
-                serde_json::json!(db_path.display().to_string()),
-            );
-        }
-        return output_structured_value(payload, fmt);
-    }
-
-    println!("CASS Forget (prune conversations by source glob)");
-    println!("================================================");
-    println!();
-    println!(
-        "Mode: {}",
-        if apply {
-            "APPLY (mutating)"
-        } else {
-            "dry-run (inspect only)"
-        }
-    );
-    println!("Pattern: {}", report.pattern);
-    println!();
-    println!(
-        "Matched conversations: {} ({} messages)",
-        report.conversations_matched, report.messages_matched
-    );
-    if !report.sample_source_paths.is_empty() {
-        println!("Sample matches:");
-        for path in &report.sample_source_paths {
-            println!("  {path}");
-        }
-        if report.conversations_matched > report.sample_source_paths.len() {
-            println!(
-                "  ... and {} more",
-                report.conversations_matched - report.sample_source_paths.len()
-            );
-        }
-    }
-    println!();
-    if apply {
-        println!(
-            "Deleted {} conversation(s) from the canonical DB and rebuilt derived assets.",
-            report.conversations_deleted
-        );
-    } else if report.conversations_matched > 0 {
-        println!("Re-run with --apply to delete these conversations.");
-    } else {
-        println!("No conversations match. Nothing to forget.");
-    }
-    Ok(())
 }
 
 fn run_mirror_prune(
@@ -9553,106 +8356,6 @@ fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
             fixture_dir.as_deref(),
             &fixture_id,
         ),
-        SwarmCommand::ResourcePlan {
-            json,
-            fixture,
-            fixture_dir,
-            fixture_id,
-            action,
-        } => run_swarm_resource_plan(
-            cli,
-            json,
-            fixture.as_deref(),
-            fixture_dir.as_deref(),
-            &fixture_id,
-            action.as_deref(),
-        ),
-        SwarmCommand::PrivacyPreview {
-            json,
-            fixture,
-            fixture_dir,
-            fixture_id,
-        } => run_swarm_privacy_preview(
-            cli,
-            json,
-            fixture.as_deref(),
-            fixture_dir.as_deref(),
-            &fixture_id,
-        ),
-        SwarmCommand::ContextPack {
-            json,
-            fixture,
-            fixture_dir,
-            fixture_id,
-        } => run_swarm_context_pack(
-            cli,
-            json,
-            fixture.as_deref(),
-            fixture_dir.as_deref(),
-            &fixture_id,
-        ),
-        SwarmCommand::WorkflowAnalytics {
-            json,
-            fixture,
-            fixture_dir,
-            fixture_id,
-        } => run_swarm_workflow_analytics(
-            cli,
-            json,
-            fixture.as_deref(),
-            fixture_dir.as_deref(),
-            &fixture_id,
-        ),
-        SwarmCommand::ReplayFixture {
-            json,
-            fixture,
-            fixture_dir,
-            fixture_id,
-        } => run_swarm_replay_fixture(
-            cli,
-            json,
-            fixture.as_deref(),
-            fixture_dir.as_deref(),
-            &fixture_id,
-        ),
-        SwarmCommand::Macros {
-            json,
-            fixture,
-            fixture_dir,
-            fixture_id,
-        } => run_swarm_macros(
-            cli,
-            json,
-            fixture.as_deref(),
-            fixture_dir.as_deref(),
-            &fixture_id,
-        ),
-        SwarmCommand::ReproCapsule {
-            json,
-            fixture,
-            fixture_dir,
-            fixture_id,
-        } => run_swarm_repro_capsule(
-            cli,
-            json,
-            fixture.as_deref(),
-            fixture_dir.as_deref(),
-            &fixture_id,
-        ),
-        SwarmCommand::Dashboard {
-            json,
-            html,
-            fixture,
-            fixture_dir,
-            fixture_id,
-        } => run_swarm_dashboard(
-            cli,
-            json,
-            html,
-            fixture.as_deref(),
-            fixture_dir.as_deref(),
-            &fixture_id,
-        ),
     }
 }
 
@@ -10051,493 +8754,6 @@ fn run_swarm_dependency_drift(
         {
             println!("Warnings: {count}");
         }
-    }
-
-    Ok(())
-}
-
-fn run_swarm_resource_plan(
-    cli: &Cli,
-    json: bool,
-    fixture: Option<&Path>,
-    fixture_dir: Option<&Path>,
-    fixture_id: &str,
-    action: Option<&str>,
-) -> CliResult<()> {
-    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-    let action_filter =
-        crate::resource_plan::validate_action_filter(action).map_err(|message| {
-            CliError::usage(
-                message,
-                Some("Use --action full-index, semantic-backfill, model-install, html-export, support-capsule, or release-verification.".to_string()),
-            )
-        })?;
-
-    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
-    {
-        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
-            |err| CliError {
-                code: 10,
-                kind: CliErrorKind::Config.kind_str(),
-                message: err.to_string(),
-                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
-                retryable: false,
-            },
-        )?;
-        let source = set
-            .input()
-            .source_value(crate::swarm_status::SwarmProviderName::ResourcePlan);
-        crate::resource_plan::render_resource_plan_fixture(
-            set.input().fixture_id(),
-            source,
-            action_filter.as_deref(),
-        )
-    } else {
-        crate::resource_plan::render_resource_plan_live(action_filter.as_deref())
-    };
-
-    if let Some(fmt) = structured_format {
-        output_structured_value(payload, fmt)?;
-    } else {
-        println!(
-            "Swarm resource plan: {}",
-            payload
-                .get("summary")
-                .and_then(|summary| summary.get("recommended_action"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-        );
-        if let Some(count) = payload
-            .get("summary")
-            .and_then(|summary| summary.get("plan_count"))
-            .and_then(serde_json::Value::as_u64)
-        {
-            println!("Plans: {count}");
-        }
-    }
-
-    Ok(())
-}
-
-fn run_swarm_privacy_preview(
-    cli: &Cli,
-    json: bool,
-    fixture: Option<&Path>,
-    fixture_dir: Option<&Path>,
-    fixture_id: &str,
-) -> CliResult<()> {
-    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
-    {
-        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
-            |err| CliError {
-                code: 10,
-                kind: CliErrorKind::Config.kind_str(),
-                message: err.to_string(),
-                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
-                retryable: false,
-            },
-        )?;
-        let source = set
-            .input()
-            .source_value(crate::swarm_status::SwarmProviderName::PrivacyExposure);
-        crate::privacy_exposure::render_privacy_exposure_fixture(set.input().fixture_id(), source)
-    } else {
-        crate::privacy_exposure::render_privacy_exposure_live()
-    };
-
-    if let Some(fmt) = structured_format {
-        output_structured_value(payload, fmt)?;
-    } else {
-        println!(
-            "Swarm privacy preview: {}",
-            payload
-                .get("summary")
-                .and_then(|summary| summary.get("recommended_action"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-        );
-        if let Some(readiness) = payload
-            .get("summary")
-            .and_then(|summary| summary.get("readiness"))
-            .and_then(serde_json::Value::as_str)
-        {
-            println!("Readiness: {readiness}");
-        }
-    }
-
-    Ok(())
-}
-
-fn run_swarm_context_pack(
-    cli: &Cli,
-    json: bool,
-    fixture: Option<&Path>,
-    fixture_dir: Option<&Path>,
-    fixture_id: &str,
-) -> CliResult<()> {
-    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
-    {
-        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
-            |err| CliError {
-                code: 10,
-                kind: CliErrorKind::Config.kind_str(),
-                message: err.to_string(),
-                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
-                retryable: false,
-            },
-        )?;
-        let source = set
-            .input()
-            .source_value(crate::swarm_status::SwarmProviderName::ContextPack);
-        crate::context_pack::render_context_pack_fixture(set.input().fixture_id(), source)
-    } else {
-        crate::context_pack::render_context_pack_live()
-    };
-
-    if let Some(fmt) = structured_format {
-        output_structured_value(payload, fmt)?;
-    } else {
-        println!(
-            "Swarm context pack: {}",
-            payload
-                .get("summary")
-                .and_then(|summary| summary.get("recommended_action"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-        );
-        if let Some(count) = payload
-            .get("summary")
-            .and_then(|summary| summary.get("selected_count"))
-            .and_then(serde_json::Value::as_u64)
-        {
-            println!("Selected refs: {count}");
-        }
-    }
-
-    Ok(())
-}
-
-fn run_swarm_workflow_analytics(
-    cli: &Cli,
-    json: bool,
-    fixture: Option<&Path>,
-    fixture_dir: Option<&Path>,
-    fixture_id: &str,
-) -> CliResult<()> {
-    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
-    {
-        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
-            |err| CliError {
-                code: 10,
-                kind: CliErrorKind::Config.kind_str(),
-                message: err.to_string(),
-                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
-                retryable: false,
-            },
-        )?;
-        let source = set
-            .input()
-            .source_value(crate::swarm_status::SwarmProviderName::WorkflowAnalytics);
-        crate::workflow_analytics::render_workflow_analytics_fixture(
-            set.input().fixture_id(),
-            source,
-        )
-    } else {
-        crate::workflow_analytics::render_workflow_analytics_live()
-    };
-
-    if let Some(fmt) = structured_format {
-        output_structured_value(payload, fmt)?;
-    } else {
-        println!(
-            "Swarm workflow analytics: {}",
-            payload
-                .get("summary")
-                .and_then(|summary| summary.get("recommended_action"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-        );
-        if let Some(count) = payload
-            .get("summary")
-            .and_then(|summary| summary.get("records_in_scope"))
-            .and_then(serde_json::Value::as_u64)
-        {
-            println!("Records in scope: {count}");
-        }
-    }
-
-    Ok(())
-}
-
-fn run_swarm_replay_fixture(
-    cli: &Cli,
-    json: bool,
-    fixture: Option<&Path>,
-    fixture_dir: Option<&Path>,
-    fixture_id: &str,
-) -> CliResult<()> {
-    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
-    {
-        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
-            |err| CliError {
-                code: 10,
-                kind: CliErrorKind::Config.kind_str(),
-                message: err.to_string(),
-                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
-                retryable: false,
-            },
-        )?;
-        let source = set
-            .input()
-            .source_value(crate::swarm_status::SwarmProviderName::ReplayFixture);
-        crate::swarm_replay_fixture::render_replay_fixture_fixture(set.input().fixture_id(), source)
-    } else {
-        crate::swarm_replay_fixture::render_replay_fixture_live()
-    };
-
-    if let Some(fmt) = structured_format {
-        output_structured_value(payload, fmt)?;
-    } else {
-        println!(
-            "Swarm replay fixture: {}",
-            payload
-                .get("summary")
-                .and_then(|summary| summary.get("recommended_action"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-        );
-        if let Some(count) = payload
-            .get("manifest")
-            .and_then(|manifest| manifest.get("event_count"))
-            .and_then(serde_json::Value::as_u64)
-        {
-            println!("Events: {count}");
-        }
-    }
-
-    Ok(())
-}
-
-fn run_swarm_macros(
-    cli: &Cli,
-    json: bool,
-    fixture: Option<&Path>,
-    fixture_dir: Option<&Path>,
-    fixture_id: &str,
-) -> CliResult<()> {
-    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
-    {
-        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
-            |err| CliError {
-                code: 10,
-                kind: CliErrorKind::Config.kind_str(),
-                message: err.to_string(),
-                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
-                retryable: false,
-            },
-        )?;
-        let source = set
-            .input()
-            .source_value(crate::swarm_status::SwarmProviderName::WorkflowMacros);
-        crate::workflow_macros::render_workflow_macros_fixture(set.input().fixture_id(), source)
-    } else {
-        crate::workflow_macros::render_workflow_macros_live()
-    };
-
-    if let Some(fmt) = structured_format {
-        output_structured_value(payload, fmt)?;
-    } else {
-        println!(
-            "Swarm macros: {}",
-            payload
-                .get("summary")
-                .and_then(|summary| summary.get("recommended_action"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-        );
-        if let Some(count) = payload
-            .get("summary")
-            .and_then(|summary| summary.get("macro_count"))
-            .and_then(serde_json::Value::as_u64)
-        {
-            println!("Macros: {count}");
-        }
-    }
-
-    Ok(())
-}
-
-fn run_swarm_repro_capsule(
-    cli: &Cli,
-    json: bool,
-    fixture: Option<&Path>,
-    fixture_dir: Option<&Path>,
-    fixture_id: &str,
-) -> CliResult<()> {
-    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
-    {
-        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
-            |err| CliError {
-                code: 10,
-                kind: CliErrorKind::Config.kind_str(),
-                message: err.to_string(),
-                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
-                retryable: false,
-            },
-        )?;
-        let source = set
-            .input()
-            .source_value(crate::swarm_status::SwarmProviderName::ReproCapsule);
-        crate::repro_capsule::render_repro_capsule_fixture(set.input().fixture_id(), source)
-    } else {
-        crate::repro_capsule::render_repro_capsule_live()
-    };
-
-    if let Some(fmt) = structured_format {
-        output_structured_value(payload, fmt)?;
-    } else {
-        println!(
-            "Swarm repro capsule: {}",
-            payload
-                .get("summary")
-                .and_then(|summary| summary.get("recommended_action"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-        );
-        if let Some(id) = payload
-            .get("manifest")
-            .and_then(|manifest| manifest.get("capsule_id"))
-            .and_then(serde_json::Value::as_str)
-        {
-            println!("Capsule: {id}");
-        }
-    }
-
-    Ok(())
-}
-
-fn run_swarm_dashboard(
-    cli: &Cli,
-    json: bool,
-    html: bool,
-    fixture: Option<&Path>,
-    fixture_dir: Option<&Path>,
-    fixture_id: &str,
-) -> CliResult<()> {
-    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    if html && structured_format.is_some() {
-        return Err(CliError {
-            code: 2,
-            kind: CliErrorKind::Usage.kind_str(),
-            message: "--html cannot be combined with a structured --format".to_string(),
-            hint: Some(
-                "Use `cass swarm dashboard --html` or `cass swarm dashboard --json`, not both."
-                    .to_string(),
-            ),
-            retryable: false,
-        });
-    }
-
-    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
-    {
-        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
-            |err| CliError {
-                code: 10,
-                kind: CliErrorKind::Config.kind_str(),
-                message: err.to_string(),
-                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
-                retryable: false,
-            },
-        )?;
-        let source = set
-            .input()
-            .source_value(crate::swarm_status::SwarmProviderName::OperationsDashboard);
-        crate::operations_dashboard::render_operations_dashboard_fixture(
-            set.input().fixture_id(),
-            source,
-        )
-    } else {
-        crate::operations_dashboard::render_operations_dashboard_live()
-    };
-
-    if html {
-        print!(
-            "{}",
-            crate::operations_dashboard::render_operations_dashboard_html(&payload)
-        );
-    } else if let Some(fmt) = structured_format {
-        output_structured_value(payload, fmt)?;
-    } else {
-        println!(
-            "Operations dashboard: {}",
-            payload
-                .get("summary")
-                .and_then(|summary| summary.get("recommended_action"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("inspect-underlying-json-surfaces")
-        );
-        println!("Use --html for the offline report or --json for the underlying model.");
     }
 
     Ok(())
@@ -13557,8 +11773,8 @@ fn swarm_proof_debt_remediation(
             }
             "missing-proof" | "missing-rch-proof" | "incomplete-proof-command-set"
             | "stale-proof" => vec![
-                "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-proof-debt-target cargo check --all-targets".to_string(),
-                "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-proof-debt-target cargo test --test swarm_status_contract -- --nocapture".to_string(),
+                "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof-debt-target cargo check --all-targets".to_string(),
+                "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof-debt-target cargo test --test swarm_status_contract -- --nocapture".to_string(),
             ],
             _ => vec![format!(
                 "cass swarm evidence --json --bead {safe_subject}"
@@ -14914,7 +13130,7 @@ fn swarm_work_packet_verification(
             "proof summary in bead closeout"
         ],
         "rch_required": rch_required,
-        "target_dir_hint": if rch_required { "/data/tmp/cass-work-packet-target" } else { "" },
+        "target_dir_hint": if rch_required { "/tmp/cass-work-packet-target" } else { "" },
         "full_gate_required": swarm_work_packet_full_gate_required(&file_classes),
         "rationale": if build_pressure == "high" {
             "Defer expensive verification until build pressure drops; keep commands for the later proof pass."
@@ -15410,7 +13626,6 @@ fn swarm_work_packet_generated_artifact_path(path: &str) -> bool {
         || lower.starts_with("target/")
         || lower.contains("/target/")
         || lower.starts_with("/tmp/cass-")
-        || lower.starts_with("/data/tmp/cass-")
         || lower.contains("cargo_target_dir")
         || lower.ends_with(".profraw")
 }
@@ -15696,35 +13911,35 @@ fn swarm_work_packet_verification_commands(
     if has_class("swarm-contract") {
         commands.push(swarm_work_packet_command_step(
             "focused-swarm-contract",
-            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-swarm-work-packet-target cargo test --test swarm_status_contract -- --nocapture",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-swarm-work-packet-target cargo test --test swarm_status_contract -- --nocapture",
             "Swarm work-packet/status contract changed or is directly relevant.",
         ));
     }
     if has_class("golden-json") {
         commands.push(swarm_work_packet_command_step(
             "robot-golden-contract",
-            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs",
             "Robot JSON or robot docs contracts need deterministic golden coverage.",
         ));
     }
     if has_class("docs") && !has_class("golden-json") {
         commands.push(swarm_work_packet_command_step(
             "robot-docs-contract",
-            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-docs-target cargo test --test golden_robot_docs",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-docs-target cargo test --test golden_robot_docs",
             "Documentation changes that touch robot-facing help should keep docs goldens stable.",
         ));
     }
     if has_class("sibling-dependency") {
         commands.push(swarm_work_packet_command_step(
             "sibling-dependency-contract",
-            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation",
             "Sibling dependency pins or build.rs contract checks changed.",
         ));
     }
     if has_class("ui-snapshot") {
         commands.push(swarm_work_packet_command_step(
             "tui-snapshot-contract",
-            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-tui-target cargo test --test tui_flows",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-tui-target cargo test --test tui_flows",
             "TUI flow or snapshot surface changed.",
         ));
     }
@@ -15741,17 +13956,17 @@ fn swarm_work_packet_verification_commands(
     if code_changed {
         commands.push(swarm_work_packet_command_step(
             "cargo-check-all-targets",
-            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo check --all-targets",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo check --all-targets",
             "Rust code or tests changed; compile every target before closeout.",
         ));
         commands.push(swarm_work_packet_command_step(
             "clippy-all-targets",
-            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo clippy --all-targets -- -D warnings",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo clippy --all-targets -- -D warnings",
             "Repo gate treats warnings as errors.",
         ));
         commands.push(swarm_work_packet_command_step(
             "fmt-check",
-            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo fmt --check",
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo fmt --check",
             "Formatting must stay stable.",
         ));
     }
@@ -16005,7 +14220,7 @@ mod swarm_status_cli_tests {
                             "kind": "rch-test",
                             "bead_id": "cass-proof-1",
                             "commit_id": "abc123",
-                            "command_shape": "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-proof cargo test --test cli_robot",
+                            "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo test --test cli_robot",
                             "status": "passed",
                             "remote_exit_status": 0,
                             "changed_paths": ["src/lib.rs", "tests/cli_robot.rs"],
@@ -16402,7 +14617,6 @@ fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>, cli: &Cli) -> 
         AnalyticsCommand::Tokens { common, .. } => ("tokens", common),
         AnalyticsCommand::Tools { common, .. } => ("tools", common),
         AnalyticsCommand::AnalyticsModels { common, .. } => ("models", common),
-        AnalyticsCommand::Incidents { common, .. } => ("incidents", common),
         AnalyticsCommand::Rebuild { common, .. } => ("rebuild", common),
         AnalyticsCommand::Validate { common, .. } => ("validate", common),
     };
@@ -16430,22 +14644,6 @@ fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>, cli: &Cli) -> 
         AnalyticsCommand::AnalyticsModels { common, group_by } => {
             run_analytics_models(common, *group_by, db_path.as_ref())?
         }
-        AnalyticsCommand::Incidents {
-            common,
-            limit,
-            max_sessions,
-            max_messages,
-            max_bytes,
-            budget_ms,
-        } => run_analytics_incidents(
-            common,
-            *limit,
-            *max_sessions,
-            *max_messages,
-            *max_bytes,
-            *budget_ms,
-            db_path.as_ref(),
-        )?,
     };
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -16471,7 +14669,6 @@ fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>, cli: &Cli) -> 
             | AnalyticsCommand::Tokens { .. }
             | AnalyticsCommand::Rebuild { .. }
             | AnalyticsCommand::Tools { .. }
-            | AnalyticsCommand::Incidents { .. }
             | AnalyticsCommand::Validate { .. }
             | AnalyticsCommand::AnalyticsModels { .. } => format!(
                 "{} analytics {}",
@@ -16932,91 +15129,6 @@ fn run_analytics_status(
     analytics::query::query_status(&conn, &filter)
         .map(|r| r.to_json())
         .map_err(analytics_query_cli_error)
-}
-
-fn incident_usage_error(message: impl Into<String>) -> CliError {
-    CliError {
-        code: 2,
-        kind: CliErrorKind::Usage.kind_str(),
-        message: message.into(),
-        hint: Some(
-            "Use positive bounded values; --limit <= 100 and --max-sessions <= 10000.".to_string(),
-        ),
-        retryable: false,
-    }
-}
-
-fn incident_scan_cli_error(error: anyhow::Error) -> CliError {
-    CliError {
-        code: 9,
-        kind: CliErrorKind::DbError.kind_str(),
-        message: format!("Incident mining failed: {error:#}"),
-        hint: Some(
-            "Check the canonical archive with 'cass doctor --json'; reduce the scan caps if the archive is very large."
-                .to_string(),
-        ),
-        retryable: false,
-    }
-}
-
-/// Run `cass analytics incidents` — bounded, read-only incident mining over
-/// canonical archive conversations and messages.
-fn run_analytics_incidents(
-    common: &AnalyticsCommon,
-    limit: usize,
-    max_sessions: u64,
-    max_messages: u64,
-    max_bytes: u64,
-    budget_ms: u64,
-    db_path_override: Option<&PathBuf>,
-) -> CliResult<serde_json::Value> {
-    if limit == 0 || limit > 100 {
-        return Err(incident_usage_error(format!(
-            "--limit must be between 1 and 100 (got {limit})"
-        )));
-    }
-    if max_sessions == 0 || max_sessions > 10_000 {
-        return Err(incident_usage_error(format!(
-            "--max-sessions must be between 1 and 10000 (got {max_sessions})"
-        )));
-    }
-    for (flag, value) in [
-        ("--max-messages", max_messages),
-        ("--max-bytes", max_bytes),
-        ("--budget-ms", budget_ms),
-    ] {
-        if value == 0 {
-            return Err(incident_usage_error(format!(
-                "{flag} must be greater than zero"
-            )));
-        }
-    }
-
-    let effective_db_path = analytics_db_path(&common.data_dir, db_path_override);
-    let pointer_db_path = std::fs::canonicalize(&effective_db_path).unwrap_or(effective_db_path);
-    let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let filter = analytics_query_filter(&conn, common)?;
-    let caps = crate::incident_discovery::DiscoveryCaps {
-        max_files: max_sessions,
-        max_lines: max_messages,
-        max_bytes,
-        budget_ms,
-        max_evidence: crate::incident_discovery::DEFAULT_MAX_EVIDENCE,
-    };
-    let scan_conn = crate::storage::sqlite::SendFrankenConnection::new(conn);
-    let scan_db_path = pointer_db_path.clone();
-    let report = crate::incident_discovery::run_incident_scan_with_hard_timeout(caps, move || {
-        let conn = scan_conn.into_parts().0;
-        crate::incident_discovery::scan_incidents(&conn, &filter, caps, limit, Some(&scan_db_path))
-    })
-    .map_err(incident_scan_cli_error)?;
-    serde_json::to_value(report).map_err(|error| CliError {
-        code: 9,
-        kind: CliErrorKind::SerializeMessage.kind_str(),
-        message: format!("Failed to serialize incident report: {error}"),
-        hint: None,
-        retryable: false,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -17712,53 +15824,18 @@ fn probe_state_db(
     timeout: Duration,
     include_counts: bool,
 ) -> StateDbSnapshot {
-    probe_state_db_modes(db_path, reason, timeout, include_counts, false)
-}
-
-/// `coding_agent_session_search` (#301 truthfulness reconciliation):
-/// `watermarks_only` opens the canonical DB but reads ONLY the two
-/// cheap single-row `meta` watermarks (`last_scan_ts`,
-/// `last_indexed_at`) — never the COUNT(*) full-table scans. It is the
-/// bridge that lets `cass health` consume the SAME staleness inputs as
-/// `cass status` (so the two truth surfaces can no longer disagree)
-/// while still honoring health's <50ms budget. The returned snapshot
-/// keeps `open_skipped=true` + `counts_skipped=true` + zero counts so
-/// the gi4oy/d0rmo health contract (null counts, assumed-good open
-/// signal) is preserved byte-for-byte — only the watermark fields are
-/// populated. When the open fails, the watermark-only path degrades to
-/// the assumed-good elision (open_skipped=true) rather than surfacing
-/// the open error, matching the prior skip-open semantics on the fast
-/// readiness surface (corrupt-DB detection stays doctor/diag's job).
-fn probe_state_db_modes(
-    db_path: &Path,
-    reason: &str,
-    timeout: Duration,
-    include_counts: bool,
-    watermarks_only: bool,
-) -> StateDbSnapshot {
     if !db_path.exists() {
         return StateDbSnapshot::default();
     }
 
     let mut snapshot = StateDbSnapshot {
-        counts_skipped: !include_counts || watermarks_only,
-        open_skipped: watermarks_only,
+        counts_skipped: !include_counts,
         ..StateDbSnapshot::default()
     };
 
     let conn = match open_franken_cli_read_db(db_path.to_path_buf(), reason, timeout) {
         Ok(conn) => conn,
         Err(err) => {
-            if watermarks_only {
-                // Preserve the pre-#301 skip-open semantics on the fast
-                // readiness surface: an open failure here is not a
-                // degraded-state signal (that is doctor/diag's job).
-                // Report the assumed-good elision so health's contract
-                // (opened=true + open_skipped=true) is unchanged when the
-                // watermark read cannot complete.
-                snapshot.opened = true;
-                return snapshot;
-            }
             snapshot.open_error = Some(err.message);
             snapshot.open_retryable = err.retryable;
             return snapshot;
@@ -17785,7 +15862,7 @@ fn probe_state_db_modes(
     )
     .ok()
     .and_then(|s| s.parse::<i64>().ok());
-    if include_counts && !watermarks_only {
+    if include_counts {
         snapshot.conversation_count = franken_query_row_map_retry(
             &conn,
             "SELECT COUNT(*) FROM conversations",
@@ -18287,107 +16364,6 @@ fn state_meta_json_for_status(
     )
 }
 
-/// Project the `.14.1` storage-integrity block onto a lightweight readiness
-/// surface (`cass status --json`, `cass search --robot-meta`) from the
-/// `state_meta` JSON it already built plus a cheap `db_path.exists()` check, so
-/// every truth surface speaks the same `StorageState` vocabulary the doctor
-/// does (bead qfswx, follow-on to vl1cj's doctor wiring). Returns the report as
-/// a JSON value (`null` only if serialization somehow fails).
-///
-/// The shared db-open/index signals derive the coarse readiness state first;
-/// bounded dedicated probes then refine typed contention, on-disk schema drift,
-/// legacy layouts, and structurally suspect WAL/SHM sidecars. Generic
-/// `CliError.retryable` is never used to infer busy/locked.
-fn storage_integrity_value_from_state(
-    data_dir: &Path,
-    db_path: &Path,
-    state: &serde_json::Value,
-    not_initialized: bool,
-) -> serde_json::Value {
-    use crate::search::storage_integrity::{
-        DoctorStorageSignals, apply_dedicated_storage_probe, build_readiness_storage_integrity,
-        load_matching_integrity_attestation, probe_dedicated_storage_state,
-    };
-    let db_file_present = db_path.exists();
-    let db_opened = state
-        .pointer("/database/opened")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let open_skipped = state
-        .pointer("/database/open_skipped")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let lexical_index_drifted = state
-        .pointer("/index/empty_with_messages")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let signals = DoctorStorageSignals {
-        db_file_present,
-        not_initialized,
-        // A present-but-unopened archive is an openread fault. status/search
-        // open the DB for real (skip_db_open=false), so only claim the fault
-        // when the open was attempted (never deliberately elided).
-        db_open_failed: db_file_present && !db_opened && !open_skipped,
-        probe_timed_out: false,
-        integrity_failed: false,
-        integrity_unverified: false,
-        lexical_index_drifted,
-    };
-    // #331: consult the persisted deep-probe attestation so a successful
-    // db_open alone projects `unchecked` (never a synthesized `ok`), while a
-    // fingerprint-still-valid doctor/index quick_check verdict projects its
-    // real pass/fail outcome with cached provenance.
-    let attestation = load_matching_integrity_attestation(data_dir, db_path);
-    let report = build_readiness_storage_integrity(signals, attestation.as_ref());
-    let dedicated = probe_dedicated_storage_state(db_path, Duration::from_millis(100));
-    serde_json::to_value(apply_dedicated_storage_probe(report, dedicated))
-        .unwrap_or(serde_json::Value::Null)
-}
-
-#[cfg(test)]
-#[test]
-fn readiness_projection_uses_only_fingerprint_matching_integrity_attestations() {
-    use crate::search::storage_integrity::{
-        IntegrityAttestationVerdict, store_integrity_attestation,
-    };
-
-    let temp = tempfile::tempdir().expect("tempdir");
-    let data_dir = temp.path();
-    let db_path = data_dir.join("agent_search.db");
-    std::fs::write(&db_path, b"canonical archive bytes").expect("seed archive file");
-    let opened_state = serde_json::json!({
-        "database": { "opened": true, "open_skipped": false },
-        "index": { "empty_with_messages": false }
-    });
-
-    let unchecked = storage_integrity_value_from_state(data_dir, &db_path, &opened_state, false);
-    assert_eq!(unchecked["storage_state"], "unchecked");
-    assert_eq!(unchecked["source_of_truth_risk"], "unknown");
-    assert_eq!(unchecked["attestation_source"], "none");
-    assert_eq!(unchecked["checks_not_attempted"][0]["name"], "quick_check");
-
-    store_integrity_attestation(
-        data_dir,
-        &db_path,
-        IntegrityAttestationVerdict::Fail,
-        "quick_check",
-        Some("fixture corruption".to_string()),
-    )
-    .expect("capture and persist fixture corruption attestation");
-    let known_bad = storage_integrity_value_from_state(data_dir, &db_path, &opened_state, false);
-    assert_eq!(known_bad["storage_state"], "integrity_failed");
-    assert_eq!(known_bad["source_of_truth_risk"], "high");
-    assert_eq!(known_bad["attestation_source"], "cached");
-
-    // Any archive mutation invalidates the cached verdict. A successful open
-    // without fresh structural evidence returns to the honest unchecked state.
-    std::fs::write(&db_path, b"canonical archive bytes changed and longer")
-        .expect("mutate archive fingerprint");
-    let stale = storage_integrity_value_from_state(data_dir, &db_path, &opened_state, false);
-    assert_eq!(stale["storage_state"], "unchecked");
-    assert_eq!(stale["attestation_source"], "none");
-}
-
 /// `coding_agent_session_search-d0rmo`: variant of `state_meta_json`
 /// that lets the caller force-skip the COUNT(*) queries on the
 /// canonical DB. Pre-fix the size-based heuristic (≤256 MB → run
@@ -18470,26 +16446,12 @@ fn state_meta_json_inner(
     // counts come from `..default()` (i.e. zero). Reporting
     // counts_skipped=false alongside message_count=0 would be a lie.
     let db_snapshot = if skip_db_open && db_exists && db_is_regular_file {
-        // [coding_agent_session_search #301 truthfulness reconciliation]
-        // Previously this branch synthesized a fully-empty snapshot
-        // (last_scan_ts=None), which is exactly why `cass health`
-        // could report `fresh`/`healthy` while `cass status` reported
-        // `stale` on the SAME DB: the scan-ahead-of-projection check
-        // below requires `last_scan_ts.is_some()`, and health never
-        // read it. Now health does a watermarks-only probe — it opens
-        // the DB but reads ONLY the two cheap single-row `meta`
-        // watermarks (no COUNT(*) scans), so the staleness inputs are
-        // IDENTICAL to status. The snapshot still reports
-        // open_skipped=true + counts_skipped=true + zero counts, so the
-        // gi4oy/d0rmo health contract (null counts, assumed-good open)
-        // is preserved byte-for-byte.
-        probe_state_db_modes(
-            db_path,
-            "state-meta-watermarks",
-            STATE_DB_OPEN_TIMEOUT,
-            false,
-            true,
-        )
+        StateDbSnapshot {
+            opened: true,
+            counts_skipped: true,
+            open_skipped: true,
+            ..StateDbSnapshot::default()
+        }
     } else if allow_db_open && db_exists {
         probe_state_db(db_path, "state-meta", STATE_DB_OPEN_TIMEOUT, include_counts)
     } else {
@@ -18792,51 +16754,12 @@ fn state_meta_json_inner(
         .unwrap_or_else(chrono::Utc::now)
         .to_rfc3339();
 
-    // [coding_agent_session_search #301 partial-index marker] When
-    // `cass index --full` is aborted by the stall watchdog (exit 70) or
-    // otherwise interrupted, it leaves a SEARCHABLE-but-incomplete lexical
-    // index: the checkpoint is present but never marked completed. Search
-    // then queries it with results that silently omit a fraction of
-    // conversations. Surface a dedicated `partial` boolean (and reason)
-    // distinct from age-staleness so `cass search --robot-meta` can warn
-    // that the index is incomplete, not merely old. The condition is: the
-    // index exists, is not actively rebuilding right now, and its
-    // checkpoint is present-but-not-completed (the durable abort/interrupt
-    // signature) — OR the live scan watermark is ahead of the projected
-    // index (scan advanced without a completed projection). Both are the
-    // exact signatures #301 produces after an aborted full index.
-    let index_partial = lexical.exists
-        && !lexical.rebuilding
-        && ((lexical.checkpoint.present && lexical.checkpoint.completed == Some(false))
-            || last_scan_ts.is_some_and(|scan_ts| {
-                last_indexed_at
-                    .map(|indexed_at| scan_ts > indexed_at.saturating_add(1_000))
-                    .unwrap_or(true)
-            }));
-    let index_partial_reason: Option<&'static str> = if index_partial {
-        if lexical.checkpoint.present && lexical.checkpoint.completed == Some(false) {
-            Some(
-                "lexical index is PARTIAL: a prior `cass index --full` was aborted or interrupted before its checkpoint completed; search results omit conversations indexed after the abort. Re-run `cass index --full` to complete it.",
-            )
-        } else {
-            Some(
-                "lexical index is PARTIAL: a scan advanced past the last completed projection (scan watermark ahead of indexed watermark); search results may omit recently scanned conversations. Re-run `cass index --full` to reconcile.",
-            )
-        }
-    } else {
-        None
-    };
-
     serde_json::json!({
         "index": {
             "exists": lexical.exists,
             "status": lexical.status,
             "reason": lexical.status_reason,
             "fresh": lexical.fresh,
-            // [coding_agent_session_search #301] explicit incomplete-index
-            // signal, distinct from age-staleness (`stale`).
-            "partial": index_partial,
-            "partial_reason": index_partial_reason,
             "last_indexed_at": last_indexed_at.map(|ts| {
                 chrono::DateTime::from_timestamp_millis(ts)
                     .unwrap_or_else(chrono::Utc::now)
@@ -18933,11 +16856,12 @@ fn state_meta_json_inner(
             "hnsw_path": semantic.hnsw_path.as_ref().map(|path| path.display().to_string()),
             "hnsw_ready": semantic.hnsw_ready,
             "progressive_ready": semantic.progressive_ready,
-            // Always true since bead tg5o9 retired the `semantic` Cargo
-            // feature: every build carries the pure-Rust
-            // frankensearch/native backend (no ONNX, no `-baseline`
-            // artifact). The key is kept for schema stability.
-            "feature_compiled_in": true,
+            // cass#256: surface whether this binary was built with the
+            // `semantic` Cargo feature. `false` means the prebuilt
+            // Microsoft ONNX Runtime is NOT linked (the baseline build
+            // for pre-AVX2 CPUs); semantic search modes will return an
+            // explicit error and hybrid degrades to lexical.
+            "feature_compiled_in": cfg!(feature = "semantic"),
             // Sub-fix 3 for cass#257 — additive fields that report
             // quality-tier readiness independently of the
             // progressive/hybrid stack so `--mode semantic` consumers
@@ -19042,11 +16966,6 @@ fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value>
         "stale": index.get("stale"),
         "stale_threshold_seconds": index.get("stale_threshold_seconds"),
         "rebuilding": index.get("rebuilding"),
-        // [coding_agent_session_search #301] propagate the incomplete-index
-        // markers so `cass search --robot-meta` can warn that the index is
-        // PARTIAL (aborted/interrupted full index), not merely stale.
-        "partial": index.get("partial"),
-        "partial_reason": index.get("partial_reason"),
         "pending_sessions": pending.and_then(|p| p.get("sessions"))
     }))
 }
@@ -19298,82 +17217,6 @@ fn readiness_snapshot_from_state(
     let lexical = lexical_readiness_from_state(state, not_initialized);
     let semantic = semantic_readiness_from_state(state);
     ReadinessSnapshot::new(lexical, semantic)
-}
-
-/// Live bridge (bead `cass-fleet-resilience-20260608-uojcg.envu1`): build the
-/// canonical typed `DerivedAssetTruthTable` for `data_dir` from the same
-/// `state_meta_json` evidence `run_status`/`run_doctor` already read.
-///
-/// Today the typed truth table is only constructed in fixtures; the live
-/// readiness surfaces work off a parallel `serde_json::Value` snapshot. This
-/// builder maps that snapshot into the typed table so the typed projections
-/// (`readiness_projection::project`, `next_command_envelope`,
-/// `QuarantineSummary`) can be reused across surfaces instead of each
-/// re-deriving the JSON. Staged ahead of its callers (the recovery-support
-/// bundle wiring `6f1lm` and the human readiness summary wiring `v6vuz`),
-/// which become thin assemblers over this one builder.
-pub(crate) fn build_truth_table_for_data_dir(
-    data_dir: &Path,
-    db_path: &Path,
-    stale_threshold: u64,
-) -> crate::search::readiness::DerivedAssetTruthTable {
-    // allow_db_open=true: derive from the real DB-open signal (status-like),
-    // so OpenFailed is distinguished from a present-but-elided open.
-    let state = state_meta_json(data_dir, db_path, stale_threshold, true);
-    build_truth_table_from_state(&state)
-}
-
-/// Variant of [`build_truth_table_for_data_dir`] for callers that already
-/// hold a `state_meta_json` snapshot (status/doctor compute it once), so the
-/// data dir is not re-probed.
-pub(crate) fn build_truth_table_from_state(
-    state: &serde_json::Value,
-) -> crate::search::readiness::DerivedAssetTruthTable {
-    let db_exists = state
-        .pointer("/database/exists")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let lexical_index_initialized = state
-        .pointer("/index/exists")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let rebuild_active = state
-        .pointer("/rebuild/active")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let not_initialized =
-        cass_not_initialized(db_exists, lexical_index_initialized, rebuild_active);
-    let readiness = readiness_snapshot_from_state(state, not_initialized);
-    crate::search::readiness::truth_table_from_state(state, readiness)
-}
-
-/// Render the bounded human readiness summary (bead
-/// `coding_agent_session_search-v6vuz`) as a CLI section, from a live
-/// `state_meta_json` snapshot the surface already computed.
-///
-/// This is the live counterpart of the `.13.2` contract
-/// (`crate::search::human_readiness_summary`): every human (non-`--json`)
-/// readiness surface emits the *same* projection the robot JSON serializes, so
-/// the operator-facing copy can never drift from the machine contract. The
-/// projection is pure over the already-built snapshot (no extra I/O), so even
-/// the `<50ms` health surface stays fast. Nothing is printed if the projection
-/// would be unsafe to surface — a structural backstop on top of the curated
-/// safe-next-command, so a human surface can never recommend a destructive or
-/// archive-risking action.
-fn print_human_readiness_section(
-    state: &serde_json::Value,
-    surface: crate::search::readiness_projection::SurfaceKind,
-) {
-    let table = build_truth_table_from_state(state);
-    let summary = crate::search::human_readiness_summary::project_human_summary(&table, surface);
-    if !summary.is_safe(table.archive_risk) {
-        return;
-    }
-    println!();
-    println!("Readiness:");
-    for line in summary.render_lines() {
-        println!("{line}");
-    }
 }
 
 fn lexical_readiness_from_state(
@@ -20155,23 +17998,17 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Pack { .. }) => "pack".to_string(),
         Some(Commands::Stats { .. }) => "stats".to_string(),
         Some(Commands::Diag { .. }) => "diag".to_string(),
-        Some(Commands::Storage { .. }) => "storage".to_string(),
-        Some(Commands::Dedup { .. }) => "dedup".to_string(),
         Some(Commands::Status { .. }) => "status".to_string(),
         Some(Commands::Triage { .. }) => "triage".to_string(),
-        Some(Commands::SupportBundle { .. }) => "support-bundle".to_string(),
         Some(Commands::View { .. }) => "view".to_string(),
         Some(Commands::Completions { .. }) => "completions".to_string(),
         Some(Commands::Man) => "man".to_string(),
         Some(Commands::Capabilities { .. }) => "capabilities".to_string(),
         Some(Commands::ApiVersion { .. }) => "api-version".to_string(),
-        Some(Commands::ReleaseVerify { .. }) => "release-verify".to_string(),
         Some(Commands::State { .. }) => "state".to_string(),
         Some(Commands::Introspect { .. }) => "introspect".to_string(),
         Some(Commands::RobotDocs { topic }) => format!("robot-docs:{topic:?}"),
         Some(Commands::Health { .. }) => "health".to_string(),
-        Some(Commands::Onboarding { .. }) => "onboarding".to_string(),
-        Some(Commands::Guide { .. }) => "guide".to_string(),
         Some(Commands::Doctor { .. }) => "doctor".to_string(),
         Some(Commands::Context { .. }) => "context".to_string(),
         Some(Commands::Sessions { .. }) => "sessions".to_string(),
@@ -20181,13 +18018,9 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::ExportHtml { .. }) => "export-html".to_string(),
         Some(Commands::Expand { .. }) => "expand".to_string(),
         Some(Commands::Timeline { .. }) => "timeline".to_string(),
-        Some(Commands::Quarantine(..)) => "quarantine".to_string(),
-        Some(Commands::Forget { .. }) => "forget".to_string(),
         Some(Commands::Mirror(..)) => "mirror".to_string(),
         Some(Commands::Sources(..)) => "sources".to_string(),
         Some(Commands::Models(..)) => "models".to_string(),
-        Some(Commands::Fleet(..)) => "fleet".to_string(),
-        Some(Commands::Lessons(..)) => "lessons".to_string(),
         Some(Commands::Swarm(..)) => "swarm".to_string(),
         Some(Commands::Pages { .. }) => "pages".to_string(),
         #[cfg(unix)]
@@ -20210,217 +18043,11 @@ fn analytics_requests_structured_output(cmd: &AnalyticsCommand, cli: &Cli) -> bo
         | AnalyticsCommand::Tokens { common, .. }
         | AnalyticsCommand::Tools { common, .. }
         | AnalyticsCommand::AnalyticsModels { common, .. }
-        | AnalyticsCommand::Incidents { common, .. }
         | AnalyticsCommand::Rebuild { common, .. }
         | AnalyticsCommand::Validate { common, .. } => common.json,
     };
 
     resolve_subcommand_structured_format(cli, json).is_some()
-}
-
-/// Default tracing directive for interactive human mode: emit INFO and above
-/// but suppress frankensqlite internal telemetry that spams at INFO level.
-///
-/// `EnvFilter` uses `::` as the hierarchy separator, so `fsqlite=warn` covers
-/// `fsqlite::runtime`, `fsqlite::cx`, etc. Crate-level targets like
-/// `fsqlite_vdbe` and `fsqlite_core` need their own directives. Custom
-/// dot-separated targets (`fsqlite.statement_reuse`, `fsqlite.compat`, etc.) are
-/// NOT matched by the hierarchical prefix, so each must be listed explicitly.
-///
-/// This list is only consulted in interactive human mode (and only when
-/// `RUST_LOG` is unset). Robot/quiet mode never reaches it — those modes pin the
-/// filter to `error` via [`robot_aware_log_directive`], which is the actual
-/// stdout/stderr hygiene guarantee. A missing entry here can therefore only make
-/// human-mode stderr noisier, never corrupt a robot JSON stream.
-const DEFAULT_DEP_LOG_SUPPRESSION: &str = concat!(
-    "info",
-    // Hierarchical (::) targets
-    ",fsqlite=warn",
-    ",fsqlite_core=warn",
-    ",fsqlite_vdbe=warn",
-    ",fsqlite_mvcc=warn",
-    ",fsqlite_pager=warn",
-    ",fsqlite_func=warn",
-    ",fsqlite_vfs=warn",
-    ",fsqlite_wal=warn",
-    ",fsqlite_c_api=warn",
-    ",fsqlite_planner=warn",
-    ",fsqlite_types=warn",
-    ",fsqlite_observability=warn",
-    // Dot-separated custom targets
-    ",fsqlite.compat=warn",
-    ",fsqlite.compat_trace=warn",
-    ",fsqlite.statement_reuse=warn",
-    ",fsqlite.statement=warn",
-    ",fsqlite.execution=warn",
-    ",fsqlite.execute_path=warn",
-    ",fsqlite.plan=warn",
-    ",fsqlite.planner=warn",
-    ",fsqlite.planner_runtime=warn",
-    ",fsqlite.parse=warn",
-    ",fsqlite.provenance=warn",
-    ",fsqlite.dp=warn",
-    ",fsqlite.udf=warn",
-    ",fsqlite.vdbe=warn",
-    ",fsqlite.rcu=warn",
-    ",fsqlite.seqlock=warn",
-    ",fsqlite.left_right=warn",
-    ",fsqlite.flat_combine=warn",
-    ",fsqlite.commit_combine=warn",
-    ",fsqlite.snapshot_publication=warn",
-    ",fsqlite.wal_publication=warn",
-    ",fsqlite.storage_wiring=warn",
-    ",fsqlite.cx_propagation=warn",
-    ",fsqlite.sketch_telemetry=warn",
-    ",fsqlite.time_travel=warn",
-    ",fsqlite.trace_export=warn",
-    ",fsqlite.txn_slot=warn",
-    ",fsqlite.evidence=warn",
-    ",fsqlite.lab_schedule=warn",
-);
-
-/// Decide the tracing filter directive for the active output mode.
-///
-/// Returns `Some(directive)` when the directive is fixed regardless of the
-/// `RUST_LOG` environment variable, and `None` when the caller should consult
-/// `RUST_LOG` (falling back to [`DEFAULT_DEP_LOG_SUPPRESSION`]).
-///
-/// Robot and quiet modes are machine-consumed: they pin the filter to `error`
-/// (unless the operator explicitly opts into `--verbose`) so that dependency
-/// INFO/WARN logging — frankensqlite telemetry in particular — can never
-/// interleave with a JSON stream, even when `RUST_LOG` is set in the
-/// environment. This is the single source of truth for robot stdout/stderr
-/// hygiene; the regression suite in `tests/cli_robot_log_hygiene.rs` exercises it
-/// end-to-end under deliberately noisy `RUST_LOG` settings.
-fn robot_aware_log_directive(robot_mode: bool, verbose: bool, quiet: bool) -> Option<&'static str> {
-    if quiet || robot_mode {
-        // Robot/quiet mode implies error-only output unless --verbose is set.
-        Some(if verbose { "debug" } else { "error" })
-    } else if verbose {
-        Some("debug")
-    } else {
-        None
-    }
-}
-
-/// Build the concrete [`EnvFilter`] for the active output mode, applying the
-/// robot/quiet hygiene policy from [`robot_aware_log_directive`].
-fn build_robot_aware_log_filter(robot_mode: bool, verbose: bool, quiet: bool) -> EnvFilter {
-    match robot_aware_log_directive(robot_mode, verbose, quiet) {
-        Some(directive) => EnvFilter::new(directive),
-        None => EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(DEFAULT_DEP_LOG_SUPPRESSION)),
-    }
-}
-
-/// Tracing directive for the explicit `--trace-file` surface
-/// (coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.5).
-///
-/// When an operator opts into `--trace-file`, dependency-level diagnostics
-/// (frankensqlite / frankensearch / asupersync, etc.) are captured at `debug`
-/// into that file as a deliberate trace artifact, while the stderr layer stays
-/// pinned to its robot-aware level so machine output is never corrupted. This is
-/// the "explicit trace surface" the bead requires: deep logs are available on
-/// demand, never by default.
-const TRACE_FILE_LOG_DIRECTIVE: &str = "debug";
-
-/// Initialize the tracing subscriber for non-TUI commands with robot-safe
-/// stdout/stderr hygiene plus an optional explicit `--trace-file` sink.
-///
-/// The stderr layer carries the robot-aware `filter` (pinned to `error` in
-/// robot/quiet mode by [`build_robot_aware_log_filter`], per uojcg.2.1), so
-/// dependency INFO/WARN logging can never interleave with a JSON stream. When
-/// `trace_file` is `Some`, a second layer captures dependency diagnostics at
-/// [`TRACE_FILE_LOG_DIRECTIVE`] into that file (uojcg.2.5) — gating deep logs
-/// behind an explicit surface rather than emitting them by default.
-///
-/// Returns the appender [`WorkerGuard`](tracing_appender::non_blocking::WorkerGuard)
-/// when a trace file is active; the caller MUST keep it alive for the duration of
-/// the command so buffered trace lines are flushed.
-fn init_cli_tracing(
-    filter: EnvFilter,
-    trace_file: Option<&Path>,
-    ansi: bool,
-) -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    use tracing_subscriber::Layer;
-
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .compact()
-        .with_target(false)
-        .with_ansi(ansi)
-        .with_filter(filter);
-
-    let (trace_layer, guard) = match trace_file {
-        Some(path) => match OpenOptions::new().create(true).append(true).open(path) {
-            Ok(file) => {
-                let (non_blocking, guard) = tracing_appender::non_blocking(file);
-                let layer = tracing_subscriber::fmt::layer()
-                    .with_writer(non_blocking)
-                    .with_ansi(false)
-                    .compact()
-                    .with_filter(EnvFilter::new(TRACE_FILE_LOG_DIRECTIVE))
-                    .boxed();
-                (Some(layer), Some(guard))
-            }
-            Err(e) => {
-                eprintln!("trace-file open error ({}): {e}", path.display());
-                (None, None)
-            }
-        },
-        None => (None, None),
-    };
-
-    tracing_subscriber::registry()
-        .with(stderr_layer)
-        .with(trace_layer)
-        .init();
-    guard
-}
-
-#[cfg(test)]
-mod log_hygiene_tests {
-    use super::{DEFAULT_DEP_LOG_SUPPRESSION, robot_aware_log_directive};
-
-    #[test]
-    fn robot_mode_pins_filter_to_error() {
-        // Robot mode (without --verbose) must emit only errors regardless of
-        // --quiet, so dependency INFO/WARN can never corrupt a JSON stream.
-        assert_eq!(robot_aware_log_directive(true, false, false), Some("error"));
-        assert_eq!(robot_aware_log_directive(true, false, true), Some("error"));
-    }
-
-    #[test]
-    fn quiet_mode_pins_filter_to_error() {
-        assert_eq!(robot_aware_log_directive(false, false, true), Some("error"));
-    }
-
-    #[test]
-    fn verbose_overrides_robot_quiet_to_debug() {
-        assert_eq!(robot_aware_log_directive(true, true, false), Some("debug"));
-        assert_eq!(robot_aware_log_directive(false, true, true), Some("debug"));
-    }
-
-    #[test]
-    fn interactive_verbose_is_debug() {
-        assert_eq!(robot_aware_log_directive(false, true, false), Some("debug"));
-    }
-
-    #[test]
-    fn interactive_default_defers_to_env() {
-        // No fixed directive in plain human mode: caller consults RUST_LOG and
-        // falls back to the dependency-suppression list.
-        assert_eq!(robot_aware_log_directive(false, false, false), None);
-    }
-
-    #[test]
-    fn dep_suppression_quiets_fsqlite_targets() {
-        // The fallback list must keep frankensqlite telemetry below INFO so even
-        // human-mode stderr is not flooded.
-        assert!(DEFAULT_DEP_LOG_SUPPRESSION.starts_with("info"));
-        assert!(DEFAULT_DEP_LOG_SUPPRESSION.contains("fsqlite=warn"));
-        assert!(DEFAULT_DEP_LOG_SUPPRESSION.contains("fsqlite_core=warn"));
-    }
 }
 
 /// Returns true if the command is using robot/JSON output mode.
@@ -20436,10 +18063,6 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Pack { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Index { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Health { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
-        Commands::Onboarding { json, .. } => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
-        Commands::Guide { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Pages { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Sessions { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
@@ -20453,13 +18076,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         }
         Commands::Stats { json, .. }
         | Commands::Diag { json, .. }
-        | Commands::Storage { json, .. }
-        | Commands::Dedup { json, .. }
         | Commands::Status { json, .. }
         | Commands::Triage { json, .. }
-        | Commands::SupportBundle { json, .. }
         | Commands::ApiVersion { json }
-        | Commands::ReleaseVerify { json, .. }
         | Commands::State { json, .. }
         | Commands::View { json, .. }
         | Commands::Capabilities { json }
@@ -20475,7 +18094,6 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Mirror(MirrorCommand::Prune { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
-        Commands::Forget { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Sources(SourcesCommand::List { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -20483,9 +18101,6 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Sources(SourcesCommand::Sync { json, .. }) => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
-        Commands::Sources(SourcesCommand::Reingest { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Sources(SourcesCommand::ArtifactManifest { json, .. }) => {
@@ -20521,30 +18136,6 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Swarm(SwarmCommand::DependencyDrift { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
-        Commands::Swarm(SwarmCommand::ResourcePlan { json, .. }) => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
-        Commands::Swarm(SwarmCommand::PrivacyPreview { json, .. }) => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
-        Commands::Swarm(SwarmCommand::ContextPack { json, .. }) => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
-        Commands::Swarm(SwarmCommand::WorkflowAnalytics { json, .. }) => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
-        Commands::Swarm(SwarmCommand::ReplayFixture { json, .. }) => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
-        Commands::Swarm(SwarmCommand::Macros { json, .. }) => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
-        Commands::Swarm(SwarmCommand::ReproCapsule { json, .. }) => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
-        Commands::Swarm(SwarmCommand::Dashboard { json, .. }) => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
         Commands::Models(ModelsCommand::Status { json }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -20557,18 +18148,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Models(ModelsCommand::CheckUpdate { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
-        Commands::Fleet(FleetCommand::UpgradeRehearsal { json, .. }) => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
-        Commands::Lessons(
-            LessonsCommand::List { json, .. }
-            | LessonsCommand::Search { json, .. }
-            | LessonsCommand::View { json, .. },
-        ) => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Sources(_) => false,
-        Commands::Quarantine(
-            QuarantineCommand::List { json, .. } | QuarantineCommand::Clear { json, .. },
-        ) => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Import(cmd) => match cmd {
             ImportCommand::Chatgpt { .. } => cli.robot_format.is_some() || env_robot_mode,
         },
@@ -20841,7 +18421,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  (global) --verbose/-v  Enable debug logs (overrides auto-quiet)".to_string(),
             "  Tip: `--robot-docs=<topic>` is normalized to `robot-docs <topic>`; globals can appear before/after subcommands.".to_string(),
             "  cass search <query> [OPTIONS]".to_string(),
-            "    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, antigravity; run `cass capabilities --json | jq .connectors` for the full 23-connector inventory)".to_string(),
+            "    --agent A         Filter by agent (codex, claude_code, gemini, vibe, opencode, amp, cline)".to_string(),
             "    --workspace W     Filter by workspace path".to_string(),
             "    --limit N         Max results (default: 0 = no limit)".to_string(),
             "    --offset N        Pagination offset (default: 0)".to_string(),
@@ -20891,8 +18471,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    Aliases: ready, preflight.".to_string(),
             "  cass status [--json] [--stale-threshold N] [--data-dir DIR]".to_string(),
             "  cass diag [--json] [--verbose] [--data-dir DIR]".to_string(),
-            "  cass sessions [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]"
-                .to_string(),
+            "  cass sessions [--workspace DIR] [--current] [--limit N] [--json]".to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
             "  cass index [--full] [--watch] [--json] [--robot-trace-ingest] [--data-dir DIR]"
                 .to_string(),
@@ -20949,7 +18528,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass api-version [--json]        Show crate_version + api_version + contract_version.".to_string(),
             "  cass state [--json]              Alias of `cass status` (index/db/rebuild/semantic readiness).".to_string(),
             "  cass models status [--json]      Semantic model acquisition + cache state.".to_string(),
-            "  cass models install [--from-file DIR] [--model minilm]  Download + install the MiniLM embedder.".to_string(),
+            "  cass models install [--from-file DIR] [--model NAME]  Download + install embedder (minilm | snowflake-arctic-s | nomic-embed).".to_string(),
             "  cass models remove [--model NAME]  Remove an installed semantic model from disk.".to_string(),
             "  cass models verify [--json]      Per-file SHA-256 verification of the installed model.".to_string(),
             "  cass models check-update [--json]  Compare installed revision against the pinned registry revision.".to_string(),
@@ -21305,10 +18884,6 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             .lines()
             .map(|s| s.to_string())
             .collect(),
-        RobotTopic::Recipes => crate::recipes_robot_docs::recipes_robot_docs_body()
-            .lines()
-            .map(|s| s.to_string())
-            .collect(),
     };
 
     println!("{}", render_block(&lines, wrap));
@@ -21320,14 +18895,13 @@ fn render_analytics_docs() -> Vec<String> {
     vec![
         "analytics:".into(),
         String::new(),
-        "# cass analytics — Usage Analytics and Bounded Incident Mining".into(),
+        "# cass analytics — Token, Tool, and Model Analytics".into(),
         String::new(),
         "## Subcommands".into(),
         "  status    Row counts, freshness, coverage, drift warnings".into(),
         "  tokens    Token usage over time with dimensional breakdowns".into(),
         "  tools     Per-tool invocation counts and derived metrics".into(),
         "  models    Top models by usage and coverage statistics".into(),
-        "  incidents Bounded recurrent CASS-incident mining over the canonical archive".into(),
         "  rebuild   Rebuild/backfill rollup tables with progress output".into(),
         "  validate  Check rollup invariants and detect data drift".into(),
         String::new(),
@@ -21352,9 +18926,8 @@ fn render_analytics_docs() -> Vec<String> {
         String::new(),
         "### analytics status".into(),
         "  data.tables: [{ table, exists, row_count, min_day_id, max_day_id, last_updated }]".into(),
-        "  data.coverage: { total_messages, <metric>_pct, <metric>_status, <metric>_display }".into(),
-        "    Metrics: message_metrics_coverage, api_token_coverage, model_name_coverage, estimate_only".into(),
-        "    <metric>_pct is number|null; status preserves true-zero, no-data, schema, and rebuild states.".into(),
+        "  data.coverage: { total_messages, message_metrics_coverage_pct, api_token_coverage_pct,".into(),
+        "                   model_name_coverage_pct, estimate_only_pct }".into(),
         "  data.drift: { signals: [{ signal, detail, severity }], track_a_fresh, track_b_fresh }".into(),
         "  data.recommended_action: string".into(),
         String::new(),
@@ -21386,33 +18959,6 @@ fn render_analytics_docs() -> Vec<String> {
         "  Models only available for connectors that report model names".into(),
         "    (claude_code, codex, pi_agent, factory, opencode, cursor).".into(),
         String::new(),
-        "### analytics incidents".into(),
-        "  Read-only; keyset-scans canonical archive rows newest-id-first.".into(),
-        "  data.schema_version: 2".into(),
-        "  data.count_scope: all_matching_candidates | scanned_candidates_partial | no_verified_results_hard_timeout".into(),
-        "  data.discovery: { caps, files_considered, files_scanned, lines_scanned,".into(),
-        "                    bytes_scanned, elapsed_ms, stop_reason, timed_out, partial,".into(),
-        "                    evidence_truncated, evidence }".into(),
-        "  data.top_sessions: [{ conversation_id, session_id, agent, host, source_id,".into(),
-        "                        origin_host?, source_path, exists_state, hit_count,".into(),
-        "                        category_breadth, dominant_categories, evidence_summaries,".into(),
-        "                        redaction_status, suggested_command: { kind, argv, display } }]".into(),
-        "  data.total_sessions, data.total_hits, data.top_sessions_truncated: ranked-scope totals".into(),
-        "  data.scan_units.message_fragment_chars: per-message inspection bound (4096)".into(),
-        "    Oversized messages stop with discovery.stop_reason=message-fragment-capped.".into(),
-        "  data.redaction: { private_text_policy, hash_strategy, fields_emitted,".into(),
-        "                    fields_suppressed, opt_in_flags }".into(),
-        "  --limit N           Ranked sessions returned (1..100; default 10)".into(),
-        "  --max-sessions N    Archive conversations scanned (1..10000; default 2000)".into(),
-        "    This bounds the newest-row candidate window before dimensional filters.".into(),
-        "  --max-messages N    Archive messages inspected (default 250000)".into(),
-        "  --max-bytes N       UTF-8 content bytes inspected (default 268435456)".into(),
-        "  --budget-ms N       Hard wall-clock result budget (default 8000)".into(),
-        "  Raw prompt/tool text is always suppressed. source_path is retained only as the".into(),
-        "  actionable archive pointer; evidence paths are basename-redacted.".into(),
-        "  suggested_command.argv carries --db and --conversation-id for exact replay.".into(),
-        "  Example: cass analytics incidents --limit 10 --json".into(),
-        String::new(),
         "### analytics rebuild".into(),
         "  data.track: string ('a')".into(),
         "  data.tracks_rebuilt: [string]".into(),
@@ -21436,9 +18982,6 @@ fn render_analytics_docs() -> Vec<String> {
         "## Coverage & Uncertainty Semantics".into(),
         "  - api_token_coverage_pct: % of messages with API token data (from Claude, Codex).".into(),
         "  - estimate_only_pct: % of messages with content-estimated tokens only (chars/4 heuristic).".into(),
-        "  - *_pct is null when no trustworthy number exists; inspect *_status and *_display.".into(),
-        "  - status values: value, true-zero, no-data, aggregate-failed, schema-incompatible,".into(),
-        "    rebuild-required, invalid-input. A true zero is never conflated with missing data.".into(),
         "  - When coverage is low, derived metrics are unreliable estimates, not ground truth.".into(),
         "  - Content token estimates are always available (heuristic); API tokens are sparse.".into(),
         String::new(),
@@ -21587,51 +19130,10 @@ pub struct SemanticSearchOptions {
     pub reranker: Option<String>,
     /// Use daemon for warm model inference
     pub use_daemon: bool,
-    /// Auto-spawn the daemon if no existing instance is reachable.
-    pub auto_spawn_daemon: bool,
     /// Use approximate nearest neighbor search when available
     pub approximate: bool,
     /// Optional two-tier execution strategy for semantic mode.
     pub tier_mode: crate::search::query::SemanticTierMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SemanticDaemonPolicy {
-    use_existing: bool,
-    auto_spawn: bool,
-}
-
-const fn semantic_daemon_policy(daemon: bool, no_daemon: bool) -> SemanticDaemonPolicy {
-    SemanticDaemonPolicy {
-        use_existing: !no_daemon,
-        auto_spawn: daemon && !no_daemon,
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn issue_347_semantic_daemon_policy_discovers_existing_by_default_and_respects_overrides() {
-    assert_eq!(
-        semantic_daemon_policy(false, false),
-        SemanticDaemonPolicy {
-            use_existing: true,
-            auto_spawn: false,
-        }
-    );
-    assert_eq!(
-        semantic_daemon_policy(true, false),
-        SemanticDaemonPolicy {
-            use_existing: true,
-            auto_spawn: true,
-        }
-    );
-    assert_eq!(
-        semantic_daemon_policy(false, true),
-        SemanticDaemonPolicy {
-            use_existing: false,
-            auto_spawn: false,
-        }
-    );
 }
 
 impl TimeFilter {
@@ -21984,40 +19486,20 @@ fn search_lexical_self_heal_diagnosis(
             "lexical checkpoint page-size contract is incompatible with this cass binary",
         )));
     }
-    let current_storage_fingerprint = match crate::indexer::lexical_storage_fingerprint_for_db(
-        db_path,
-    ) {
-        Ok(fingerprint) => fingerprint,
-        Err(err) => {
-            let dedicated = crate::search::storage_integrity::probe_dedicated_storage_state(
-                db_path,
-                Duration::from_millis(100),
-            );
-            if dedicated.busy_or_locked {
-                return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
-                    "canonical database is busy or locked; using the existing readable lexical index and deferring validation",
-                )));
-            }
-            if dedicated.wal_sidecar_suspect && dedicated.main_db_header_plausible {
-                return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
-                    "canonical database has a structurally suspect WAL/SHM sidecar; using the existing readable lexical index and deferring validation",
-                )));
-            }
-            return Err(CliError {
-                    code: 5,
-                    kind: CliErrorKind::StorageFingerprint.kind_str(),
-                    message: format!(
-                        "failed to fingerprint cass database {} while validating lexical assets: {err}",
-                        db_path.display()
-                    ),
-                    hint: Some(
-                        "cass will rebuild the derived lexical index after the canonical database can be fingerprinted"
-                            .to_string(),
-                    ),
-                    retryable: true,
-            });
-        }
-    };
+    let current_storage_fingerprint =
+        crate::indexer::lexical_storage_fingerprint_for_db(db_path).map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::StorageFingerprint.kind_str(),
+            message: format!(
+                "failed to fingerprint cass database {} while validating lexical assets: {e}",
+                db_path.display()
+            ),
+            hint: Some(
+                "cass will rebuild the derived lexical index after the canonical database can be fingerprinted"
+                    .to_string(),
+            ),
+            retryable: true,
+        })?;
     if !crate::search::asset_state::lexical_storage_fingerprints_match(
         &current_storage_fingerprint,
         &checkpoint.storage_fingerprint,
@@ -22133,7 +19615,6 @@ fn ensure_lexical_assets_for_search(
     timeout_ms: Option<u64>,
     started_at: Instant,
     dry_run: bool,
-    robot_bounded_degraded: bool,
 ) -> CliResult<SearchLexicalSelfHeal> {
     if dry_run || !db_path.exists() {
         return Ok(SearchLexicalSelfHeal::skipped());
@@ -22462,7 +19943,6 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
-            false,
         )
         .expect("search self-heal should rebuild missing lexical index");
         assert_eq!(repair.action, "rebuilt-from-canonical-db");
@@ -22498,7 +19978,6 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
-            false,
         )
         .expect("initial rebuild");
 
@@ -22519,7 +19998,6 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
-            false,
             false,
         )
         .expect("search self-heal should refresh checkpoint");
@@ -22556,7 +20034,6 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
-            false,
         )
         .expect("initial rebuild from old database");
 
@@ -22566,7 +20043,6 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
-            false,
             false,
         )
         .expect("search self-heal should rebuild for different active db");
@@ -22621,7 +20097,6 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
-            false,
         )
         .expect("initial rebuild from active database");
 
@@ -22648,7 +20123,6 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
-            false,
             false,
         )
         .expect("search self-heal should not rebuild inline after same-db content changes");
@@ -22704,7 +20178,6 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
-            false,
         )
         .expect("initial rebuild from old database");
         let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
@@ -22724,7 +20197,6 @@ mod search_lexical_self_heal_tests {
             &index_path,
             Some(0),
             Instant::now(),
-            false,
             false,
         )
         .expect_err(
@@ -22750,7 +20222,6 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
-            false,
             false,
         )
         .expect("initial rebuild from active database");
@@ -22784,7 +20255,6 @@ mod search_lexical_self_heal_tests {
             Some(0),
             Instant::now(),
             false,
-            false,
         )
         .expect_err(
             "incomplete checkpoint should wait for active rebuild instead of being searched",
@@ -22794,151 +20264,6 @@ mod search_lexical_self_heal_tests {
         assert!(
             err.message.contains("already repairing the search index"),
             "unexpected error: {err:?}"
-        );
-    }
-
-    /// #287: a robot-mode search facing an incomplete lexical checkpoint that
-    /// the cheap live-index refresh cannot reconcile must return a bounded
-    /// structured refusal with the stable `checkpoint_incomplete` reason code
-    /// instead of silently launching a multi-minute inline rebuild.
-    #[test]
-    fn robot_search_returns_bounded_checkpoint_incomplete_instead_of_inline_rebuild() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from active database");
-
-        // Mark the checkpoint incomplete AND grow the canonical DB so the
-        // live-index doc count no longer matches — the cheap metadata-only
-        // checkpoint refresh then cannot reconcile, and only the heavyweight
-        // canonical rebuild path remains.
-        let state_path = index_path.join(".lexical-rebuild-state.json");
-        let mut state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
-                .expect("parse checkpoint");
-        state["completed"] = serde_json::json!(false);
-        std::fs::write(
-            &state_path,
-            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
-        )
-        .expect("write incomplete checkpoint");
-        seed_search_db_at(
-            &db_path,
-            "robotrefusalneedle appended after the incomplete checkpoint",
-            "robot-refusal-extra-conversation",
-        );
-
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            true,
-        )
-        .expect_err(
-            "robot search must refuse the heavyweight inline rebuild with a bounded verdict",
-        );
-        assert_eq!(err.kind, "checkpoint_incomplete");
-        assert_eq!(err.code, 5);
-        assert!(err.retryable);
-        assert!(
-            err.message
-                .contains("lexical rebuild checkpoint is incomplete"),
-            "unexpected error: {err:?}"
-        );
-
-        // Human-mode (non-robot) searches keep the self-healing inline rebuild.
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("human-mode search keeps the inline self-heal rebuild");
-        assert_eq!(repair.action, "rebuilt-from-canonical-db");
-    }
-
-    /// #287: an active ingest-quarantine circuit breaker means any inline
-    /// rebuild may never converge — robot-mode searches must surface the
-    /// stable `quarantine_circuit_breaker` reason code as a bounded refusal.
-    #[test]
-    fn robot_search_returns_bounded_quarantine_circuit_breaker_refusal() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-
-        // Trip the ingest-quarantine circuit breaker: at least
-        // INGEST_QUARANTINE_CIRCUIT_DEFAULT_LIMIT recent poison records.
-        let quarantine_dir = data_dir.join("quarantine");
-        std::fs::create_dir_all(&quarantine_dir).expect("create quarantine dir");
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let mut lines = String::new();
-        for idx in 0..25 {
-            let record = serde_json::json!({
-                "schema_version": 1,
-                "conversation_id": format!("tester|/logs/demo-{idx}.jsonl|/workspace/demo|poison-{idx}|1|2|1"),
-                "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
-                "first_quarantined_at_ms": now_ms,
-                "last_attempt_at_ms": now_ms,
-                "attempt_count": 1,
-                "reason": "index-ingest-out-of-memory",
-                "error_kind": "out-of-memory",
-                "last_error": "out of memory",
-                "agent_slug": "tester",
-                "external_id": format!("poison-{idx}"),
-                "source_path": format!("/logs/demo-{idx}.jsonl"),
-                "workspace": "/workspace/demo",
-                "started_at": 1,
-                "ended_at": 2,
-                "message_count": 1
-            });
-            lines.push_str(&format!("{record}\n"));
-        }
-        std::fs::write(quarantine_dir.join("index_ingest_poison.jsonl"), lines)
-            .expect("write poison records");
-        let summary = crate::indexer::conversation_ingest_quarantine_summary(data_dir);
-        assert!(
-            summary.circuit_breaker_active,
-            "fixture must trip the ingest circuit breaker: {summary:?}"
-        );
-
-        // No lexical index exists, so the self-heal would normally launch the
-        // inline canonical rebuild; robot mode must refuse instead while the
-        // breaker is active.
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            true,
-        )
-        .expect_err("robot search must refuse inline rebuild behind an active circuit breaker");
-        assert_eq!(err.kind, "quarantine_circuit_breaker");
-        assert_eq!(err.code, 5);
-        assert!(err.retryable);
-        assert!(
-            err.hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("cass index --watch-once")),
-            "hint must name the recovery command: {err:?}"
         );
     }
 
@@ -22995,7 +20320,6 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
-            false,
         )
         .expect(
             "search self-heal should not rebuild inline when only checkpoint metadata is missing",
@@ -23048,7 +20372,6 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
-            false,
         )
         .expect("initial rebuild");
 
@@ -23065,7 +20388,6 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
-            false,
             false,
         )
         .expect("search self-heal should rebuild incompatible lexical artifact");
@@ -23104,7 +20426,6 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
-            false,
             false,
         )
         .expect("search self-heal should publish a fresh empty lexical artifact");
@@ -23863,8 +21184,7 @@ fn run_cli_search(
     refresh: bool,
 ) -> CliResult<()> {
     use crate::search::model_manager::{
-        load_hash_semantic_context, load_semantic_context, load_semantic_context_deferred,
-        load_semantic_context_for_embedder, load_semantic_context_for_embedder_deferred,
+        load_hash_semantic_context, load_semantic_context, load_semantic_context_for_embedder,
     };
     use crate::search::query::{QueryExplanation, SearchFilters, SearchMode};
 
@@ -24002,7 +21322,7 @@ fn run_cli_search(
         let elapsed_ms = start_time.elapsed().as_millis();
         let meta = search_dry_run_meta(robot_meta, elapsed_ms);
 
-        let mut output = serde_json::json!({
+        let output = serde_json::json!({
             "dry_run": true,
             "valid": explanation.warnings.iter().all(|w| !w.contains("error") && !w.contains("invalid")),
             "query": query,
@@ -24177,8 +21497,6 @@ fn run_cli_search(
     // If semantic assets are unavailable, hybrid searches fail open to lexical
     // while robot metadata reports the realized mode and fallback reason.
     let mut mode_meta = SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none());
-    mode_meta.quality_tier_refined =
-        semantic_opts.tier_mode != crate::search::query::SemanticTierMode::FastOnly;
     let hybrid_fail_open = mode_meta.fail_open_on_semantic_unavailable();
 
     if semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
@@ -24300,23 +21618,12 @@ fn run_cli_search(
             Some(name) => registry.get(name),
             None => Some(registry.best_available()),
         };
-        // `--fast-only` is a request for the hash-vector space, not merely a
-        // scoring toggle over a quality embedding. Feeding a MiniLM daemon
-        // vector to the same-dimensional FNV index is silently wrong (#347).
-        let prefer_hash = semantic_opts.tier_mode
-            == crate::search::query::SemanticTierMode::FastOnly
-            || embedder_info.is_some_and(|e| e.name == HASH_EMBEDDER);
+        let prefer_hash = embedder_info.is_some_and(|e| e.name == HASH_EMBEDDER);
 
         let setup = if prefer_hash {
             load_hash_semantic_context(&data_dir, &db_path)
         } else if let Some(model_name) = requested_model {
-            if semantic_opts.use_daemon {
-                load_semantic_context_for_embedder_deferred(&data_dir, &db_path, model_name)
-            } else {
-                load_semantic_context_for_embedder(&data_dir, &db_path, model_name)
-            }
-        } else if semantic_opts.use_daemon {
-            load_semantic_context_deferred(&data_dir, &db_path)
+            load_semantic_context_for_embedder(&data_dir, &db_path, model_name)
         } else {
             load_semantic_context(&data_dir, &db_path)
         };
@@ -24327,40 +21634,33 @@ fn run_cli_search(
             let additional_indexes = context.additional_indexes;
             let filter_maps = context.filter_maps;
             let roles = context.roles;
-            let daemon_embedder_compatible = embedder.id()
-                == crate::search::fastembed_embedder::FastEmbedder::embedder_id_static();
 
-            let embedder: Arc<dyn crate::search::embedder::Embedder> =
-                if semantic_opts.use_daemon && !prefer_hash && daemon_embedder_compatible {
-                    use crate::search::daemon_client::{DaemonFallbackEmbedder, DaemonRetryConfig};
+            let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts.use_daemon {
+                use crate::search::daemon_client::{DaemonFallbackEmbedder, DaemonRetryConfig};
 
-                    #[cfg(unix)]
-                    {
-                        let daemon = (if semantic_opts.auto_spawn_daemon {
-                            crate::daemon::client::connect_or_spawn_for_embedder(embedder.id()).ok()
-                        } else {
-                            crate::daemon::client::try_connect_for_embedder(embedder.id())
-                        })
+                #[cfg(unix)]
+                {
+                    let daemon = crate::daemon::client::try_connect()
                         .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
                         .unwrap_or_else(|| {
                             Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
                                 "daemon-unconfigured",
                             ))
                         });
-                        let config = DaemonRetryConfig::from_env();
-                        Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                            "daemon-unconfigured",
-                        ));
-                        let config = DaemonRetryConfig::from_env();
-                        Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
-                    }
-                } else {
-                    embedder
-                };
+                    let config = DaemonRetryConfig::from_env();
+                    Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
+                }
+                #[cfg(not(unix))]
+                {
+                    let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                        "daemon-unconfigured",
+                    ));
+                    let config = DaemonRetryConfig::from_env();
+                    Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
+                }
+            } else {
+                embedder
+            };
 
             let ann_path = Some(
                 data_dir
@@ -24424,22 +21724,6 @@ fn run_cli_search(
         } else {
             semantic_opts.approximate
         };
-    // The one-shot CLI emits one final result set. Its legacy synchronous
-    // two-tier helper accepts only one query vector, which would incorrectly
-    // reuse a MiniLM vector against the FNV fast index. The interactive TUI has
-    // the true two-embedder progressive pipeline; here progressive/quality-only
-    // correctly return the final quality result, while fast-only uses the hash
-    // context selected above (#347).
-    let semantic_execution_tier = match semantic_opts.tier_mode {
-        crate::search::query::SemanticTierMode::FastOnly => {
-            crate::search::query::SemanticTierMode::FastOnly
-        }
-        crate::search::query::SemanticTierMode::Single
-        | crate::search::query::SemanticTierMode::Progressive
-        | crate::search::query::SemanticTierMode::QualityOnly => {
-            crate::search::query::SemanticTierMode::Single
-        }
-    };
 
     // Use search_with_fallback to get full metadata (wildcard_fallback, cache_stats)
     let sparse_threshold = 3; // Threshold for triggering wildcard fallback
@@ -24579,27 +21863,26 @@ fn run_cli_search(
             SearchMode::Lexical => client
                 .search_with_fallback(
                     query,
-                    filters.clone(),
                     search_limit,
                     search_offset,
-                    search_sparse_threshold,
-                    field_mask,
-                )
-                .map_err(|e| CliError {
-                    code: 9,
-                    kind: CliErrorKind::Search.kind_str(),
-                    message: format!("search failed: {e}"),
-                    hint: None,
-                    retryable: true,
-                })?,
-            SearchMode::Semantic => {
-                // The former `semantic` Cargo feature (and its `-baseline`
-                // refusal arm for the ONNX-era AVX2 hazard, cass#256) was retired
-                // with bead tg5o9: every build carries the pure-Rust
-                // frankensearch/native backend, so semantic availability is a
-                // runtime question (model/vector assets), not a compile-time one.
-                {
-                    let (hits, ann_stats) = client
+                );
+                let _ = client;
+                Err::<crate::search::query::SearchResult, CliError>(CliError {
+                    code: 15,
+                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                    message:
+                        "semantic search is not available in this build (cass was built without the `semantic` Cargo feature; this is the `-baseline` artifact for pre-AVX2 CPUs; cass#256)"
+                            .to_string(),
+                    hint: Some(
+                        "Re-run with `--mode lexical` (or omit `--mode` and accept the default hybrid-preferred mode, which fails open to lexical), or install the full release artifact (e.g. `cass-windows-amd64.zip` / `cass-linux-amd64.tar.gz`) on a host with AVX2 support."
+                            .to_string(),
+                    ),
+                    retryable: false,
+                })?
+            }
+            #[cfg(feature = "semantic")]
+            {
+                let (hits, ann_stats) = client
                     .search_semantic_with_tier(
                         query,
                         filters.clone(),
@@ -24607,7 +21890,7 @@ fn run_cli_search(
                         search_offset,
                         field_mask,
                         approximate,
-                        semantic_execution_tier,
+                        semantic_opts.tier_mode,
                     )
                     .map_err(|e| {
                         let err_str = e.to_string();
@@ -24649,35 +21932,34 @@ fn run_cli_search(
                             }
                         }
                     })?;
-                    crate::search::query::SearchResult {
-                        hits,
-                        wildcard_fallback: false,
-                        cache_stats: crate::search::query::CacheStats::default(),
-                        suggestions: Vec::new(),
-                        ann_stats,
-                        total_count: None,
-                    }
+                crate::search::query::SearchResult {
+                    hits,
+                    wildcard_fallback: false,
+                    cache_stats: crate::search::query::CacheStats::default(),
+                    suggestions: Vec::new(),
+                    ann_stats,
+                    total_count: None,
                 }
             }
-            SearchMode::Hybrid => match client.search_hybrid(
-                query,
-                query,
-                filters.clone(),
-                search_limit,
-                search_offset,
-                search_sparse_threshold,
-                field_mask,
-                approximate,
-            ) {
-                Ok(result) => result,
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if hybrid_fail_open
-                        && (err_str.contains("unavailable") || err_str.contains("no embedder"))
-                    {
-                        mode_meta
-                            .fall_back_to_lexical(format!("hybrid execution unavailable: {e}"));
-                        client
+        }
+        SearchMode::Hybrid => match client.search_hybrid(
+            query,
+            query,
+            filters.clone(),
+            search_limit,
+            search_offset,
+            search_sparse_threshold,
+            field_mask,
+            approximate,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                let err_str = e.to_string();
+                if hybrid_fail_open
+                    && (err_str.contains("unavailable") || err_str.contains("no embedder"))
+                {
+                    mode_meta.fall_back_to_lexical(format!("hybrid execution unavailable: {e}"));
+                    client
                         .search_with_fallback(
                             query,
                             filters.clone(),
@@ -24695,8 +21977,8 @@ fn run_cli_search(
                             hint: None,
                             retryable: true,
                         })?
-                    } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
-                        return Err(CliError {
+                } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
+                    return Err(CliError {
                         code: 15,
                         kind: CliErrorKind::SemanticUnavailable.kind_str(),
                         message: "Hybrid search not available (requires semantic search)".to_string(),
@@ -24706,8 +21988,8 @@ fn run_cli_search(
                         ),
                         retryable: false,
                     });
-                    } else {
-                        return Err(CliError {
+                } else {
+                    return Err(CliError {
                         code: 9,
                         kind: CliErrorKind::Search.kind_str(),
                         message: format!("hybrid search failed: {e}"),
@@ -24717,10 +21999,9 @@ fn run_cli_search(
                         ),
                         retryable: true,
                     });
-                    }
                 }
-            },
-        }
+            }
+        },
     };
     let search_ms = search_start.elapsed().as_millis() as u64;
 
@@ -24879,14 +22160,11 @@ fn run_cli_search(
         0
     };
 
+    // Check if search exceeded timeout - return partial results with timeout indicator
+    let timed_out = timeout_duration.is_some_and(|t| start_time.elapsed() > t);
+
     // Build query explanation if requested
-    let explanation_budget_available = search_budget
-        .as_ref()
-        .is_none_or(|budget| budget.is_healthy());
-    let explanation = if explain && !explanation_budget_available {
-        skipped_sections.push("explanation".to_string());
-        None
-    } else if explain {
+    let explanation = if explain {
         Some(
             QueryExplanation::analyze(query, &filters)
                 .with_wildcard_fallback(result.wildcard_fallback),
@@ -24897,11 +22175,7 @@ fn run_cli_search(
 
     // Compute aggregations and create display result based on mode
     let (aggregations, display_result, total_matches, has_more_results, total_matches_exact) =
-        if has_aggregation
-            && search_budget
-                .as_ref()
-                .is_none_or(|budget| budget.is_healthy())
-        {
+        if has_aggregation {
             // Compute aggregations from all fetched results
             let aggs = compute_aggregations(&result.hits, &agg_fields);
             let total = result.hits.len();
@@ -24931,31 +22205,6 @@ fn run_cli_search(
             };
             let has_more = total > offset_val + display.hits.len();
             (aggs, display, total, has_more, false)
-        } else if has_aggregation {
-            skipped_sections.push("aggregations".to_string());
-            let total = result.hits.len();
-            let effective_limit = if limit_val == 0 {
-                usize::MAX
-            } else {
-                limit_val
-            };
-            let display_hits: Vec<_> = result
-                .hits
-                .iter()
-                .skip(offset_val)
-                .take(effective_limit)
-                .cloned()
-                .collect();
-            let has_more = total > offset_val.saturating_add(display_hits.len());
-            let display = crate::search::query::SearchResult {
-                hits: display_hits,
-                wildcard_fallback: result.wildcard_fallback,
-                cache_stats: result.cache_stats,
-                suggestions: result.suggestions.clone(),
-                ann_stats: result.ann_stats.clone(),
-                total_count: result.total_count,
-            };
-            (Aggregations::default(), display, total, has_more, false)
         } else {
             // No aggregation - result was over-fetched by one to derive pagination state.
             // When limit_val == 0 (meaning "no limit"), take all results.
@@ -25113,40 +22362,23 @@ fn run_cli_search(
     // trusting the result set as complete.
     let partial_warning = index_freshness
         .as_ref()
-        .and_then(|f: &serde_json::Value| f.get("partial"))
+        .and_then(|f: &serde_json::Value| f.get("stale"))
         .and_then(|v: &serde_json::Value| v.as_bool())
-        .filter(|partial| *partial)
+        .filter(|stale| *stale)
         .map(|_| {
-            index_freshness
+            let age = index_freshness
                 .as_ref()
-                .and_then(|f: &serde_json::Value| f.get("partial_reason"))
-                .and_then(|v: &serde_json::Value| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    "Lexical index is PARTIAL (a prior `cass index --full` was aborted); results may omit conversations. Re-run `cass index --full`.".to_string()
-                })
+                .and_then(|f: &serde_json::Value| f.get("age_seconds"))
+                .and_then(|v: &serde_json::Value| v.as_u64()).map_or_else(|| "an unknown age".to_string(), |s| format!("{s} seconds"));
+            let pending = index_freshness
+                .as_ref()
+                .and_then(|f: &serde_json::Value| f.get("pending_sessions"))
+                .and_then(|v: &serde_json::Value| v.as_u64())
+                .unwrap_or(0);
+            format!(
+                "Index may be stale (age: {age}; pending sessions: {pending}). Run `cass index --full` or enable watch mode for fresh results."
+            )
         });
-    let warning = partial_warning.or_else(|| {
-        index_freshness
-            .as_ref()
-            .and_then(|f: &serde_json::Value| f.get("stale"))
-            .and_then(|v: &serde_json::Value| v.as_bool())
-            .filter(|stale| *stale)
-            .map(|_| {
-                let age = index_freshness
-                    .as_ref()
-                    .and_then(|f: &serde_json::Value| f.get("age_seconds"))
-                    .and_then(|v: &serde_json::Value| v.as_u64()).map_or_else(|| "an unknown age".to_string(), |s| format!("{s} seconds"));
-                let pending = index_freshness
-                    .as_ref()
-                    .and_then(|f: &serde_json::Value| f.get("pending_sessions"))
-                    .and_then(|v: &serde_json::Value| v.as_u64())
-                    .unwrap_or(0);
-                format!(
-                    "Index may be stale (age: {age}; pending sessions: {pending}). Run `cass index --full` or enable watch mode for fresh results."
-                )
-            })
-    });
 
     let index_freshness_for_closure = index_freshness.clone();
     let state_meta_with_warning = state_meta.map(|mut meta| {
@@ -25421,9 +22653,7 @@ fn run_cli_search(
             has_more_results,
             total_matches_exact,
             state_meta_with_warning,
-            search_completeness,
             index_freshness,
-            storage_integrity_meta,
             warning,
             &aggregations,
             total_matches,
@@ -25459,25 +22689,6 @@ fn run_cli_search(
             println!("Snippet: {}", apply_wrap(&snippet, wrap));
         }
         println!("----------------------------------------------------------------");
-    }
-
-    // Bead v6vuz: in human (non-robot) search mode, surface the same bounded
-    // readiness banner the robot `_meta` carries when the lexical index is
-    // stale or partial — so a human is told results may be incomplete instead
-    // of silently trusting them, in the same vocabulary as `--robot-meta`. The
-    // banner goes to stderr (stdout stays results-only) and the truth-table
-    // probe runs only on the already-degraded path (a staleness/partial
-    // `warning` exists), so the common healthy search stays probe-free.
-    if is_human_search && has_readiness_warning {
-        let table =
-            build_truth_table_for_data_dir(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS);
-        let summary = crate::search::human_readiness_summary::project_human_summary(
-            &table,
-            crate::search::readiness_projection::SurfaceKind::SearchMeta,
-        );
-        if summary.is_safe(table.archive_risk) {
-            eprintln!("{}", summary.render_compact_line());
-        }
     }
 
     Ok(())
@@ -25873,8 +23084,6 @@ fn run_cli_pack(
 
     if refresh && !structured_pack && timeout_ms.is_none() {
         refresh_index_inline(db_override.clone(), data_dir_override.clone());
-    } else if refresh {
-        skipped_sections.push("refresh".to_string());
     }
 
     let setup = if structured_pack {
@@ -25967,8 +23176,7 @@ fn run_cli_pack(
     }
 
     let timeout_duration = timeout_ms.map(Duration::from_millis);
-    if !structured_pack
-        && let Some(timeout) = timeout_duration
+    if let Some(timeout) = timeout_duration
         && start_time.elapsed() >= timeout
     {
         return Err(CliError {
@@ -26075,19 +23283,13 @@ fn run_cli_pack(
         .collect::<Vec<_>>();
 
     let generated_at_ms = Utc::now().timestamp_millis();
-    let realized_explain_selection = if explain_selection && !pack_budget.is_healthy() {
-        skipped_sections.push("selection_explanations".to_string());
-        false
-    } else {
-        explain_selection
-    };
     let plan_request = PackPlanRequest {
         now_ms: generated_at_ms,
         limits: limits.clone(),
         freshness_policy,
         freshness_window_seconds,
         candidates,
-        explain_selection: realized_explain_selection,
+        explain_selection,
     };
     let candidate_count = plan_request.candidates.len();
     let mut plan = if structured_pack {
@@ -26217,7 +23419,7 @@ fn run_cli_pack(
         redaction_policy: "strict".to_string(),
         sensitive_output: false,
         skill_content_included: false,
-        explain_selection: realized_explain_selection,
+        explain_selection,
         readiness: PackReadinessSnapshot {
             index_generation: search_self_heal
                 .indexed_docs
@@ -28006,12 +25208,6 @@ fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_js
             "lexical_shard_generation": lexical_shard_generation,
             "freshness": index_freshness,
             "stale": input.index_freshness.and_then(|f| f.get("stale")).cloned().unwrap_or(serde_json::Value::Null),
-            // [coding_agent_session_search #301] surface the incomplete-index
-            // signal so robot callers can tell an aborted/partial full index
-            // apart from a merely stale one. `partial=true` means results
-            // omit conversations indexed after a `cass index --full` abort.
-            "partial": input.index_freshness.and_then(|f| f.get("partial")).cloned().unwrap_or(serde_json::Value::Null),
-            "partial_reason": input.index_freshness.and_then(|f| f.get("partial_reason")).cloned().unwrap_or(serde_json::Value::Null),
             "rebuilding": index_rebuilding,
             "pending_sessions": input.index_freshness.and_then(|f| f.get("pending_sessions")).cloned().unwrap_or(serde_json::Value::Null),
         },
@@ -28023,105 +25219,6 @@ fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_js
             "semantic_refinement": input.search_mode_meta.semantic_refinement(),
         },
     })
-}
-
-/// Map the realized [`SearchMode`] to the trust [`RealizedMode`] vocabulary.
-fn trust_realized_mode(
-    mode: crate::search::query::SearchMode,
-) -> crate::search::trust_scoring::RealizedMode {
-    use crate::search::query::SearchMode;
-    use crate::search::trust_scoring::RealizedMode;
-    match mode {
-        SearchMode::Lexical => RealizedMode::Lexical,
-        SearchMode::Semantic => RealizedMode::Semantic,
-        SearchMode::Hybrid => RealizedMode::Hybrid,
-    }
-}
-
-/// Map a hit's origin to the trust source-kind with a cheap fs/archive probe
-/// (q4pau). A remote hit is backed by a reachable mirror copy. A local hit whose
-/// recorded `source_path` no longer exists on disk is archive-only — the source
-/// file was deleted, moved, or pruned and only the DB row survives — so it scores
-/// `ArchiveOnly` (source-unhealthy) instead of overtrusting a dead path.
-fn trust_source_kind_for_hit(
-    hit: &crate::search::query::SearchHit,
-) -> crate::search::trust_scoring::SourceTrustKind {
-    use crate::search::trust_scoring::SourceTrustKind;
-    if !normalized_robot_hit_origin_kind(hit)
-        .eq_ignore_ascii_case(crate::sources::provenance::LOCAL_SOURCE_ID)
-    {
-        return SourceTrustKind::RemoteMirror;
-    }
-    let path = hit.source_path.trim();
-    if !path.is_empty() && std::path::Path::new(path).exists() {
-        SourceTrustKind::LocalPresent
-    } else {
-        SourceTrustKind::ArchiveOnly
-    }
-}
-
-/// Build the metadata-only trust verdict JSON for one search hit (beads
-/// 5u82n.3 + q4pau). Advisory only — it never affects result ordering.
-///
-/// Recency, source health (fs probe), and realized mode always contribute.
-/// `query_workspace` (the project the agent is in now) drives a cwd-relative
-/// workspace match. For on-project hits, `correlation` links the result to a
-/// closed bead / commit / proof / release when the hit's own indexed text
-/// references a known identifier — so the verdict reaches trusted/likely/failed
-/// instead of only unverified/stale. Off-project hits are never correlated, so a
-/// cross-project conversation cannot inherit this project's trust.
-fn trust_value_for_hit(
-    hit: &crate::search::query::SearchHit,
-    now_ms: i64,
-    realized_mode: crate::search::trust_scoring::RealizedMode,
-    correlation: &crate::search::trust_correlation::CorrelationIndex,
-    query_workspace: Option<&str>,
-) -> serde_json::Value {
-    use crate::search::trust_correlation::{correlate, proof_for, scan_text, workspace_matches};
-    use crate::search::trust_scoring::{HitTrustContext, assess_trust, derive_trust_signals};
-    let workspace = {
-        let ws = hit.workspace.trim();
-        (!ws.is_empty()).then(|| ws.to_string())
-    };
-    // cwd-relative workspace match: None (no cwd anchor) => no penalty and no
-    // correlation; Some(false) => off-project; Some(true) => on-project.
-    let on_project = match (query_workspace, workspace.as_deref()) {
-        (None, _) => None,
-        (Some(q), Some(w)) => Some(workspace_matches(q, w)),
-        (Some(_), None) => Some(false),
-    };
-    let mut ctx = HitTrustContext {
-        created_at_ms: hit.created_at,
-        now_ms,
-        workspace,
-        // Workspace match is applied below via the cwd-relative policy, so the
-        // pure derivation is left without a filter to avoid double-penalizing.
-        query_workspace: None,
-        source_kind: trust_source_kind_for_hit(hit),
-        realized_mode,
-        ..HitTrustContext::default()
-    };
-    if matches!(on_project, Some(true)) {
-        let scan = scan_text(&[&hit.title, &hit.snippet, &hit.content]);
-        let link = correlate(correlation, &scan);
-        if !link.is_empty() {
-            ctx.outcome = link.outcome;
-            ctx.linked_closed_bead = link.linked_closed_bead;
-            ctx.linked_lessons = link.linked_lessons;
-            if let Some(commit) = link.linked_commit {
-                ctx.release_tag = correlation.release_tag_for_commit(&commit);
-                ctx.linked_commit = Some(commit);
-            }
-            ctx.proof = proof_for(
-                ctx.outcome,
-                ctx.linked_commit.is_some(),
-                ctx.release_tag.is_some(),
-            );
-        }
-    }
-    let mut signals = derive_trust_signals(&ctx);
-    signals.workspace_match = on_project.unwrap_or(true);
-    serde_json::to_value(assess_trust(&signals)).unwrap_or(serde_json::Value::Null)
 }
 
 /// Output search results in robot-friendly format
@@ -28143,15 +25240,7 @@ fn output_robot_results(
     has_more_results: bool,
     total_matches_exact: bool,
     state_meta: Option<serde_json::Value>,
-    // uojcg.3.3: compact search-completeness verdict, present only with
-    // --robot-meta and only when conversations are quarantined (so the common
-    // complete-coverage case stays byte-for-byte unchanged).
-    search_completeness: Option<serde_json::Value>,
     index_freshness: Option<serde_json::Value>,
-    // qfswx: `.14.1` storage-integrity block, present only with --robot-meta
-    // (Some mirrors state_meta), so search agrees with doctor/status on the
-    // canonical StorageState vocabulary.
-    storage_integrity: Option<serde_json::Value>,
     warning: Option<String>,
     aggregations: &Aggregations,
     total_matches: usize,
@@ -28276,7 +25365,6 @@ fn output_robot_results(
             request_id: Option<String>,
             cursor: Option<String>,
             hits_clamped: bool,
-            budget: &'a crate::robot_budget_envelope::BudgetBlock,
         }
 
         let payload = FastSummaryJsonPayload {
@@ -28290,7 +25378,6 @@ fn output_robot_results(
             request_id,
             cursor: input_cursor,
             hits_clamped: false,
-            budget,
         };
         let stdout = std::io::stdout();
         let mut out = BufWriter::new(stdout.lock());
@@ -28404,7 +25491,6 @@ fn output_robot_results(
             request_id: Option<String>,
             cursor: Option<String>,
             hits_clamped: bool,
-            budget: &'a crate::robot_budget_envelope::BudgetBlock,
         }
 
         let payload = FastJsonPayload {
@@ -28418,7 +25504,6 @@ fn output_robot_results(
             request_id,
             cursor: input_cursor,
             hits_clamped: false,
-            budget,
         };
         let stdout = std::io::stdout();
         let mut out = BufWriter::new(stdout.lock());
@@ -28516,11 +25601,9 @@ fn output_robot_results(
         && (include_meta
             || !aggregations.is_empty()
             || !result.suggestions.is_empty()
-            || explanation.is_some()
-            || budget.budget_ms > 0
-            || budget.timed_out);
+            || explanation.is_some());
     let estimate_tokens = max_tokens.is_some() || include_meta || jsonl_meta_emitted;
-    let (mut filtered_hits, tokens_estimated, hits_clamped) =
+    let (filtered_hits, tokens_estimated, hits_clamped) =
         clamp_hits_to_budget(filtered_hits, max_tokens, estimate_tokens);
 
     // 5u82n.3: attach a metadata-only trust/provenance verdict per hit. Gated on
@@ -28662,7 +25745,6 @@ fn output_robot_results(
                 "request_id": request_id,
                 "cursor": input_cursor,
                 "hits_clamped": hits_clamped,
-                "budget": budget,
             });
 
             // Add suggestions if present
@@ -28698,14 +25780,11 @@ fn output_robot_results(
                     "fallback_tier": search_mode_meta.fallback_tier,
                     "fallback_reason": search_mode_meta.fallback_reason.clone(),
                     "semantic_refinement": search_mode_meta.semantic_refinement(),
-                    "refinement_level": search_mode_meta.realized_refinement(),
-                    "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "wildcard_fallback": result.wildcard_fallback,
                     "cache_stats": {
                         "hits": result.cache_stats.cache_hits,
                         "misses": result.cache_stats.cache_miss,
                         "shortfall": result.cache_stats.cache_shortfall,
-                        "outcomes": result.cache_stats.searcher_cache,
                         "prewarm_scheduled": result.cache_stats.prewarm_scheduled,
                         "prewarm_skipped_pressure": result.cache_stats.prewarm_skipped_pressure,
                     },
@@ -28733,20 +25812,6 @@ fn output_robot_results(
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
                     m.insert("index_freshness".to_string(), freshness);
-                }
-                // uojcg.3.3: surface the quarantine search-completeness verdict in
-                // --robot-meta; only present when conversations are excluded.
-                if let Some(sc) = search_completeness.as_ref()
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert("search_completeness".to_string(), sc.clone());
-                }
-                // qfswx: surface the storage-integrity verdict in --robot-meta so
-                // search agrees with doctor/status on the canonical StorageState.
-                if let Some(si) = storage_integrity.as_ref()
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert("storage_integrity".to_string(), si.clone());
                 }
                 // Add timeout info to _meta if timeout was configured
                 if let Some(timeout) = timeout_ms
@@ -28823,11 +25888,8 @@ fn output_robot_results(
                 || agg_json.is_some()
                 || !result.suggestions.is_empty()
                 || explanation.is_some()
-                || budget.budget_ms > 0
-                || budget.timed_out
             {
                 let mut meta = serde_json::json!({
-                    "budget": budget,
                     "_meta": {
                         "query": query,
                         "limit": limit,
@@ -28841,14 +25903,11 @@ fn output_robot_results(
                         "fallback_tier": search_mode_meta.fallback_tier,
                         "fallback_reason": search_mode_meta.fallback_reason.clone(),
                         "semantic_refinement": search_mode_meta.semantic_refinement(),
-                        "refinement_level": search_mode_meta.realized_refinement(),
-                        "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                         "wildcard_fallback": result.wildcard_fallback,
                         "cache_stats": {
                             "hits": result.cache_stats.cache_hits,
                             "misses": result.cache_stats.cache_miss,
                             "shortfall": result.cache_stats.cache_shortfall,
-                            "outcomes": result.cache_stats.searcher_cache,
                             "prewarm_scheduled": result.cache_stats.prewarm_scheduled,
                             "prewarm_skipped_pressure": result.cache_stats.prewarm_skipped_pressure,
                         },
@@ -28873,21 +25932,6 @@ fn output_robot_results(
                     && let Some(serde_json::Value::Object(m)) = outer.get_mut("_meta")
                 {
                     m.insert("index_freshness".to_string(), freshness);
-                }
-                // uojcg.3.3: quarantine search-completeness verdict in the jsonl
-                // _meta header; only present when conversations are excluded.
-                if let Some(sc) = search_completeness.as_ref()
-                    && let serde_json::Value::Object(ref mut outer) = meta
-                    && let Some(serde_json::Value::Object(m)) = outer.get_mut("_meta")
-                {
-                    m.insert("search_completeness".to_string(), sc.clone());
-                }
-                // qfswx: surface the storage-integrity verdict in --robot-meta so
-                // search agrees with doctor/status on the canonical StorageState.
-                if let Some(si) = storage_integrity.as_ref()
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert("storage_integrity".to_string(), si.clone());
                 }
                 // Add suggestions to meta line
                 if !result.suggestions.is_empty()
@@ -28993,7 +26037,6 @@ fn output_robot_results(
                 "request_id": request_id,
                 "cursor": input_cursor,
                 "hits_clamped": hits_clamped,
-                "budget": budget,
             });
 
             // Add suggestions if present
@@ -29028,8 +26071,6 @@ fn output_robot_results(
                     "fallback_tier": search_mode_meta.fallback_tier,
                     "fallback_reason": search_mode_meta.fallback_reason.clone(),
                     "semantic_refinement": search_mode_meta.semantic_refinement(),
-                    "refinement_level": search_mode_meta.realized_refinement(),
-                    "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "wildcard_fallback": result.wildcard_fallback,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
@@ -29049,20 +26090,6 @@ fn output_robot_results(
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
                     m.insert("index_freshness".to_string(), freshness);
-                }
-                // uojcg.3.3: surface the quarantine search-completeness verdict in
-                // --robot-meta; only present when conversations are excluded.
-                if let Some(sc) = search_completeness.as_ref()
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert("search_completeness".to_string(), sc.clone());
-                }
-                // qfswx: surface the storage-integrity verdict in --robot-meta so
-                // search agrees with doctor/status on the canonical StorageState.
-                if let Some(si) = storage_integrity.as_ref()
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert("storage_integrity".to_string(), si.clone());
                 }
                 // Add timeout info to _meta if timeout was configured
                 if let Some(timeout) = timeout_ms
@@ -29128,7 +26155,6 @@ fn output_robot_results(
                 "request_id": request_id,
                 "cursor": input_cursor,
                 "hits_clamped": hits_clamped,
-                "budget": budget,
             });
 
             // Add suggestions if present
@@ -29163,8 +26189,6 @@ fn output_robot_results(
                     "fallback_tier": search_mode_meta.fallback_tier,
                     "fallback_reason": search_mode_meta.fallback_reason.clone(),
                     "semantic_refinement": search_mode_meta.semantic_refinement(),
-                    "refinement_level": search_mode_meta.realized_refinement(),
-                    "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
                     "wildcard_fallback": result.wildcard_fallback,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
@@ -29184,20 +26208,6 @@ fn output_robot_results(
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
                     m.insert("index_freshness".to_string(), freshness);
-                }
-                // uojcg.3.3: surface the quarantine search-completeness verdict in
-                // --robot-meta; only present when conversations are excluded.
-                if let Some(sc) = search_completeness.as_ref()
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert("search_completeness".to_string(), sc.clone());
-                }
-                // qfswx: surface the storage-integrity verdict in --robot-meta so
-                // search agrees with doctor/status on the canonical StorageState.
-                if let Some(si) = storage_integrity.as_ref()
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert("storage_integrity".to_string(), si.clone());
                 }
                 if let Some(timeout) = timeout_ms
                     && let serde_json::Value::Object(ref mut m) = meta
@@ -29664,474 +26674,6 @@ fn run_stats(
     }
 
     Ok(())
-}
-
-/// Stable component identifiers for the `cass storage` breakdown. The
-/// order here is the order they appear in the JSON `components` array and
-/// the human table (golden-frozen). Each variant maps a user-meaningful
-/// on-disk component to the data-dir entries that compose it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StorageComponent {
-    CanonicalDb,
-    DbWal,
-    DbShm,
-    LexicalIndex,
-    RawMirror,
-    SemanticIndex,
-    Quarantine,
-    Backups,
-    Other,
-}
-
-impl StorageComponent {
-    /// Stable robot key (kebab-case-free snake to match other cass JSON).
-    fn key(self) -> &'static str {
-        match self {
-            Self::CanonicalDb => "canonical_db",
-            Self::DbWal => "db_wal",
-            Self::DbShm => "db_shm",
-            Self::LexicalIndex => "lexical_index",
-            Self::RawMirror => "raw_mirror",
-            Self::SemanticIndex => "semantic_index",
-            Self::Quarantine => "quarantine",
-            Self::Backups => "backups",
-            Self::Other => "other",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::CanonicalDb => "Canonical DB (agent_search.db)",
-            Self::DbWal => "DB WAL (agent_search.db-wal)",
-            Self::DbShm => "DB shared-memory (agent_search.db-shm)",
-            Self::LexicalIndex => "Lexical index (index/)",
-            Self::RawMirror => "Raw mirror (raw-mirror/)",
-            Self::SemanticIndex => "Semantic index (vector_index/, semantic/)",
-            Self::Quarantine => "Quarantine (quarantine/, doctor-quarantine/)",
-            Self::Backups => "Backups (backups/)",
-            Self::Other => "Other (remotes, caches, locks, misc)",
-        }
-    }
-
-    /// Whether this component is a derived asset that can be safely rebuilt
-    /// from the canonical DB (advisory, mirrors the search-asset contract).
-    fn derived(self) -> bool {
-        matches!(
-            self,
-            Self::DbWal
-                | Self::DbShm
-                | Self::LexicalIndex
-                | Self::SemanticIndex
-                | Self::Quarantine
-                | Self::Backups
-        )
-    }
-
-    /// All components in stable display order.
-    fn ordered() -> [Self; 9] {
-        [
-            Self::CanonicalDb,
-            Self::DbWal,
-            Self::DbShm,
-            Self::LexicalIndex,
-            Self::RawMirror,
-            Self::SemanticIndex,
-            Self::Quarantine,
-            Self::Backups,
-            Self::Other,
-        ]
-    }
-}
-
-/// Classify a top-level data-dir entry name into a storage component.
-/// Anything unrecognized rolls into `Other` so the per-component bytes
-/// always sum to the total accounted footprint.
-fn classify_storage_entry(name: &str) -> StorageComponent {
-    match name {
-        "agent_search.db" => StorageComponent::CanonicalDb,
-        "agent_search.db-wal" => StorageComponent::DbWal,
-        "agent_search.db-shm" => StorageComponent::DbShm,
-        "index" => StorageComponent::LexicalIndex,
-        "raw-mirror" | "raw_mirror" => StorageComponent::RawMirror,
-        "vector_index" | "semantic" | "semantic-cache" => StorageComponent::SemanticIndex,
-        "quarantine" | "doctor-quarantine" => StorageComponent::Quarantine,
-        "backups" | "backup" => StorageComponent::Backups,
-        _ => StorageComponent::Other,
-    }
-}
-
-/// `cass storage` (#292.4): read-only on-disk footprint breakdown by
-/// component. Sums per-component bytes from the data dir so operators can
-/// answer "what is my N GB and what is safe to reclaim" without manual
-/// `du` + `sqlite3`. Mutates nothing; pairs with `mirror prune` /
-/// `cass forget` for actual reclamation.
-fn run_storage(
-    data_dir_override: &Option<PathBuf>,
-    db_override: Option<PathBuf>,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
-    use std::collections::BTreeMap;
-
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let db_path = db_override
-        .clone()
-        .unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let data_dir_exists = data_dir.exists();
-
-    let mut bytes_by_component: BTreeMap<&'static str, u64> = BTreeMap::new();
-    let mut files_by_component: BTreeMap<&'static str, u64> = BTreeMap::new();
-    for component in StorageComponent::ordered() {
-        bytes_by_component.insert(component.key(), 0);
-        files_by_component.insert(component.key(), 0);
-    }
-
-    // Walk the top-level data-dir entries once. Each entry (file or dir)
-    // is attributed wholesale to a single component; nested files are
-    // counted via fs_dir_size. The canonical DB may live OUTSIDE the data
-    // dir when --db is overridden, so account it explicitly below.
-    if data_dir_exists && let Ok(entries) = std::fs::read_dir(&data_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let path = entry.path();
-            // When --db points back into the data dir, the canonical-DB
-            // entry is handled by the explicit accounting below to keep a
-            // single source of truth; skip it here to avoid double count.
-            if path == db_path && classify_storage_entry(&name) == StorageComponent::CanonicalDb {
-                continue;
-            }
-            let component = classify_storage_entry(&name);
-            let size = fs_dir_size(&path);
-            let file_count = if path.is_dir() {
-                storage_file_count(&path)
-            } else {
-                1
-            };
-            *bytes_by_component.entry(component.key()).or_insert(0) += size;
-            *files_by_component.entry(component.key()).or_insert(0) += file_count;
-        }
-    }
-
-    // Explicit canonical-DB accounting (honors --db override that may sit
-    // outside the data dir). The WAL/SHM sidecars are derived from the
-    // resolved DB path so an overridden DB still reports its sidecars.
-    let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-    if db_size > 0 {
-        *bytes_by_component
-            .entry(StorageComponent::CanonicalDb.key())
-            .or_insert(0) += db_size;
-        *files_by_component
-            .entry(StorageComponent::CanonicalDb.key())
-            .or_insert(0) += 1;
-    }
-    let db_exists = db_path.exists();
-    for (suffix, component) in [
-        ("-wal", StorageComponent::DbWal),
-        ("-shm", StorageComponent::DbShm),
-    ] {
-        let mut sidecar = db_path.clone();
-        let file_name = format!(
-            "{}{suffix}",
-            db_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "agent_search.db".to_string())
-        );
-        sidecar.set_file_name(&file_name);
-        // Only account an overridden-DB sidecar; the in-data-dir sidecar
-        // was already counted by the directory walk above.
-        if sidecar.parent() != Some(data_dir.as_path()) {
-            let size = std::fs::metadata(&sidecar).map(|m| m.len()).unwrap_or(0);
-            if size > 0 {
-                *bytes_by_component.entry(component.key()).or_insert(0) += size;
-                *files_by_component.entry(component.key()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    let total_bytes: u64 = bytes_by_component.values().sum();
-    let total_files: u64 = files_by_component.values().sum();
-
-    let components_json: Vec<serde_json::Value> = StorageComponent::ordered()
-        .iter()
-        .map(|component| {
-            let key = component.key();
-            let bytes = *bytes_by_component.get(key).unwrap_or(&0);
-            let files = *files_by_component.get(key).unwrap_or(&0);
-            let percent = if total_bytes > 0 {
-                ((bytes as f64 / total_bytes as f64) * 10000.0).round() / 100.0
-            } else {
-                0.0
-            };
-            serde_json::json!({
-                "component": key,
-                "label": component.label(),
-                "bytes": bytes,
-                "human": format_bytes(bytes),
-                "file_count": files,
-                "percent_of_total": percent,
-                "derived_reclaimable": component.derived(),
-            })
-        })
-        .collect();
-
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    if let Some(fmt) = structured_format {
-        let payload = serde_json::json!({
-            "schema_version": 1,
-            "data_dir": data_dir.display().to_string(),
-            "data_dir_exists": data_dir_exists,
-            "db_path": db_path.display().to_string(),
-            "db_exists": db_exists,
-            "total_bytes": total_bytes,
-            "total_human": format_bytes(total_bytes),
-            "total_file_count": total_files,
-            "components": components_json,
-        });
-        return output_structured_value(payload, fmt);
-    }
-
-    println!("CASS Storage Breakdown");
-    println!("======================");
-    println!();
-    println!("Data directory: {}", data_dir.display());
-    if !data_dir_exists {
-        println!("  (data directory does not exist yet — run 'cass index --full')");
-    }
-    println!("Database: {}", db_path.display());
-    println!();
-    println!("Total on-disk footprint: {}", format_bytes(total_bytes));
-    println!();
-    println!("{:<42} {:>12} {:>7}", "Component", "Size", "Share");
-    println!("{}", "-".repeat(63));
-    for component in StorageComponent::ordered() {
-        let key = component.key();
-        let bytes = *bytes_by_component.get(key).unwrap_or(&0);
-        let percent = if total_bytes > 0 {
-            (bytes as f64 / total_bytes as f64) * 100.0
-        } else {
-            0.0
-        };
-        let derived = if component.derived() {
-            " (reclaimable)"
-        } else {
-            ""
-        };
-        println!(
-            "{:<42} {:>12} {:>6.1}%{}",
-            component.label(),
-            format_bytes(bytes),
-            percent,
-            derived
-        );
-    }
-    println!();
-    println!("Components marked (reclaimable) are derived assets that can be rebuilt");
-    println!("from the canonical DB. Use 'cass mirror prune' or 'cass forget' to reclaim.");
-
-    Ok(())
-}
-
-/// `cass dedup` (#302 ask #2 / bead uhhxy): collapse PRE-EXISTING duplicate
-/// conversation rows where the watcher and full-rebuild ingest paths created
-/// both a `projects/<rel>` and a bare `<rel>` external_id for the same
-/// `source_path`. Dry-run by default (inspect only); `--apply` performs the
-/// deletion and rebuilds the lexical FTS index so search stops returning the
-/// dropped twins.
-fn run_dedup(
-    data_dir_override: &Option<PathBuf>,
-    db_override: Option<PathBuf>,
-    output_format: Option<RobotFormat>,
-    apply: bool,
-) -> CliResult<()> {
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    if !db_path.exists() {
-        // No DB: nothing to dedup. Report an empty, successful result so the
-        // robot contract stays uniform (matches stats/diag missing-DB shape).
-        if let Some(fmt) = structured_format {
-            let payload = serde_json::json!({
-                "schema_version": 1,
-                "applied": false,
-                "dry_run": !apply,
-                "db_path": db_path.display().to_string(),
-                "db_exists": false,
-                "conversations_collapsed": 0,
-                "messages_removed": 0,
-                "lexical_rebuilt": false,
-                "pairs": [],
-                "recommended_action": "No database found. Run 'cass index --full' first.",
-            });
-            return output_structured_value(payload, fmt);
-        }
-        println!("No database found at {}.", db_path.display());
-        println!("Run 'cass index --full' to create it.");
-        return Ok(());
-    }
-
-    let storage =
-        crate::storage::sqlite::FrankenStorage::open(&db_path).map_err(|err| CliError {
-            code: 3,
-            kind: CliErrorKind::DbOpen.kind_str(),
-            message: format!("failed to open canonical DB for dedup: {err}"),
-            hint: Some("Run 'cass doctor check --json' for a read-only diagnosis.".to_string()),
-            retryable: true,
-        })?;
-
-    let result = storage
-        .collapse_external_id_prefix_duplicates(!apply)
-        .map_err(|err| CliError {
-            code: 5,
-            kind: CliErrorKind::Storage.kind_str(),
-            message: format!("duplicate-conversation cleanup failed: {err}"),
-            hint: Some(
-                "Re-run without --apply to inspect, or 'cass doctor check --json' for diagnosis."
-                    .to_string(),
-            ),
-            retryable: false,
-        })?;
-
-    // On apply, rebuild the lexical FTS index so the dropped twins stop
-    // surfacing in search. Only worth doing when something was removed.
-    let mut lexical_rebuilt = false;
-    if apply && result.conversations_affected > 0 {
-        match storage.rebuild_lexical_index_after_dedup() {
-            Ok(()) => lexical_rebuilt = true,
-            Err(err) => {
-                tracing::warn!(
-                    "duplicate cleanup removed rows but lexical rebuild failed: {err}; run 'cass index --full' to refresh search"
-                );
-            }
-        }
-    }
-
-    let recommended_action = if result.conversations_affected == 0 {
-        "No pre-existing duplicate conversations found. Nothing to do.".to_string()
-    } else if apply {
-        if lexical_rebuilt {
-            format!(
-                "Collapsed {} duplicate conversation(s) and rebuilt the in-DB FTS shadow. Run 'cass index --full' to also refresh the on-disk lexical search index.",
-                result.conversations_affected
-            )
-        } else {
-            format!(
-                "Collapsed {} duplicate conversation(s). Run 'cass index --full' to refresh the lexical index.",
-                result.conversations_affected
-            )
-        }
-    } else {
-        format!(
-            "Found {} duplicate conversation(s) ({} message rows). Re-run with --apply to collapse them.",
-            result.conversations_affected, result.messages_affected
-        )
-    };
-
-    if let Some(fmt) = structured_format {
-        let pairs: Vec<serde_json::Value> = result
-            .pairs
-            .iter()
-            .map(|pair| {
-                serde_json::json!({
-                    "keep_conversation_id": pair.keep_conversation_id,
-                    "drop_conversation_id": pair.drop_conversation_id,
-                    "source_path": pair.source_path,
-                    "keep_external_id": pair.keep_external_id,
-                    "drop_external_id": pair.drop_external_id,
-                })
-            })
-            .collect();
-        let payload = serde_json::json!({
-            "schema_version": 1,
-            "applied": apply,
-            "dry_run": !apply,
-            "db_path": db_path.display().to_string(),
-            "db_exists": true,
-            "conversations_collapsed": result.conversations_affected,
-            "messages_removed": result.messages_affected,
-            "lexical_rebuilt": lexical_rebuilt,
-            "pairs": pairs,
-            "recommended_action": recommended_action,
-        });
-        return output_structured_value(payload, fmt);
-    }
-
-    println!("CASS Duplicate Conversation Cleanup");
-    println!("===================================");
-    println!();
-    println!("Database: {}", db_path.display());
-    println!(
-        "Mode: {}",
-        if apply {
-            "APPLY (mutating)"
-        } else {
-            "dry-run (inspect only)"
-        }
-    );
-    println!();
-    if result.conversations_affected == 0 {
-        println!("No pre-existing duplicate conversations found.");
-        return Ok(());
-    }
-    println!(
-        "Duplicate conversation pairs (projects/<rel> twin vs bare canonical): {}",
-        result.conversations_affected
-    );
-    println!(
-        "Message rows in the dropped twins: {}",
-        result.messages_affected
-    );
-    println!();
-    for pair in result.pairs.iter().take(20) {
-        println!(
-            "  drop id={:<8} keep id={:<8} {}",
-            pair.drop_conversation_id, pair.keep_conversation_id, pair.source_path
-        );
-    }
-    if result.pairs.len() > 20 {
-        println!("  ... and {} more", result.pairs.len() - 20);
-    }
-    println!();
-    println!("{recommended_action}");
-
-    Ok(())
-}
-
-/// Count files (not bytes) recursively under a directory for the storage
-/// breakdown. Mirrors `fs_dir_size`'s traversal but counts leaf files.
-fn storage_file_count(path: &std::path::Path) -> u64 {
-    if !path.is_dir() {
-        return 1;
-    }
-    std::fs::read_dir(path)
-        .map(|entries| {
-            entries
-                .filter_map(std::result::Result::ok)
-                .map(|e| {
-                    let p = e.path();
-                    if p.is_dir() {
-                        storage_file_count(&p)
-                    } else {
-                        1
-                    }
-                })
-                .sum()
-        })
-        .unwrap_or(0)
 }
 
 fn run_diag(
@@ -36368,26 +32910,6 @@ fn doctor_storage_relative_components(relative_path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// GH#324: crash-orphaned lexical staging roots (`cass-lexical-shards.*`,
-/// `cass-lexical-merge.*`, `cass-federated-materialize-*`,
-/// `cass-empty-lexical-repair-*`, and their interrupted-reclaim rename
-/// markers). These are derived scratch space — rebuildable by definition —
-/// so they classify as reclaimable instead of falling through to the
-/// fail-closed Unknown/protected bucket that used to shield the debris from
-/// cleanup. The name must strictly extend a prefix: tempfile always appends
-/// a random suffix, so a bare prefix is never a cass-created name.
-fn doctor_storage_component_is_lexical_staging_dir(component: &str) -> bool {
-    const STAGING_PREFIXES: [&str; 4] = [
-        "cass-lexical-shards.",
-        "cass-lexical-merge.",
-        "cass-federated-materialize-",
-        "cass-empty-lexical-repair-",
-    ];
-    STAGING_PREFIXES
-        .iter()
-        .any(|prefix| component.len() > prefix.len() && component.starts_with(prefix))
-}
-
 fn doctor_classify_storage_relative_path(relative_path: &Path) -> DoctorAssetClass {
     let components = doctor_storage_relative_components(relative_path);
     let Some(first) = components.first().map(String::as_str) else {
@@ -36439,16 +32961,7 @@ fn doctor_classify_storage_relative_path(relative_path: &Path) -> DoctorAssetCla
             _ => DoctorAssetClass::ForensicBundle,
         };
     }
-    if doctor_storage_component_is_lexical_staging_dir(first) {
-        return DoctorAssetClass::ReclaimableDerivedCache;
-    }
     if first == "index" {
-        if components
-            .get(1)
-            .is_some_and(|part| doctor_storage_component_is_lexical_staging_dir(part))
-        {
-            return DoctorAssetClass::ReclaimableDerivedCache;
-        }
         if components
             .iter()
             .any(|part| part == ".lexical-publish-backups")
@@ -38199,17 +34712,11 @@ fn query_doctor_source_inventory_db_rows(
     } else {
         ""
     };
-    // Keep the database side of this inventory to a plain metadata scan.  The
-    // report builder below already folds rows into deterministic BTreeMaps, so
-    // asking the SQL engine to GROUP BY and ORDER BY the same dimensions only
-    // duplicates work.  More importantly, FrankenSQLite currently materializes
-    // that aggregate/sort pipeline; on a multi-million-message archive the
-    // transient values can dwarf the conversations table and exhaust memory.
-    // Emitting one unit row per conversation preserves the exact aggregation
-    // semantics while keeping the SQL executor streaming and sorter-free.
     let sql = format!(
-        "SELECT {provider_expr}, {source_path_expr}, {source_id_expr}, {origin_host_expr}, {origin_kind_expr}, 1 \
-         FROM conversations c{agent_join}{source_join}"
+        "SELECT {provider_expr}, {source_path_expr}, {source_id_expr}, {origin_host_expr}, {origin_kind_expr}, COUNT(*) \
+         FROM conversations c{agent_join}{source_join} \
+         GROUP BY 1, 2, 3, 4, 5 \
+         ORDER BY 1, 3, 4, 2"
     );
 
     conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
@@ -39252,16 +35759,6 @@ const DOCTOR_RAW_MIRROR_HASH_ALGORITHM: &str = "blake3";
 const DOCTOR_RAW_MIRROR_BLOB_EXTENSION: &str = "raw";
 const DOCTOR_RAW_MIRROR_DIR_MODE: &str = "0700";
 const DOCTOR_RAW_MIRROR_FILE_MODE: &str = "0600";
-const CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY: &str = "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY";
-const CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT: &str =
-    "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT";
-const DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_MANIFEST_LIMIT: usize = 256;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DoctorRawMirrorVerificationMode {
-    Full,
-    Bounded { manifest_limit: usize },
-}
 
 #[derive(Debug, Clone, Serialize)]
 struct DoctorRawMirrorReport {
@@ -40133,67 +36630,16 @@ fn doctor_raw_mirror_size_warning(total_blob_bytes: u64, threshold_bytes: u64) -
     })
 }
 
-fn doctor_raw_mirror_full_verify_requested() -> bool {
-    dotenvy::var(CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY)
-        .ok()
-        .is_some_and(|raw| {
-            matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-}
-
-fn doctor_raw_mirror_full_verify_manifest_limit() -> usize {
-    dotenvy::var(CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|&limit| limit > 0)
-        .unwrap_or(DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_MANIFEST_LIMIT)
-}
-
-fn collect_doctor_raw_mirror_report_for_doctor(
-    data_dir: &Path,
-    mutating_repair_requested: bool,
-) -> DoctorRawMirrorReport {
-    let mode = if mutating_repair_requested || doctor_raw_mirror_full_verify_requested() {
-        DoctorRawMirrorVerificationMode::Full
-    } else {
-        DoctorRawMirrorVerificationMode::Bounded {
-            manifest_limit: doctor_raw_mirror_full_verify_manifest_limit(),
-        }
-    };
-    collect_doctor_raw_mirror_report_with_threshold_and_mode(
-        data_dir,
-        doctor_raw_mirror_size_warn_threshold_bytes(),
-        mode,
-    )
-}
-
 fn collect_doctor_raw_mirror_report(data_dir: &Path) -> DoctorRawMirrorReport {
-    collect_doctor_raw_mirror_report_with_threshold_and_mode(
+    collect_doctor_raw_mirror_report_with_threshold(
         data_dir,
         doctor_raw_mirror_size_warn_threshold_bytes(),
-        DoctorRawMirrorVerificationMode::Full,
     )
 }
 
-#[cfg(test)]
 fn collect_doctor_raw_mirror_report_with_threshold(
     data_dir: &Path,
     size_warn_threshold_bytes: u64,
-) -> DoctorRawMirrorReport {
-    collect_doctor_raw_mirror_report_with_threshold_and_mode(
-        data_dir,
-        size_warn_threshold_bytes,
-        DoctorRawMirrorVerificationMode::Full,
-    )
-}
-
-fn collect_doctor_raw_mirror_report_with_threshold_and_mode(
-    data_dir: &Path,
-    size_warn_threshold_bytes: u64,
-    verification_mode: DoctorRawMirrorVerificationMode,
 ) -> DoctorRawMirrorReport {
     let root = doctor_raw_mirror_root(data_dir);
     let root_path = root.display().to_string();
@@ -40239,13 +36685,6 @@ fn collect_doctor_raw_mirror_report_with_threshold_and_mode(
     }
 
     let manifest_root = root.join("manifests");
-    let bounded_manifest_limit = match verification_mode {
-        DoctorRawMirrorVerificationMode::Full => None,
-        DoctorRawMirrorVerificationMode::Bounded { manifest_limit } => Some(manifest_limit),
-    };
-    let mut manifest_entries: Vec<(PathBuf, bool)> = Vec::new();
-    let mut manifest_entry_count = 0usize;
-    let mut full_verification_deferred = false;
     if manifest_root.exists() {
         for entry in walkdir::WalkDir::new(&manifest_root)
             .follow_links(false)
@@ -40257,12 +36696,28 @@ fn collect_doctor_raw_mirror_report_with_threshold_and_mode(
                     if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                         continue;
                     }
-                    manifest_entry_count += 1;
-                    if bounded_manifest_limit.is_some_and(|limit| manifest_entry_count > limit) {
-                        full_verification_deferred = true;
-                        continue;
-                    }
-                    manifest_entries.push((path.to_path_buf(), entry.file_type().is_symlink()));
+                    let report_entry = if entry.file_type().is_symlink() {
+                        doctor_raw_mirror_invalid_manifest_report(
+                            data_dir,
+                            path,
+                            "manifest path is a symlink".to_string(),
+                        )
+                    } else {
+                        match std::fs::read_to_string(path)
+                            .ok()
+                            .and_then(|content| serde_json::from_str(&content).ok())
+                        {
+                            Some(manifest) => {
+                                doctor_verify_raw_mirror_manifest(data_dir, &root, path, manifest)
+                            }
+                            None => doctor_raw_mirror_invalid_manifest_report(
+                                data_dir,
+                                path,
+                                "manifest is not parseable JSON".to_string(),
+                            ),
+                        }
+                    };
+                    report.manifests.push(report_entry);
                 }
                 Ok(_) => {}
                 Err(err) => report
@@ -40270,45 +36725,6 @@ fn collect_doctor_raw_mirror_report_with_threshold_and_mode(
                     .push(format!("failed to scan raw mirror manifest entry: {err}")),
             }
         }
-    }
-
-    if full_verification_deferred {
-        report.summary.manifest_count = manifest_entry_count;
-        report.status = "verification_deferred".to_string();
-        let limit = bounded_manifest_limit.unwrap_or(0);
-        report.warnings.push(format!(
-            "Raw mirror verification deferred: {manifest_entry_count} manifest(s) exceed the bounded doctor limit of {limit}; set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run a full blob checksum verification."
-        ));
-        report.notes.push(
-            "Bounded doctor mode does not claim raw mirror blobs are verified until full checksum verification runs."
-                .to_string(),
-        );
-        return report;
-    }
-
-    for (path, is_symlink) in manifest_entries {
-        let report_entry = if is_symlink {
-            doctor_raw_mirror_invalid_manifest_report(
-                data_dir,
-                &path,
-                "manifest path is a symlink".to_string(),
-            )
-        } else {
-            match std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|content| serde_json::from_str(&content).ok())
-            {
-                Some(manifest) => {
-                    doctor_verify_raw_mirror_manifest(data_dir, &root, &path, manifest)
-                }
-                None => doctor_raw_mirror_invalid_manifest_report(
-                    data_dir,
-                    &path,
-                    "manifest is not parseable JSON".to_string(),
-                ),
-            }
-        };
-        report.manifests.push(report_entry);
     }
 
     report
@@ -41670,10 +38086,7 @@ fn query_doctor_raw_mirror_backfill_candidates(
         "NULL"
     };
     let message_count_expr = if can_count_messages {
-        // Count messages in one narrow streaming index pass after the bounded
-        // conversation metadata query.  A correlated COUNT here executes one
-        // messages scan per conversation under FrankenSQLite.
-        "0"
+        "(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id)"
     } else if conversation_columns.contains("message_count") {
         "COALESCE(c.message_count, 0)"
     } else {
@@ -41696,7 +38109,7 @@ fn query_doctor_raw_mirror_backfill_candidates(
          ORDER BY c.id"
     );
 
-    let mut candidates = conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
+    conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
         let message_count: i64 = row.get_typed(7)?;
         Ok(DoctorRawMirrorBackfillCandidate {
             conversation_id: row.get_typed(0)?,
@@ -41708,50 +38121,7 @@ fn query_doctor_raw_mirror_backfill_candidates(
             started_at_ms: row.get_typed(6)?,
             message_count: message_count.max(0) as usize,
         })
-    })?;
-
-    if can_count_messages && !candidates.is_empty() {
-        let candidate_positions: HashMap<i64, usize> = candidates
-            .iter()
-            .enumerate()
-            .map(|(position, candidate)| (candidate.conversation_id, position))
-            .collect();
-        let message_indexes: HashSet<String> = conn
-            .query_map_collect(
-                "PRAGMA index_list(messages)",
-                &[],
-                |row: &frankensqlite::Row| row.get_typed::<String>(1),
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let message_scan_sql = if message_indexes.contains("sqlite_autoindex_messages_1") {
-            // The UNIQUE(conversation_id, idx) autoindex is narrow: scanning it
-            // avoids loading the potentially enormous content column.
-            "SELECT conversation_id \
-             FROM messages INDEXED BY sqlite_autoindex_messages_1"
-        } else {
-            // Historical schemas may lack the modern uniqueness constraint.
-            // A plain table scan remains exact and streaming; unlike GROUP BY
-            // or a correlated COUNT it does not allocate an unbounded sorter or
-            // repeat the scan for every conversation.
-            "SELECT conversation_id FROM messages"
-        };
-        conn.query_with_params_for_each(
-            message_scan_sql,
-            &[] as &[frankensqlite::SqliteValue],
-            |row| {
-                let conversation_id: i64 = row.get_typed(0)?;
-                if let Some(position) = candidate_positions.get(&conversation_id) {
-                    candidates[*position].message_count =
-                        candidates[*position].message_count.saturating_add(1);
-                }
-                Ok(())
-            },
-        )?;
-    }
-
-    Ok(candidates)
+    })
 }
 
 fn doctor_raw_mirror_backfill_source_path_blake3(path: &str) -> String {
@@ -60365,55 +56735,6 @@ mod doctor_asset_taxonomy_tests {
         DoctorSourceAuthorityKind::SupportBundle,
     ];
 
-    /// GH#324: crash-orphaned lexical staging dirs must classify as
-    /// reclaimable derived cache (safe_to_gc, auto-delete allowed) instead of
-    /// falling into a protected class that shields the debris from cleanup.
-    #[test]
-    fn doctor_classifies_orphaned_lexical_staging_dirs_as_reclaimable() {
-        for relative in [
-            "index/cass-lexical-shards.k1eHZJ/shard-0/meta.json",
-            "index/cass-lexical-merge.2qwt8l",
-            "index/cass-lexical-merge.2qwt8l.reclaim-42-0/index/meta.json",
-            "index/cass-federated-materialize-r4nd0m/index/meta.json",
-            "index/cass-empty-lexical-repair-q1w2e3/file",
-            // Historical top-level layout.
-            "cass-lexical-shards.abc123/shard-0/meta.json",
-            "cass-lexical-merge.abc123",
-        ] {
-            assert_eq!(
-                doctor_classify_storage_relative_path(Path::new(relative)),
-                DoctorAssetClass::ReclaimableDerivedCache,
-                "{relative} should classify as reclaimable staging debris"
-            );
-        }
-        let reclaimable_safety = doctor_asset_safety(DoctorAssetClass::ReclaimableDerivedCache);
-        assert!(reclaimable_safety.safe_to_gc_allowed);
-        assert!(reclaimable_safety.auto_delete_allowed);
-        assert!(!reclaimable_safety.precious);
-
-        // Live/published assets must keep their protective classes.
-        for (relative, expected) in [
-            ("index/v8/meta.json", DoctorAssetClass::DerivedLexicalIndex),
-            (
-                "index/.lexical-publish-backups/gen-1/meta.json",
-                DoctorAssetClass::RetainedPublishBackup,
-            ),
-            ("agent_search.db", DoctorAssetClass::CanonicalArchiveDb),
-            // Bare prefixes (no tempfile suffix) are not cass-created names;
-            // they stay in the fail-closed lexical-index bucket.
-            (
-                "index/cass-lexical-shards.",
-                DoctorAssetClass::DerivedLexicalIndex,
-            ),
-        ] {
-            assert_eq!(
-                doctor_classify_storage_relative_path(Path::new(relative)),
-                expected,
-                "{relative} must not be classified as reclaimable"
-            );
-        }
-    }
-
     #[test]
     fn doctor_asset_taxonomy_explicitly_covers_every_class_and_operation() {
         let policy_classes: HashSet<_> = DOCTOR_ASSET_POLICY_TABLE
@@ -67283,161 +63604,6 @@ paths = ["~/.claude/projects"]
     }
 
     #[test]
-    fn doctor_inventory_queries_stream_metadata_and_count_messages_in_one_narrow_pass() {
-        use frankensqlite::compat::ConnectionExt as _;
-
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = temp.path().join("doctor-inventory-streaming.db");
-        let source_path = temp.path().join("session.jsonl");
-        std::fs::write(&source_path, b"{}\n").expect("write source fixture");
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())
-            .expect("open fixture database");
-        conn.execute_batch(&format!(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
-             CREATE TABLE conversations (
-                 id INTEGER PRIMARY KEY,
-                 agent_id INTEGER,
-                 source_id TEXT,
-                 source_path TEXT,
-                 origin_host TEXT,
-                 started_at INTEGER
-             );
-             CREATE TABLE messages (
-                 id INTEGER PRIMARY KEY,
-                 conversation_id INTEGER NOT NULL,
-                 idx INTEGER NOT NULL,
-                 content TEXT NOT NULL,
-                 UNIQUE(conversation_id, idx)
-             );
-             INSERT INTO agents(id, slug) VALUES(1, 'codex');
-             INSERT INTO sources(id, kind) VALUES('local', 'local');
-             INSERT INTO conversations(id, agent_id, source_id, source_path, started_at)
-             VALUES
-                 (10, 1, 'local', '{source}', 1000),
-                 (20, 1, 'local', '{source}', 2000),
-                 (30, NULL, 'local', '{source}', 3000);
-             INSERT INTO messages(id, conversation_id, idx, content)
-             VALUES
-                 (101, 10, 0, 'one'),
-                 (901, 10, 100, 'two'),
-                 (5001, 30, 2, 'three'),
-                 (7001, 30, 50, 'four'),
-                 (9001, 30, 99, 'five');",
-            source = source_path.display(),
-        ))
-        .expect("seed inventory fixture");
-
-        let inventory_rows =
-            query_doctor_source_inventory_db_rows(&conn).expect("query source inventory");
-        assert_eq!(inventory_rows.len(), 3);
-        assert!(
-            inventory_rows.iter().all(|row| row.conversation_count == 1),
-            "the database query must emit unit rows for the bounded Rust aggregation: {inventory_rows:#?}"
-        );
-        let inventory = build_doctor_source_inventory_report(
-            temp.path(),
-            true,
-            None,
-            inventory_rows,
-            Vec::new(),
-        );
-        assert_eq!(inventory.total_indexed_conversations, 3);
-        assert_eq!(inventory.provider_counts.get("codex"), Some(&2));
-        assert_eq!(inventory.provider_counts.get("unknown"), Some(&1));
-
-        let candidates = query_doctor_raw_mirror_backfill_candidates(&conn)
-            .expect("query raw mirror candidates");
-        let counts: Vec<(i64, usize)> = candidates
-            .iter()
-            .map(|candidate| (candidate.conversation_id, candidate.message_count))
-            .collect();
-        assert_eq!(counts, vec![(10, 2), (20, 0), (30, 3)]);
-
-        let inventory_plan: Vec<String> = conn
-            .query_map_collect(
-                "EXPLAIN QUERY PLAN
-                 SELECT COALESCE(a.slug, 'unknown'), c.source_path,
-                        COALESCE(c.source_id, 'local'), c.origin_host, s.kind, 1
-                 FROM conversations c
-                 LEFT JOIN agents a ON c.agent_id = a.id
-                 LEFT JOIN sources s ON c.source_id = s.id",
-                &[],
-                |row: &frankensqlite::Row| row.get_typed(3),
-            )
-            .expect("explain source inventory metadata scan");
-        assert!(
-            !inventory_plan
-                .iter()
-                .any(|detail| detail.contains("TEMP B-TREE")),
-            "source inventory must not materialize GROUP BY/ORDER BY state: {inventory_plan:?}"
-        );
-        let message_plan: Vec<String> = conn
-            .query_map_collect(
-                "EXPLAIN QUERY PLAN
-                 SELECT conversation_id
-                 FROM messages INDEXED BY sqlite_autoindex_messages_1",
-                &[],
-                |row: &frankensqlite::Row| row.get_typed(3),
-            )
-            .expect("explain narrow message scan");
-        // FrankenSQLite currently renders a full covering-index walk as the
-        // generic `SCAN messages`; the production SQL's INDEXED BY clause is
-        // the enforceable index contract (and would fail preparation if the
-        // autoindex were absent). The plan still must remain a single scan with
-        // no temp materialization.
-        assert_eq!(
-            message_plan.len(),
-            1,
-            "unexpected scan plan: {message_plan:?}"
-        );
-        assert!(
-            !message_plan
-                .iter()
-                .any(|detail| detail.contains("TEMP B-TREE")),
-            "message counts must not materialize grouped state: {message_plan:?}"
-        );
-    }
-
-    #[test]
-    fn doctor_raw_mirror_message_count_falls_back_to_one_streaming_legacy_table_scan() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let db_path = temp.path().join("doctor-inventory-legacy.db");
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())
-            .expect("open legacy fixture database");
-        conn.execute_batch(
-            "CREATE TABLE conversations (
-                 id INTEGER PRIMARY KEY,
-                 source_path TEXT,
-                 message_count INTEGER
-             );
-             CREATE TABLE messages (
-                 id INTEGER PRIMARY KEY,
-                 conversation_id INTEGER,
-                 idx INTEGER,
-                 content TEXT
-             );
-             INSERT INTO conversations(id, source_path, message_count)
-             VALUES(1, '/legacy/one.jsonl', 999), (2, '/legacy/two.jsonl', 999);
-             INSERT INTO messages(id, conversation_id, idx, content)
-             VALUES(5, 1, 8, 'one'), (99, 1, 2, 'two'), (1000, 2, 400, 'three');",
-        )
-        .expect("seed legacy inventory fixture");
-
-        let candidates = query_doctor_raw_mirror_backfill_candidates(&conn)
-            .expect("query legacy raw mirror candidates");
-        let counts: Vec<(i64, usize)> = candidates
-            .iter()
-            .map(|candidate| (candidate.conversation_id, candidate.message_count))
-            .collect();
-        assert_eq!(
-            counts,
-            vec![(1, 2), (2, 1)],
-            "a legacy table without the modern autoindex must use exact streamed counts, not stale conversation metadata"
-        );
-    }
-
-    #[test]
     fn doctor_source_inventory_counts_missing_sources_without_calling_them_lost() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
@@ -67905,207 +64071,6 @@ paths = ["~/.claude/projects"]
         assert_eq!(summary.sync_staleness, "fresh");
         assert_eq!(summary.archive_remote_conversation_count, Some(1));
         assert_eq!(summary.recommended_action, "none");
-    }
-
-    #[test]
-    fn doctor_remote_source_sync_report_advice_is_additive_and_preservation_safe() {
-        use crate::sources::config::{SourceDefinition, SourcesConfig, SyncSchedule};
-        use crate::sources::sync::{SourceSyncInfo, SyncResult, SyncStatus, current_unix_ms};
-
-        // A pruned-remote source with a present local mirror and existing archive
-        // evidence is the highest-risk shape for a doctor recommending destructive
-        // "repair": this is exactly where additive/preservation guarantees matter.
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let remotes_dir = data_dir.join("remotes");
-        std::fs::create_dir_all(&remotes_dir).expect("create remotes dir");
-        let config_path = temp.path().join("config/cass/sources.toml");
-        let mut source = SourceDefinition::ssh("retired-laptop", "user@retired-laptop");
-        source.paths = vec!["~/.codex/sessions".to_string()];
-        source.sync_schedule = SyncSchedule::Manual;
-        SourcesConfig {
-            sources: vec![source],
-            disabled_agents: Vec::new(),
-        }
-        .save_to(&config_path)
-        .expect("write fixture sources config");
-
-        // Local mirror has more readable files than the archive currently tracks,
-        // and the archive is ahead of the last (zero-file) durable sync — both the
-        // coverage-comparison gaps fire alongside the pruned-source failed-sync gap.
-        let mirror_dir = remotes_dir.join("retired-laptop").join("mirror");
-        std::fs::create_dir_all(&mirror_dir).expect("create mirror dir");
-        std::fs::write(mirror_dir.join("a.jsonl"), b"mirror bytes a\n").expect("mirror a");
-        std::fs::write(mirror_dir.join("b.jsonl"), b"mirror bytes b\n").expect("mirror b");
-
-        let mut sync_status = SyncStatus::default();
-        sync_status.set_info(
-            "retired-laptop",
-            SourceSyncInfo {
-                last_sync: Some(current_unix_ms()),
-                last_result: SyncResult::Failed(
-                    "remote source path does not exist; source pruned".to_string(),
-                ),
-                files_synced: 0,
-                bytes_transferred: 0,
-                duration_ms: 500,
-                consecutive_failures: 3,
-            },
-        );
-        sync_status.save(&data_dir).expect("write sync status");
-
-        let rows = vec![DoctorSourceInventoryDbRow {
-            provider: "codex".to_string(),
-            source_path: Some("/remote/codex/session.jsonl".to_string()),
-            source_id: "retired-laptop".to_string(),
-            origin_host: Some("user@retired-laptop".to_string()),
-            origin_kind: Some("ssh".to_string()),
-            conversation_count: 1,
-        }];
-        let source_inventory =
-            build_doctor_source_inventory_report(&data_dir, true, None, rows, Vec::new());
-
-        let report =
-            collect_doctor_remote_source_sync_report(&data_dir, &config_path, &source_inventory);
-
-        // Sanity: the high-risk shape actually produced the gaps we want to police.
-        assert_eq!(report.status, "warn");
-        let gap_kinds: Vec<&str> = report
-            .sync_gaps
-            .iter()
-            .map(|gap| gap.gap_kind.as_str())
-            .collect();
-        assert!(
-            gap_kinds.contains(&"remote_source_pruned"),
-            "pruned remote should surface a pruned gap: {gap_kinds:?}"
-        );
-        assert!(
-            gap_kinds.contains(&"local_archive_ahead_of_remote"),
-            "archive-ahead coverage gap should fire: {gap_kinds:?}"
-        );
-        assert!(
-            gap_kinds.contains(&"remote_copy_ahead_verified"),
-            "verified mirror coverage gap should fire: {gap_kinds:?}"
-        );
-
-        // Every user-facing string the doctor emits: gap evidence, gap advice,
-        // per-source reasons, and the recommended command set, plus the runtime
-        // summary advice. None of these may instruct destructive transfer.
-        let summary =
-            doctor_remote_source_sync_runtime_summary(&report, "status-inline-local-config", true);
-        let mut advice_strings: Vec<String> = Vec::new();
-        let mut all_strings: Vec<String> = Vec::new();
-        for gap in &report.sync_gaps {
-            advice_strings.push(gap.recommended_action.clone());
-            all_strings.push(gap.recommended_action.clone());
-            all_strings.extend(gap.evidence.iter().cloned());
-        }
-        for entry in &report.sources {
-            all_strings.extend(entry.reasons.iter().cloned());
-        }
-        advice_strings.extend(report.recommended_sync_commands.iter().cloned());
-        all_strings.extend(report.recommended_sync_commands.iter().cloned());
-        advice_strings.push(summary.recommended_action.clone());
-        all_strings.push(summary.recommended_action.clone());
-
-        // Destructive transfer flags / source-log mutation must never appear in any
-        // emitted string. rsync runs additive (no --delete); provider logs are never
-        // rewritten by a recommended action.
-        const DESTRUCTIVE_FLAGS: &[&str] = &[
-            "--delete",
-            "--delete-after",
-            "--delete-during",
-            "--delete-excluded",
-            "--remove-source-files",
-            "--remove-sent-files",
-        ];
-        // Tokenized command words (exact match against whitespace/punct-split tokens
-        // so benign words like "perform"/"transform"/"truncated" never false-match).
-        const DESTRUCTIVE_TOKENS: &[&str] = &["rm", "rmdir", "shred", "unlink", "wipe"];
-        const DESTRUCTIVE_PHRASES: &[&str] = &[
-            "delete the source",
-            "delete source log",
-            "remove the source",
-            "remove source log",
-            "prune the source log",
-            "rsync --delete",
-            "rm -rf",
-        ];
-        for s in &all_strings {
-            let lower = s.to_ascii_lowercase();
-            for flag in DESTRUCTIVE_FLAGS {
-                assert!(
-                    !lower.contains(flag),
-                    "doctor advice/evidence must not contain destructive flag {flag:?}: {s:?}"
-                );
-            }
-            for phrase in DESTRUCTIVE_PHRASES {
-                assert!(
-                    !lower.contains(phrase),
-                    "doctor advice/evidence must not contain destructive phrase {phrase:?}: {s:?}"
-                );
-            }
-            for token in lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
-                assert!(
-                    !DESTRUCTIVE_TOKENS.contains(&token),
-                    "doctor advice/evidence must not invoke destructive command {token:?}: {s:?}"
-                );
-            }
-        }
-
-        // Recommended actions are either gated additive cass subcommands, inert
-        // status tokens, or human-readable preservation prose. They must never be a
-        // raw transport/shell invocation (which could carry destructive flags) and
-        // must never redirect output over a source log.
-        const RAW_INVOCATION_BINARIES: &[&str] = &[
-            "rsync", "scp", "ssh", "sftp", "sh", "bash", "zsh", "rm", "rmdir", "shred",
-        ];
-        for advice in &advice_strings {
-            let trimmed = advice.trim();
-            if let Some(first_token) = trimmed.split_whitespace().next() {
-                assert!(
-                    !RAW_INVOCATION_BINARIES.contains(&first_token),
-                    "doctor advice must not be a raw transport/shell invocation: {advice:?}"
-                );
-            }
-            assert!(
-                !advice.contains(" > ") && !advice.contains(" >> "),
-                "doctor advice must not redirect output over a source log: {advice:?}"
-            );
-            // If advice ever mentions cleanup/prune, it must point at the explicit
-            // dry-run / fingerprinted flow rather than an automatic destructive repair.
-            let lower = advice.to_ascii_lowercase();
-            if lower.contains("prune") || lower.contains("cleanup") {
-                assert!(
-                    lower.contains("--dry-run") || lower.contains("fingerprint"),
-                    "cleanup/prune advice must point only at dry-run/fingerprinted flows: {advice:?}"
-                );
-            }
-        }
-
-        // Positive preservation signal: the pruned-source path explicitly tells the
-        // operator to preserve the archive and local mirror before any rebuild.
-        assert!(
-            report.sync_gaps.iter().any(|gap| gap
-                .evidence
-                .iter()
-                .any(|line| line.to_ascii_lowercase().contains("preserve"))),
-            "pruned/coverage gaps must carry an explicit preservation warning: {report:#?}"
-        );
-        // Recommended commands are present (the source needs attention) and are all
-        // additive cass sync/list/add invocations.
-        assert!(
-            !report.recommended_sync_commands.is_empty(),
-            "an actionable source should still receive additive recommendations"
-        );
-        assert!(
-            report
-                .recommended_sync_commands
-                .iter()
-                .all(|command| command.starts_with("cass sources ")),
-            "all recommended commands must be additive cass sources subcommands: {:?}",
-            report.recommended_sync_commands
-        );
     }
 
     #[test]
@@ -71918,540 +67883,6 @@ fn capabilities_connector_names() -> Vec<String> {
     connectors
 }
 
-/// Roughly count session-like files under a detected provider root, bounded so
-/// first-run onboarding stays fast even against a large existing corpus (the
-/// estimate is an indexing-cost signal, not an exact total).
-fn count_onboarding_sessions(root: &Path) -> u64 {
-    const MAX_FILES: u64 = 50_000;
-    const MAX_DEPTH: usize = 8;
-    let mut count = 0u64;
-    for entry in walkdir::WalkDir::new(root)
-        .max_depth(MAX_DEPTH)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let is_session = entry
-            .path()
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| {
-                ext.eq_ignore_ascii_case("jsonl")
-                    || ext.eq_ignore_ascii_case("json")
-                    || ext.eq_ignore_ascii_case("md")
-                    || ext.eq_ignore_ascii_case("db")
-            });
-        if is_session {
-            count += 1;
-            if count >= MAX_FILES {
-                break;
-            }
-        }
-    }
-    count
-}
-
-/// Gather a read-only [`OnboardingObservation`](crate::source_onboarding::OnboardingObservation)
-/// from live host state — detected agent providers, source-config exclusions and
-/// remote sources, local semantic-model files, and the archive DB. Performs no
-/// mutation (bead 5u82n.6).
-fn gather_onboarding_observation(
-    data_dir: &Path,
-    db_path: &Path,
-) -> crate::source_onboarding::OnboardingObservation {
-    use crate::source_onboarding::{OnboardingObservation, ProviderObservation};
-
-    let sources_config = crate::sources::config::SourcesConfig::load().ok();
-
-    // Detected providers (default opts => detected-only) with per-provider
-    // readability + a bounded session estimate + the config exclusion flag.
-    let opts = franken_agent_detection::AgentDetectOptions::default();
-    let providers: Vec<ProviderObservation> =
-        match franken_agent_detection::detect_installed_agents(&opts) {
-            Ok(report) => report
-                .installed_agents
-                .into_iter()
-                .filter(|entry| entry.detected)
-                .map(|entry| {
-                    let root_readable = entry
-                        .root_paths
-                        .iter()
-                        .any(|p| std::fs::read_dir(p).is_ok());
-                    let estimated_sessions = entry
-                        .root_paths
-                        .iter()
-                        .map(|p| count_onboarding_sessions(Path::new(p)))
-                        .sum();
-                    let excluded = sources_config
-                        .as_ref()
-                        .is_some_and(|cfg| cfg.is_agent_disabled(&entry.slug));
-                    ProviderObservation {
-                        name: entry.slug,
-                        excluded,
-                        root_readable,
-                        estimated_sessions,
-                    }
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-
-    let remote_sources_configured = sources_config
-        .as_ref()
-        .is_some_and(|cfg| cfg.remote_sources().next().is_some());
-
-    let model_dir = crate::search::model_manager::default_model_dir(data_dir);
-    let manifest = crate::search::model_manager::default_model_manifest();
-    let semantic_model_present =
-        crate::search::model_download::check_model_installed(&model_dir, &manifest).is_ready();
-
-    // "Existing indexed DB" means a DB that actually carries content, so an
-    // empty/just-created DB still routes the user to a first index.
-    let indexed_conversation_count = if db_path.exists() {
-        crate::storage::sqlite::FrankenStorage::open(db_path)
-            .ok()
-            .and_then(|storage| storage.total_conversation_count().ok())
-            .unwrap_or(0) as u64
-    } else {
-        0
-    };
-    let existing_indexed_db = indexed_conversation_count > 0;
-
-    OnboardingObservation {
-        providers,
-        semantic_model_present,
-        remote_sources_configured,
-        existing_indexed_db,
-        indexed_conversation_count,
-    }
-}
-
-/// Human-readable onboarding summary (never a bare TUI).
-fn print_onboarding_human(
-    report: &crate::source_onboarding::OnboardingReport,
-    observation: &crate::source_onboarding::OnboardingObservation,
-) {
-    use colored::Colorize;
-    println!("{}", "CASS onboarding".bold());
-    if report.providers.is_empty() {
-        println!("  No agent session providers detected yet.");
-    } else {
-        let lines: Vec<String> = report
-            .providers
-            .iter()
-            .map(|p| {
-                format!(
-                    "    - {} [{}] ~{} sessions",
-                    p.name,
-                    p.readiness.as_str(),
-                    p.estimated_sessions
-                )
-            })
-            .collect();
-        println!("  Detected providers:");
-        println!("{}", lines.join("\n"));
-    }
-    if !report.excluded_providers.is_empty() {
-        println!(
-            "  Excluded providers: {}",
-            report.excluded_providers.join(", ")
-        );
-    }
-    println!(
-        "  Estimated sessions to index: {}",
-        report.estimated_index_sessions
-    );
-    if observation.existing_indexed_db {
-        println!(
-            "  Already indexed conversations: {}",
-            observation.indexed_conversation_count
-        );
-    }
-    println!("  {}", report.semantic_note());
-    if let Some(hint) = &report.remote_hint {
-        println!("  {hint}");
-    }
-    println!();
-    println!("  {} {}", "Recommended:".bold(), report.recommended_command);
-    println!("  Undo: {}", report.rollback_note);
-}
-
-/// Run the TTY-only guided review shell over an already-gathered onboarding
-/// report. The shell is deliberately advisory: choosing an item only explains
-/// the observation or prints the next command. It never executes that command,
-/// indexes data, installs a model, or changes source configuration.
-fn run_onboarding_interactive_wizard(
-    report: &crate::source_onboarding::OnboardingReport,
-    observation: &crate::source_onboarding::OnboardingObservation,
-) -> CliResult<()> {
-    use colored::Colorize;
-    use dialoguer::{Confirm, Select, theme::ColorfulTheme};
-
-    const MENU_ITEMS: [&str; 4] = [
-        "Show the safest next command",
-        "Review providers and indexing scope",
-        "Review privacy, search mode, and undo",
-        "Exit without changes",
-    ];
-
-    println!();
-    println!("{}", "Read-only guided review".bold().cyan());
-    println!("  This wizard explains the plan. It will not run commands or change CASS state.");
-
-    loop {
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("What would you like to review?")
-            .items(MENU_ITEMS)
-            .default(0)
-            .interact_opt()
-            .map_err(|err| CliError::unknown(format!("onboarding wizard input failed: {err}")))?;
-
-        let Some(selection) = selection else {
-            println!("  Input cancelled; no changes were made.");
-            return Ok(());
-        };
-
-        match selection {
-            0 => {
-                println!();
-                println!("{}", "Recommended next command".bold());
-                println!("  {}", report.recommended_command.cyan());
-                println!("  This wizard did not run that command.");
-            }
-            1 => {
-                println!();
-                println!("{}", "Provider and indexing scope".bold());
-                if report.providers.is_empty() {
-                    println!("  No provider roots were detected.");
-                } else {
-                    for provider in &report.providers {
-                        println!(
-                            "  - {}: {} (~{} sessions)",
-                            provider.name,
-                            provider.readiness.as_str(),
-                            provider.estimated_sessions
-                        );
-                    }
-                }
-                println!(
-                    "  Estimated new sessions in scope: {}",
-                    report.estimated_index_sessions
-                );
-                println!(
-                    "  Conversations already indexed: {}",
-                    observation.indexed_conversation_count
-                );
-            }
-            2 => {
-                println!();
-                println!("{}", "Privacy, search mode, and undo".bold());
-                println!(
-                    "  Provider discovery reads directory metadata; this review does not index session content."
-                );
-                println!("  {}", report.semantic_note());
-                println!("  Undo: {}", report.rollback_note);
-                if let Some(hint) = &report.remote_hint {
-                    println!("  Remote sources: {hint}");
-                }
-            }
-            _ => {
-                println!("  No changes were made.");
-                return Ok(());
-            }
-        }
-
-        let review_another = Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt("Review another section?")
-            .default(false)
-            .interact()
-            .map_err(|err| CliError::unknown(format!("onboarding wizard input failed: {err}")))?;
-        if !review_another {
-            println!("  No changes were made.");
-            return Ok(());
-        }
-    }
-}
-
-/// `cass onboarding` — read-only first-run onboarding/readiness surface. Gathers
-/// a live observation, maps it through the pure `source_onboarding::recommend`
-/// core, and emits the deterministic report (`--json` for agents, otherwise a
-/// human summary). When both standard streams are terminals, the summary is
-/// followed by a read-only guided review shell. Mutation-free (beads 5u82n.6
-/// and 5u82n.16).
-fn run_onboarding(
-    data_dir_override: &Option<PathBuf>,
-    db_override: Option<PathBuf>,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-
-    let observation = gather_onboarding_observation(&data_dir, &db_path);
-    let report = crate::source_onboarding::recommend(&observation);
-
-    if let Some(format) = output_format {
-        let mut payload = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
-        if let serde_json::Value::Object(map) = &mut payload {
-            map.insert(
-                "data_dir".to_string(),
-                serde_json::Value::String(data_dir.display().to_string()),
-            );
-            map.insert(
-                "indexed_conversation_count".to_string(),
-                serde_json::json!(observation.indexed_conversation_count),
-            );
-        }
-        return output_structured_value(payload, format);
-    }
-
-    print_onboarding_human(&report, &observation);
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        run_onboarding_interactive_wizard(&report, &observation)?;
-    }
-    Ok(())
-}
-
-/// `cass guide [INTENT]` — intent-to-command planner plus gated runner (beads
-/// `…5u82n.1` and `…5u82n.17`). Dry-run is the default. Apply mode automatically
-/// evaluates only allowlisted read-only proof adapters and requires an explicit
-/// confirmation for each exact mutating step; workflow macro strings are never
-/// interpreted by a shell.
-///
-/// Live mode derives the determinable preflight facts (db present, lexical index
-/// present, search assets ready) from a single `state_meta_json` snapshot; facts
-/// it cannot determine are left for the operator to confirm. `--fixture <file>`
-/// supplies `{ "facts": {…}, "intent"?: "…" }` for deterministic scenarios.
-#[allow(clippy::too_many_arguments)]
-fn run_guide(
-    intent_words: &[String],
-    fixture: Option<&Path>,
-    data_dir_override: &Option<PathBuf>,
-    db_override: Option<PathBuf>,
-    output_format: Option<RobotFormat>,
-    apply: bool,
-    confirmed_steps: &[usize],
-    confirmed_facts: &[String],
-    accepted_privacy_tier: Option<&str>,
-    accepted_cost_risk: Option<&str>,
-    allow_rch: bool,
-    stop_conditions_clear: bool,
-) -> CliResult<()> {
-    let mut intent = intent_words.join(" ");
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-
-    // Fixture mode: facts (and optionally a default intent) from a checked-in file.
-    let (mut facts, source_kind, fixture_id, fixture_context): (
-        Option<serde_json::Value>,
-        &str,
-        String,
-        Option<serde_json::Value>,
-    ) = if let Some(path) = fixture {
-        let raw = std::fs::read_to_string(path).map_err(|err| CliError {
-                code: 10,
-                kind: CliErrorKind::Config.kind_str(),
-                message: format!("could not read guide fixture {}: {err}", path.display()),
-                hint: Some(
-                    "Pass --fixture <file> with a JSON object like {\"facts\": {\"db_present\": true}}."
-                        .to_string(),
-                ),
-                retryable: false,
-            })?;
-        let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|err| CliError {
-            code: 10,
-            kind: CliErrorKind::Config.kind_str(),
-            message: format!("invalid guide fixture {}: {err}", path.display()),
-            hint: Some("The fixture must be a JSON object with a `facts` map.".to_string()),
-            retryable: false,
-        })?;
-        if intent.trim().is_empty()
-            && let Some(fixture_intent) = parsed.get("intent").and_then(serde_json::Value::as_str)
-        {
-            intent = fixture_intent.to_string();
-        }
-        let facts = parsed.get("facts").cloned();
-        let id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("fixture")
-            .to_string();
-        (facts, "fixture", id, Some(parsed))
-    } else {
-        // Live mode: derive the determinable facts from one state snapshot.
-        let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-        let state = state_meta_json(&data_dir, &db_path, 300, true);
-        let db_present = state
-            .pointer("/database/exists")
-            .and_then(serde_json::Value::as_bool);
-        let index_present = state
-            .pointer("/index/exists")
-            .and_then(serde_json::Value::as_bool);
-        let rebuild_active = state
-            .pointer("/rebuild/active")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let search_assets_ready = match (index_present, db_present) {
-            (Some(idx), Some(db)) => Some(idx && db && !rebuild_active),
-            _ => None,
-        };
-        let facts = crate::guide_planner::preflight_facts(
-            index_present,
-            db_present,
-            search_assets_ready,
-            None,
-            None,
-        );
-        (Some(facts), "live", "live".to_string(), None)
-    };
-
-    // Operator-context facts are explicit grants, never inferred. They are
-    // overlaid before readiness classification and echoed in the transcript.
-    if !confirmed_facts.is_empty() {
-        let facts = facts.get_or_insert_with(|| serde_json::json!({}));
-        let map = facts.as_object_mut().ok_or_else(|| CliError {
-            code: 10,
-            kind: CliErrorKind::Config.kind_str(),
-            message: "guide facts must be a JSON object".to_string(),
-            hint: Some(
-                "Use a fixture shaped like {\"facts\": {\"db_present\": true}}.".to_string(),
-            ),
-            retryable: false,
-        })?;
-        for fact in confirmed_facts {
-            map.insert(fact.clone(), serde_json::Value::Bool(true));
-        }
-    }
-
-    let plan =
-        crate::guide_planner::render_guide_plan(&intent, facts.as_ref(), source_kind, &fixture_id);
-    let payload = crate::guide_runner::render_execution(
-        plan,
-        &crate::guide_runner::GuideRunRequest {
-            apply,
-            confirmed_steps,
-            confirmed_facts,
-            accepted_privacy_tier,
-            accepted_cost_risk,
-            allow_rch,
-            stop_conditions_clear,
-            source_kind,
-            fixture_context: fixture_context.as_ref(),
-            data_dir: &data_dir,
-        },
-    );
-
-    if let Some(format) = output_format {
-        return output_structured_value(payload, format);
-    }
-
-    print_guide_human(&payload);
-    Ok(())
-}
-
-/// Human-readable guide summary (never a bare TUI). The richer interactive
-/// shell is a later dependent surface; this stays terse and copy-safe.
-fn print_guide_human(payload: &serde_json::Value) {
-    use colored::Colorize;
-    let intent = payload
-        .pointer("/intent/raw")
-        .and_then(serde_json::Value::as_str);
-    match intent {
-        None => {
-            // Catalog mode.
-            println!("{}", "CASS guide — known intents".bold());
-            if let Some(intents) = payload
-                .get("known_intents")
-                .and_then(serde_json::Value::as_array)
-            {
-                for entry in intents {
-                    let name = entry
-                        .get("intent")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let summary = entry
-                        .get("summary")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    println!("  - {} — {summary}", name.cyan());
-                }
-            }
-            println!();
-            println!("  Plan one: cass guide <intent> --json");
-        }
-        Some(raw) => {
-            let recognized = payload
-                .pointer("/intent/recognized")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if !recognized {
-                println!("{} {}", "Unknown intent:".bold(), raw);
-                println!("  Try one of the known intents:");
-                if let Some(intents) = payload
-                    .get("known_intents")
-                    .and_then(serde_json::Value::as_array)
-                {
-                    for entry in intents {
-                        if let Some(name) = entry.get("intent").and_then(serde_json::Value::as_str)
-                        {
-                            println!("    - {}", name.cyan());
-                        }
-                    }
-                }
-                println!("  Docs: cass robot-docs guide");
-                return;
-            }
-            let title = payload
-                .pointer("/plan/title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let readiness = payload
-                .get("readiness")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            println!("{} {}", "Guide:".bold(), title);
-            println!("  Intent: {raw}  |  Readiness: {readiness}");
-            if let Some(steps) = payload
-                .pointer("/plan/steps")
-                .and_then(serde_json::Value::as_array)
-            {
-                println!("  Steps:");
-                for step in steps {
-                    let order = step
-                        .get("order")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    let intent = step
-                        .get("intent")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let gate = step
-                        .get("proof_gate")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    println!("    {order}. {intent}  (proof: {gate})");
-                }
-            }
-            if let Some(action) = payload
-                .get("recommended_action")
-                .and_then(serde_json::Value::as_str)
-            {
-                println!("  Next: {action}");
-            }
-            let execution_mode = payload
-                .pointer("/execution/mode")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("dry-run");
-            let execution_status = payload
-                .pointer("/execution/overall_status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("dry-run");
-            println!("  Mode: {execution_mode}  |  Execution: {execution_status}");
-            println!("  (pass --json for the argv, proof-gate, and confirmation transcript)");
-        }
-    }
-}
-
 fn diagnostics_connector_paths(
     _home: &std::path::Path,
     _config_dir: &std::path::Path,
@@ -72524,203 +67955,6 @@ fn truncate_end(s: &str, max_chars: usize) -> String {
 
 /// Quick health check for agents: index freshness, db stats, recommended action.
 /// Designed to be fast (<100ms) for pre-search checks.
-/// Bounded budget (ms) for `cass status` before it sheds optional/expensive
-/// sections. Overridable via `CASS_STATUS_BUDGET_MS`; defaults to 8s (the report
-/// observed status timing out under an 8s cap). Bead uojcg.2.2.
-fn status_budget_ms() -> u64 {
-    dotenvy::var("CASS_STATUS_BUDGET_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .unwrap_or(8000)
-}
-
-/// Test-only deterministic slowdown so E2E can trip the status budget. Honored
-/// only when `CASS_TEST_STATUS_SLOW_MS` is set (operators never set it). Bead
-/// uojcg.2.2.
-fn maybe_test_status_delay() {
-    if let Ok(raw) = dotenvy::var("CASS_TEST_STATUS_SLOW_MS")
-        && let Ok(ms) = raw.parse::<u64>()
-        && ms > 0
-    {
-        std::thread::sleep(Duration::from_millis(ms));
-    }
-}
-
-/// Build a read-only [`ProjectionSignals`](crate::root_cause_projection::ProjectionSignals)
-/// snapshot from the shared status/health `state` JSON so status/triage/doctor
-/// can emit a [`RootCauseAttribution`](crate::root_cause_taxonomy::RootCauseAttribution)
-/// in `--json` (bead cass-fleet-resilience-20260608-uojcg.9.2 / 9.5).
-///
-/// Conservative by construction: a signal is set only when the observed fact
-/// clearly implicates that family, so the projection's false-positive
-/// guardrails keep ambiguous or merely-degraded states `Unknown`. A *retryable*
-/// open error, a permission/not-found open error, or semantic assets that are
-/// simply absent-by-policy never drive an attribution. `host_disk_free_pct` is
-/// supplied by callers that cheaply measure it (doctor); status/triage pass
-/// `None` to keep the fast readiness surfaces probe-free.
-fn gather_projection_signals_from_state(
-    state: &serde_json::Value,
-    host_disk_free_pct: Option<f64>,
-) -> crate::root_cause_projection::ProjectionSignals {
-    let mut signals = crate::root_cause_projection::ProjectionSignals {
-        host_disk_free_pct,
-        ..Default::default()
-    };
-
-    // frankensqlite storage: a non-retryable open failure whose error text names
-    // a storage-engine fault (corruption / OpenRead / bad format) — not a
-    // permission/not-found/busy condition, which are host/transient, not storage
-    // corruption.
-    let open_retryable = state
-        .pointer("/database/open_retryable")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if !open_retryable
-        && let Some(err) = state
-            .pointer("/database/open_error")
-            .and_then(serde_json::Value::as_str)
-    {
-        let lower = err.to_ascii_lowercase();
-        let storage_fault = lower.contains("openread")
-            || lower.contains("malformed")
-            || lower.contains("corrupt")
-            || lower.contains("not a database")
-            || lower.contains("disk image")
-            || lower.contains("sqlite_");
-        if storage_fault {
-            signals.open_read_failure = true;
-        }
-    }
-
-    // cass derived state: the lexical index is empty while the canonical DB has
-    // messages — two cass-owned facts disagree. A cold/empty dir is not this.
-    if state
-        .pointer("/index/empty_with_messages")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        signals.derived_truth_table_mismatch = true;
-    }
-
-    // semantic assets: the model was present but failed to load. Absent /
-    // not-initialized is opt-in policy, not a fault.
-    if state
-        .pointer("/semantic/availability")
-        .and_then(serde_json::Value::as_str)
-        == Some("load_failed")
-    {
-        signals.semantic_requested_but_missing = true;
-    }
-
-    signals
-}
-
-#[cfg(test)]
-mod root_cause_signal_gather_tests {
-    use super::gather_projection_signals_from_state;
-    use crate::root_cause_projection::project_root_cause;
-    use crate::root_cause_taxonomy::{AttributionConfidence, RootCauseFamily};
-
-    #[test]
-    fn malformed_db_open_failure_attributes_storage() {
-        let state = serde_json::json!({
-            "database": {
-                "open_error": "OpenRead failed: database disk image is malformed",
-                "open_retryable": false
-            }
-        });
-        let s = gather_projection_signals_from_state(&state, None);
-        assert!(s.open_read_failure);
-        assert_eq!(
-            project_root_cause(&s).family,
-            RootCauseFamily::FrankensqliteStorage
-        );
-    }
-
-    #[test]
-    fn retryable_or_permission_open_error_is_not_a_storage_fault() {
-        for (err, retryable) in [
-            ("database is locked", true),
-            ("permission denied", false),
-            ("no such file or directory", false),
-        ] {
-            let state =
-                serde_json::json!({"database": {"open_error": err, "open_retryable": retryable}});
-            let s = gather_projection_signals_from_state(&state, None);
-            assert!(!s.open_read_failure, "{err} must not be a storage fault");
-            assert_eq!(project_root_cause(&s).family, RootCauseFamily::Unknown);
-        }
-    }
-
-    #[test]
-    fn empty_index_with_messages_attributes_derived_state() {
-        let state = serde_json::json!({"index": {"empty_with_messages": true}});
-        let s = gather_projection_signals_from_state(&state, None);
-        assert!(s.derived_truth_table_mismatch);
-        assert_eq!(
-            project_root_cause(&s).family,
-            RootCauseFamily::CassDerivedState
-        );
-    }
-
-    #[test]
-    fn semantic_load_failed_is_a_fault_but_absent_is_not() {
-        let failed = serde_json::json!({"semantic": {"availability": "load_failed"}});
-        assert!(gather_projection_signals_from_state(&failed, None).semantic_requested_but_missing);
-        let absent = serde_json::json!({"semantic": {"availability": "not_initialized"}});
-        assert!(
-            !gather_projection_signals_from_state(&absent, None).semantic_requested_but_missing
-        );
-    }
-
-    #[test]
-    fn host_disk_pct_below_threshold_attributes_host_pressure() {
-        let s = gather_projection_signals_from_state(&serde_json::json!({}), Some(2.0));
-        assert_eq!(
-            project_root_cause(&s).family,
-            RootCauseFamily::HostDiskPressure
-        );
-        // Abundant free space rules it out.
-        let plenty = gather_projection_signals_from_state(&serde_json::json!({}), Some(60.0));
-        assert_eq!(project_root_cause(&plenty).family, RootCauseFamily::Unknown);
-    }
-
-    #[test]
-    fn empty_state_is_explicit_unknown() {
-        let s = gather_projection_signals_from_state(&serde_json::json!({}), None);
-        let a = project_root_cause(&s);
-        assert_eq!(a.family, RootCauseFamily::Unknown);
-        assert_eq!(a.confidence, AttributionConfidence::Unknown);
-    }
-}
-
-fn probe_daemon_runtime_for_diagnostics(
-    data_dir: &std::path::Path,
-) -> crate::daemon_runtime_state::DaemonRuntimeDiagnostic {
-    #[cfg(unix)]
-    {
-        crate::daemon::client::probe_daemon_runtime(
-            data_dir,
-            crate::daemon::client::DEFAULT_RUNTIME_PROBE_TIMEOUT,
-        )
-    }
-
-    #[cfg(not(unix))]
-    {
-        crate::daemon_runtime_state::DaemonRuntimeDiagnostic::from_observation(
-            crate::daemon_runtime_state::DaemonRuntimeObservation {
-                data_dir: Some(data_dir.display().to_string()),
-                probe_incomplete: true,
-                connect_error: Some(
-                    "daemon runtime probing is unavailable on this platform".to_string(),
-                ),
-                ..Default::default()
-            },
-        )
-    }
-}
-
 fn run_status(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
@@ -72730,14 +67964,8 @@ fn run_status(
 ) -> CliResult<()> {
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    // Bounded execution budget for the robot surface (uojcg.2.2): when the
-    // optional/expensive sections would exceed it, status sheds them and returns
-    // a parseable partial result (with timed_out + skipped_sections) instead of
-    // blocking on a slow filesystem/coverage scan.
-    let status_budget = crate::robot_budget_envelope::RobotBudget::new(status_budget_ms());
     let mut state = state_meta_json_for_status(&data_dir, &db_path, stale_threshold);
     refresh_state_database_counts_if_needed(&mut state, &db_path, "status");
-    maybe_test_status_delay();
 
     let index_exists = state
         .get("index")
@@ -72866,32 +68094,13 @@ fn run_status(
     let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
     let not_initialized =
         cass_not_initialized(db_exists, lexical_index_initialized, rebuild_active);
-    // #331: a fingerprint-still-valid deep-probe attestation that proved
-    // committed structural corruption must gate top-level `healthy` — a
-    // known-bad canonical store cannot read as healthy just because it still
-    // opens and the derived lexical index remains complete.
-    let attested_integrity_failure = db_exists
-        && crate::search::storage_integrity::load_matching_integrity_attestation(
-            &data_dir, &db_path,
-        )
-        .is_some_and(|attestation| {
-            attestation.verdict
-                == crate::search::storage_integrity::IntegrityAttestationVerdict::Fail
-        });
-    if attested_integrity_failure {
-        warnings.push(
-            "a recent integrity probe proved committed structural corruption in the canonical archive (see storage_integrity); run 'cass doctor check --json' and plan a recovery before trusting new writes"
-                .to_string(),
-        );
-    }
     let healthy = db_exists
         && db_available
         && index_exists
         && index_fresh
         && !rebuild_active
         && !index_empty_with_messages
-        && !ingest_quarantine_critical
-        && !attested_integrity_failure;
+        && !ingest_quarantine_critical;
     // Stalled rebuilds are reported as a distinct status so operators
     // can tell a wedged indexer apart from a slow-but-progressing one
     // (issue #258). `stalled` implies `rebuild_active=true`, but it
@@ -72958,6 +68167,10 @@ fn run_status(
     });
 
     if let Some(fmt) = structured_format {
+        let quarantine_report = collect_diag_quarantine_report(
+            &data_dir,
+            &crate::search::tantivy::expected_index_dir(&data_dir),
+        );
         let policy_registry = state
             .get("policy_registry")
             .cloned()
@@ -72965,71 +68178,41 @@ fn run_status(
         let topology_budget =
             serde_json::to_value(crate::topology_budget::inspect_host_topology_budget())
                 .unwrap_or(serde_json::Value::Null);
-        let daemon_runtime = probe_daemon_runtime_for_diagnostics(&data_dir);
-
-        // Status is a readiness surface, not a doctor run. Deep coverage checks
-        // verify raw-mirror manifests and can hash very large archived blobs, and
-        // the quarantine scan walks the filesystem; doing that here made
-        // `cass status --json` CPU-bound on real archives. These optional sections
-        // are now shed when the bounded budget is tripped (uojcg.2.2), so status
-        // returns a parseable PARTIAL result with timed_out + skipped_sections
-        // rather than blocking. The core readiness above is cheap and always
-        // present; operators are routed to `cass doctor check` for the rest.
-        let mut skipped_sections: Vec<String> = Vec::new();
-        let (quarantine_value, coverage_value, remote_sync_value, doctor_summary_value) =
-            if status_budget.is_healthy() {
-                let quarantine_report = collect_diag_quarantine_report(
-                    &data_dir,
-                    &crate::search::tantivy::expected_index_dir(&data_dir),
-                );
-                let coverage_risk = doctor_fast_coverage_risk_unchecked(db_exists);
-                let sources_path = doctor_sources_config_path(&data_dir);
-                let remote_source_sync_report =
-                    collect_doctor_remote_source_sync_fast_report(&data_dir, &sources_path);
-                let remote_source_sync_summary = doctor_remote_source_sync_runtime_summary(
-                    &remote_source_sync_report,
-                    "status-inline-local-config",
-                    false,
-                );
-                let doctor_summary = build_doctor_runtime_summary(DoctorRuntimeSummaryInput {
-                    surface: "status-summary",
-                    state: &state,
-                    status,
-                    healthy,
-                    initialized: !not_initialized,
-                    db_exists,
-                    rebuild_active,
-                    coverage_risk: &coverage_risk,
-                    coverage_source: "status-fast-state",
-                    coverage_checked: false,
-                    remote_source_sync_summary: Some(&remote_source_sync_summary),
-                    quarantine_summary: Some(&quarantine_report.summary),
-                    recommended_action: recommended_action.as_ref(),
-                    data_dir: &data_dir,
-                });
-                (
-                    serde_json::to_value(&quarantine_report).unwrap_or(serde_json::Value::Null),
-                    serde_json::to_value(&coverage_risk).unwrap_or(serde_json::Value::Null),
-                    serde_json::to_value(&remote_source_sync_summary)
-                        .unwrap_or(serde_json::Value::Null),
-                    serde_json::to_value(&doctor_summary).unwrap_or(serde_json::Value::Null),
-                )
-            } else {
-                for section in [
-                    "quarantine",
-                    "coverage_risk",
-                    "remote_source_sync",
-                    "doctor_summary",
-                ] {
-                    skipped_sections.push(section.to_string());
-                }
-                (
-                    serde_json::Value::Null,
-                    serde_json::Value::Null,
-                    serde_json::Value::Null,
-                    serde_json::Value::Null,
-                )
-            };
+        // Status is a readiness surface, not a doctor run. Deep coverage
+        // checks verify raw-mirror manifests and can hash very large archived
+        // blobs; doing that here made `cass status --json` CPU-bound on real
+        // archives. Keep the provenance explicit and route operators to doctor
+        // for sole-copy/source-coverage analysis.
+        let (coverage_risk, coverage_source, coverage_checked) = (
+            doctor_fast_coverage_risk_unchecked(db_exists),
+            "status-fast-state",
+            false,
+        );
+        let sources_path = doctor_sources_config_path(&data_dir);
+        let remote_source_sync_report =
+            collect_doctor_remote_source_sync_fast_report(&data_dir, &sources_path);
+        let remote_source_archive_checked = false;
+        let remote_source_sync_summary = doctor_remote_source_sync_runtime_summary(
+            &remote_source_sync_report,
+            "status-inline-local-config",
+            remote_source_archive_checked,
+        );
+        let doctor_summary = build_doctor_runtime_summary(DoctorRuntimeSummaryInput {
+            surface: "status-summary",
+            state: &state,
+            status,
+            healthy,
+            initialized: !not_initialized,
+            db_exists,
+            rebuild_active,
+            coverage_risk: &coverage_risk,
+            coverage_source,
+            coverage_checked,
+            remote_source_sync_summary: Some(&remote_source_sync_summary),
+            quarantine_summary: Some(&quarantine_report.summary),
+            recommended_action: recommended_action.as_ref(),
+            data_dir: &data_dir,
+        });
         let recommended_commands = readiness_recommended_commands(
             &data_dir,
             &db_path,
@@ -73039,12 +68222,6 @@ fn run_status(
             not_initialized,
             recommended_action.as_deref(),
         );
-        let budget_timed_out = status_budget.is_exhausted();
-        let recommended_next_probe = if skipped_sections.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::Value::String("cass doctor check --json".to_string())
-        };
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
@@ -73072,45 +68249,12 @@ fn run_status(
             "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
             "policy_registry": policy_registry,
             "topology_budget": topology_budget,
-            "daemon_runtime": daemon_runtime,
-            "doctor_summary": doctor_summary_value,
-            "remote_source_sync": remote_sync_value,
-            "coverage_risk": coverage_value,
-            "quarantine": quarantine_value,
-            // uojcg.3.3: compact "is search missing known conversations?" verdict,
-            // derived from the cheap ingest-quarantine counts above so health and
-            // status agree. `quarantine` (above) is the deep, budget-shed scan.
-            "search_completeness": serde_json::to_value(
-                crate::search::quarantine_status::project_search_completeness(
-                    quarantined_conversations,
-                    ingest_quarantine_critical,
-                ),
-            )
-            .unwrap_or(serde_json::Value::Null),
-            // uojcg.9.2/9.5: likely root-cause family attributed from the live
-            // state signals (storage open failure, derived truth-table mismatch,
-            // semantic load failure). Conservative — Unknown when no signal
-            // implicates a family. Status is probe-free, so no host-disk signal.
-            "root_cause": serde_json::to_value(
-                crate::root_cause_projection::project_root_cause(
-                    &gather_projection_signals_from_state(&state, None),
-                ),
-            )
-            .unwrap_or(serde_json::Value::Null),
-            // qfswx: project the `.14.1` storage-integrity vocabulary doctor
-            // emits onto status too, so every truth surface agrees. Probe-free:
-            // derives ok / openread_failed / derived_only_drift /
-            // unknown_deferred from the db-open + index-drift signals above.
-            "storage_integrity": storage_integrity_value_from_state(&data_dir, &db_path, &state, not_initialized),
+            "doctor_summary": doctor_summary,
+            "remote_source_sync": remote_source_sync_summary,
+            "coverage_risk": coverage_risk,
+            "quarantine": quarantine_report,
             "recommended_action": recommended_action,
             "recommended_commands": recommended_commands,
-            "budget": serde_json::json!({
-                "elapsed_ms": status_budget.elapsed_ms(),
-                "budget_ms": status_budget.total_ms(),
-                "timed_out": budget_timed_out,
-                "skipped_sections": skipped_sections,
-                "recommended_next_probe": recommended_next_probe,
-            }),
             "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
         });
         return output_structured_value(payload, fmt);
@@ -73242,13 +68386,6 @@ fn run_status(
         println!();
         println!("Recommended: {action}");
     }
-
-    // Bead v6vuz: mirror the robot readiness vocabulary in the human surface so
-    // the operator-facing summary never contradicts `cass status --json`.
-    print_human_readiness_section(
-        &state,
-        crate::search::readiness_projection::SurfaceKind::Status,
-    );
 
     Ok(())
 }
@@ -73795,7 +68932,6 @@ fn run_triage(
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild_progress": rebuild_progress,
             "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
-            "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
         },
         "discovery": {
             "capabilities_command": "cass capabilities --json",
@@ -73803,9 +68939,8 @@ fn run_triage(
             "docs_command": "cass robot-docs guide",
             "api_version_command": "cass api-version --json",
         },
-        "starter_workflows": starter_workflows,
-        "mistake_recoveries": mistake_recoveries,
-        "budget": budget,
+        "starter_workflows": build_workflow_capabilities(),
+        "mistake_recoveries": build_mistake_recovery_capabilities(),
         "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
     });
 
@@ -74326,16 +69461,6 @@ fn run_health(
             "coverage_risk": coverage_risk,
             "policy_registry": policy_registry,
             "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
-            // uojcg.3.3: same compact search-completeness verdict as `cass status`
-            // so the cheap health surface never contradicts status on whether
-            // quarantine makes search incomplete.
-            "search_completeness": serde_json::to_value(
-                crate::search::quarantine_status::project_search_completeness(
-                    quarantined_conversations,
-                    ingest_quarantine_critical,
-                ),
-            )
-            .unwrap_or(serde_json::Value::Null),
             "responsiveness": responsiveness,
             "parallel_wal_shadow": parallel_wal_shadow,
             // [coding_agent_session_search-yvv7r + waijq] Runtime optimization
@@ -74399,17 +69524,6 @@ fn run_health(
         } else {
             println!("Run 'cass status --json' for the exact readiness gap.");
         }
-    }
-
-    // Bead v6vuz: append the bounded readiness summary on the human surface
-    // only (never in `--json` mode, which must stay a pure JSON payload). The
-    // Health surface renders a compact partial — the projection is pure over
-    // the snapshot already built above, so health stays the <50ms fast surface.
-    if structured_format.is_none() {
-        print_human_readiness_section(
-            &state,
-            crate::search::readiness_projection::SurfaceKind::Health,
-        );
     }
 
     let final_error = if healthy {
@@ -74960,82 +70074,6 @@ mod cli_read_db_tests {
         );
     }
 
-    /// [coding_agent_session_search #301 truthfulness reconciliation]
-    /// `cass health` and `cass status` MUST agree on index staleness for
-    /// the SAME DB. Pre-fix, health passed skip_db_open=true and never
-    /// read `last_scan_ts`, so the scan-ahead-of-projection check could
-    /// not fire — health reported `fresh`/`status=ready` while status
-    /// reported `stale`. Now health does a watermarks-only probe so the
-    /// staleness inputs are identical. Guard both halves: the verdicts
-    /// match AND health still honors its gi4oy/d0rmo contract (the open
-    /// is assumed-good with null counts; only the watermarks are read).
-    #[test]
-    fn health_and_status_agree_on_scan_ahead_of_projection_stale() {
-        let (temp, db_path) = seed_cli_db();
-        {
-            let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
-            storage
-                .set_last_scan_ts(1_733_000_010_000)
-                .expect("set scan ahead");
-        }
-
-        let status = state_meta_json_for_status(temp.path(), &db_path, 60);
-        let health = state_meta_json_for_health(temp.path(), &db_path, 60);
-
-        for (label, state) in [("status", &status), ("health", &health)] {
-            let index = state
-                .get("index")
-                .and_then(serde_json::Value::as_object)
-                .unwrap_or_else(|| panic!("{label} index state"));
-            assert_eq!(
-                index.get("fresh").and_then(|v| v.as_bool()),
-                Some(false),
-                "{label} must report fresh=false on scan-ahead-of-projection"
-            );
-            assert_eq!(
-                index.get("stale").and_then(|v| v.as_bool()),
-                Some(true),
-                "{label} must report stale=true on scan-ahead-of-projection"
-            );
-            assert_eq!(
-                index.get("status").and_then(|v| v.as_str()),
-                Some("stale"),
-                "{label} must report status=stale on scan-ahead-of-projection"
-            );
-        }
-
-        // Health must STILL honor the gi4oy/d0rmo fast-surface contract:
-        // the watermarks-only probe reads the meta watermarks but reports
-        // open_skipped=true, counts_skipped=true, and null counts so the
-        // 0-counts are an intentional skip signal, not missing data.
-        let health_db = health
-            .get("database")
-            .and_then(serde_json::Value::as_object)
-            .expect("health database state");
-        assert_eq!(
-            health_db.get("open_skipped").and_then(|v| v.as_bool()),
-            Some(true),
-            "health watermarks-only probe must still report open_skipped=true"
-        );
-        assert_eq!(
-            health_db.get("counts_skipped").and_then(|v| v.as_bool()),
-            Some(true),
-            "health watermarks-only probe must still report counts_skipped=true"
-        );
-        assert!(
-            health_db
-                .get("conversations")
-                .is_some_and(serde_json::Value::is_null),
-            "health must still report conversations=null (counts skipped): {health_db:?}"
-        );
-        assert!(
-            health_db
-                .get("messages")
-                .is_some_and(serde_json::Value::is_null),
-            "health must still report messages=null (counts skipped): {health_db:?}"
-        );
-    }
-
     #[test]
     fn status_state_still_probes_malformed_non_file_db_path() {
         let temp = TempDir::new().expect("tempdir");
@@ -75110,7 +70148,7 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn refresh_state_database_counts_materializes_small_db_count_envelope() -> anyhow::Result<()> {
+    fn refresh_state_database_counts_keeps_large_db_counts_skipped() {
         let (_temp, db_path) = seed_cli_db();
         let mut state = serde_json::json!({
             "database": {
@@ -75126,70 +70164,23 @@ mod cli_read_db_tests {
         let database = state
             .get("database")
             .and_then(|value| value.as_object())
-            .ok_or_else(|| anyhow::anyhow!("database object missing"))?;
-        anyhow::ensure!(
+            .expect("database object");
+        assert_eq!(
             database
                 .get("counts_skipped")
-                .and_then(|value| value.as_bool())
-                == Some(false),
-            "small DB count refresh should clear counts_skipped"
+                .and_then(|value| value.as_bool()),
+            Some(true)
         );
-        anyhow::ensure!(
+        assert!(
             database
                 .get("conversations")
-                .and_then(|value| value.as_i64())
-                == Some(0),
-            "small DB count refresh should materialize conversation count"
+                .is_some_and(serde_json::Value::is_null)
         );
-        anyhow::ensure!(
-            database.get("messages").and_then(|value| value.as_i64()) == Some(0),
-            "small DB count refresh should materialize message count"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn refresh_state_database_counts_keeps_large_db_counts_skipped() -> anyhow::Result<()> {
-        let (_temp, db_path) = seed_cli_db();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&db_path)?
-            .set_len(STATUS_COUNT_SCAN_MAX_DB_BYTES + 4096)?;
-        let mut state = serde_json::json!({
-            "database": {
-                "opened": true,
-                "conversations": serde_json::Value::Null,
-                "messages": serde_json::Value::Null,
-                "counts_skipped": true
-            }
-        });
-
-        refresh_state_database_counts_if_needed(&mut state, &db_path, "status");
-
-        let database = state
-            .get("database")
-            .and_then(|value| value.as_object())
-            .ok_or_else(|| anyhow::anyhow!("database object missing"))?;
-        anyhow::ensure!(
-            database
-                .get("counts_skipped")
-                .and_then(|value| value.as_bool())
-                == Some(true),
-            "large DB count refresh should keep counts_skipped"
-        );
-        anyhow::ensure!(
-            database
-                .get("conversations")
-                .is_some_and(serde_json::Value::is_null),
-            "large DB count refresh should leave conversation count null"
-        );
-        anyhow::ensure!(
+        assert!(
             database
                 .get("messages")
-                .is_some_and(serde_json::Value::is_null),
-            "large DB count refresh should leave message count null"
+                .is_some_and(serde_json::Value::is_null)
         );
-        Ok(())
     }
 
     #[test]
@@ -75279,11 +70270,17 @@ mod cli_read_db_tests {
 
     #[test]
     #[serial]
-    fn unsupported_semantic_policy_does_not_route_to_unloadable_embedder() {
+    fn semantic_index_embedder_policy_env_overrides_fastembed_default() {
         let _embedder = set_env("CASS_SEMANTIC_EMBEDDER", "snowflake-arctic-s");
 
-        assert_eq!(resolve_semantic_index_embedder("fastembed"), "fastembed");
-        assert_eq!(resolve_semantic_index_embedder("minilm"), "minilm");
+        assert_eq!(
+            resolve_semantic_index_embedder("fastembed"),
+            "snowflake-arctic-s"
+        );
+        assert_eq!(
+            resolve_semantic_index_embedder("minilm"),
+            "snowflake-arctic-s"
+        );
         assert_eq!(resolve_semantic_index_embedder("hash"), "hash");
     }
 
@@ -76317,9 +71314,7 @@ mod cli_read_db_tests {
         let target = resolve_resume_target(&path, None).expect("resolve");
         assert_eq!(target.agent, "opencode");
         assert_eq!(target.session_id.as_deref(), Some("sess-42"));
-        // Current OpenCode continues a session via `--session <id>`, not the
-        // removed `opencode resume <id>` subcommand (cass#316).
-        assert_eq!(target.argv, vec!["opencode", "--session", "sess-42"]);
+        assert_eq!(target.argv, vec!["opencode", "resume", "sess-42"]);
     }
 
     #[test]
@@ -76327,7 +71322,7 @@ mod cli_read_db_tests {
         // `~/.config/opencode/config.json` matches the opencode detection
         // heuristic but is NOT a session path. We must refuse to produce
         // a resume command rather than synthesize a plausible-but-wrong
-        // `opencode --session config.json` invocation.
+        // `opencode resume config.json` invocation.
         let path = PathBuf::from("/Users/ellis/.config/opencode/config.json");
         let err = resolve_resume_target(&path, None).expect_err("must reject non-session path");
         assert_eq!(err.code, 5);
@@ -76356,7 +71351,7 @@ mod cli_read_db_tests {
             .expect("explicit override must bypass parent-directory check");
         assert_eq!(target.agent, "opencode");
         assert_eq!(target.session_id.as_deref(), Some("sess-xyz"));
-        assert_eq!(target.argv, vec!["opencode", "--session", "sess-xyz"]);
+        assert_eq!(target.argv, vec!["opencode", "resume", "sess-xyz"]);
     }
 
     #[test]
@@ -76413,51 +71408,6 @@ mod cli_read_db_tests {
         assert_eq!(target.argv[0], "gemini");
         assert_eq!(target.argv[1], "session");
         assert_eq!(target.argv[2], "restore");
-    }
-
-    #[test]
-    fn resume_detects_antigravity_from_transcript_path() {
-        // cass#314: an Antigravity transcript source path resolves to
-        // `agy --conversation <uuid>`, where <uuid> is the `brain/<uuid>`
-        // directory name. The path also contains `.gemini/`, so this proves
-        // antigravity detection wins over the gemini arm.
-        let uuid = "f1e2d3c4-b5a6-4789-9abc-def012345678";
-        let path = PathBuf::from(format!(
-            "/home/dev/.gemini/antigravity-cli/brain/{uuid}/.system_generated/logs/transcript.jsonl"
-        ));
-        let target = resolve_resume_target(&path, None).expect("resolve");
-        assert_eq!(target.agent, "antigravity");
-        assert_eq!(target.session_id.as_deref(), Some(uuid));
-        assert_eq!(
-            target.argv,
-            vec!["agy", "--conversation", uuid],
-            "antigravity must resume via `agy --conversation <uuid>`"
-        );
-    }
-
-    #[test]
-    fn resume_antigravity_override_and_agy_alias() {
-        // Both `--agent antigravity` and `--agent agy` map to the antigravity
-        // slug; the UUID is recovered from the transcript path in either case.
-        let uuid = "11111111-2222-3333-4444-555555555555";
-        let path = PathBuf::from(format!(
-            "/mnt/mirror/antigravity-cli/brain/{uuid}/.system_generated/logs/transcript_full.jsonl"
-        ));
-        for alias in ["antigravity", "agy"] {
-            let target = resolve_resume_target(&path, Some(alias)).expect("resolve");
-            assert_eq!(target.agent, "antigravity");
-            assert_eq!(target.argv, vec!["agy", "--conversation", uuid]);
-        }
-    }
-
-    #[test]
-    fn resume_antigravity_rejects_path_without_uuid() {
-        // A path with no `brain/<uuid>` / `.system_generated` ancestry cannot
-        // yield a conversation id — fail explicitly rather than fabricate one.
-        let path = PathBuf::from("/home/dev/.gemini/antigravity-cli/notes.txt");
-        let err = resolve_resume_target(&path, Some("agy")).expect_err("must reject");
-        assert_eq!(err.code, 5);
-        assert_eq!(err.kind, "session-id-not-found");
     }
 
     #[test]
@@ -76626,75 +71576,6 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn extract_uuid_from_stem_handles_bare_and_prefixed_forms() {
-        // Bare UUID stem (Claude Code / legacy Codex layout).
-        assert_eq!(
-            extract_uuid_from_stem("fedc1234-babe-cafe-beef-abcdef012345").as_deref(),
-            Some("fedc1234-babe-cafe-beef-abcdef012345")
-        );
-        // Codex rollout prefix: `rollout-<ISO timestamp>-<uuid>` — the
-        // timestamp carries dashes but no 8-4-4-4-12 hex run, so only the
-        // trailing UUID is recovered.
-        assert_eq!(
-            extract_uuid_from_stem(
-                "rollout-2026-06-03T17-39-34-019e8e23-d763-76a2-9273-9fa5b5fa1204"
-            )
-            .as_deref(),
-            Some("019e8e23-d763-76a2-9273-9fa5b5fa1204")
-        );
-        // No UUID present anywhere → None (caller falls back / errors).
-        assert_eq!(extract_uuid_from_stem("notes"), None);
-        assert_eq!(extract_uuid_from_stem("2026-04-09T10-00-00_notes"), None);
-        // A UUID-shaped slice embedded in a longer hex run must be rejected by
-        // the boundary checks (no false recovery from arbitrary hex blobs).
-        assert_eq!(
-            extract_uuid_from_stem("deadbeef12345678-dead-beef-cafe-0123456789abff"),
-            None
-        );
-    }
-
-    #[test]
-    fn resume_recovers_uuid_from_codex_rollout_prefix() {
-        // Regression for cass#300: auto-detected Codex rollout files carry a
-        // `rollout-<timestamp>-` prefix on the stem. Resume must recover the
-        // canonical UUID and pass *that* (not the full stem) to `codex resume`.
-        let path = PathBuf::from(
-            "/Users/ellis/.codex/sessions/2026/06/03/rollout-2026-06-03T17-39-34-019e8e23-d763-76a2-9273-9fa5b5fa1204.jsonl",
-        );
-        let target = resolve_resume_target(&path, None)
-            .expect("prefixed Codex rollout filename must resolve");
-        assert_eq!(target.agent, "codex");
-        assert_eq!(
-            target.session_id.as_deref(),
-            Some("019e8e23-d763-76a2-9273-9fa5b5fa1204")
-        );
-        assert_eq!(
-            target.argv,
-            vec![
-                "codex".to_string(),
-                "resume".to_string(),
-                "019e8e23-d763-76a2-9273-9fa5b5fa1204".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn resume_recovers_uuid_from_codex_rollout_prefix_with_override() {
-        // `--agent codex` must also hand the bare UUID to `codex resume`, not
-        // the rollout-prefixed stem (the documented workaround is now correct).
-        let path = PathBuf::from(
-            "/tmp/exported/rollout-2026-06-03T17-39-34-019e8e23-d763-76a2-9273-9fa5b5fa1204.jsonl",
-        );
-        let target = resolve_resume_target(&path, Some("codex"))
-            .expect("explicit override on a prefixed rollout filename must resolve");
-        assert_eq!(
-            target.session_id.as_deref(),
-            Some("019e8e23-d763-76a2-9273-9fa5b5fa1204")
-        );
-        assert_eq!(target.argv[2], "019e8e23-d763-76a2-9273-9fa5b5fa1204");
-    }
-
-    #[test]
     fn run_resume_rejects_exec_with_structured_output() {
         // `--exec` + `--robot-format json` is a conflict clap cannot
         // see from the subcommand (robot_format is global). Runtime
@@ -76810,108 +71691,6 @@ mod cli_read_db_tests {
         std::fs::write(&f, content).expect("write");
         let id = extract_pi_agent_session_id(&f).expect("extract");
         assert_eq!(id, "after-blanks");
-    }
-}
-
-/// Data gathered by the bounded archive-DB doctor probe (#287): row counts,
-/// the PRAGMA integrity verdict, and (when the database is healthy) the FTS
-/// visibility state — everything `run_doctor_impl` needs to reconstruct the
-/// `database`/`fts_table` checks without touching the connection on the main
-/// thread.
-struct DoctorBoundedArchiveDbProbe {
-    conv_count: Option<i64>,
-    msg_count: Option<i64>,
-    integrity: Option<Result<DoctorDatabaseIntegrityProbe, String>>,
-    fts_state: Option<DoctorFtsTableState>,
-}
-
-enum DoctorBoundedArchiveDbProbeOutcome {
-    Completed(DoctorBoundedArchiveDbProbe),
-    TimedOut { phase: &'static str },
-}
-
-/// Hard deadline for the bounded archive-DB doctor probe (#287). Matches the
-/// 30s DB-open hard timeout by default; override via
-/// `CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS`.
-fn doctor_archive_db_probe_hard_timeout() -> Duration {
-    let secs = dotenvy::var("CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|&secs| secs > 0)
-        .unwrap_or(30);
-    Duration::from_secs(secs)
-}
-
-/// #287: the doctor's `SELECT COUNT(*)` row counts and
-/// `PRAGMA quick_check`/`integrity_check` probes used to run unbounded on the
-/// main thread, so a wedged or busy-spinning database made
-/// `cass doctor --json` emit zero stdout bytes until an external timeout
-/// killed it. Run the connection-consuming probe work on a worker thread with
-/// a hard deadline instead: on timeout the doctor marks the `database` check
-/// `status:"timeout"` (with the phase that was in flight) and continues to a
-/// final JSON verdict. The abandoned worker stays detached — the same
-/// containment contract as `open_franken_cli_read_db_with_hard_timeout`.
-fn run_bounded_doctor_archive_db_probe(
-    conn: frankensqlite::Connection,
-    db_path: &Path,
-    timeout: Duration,
-) -> DoctorBoundedArchiveDbProbeOutcome {
-    let phase = std::sync::Arc::new(std::sync::Mutex::new("row_count_conversations"));
-    let (tx, rx) = std::sync::mpsc::channel();
-    let worker_phase = std::sync::Arc::clone(&phase);
-    let worker_db_path = db_path.to_path_buf();
-    let conn = crate::storage::sqlite::SendFrankenConnection::new(conn);
-    let _probe_worker = std::thread::spawn(move || {
-        use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
-
-        let set_phase = |value: &'static str| {
-            if let Ok(mut current) = worker_phase.lock() {
-                *current = value;
-            }
-        };
-        let (conn, _, _) = conn.into_parts();
-        let conv_count: Option<i64> = conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM conversations",
-                &[],
-                |r: &frankensqlite::Row| r.get_typed(0),
-            )
-            .ok();
-        set_phase("row_count_messages");
-        let msg_count: Option<i64> = conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM messages",
-                &[],
-                |r: &frankensqlite::Row| r.get_typed(0),
-            )
-            .ok();
-        let mut integrity = None;
-        let mut fts_state = None;
-        if conv_count.is_some() && msg_count.is_some() {
-            set_phase("integrity_probe");
-            let probe = doctor_database_integrity_probe(&conn);
-            let healthy = matches!(&probe, Ok(result) if result.is_ok());
-            integrity = Some(probe);
-            if healthy {
-                set_phase("fts_probe");
-                fts_state = Some(probe_doctor_fts_table(&conn));
-            }
-        }
-        set_phase("connection_close");
-        let _ = close_franken_cli_read_db(conn, &worker_db_path, "doctor database health");
-        let _ = tx.send(DoctorBoundedArchiveDbProbe {
-            conv_count,
-            msg_count,
-            integrity,
-            fts_state,
-        });
-    });
-
-    match rx.recv_timeout(timeout) {
-        Ok(probe) => DoctorBoundedArchiveDbProbeOutcome::Completed(probe),
-        Err(_) => DoctorBoundedArchiveDbProbeOutcome::TimedOut {
-            phase: phase.lock().map(|current| *current).unwrap_or("unknown"),
-        },
     }
 }
 
@@ -77042,21 +71821,6 @@ pub(crate) fn run_doctor_impl(
     let mut db_ok = false;
     let mut db_conversations: Option<usize> = None;
     let mut db_messages: Option<usize> = None;
-    // `.14.1` storage-integrity signals (bead vl1cj): the read-only facts the
-    // database + lexical-index checks below already observe, from which the
-    // `storage_integrity` block projects a `StorageState`. Set, never compared,
-    // so lib.rs's secret-context UBS scan sees no raw equality on these.
-    let mut storage_db_open_failed = false;
-    let mut storage_integrity_failed = false;
-    let mut storage_integrity_unverified = false;
-    let mut storage_probe_timed_out = false;
-    let mut storage_lexical_index_drifted = false;
-    let mut storage_attestation_check_depth: Option<&'static str> = None;
-    let mut storage_attestation_detail: Option<String> = None;
-    let dedicated_storage_probe = crate::search::storage_integrity::probe_dedicated_storage_state(
-        &db_path,
-        Duration::from_millis(100),
-    );
     let mut auto_fix_actions: Vec<String> = Vec::new();
     let mut auto_fix_applied = false;
     let mut fs_mutation_receipts: Vec<DoctorFsMutationReceipt> = Vec::new();
@@ -77332,150 +72096,113 @@ pub(crate) fn run_doctor_impl(
     // databases without dirtying precious archive evidence during a read-only doctor check.
     let archive_db_probe_started = Instant::now();
     if db_path.exists() {
-        if dedicated_storage_probe.busy_or_locked {
-            add_check!(
-                "database",
-                "warn",
-                "Database is busy or locked by another operation; bounded typed contention probe stopped before the deep integrity check",
-                false
-            );
-        } else {
-            let db_open_result = open_franken_cli_read_db_with_hard_timeout(
-                db_path.to_path_buf(),
-                "doctor database health",
-                Duration::from_secs(30),
-            );
-            match db_open_result {
-                Ok(conn) => {
-                    // #287: the row-count and PRAGMA probes run on a deadline-bounded
-                    // worker thread. On timeout the doctor records a `timeout` check
-                    // (with the in-flight phase) and continues, so a wedged database
-                    // can no longer hold the entire doctor run hostage with zero
-                    // stdout output.
-                    let probe_timeout = doctor_archive_db_probe_hard_timeout();
-                    match run_bounded_doctor_archive_db_probe(conn, &db_path, probe_timeout) {
-                        DoctorBoundedArchiveDbProbeOutcome::Completed(probe) => {
-                            if let (Some(conv_count), Some(msg_count), Some(integrity_probe)) =
-                                (probe.conv_count, probe.msg_count, probe.integrity)
-                            {
-                                db_conversations = Some(conv_count.max(0) as usize);
-                                db_messages = Some(msg_count.max(0) as usize);
-                                match integrity_probe {
-                                    Ok(integrity) if integrity.is_ok() => {
-                                        storage_attestation_check_depth = Some("integrity_check");
-                                        db_ok = true;
-                                        add_check!(
-                                            "database",
-                                            "pass",
-                                            format!(
-                                                "Database OK ({} conversations, {} messages)",
-                                                conv_count, msg_count
-                                            ),
-                                            false
-                                        );
+        let db_open_result = open_franken_cli_read_db_with_hard_timeout(
+            db_path.to_path_buf(),
+            "doctor database health",
+            Duration::from_secs(30),
+        );
+        match db_open_result {
+            Ok(conn) => {
+                use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
 
-                                        // Check whether the FTS table is visible through
-                                        // frankensqlite on this connection. Do not auto-register
-                                        // it here: on migrated databases with legacy rootpage=0
-                                        // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
-                                        // can persist duplicate sqlite_master rows.
-                                        match probe.fts_state {
-                                            Some(
-                                                DoctorFtsTableState::QueryableViaFrankensqlite,
-                                            ) => {
-                                                add_check!(
-                                                    "fts_table",
-                                                    "pass",
-                                                    "FTS search table (fts_messages) is queryable via frankensqlite",
-                                                    false
-                                                );
-                                            }
-                                            Some(DoctorFtsTableState::Missing {
-                                                frankensqlite_error,
-                                            }) => {
-                                                // An absent in-DB FTS shadow is benign
-                                                // here (lexical search falls back to
-                                                // Tantivy), so it does NOT feed the
-                                                // storage_state derivation — doctor
-                                                // reports it as a `pass` below.
-                                                add_check!(
-                                                    "fts_table",
-                                                    "pass",
-                                                    format!(
-                                                        "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
-                                                    ),
-                                                    false
-                                                );
-                                            }
-                                            None => {}
-                                        }
-                                    }
-                                    Ok(integrity) => {
-                                        storage_integrity_failed = true;
-                                        let failed_pragma = integrity.failed_pragma_name();
-                                        let diagnostic_summary = integrity.diagnostic_summary();
-                                        storage_attestation_check_depth = Some(failed_pragma);
-                                        storage_attestation_detail =
-                                            Some(diagnostic_summary.clone());
-                                        add_check!(
-                                            "database",
-                                            "fail",
-                                            format!(
-                                                "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages)",
-                                                diagnostic_summary, conv_count, msg_count
-                                            ),
-                                            true
-                                        );
-                                        needs_rebuild = true;
-                                    }
-                                    Err(err) => {
-                                        storage_integrity_unverified = true;
-                                        add_check!(
-                                            "database",
-                                            "fail",
-                                            format!(
-                                                "Database health probe failed via frankensqlite: {err}"
-                                            ),
-                                            true
-                                        );
-                                        needs_rebuild = true;
-                                    }
-                                }
-                            } else {
-                                storage_integrity_unverified = true;
-                                add_check!("database", "fail", "Database query failed", true);
-                                needs_rebuild = true;
-                            }
-                        }
-                        DoctorBoundedArchiveDbProbeOutcome::TimedOut { phase } => {
-                            storage_probe_timed_out = true;
-                            // Deliberately NOT a `fail`: a busy or wedged database is
-                            // not proof of corruption, so the doctor must not steer
-                            // operators toward a rebuild. The `timeout` status keeps
-                            // the run bounded and is surfaced through the
-                            // `timeout_or_busy_spin_guard` reason code (#287).
+                let conv_count: Option<i64> = conn
+                    .query_row_map(
+                        "SELECT COUNT(*) FROM conversations",
+                        &[],
+                        |r: &frankensqlite::Row| r.get_typed(0),
+                    )
+                    .ok();
+                let msg_count: Option<i64> = conn
+                    .query_row_map(
+                        "SELECT COUNT(*) FROM messages",
+                        &[],
+                        |r: &frankensqlite::Row| r.get_typed(0),
+                    )
+                    .ok();
+
+                if let (Some(conv_count), Some(msg_count)) = (conv_count, msg_count) {
+                    db_conversations = Some(conv_count.max(0) as usize);
+                    db_messages = Some(msg_count.max(0) as usize);
+                    match doctor_database_integrity_probe(&conn) {
+                        Ok(integrity) if integrity.is_ok() => {
+                            db_ok = true;
                             add_check!(
                                 "database",
-                                "timeout",
+                                "pass",
                                 format!(
-                                    "Database health probe timed out after {}s during {phase}; archive health is unverified (busy or wedged database). Retry later or inspect with `cass status --json`.",
-                                    probe_timeout.as_secs()
+                                    "Database OK ({} conversations, {} messages)",
+                                    conv_count, msg_count
                                 ),
                                 false
                             );
+
+                            // Check whether the FTS table is visible through
+                            // frankensqlite on this connection. Do not auto-register
+                            // it here: on migrated databases with legacy rootpage=0
+                            // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
+                            // can persist duplicate sqlite_master rows.
+                            match probe_doctor_fts_table(&conn) {
+                                DoctorFtsTableState::QueryableViaFrankensqlite => {
+                                    add_check!(
+                                        "fts_table",
+                                        "pass",
+                                        "FTS search table (fts_messages) is queryable via frankensqlite",
+                                        false
+                                    );
+                                }
+                                DoctorFtsTableState::Missing {
+                                    frankensqlite_error,
+                                } => {
+                                    add_check!(
+                                        "fts_table",
+                                        "pass",
+                                        format!(
+                                            "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
+                                        ),
+                                        false
+                                    );
+                                }
+                            }
+                        }
+                        Ok(integrity) => {
+                            let failed_pragma = integrity.failed_pragma_name();
+                            add_check!(
+                                "database",
+                                "fail",
+                                format!(
+                                    "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages)",
+                                    integrity.diagnostic_summary(),
+                                    conv_count,
+                                    msg_count
+                                ),
+                                true
+                            );
+                            needs_rebuild = true;
+                        }
+                        Err(err) => {
+                            add_check!(
+                                "database",
+                                "fail",
+                                format!("Database health probe failed via frankensqlite: {err}"),
+                                true
+                            );
+                            needs_rebuild = true;
                         }
                     }
-                }
-                Err(e) => {
-                    storage_db_open_failed = true;
-                    add_check!(
-                        "database",
-                        "fail",
-                        format!("Cannot open database: {}", e.message),
-                        true
-                    );
+                } else {
+                    add_check!("database", "fail", "Database query failed", true);
                     needs_rebuild = true;
                 }
+                let _ = close_franken_cli_read_db(conn, &db_path, "doctor database health");
+            }
+            Err(e) => {
+                add_check!(
+                    "database",
+                    "fail",
+                    format!("Cannot open database: {}", e.message),
+                    true
+                );
+                needs_rebuild = true;
             }
         }
     } else if not_initialized {
@@ -77512,34 +72239,41 @@ pub(crate) fn run_doctor_impl(
                     false
                 );
 
-                // Check if index is empty but database has data. #287: reuse the
-                // message count from the bounded archive-DB probe above (db_ok
-                // implies it succeeded) instead of re-opening the database and
-                // running another unbounded COUNT on the main thread.
-                if num_docs == 0
-                    && db_ok
-                    && let Some(msg_count) = db_messages.filter(|&count| count > 0)
-                {
-                    storage_lexical_index_drifted = true;
-                    add_check!(
-                        "index_sync",
-                        "warn",
-                        format!("Index is empty but database has {} messages", msg_count),
-                        true
-                    );
-                    needs_rebuild = true;
+                // Check if index is empty but database has data
+                if num_docs == 0 && db_ok {
+                    if let Ok(conn) = open_franken_cli_read_db_with_hard_timeout(
+                        db_path.to_path_buf(),
+                        "doctor index sync",
+                        Duration::from_secs(1),
+                    ) {
+                        use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
+                        if let Ok(msg_count) = conn.query_row_map(
+                            "SELECT COUNT(*) FROM messages",
+                            &[],
+                            |r: &frankensqlite::Row| r.get_typed::<i64>(0),
+                        ) {
+                            if msg_count > 0 {
+                                add_check!(
+                                    "index_sync",
+                                    "warn",
+                                    format!(
+                                        "Index is empty but database has {} messages",
+                                        msg_count
+                                    ),
+                                    true
+                                );
+                                needs_rebuild = true;
+                            }
+                        }
+                        let _ = close_franken_cli_read_db(conn, &db_path, "doctor index sync");
+                    }
                 }
             }
             Ok(None) => {
-                // A broken/absent derived index over an intact, populated DB is
-                // derived-only drift (the `.14.1` `DerivedOnlyDrift` signal); an
-                // empty DB with no index is consistent, not drift.
-                storage_lexical_index_drifted |= db_messages.is_some_and(|m| m > 0);
                 add_check!("index", "fail", "Search index metadata is missing", true);
                 needs_rebuild = true;
             }
             Err(e) => {
-                storage_lexical_index_drifted |= db_messages.is_some_and(|m| m > 0);
                 add_check!("index", "fail", format!("Cannot open index: {}", e), true);
                 needs_rebuild = true;
             }
@@ -77552,7 +72286,6 @@ pub(crate) fn run_doctor_impl(
             false
         );
     } else {
-        storage_lexical_index_drifted |= db_messages.is_some_and(|m| m > 0);
         add_check!("index", "fail", "Search index not found", true);
         needs_rebuild = true;
     }
@@ -77565,94 +72298,6 @@ pub(crate) fn run_doctor_impl(
         DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
         vec!["derived lexical index presence and metadata probe completed".to_string()],
     );
-
-    // `.14.1` storage-integrity projection (bead vl1cj): fold the read-only
-    // database + lexical-index signals gathered above into the canonical
-    // `StorageState` / `SourceOfTruthRisk` / `ArchiveReadability` contract so
-    // doctor robot JSON projects the same vocabulary status/search-meta will.
-    // The common signals derive ok/openread/integrity/derived/deferred first;
-    // the dedicated probe overlays typed contention, schema drift, legacy
-    // layout, or structurally suspect WAL/SHM evidence below. FTS metadata
-    // remains separate because a missing in-DB shadow is a benign fallback.
-    let storage_integrity_report = {
-        use crate::search::storage_integrity::{
-            DoctorStorageSignals, StorageCheck, apply_dedicated_storage_probe,
-            build_doctor_storage_integrity,
-        };
-        let db_file_present = db_path.exists();
-        let db_elapsed_ms = archive_db_probe_started.elapsed().as_millis() as i64;
-        let index_elapsed_ms = lexical_probe_started.elapsed().as_millis() as i64;
-        let mut storage_checks: Vec<StorageCheck> = Vec::new();
-        if !db_file_present {
-            let reason = if not_initialized {
-                "database not initialized"
-            } else {
-                "no archive present to probe"
-            };
-            storage_checks.push(StorageCheck::skipped("archive_integrity", reason));
-        } else if storage_probe_timed_out {
-            storage_checks.push(StorageCheck::timed_out("archive_integrity", db_elapsed_ms));
-        } else {
-            storage_checks.push(StorageCheck::ran("archive_integrity", db_elapsed_ms));
-        }
-        if not_initialized {
-            storage_checks.push(StorageCheck::skipped(
-                "lexical_index",
-                "index not initialized",
-            ));
-        } else {
-            storage_checks.push(StorageCheck::ran("lexical_index", index_elapsed_ms));
-        }
-        let signals = DoctorStorageSignals {
-            db_file_present,
-            not_initialized,
-            db_open_failed: storage_db_open_failed,
-            probe_timed_out: storage_probe_timed_out,
-            integrity_failed: storage_integrity_failed,
-            integrity_unverified: storage_integrity_unverified,
-            lexical_index_drifted: storage_lexical_index_drifted,
-        };
-        // #331: capture completed deep-probe evidence against the current
-        // db/WAL fingerprint. The ordinary `doctor check` surface is strictly
-        // read-only, so it projects this as live evidence without persisting
-        // anything. An explicitly mutating doctor surface may refresh the
-        // cache that lightweight status/search later reuse.
-        let live_attestation = if db_file_present
-            && !storage_db_open_failed
-            && !storage_probe_timed_out
-            && !storage_integrity_unverified
-            && let Some(check_depth) = storage_attestation_check_depth
-        {
-            crate::search::storage_integrity::capture_integrity_attestation(
-                &db_path,
-                if storage_integrity_failed {
-                    crate::search::storage_integrity::IntegrityAttestationVerdict::Fail
-                } else {
-                    crate::search::storage_integrity::IntegrityAttestationVerdict::Pass
-                },
-                check_depth,
-                storage_attestation_detail.clone(),
-            )
-        } else {
-            None
-        };
-        if fix_can_mutate && let Some(attestation) = live_attestation.as_ref() {
-            crate::search::storage_integrity::persist_integrity_attestation(&data_dir, attestation);
-        }
-        let mut report = apply_dedicated_storage_probe(
-            build_doctor_storage_integrity(signals, storage_checks),
-            dedicated_storage_probe,
-        );
-        if let Some(attestation) = live_attestation {
-            report.attestation_source = Some("live".to_string());
-            report.attestation_check_depth = Some(attestation.check_depth.clone());
-            report.attested_at_ms = Some(attestation.checked_at_ms);
-            report.attested_db_fingerprint = Some(
-                crate::search::storage_integrity::integrity_attestation_fingerprint(&attestation),
-            );
-        }
-        report
-    };
 
     // 5. Check config file
     let config_path = data_dir.join("config.toml");
@@ -77856,7 +72501,7 @@ pub(crate) fn run_doctor_impl(
     }
 
     let raw_mirror_scan_started = Instant::now();
-    let mut raw_mirror = collect_doctor_raw_mirror_report_for_doctor(&data_dir, fix_can_mutate);
+    let mut raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
     doctor_push_timing_span(
         &mut timing_spans,
         "raw_mirror_scan",
@@ -77880,7 +72525,7 @@ pub(crate) fn run_doctor_impl(
             raw_mirror_backfill.captured_live_source_count,
             raw_mirror_backfill.existing_raw_manifest_link_count
         ));
-        raw_mirror = collect_doctor_raw_mirror_report_for_doctor(&data_dir, fix_can_mutate);
+        raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
     }
     doctor_push_timing_span(
         &mut timing_spans,
@@ -77919,17 +72564,6 @@ pub(crate) fn run_doctor_impl(
                 format!(
                     "Raw mirror verified ({} manifest(s), {} blob byte(s))",
                     raw_mirror.summary.manifest_count, raw_mirror.summary.total_blob_bytes
-                ),
-                false
-            );
-        }
-        "verification_deferred" => {
-            add_check!(
-                "raw_mirror",
-                "warn",
-                format!(
-                    "Raw mirror verification deferred for bounded read-only doctor check ({} manifest(s)); set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run full blob checksum verification",
-                    raw_mirror.summary.manifest_count
                 ),
                 false
             );
@@ -79142,14 +73776,8 @@ pub(crate) fn run_doctor_impl(
         });
     }
 
-    // Count issues. #287: a `timeout` check means the doctor could not verify
-    // that surface within its hard deadline — the run is bounded but the
-    // verdict is unproven, so it counts as a failure for health/exit purposes
-    // (an agent must not read a timed-out probe as "healthy").
-    let fail_count = checks
-        .iter()
-        .filter(|c| c.status == "fail" || c.status == "timeout")
-        .count();
+    // Count issues
+    let fail_count = checks.iter().filter(|c| c.status == "fail").count();
     let warn_count = checks.iter().filter(|c| c.status == "warn").count();
     let issues_found = fail_count + warn_count;
     let issues_fixed = checks.iter().filter(|c| c.fix_applied).count();
@@ -79214,21 +73842,7 @@ pub(crate) fn run_doctor_impl(
         .first()
         .map(|incident| incident.incident_id.clone());
 
-    let daemon_runtime = output_format
-        .or_else(robot_format_from_env)
-        .map(|_| probe_daemon_runtime_for_diagnostics(&data_dir));
     let elapsed_ms = start.elapsed().as_millis() as u64;
-    // Bounded-budget signal for the robot surface (uojcg.2.2): the report saw
-    // `doctor check` exceed an 8s cap. Per-check internal timeouts already bound
-    // each probe, so doctor does not hang; this advertises whether the whole run
-    // exceeded its budget so an agent can fall back to a cheaper probe. Override
-    // via CASS_DOCTOR_BUDGET_MS.
-    let doctor_budget_ms = dotenvy::var("CASS_DOCTOR_BUDGET_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .unwrap_or(8000);
-    let doctor_budget_timed_out = elapsed_ms > doctor_budget_ms;
     let locks = build_doctor_lock_diagnostics(&operation_state, doctor_now_ms());
     let slow_operations = build_doctor_slow_operations(&timing_spans);
     let timing_summary = build_doctor_timing_summary(&timing_spans, elapsed_ms);
@@ -79354,36 +73968,6 @@ pub(crate) fn run_doctor_impl(
     } else {
         "unhealthy"
     };
-    // #287: stable machine-readable reason codes for degraded doctor outcomes,
-    // so an agent can make a bounded decision from the JSON verdict without
-    // parsing free-form check messages. Ordered by triage priority; the first
-    // entry is surfaced as the primary `reason_code`.
-    let mut degraded_reason_codes: Vec<&'static str> = Vec::new();
-    if checks.iter().any(|c| c.status == "timeout") {
-        degraded_reason_codes.push("timeout_or_busy_spin_guard");
-    }
-    if checks
-        .iter()
-        .any(|c| c.name == "database" && c.status == "fail")
-    {
-        degraded_reason_codes.push("db_unavailable");
-    }
-    if readiness_snapshot
-        .pointer("/ingest_quarantine/circuit_breaker_active")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        degraded_reason_codes.push("quarantine_circuit_breaker");
-    }
-    if !not_initialized
-        && readiness_snapshot
-            .pointer("/index/checkpoint/completed")
-            .and_then(serde_json::Value::as_bool)
-            == Some(false)
-    {
-        degraded_reason_codes.push("checkpoint_incomplete");
-    }
-    let primary_reason_code = degraded_reason_codes.first().copied();
 
     // Output
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -79400,17 +73984,6 @@ pub(crate) fn run_doctor_impl(
         } else {
             collect_diag_quarantine_report(&data_dir, &index_path)
         };
-        // uojcg.9.2/9.5: attribute a likely root-cause family from the live
-        // doctor signals (storage open failure, derived truth-table mismatch,
-        // semantic load failure). Complements the per-incident `incidents[]`
-        // breakdown. Host disk-free % is deliberately NOT fed here: it is a live
-        // host metric that would make the doctor golden environment-dependent,
-        // and `storage_pressure` already reports low-disk state separately. The
-        // projection still supports host-disk-pressure for a future surface that
-        // can supply a deterministic/scrubbed signal.
-        let root_cause_attribution = crate::root_cause_projection::project_root_cause(
-            &gather_projection_signals_from_state(&readiness_snapshot, None),
-        );
         let mut payload = serde_json::json!({
             // Top-level envelope versioning. Bumped to 2 in world-class-doctor
             // pass-3 alongside the new per-run artifact directory + undo
@@ -79422,13 +73995,6 @@ pub(crate) fn run_doctor_impl(
             "doctor_contract_version": 1,
             "capabilities_url": "cass capabilities --json",
             "status": doctor_status,
-            // #287: machine-readable degradation taxonomy. `reason_code` is the
-            // primary (highest-priority) entry of `degraded_reason_codes`; both
-            // are null/empty on healthy runs. Stable values:
-            // timeout_or_busy_spin_guard, db_unavailable,
-            // quarantine_circuit_breaker, checkpoint_incomplete.
-            "reason_code": primary_reason_code,
-            "degraded_reason_codes": degraded_reason_codes,
             "health_class": health_class,
             "risk_level": risk_level,
             "healthy": healthy,
@@ -79469,19 +74035,8 @@ pub(crate) fn run_doctor_impl(
             "locks": locks,
             "slow_operations": slow_operations,
             "timing_summary": timing_summary,
-            "budget": serde_json::json!({
-                "elapsed_ms": elapsed_ms,
-                "budget_ms": doctor_budget_ms,
-                "timed_out": doctor_budget_timed_out,
-                "recommended_next_probe": if doctor_budget_timed_out {
-                    serde_json::Value::String("cass status --json".to_string())
-                } else {
-                    serde_json::Value::Null
-                },
-            }),
             "retry_recommendation": retry_recommendation,
             "safe_auto_eligibility": safe_auto_eligibility,
-            "root_cause": root_cause_attribution,
             "primary_incident_id": primary_incident_id,
             "incidents": incidents,
             "event_log": operation_event_log,
@@ -79489,8 +74044,6 @@ pub(crate) fn run_doctor_impl(
             "semantic": readiness_snapshot.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
             "derived_semantic_assets": derived_semantic_assets,
             "storage_pressure": storage_pressure,
-            "storage_integrity": storage_integrity_report,
-            "daemon_runtime": daemon_runtime,
             "asset_taxonomy": doctor_asset_taxonomy_report(),
             "anomaly_taxonomy": doctor_anomaly_taxonomy_report(),
             "repair_contract": doctor_repair_contract_report(),
@@ -79878,7 +74431,6 @@ fn run_sessions(
     workspace: Option<&PathBuf>,
     current: bool,
     limit: Option<usize>,
-    since: Option<&str>,
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
@@ -79903,86 +74455,59 @@ fn run_sessions(
         None if current_determined_workspace => Some(1),
         None => Some(10),
     };
-    let since_ms: Option<i64> = match since {
-        None => None,
-        Some(raw) => Some(parse_datetime_flexible(raw).ok_or_else(|| CliError {
-            code: 2,
-            kind: CliErrorKind::Usage.kind_str(),
-            message: format!(
-                "Invalid --since value '{raw}'. Use YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, \
-                 'today', 'yesterday', or a relative offset like -7d / -24h."
-            ),
-            hint: Some("Example: cass sessions --since -7d".into()),
-            retryable: false,
-        })?),
-    };
 
-    // cass#323: enumerate conversations WITHOUT joining messages. The old
-    // single query LEFT JOINed the full messages table and GROUP BYed over
-    // it just to compute per-session message/human-turn counts, which made
-    // `sessions --limit 5` cost a full corpus aggregation (minutes of CPU
-    // and multi-GB peaks on large indexes). Counts are now backfilled after
-    // limit truncation, so only the N returned sessions ever touch the
-    // messages table (served by the (conversation_id, idx) unique index).
-    let since_filter = if since_ms.is_some() {
-        // Sessions whose recorded activity window is unknown (both
-        // timestamps NULL) are retained here and re-checked against file
-        // mtime below, so a legacy undated-but-active session is not
-        // silently dropped by --since.
-        "WHERE COALESCE(c.ended_at, c.started_at) >= ?1
-              OR (c.ended_at IS NULL AND c.started_at IS NULL)"
-    } else {
-        ""
-    };
-    let sessions_sql = format!(
-        // LEFT JOIN + COALESCE on agents so list_sessions still reports
-        // legacy conversations with NULL agent_id.
-        "SELECT c.id,
-                COALESCE(a.slug, 'unknown') AS agent_slug,
-                w.path,
-                c.title,
-                c.source_path,
-                COALESCE(c.source_id, 'local'),
-                c.origin_host,
-                s.kind,
-                c.started_at,
-                c.ended_at
-         FROM conversations c
-         LEFT JOIN agents a ON c.agent_id = a.id
-         LEFT JOIN workspaces w ON c.workspace_id = w.id
-         LEFT JOIN sources s ON c.source_id = s.id
-         {since_filter}
-         ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC"
-    );
-    let since_params: Vec<ParamValue> = since_ms.map(ParamValue::from).into_iter().collect();
-    let params: &[ParamValue] = &since_params;
+    let params: &[ParamValue] = &[];
     #[allow(clippy::type_complexity)]
     let rows: Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
         i64,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
+        i64,
     )> = conn
-        .query_map_collect(&sessions_sql, params, |row: &frankensqlite::Row| {
-            Ok((
-                row.get_typed(0)?,
-                row.get_typed(1)?,
-                row.get_typed(2)?,
-                row.get_typed(3)?,
-                row.get_typed(4)?,
-                row.get_typed(5)?,
-                row.get_typed(6)?,
-                row.get_typed(7)?,
-                row.get_typed(8)?,
-                row.get_typed(9)?,
-            ))
-        })
+        .query_map_collect(
+            // LEFT JOIN + COALESCE on agents so list_sessions still reports
+            // legacy conversations with NULL agent_id.  GROUP BY must use the
+            // same COALESCE expression so those rows group into a single
+            // 'unknown' bucket.
+            "SELECT COALESCE(a.slug, 'unknown') AS agent_slug,
+                    w.path,
+                    c.title,
+                    c.source_path,
+                    COALESCE(c.source_id, 'local'),
+                    c.origin_host,
+                    s.kind,
+                    c.started_at,
+                    COUNT(m.id) AS message_count,
+                    COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS human_turns
+             FROM conversations c
+             LEFT JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             LEFT JOIN sources s ON c.source_id = s.id
+             LEFT JOIN messages m ON m.conversation_id = c.id
+             GROUP BY c.id, COALESCE(a.slug, 'unknown'), w.path, c.title, c.source_path, COALESCE(c.source_id, 'local'), c.origin_host, s.kind, c.started_at
+             ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC",
+            params,
+            |row: &frankensqlite::Row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                    row.get_typed(4)?,
+                    row.get_typed(5)?,
+                    row.get_typed(6)?,
+                    row.get_typed(7)?,
+                    row.get_typed(8)?,
+                    row.get_typed(9)?,
+                ))
+            },
+        )
         .map_err(|e| CliError {
             code: 9,
             kind: CliErrorKind::DbQuery.kind_str(),
@@ -79991,11 +74516,10 @@ fn run_sessions(
             retryable: false,
         })?;
 
-    let mut sessions: Vec<(i64, bool, SessionSummaryRecord)> = rows
+    let mut sessions: Vec<SessionSummaryRecord> = rows
         .into_iter()
         .map(
             |(
-                conversation_id,
                 agent,
                 workspace,
                 title,
@@ -80004,7 +74528,8 @@ fn run_sessions(
                 origin_host,
                 origin_kind,
                 started_at,
-                ended_at,
+                message_count,
+                human_turns,
             )| {
                 let source_path_buf = PathBuf::from(&source_path);
                 let origin_host = normalized_provenance_origin_host(origin_host.as_deref());
@@ -80023,55 +74548,33 @@ fn run_sessions(
                     .and_then(|m| m.modified().ok())
                     .map(|ts| chrono::DateTime::<Utc>::from(ts).timestamp_millis());
 
-                let has_recorded_timestamp = started_at.is_some() || ended_at.is_some();
-                (
-                    conversation_id,
-                    has_recorded_timestamp,
-                    SessionSummaryRecord {
-                        agent,
-                        workspace: workspace.map(PathBuf::from),
-                        workspace_match_distance: None,
-                        title,
-                        source_path: source_path_buf,
-                        source_id,
-                        origin_host,
-                        started_at,
-                        modified_at,
-                        size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
-                        message_count: 0,
-                        human_turns: 0,
-                    },
-                )
+                SessionSummaryRecord {
+                    agent,
+                    workspace: workspace.map(PathBuf::from),
+                    workspace_match_distance: None,
+                    title,
+                    source_path: source_path_buf,
+                    source_id,
+                    origin_host,
+                    started_at,
+                    modified_at,
+                    size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
+                    message_count,
+                    human_turns,
+                }
             },
         )
         .collect();
 
-    if let Some(since_ms) = since_ms {
-        // Rows with a recorded timestamp already satisfied the SQL window
-        // filter. Undated conversations passed it unconditionally; resolve
-        // them against file mtime where one is available. Rows with no
-        // recorded timestamps AND no statable file are kept (fail open:
-        // --since must never hide a session it cannot date).
-        sessions.retain(|(_, has_recorded_timestamp, session)| {
-            if *has_recorded_timestamp {
-                return true;
-            }
-            match session.modified_at {
-                Some(modified_at) => modified_at >= since_ms,
-                None => true,
-            }
-        });
-    }
-
     if let Some(target) = target_workspace.as_deref() {
-        for (_, _, session) in &mut sessions {
+        for session in &mut sessions {
             session.workspace_match_distance =
                 workspace_match_distance(session.workspace.as_deref(), target);
         }
-        sessions.retain(|(_, _, session)| session.workspace_match_distance.is_some());
+        sessions.retain(|session| session.workspace_match_distance.is_some());
     }
 
-    sessions.sort_by(|(_, _, left), (_, _, right)| {
+    sessions.sort_by(|left, right| {
         left.workspace_match_distance
             .unwrap_or(usize::MAX)
             .cmp(&right.workspace_match_distance.unwrap_or(usize::MAX))
@@ -80083,45 +74586,6 @@ fn run_sessions(
     if let Some(limit) = effective_limit {
         sessions.truncate(limit);
     }
-
-    // Backfill message/human-turn counts for the surviving sessions only.
-    // Deliberately NOT a SQL aggregate: the frankensqlite planner executes
-    // `SELECT COUNT(..) WHERE conversation_id = ?` as a full messages-table
-    // scan even under an INDEXED BY hint (verified via live backtraces on a
-    // 26 GB index). The plain indexed row-fetch shape below is the same one
-    // the hot per-conversation message paths use (see the EXPLAIN QUERY
-    // PLAN contract test in storage::sqlite), so each lookup is an indexed
-    // range scan on messages(conversation_id, idx) and the roles are
-    // tallied in Rust — cost scales with the returned page, not the corpus.
-    let count_session_messages =
-        |conversation_id: i64| -> Result<(i64, i64), frankensqlite::FrankenError> {
-            let roles: Vec<String> = conn.query_map_collect(
-                "SELECT role
-                 FROM messages INDEXED BY sqlite_autoindex_messages_1
-                 WHERE conversation_id = ?1",
-                &[ParamValue::from(conversation_id)],
-                |row: &frankensqlite::Row| row.get_typed::<String>(0),
-            )?;
-            let message_count = roles.len() as i64;
-            let human_turns = roles.iter().filter(|role| role.as_str() == "user").count() as i64;
-            Ok((message_count, human_turns))
-        };
-    let sessions: Vec<SessionSummaryRecord> = sessions
-        .into_iter()
-        .map(|(conversation_id, _, mut session)| {
-            let (message_count, human_turns) =
-                count_session_messages(conversation_id).map_err(|e| CliError {
-                    code: 9,
-                    kind: CliErrorKind::DbQuery.kind_str(),
-                    message: format!("Failed to count session messages: {e}"),
-                    hint: None,
-                    retryable: false,
-                })?;
-            session.message_count = message_count;
-            session.human_turns = human_turns;
-            Ok(session)
-        })
-        .collect::<CliResult<Vec<_>>>()?;
 
     let entries: Vec<SessionSummaryEntry> = sessions
         .into_iter()
@@ -80676,8 +75140,6 @@ pub struct IntrospectResponse {
     pub api_version: u32,
     /// Contract version (human-visible)
     pub contract_version: String,
-    /// Executable proof-coverage inventory for every report subsystem.
-    pub subsystem_coverage: crate::subsystem_coverage_matrix::MatrixReport,
     /// Global flags (apply to all commands)
     pub global_flags: Vec<ArgumentSchema>,
     /// All available commands with arguments
@@ -81100,16 +75562,6 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Suppress NDJSON progress events from cass index --json when set to 1.",
         ),
         env_var_capability(
-            "CASS_INDEX_STALL_DETECT_SECS",
-            Some("120"),
-            "Seconds without measured phase progress before cass index emits diagnostics; 0 disables detection.",
-        ),
-        env_var_capability(
-            "CASS_INDEX_STALL_ABORT_SECS",
-            Some("300"),
-            "Seconds without progress before an abort-eligible lexical stall exits 70; 0 keeps stalls report-only. Semantic phases are report-only.",
-        ),
-        env_var_capability(
             "CASS_SEMANTIC_EMBEDDER",
             None,
             "Select the semantic embedder/model implementation when configured.",
@@ -81348,7 +75800,7 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass commands --json",
             "cass robot-docs commands",
             true,
-            "Non-command robot-docs topic shorthands such as commands, schemas, examples, env, paths, exit-codes, and quickstart route to robot-docs instead of search. The guide name remains the dedicated guided-operations planner.",
+            "Non-command robot-docs topic shorthands such as commands, schemas, examples, env, paths, exit-codes, and guide route to robot-docs instead of search.",
         ),
         mistake_recovery_capability(
             "cass search \"query\" limit=5",
@@ -81726,24 +76178,19 @@ fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
     Ok(())
 }
 
-fn build_introspect_subsystem_coverage() -> crate::subsystem_coverage_matrix::MatrixReport {
-    crate::subsystem_coverage_matrix::matrix_report()
-}
-
-fn build_introspect_response() -> IntrospectResponse {
-    IntrospectResponse {
-        api_version: 1,
-        contract_version: CONTRACT_VERSION.to_string(),
-        subsystem_coverage: build_introspect_subsystem_coverage(),
-        global_flags: build_global_flag_schemas(),
-        commands: build_command_schemas(),
-        response_schemas: build_response_schemas(),
-    }
-}
-
 /// Full API schema introspection - commands, arguments, and response schemas.
 fn run_introspect(output_format: Option<RobotFormat>) -> CliResult<()> {
-    let response = build_introspect_response();
+    let global_flags = build_global_flag_schemas();
+    let commands = build_command_schemas();
+    let response_schemas = build_response_schemas();
+
+    let response = IntrospectResponse {
+        api_version: 1,
+        contract_version: CONTRACT_VERSION.to_string(),
+        global_flags,
+        commands,
+        response_schemas,
+    };
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -81781,10 +76228,6 @@ fn run_introspect(output_format: Option<RobotFormat>) -> CliResult<()> {
     println!();
     println!("API Version: {}", response.api_version);
     println!("Contract Version: {}", response.contract_version);
-    println!(
-        "Subsystem Coverage: {} subsystems (complete: {})",
-        response.subsystem_coverage.subsystem_count, response.subsystem_coverage.complete
-    );
     println!();
     println!("Global Flags:");
     println!("-------------");
@@ -81978,7 +76421,6 @@ fn run_config_based_export(
         recovery_secret,
         generate_qr: wizard_state.generate_qr,
         generated_docs: vec![],
-        analytics_status: Some(crate::pages::analytics::robot_status_projection(db_path)?),
     };
 
     let bundle_builder = crate::pages::bundle::BundleBuilder::with_config(bundle_config);
@@ -82119,327 +76561,6 @@ fn run_api_version(output_format: Option<RobotFormat>) -> CliResult<()> {
     Ok(())
 }
 
-/// Default GitHub owner/repo and crate name for the release channels.
-const RELEASE_VERIFY_DEFAULT_REPO: &str = "Dicklesworthstone/coding_agent_session_search";
-const RELEASE_VERIFY_DEFAULT_CRATE: &str = "coding-agent-search";
-const RELEASE_VERIFY_HTTP_TIMEOUT_SECS: u64 = 15;
-
-/// Resolved configuration for a live release-channel probe.
-struct LiveGatherConfig {
-    expected_version: String,
-    repo: String,
-    crate_name: String,
-    homebrew_formula_url: Option<String>,
-    scoop_manifest_url: Option<String>,
-}
-
-/// Robot-safe `cass release-verify`. Offline `--from` reuses the tested
-/// [`crate::release_verify::verify_from_json`] core; `--live` gathers explicit
-/// per-channel observations over the network. Prints a ReleaseVerificationReport.
-#[allow(clippy::too_many_arguments)]
-async fn run_release_verify(
-    output_format: Option<RobotFormat>,
-    from: Option<&str>,
-    live: bool,
-    expected_version: Option<&str>,
-    repo: Option<&str>,
-    crate_name: Option<&str>,
-    homebrew_formula_url: Option<&str>,
-    scoop_manifest_url: Option<&str>,
-) -> CliResult<()> {
-    let report = if let Some(path) = from {
-        let body = read_release_verify_input(path).map_err(|err| CliError {
-            code: 2,
-            kind: CliErrorKind::Usage.kind_str(),
-            message: format!("failed to read release-verify request from {path}: {err}"),
-            hint: Some(
-                "Provide a ReleaseVerifyRequest JSON file path or '-' for stdin.".to_string(),
-            ),
-            retryable: false,
-        })?;
-        crate::release_verify::verify_from_json(&body).map_err(|err| CliError {
-            code: 2,
-            kind: CliErrorKind::Usage.kind_str(),
-            message: format!("invalid release-verify request JSON: {err}"),
-            hint: Some(
-                "Expected {\"expected_version\":\"x.y.z\",\"channels\":[{\"channel\":\"github_release\",...}]}."
-                    .to_string(),
-            ),
-            retryable: false,
-        })?
-    } else if live {
-        let version = expected_version.ok_or_else(|| {
-            CliError::usage(
-                "--live requires --expected-version <v>",
-                Some(
-                    "Pass the release version under test, e.g. --expected-version 0.6.13."
-                        .to_string(),
-                ),
-            )
-        })?;
-        let config = LiveGatherConfig {
-            expected_version: version.to_string(),
-            repo: repo.unwrap_or(RELEASE_VERIFY_DEFAULT_REPO).to_string(),
-            crate_name: crate_name
-                .unwrap_or(RELEASE_VERIFY_DEFAULT_CRATE)
-                .to_string(),
-            homebrew_formula_url: homebrew_formula_url.map(str::to_string),
-            scoop_manifest_url: scoop_manifest_url.map(str::to_string),
-        };
-        let request =
-            asupersync::runtime::spawn_blocking(move || gather_live_release_observations(&config))
-                .await;
-        crate::release_verify::verify_request(request)
-    } else {
-        return Err(CliError::usage(
-            "release-verify requires --from <file|-> or --live",
-            Some(
-                "Use --from for offline/CI evaluation, or --live to probe channels over the network."
-                    .to_string(),
-            ),
-        ));
-    };
-
-    let payload = serde_json::to_value(&report).map_err(|err| CliError {
-        code: 1,
-        kind: CliErrorKind::Unknown.kind_str(),
-        message: format!("serializing release-verify report: {err}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-    if let Some(fmt) = structured_format {
-        return output_structured_value(payload, fmt);
-    }
-
-    println!(
-        "Release {} channels: {}/{} ready (overall_ready={})",
-        report.expected_version, report.summary.ready, report.summary.total, report.overall_ready
-    );
-    for action in report.manual_actions() {
-        if let Some(next) = &action.manual_next_action {
-            println!("  {} -> {next}", action.channel.as_str());
-        }
-    }
-    Ok(())
-}
-
-/// Read a release-verify request body from a file path or `-` (stdin).
-fn read_release_verify_input(path: &str) -> std::io::Result<String> {
-    use std::io::Read;
-    if path == "-" {
-        let mut body = String::new();
-        std::io::stdin().read_to_string(&mut body)?;
-        Ok(body)
-    } else {
-        std::fs::read_to_string(path)
-    }
-}
-
-/// Gather explicit, best-effort per-channel observations over the network.
-/// Never fails: an unreachable channel becomes a `reachable: false` observation
-/// that [`crate::release_verify::evaluate_channel`] maps to `NetworkUnavailable`.
-fn gather_live_release_observations(
-    config: &LiveGatherConfig,
-) -> crate::release_verify::ReleaseVerifyRequest {
-    use crate::release_verify::{ChannelObservationInput, ReleaseChannel, ReleaseVerifyRequest};
-
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(RELEASE_VERIFY_HTTP_TIMEOUT_SECS))
-        .build()
-        .ok();
-
-    let unreachable = |channel: ReleaseChannel| ChannelObservationInput {
-        channel,
-        configured: true,
-        reachable: false,
-        observed_version: None,
-        checksum_ok: None,
-        dispatch_ran: None,
-        installer_ok: None,
-    };
-    let not_configured = |channel: ReleaseChannel| ChannelObservationInput {
-        channel,
-        configured: false,
-        reachable: false,
-        observed_version: None,
-        checksum_ok: None,
-        dispatch_ran: None,
-        installer_ok: None,
-    };
-
-    let Some(client) = client else {
-        // Could not even build a client: report every channel as unreachable.
-        return ReleaseVerifyRequest {
-            expected_version: config.expected_version.clone(),
-            channels: vec![
-                unreachable(ReleaseChannel::GithubRelease),
-                unreachable(ReleaseChannel::Homebrew),
-                unreachable(ReleaseChannel::Scoop),
-                unreachable(ReleaseChannel::CratesIo),
-                not_configured(ReleaseChannel::InstallerScript),
-            ],
-        };
-    };
-
-    let mut channels = Vec::new();
-
-    // GitHub release (source of truth): latest published tag + asset presence.
-    channels.push(
-        probe_json_version(
-            &client,
-            ReleaseChannel::GithubRelease,
-            &format!(
-                "https://api.github.com/repos/{}/releases/latest",
-                config.repo
-            ),
-            "tag_name",
-        )
-        .unwrap_or_else(|| unreachable(ReleaseChannel::GithubRelease)),
-    );
-
-    // crates.io: max stable version.
-    channels.push(
-        probe_json_version(
-            &client,
-            ReleaseChannel::CratesIo,
-            &format!("https://crates.io/api/v1/crates/{}", config.crate_name),
-            "crate.max_stable_version",
-        )
-        .unwrap_or_else(|| unreachable(ReleaseChannel::CratesIo)),
-    );
-
-    // Homebrew formula (dispatch-driven): only when an explicit URL is supplied.
-    channels.push(match &config.homebrew_formula_url {
-        Some(url) => probe_text_version(&client, ReleaseChannel::Homebrew, url, true)
-            .unwrap_or_else(|| unreachable(ReleaseChannel::Homebrew)),
-        None => not_configured(ReleaseChannel::Homebrew),
-    });
-
-    // Scoop manifest (dispatch-driven): only when an explicit URL is supplied.
-    channels.push(match &config.scoop_manifest_url {
-        Some(url) => probe_json_version(&client, ReleaseChannel::Scoop, url, "version")
-            .map(|mut obs| {
-                obs.dispatch_ran = Some(true);
-                obs
-            })
-            .unwrap_or_else(|| unreachable(ReleaseChannel::Scoop)),
-        None => not_configured(ReleaseChannel::Scoop),
-    });
-
-    // Installer smoke is not auto-executed (it runs curl|bash); CI supplies it
-    // via --from. Marked not-configured for live probes.
-    channels.push(not_configured(ReleaseChannel::InstallerScript));
-
-    ReleaseVerifyRequest {
-        expected_version: config.expected_version.clone(),
-        channels,
-    }
-}
-
-/// GET a JSON document and read a (possibly dotted) string field as the observed
-/// version. Returns `None` on any network/parse failure (caller maps to
-/// unreachable).
-fn probe_json_version(
-    client: &reqwest::blocking::Client,
-    channel: crate::release_verify::ReleaseChannel,
-    url: &str,
-    field_path: &str,
-) -> Option<crate::release_verify::ChannelObservationInput> {
-    use crate::release_verify::ChannelObservationInput;
-    let response = client.get(url).send().ok()?;
-    if !response.status().is_success() {
-        // Reachable but no artifact (e.g. 404) -> configured, reachable, missing.
-        return Some(ChannelObservationInput {
-            channel,
-            configured: true,
-            reachable: true,
-            observed_version: None,
-            checksum_ok: None,
-            dispatch_ran: None,
-            installer_ok: None,
-        });
-    }
-    let json: serde_json::Value = response.json().ok()?;
-    let mut current = &json;
-    for key in field_path.split('.') {
-        current = current.get(key)?;
-    }
-    let observed = current.as_str().map(str::to_string);
-    Some(ChannelObservationInput {
-        channel,
-        configured: true,
-        reachable: true,
-        observed_version: observed,
-        checksum_ok: None,
-        dispatch_ran: None,
-        installer_ok: None,
-    })
-}
-
-/// GET a text document and extract the first `version "X"` / `version X`
-/// occurrence (Homebrew formula style). Returns `None` on failure.
-fn probe_text_version(
-    client: &reqwest::blocking::Client,
-    channel: crate::release_verify::ReleaseChannel,
-    url: &str,
-    dispatch_driven: bool,
-) -> Option<crate::release_verify::ChannelObservationInput> {
-    use crate::release_verify::ChannelObservationInput;
-    let response = client.get(url).send().ok()?;
-    if !response.status().is_success() {
-        return Some(ChannelObservationInput {
-            channel,
-            configured: true,
-            reachable: true,
-            observed_version: None,
-            checksum_ok: None,
-            dispatch_ran: dispatch_driven.then_some(false),
-            installer_ok: None,
-        });
-    }
-    let body = response.text().ok()?;
-    let observed = extract_formula_version(&body);
-    Some(ChannelObservationInput {
-        channel,
-        configured: true,
-        reachable: true,
-        observed_version: observed.clone(),
-        checksum_ok: None,
-        dispatch_ran: dispatch_driven.then_some(observed.is_some()),
-        installer_ok: None,
-    })
-}
-
-/// Extract a `version "X"` value from a Homebrew-style formula body.
-fn extract_formula_version(body: &str) -> Option<String> {
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("version") {
-            let rest = rest.trim();
-            let inner = rest.trim_start_matches(['=', ' ']).trim();
-            let value = inner.trim_matches(['"', '\'']);
-            if !value.is_empty()
-                && value
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_digit() || c == 'v')
-            {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
-}
-
 /// Build command schemas for all CLI commands
 fn build_command_schemas() -> Vec<CommandSchema> {
     let root = Cli::command();
@@ -82539,7 +76660,6 @@ const INTEGER_ARG_NAMES: &[&str] = &[
     "max-tokens",
     "max-sessions",
     "max-evidence",
-    "conversation-id",
     "context-lines",
     "max-excerpt-chars",
     "freshness-window-seconds",
@@ -82606,8 +76726,6 @@ fn response_schema_index_state() -> serde_json::Value {
             "status": { "type": "string" },
             "reason": { "type": ["string", "null"] },
             "fresh": { "type": "boolean" },
-            "partial": { "type": "boolean" },
-            "partial_reason": { "type": ["string", "null"] },
             "last_indexed_at": { "type": ["string", "null"] },
             "age_seconds": { "type": ["integer", "null"] },
             "stale": { "type": "boolean" },
@@ -83091,8 +77209,6 @@ fn response_schema_index_freshness() -> serde_json::Value {
             "status": { "type": "string" },
             "reason": { "type": ["string", "null"] },
             "fresh": { "type": "boolean" },
-            "partial": { "type": ["boolean", "null"] },
-            "partial_reason": { "type": ["string", "null"] },
             "last_indexed_at": { "type": ["string", "null"] },
             "age_seconds": { "type": ["integer", "null"] },
             "stale": { "type": "boolean" },
@@ -85532,20 +79648,6 @@ fn response_schema_search_cache_stats() -> serde_json::Value {
         ("misses", serde_json::json!({ "type": "integer" })),
         ("shortfall", serde_json::json!({ "type": "integer" })),
         (
-            "outcomes",
-            response_schema_object([
-                ("hit", serde_json::json!({ "type": "integer" })),
-                ("cold_miss", serde_json::json!({ "type": "integer" })),
-                (
-                    "stale_generation_miss",
-                    serde_json::json!({ "type": "integer" }),
-                ),
-                ("forced_reload", serde_json::json!({ "type": "integer" })),
-                ("reload_failure", serde_json::json!({ "type": "integer" })),
-                ("fallback", serde_json::json!({ "type": "integer" })),
-            ]),
-        ),
-        (
             "prewarm_scheduled",
             serde_json::json!({ "type": "integer" }),
         ),
@@ -85925,12 +80027,6 @@ fn response_schema_search_meta() -> serde_json::Value {
             "semantic_refinement",
             serde_json::json!({ "type": ["boolean", "null"] }),
         ),
-        // Truthful refinement level + typed fallback reason (bead .5.4).
-        ("refinement_level", serde_json::json!({ "type": "string" })),
-        (
-            "semantic_fallback_reason",
-            serde_json::json!({ "type": ["string", "null"] }),
-        ),
         (
             "wildcard_fallback",
             serde_json::json!({ "type": "boolean" }),
@@ -85958,11 +80054,7 @@ fn response_schema_search_meta() -> serde_json::Value {
         ),
         ("hits_clamped", serde_json::json!({ "type": "boolean" })),
         ("state", response_schema_state_meta()),
-        ("search_completeness", response_schema_search_completeness()),
         ("index_freshness", response_schema_index_freshness()),
-        // qfswx: same storage-integrity vocabulary doctor/status project,
-        // present in --robot-meta so every truth surface agrees.
-        ("storage_integrity", response_schema_storage_integrity()),
         (
             "timeout_ms",
             serde_json::json!({ "type": ["integer", "null"] }),
@@ -86002,7 +80094,6 @@ fn response_schema_search() -> serde_json::Value {
         ),
         ("cursor", serde_json::json!({ "type": ["string", "null"] })),
         ("hits_clamped", serde_json::json!({ "type": "boolean" })),
-        ("budget", response_schema_budget_block()),
         (
             "hits",
             serde_json::json!({
@@ -86049,7 +80140,6 @@ fn response_schema_search() -> serde_json::Value {
 fn response_schema_pack() -> serde_json::Value {
     response_schema_object([
         ("schema_version", serde_json::json!({ "type": "string" })),
-        ("budget", response_schema_budget_block()),
         (
             "query",
             serde_json::json!({
@@ -86262,69 +80352,6 @@ fn response_schema_pack() -> serde_json::Value {
     ])
 }
 
-fn response_schema_subsystem_coverage_matrix() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "schema_version": { "type": "integer" },
-            "subsystem_count": { "type": "integer" },
-            "complete": { "type": "boolean" },
-            "subsystems": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "subsystem": { "type": "string" },
-                        "owning_beads": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        },
-                        "failure_modes": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        },
-                        "mandatory_proofs": {
-                            "type": "array",
-                            "items": {
-                                "type": "string",
-                                "enum": ["unit", "integration", "golden", "e2e", "logs"]
-                            }
-                        },
-                        "proof_artifacts": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        },
-                        "optional_diagnostics": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        },
-                        "fixture_provenance": { "type": "string" },
-                        "log_expectation": { "type": "string" },
-                        "redaction": {
-                            "type": "string",
-                            "enum": ["no-user-content", "local-only", "redact-required"]
-                        },
-                        "closure_evidence": { "type": "string" }
-                    },
-                    "required": [
-                        "subsystem",
-                        "owning_beads",
-                        "failure_modes",
-                        "mandatory_proofs",
-                        "proof_artifacts",
-                        "optional_diagnostics",
-                        "fixture_provenance",
-                        "log_expectation",
-                        "redaction",
-                        "closure_evidence"
-                    ]
-                }
-            }
-        },
-        "required": ["schema_version", "subsystem_count", "complete", "subsystems"]
-    })
-}
-
 /// Build response schemas for commands that support JSON output.
 ///
 /// Returns a `BTreeMap` so the serialized JSON object has deterministic
@@ -86336,137 +80363,6 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
 
     schemas.insert("search".to_string(), response_schema_search());
     schemas.insert("pack".to_string(), response_schema_pack());
-    schemas.insert(
-        "analytics-incidents".to_string(),
-        json!({
-            "type": "object",
-            "description": "cass analytics incidents --json: bounded read-only incident mining over canonical archive conversations/messages.",
-            "properties": {
-                "command": { "type": "string", "const": "analytics/incidents" },
-                "data": {
-                    "type": "object",
-                    "properties": {
-                        "schema_version": { "type": "integer", "const": 2 },
-                        "count_scope": { "type": "string", "enum": ["all_matching_candidates", "scanned_candidates_partial", "no_verified_results_hard_timeout"] },
-                        "scan_units": {
-                            "type": "object",
-                            "properties": {
-                                "files": { "type": "string" },
-                                "lines": { "type": "string" },
-                                "bytes": { "type": "string" },
-                                "candidate_order": { "type": "string" },
-                                "message_fragment_chars": { "type": "integer" }
-                            },
-                            "required": ["files", "lines", "bytes", "candidate_order", "message_fragment_chars"]
-                        },
-                        "discovery": {
-                            "type": "object",
-                            "properties": {
-                                "caps": {
-                                    "type": "object",
-                                    "properties": {
-                                        "max_files": { "type": "integer" },
-                                        "max_lines": { "type": "integer" },
-                                        "max_bytes": { "type": "integer" },
-                                        "budget_ms": { "type": "integer" },
-                                        "max_evidence": { "type": "integer" }
-                                    },
-                                    "required": ["max_files", "max_lines", "max_bytes", "budget_ms", "max_evidence"]
-                                },
-                                "files_considered": { "type": "integer" },
-                                "files_scanned": { "type": "integer" },
-                                "lines_scanned": { "type": "integer" },
-                                "bytes_scanned": { "type": "integer" },
-                                "elapsed_ms": { "type": "integer" },
-                                "stop_reason": { "type": "string", "enum": ["completed", "files-capped", "lines-capped", "bytes-capped", "message-fragment-capped", "timed-out"] },
-                                "timed_out": { "type": "boolean" },
-                                "partial": { "type": "boolean" },
-                                "evidence_truncated": { "type": "boolean" },
-                                "evidence": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "file": { "type": "string" },
-                                            "line": { "type": "integer" },
-                                            "category": { "type": "string" },
-                                            "reason": { "type": "string" }
-                                        },
-                                        "required": ["file", "line"]
-                                    }
-                                }
-                            },
-                            "required": ["caps", "files_considered", "files_scanned", "lines_scanned", "bytes_scanned", "elapsed_ms", "stop_reason", "timed_out", "partial", "evidence_truncated", "evidence"]
-                        },
-                        "top_sessions": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "conversation_id": { "type": "integer" },
-                                    "session_id": { "type": "string" },
-                                    "agent": { "type": "string" },
-                                    "host": { "type": "string" },
-                                    "source_id": { "type": "string" },
-                                    "origin_host": { "type": ["string", "null"] },
-                                    "source_path": { "type": "string" },
-                                    "exists_state": { "type": "string", "enum": ["exists", "archive_only", "unknown"] },
-                                    "hit_count": { "type": "integer" },
-                                    "category_breadth": { "type": "integer" },
-                                    "dominant_categories": { "type": "array", "items": { "type": "string" } },
-                                    "evidence_summaries": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "category": { "type": "string" },
-                                                "hit_count": { "type": "integer" },
-                                                "content_fingerprints": { "type": "array", "items": { "type": "string" } },
-                                                "evidence_paths": { "type": "array", "items": { "type": "string" } }
-                                            },
-                                            "required": ["category", "hit_count", "content_fingerprints", "evidence_paths"]
-                                        }
-                                    },
-                                    "redaction_status": { "type": "string", "enum": ["redacted", "not_applicable"] },
-                                    "suggested_command": {
-                                        "type": "object",
-                                        "properties": {
-                                            "kind": { "type": "string", "const": "view" },
-                                            "argv": {
-                                                "type": "array",
-                                                "description": "Executable argv preserving the effective --db and exact --conversation-id archive identity.",
-                                                "items": { "type": "string" }
-                                            },
-                                            "display": { "type": "string" }
-                                        },
-                                        "required": ["kind", "argv", "display"]
-                                    }
-                                },
-                                "required": ["conversation_id", "session_id", "agent", "host", "source_id", "source_path", "exists_state", "hit_count", "category_breadth", "dominant_categories", "evidence_summaries", "redaction_status", "suggested_command"]
-                            }
-                        },
-                        "total_sessions": { "type": "integer" },
-                        "total_hits": { "type": "integer" },
-                        "top_sessions_truncated": { "type": "boolean" },
-                        "redaction": {
-                            "type": "object",
-                            "properties": {
-                                "private_text_policy": { "type": "string", "const": "suppress_all" },
-                                "hash_strategy": { "type": "string", "const": "blake3_256_v1" },
-                                "fields_emitted": { "type": "array", "items": { "type": "string" } },
-                                "fields_suppressed": { "type": "array", "items": { "type": "string" } },
-                                "opt_in_flags": { "type": "array", "items": { "type": "string" } }
-                            },
-                            "required": ["private_text_policy", "hash_strategy", "fields_emitted", "fields_suppressed", "opt_in_flags"]
-                        }
-                    },
-                    "required": ["schema_version", "count_scope", "scan_units", "discovery", "top_sessions", "total_sessions", "total_hits", "top_sessions_truncated", "redaction"]
-                },
-                "_meta": { "type": "object" }
-            },
-            "required": ["command", "data", "_meta"]
-        }),
-    );
 
     schemas.insert(
         "status".to_string(),
@@ -86491,14 +80387,10 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "ingest_quarantine": response_schema_ingest_quarantine(),
                 "policy_registry": response_schema_policy_registry(),
                 "topology_budget": response_schema_topology_budget(),
-                "daemon_runtime": response_schema_opaque_object(),
                 "doctor_summary": response_schema_doctor_v2_summary("status-summary"),
                 "remote_source_sync": response_schema_doctor_remote_source_sync_runtime_summary(),
                 "coverage_risk": response_schema_doctor_coverage_risk(),
                 "quarantine": response_schema_opaque_object(),
-                "search_completeness": response_schema_search_completeness(),
-                "root_cause": response_schema_root_cause_attribution(),
-                "storage_integrity": response_schema_storage_integrity(),
                 "_meta": {
                     "type": "object",
                     "properties": {
@@ -86593,8 +80485,6 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "initialized",
                 "recommended_commands",
                 "next_command",
-                "search_completeness",
-                "root_cause",
                 "readiness",
                 "discovery",
                 "starter_workflows",
@@ -86808,7 +80698,6 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "properties": {
                 "api_version": { "type": "integer" },
                 "contract_version": { "type": "string" },
-                "subsystem_coverage": response_schema_subsystem_coverage_matrix(),
                 "global_flags": {
                     "type": "array",
                     "items": {
@@ -86948,7 +80837,6 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "target_line": { "type": ["integer", "null"] },
                 "context": { "type": "integer" },
                 "total_lines": { "type": "integer" },
-                "budget": response_schema_budget_block(),
                 "lines": {
                     "type": "array",
                     "items": {
@@ -87049,7 +80937,6 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "coverage_risk": response_schema_doctor_coverage_risk(),
                 "policy_registry": response_schema_policy_registry(),
                 "ingest_quarantine": response_schema_ingest_quarantine(),
-                "search_completeness": response_schema_search_completeness(),
                 "responsiveness": {
                     "type": "object",
                     "description": "Machine-responsiveness governor telemetry. Explains why the indexer is running at reduced fan-out and what pressure triggered any recent shrinkage.",
@@ -87219,7 +81106,6 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "timing_summary": response_schema_doctor_timing_summary(),
             "retry_recommendation": response_schema_doctor_retry_recommendation(),
             "safe_auto_eligibility": response_schema_opaque_object(),
-            "root_cause": response_schema_root_cause_attribution(),
             "primary_incident_id": { "type": ["string", "null"], "description": "incident_id for the highest-priority root-cause incident, or null when no incident was found." },
             "incidents": {
                 "type": "array",
@@ -87826,11 +81712,6 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     "additionalProperties": true,
                     "description": "Opaque lifecycle block describing cache state, missing files, and consent status."
                 },
-                "model_acquisition": {
-                    "type": "object",
-                    "additionalProperties": true,
-                    "description": "Hardened acquisition contract: state (absent|partial_download|ready|checksum_mismatch|quarantined_corrupt|budget_blocked|offline_blocked|disabled_by_policy|baseline_no_semantic|incompatible_runtime|runtime_load_failed), runtime, source, cost_class, expected_download_bytes, fallback_mode, next_step, next_command, state_detail, rollback_guidance, fingerprint{revision,content_digest,marker_token}, and skipped_network_reason (the typed proof cass never auto-downloads outside `cass models install`)."
-                },
                 "files": response_schema_opaque_object_array()
             },
             "required": ["policy_quality_tier_embedder", "lexical_fail_open", "models"]
@@ -87850,11 +81731,6 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "model_dir": { "type": "string" },
                 "all_valid": { "type": "boolean" },
                 "cache_lifecycle": response_schema_opaque_object(),
-                "model_acquisition": {
-                    "type": "object",
-                    "additionalProperties": true,
-                    "description": "Hardened acquisition contract (same shape as models-status.model_acquisition): state, runtime, source, cost_class, fingerprint, and skipped_network_reason proving verify never auto-downloads."
-                },
                 "error": { "type": ["string", "null"] }
             },
             "required": ["status", "all_valid", "lexical_fail_open"]
@@ -87882,134 +81758,6 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
 #[cfg(test)]
 mod response_schema_tests {
     use super::*;
-
-    #[test]
-    fn introspect_coverage_source_is_the_executable_matrix_report() -> Result<(), String> {
-        let embedded = serde_json::to_value(build_introspect_subsystem_coverage())
-            .map_err(|error| error.to_string())?;
-        let expected = serde_json::to_value(crate::subsystem_coverage_matrix::matrix_report())
-            .map_err(|error| error.to_string())?;
-
-        if !embedded.eq(&expected) {
-            return Err("introspect subsystem coverage drifted from matrix_report()".to_string());
-        }
-        let coverage = build_introspect_subsystem_coverage();
-        if !coverage
-            .subsystem_count
-            .eq(&crate::subsystem_coverage_matrix::REPORT_SUBSYSTEM_FILES.len())
-            || !coverage.complete
-        {
-            return Err("introspect published an incomplete subsystem coverage report".to_string());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn introspect_schema_describes_subsystem_coverage_contract() -> Result<(), String> {
-        let schemas = build_response_schemas();
-        let published = schemas
-            .get("introspect")
-            .and_then(|schema| schema.pointer("/properties/subsystem_coverage"))
-            .ok_or_else(|| "introspect schema omits subsystem_coverage".to_string())?;
-        if !published.eq(&response_schema_subsystem_coverage_matrix()) {
-            return Err("published subsystem coverage schema drifted from its source".to_string());
-        }
-
-        let proof_levels = published
-            .pointer("/properties/subsystems/items/properties/mandatory_proofs/items/enum")
-            .ok_or_else(|| "subsystem coverage schema omits proof-level enum".to_string())?;
-        if !proof_levels.eq(&serde_json::json!([
-            "unit",
-            "integration",
-            "golden",
-            "e2e",
-            "logs"
-        ])) {
-            return Err("subsystem coverage proof-level enum drifted".to_string());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn analytics_incidents_schema_is_discoverable_and_explicit() {
-        let schemas = build_response_schemas();
-        let schema = &schemas["analytics-incidents"];
-        assert_eq!(
-            schema["properties"]["command"]["const"],
-            "analytics/incidents"
-        );
-        assert_eq!(
-            schema["properties"]["data"]["properties"]["schema_version"]["const"],
-            2
-        );
-
-        let data_required = schema["properties"]["data"]["required"]
-            .as_array()
-            .expect("analytics incidents data required fields");
-        for field in [
-            "discovery",
-            "top_sessions",
-            "total_sessions",
-            "total_hits",
-            "top_sessions_truncated",
-            "redaction",
-        ] {
-            assert!(
-                data_required
-                    .iter()
-                    .any(|required| required.as_str() == Some(field)),
-                "analytics incidents schema omits required field {field}"
-            );
-        }
-        assert_eq!(
-            schema["properties"]["data"]["properties"]["redaction"]["properties"]["hash_strategy"]
-                ["const"],
-            "blake3_256_v1"
-        );
-        assert_eq!(
-            schema["properties"]["data"]["properties"]["top_sessions"]["items"]["properties"]["suggested_command"]
-                ["properties"]["argv"]["type"],
-            "array"
-        );
-    }
-
-    #[test]
-    fn b7tb0_runtime_and_cache_outcome_schemas_are_discoverable() {
-        let schemas = build_response_schemas();
-        assert!(
-            schemas["status"]["properties"]
-                .get("daemon_runtime")
-                .is_some()
-        );
-        assert!(
-            schemas["doctor"]["properties"]
-                .get("daemon_runtime")
-                .is_some()
-        );
-        assert!(
-            schemas["doctor"]["required"]
-                .as_array()
-                .expect("doctor required fields")
-                .iter()
-                .any(|field| field.as_str() == Some("daemon_runtime"))
-        );
-
-        let outcomes = &schemas["search"]["properties"]["_meta"]["properties"]["cache_stats"]["properties"]
-            ["outcomes"]["properties"];
-        for field in [
-            "hit",
-            "cold_miss",
-            "stale_generation_miss",
-            "forced_reload",
-            "reload_failure",
-            "fallback",
-        ] {
-            assert!(
-                outcomes.get(field).is_some(),
-                "missing cache outcome {field}"
-            );
-        }
-    }
 
     #[test]
     fn status_schema_includes_semantic_and_rebuild_truth() {
@@ -88974,31 +82722,13 @@ fn try_load_indexed_conversation_from_db_with_source(
     source_path: &Path,
     db_path: &Path,
     source_id: Option<&str>,
-    conversation_id: Option<i64>,
 ) -> Option<crate::ui::data::ConversationView> {
     if !db_path.exists() {
         return None;
     }
-    // `cass view` is an inspection surface. Archive fallback must therefore use
-    // the read-only connection lane and must never run migrations or schema
-    // repair merely because an incident-summary pointer was followed.
-    let storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).ok()?;
+    let storage = crate::storage::sqlite::FrankenStorage::open(db_path).ok()?;
     let source_path = source_path.to_string_lossy();
     let source_id = canonical_followup_source_id(source_id);
-    if let Some(conversation_id) = conversation_id {
-        let view =
-            crate::ui::data::load_conversation_by_id_uncached(&storage, conversation_id).ok()??;
-        if view.convo.source_path.to_string_lossy() != source_path {
-            return None;
-        }
-        if source_id
-            .as_deref()
-            .is_some_and(|expected| view.convo.source_id != expected)
-        {
-            return None;
-        }
-        return Some(view);
-    }
     if let Some(source_id) = source_id.as_deref() {
         return crate::ui::data::load_conversation_for_source(&storage, source_id, &source_path)
             .ok()?;
@@ -89131,7 +82861,7 @@ fn try_load_indexed_conversation_from_db(
     source_path: &Path,
     db_path: &Path,
 ) -> Option<crate::ui::data::ConversationView> {
-    try_load_indexed_conversation_from_db_with_source(source_path, db_path, None, None)
+    try_load_indexed_conversation_from_db_with_source(source_path, db_path, None)
 }
 
 struct ResolvedViewLine {
@@ -89156,7 +82886,6 @@ fn resolve_view(
     path: &Path,
     db_path: &Path,
     source_id: Option<&str>,
-    conversation_id: Option<i64>,
     line: Option<usize>,
     context: usize,
 ) -> CliResult<ResolvedView> {
@@ -89174,78 +82903,48 @@ fn resolve_view(
     let allow_direct_file =
         conversation_id.is_none() && (followup_source_is_local(source_id) || source_id.is_none());
 
-    let prefer_direct_file = conversation_id.is_none() && prefers_direct_view_file(path, source_id);
-    let source_exists = path.exists();
+    let prefer_direct_file = prefers_direct_view_file(path, source_id);
 
-    // Archive-only resolution (uojcg.2.3): when the source file is stale, moved,
-    // vanished, or belongs to a remote/mapped workspace, fall back to the
-    // canonical DB/archive row rather than failing. File reads are a fast path,
-    // not the only path. `archive_used` records whether the content came from the
-    // archive so the output can advertise source_exists / archive_only.
-    let (lines, archive_used): (Vec<String>, bool) = if prefer_direct_file {
+    let lines: Vec<String> = if prefer_direct_file {
         match read_followup_file_lines(path) {
-            Ok(lines) => (lines, false),
+            Ok(lines) => lines,
             Err(err) => {
                 if let Some(view) = indexed_view.as_ref() {
-                    (serialize_indexed_view_lines(view)?, true)
+                    serialize_indexed_view_lines(view)?
                 } else {
                     return Err(err);
                 }
             }
         }
     } else if let Some(view) = indexed_view.as_ref() {
-        (serialize_indexed_view_lines(view)?, true)
-    } else if allow_direct_file && source_exists {
-        (read_followup_file_lines(path)?, false)
+        serialize_indexed_view_lines(view)?
+    } else if allow_direct_file && path.exists() {
+        read_followup_file_lines(path)?
     } else {
-        // No archive row was found. Distinguish a missing ARCHIVE ROW from a
-        // missing SOURCE FILE so an agent knows whether to reindex vs. fix the
-        // path (uojcg.2.3).
-        let (kind, message, hint) = match (conversation_id, source_id) {
-            (Some(conversation_id), _) => (
-                CliErrorKind::IndexedSessionRequired.kind_str(),
-                format!(
-                    "No archived row matched conversation_id {conversation_id}, source {}, and path {}",
-                    source_id.unwrap_or("[unspecified]"),
-                    path.display()
-                ),
-                "Use the exact --db, --conversation-id, --source, and path from the incident report's suggested_command.argv."
-                    .to_string(),
-            ),
-            (None, Some(source_id)) => (
-                CliErrorKind::IndexedSessionRequired.kind_str(),
-                format!(
-                    "No archived row for source '{source_id}' at {} (archive row missing)",
-                    path.display()
-                ),
-                "Use the exact source_id from search output, or re-run index to archive this session."
-                    .to_string(),
-            ),
-            (None, None) if !source_exists => (
-                CliErrorKind::FileNotFound.kind_str(),
-                format!(
-                    "Source file missing and no archived row found: {}",
-                    path.display()
-                ),
-                "The source file moved or was pruned and is not archived; re-run index, then use the source_path from search output."
-                    .to_string(),
-            ),
-            (None, None) => (
-                CliErrorKind::FileNotFound.kind_str(),
-                format!("File not found: {}", path.display()),
-                "Path may be virtual (e.g. Cursor composer). Re-run index, then use the exact source_path from search output."
-                    .to_string(),
-            ),
-        };
         return Err(CliError {
             code: 3,
-            kind,
-            message,
-            hint: Some(hint),
+            kind: CliErrorKind::FileNotFound.kind_str(),
+            message: match source_id {
+                Some(source_id) => format!(
+                    "No indexed session found for source '{}' at {}",
+                    source_id,
+                    path.display()
+                ),
+                None => format!("File not found: {}", path.display()),
+            },
+            hint: Some(match source_id {
+                Some(_) => {
+                    "Use the exact source_id from search output or omit --source to prefer the local file/path."
+                        .to_string()
+                }
+                None => {
+                    "Path may be virtual (e.g. Cursor composer). Re-run index, then use the exact source_path from search output."
+                        .to_string()
+                }
+            }),
             retryable: false,
         });
     };
-    let archive_only = archive_used && !source_exists;
 
     if lines.is_empty() {
         return Err(CliError {
@@ -89894,13 +83593,8 @@ const INDEX_STALL_HINT: &str = concat!(
     "Capture a stack trace with `sudo cat /proc/$(pgrep -f 'cass index')/stack` ",
     "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
     "and attach to issue #244 (indexing-phase wedges) or #258 (watch_startup wedges where the lock-file ",
-    "heartbeat keeps refreshing while one thread spins). Semantic replay, embedding, vector publish, manifest, ",
-    "and finalize phases expose their own counters and are report-only; native HNSW construction is explicitly ",
-    "labelled but opaque. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable detection; set ",
-    "CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only. ",
-    "If `finalizing` is true in the diagnostics the indexer is inside the final WAL checkpoint of a large ",
-    "deferred bulk-ingest WAL (slow on macOS); CASS_INDEX_FINALIZE_ABORT_SECS (default 1800) bounds that window, ",
-    "and CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=1000 caps WAL growth so the final checkpoint stays small."
+    "heartbeat keeps refreshing while one thread spins). Set CASS_INDEX_STALL_DETECT_SECS=0 to disable detection; ",
+    "set CASS_INDEX_STALL_ABORT_SECS=0 to keep phase-2 stalls report-only."
 );
 
 fn index_stall_threshold(progress_interval: Duration) -> Option<Duration> {
@@ -89934,40 +83628,6 @@ fn index_stall_abort_threshold(
     Some(Duration::from_secs(abort_threshold_secs).max(min_after_report))
 }
 
-/// Bounded-but-generous abort grace for the post-publish *finalize* window
-/// (#319/#321).
-///
-/// A non-watch, non-semantic `cass index --full` ends by checkpointing the
-/// deferred bulk-ingest WAL inside `close_storage_after_index` — a synchronous,
-/// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` that runs
-/// on the indexer thread and cannot advance the progress atomics. On a large
-/// corpus (the #319 report: a ~1.1 GB / ~290k-frame WAL) that checkpoint
-/// legitimately takes minutes, especially on macOS where Darwin fsync/flock is
-/// slow. The generic finalize-wedge abort (`CASS_INDEX_STALL_ABORT_SECS`,
-/// default 300 s) misreads that active checkpoint as a #297 wedge and kills the
-/// process with `exit(70)` mid-checkpoint — stranding the un-truncated WAL and
-/// leaving the DB malformed to stock SQLite (#296/#321).
-///
-/// While the indexer signals `IndexingProgress::finalizing`, the watchdog uses
-/// this larger threshold instead, so a slow-but-progressing final checkpoint
-/// completes. Because the checkpoint is a single blocking `!Send` call on the
-/// indexer thread, it cannot be heartbeated — so a bound is the only liveness
-/// guard against a genuinely stuck finalize: once it elapses the abort still
-/// fires. `CASS_INDEX_FINALIZE_ABORT_SECS=0` makes the finalize window
-/// report-only (never abort). The floor is the ordinary abort threshold, so
-/// this can only ever *lengthen* the finalize grace, never shorten it.
-fn index_finalize_abort_threshold(abort_threshold: Option<Duration>) -> Option<Duration> {
-    let abort_threshold = abort_threshold?;
-    let finalize_secs = dotenvy::var("CASS_INDEX_FINALIZE_ABORT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(1800);
-    if finalize_secs == 0 {
-        return None;
-    }
-    Some(Duration::from_secs(finalize_secs).max(abort_threshold))
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IndexStallAbortPolicy {
     #[cfg(test)]
@@ -89979,29 +83639,9 @@ struct IndexStallWatchdog {
     data_dir: PathBuf,
     threshold: Option<Duration>,
     abort_threshold: Option<Duration>,
-    /// Larger abort grace used only while `IndexingProgress::finalizing` is set
-    /// (the post-publish WAL-checkpoint window). `None` = never abort during
-    /// finalize (report-only). See `index_finalize_abort_threshold` (#319/#321).
-    finalize_abort_threshold: Option<Duration>,
     abort_policy: IndexStallAbortPolicy,
-    /// True when supervising a long-lived `cass index --watch` daemon. In
-    /// watch mode the post-publish quiescent resting state (phase 0,
-    /// `current >= total`) is normal idle between rescans, not a wedge, so the
-    /// finalize-wedge detect/abort is suppressed (cass #311).
-    is_watch: bool,
-    /// True when this run is building semantic (vector) assets. Semantic work
-    /// now publishes honest per-phase counters; this flag keeps those phases
-    /// report-only and suppresses false stall reports during the one opaque
-    /// native HNSW call. A preceding phase-2 lexical wedge remains abortable.
-    semantic_build: bool,
     last_phase: usize,
     last_current: usize,
-    /// #332: last observed `IndexingProgress::activity` tick. Producers bump
-    /// activity once per parsed conversation and the consumer once per batch,
-    /// so an advancing tick proves live work between coarse `current`
-    /// publications (a long parse of one large source artifact must not read
-    /// as a stall).
-    last_activity: u64,
     last_progress_advance: std::time::Instant,
     stall_reported_for_phase: Option<usize>,
     stall_abort_reported_for_phase: Option<usize>,
@@ -90025,31 +83665,6 @@ impl IndexStallWatchdog {
         )
     }
 
-    /// Mark this watchdog as supervising a long-lived `cass index --watch`
-    /// daemon. In watch mode the post-publish, fully-quiescent resting state
-    /// (phase 0 "preparing", `current >= total`) is the NORMAL idle between
-    /// rescans — it is not a wedge. Without this flag the #297 finalize-wedge
-    /// abort fires after `abort_threshold` of that normal idle and crash-loops
-    /// the daemon with exit(70) (cass #311). Set on the watch path only.
-    fn watch_aware(mut self, is_watch: bool) -> Self {
-        self.is_watch = is_watch;
-        self
-    }
-
-    /// Mark this watchdog as supervising a one-shot semantic (vector) build.
-    /// Measured semantic phases can emit diagnostics but never exit the
-    /// process; native HNSW is opaque and therefore excluded from no-progress
-    /// diagnostics. A genuine phase-2 lexical wedge is still detected and
-    /// aborted under the ordinary policy.
-    fn semantic_aware(mut self, semantic_build: bool) -> Self {
-        self.semantic_build = semantic_build;
-        self
-    }
-
-    fn data_dir(&self) -> &Path {
-        &self.data_dir
-    }
-
     fn with_abort_policy(
         data_dir: PathBuf,
         progress_interval: Duration,
@@ -90057,18 +83672,13 @@ impl IndexStallWatchdog {
     ) -> Self {
         let threshold = index_stall_threshold(progress_interval);
         let abort_threshold = index_stall_abort_threshold(progress_interval, threshold);
-        let finalize_abort_threshold = index_finalize_abort_threshold(abort_threshold);
         Self {
             data_dir,
             threshold,
             abort_threshold,
-            finalize_abort_threshold,
             abort_policy,
-            is_watch: false,
-            semantic_build: false,
             last_phase: usize::MAX,
             last_current: 0,
-            last_activity: 0,
             last_progress_advance: std::time::Instant::now(),
             stall_reported_for_phase: None,
             stall_abort_reported_for_phase: None,
@@ -90086,14 +83696,10 @@ impl IndexStallWatchdog {
         let current = index_progress
             .current
             .load(std::sync::atomic::Ordering::Relaxed);
-        let activity = index_progress
-            .activity
-            .load(std::sync::atomic::Ordering::Relaxed);
 
         if phase_code != self.last_phase {
             self.last_phase = phase_code;
             self.last_current = current;
-            self.last_activity = activity;
             self.last_progress_advance = std::time::Instant::now();
             self.stall_reported_for_phase = None;
             self.stall_abort_reported_for_phase = None;
@@ -90103,60 +83709,13 @@ impl IndexStallWatchdog {
         if current != self.last_current {
             self.last_progress_advance = std::time::Instant::now();
             self.last_current = current;
-            self.last_activity = activity;
             self.stall_reported_for_phase = None;
             self.stall_abort_reported_for_phase = None;
-            return None;
-        }
-
-        // #332: `current` measures batch publication, not worker activity. A
-        // producer mid-parse of one large source artifact publishes nothing
-        // for minutes while ticking the activity counter per parsed
-        // conversation — that is forward progress, not a stall.
-        if activity != self.last_activity {
-            self.last_progress_advance = std::time::Instant::now();
-            self.last_activity = activity;
-            self.stall_reported_for_phase = None;
-            self.stall_abort_reported_for_phase = None;
-            return None;
-        }
-
-        if self.semantic_build && phase_code == indexer::INDEX_PHASE_SEMANTIC_HNSW {
             return None;
         }
 
         let threshold = self.threshold?;
         let stall_elapsed = self.last_progress_advance.elapsed();
-        // cass #311: in `--watch` mode the daemon legitimately rests in a
-        // quiescent, fully-published state (phase 0 "preparing",
-        // `current >= total`) between rescans. That resting state matches the
-        // #297 finalize-wedge shape, so the watchdog used to emit a spurious
-        // `stall_detected` and then abort the long-lived watch process with
-        // exit(70) after `abort_threshold` of perfectly normal idle — a
-        // crash-loop (systemd restart -> repeat). Treat the quiescent resting
-        // state as healthy idle in watch mode (no detect, no abort). A genuine
-        // watch wedge in active work — phase 2, or phase 0 with `current < total`
-        // or a non-quiescent rebuild pipeline — does not match and is still
-        // detected and aborted below.
-        //
-        // cass #315: a one-shot `cass index --semantic` build has the same
-        // healthy-idle shape here for the entire semantic pass. The lexical
-        // rebuild finishes and parks progress at phase 0 / `current == total` /
-        // quiescent, then the native MiniLM embed + HNSW build + vector publish
-        // run for minutes WITHOUT ever advancing those atomics. That legitimate
-        // work is indistinguishable from a finalize wedge, so the abort used to
-        // kill the process (exit 70) before publishing any vector index. Treat
-        // the quiescent finalize state as healthy active work for semantic
-        // builds too, so the embed/publish runs to completion. A genuine phase-2
-        // lexical wedge does not match (phase_code != 0) and is still caught.
-        if (self.is_watch || self.semantic_build) && phase_code == 0 {
-            let total = index_progress
-                .total
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if total > 0 && current >= total && index_progress.rebuild_pipeline_is_quiescent() {
-                return None;
-            }
-        }
         // Historically this gated on `phase_code != 0` so the watchdog
         // never fired during the "preparing" phase (phase=0). Issue #258
         // is exactly that: the v0.6.2 watcher wedged at startup before
@@ -90184,62 +83743,10 @@ impl IndexStallWatchdog {
         }
 
         let abort_threshold = self.abort_threshold?;
-        // The post-publish / post-rebuild finalize runs under the
-        // "preparing" phase (phase 0) with `current == total`. Issue #297:
-        // a wedge there (workers parked after the lexical publish, never
-        // woken to checkpoint/clean up) used to keep the process alive
-        // indefinitely, because the abort was historically gated on
-        // `phase == 2` only. Extend the abort to fire in any phase once the
-        // work is nominally complete (`current >= total > 0`) AND the
-        // rebuild pipeline is fully quiescent — so a legitimately
-        // slow-but-active sort/rebuild (#294) is never killed. The
-        // `abort_threshold` (default 300 s of zero forward progress) remains
-        // the outer safety margin on top of that.
-        let total = index_progress
-            .total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        // `!self.is_watch`: in watch mode the quiescent `current >= total`
-        // resting state is normal idle (handled by the early return above), so
-        // it must never be treated as a finalize wedge (cass #311).
-        // `!self.semantic_build`: for a one-shot semantic build the same
-        // quiescent state is the active embed/publish window (also handled by
-        // the early return above); belt-and-suspenders so an off-by-one phase
-        // never resurrects the exit(70) that killed the build pre-publish (cass
-        // #315).
-        let finalize_wedge = !self.is_watch
-            && !self.semantic_build
-            && total > 0
-            && current >= total
-            && index_progress.rebuild_pipeline_is_quiescent();
-        let abort_eligible = phase_code == 2 || finalize_wedge;
-        // #319/#321: while the indexer signals `finalizing`, the phase-0 /
-        // current==total / quiescent shape is the post-publish WAL-checkpoint
-        // window, not a #297 wedge. The checkpoint is a synchronous, `!Send`
-        // frankensqlite call on the indexer thread that cannot advance the
-        // progress atomics, so it can only be recognised via this flag. Give it
-        // the larger `finalize_abort_threshold` so a slow-but-active checkpoint
-        // of a large deferred WAL completes instead of being killed mid-write
-        // (which strands the WAL and leaves the DB malformed). A genuine phase-2
-        // wedge (phase_code == 2) is unaffected and still aborts at the normal
-        // threshold. Because the checkpoint blocks a single thread and cannot be
-        // heartbeated, the bound is the only liveness guard: once it elapses the
-        // finalize is aborted too.
-        let effective_abort_threshold = if finalize_wedge
-            && phase_code != 2
-            && index_progress
-                .finalizing
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            // Finalize aborts disabled (CASS_INDEX_FINALIZE_ABORT_SECS=0):
-            // treat the finalize window as report-only.
-            self.finalize_abort_threshold?
-        } else {
-            abort_threshold
-        };
         if self.abort_policy != IndexStallAbortPolicy::AbortPhaseTwo
-            || !abort_eligible
+            || phase_code != 2
             || self.stall_abort_reported_for_phase == Some(phase_code)
-            || stall_elapsed < effective_abort_threshold
+            || stall_elapsed < abort_threshold
         {
             return None;
         }
@@ -90316,7 +83823,7 @@ fn index_stall_warning_lines(payload: &serde_json::Value) -> (String, String) {
     (summary, diagnostics)
 }
 
-fn abort_after_index_stall_if_requested(payload: &serde_json::Value, data_dir: &Path) {
+fn abort_after_index_stall_if_requested(payload: &serde_json::Value) {
     if payload
         .get("abort_process")
         .and_then(serde_json::Value::as_bool)
@@ -90325,11 +83832,6 @@ fn abort_after_index_stall_if_requested(payload: &serde_json::Value, data_dir: &
         eprintln!(
             "cass index made no indexing progress past the abort threshold; exiting with code 70."
         );
-        // #296: before the bounded exit (which skips destructors), best-effort
-        // checkpoint the canonical WAL so the killed run leaves a recoverable
-        // DB instead of a multi-GB orphaned WAL. Stale locks are reaped by the
-        // next startup's flock-based recovery.
-        crate::indexer::best_effort_abort_wal_checkpoint(data_dir);
         std::process::exit(70);
     }
 }
@@ -90337,23 +83839,7 @@ fn abort_after_index_stall_if_requested(payload: &serde_json::Value, data_dir: &
 #[cfg(test)]
 mod stall_diagnostics_tests {
     use super::collect_stall_diagnostics;
-    use clap::CommandFactory;
     use tempfile::TempDir;
-
-    #[test]
-    fn issue_342_index_help_documents_semantic_stall_controls() {
-        super::run_on_large_stack(|| {
-            let mut command = super::Cli::command();
-            let index = command
-                .find_subcommand_mut("index")
-                .expect("index subcommand");
-            let help = index.render_long_help().to_string();
-            let normalized_help = help.split_whitespace().collect::<Vec<_>>().join(" ");
-            assert!(normalized_help.contains("CASS_INDEX_STALL_DETECT_SECS=0"));
-            assert!(normalized_help.contains("CASS_INDEX_STALL_ABORT_SECS=0"));
-            assert!(normalized_help.contains("opaque phase"));
-        });
-    }
 
     #[test]
     fn empty_data_dir_produces_null_checkpoint_and_no_lock() {
@@ -90487,85 +83973,6 @@ mod stall_diagnostics_tests {
         );
     }
 
-    /// Regression for #332: `current` measures batch publication, not worker
-    /// activity. While a producer is mid-parse of a large source artifact it
-    /// ticks `IndexingProgress::activity` per parsed conversation without
-    /// advancing `current` — the watchdog must treat that tick as forward
-    /// progress instead of emitting a false `stall_detected`.
-    #[test]
-    fn watchdog_treats_activity_ticks_as_progress() {
-        use super::IndexStallWatchdog;
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new().expect("temp dir");
-        let mut watchdog =
-            IndexStallWatchdog::new(tmp.path().to_path_buf(), Duration::from_millis(50));
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.last_phase = 2;
-        watchdog.last_current = 141;
-        watchdog.last_activity = 0;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        progress.phase.store(2, Ordering::Relaxed);
-        progress.total.store(221, Ordering::Relaxed);
-        progress.current.store(141, Ordering::Relaxed);
-        // Active parsing: the counter that CAN move during a long parse moved.
-        progress.tick_activity();
-
-        assert!(
-            watchdog.observe(&progress, 100).is_none(),
-            "an advancing activity tick is forward progress, not a stall (#332)"
-        );
-
-        // With current AND activity both flat past the threshold, the stall
-        // genuinely fires.
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-        let payload = watchdog
-            .observe(&progress, 200)
-            .expect("a genuinely idle phase must still stall-detect");
-        assert_eq!(payload["event"], serde_json::json!("stall_detected"));
-    }
-
-    /// Regression for #332 (ETA half): while `total` is still an expanding
-    /// "discovered so far" count, the snapshot must not publish an ETA (it
-    /// would regress by hours as discovery expands the denominator), and it
-    /// must label the unit + finality so dashboards can tell the difference.
-    #[test]
-    fn snapshot_suppresses_eta_until_total_is_final() {
-        use crate::indexer::IndexingProgress;
-        use std::sync::atomic::Ordering;
-
-        let progress = IndexingProgress::default();
-        progress.phase.store(2, Ordering::Relaxed);
-        progress.total.store(221, Ordering::Relaxed);
-        progress.current.store(141, Ordering::Relaxed);
-        progress.total_is_final.store(false, Ordering::Relaxed);
-
-        let expanding = progress.snapshot_json(60_000);
-        assert_eq!(expanding["total_is_final"], serde_json::json!(false));
-        assert_eq!(expanding["unit"], serde_json::json!("conversations"));
-        assert!(
-            expanding["eta_seconds"].is_null(),
-            "an expanding denominator must not publish a regressing ETA: {expanding}"
-        );
-        assert!(
-            expanding["rate_per_sec"].is_number(),
-            "the observed rate stays available while the total expands"
-        );
-
-        progress.total_is_final.store(true, Ordering::Relaxed);
-        let stable = progress.snapshot_json(60_000);
-        assert_eq!(stable["total_is_final"], serde_json::json!(true));
-        assert!(
-            stable["eta_seconds"].is_number(),
-            "a final denominator publishes a real ETA: {stable}"
-        );
-    }
-
     #[test]
     fn watchdog_reports_before_phase_two_abort_event() -> anyhow::Result<()> {
         use super::{IndexStallAbortPolicy, IndexStallWatchdog};
@@ -90606,407 +84013,6 @@ mod stall_diagnostics_tests {
         assert!(
             repeat.is_none(),
             "watchdog must not spam repeated abort events for the same stalled phase",
-        );
-        Ok(())
-    }
-
-    /// Regression for #297: the post-publish / post-rebuild finalize runs
-    /// under the "preparing" phase (phase 0) with `current == total`. A
-    /// wedge there used to hang forever because the abort was gated on
-    /// `phase == 2`. The abort now fires for a quiescent finalize wedge in
-    /// any phase.
-    #[test]
-    fn watchdog_aborts_on_quiescent_finalize_wedge() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // Post-publish finalize: phase back to "preparing" (0), all work
-        // accounted for (current == total), pipeline fully idle.
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        let report = watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("finalize stall did not report"))?;
-        assert_eq!(report["event"], serde_json::json!("stall_detected"));
-        assert_ne!(report["abort_process"], serde_json::json!(true));
-
-        let abort = watchdog.observe(&progress, 200).ok_or_else(|| {
-            anyhow::anyhow!("quiescent finalize wedge did not request abort (#297)")
-        })?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["abort_process"], serde_json::json!(true));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-        Ok(())
-    }
-
-    /// Regression for #311: in `cass index --watch` mode the post-publish
-    /// quiescent resting state (phase 0, `current == total`, pipeline idle) is
-    /// NORMAL idle between rescans, not a wedge. A watch-aware watchdog must
-    /// neither report a stall nor abort the long-lived daemon with exit(70)
-    /// (the bug: a deterministic exit-70 crash-loop, systemd restart, repeat).
-    /// A genuine phase-2 wedge must still abort even in watch mode.
-    #[test]
-    fn watchdog_does_not_abort_watch_idle_resting_state() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        )
-        .watch_aware(true);
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // Identical state to the #297 finalize-wedge test, but in watch mode
-        // this is healthy idle: the daemon published and awaits the next rescan.
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        // Well past both detect and abort thresholds: a non-watch watchdog
-        // would emit stall_detected then stall_aborting(exit 70) here (see
-        // `watchdog_aborts_on_quiescent_finalize_wedge`). Watch-aware: silent.
-        assert!(
-            watchdog.observe(&progress, 100).is_none(),
-            "watch idle resting state must not be reported as a stall (#311)"
-        );
-        assert!(
-            watchdog.observe(&progress, 200).is_none(),
-            "watch idle resting state must never trigger exit(70) abort (#311)"
-        );
-
-        // A genuine phase-2 wedge in watch mode is still aborted.
-        progress.phase.store(2, Ordering::Relaxed);
-        // The phase change resets the watchdog's progress clock; re-arm it.
-        let _ = watchdog.observe(&progress, 250);
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-        let detected = watchdog
-            .observe(&progress, 300)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 watch stall did not report"))?;
-        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        let abort = watchdog
-            .observe(&progress, 400)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 watch stall did not abort"))?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-        Ok(())
-    }
-
-    /// Regression for #315: a one-shot `cass index --semantic` build finishes
-    /// the lexical rebuild (parking progress at phase 0, `current == total`,
-    /// pipeline quiescent) and then runs the native embed + HNSW build + vector
-    /// publish for minutes WITHOUT advancing the progress atomics. That work is
-    /// shaped exactly like a #297 finalize wedge, so a non-semantic watchdog
-    /// used to abort mid-embed with exit(70) before publishing any vector index
-    /// — leaving semantic search permanently unavailable. A semantic-aware
-    /// watchdog must treat that quiescent finalize state as healthy active work
-    /// (no exit-70 abort), while a genuine phase-2 lexical wedge still aborts.
-    #[test]
-    fn watchdog_does_not_abort_semantic_finalize_build() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        )
-        .semantic_aware(true);
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // Identical state to the #297 finalize-wedge test, but this is the
-        // semantic embed/publish window: the lexical rebuild published and the
-        // native embedder is now grinding through vectors without touching the
-        // atomics. Well past both detect and abort thresholds.
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        assert!(
-            watchdog.observe(&progress, 100).is_none(),
-            "semantic finalize build must not be reported as a stall (#315)"
-        );
-        assert!(
-            watchdog.observe(&progress, 200).is_none(),
-            "semantic finalize build must never trigger exit(70) before publish (#315)"
-        );
-
-        // A genuine phase-2 lexical wedge during a semantic run is still aborted.
-        progress.phase.store(2, Ordering::Relaxed);
-        // The phase change resets the watchdog's progress clock; re-arm it.
-        let _ = watchdog.observe(&progress, 250);
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-        let detected = watchdog
-            .observe(&progress, 300)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 semantic stall did not report"))?;
-        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        let abort = watchdog
-            .observe(&progress, 400)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 semantic stall did not abort"))?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-        Ok(())
-    }
-
-    #[test]
-    fn issue_342_watchdog_reports_semantic_embedding_stall_without_aborting() -> anyhow::Result<()>
-    {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::{INDEX_PHASE_SEMANTIC_EMBEDDING, IndexingProgress};
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        )
-        .semantic_aware(true);
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = INDEX_PHASE_SEMANTIC_EMBEDDING;
-        watchdog.last_current = 7;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        progress
-            .phase
-            .store(INDEX_PHASE_SEMANTIC_EMBEDDING, Ordering::Relaxed);
-        progress.current.store(7, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-
-        let report = watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("semantic embedding stall did not report"))?;
-        assert_eq!(report["event"], serde_json::json!("stall_detected"));
-        assert_eq!(report["phase"], serde_json::json!("semantic_embedding"));
-        assert_ne!(report["abort_process"], serde_json::json!(true));
-        assert!(
-            watchdog.observe(&progress, 200).is_none(),
-            "semantic phases must remain report-only past the abort threshold"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn issue_342_watchdog_suppresses_false_stall_for_opaque_semantic_hnsw() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::{INDEX_PHASE_SEMANTIC_HNSW, IndexingProgress};
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        )
-        .semantic_aware(true);
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = INDEX_PHASE_SEMANTIC_HNSW;
-        watchdog.last_current = 0;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        progress
-            .phase
-            .store(INDEX_PHASE_SEMANTIC_HNSW, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-
-        assert!(watchdog.observe(&progress, 100).is_none());
-        assert!(watchdog.observe(&progress, 200).is_none());
-        Ok(())
-    }
-
-    /// Regression for #319/#321: the post-publish finalize WAL checkpoint of a
-    /// large deferred bulk-ingest WAL runs as a synchronous, `!Send`
-    /// frankensqlite call on the indexer thread (inside
-    /// `close_storage_after_index`). It cannot advance the progress atomics, so
-    /// it looks exactly like a #297 finalize wedge — phase 0, `current == total`,
-    /// pipeline quiescent — while the process is actually alive and checkpointing
-    /// (minutes on macOS). Before this fix the watchdog aborted it at the normal
-    /// 300 s threshold with `exit(70)`, killing the checkpoint mid-write and
-    /// stranding the un-truncated ~1.1 GB WAL (leaving the DB malformed to stock
-    /// SQLite). The indexer now sets `IndexingProgress::finalizing`; the watchdog
-    /// must (a) NOT abort while finalizing until the larger
-    /// `finalize_abort_threshold` elapses, yet (b) still abort a genuinely stuck
-    /// finalize once that bound passes, and (c) still abort a normal phase-2
-    /// wedge at the ordinary threshold.
-    #[test]
-    fn watchdog_defers_abort_during_final_wal_checkpoint_finalize() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        // Generous finalize grace: much larger than the ordinary abort threshold.
-        watchdog.finalize_abort_threshold = Some(Duration::from_millis(500));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // The exact #297 finalize-wedge shape, but the indexer has signalled it
-        // is inside the final WAL checkpoint.
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        progress.finalizing.store(true, Ordering::Relaxed);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        // Well past the ordinary abort threshold (2 ms) but under the finalize
-        // grace (500 ms): the first observe reports the stall, but the watchdog
-        // must NOT abort — the checkpoint is legitimate active work.
-        let detected = watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("finalize stall did not report"))?;
-        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        assert!(
-            detected.get("exit_code").is_none(),
-            "the stall_detected report must not carry an abort during finalize"
-        );
-        assert_eq!(detected["finalizing"], serde_json::json!(true));
-        for elapsed in [200_u128, 300, 400] {
-            assert!(
-                watchdog.observe(&progress, elapsed).is_none(),
-                "the finalize WAL checkpoint must not be aborted before the finalize grace elapses (#319/#321)"
-            );
-        }
-
-        // Liveness bound: once the finalize grace itself elapses, a genuinely
-        // stuck finalize is still aborted (the checkpoint blocks one thread and
-        // cannot be heartbeated, so this bound is the only guard).
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(600);
-        let abort = watchdog
-            .observe(&progress, 500)
-            .ok_or_else(|| anyhow::anyhow!("stuck finalize past the grace did not abort"))?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-
-        // Control: with `finalizing` cleared, the identical quiescent shape is a
-        // #297 wedge again and aborts at the ordinary threshold.
-        let mut wedge_watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        wedge_watchdog.threshold = Some(Duration::from_millis(1));
-        wedge_watchdog.abort_threshold = Some(Duration::from_millis(2));
-        wedge_watchdog.finalize_abort_threshold = Some(Duration::from_millis(500));
-        wedge_watchdog.last_phase = 0;
-        wedge_watchdog.last_current = 100;
-        wedge_watchdog.last_progress_advance =
-            std::time::Instant::now() - Duration::from_millis(100);
-        progress.finalizing.store(false, Ordering::Relaxed);
-        let detected = wedge_watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("non-finalizing wedge did not report"))?;
-        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        let abort = wedge_watchdog.observe(&progress, 200).ok_or_else(|| {
-            anyhow::anyhow!("non-finalizing wedge did not abort at the ordinary threshold")
-        })?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-        Ok(())
-    }
-
-    /// A legitimately slow but *active* rebuild (#294) must never be
-    /// aborted outside phase 2, even when `current == total` and the stall
-    /// threshold has elapsed: as long as the pipeline reports in-flight
-    /// work, the watchdog only reports, never aborts.
-    #[test]
-    fn watchdog_does_not_abort_active_rebuild_outside_phase_two() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        // Still one staged shard build in flight: the rebuild is slow, not
-        // wedged.
-        progress
-            .rebuild_pipeline_staged_shard_build_active_jobs
-            .store(1, Ordering::Relaxed);
-        assert!(!progress.rebuild_pipeline_is_quiescent());
-
-        let report = watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("finalize stall did not report"))?;
-        assert_eq!(report["event"], serde_json::json!("stall_detected"));
-
-        let again = watchdog.observe(&progress, 200);
-        assert!(
-            again.is_none(),
-            "an active (non-quiescent) rebuild must not be aborted outside phase 2 (#294)",
         );
         Ok(())
     }
@@ -91170,23 +84176,6 @@ fn run_index_with_data(
         }
     };
 
-    // #287: machine-readable liveness for robot callers. Healthy structured
-    // runs still end with exactly one JSON document on stdout; but when the
-    // stall watchdog fires, a robot caller that only reads stdout used to see
-    // zero bytes until its external timeout killed the process. Emit the
-    // stall/abort payload as an NDJSON event line on stdout too (flushed, in
-    // case the caller kills us next) so the agent can distinguish "wedged
-    // indexer" from "slow command" before its deadline.
-    let emit_robot_stall_event_on_stdout = |payload: &serde_json::Value| {
-        if structured_format.is_some()
-            && let Ok(line) = serde_json::to_string(payload)
-        {
-            use std::io::Write as _;
-            println!("{line}");
-            let _ = std::io::stdout().flush();
-        }
-    };
-
     if let Some(notice) = &indexing_exclusion_notice {
         emit_indexing_exclusion_notice(notice, structured_output);
     }
@@ -91302,9 +84291,7 @@ fn run_index_with_data(
         let mut last_agents = usize::MAX;
         let mut last_update = std::time::Instant::now();
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch)
-                .semantic_aware(semantic);
+            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval);
 
         loop {
             // Check if indexer finished
@@ -91326,21 +84313,14 @@ fn run_index_with_data(
                 .unwrap_or_default();
 
             let phase_str = match phase {
-                indexer::INDEX_PHASE_SCANNING => "Scanning",
-                indexer::INDEX_PHASE_LEXICAL_INDEXING => "Indexing",
-                indexer::INDEX_PHASE_SEMANTIC_INITIALIZE => "Semantic initialize",
-                indexer::INDEX_PHASE_SEMANTIC_REPLAY => "Semantic replay",
-                indexer::INDEX_PHASE_SEMANTIC_EMBEDDING => "Semantic embedding",
-                indexer::INDEX_PHASE_SEMANTIC_VECTOR_PUBLISH => "Semantic vector publish",
-                indexer::INDEX_PHASE_SEMANTIC_HNSW => "Semantic HNSW",
-                indexer::INDEX_PHASE_SEMANTIC_MANIFEST => "Semantic manifest",
-                indexer::INDEX_PHASE_SEMANTIC_FINALIZE => "Semantic finalize",
+                1 => "Scanning",
+                2 => "Indexing",
                 _ => "Preparing",
             };
 
             let rebuild_indicator = if is_rebuilding { " (rebuilding)" } else { "" };
 
-            let msg = if phase == indexer::INDEX_PHASE_SCANNING {
+            let msg = if phase == 1 {
                 let scan_progress = if total > 0 {
                     format!("{current}/{total} connectors")
                 } else {
@@ -91366,7 +84346,7 @@ fn run_index_with_data(
                         phase_str, rebuild_indicator, scan_progress
                     )
                 }
-            } else if phase == indexer::INDEX_PHASE_LEXICAL_INDEXING {
+            } else if phase == 2 {
                 // Indexing phase - show progress
                 if total > 0 {
                     let pct = (current as f64 / total as f64 * 100.0).min(100.0);
@@ -91377,16 +84357,6 @@ fn run_index_with_data(
                 } else {
                     format!("{}{}: Processing...", phase_str, rebuild_indicator)
                 }
-            } else if phase >= indexer::INDEX_PHASE_SEMANTIC_INITIALIZE && total > 0 {
-                let pct = (current as f64 / total as f64 * 100.0).min(100.0);
-                format!(
-                    "{}: {}/{} {} ({:.0}%)",
-                    phase_str,
-                    current,
-                    total,
-                    indexer::IndexingProgress::phase_unit_for(phase),
-                    pct
-                )
             } else {
                 format!("{}{}...", phase_str, rebuild_indicator)
             };
@@ -91412,7 +84382,7 @@ fn run_index_with_data(
                 let (summary, diagnostics) = index_stall_warning_lines(&payload);
                 pb.println(summary);
                 pb.println(diagnostics);
-                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
+                abort_after_index_stall_if_requested(&payload);
             }
 
             std::thread::sleep(Duration::from_millis(50));
@@ -91432,13 +84402,8 @@ fn run_index_with_data(
         let mut last_agents = 0;
         let mut last_current = 0;
         let mut last_scan_current = 0;
-        let mut last_counter_emit = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now);
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch)
-                .semantic_aware(semantic);
+            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval);
 
         loop {
             if index_handle.is_finished() {
@@ -91453,22 +84418,15 @@ fn run_index_with_data(
             // Print status on phase change
             if phase != last_phase {
                 match phase {
-                    indexer::INDEX_PHASE_SCANNING => eprintln!("Scanning for agents..."),
-                    indexer::INDEX_PHASE_LEXICAL_INDEXING => {
-                        eprintln!("Indexing conversations...")
-                    }
-                    phase if phase >= indexer::INDEX_PHASE_SEMANTIC_INITIALIZE => {
-                        eprintln!("{}...", indexer::IndexingProgress::phase_label_for(phase));
-                    }
+                    1 => eprintln!("Scanning for agents..."),
+                    2 => eprintln!("Indexing conversations..."),
                     _ => {}
                 }
                 last_phase = phase;
-                last_current = current;
-                last_counter_emit = std::time::Instant::now();
             }
 
             // Print scan progress during discovery
-            if phase == indexer::INDEX_PHASE_SCANNING && current != last_scan_current {
+            if phase == 1 && current != last_scan_current {
                 if total > 0 {
                     eprintln!("  Scanned {}/{} connectors", current, total);
                 } else {
@@ -91484,10 +84442,7 @@ fn run_index_with_data(
             }
 
             // Print indexing progress every 100 conversations
-            if phase == indexer::INDEX_PHASE_LEXICAL_INDEXING
-                && current > last_current
-                && current % 100 == 0
-            {
+            if phase == 2 && current > last_current && current % 100 == 0 {
                 if total > 0 {
                     eprintln!("  Indexed {}/{} conversations", current, total);
                 } else {
@@ -91496,40 +84451,13 @@ fn run_index_with_data(
                 last_current = current;
             }
 
-            // Semantic counters can advance rapidly during replay/vector
-            // publish. Emit at most once per second, plus the exact terminal
-            // value, so plain mode is informative without becoming a log
-            // flood on large corpora.
-            if phase >= indexer::INDEX_PHASE_SEMANTIC_INITIALIZE
-                && current != last_current
-                && (last_counter_emit.elapsed() >= Duration::from_secs(1)
-                    || (total > 0 && current >= total))
-            {
-                if total > 0 {
-                    eprintln!(
-                        "  {}/{} {}",
-                        current,
-                        total,
-                        indexer::IndexingProgress::phase_unit_for(phase)
-                    );
-                } else {
-                    eprintln!(
-                        "  {} {}",
-                        current,
-                        indexer::IndexingProgress::phase_unit_for(phase)
-                    );
-                }
-                last_current = current;
-                last_counter_emit = std::time::Instant::now();
-            }
-
             if let Some(payload) =
                 stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
             {
                 let (summary, diagnostics) = index_stall_warning_lines(&payload);
                 eprintln!("{summary}");
                 eprintln!("{diagnostics}");
-                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
+                abort_after_index_stall_if_requested(&payload);
             }
 
             std::thread::sleep(Duration::from_millis(200));
@@ -91545,9 +84473,7 @@ fn run_index_with_data(
             .checked_sub(progress_interval)
             .unwrap_or_else(std::time::Instant::now);
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch)
-                .semantic_aware(semantic);
+            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval);
 
         // Finish-aware poll cadence: 100ms for snappy shutdown, but only emit a
         // `progress` event at `progress_interval`.
@@ -91588,8 +84514,7 @@ fn run_index_with_data(
 
             if let Some(payload) = stall_watchdog.observe(&index_progress, elapsed_ms) {
                 emit_event(payload.clone());
-                emit_robot_stall_event_on_stdout(&payload);
-                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
+                abort_after_index_stall_if_requested(&payload);
             }
 
             std::thread::sleep(Duration::from_millis(100));
@@ -91598,9 +84523,7 @@ fn run_index_with_data(
         // No progress display (json mode with events disabled, or plain=none):
         // just wait for completion.
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch)
-                .semantic_aware(semantic);
+            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval);
         while !index_handle.is_finished() {
             if let Some(payload) =
                 stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
@@ -91608,11 +84531,7 @@ fn run_index_with_data(
                 let (summary, diagnostics) = index_stall_warning_lines(&payload);
                 eprintln!("{summary}");
                 eprintln!("{diagnostics}");
-                // #287: `--json --no-progress-events` callers still need a
-                // machine-readable stall signal on stdout before any external
-                // timeout kills the run.
-                emit_robot_stall_event_on_stdout(&payload);
-                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
+                abort_after_index_stall_if_requested(&payload);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -92571,15 +85490,12 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             // Oh My Pi: user explicitly selected the `omp` binary.
             "omp" | "oh-my-pi" | "ohmypi" | "oh_my_pi" => ("pi_agent", Some("omp")),
             "gemini" => ("gemini", None),
-            // Antigravity resumes via `agy --conversation <uuid>`; `agy` is
-            // the binary name, so accept it as an alias for the slug.
-            "antigravity" | "agy" => ("antigravity", None),
             other => {
                 return Err(CliError {
                     code: 2,
                     kind: CliErrorKind::InvalidAgent.kind_str(),
                     message: format!(
-                        "unknown --agent value '{other}'; expected one of: claude, codex, opencode, pi_agent, pi, omp, gemini, antigravity"
+                        "unknown --agent value '{other}'; expected one of: claude, codex, opencode, pi_agent, pi, omp, gemini"
                     ),
                     hint: None,
                     retryable: false,
@@ -92647,20 +85563,6 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             reason: "path contains .pi/agent".to_string(),
         });
     }
-    // Antigravity (`agy`) stores its transcripts under
-    // `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl`.
-    // That path ALSO contains `.gemini/`, so it must be matched BEFORE the
-    // gemini arm below or an antigravity session would be misrouted to the
-    // Gemini harness. (probe.rs / fleet_archive_coverage.rs enforce the same
-    // antigravity-before-gemini ordering.)
-    if path_str.contains("antigravity-cli") || path_str.contains(".system_generated") {
-        return Ok(DetectedAgent {
-            slug: "antigravity",
-            binary_hint: None,
-            is_override: false,
-            reason: "path contains antigravity-cli storage".to_string(),
-        });
-    }
     if path_str.contains(".gemini/") || path_str.contains("/gemini/sessions") {
         return Ok(DetectedAgent {
             slug: "gemini",
@@ -92678,8 +85580,7 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             path.display()
         ),
         hint: Some(
-            "Pass --agent <name> to override (claude, codex, opencode, pi, omp, gemini, antigravity)."
-                .into(),
+            "Pass --agent <name> to override (claude, codex, opencode, pi, omp, gemini).".into(),
         ),
         retryable: false,
     })
@@ -92703,13 +85604,7 @@ fn extract_filename_session_id(path: &Path) -> Option<String> {
 /// that clearly isn't a UUID we can surface a clearer error than the
 /// "session not found" the downstream harness would emit.
 fn looks_like_session_uuid(candidate: &str) -> bool {
-    looks_like_session_uuid_bytes(candidate.as_bytes())
-}
-
-/// Byte-level core of [`looks_like_session_uuid`], reused by
-/// [`extract_uuid_from_stem`] so a sliding window can be checked without an
-/// intermediate `&str`.
-fn looks_like_session_uuid_bytes(bytes: &[u8]) -> bool {
+    let bytes = candidate.as_bytes();
     if bytes.len() != 36 {
         return false;
     }
@@ -92728,37 +85623,6 @@ fn looks_like_session_uuid_bytes(bytes: &[u8]) -> bool {
         }
     }
     true
-}
-
-/// Recover a canonical 8-4-4-4-12 hex UUID from a filename stem that may carry
-/// a prefix. Codex names rollout sessions
-/// `rollout-<ISO timestamp>-<uuid>.jsonl`, so the bare stem is longer than a
-/// raw UUID even though the session id Codex resumes by is the trailing UUID
-/// (see bead/issue cass#300). Returns the right-most canonical UUID substring —
-/// scanning from the end matches the trailing-UUID layout and avoids carving a
-/// hex-shaped slice out of the timestamp — or `None` when the stem holds no
-/// UUID. Boundary checks reject windows flanked by another hex digit so we
-/// never split a longer hex run.
-fn extract_uuid_from_stem(stem: &str) -> Option<String> {
-    let bytes = stem.as_bytes();
-    if bytes.len() < 36 {
-        return None;
-    }
-    for start in (0..=bytes.len() - 36).rev() {
-        let window = &bytes[start..start + 36];
-        if !looks_like_session_uuid_bytes(window) {
-            continue;
-        }
-        let left_ok = start
-            .checked_sub(1)
-            .is_none_or(|p| !bytes[p].is_ascii_hexdigit());
-        let right_ok = bytes.get(start + 36).is_none_or(|b| !b.is_ascii_hexdigit());
-        if left_ok && right_ok {
-            // The window passed the hex/dash shape check, so it is pure ASCII.
-            return std::str::from_utf8(window).ok().map(str::to_string);
-        }
-    }
-    None
 }
 
 /// Extract the Oh My Pi / pi-mono session id from a JSONL session file.
@@ -92920,62 +85784,6 @@ fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
     Ok(decoded)
 }
 
-/// Extract the Antigravity conversation UUID from a transcript source path.
-///
-/// Antigravity records each conversation under
-/// `<...>/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl`
-/// (a `transcript_full.jsonl` sibling may also appear). The `<uuid>` — the same
-/// id `agy --conversation <uuid>` resumes by, and the connector's normalized
-/// `external_id` — is the name of the directory that contains
-/// `.system_generated`. We locate that segment structurally rather than by a
-/// fixed depth so extraction still works when a remote mirror adds leading path
-/// components, and fall back to the component immediately after a `brain`
-/// segment when the path points straight at the conversation directory.
-fn extract_antigravity_conversation_id(path: &Path) -> CliResult<String> {
-    // Primary: the directory whose immediate child is `.system_generated`.
-    let mut cursor = path;
-    while let Some(parent) = cursor.parent() {
-        if parent.file_name().is_some_and(|n| n == ".system_generated")
-            && let Some(uuid) = parent
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|n| n.to_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        {
-            return Ok(uuid.to_string());
-        }
-        cursor = parent;
-    }
-    // Fallback: the path component right after a `brain` segment is the <uuid>
-    // (covers a path that already points at `brain/<uuid>` or below).
-    let names: Vec<&str> = path
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .collect();
-    if let Some(pos) = names.iter().position(|n| *n == "brain")
-        && let Some(uuid) = names
-            .get(pos + 1)
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-    {
-        return Ok(uuid.to_string());
-    }
-    Err(CliError {
-        code: 5,
-        kind: CliErrorKind::SessionIdNotFound.kind_str(),
-        message: format!(
-            "cannot derive Antigravity conversation id from '{}'",
-            path.display()
-        ),
-        hint: Some(
-            "Expected an Antigravity transcript path like '<...>/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl'."
-                .into(),
-        ),
-        retryable: false,
-    })
-}
-
 /// Build the ready-to-run resume target for a session path. Does not
 /// touch the filesystem unless the agent requires file-based id
 /// extraction (pi-agent).
@@ -93023,30 +85831,19 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
             })
         }
         "codex" => {
-            let stem = extract_filename_session_id(path).ok_or_else(|| CliError {
+            let uuid = extract_filename_session_id(path).ok_or_else(|| CliError {
                 code: 5,
                 kind: CliErrorKind::SessionIdNotFound.kind_str(),
                 message: format!("cannot derive Codex session UUID from '{}'", path.display()),
                 hint: None,
                 retryable: false,
             })?;
-            // Codex rollout files are named `rollout-<timestamp>-<uuid>.jsonl`,
-            // so the bare stem can carry a prefix. The id Codex resumes by is
-            // the trailing UUID — recover it from the stem (falling back to the
-            // stem itself when no UUID is present), so both auto-detected and
-            // `--agent codex` invocations hand `codex resume` the canonical id
-            // rather than the full filename (cass#300).
-            let uuid = if looks_like_session_uuid(&stem) {
-                stem.clone()
-            } else {
-                extract_uuid_from_stem(&stem).unwrap_or_else(|| stem.clone())
-            };
             if !is_override && !looks_like_session_uuid(&uuid) {
                 return Err(CliError {
                     code: 5,
                     kind: CliErrorKind::SessionIdNotFound.kind_str(),
                     message: format!(
-                        "filename stem '{stem}' does not look like a Codex session UUID (expected 8-4-4-4-12 hex)"
+                        "filename stem '{uuid}' does not look like a Codex session UUID (expected 8-4-4-4-12 hex)"
                     ),
                     hint: Some(
                         "Did you pass a date directory or log file instead of a <uuid>.jsonl session file? Pass `--agent codex` to bypass this check if the id is correct."
@@ -93066,15 +85863,9 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
             // Strict mode only when we auto-detected. An explicit
             // `--agent opencode` bypasses the parent-directory check.
             let id = extract_opencode_session_id(path, !is_override)?;
-            // Current OpenCode (1.16.x) continues a session via the
-            // top-level `--session <id>` flag (`-s` for short); the old
-            // `opencode resume <id>` subcommand was removed and is no
-            // longer discoverable via `--help` (cass#316). Emit the
-            // documented flag form so the generated command actually
-            // resumes on a current OpenCode install.
             Ok(ResumeTarget {
                 agent: "opencode",
-                argv: vec!["opencode".into(), "--session".into(), id.clone()],
+                argv: vec!["opencode".into(), "resume".into(), id.clone()],
                 session_id: Some(id),
                 detection_reason,
             })
@@ -93114,22 +85905,6 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
                     path_str,
                 ],
                 session_id: None,
-                detection_reason,
-            })
-        }
-        "antigravity" => {
-            // Antigravity resumes by conversation UUID: `agy --conversation
-            // <uuid>` (verified against agy 1.0.x `--help`: "--conversation
-            // Resume a previous conversation by ID"). The UUID is the
-            // `brain/<uuid>` directory name, recoverable from the transcript
-            // source path cass stores — the same id the connector keys both
-            // `conversations/<uuid>.db` and `brain/<uuid>/` by, and the
-            // normalized `external_id` (cass#314).
-            let uuid = extract_antigravity_conversation_id(path)?;
-            Ok(ResumeTarget {
-                agent: "antigravity",
-                argv: vec!["agy".into(), "--conversation".into(), uuid.clone()],
-                session_id: Some(uuid),
                 detection_reason,
             })
         }
@@ -93458,7 +86233,7 @@ fn run_export(
     let mut indexed_view = if should_defer_indexed_lookup_for_direct_export(path, source_id) {
         None
     } else {
-        try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id, None)
+        try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id)
     };
 
     if source_id.is_none()
@@ -93493,7 +86268,7 @@ fn run_export(
             Err(err) => {
                 if indexed_view.is_none() {
                     indexed_view = try_load_indexed_conversation_from_db_with_source(
-                        path, &db_path, source_id, None,
+                        path, &db_path, source_id,
                     );
                 }
                 if let Some(view) = indexed_view.as_ref() {
@@ -93953,7 +86728,7 @@ fn run_export_html(
     {
         None
     } else {
-        try_load_indexed_conversation_from_db_with_source(session_path, &db_path, source_id, None)
+        try_load_indexed_conversation_from_db_with_source(session_path, &db_path, source_id)
     };
 
     // --- Validate session exists ---
@@ -94088,7 +86863,6 @@ fn run_export_html(
                         session_path,
                         &db_path,
                         source_id,
-                        None,
                     );
                 }
                 if let Some(view) = indexed_view.as_ref() {
@@ -96740,7 +89514,6 @@ mod indexed_conversation_fallback_tests {
             &session_path,
             Some(db_path),
             None,
-            None,
             Some(2),
             0,
             Some(RobotFormat::Json),
@@ -96804,7 +89577,6 @@ local second line
         run_view(
             &session_path,
             Some(db_path),
-            None,
             None,
             Some(2),
             0,
@@ -97326,7 +90098,6 @@ This should stay behind the indexed html export.
             &session_path,
             Some(db_path),
             None,
-            None,
             Some(1),
             0,
             Some(RobotFormat::Json),
@@ -97442,7 +90213,6 @@ This should stay behind the indexed html export.
         run_view(
             &synthetic_path,
             Some(db_path),
-            None,
             None,
             Some(1),
             0,
@@ -98470,8 +91240,7 @@ fn run_expand(
     }
 
     let db_path = db_override.unwrap_or_else(default_db_path);
-    let indexed_view =
-        try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id, None);
+    let indexed_view = try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id);
     let allow_direct_file = followup_source_is_local(source_id) || source_id.is_none();
 
     let prefer_direct_file = prefers_direct_jsonl_file(path, source_id);
@@ -99230,15 +91999,6 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_sources_sync(source, no_index, verbose, dry_run, structured_format)
-        }
-        SourcesCommand::Reingest {
-            from_mirror: _,
-            source,
-            full,
-            json,
-        } => {
-            let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_sources_reingest(source, full, structured_format)
         }
         SourcesCommand::ArtifactManifest {
             index_path,
@@ -100056,9 +92816,6 @@ struct DiagnosticCheck {
 #[derive(serde::Serialize)]
 struct SourceDiagnostics {
     source_id: String,
-    /// Bounded fleet-doctor host report (bead uojcg.8.2): reachability/transport
-    /// state + likely root cause + safe next command, in the 6.1 schema.
-    host_report: crate::fleet_doctor_schema::HostDoctorReport,
     checks: Vec<DiagnosticCheck>,
     passed: usize,
     warnings: usize,
@@ -100451,7 +93208,6 @@ fn run_sources_doctor(
     }
 
     let mut all_diagnostics = Vec::new();
-    let mut observations = Vec::new();
 
     for source in sources_to_check {
         let source_start = std::time::Instant::now();
@@ -100837,18 +93593,12 @@ fn run_sources_doctor(
 
         all_diagnostics.push(SourceDiagnostics {
             source_id: source.name.clone(),
-            host_report,
             checks,
             passed,
             warnings,
             failed,
         });
     }
-
-    // Bead uojcg.8.6: classify the read-only observations into the explicit
-    // source-doctor health report (per-source state, preservation-safe next
-    // command, mutation-free marker). Pure: building the report performs no I/O.
-    let health_report = crate::source_doctor_health::SourceDoctorReport::build(&observations);
 
     // Output results
     if let Some(fmt) = structured_format {
@@ -100913,20 +93663,7 @@ fn run_sources_doctor(
         })?;
         output_structured_value(payload, fmt)?;
     } else {
-        if health_report.sources.len() != all_diagnostics.len() {
-            return Err(CliError::unknown(format!(
-                "source doctor projection mismatch: {} health entries for {} diagnostics",
-                health_report.sources.len(),
-                all_diagnostics.len()
-            )));
-        }
-        for (entry, diag) in health_report.sources.iter().zip(&all_diagnostics) {
-            if entry.source_id != diag.source_id {
-                return Err(CliError::unknown(format!(
-                    "source doctor projection mismatch: health source {:?} paired with diagnostic {:?}",
-                    entry.source_id, diag.source_id
-                )));
-            }
+        for diag in &all_diagnostics {
             println!();
             println!("{}", format!("Checking source: {}", diag.source_id).bold());
             println!();
@@ -100951,13 +93688,6 @@ fn run_sources_doctor(
                 }
             }
 
-            let human =
-                crate::source_doctor_health::project_source_human_summary(entry, &diag.host_report);
-            println!();
-            for line in human.render_lines() {
-                println!("  {line}");
-            }
-
             println!();
             println!(
                 "Summary: {} passed, {} warnings, {} failed",
@@ -100970,10 +93700,7 @@ fn run_sources_doctor(
 
     // Set exit code based on results
     let total_failed: usize = all_diagnostics.iter().map(|d| d.failed).sum();
-    if total_failed > 0
-        || health_report.summary.unhealthy > 0
-        || health_report.summary.unreached > 0
-    {
+    if total_failed > 0 {
         std::process::exit(1);
     }
 
@@ -101270,10 +93997,10 @@ fn check_ssh_connectivity(
     ssh_args.push(host.to_string());
     ssh_args.push(remote_noop_command(platform));
 
-    let output = bounded_ssh_output(&ssh_args, timeout);
+    let output = std::process::Command::new("ssh").args(&ssh_args).output();
 
     match output {
-        Ok(Some(out)) if out.status.success() => DiagnosticCheck {
+        Ok(out) if out.status.success() => DiagnosticCheck {
             name: "SSH Connectivity".into(),
             status: "pass".into(),
             message: format!("Connected to {} successfully", host),
@@ -101311,15 +94038,6 @@ fn check_ssh_connectivity(
                 remediation,
             }
         }
-        Ok(None) => DiagnosticCheck {
-            name: "SSH Connectivity".into(),
-            status: "warn".into(),
-            message: format!(
-                "SSH probe timed out after {}ms",
-                u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
-            ),
-            remediation: Some("Retry this host with a larger per-host fleet budget".into()),
-        },
         Err(e) => DiagnosticCheck {
             name: "SSH Connectivity".into(),
             status: "fail".into(),
@@ -101529,83 +94247,34 @@ fn classify_remote_path_probe(
 fn check_local_storage(source_name: &str) -> DiagnosticCheck {
     let data_dir = default_data_dir();
     let source_dir = data_dir.join("remotes").join(source_name);
-    check_local_storage_path(&source_dir)
-}
 
-fn check_local_storage_path(source_dir: &Path) -> DiagnosticCheck {
-    let mut inspected = None;
-    for candidate in source_dir.ancestors() {
-        match std::fs::metadata(candidate) {
-            Ok(metadata) => {
-                inspected = Some((candidate, metadata));
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return DiagnosticCheck {
-                    name: "Local Storage".into(),
-                    status: "fail".into(),
-                    message: format!(
-                        "Cannot inspect {} without writing: {error}",
-                        candidate.display()
-                    ),
-                    remediation: Some("Check file permissions on data directory".into()),
-                };
-            }
+    // Try to create the directory if it doesn't exist
+    if !source_dir.exists() {
+        if std::fs::create_dir_all(&source_dir).is_ok() {
+            return DiagnosticCheck {
+                name: "Local Storage".into(),
+                status: "pass".into(),
+                message: format!("{} is writable", source_dir.display()),
+                remediation: None,
+            };
+        } else {
+            return DiagnosticCheck {
+                name: "Local Storage".into(),
+                status: "fail".into(),
+                message: format!("Cannot create {}", source_dir.display()),
+                remediation: Some("Check file permissions on data directory".into()),
+            };
         }
     }
 
-    let Some((inspected_path, metadata)) = inspected else {
-        return DiagnosticCheck {
-            name: "Local Storage".into(),
-            status: "fail".into(),
-            message: format!(
-                "No existing ancestor of {} could be inspected without writing",
-                source_dir.display()
-            ),
-            remediation: Some("Check the configured data directory path".into()),
-        };
-    };
-
-    if !metadata.is_dir() {
-        return DiagnosticCheck {
-            name: "Local Storage".into(),
-            status: "fail".into(),
-            message: format!(
-                "{} is not a directory (read-only check; no write attempted)",
-                inspected_path.display()
-            ),
-            remediation: Some("Replace the path with a writable directory".into()),
-        };
-    }
-
-    let target_context = if inspected_path == source_dir {
-        String::new()
-    } else {
-        format!(" for target {}", source_dir.display())
-    };
-    if metadata.permissions().readonly() {
-        DiagnosticCheck {
-            name: "Local Storage".into(),
-            status: "fail".into(),
-            message: format!(
-                "{} appears read-only from permission metadata{} (read-only check; no write \
-                 attempted; effective ACL access was not tested)",
-                inspected_path.display(),
-                target_context
-            ),
-            remediation: Some("Check file permissions on data directory".into()),
-        }
-    } else {
+    // Directory exists, check if writable
+    let test_file = source_dir.join(".doctor_test");
+    if std::fs::write(&test_file, b"test").is_ok() {
+        let _ = std::fs::remove_file(&test_file);
         DiagnosticCheck {
             name: "Local Storage".into(),
             status: "pass".into(),
-            message: format!(
-                "{} appears writable from permission metadata{} (read-only check; no write \
-                 attempted; effective ACL access was not tested)",
-                inspected_path.display(),
-                target_context
-            ),
+            message: format!("{} is writable", source_dir.display()),
             remediation: None,
         }
     }
@@ -101783,71 +94452,12 @@ fn platform_from_uname(uname_s: &str) -> crate::fleet_doctor_schema::Platform {
     } else if lower.contains("mingw") || lower.contains("msys") || lower.contains("windows") {
         (HostOs::Windows, PathStyle::Windows, Vec::new())
     } else {
-        (HostOs::Other, PathStyle::Posix, Vec::new())
-    };
-    Platform {
-        os,
-        arch: String::new(),
-        path_style,
-        tool_notes,
-    }
-}
-
-/// Archive DB last-modified time in epoch milliseconds, when the DB exists.
-fn archive_db_mtime_ms(data_dir: &std::path::Path) -> Option<i64> {
-    let modified = std::fs::metadata(data_dir.join("agent_search.db"))
-        .ok()?
-        .modified()
-        .ok()?;
-    let dur = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-    i64::try_from(dur.as_millis()).ok()
-}
-
-/// Gather cass-owned LOCAL sync/mirror/index evidence for a source (bead uojcg.8.7).
-/// Reads only local state — the remote-path probe results already collected for
-/// reachability, `sync_status.json`, the local mirror dir, and the archive DB
-/// mtime. It opens no SSH session and mutates nothing.
-fn gather_source_sync_evidence(
-    source: &crate::sources::config::SourceDefinition,
-    checks: &[DiagnosticCheck],
-) -> crate::source_doctor_health::SourceSyncEvidence {
-    let remote_path_missing = checks
-        .iter()
-        .any(|c| c.name.starts_with("Remote Path") && c.message.contains("does not exist"));
-    let remote_path_empty = checks
-        .iter()
-        .any(|c| c.name.starts_with("Remote Path") && c.message.contains("exists but is empty"));
-
-    let data_dir = default_data_dir();
-    let mirror_dir = data_dir.join("remotes").join(&source.name).join("mirror");
-    let local_mirror_nonempty = std::fs::read_dir(&mirror_dir)
-        .map(|mut entries| entries.any(|entry| entry.is_ok()))
-        .unwrap_or(false);
-
-    let sync_status = crate::sources::SyncStatus::load(&data_dir).ok();
-    let info = sync_status.as_ref().and_then(|s| s.get(&source.name));
-    let has_sync_record = info.is_some();
-    let last_sync_incomplete = info.is_some_and(|i| {
-        matches!(
-            i.last_result,
-            crate::sources::SyncResult::PartialFailure(_) | crate::sources::SyncResult::Failed(_)
-        )
-    });
-    let index_behind_sync = match (
-        info.and_then(|i| i.last_sync),
-        archive_db_mtime_ms(&data_dir),
-    ) {
-        (Some(sync_ms), Some(db_ms)) => sync_ms > db_ms,
-        _ => false,
-    };
-
-    crate::source_doctor_health::SourceSyncEvidence {
-        remote_path_missing,
-        remote_path_empty,
-        local_mirror_nonempty,
-        has_sync_record,
-        last_sync_incomplete,
-        index_behind_sync,
+        DiagnosticCheck {
+            name: "Local Storage".into(),
+            status: "fail".into(),
+            message: format!("{} is not writable", source_dir.display()),
+            remediation: Some("Check file permissions on data directory".into()),
+        }
     }
 }
 
@@ -101989,7 +94599,6 @@ fn run_sources_sync(
                                 "files": 0,
                                 "bytes": 0,
                                 "error": format!("Invalid source path: {message}"),
-                                "failure_reason": "invalid_path",
                             })
                         } else {
                             serde_json::json!({
@@ -101998,7 +94607,6 @@ fn run_sources_sync(
                                 "files": 0,
                                 "bytes": 0,
                                 "error": serde_json::Value::Null,
-                                "failure_reason": serde_json::Value::Null,
                             })
                         }
                     })
@@ -102014,10 +94622,6 @@ fn run_sources_sync(
                     "total_files": 0,
                     "total_bytes": 0,
                     "duration_ms": 0,
-                    "transport_decision": serde_json::to_value(
-                        SyncEngine::detect_sync_method().transport_decision()
-                    )
-                    .unwrap_or_else(|_| serde_json::json!({})),
                     "sync_decision": serde_json::to_value(&sync_decision)
                         .unwrap_or_else(|_| serde_json::json!({})),
                 }));
@@ -102041,24 +94645,20 @@ fn run_sources_sync(
                 });
 
                 if let Some(_fmt) = structured_format {
-                    let transport_decision = failed_report.transport_decision();
                     all_reports.push(serde_json::json!({
                         "source": source.name,
                         "status": "error",
-                        "method": transport_decision.chosen_transport.clone(),
+                        "method": failed_report.method.to_string(),
                         "paths": failed_report.path_results.iter().map(|r| serde_json::json!({
                             "path": r.remote_path,
                             "success": r.success,
                             "files": r.files_transferred,
                             "bytes": r.bytes_transferred,
                             "error": r.error,
-                            "failure_reason": r.failure_reason(),
                         })).collect::<Vec<_>>(),
                         "total_files": failed_report.total_files(),
                         "total_bytes": failed_report.total_bytes(),
                         "duration_ms": failed_report.total_duration_ms,
-                        "transport_decision": serde_json::to_value(&transport_decision)
-                            .unwrap_or_else(|_| serde_json::json!({})),
                         "sync_decision": serde_json::to_value(&sync_decision)
                             .unwrap_or_else(|_| serde_json::json!({})),
                         "error": failed_report
@@ -102102,13 +94702,10 @@ fn run_sources_sync(
                     "files": r.files_transferred,
                     "bytes": r.bytes_transferred,
                     "error": r.error,
-                    "failure_reason": r.failure_reason(),
                 })).collect::<Vec<_>>(),
                 "total_files": report.total_files(),
                 "total_bytes": report.total_bytes(),
                 "duration_ms": report.total_duration_ms,
-                "transport_decision": serde_json::to_value(report.transport_decision())
-                    .unwrap_or_else(|_| serde_json::json!({})),
                 "sync_decision": serde_json::to_value(&sync_decision)
                     .unwrap_or_else(|_| serde_json::json!({})),
             }));
@@ -102228,174 +94825,6 @@ fn run_sources_sync(
             false, // no_progress_events
             false, // robot_trace_ingest
         )?;
-    }
-
-    Ok(())
-}
-
-/// Re-ingest already-synced mirror(s) into the canonical archive without rsync.
-///
-/// #266 bug 4: `cass sources sync` only ingests when new files are transferred,
-/// so an already-current mirror (or one whose sessions never reached canonical)
-/// has no promotion path short of a wasteful re-transfer. This forces an ingest
-/// pass over the existing mirror root(s). The actual scan-root discovery is the
-/// same machinery `cass index` uses after a sync (`build_scan_roots` /
-/// `additional_scan_roots_for_scan_or_watch`), so a plain index run already
-/// scans the mirrors — we just trigger it directly, skipping the transfer.
-fn run_sources_reingest(
-    source_filter: Option<Vec<String>>,
-    full: bool,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
-    use crate::sources::config::{SourcesConfig, source_names_equal};
-    use colored::Colorize;
-
-    let config = SourcesConfig::load().map_err(|e| CliError {
-        code: 9,
-        kind: CliErrorKind::Config.kind_str(),
-        message: format!("Failed to load sources config: {e}"),
-        hint: Some("Run 'cass sources add' to configure a source".into()),
-        retryable: false,
-    })?;
-
-    let remote_sources: Vec<_> = config.remote_sources().collect();
-    if remote_sources.is_empty() {
-        let is_robot = output_format.is_some() || robot_format_from_env().is_some();
-        if is_robot {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "status": "no_sources",
-                    "message": "No remote sources configured"
-                })
-            );
-        } else {
-            println!(
-                "{}",
-                "No remote sources configured. Run 'cass sources add' first.".yellow()
-            );
-        }
-        return Ok(());
-    }
-
-    // Validate the filter resolves to configured remote sources so an operator
-    // typo fails loudly rather than silently no-op'ing.
-    let selected: Vec<&crate::sources::config::SourceDefinition> =
-        if let Some(ref names) = source_filter {
-            let matched: Vec<_> = remote_sources
-                .iter()
-                .copied()
-                .filter(|s| names.iter().any(|name| source_names_equal(name, &s.name)))
-                .collect();
-            if matched.is_empty() {
-                return Err(CliError {
-                    code: 2,
-                    kind: "usage",
-                    message: format!(
-                        "no configured remote source matches {names:?}; known: {}",
-                        remote_sources
-                            .iter()
-                            .map(|s| s.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    hint: Some("Run 'cass sources list' to see configured sources.".into()),
-                    retryable: false,
-                });
-            }
-            matched
-        } else {
-            remote_sources.clone()
-        };
-
-    let data_dir = default_data_dir();
-    let db_path = data_dir.join("agent_search.db");
-
-    // Surface the mirror roots that will actually be scanned so the operator
-    // can confirm the mirror is present before the (potentially long) ingest.
-    let mut mirror_roots: Vec<String> = Vec::new();
-    let mut missing_mirrors: Vec<String> = Vec::new();
-    if let Ok(storage) = crate::storage::sqlite::FrankenStorage::open(&db_path) {
-        let roots = crate::indexer::build_scan_roots(&storage, &data_dir);
-        let selected_names: std::collections::HashSet<&str> =
-            selected.iter().map(|s| s.name.as_str()).collect();
-        for root in &roots {
-            if selected_names.contains(root.origin.source_id.as_str()) {
-                mirror_roots.push(root.path.display().to_string());
-            }
-        }
-    }
-    for source in &selected {
-        if !mirror_roots
-            .iter()
-            .any(|p| p.contains(&format!("/remotes/{}/", source.name)))
-        {
-            missing_mirrors.push(source.name.clone());
-        }
-    }
-
-    let is_robot = output_format.is_some() || robot_format_from_env().is_some();
-    if !is_robot {
-        println!(
-            "{} {} source(s) from existing mirror(s) (no rsync)...",
-            "Re-ingesting".cyan().bold(),
-            selected.len()
-        );
-        for root in &mirror_roots {
-            println!("  {} {}", "mirror:".dimmed(), root);
-        }
-        if !missing_mirrors.is_empty() {
-            println!(
-                "  {} no mirror found for: {} — run 'cass sources sync' first.",
-                "warning:".yellow().bold(),
-                missing_mirrors.join(", ")
-            );
-        }
-    }
-
-    let progress = if output_format.is_some() {
-        ProgressResolved::None
-    } else if std::io::stdout().is_terminal() {
-        ProgressResolved::Bars
-    } else {
-        ProgressResolved::Plain
-    };
-
-    run_index_with_data(
-        None,                   // db_override (uses data_dir default)
-        full,                   // full rebuild if requested
-        false,                  // force_rebuild
-        false,                  // watch
-        None,                   // watch_once
-        30,                     // watch_interval (default)
-        Some(data_dir.clone()), // data_dir (existing mirror root is discovered here)
-        false,                  // semantic
-        false,                  // build_hnsw
-        "fastembed".to_string(),
-        progress,
-        output_format,
-        None,  // idempotency_key
-        2000,  // progress_interval_ms (default)
-        false, // no_progress_events
-        false, // robot_trace_ingest
-    )?;
-
-    if is_robot {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": "complete",
-                "kind": "sources_reingest",
-                "from_mirror": true,
-                "full": full,
-                "sources": selected.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
-                "mirror_roots": mirror_roots,
-                "missing_mirrors": missing_mirrors,
-                "data_dir": data_dir.display().to_string(),
-                "note": "Re-ingested from the existing mirror with no rsync transfer.",
-            }))
-            .unwrap_or_default()
-        );
     }
 
     Ok(())
@@ -103443,7 +95872,8 @@ fn print_fleet_upgrade_rehearsal_human(output: &FleetUpgradeRehearsalOutput) {
 
 /// Show semantic model installation status.
 ///
-/// Reports the MiniLM embedder implemented by the native backend.
+/// Reports on every embedder cass knows about (currently `minilm`,
+/// `snowflake-arctic-s`, `nomic-embed`), not just the compiled-in default.
 /// The "active" model is the one resolved from policy
 /// (`quality_tier_embedder`) — that is what `cass index` and `cass search`
 /// will actually use.
@@ -103458,22 +95888,22 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
 
-    // Hardened model-acquisition contract (bead 0qxwg): cheap host loadability
-    // (never loads ONNX — safe on any host) folded with the on-disk policy
-    // inputs the filesystem-only probe needs. The same inputs drive every
-    // model's `model_acquisition` block so the report cannot drift per model.
-    let acq_runtime = crate::search::model_acquisition::RuntimeLoadability::probe_cheap_host();
-    let acq_policy_inputs = crate::search::model_acquisition::OnDiskPolicyInputs {
-        policy_enabled: acquisition_policy.downloads_enabled,
-        offline: acquisition_policy.offline,
-        budget_max_bytes: acquisition_policy.max_model_bytes,
-    };
-
-    // Canonicalize the policy's quality_tier_embedder to the one registry name
-    // implemented by the native backend. Unsupported historical aliases remain
-    // visible in `policy_quality_tier_embedder`, but never become active.
+    // Canonicalize the policy's quality_tier_embedder to a registry name.
+    // The policy stores short aliases (e.g. "snowflake", "minilm") while
+    // ModelManifest::for_embedder expects registry names — match both.
     let policy_embedder = policy.quality_tier_embedder.as_str();
-    let active_registry_name = FastEmbedder::canonical_name(policy_embedder);
+    let active_registry_name = match policy_embedder {
+        "minilm" | "all-minilm-l6-v2" | "fastembed" | "minilm-384" => Some("minilm"),
+        "snowflake"
+        | "snowflake-arctic-s"
+        | "snowflake-arctic-embed-s"
+        | "snowflake-arctic-s-384" => Some("snowflake-arctic-s"),
+        "nomic" | "nomic-embed" | "nomic-embed-text-v1.5" | "nomic-embed-768" => {
+            Some("nomic-embed")
+        }
+        "hash" => None, // hash fallback — no model files
+        _ => None,
+    };
 
     // Per-model status snapshot.
     struct ModelStatus {
@@ -103484,12 +95914,9 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         total_size: u64,
         installed_size: u64,
         files: Vec<serde_json::Value>,
-        /// Hardened model-acquisition projection (state, runtime, source,
-        /// cost_class, skipped_network_reason, next_command, fingerprint, …).
-        acquisition: serde_json::Value,
     }
 
-    let known: &[&str] = &["minilm"];
+    let known: &[&str] = &["minilm", "snowflake-arctic-s", "nomic-embed"];
     let mut statuses: Vec<ModelStatus> = Vec::with_capacity(known.len());
     for name in known {
         let Some(manifest) = ModelManifest::for_embedder(name) else {
@@ -103528,13 +95955,6 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                 "size_match": exists && size == mfile.size,
             }));
         }
-        let acquisition = crate::search::model_acquisition::live_acquisition_block(
-            &model_dir,
-            &manifest,
-            acq_runtime,
-            acq_policy_inputs,
-            name,
-        );
         statuses.push(ModelStatus {
             registry_name: name,
             manifest,
@@ -103543,7 +95963,6 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
             total_size,
             installed_size,
             files: file_info,
-            acquisition,
         });
     }
 
@@ -103578,7 +95997,6 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                     "observed_file_bytes": s.installed_size,
                     "policy_source": s.cache_report.policy_source.as_str(),
                     "cache_lifecycle": &s.cache_report,
-                    "model_acquisition": &s.acquisition,
                     "files": s.files,
                 })
             })
@@ -103607,7 +96025,6 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
                 "observed_file_bytes": s.installed_size,
                 "policy_source": s.cache_report.policy_source.as_str(),
                 "cache_lifecycle": &s.cache_report,
-                "model_acquisition": &s.acquisition,
                 "files": &s.files,
             })
         });
@@ -103638,14 +96055,16 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         println!("Active embedder (quality tier): {}", policy_embedder);
         if active_registry_name.is_none() && policy_embedder != "hash" {
             println!(
-                "  {} unsupported quality embedder; hybrid search will fail open to lexical.",
+                "  {} unrecognized embedder name; cass will fall back to hash-only.",
                 "⚠".yellow()
             );
         }
         if policy_embedder == "hash" {
-            println!("  The explicit hash vector tier is active; no native model is in use.");
+            println!("  No ONNX model is in use; semantic search runs in hash-fallback mode.");
         }
-        println!("Override with: CASS_SEMANTIC_EMBEDDER={{minilm|hash}}");
+        println!(
+            "Override with: CASS_SEMANTIC_EMBEDDER={{minilm|snowflake-arctic-s|nomic-embed|hash}}"
+        );
         println!("Fail-open: lexical search remains available.");
         println!();
 
@@ -103715,7 +96134,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         if active_status.is_none() && policy_embedder != "hash" {
             println!(
                 "{}: active embedder '{}' has no manifest registered. \
-                 Use 'cass models install --model minilm' to install the supported embedder.",
+                 Use 'cass models install --model <name>' to install one of the supported embedders.",
                 "⚠".yellow(),
                 policy_embedder
             );
@@ -103726,60 +96145,30 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
 }
 
 /// Resolve a CLI-supplied semantic model name (or alias) to the canonical
-/// registry name used by model installation and removal. Embedder aliases match
-/// the MiniLM-only daemon worker; retired ONNX-era aliases are rejected before
-/// they can route to an unloadable manifest.
-/// Models the pure-Rust native inference backend can actually load (cass
-/// #308): the native embedder hardcodes the all-MiniLM-L6-v2 topology and the
-/// native reranker is architecture-verified for ms-marco only. Anything else
-/// would download and sha-verify fine, report installed/Ready, and then fail
-/// every load with `EmbedderUnavailable` — so `models install` refuses it up
-/// front instead of leaving a 100+ MB permanently-unloadable install behind.
-fn native_backend_supports_model(registry_name: &str) -> bool {
-    matches!(registry_name, "minilm" | "ms-marco")
-}
-
+/// registry name used by `ModelManifest::for_embedder` and
+/// `FastEmbedder::model_dir_for`. Mirrors the alias map in
+/// `src/daemon/worker.rs::resolve_embedder_kind` so the CLI surface accepts
+/// the same names the daemon worker honors. Bead:
+/// `coding_agent_session_search-v3of1`.
 fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
     match model_name.to_ascii_lowercase().as_str() {
         "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => Ok("minilm"),
-        "snowflake"
-        | "snowflake-arctic-s"
-        | "snowflake-arctic-s-384"
-        | "snowflake-arctic-embed-s"
-        | "nomic"
-        | "nomic-embed"
-        | "nomic-embed-768"
-        | "nomic-embed-text-v1.5" => Err(CliError {
-            code: 20,
-            kind: CliErrorKind::Model.kind_str(),
-            message: format!(
-                "Unsupported embedder '{}': the pure-Rust native backend currently supports only all-MiniLM-L6-v2 (alias minilm).",
-                model_name
-            ),
-            hint: Some("Use --model minilm, or keep using lexical search".into()),
-            retryable: false,
-        }),
+        "snowflake-arctic-s" | "snowflake-arctic-s-384" | "snowflake-arctic-embed-s" => {
+            Ok("snowflake-arctic-s")
+        }
+        "nomic-embed" | "nomic-embed-768" | "nomic-embed-text-v1.5" => Ok("nomic-embed"),
         "ms-marco" | "ms-marco-minilm" | "ms-marco-minilm-l-6-v2" | "ms-marco-minilm-l6-v2" => {
             Ok("ms-marco")
         }
         "jina-reranker-turbo" | "jina-reranker-v1-turbo" | "jina-reranker-v1-turbo-en" => {
-            Err(CliError {
-                code: 20,
-                kind: CliErrorKind::Model.kind_str(),
-                message: format!(
-                    "Unsupported reranker '{}': the pure-Rust native backend currently supports only ms-marco-MiniLM-L-6-v2 (alias ms-marco).",
-                    model_name
-                ),
-                hint: Some("Use --model ms-marco, or omit reranking".into()),
-                retryable: false,
-            })
+            Ok("jina-reranker-turbo")
         }
         _ => Err(CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
-                "Unknown model '{}'. Embedder: all-minilm-l6-v2 (alias minilm). \
-                 Reranker: ms-marco.",
+                "Unknown model '{}'. Embedders: all-minilm-l6-v2 (alias minilm), \
+                 snowflake-arctic-s, nomic-embed. Rerankers: ms-marco, jina-reranker-turbo.",
                 model_name
             ),
             hint: Some("Use 'cass models status' to see available models".into()),
@@ -103848,24 +96237,6 @@ fn run_models_install(
     use indicatif::{ProgressBar, ProgressStyle};
 
     let registry_name = resolve_cli_model_name(model_name)?;
-    if !native_backend_supports_model(registry_name) {
-        return Err(CliError {
-            code: 20,
-            kind: CliErrorKind::Model.kind_str(),
-            message: format!(
-                "Model '{registry_name}' cannot be loaded by the pure-Rust native inference \
-                 backend yet: only all-MiniLM-L6-v2 (embedder) and ms-marco (reranker) are \
-                 architecture-verified (cass #308). Installing it would download files that \
-                 can never be used."
-            ),
-            hint: Some(
-                "Install the supported default embedder instead: \
-                 cass models install --model all-minilm-l6-v2"
-                    .into(),
-            ),
-            retryable: false,
-        });
-    }
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let (model_dir, manifest) = resolve_model_install_dir(&data_dir, registry_name)?;
     let mirror_base_url = mirror
@@ -103895,7 +96266,7 @@ fn run_models_install(
                     source_path.display()
                 ),
                 hint: Some(
-                    "Provide a directory containing model files (model.safetensors, tokenizer.json, etc.)"
+                    "Provide a directory containing model files (model.onnx, tokenizer.json, etc.)"
                         .into(),
                 ),
                 retryable: false,
@@ -103980,19 +96351,13 @@ fn run_models_install(
             })?;
         }
 
-        // Write verified marker. The hardened marker records the install
-        // source provenance (`from-file`), the local source path, and the
-        // model fingerprint so an air-gapped install is auditable and
-        // distinguishable from a network download (bead
-        // cass-fleet-resilience-20260608-uojcg.5.5). Byte-compatible with the
-        // legacy reader: `revision=` stays first and unknown lines are ignored.
-        let marker_path = model_dir.join(crate::search::model_acquisition::VERIFIED_MARKER_NAME);
-        let content = crate::search::model_acquisition::VerifiedMarker::for_from_file(
-            &manifest,
-            source_path,
-            chrono::Utc::now().to_rfc3339(),
-        )
-        .render();
+        // Write verified marker
+        let marker_path = model_dir.join(".verified");
+        let content = format!(
+            "revision={}\nverified_at={}\n",
+            manifest.revision,
+            chrono::Utc::now().to_rfc3339()
+        );
         std::fs::write(&marker_path, content).map_err(|e| CliError {
             code: 22,
             kind: CliErrorKind::Io.kind_str(),
@@ -104181,24 +96546,6 @@ fn run_models_verify(
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
     let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
-
-    // Hardened model-acquisition projection (bead 0qxwg): the same probe-based
-    // block `cass models status` emits, so verify and status agree. The probe
-    // is filesystem-only — `skipped_network_reason` proves verify never
-    // auto-downloads. `probe_cheap_host()` never loads ONNX, so it is safe even
-    // on a corrupt/incompatible cache.
-    let acquisition_block = crate::search::model_acquisition::live_acquisition_block(
-        &model_dir,
-        &manifest,
-        crate::search::model_acquisition::RuntimeLoadability::probe_cheap_host(),
-        crate::search::model_acquisition::OnDiskPolicyInputs {
-            policy_enabled: acquisition_policy.downloads_enabled,
-            offline: acquisition_policy.offline,
-            budget_max_bytes: acquisition_policy.max_model_bytes,
-        },
-        "all-minilm-l6-v2",
-    );
-
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
@@ -104219,7 +96566,6 @@ fn run_models_verify(
                     "model_dir": model_dir.display().to_string(),
                     "all_valid": false,
                     "cache_lifecycle": &cache_report,
-                    "model_acquisition": &acquisition_block,
                     "error": "model directory does not exist",
                 }))
                 .unwrap_or_default()
@@ -104309,7 +96655,6 @@ fn run_models_verify(
                 "lexical_fail_open": true,
                 "all_valid": all_valid,
                 "cache_lifecycle": &cache_report,
-                "model_acquisition": &acquisition_block,
                 "files": results,
             }))
             .unwrap_or_default()
@@ -104446,7 +96791,10 @@ fn run_models_backfill(
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!("Unknown embedder '{}'.", embedder_type),
-            hint: Some("Use --embedder hash or --embedder minilm (alias fastembed)".into()),
+            hint: Some(
+                "Use --embedder hash, --embedder fastembed, or a registered model name such as snowflake-arctic-s"
+                    .into(),
+            ),
             retryable: false,
         });
     }
@@ -105595,8 +97943,7 @@ fn run_daemon(
     use crate::daemon::{ModelDaemon, ModelManager};
 
     let data_dir = data_dir.unwrap_or_else(default_data_dir);
-    let mut config = resolved_daemon_config(socket, idle_timeout, max_connections);
-    config.served_generation = crate::daemon::published_lexical_generation(&data_dir);
+    let config = resolved_daemon_config(socket, idle_timeout, max_connections);
 
     let models = ModelManager::new(&data_dir);
     let daemon = ModelDaemon::new(config, models);
@@ -105748,7 +98095,6 @@ mod subcommand_robot_output_tests {
                 vec!["cass", "sessions", "--json"],
                 vec!["cass", "timeline", "--json"],
                 vec!["cass", "analytics", "status", "--json"],
-                vec!["cass", "analytics", "incidents", "--json"],
                 vec![
                     "cass",
                     "pages",
@@ -105784,7 +98130,6 @@ mod subcommand_robot_output_tests {
                         | AnalyticsCommand::Tokens { common, .. }
                         | AnalyticsCommand::Tools { common, .. }
                         | AnalyticsCommand::AnalyticsModels { common, .. }
-                        | AnalyticsCommand::Incidents { common, .. }
                         | AnalyticsCommand::Rebuild { common, .. }
                         | AnalyticsCommand::Validate { common, .. },
                     ) => resolve_subcommand_structured_format(&cli, common.json),
@@ -105820,40 +98165,6 @@ mod subcommand_robot_output_tests {
                 resolve_subcommand_structured_format(&cli, json),
                 Some(RobotFormat::Jsonl)
             );
-        });
-    }
-
-    #[test]
-    fn sources_reingest_parses_from_mirror_flags() {
-        run_on_large_stack(|| {
-            // #266: `cass sources reingest` re-ingests an already-synced mirror
-            // without re-running rsync. The `--from-mirror` spelling is accepted
-            // by clap as a hidden alias-free no-op understanding; the canonical
-            // flags are --source/--full/--json.
-            let cli = Cli::try_parse_from([
-                "cass",
-                "sources",
-                "reingest",
-                "--from-mirror",
-                "--source",
-                "laptop",
-                "--full",
-                "--json",
-            ])
-            .expect("parse sources reingest");
-            let Some(Commands::Sources(SourcesCommand::Reingest {
-                from_mirror,
-                source,
-                full,
-                json,
-            })) = cli.command.as_ref()
-            else {
-                panic!("expected sources reingest command, got {:?}", cli.command);
-            };
-            assert!(*from_mirror);
-            assert_eq!(source.as_deref(), Some(["laptop".to_string()].as_slice()));
-            assert!(*full);
-            assert!(*json);
         });
     }
 
@@ -105955,86 +98266,70 @@ mod subcommand_robot_output_tests {
 mod cli_models_resolution_tests {
     use super::*;
 
+    /// `coding_agent_session_search-v3of1`: `cass models install` and
+    /// `cass models remove` previously hardcoded
+    /// `if model_name != "all-minilm-l6-v2"` (with comment "Only support
+    /// the default model for now"), rejecting all other registered
+    /// embedders even though `EmbedderRegistry`, `ModelManifest::for_embedder`,
+    /// `FastEmbedder::model_dir_for`, and the daemon worker
+    /// (commit cf85b403) all know about `snowflake-arctic-s` and
+    /// `nomic-embed`. This test pins the post-fix contract: every
+    /// registry-known name (including aliases honored by
+    /// `daemon::worker::resolve_embedder_kind`) must resolve to its
+    /// canonical registry name; only genuinely unknown names error.
     #[test]
-    fn resolve_cli_model_name_accepts_only_native_minilm_embedder_aliases() -> Result<(), String> {
-        for alias in [
+    fn resolve_cli_model_name_accepts_every_registered_embedder_alias() {
+        for (alias, expected_canonical) in [
             ("all-minilm-l6-v2", "minilm"),
             ("minilm", "minilm"),
             ("minilm-384", "minilm"),
             ("fastembed", "minilm"),
             ("MINILM", "minilm"),
+            ("snowflake-arctic-s", "snowflake-arctic-s"),
+            ("snowflake-arctic-s-384", "snowflake-arctic-s"),
+            ("snowflake-arctic-embed-s", "snowflake-arctic-s"),
+            ("Snowflake-Arctic-S", "snowflake-arctic-s"),
+            ("nomic-embed", "nomic-embed"),
+            ("nomic-embed-768", "nomic-embed"),
+            ("nomic-embed-text-v1.5", "nomic-embed"),
+            ("NOMIC-EMBED", "nomic-embed"),
         ] {
-            let resolved = resolve_cli_model_name(alias.0).map_err(|error| error.message)?;
-            assert_eq!(resolved, alias.1);
+            assert_eq!(
+                resolve_cli_model_name(alias).expect("registered alias must resolve"),
+                expected_canonical,
+                "registered alias {alias:?} must resolve to canonical name {expected_canonical:?}"
+            );
         }
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_cli_model_name_rejects_unimplemented_embedder_topologies() -> Result<(), &'static str>
-    {
-        for alias in ["snowflake-arctic-s", "nomic-embed-text-v1.5"] {
-            let error = match resolve_cli_model_name(alias) {
-                Err(error) => error,
-                Ok(_) => return Err("unimplemented embedder topology unexpectedly resolved"),
-            };
-            if error.code != 20 {
-                return Err("unimplemented embedder topology returned the wrong error code");
-            }
-            if !error.message.contains("supports only all-MiniLM-L6-v2") {
-                return Err("unimplemented embedder topology returned the wrong error message");
-            }
-            for forbidden in ["install --model snowflake", "install --model nomic"] {
-                if error.message.contains(forbidden) {
-                    return Err("embedder topology error advertised an unavailable route");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_cli_model_name_rejects_unimplemented_reranker_topology() -> Result<(), String> {
-        let error = match resolve_cli_model_name("jina-reranker-v1-turbo-en") {
-            Err(error) => error,
-            Ok(canonical) => {
-                return Err(format!(
-                    "unimplemented Jina topology resolved to {canonical}"
-                ));
-            }
-        };
-        if error.code != 20
-            || !error
-                .message
-                .contains("supports only ms-marco-MiniLM-L-6-v2")
-            || error.hint.as_deref() != Some("Use --model ms-marco, or omit reranking")
-        {
-            return Err(format!("unexpected Jina topology error: {error:?}"));
-        }
-        Ok(())
     }
 
     /// `coding_agent_session_search-v3of1`: unknown names must be rejected
     /// with code=20, kind="model", and a hint pointing at `cass models status`.
+    /// Pre-fix message was "Only 'all-minilm-l6-v2' is supported."; post-fix
+    /// must list all registered names so operators discover snowflake/nomic.
     #[test]
-    fn resolve_cli_model_name_rejects_unknown_with_useful_hint() -> Result<(), String> {
-        let err = match resolve_cli_model_name("e5-large-v2") {
-            Err(error) => error,
-            Ok(canonical) => return Err(format!("unknown model resolved to {canonical}")),
-        };
-        if err.code != 20
-            || err.kind != "model"
-            || !err.message.contains("Unknown model 'e5-large-v2'")
-            || !err.message.contains("all-minilm-l6-v2")
-            || err.message.contains("snowflake-arctic-s")
-            || err.message.contains("nomic-embed")
-            || err.message.contains("jina-reranker")
-            || err.hint.as_deref() != Some("Use 'cass models status' to see available models")
-            || err.retryable
-        {
-            return Err(format!("unexpected unknown-model error: {err:?}"));
-        }
-        Ok(())
+    fn resolve_cli_model_name_rejects_unknown_with_useful_hint() {
+        let err =
+            resolve_cli_model_name("e5-large-v2").expect_err("unknown model must be rejected");
+        assert_eq!(err.code, 20);
+        assert_eq!(err.kind, "model");
+        assert!(
+            err.message.contains("Unknown model 'e5-large-v2'"),
+            "error must name the rejected input; got {message:?}",
+            message = err.message
+        );
+        assert!(
+            err.message.contains("snowflake-arctic-s")
+                && err.message.contains("nomic-embed")
+                && err.message.contains("all-minilm-l6-v2"),
+            "error must list all 3 supported models so operators discover non-default options; \
+             got {message:?}",
+            message = err.message
+        );
+        assert_eq!(
+            err.hint.as_deref(),
+            Some("Use 'cass models status' to see available models")
+        );
+        assert!(!err.retryable);
     }
 
     /// `coding_agent_session_search-v3of1`: every name that
@@ -106045,13 +98340,12 @@ mod cli_models_resolution_tests {
     /// contract that the original hardcoded `all-minilm-l6-v2` check
     /// silently maintained — making it explicit prevents drift.
     #[test]
-    fn every_resolved_canonical_name_has_manifest_and_dir_mapping() -> Result<(), String> {
+    fn every_resolved_canonical_name_has_manifest_and_dir_mapping() {
         use crate::search::fastembed_embedder::FastEmbedder;
         use crate::search::model_download::ModelManifest;
 
         let probe_data_dir = std::path::Path::new("/tmp/cass-v3of1-probe");
-        {
-            let canonical = "minilm";
+        for canonical in ["minilm", "snowflake-arctic-s", "nomic-embed"] {
             assert!(
                 ModelManifest::for_embedder(canonical).is_some(),
                 "canonical name {canonical:?} returned by resolve_cli_model_name must have a \
@@ -106063,7 +98357,6 @@ mod cli_models_resolution_tests {
                  FastEmbedder::model_dir_for mapping"
             );
         }
-        Ok(())
     }
 
     /// Reranker aliases must round-trip through `resolve_cli_model_name`
@@ -106074,7 +98367,7 @@ mod cli_models_resolution_tests {
     /// "reranker model directory not found" because the manifest `id`
     /// drifted from the loader's hard-coded directory name.
     #[test]
-    fn reranker_aliases_resolve_and_install_path_matches_loader_dir() -> Result<(), String> {
+    fn reranker_aliases_resolve_and_install_path_matches_loader_dir() {
         use crate::search::model_download::ModelManifest;
         use crate::search::reranker_registry::RERANKERS;
 
@@ -106084,10 +98377,12 @@ mod cli_models_resolution_tests {
             ("ms-marco-minilm-l-6-v2", "ms-marco"),
             ("ms-marco-minilm-l6-v2", "ms-marco"),
             ("MS-MARCO", "ms-marco"),
+            ("jina-reranker-turbo", "jina-reranker-turbo"),
+            ("jina-reranker-v1-turbo-en", "jina-reranker-turbo"),
         ] {
-            let resolved = resolve_cli_model_name(alias).map_err(|error| error.message)?;
             assert_eq!(
-                resolved, canonical,
+                resolve_cli_model_name(alias).expect("reranker alias must resolve"),
+                canonical,
                 "reranker alias {alias:?} must resolve to {canonical:?}"
             );
             assert!(
@@ -106103,25 +98398,25 @@ mod cli_models_resolution_tests {
         // the exact bug that left "WARN Failed to load reranker" on
         // every fresh daemon start (cass#242).
         let probe = std::path::Path::new("/tmp/cass-reranker-probe");
-        let canonical = "ms-marco";
-        let manifest = ModelManifest::for_reranker(canonical)
-            .ok_or_else(|| format!("{canonical} manifest must be registered"))?;
-        let registered = RERANKERS
-            .iter()
-            .find(|r| r.name == canonical)
-            .ok_or_else(|| format!("{canonical} must be in RERANKERS"))?;
-        let loader_dir = registered
-            .model_dir(probe)
-            .ok_or_else(|| format!("{canonical} must have a model_dir"))?;
-        let loader_dir_name = loader_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| format!("{canonical} model_dir must have a final segment"))?;
-        assert_eq!(
-            manifest.id, loader_dir_name,
-            "{canonical} manifest.id must match the loader's model_dir name so install and loader \
-             agree on the on-disk directory"
-        );
-        Ok(())
+        for canonical in ["ms-marco", "jina-reranker-turbo"] {
+            let manifest = ModelManifest::for_reranker(canonical)
+                .unwrap_or_else(|| panic!("{canonical} manifest must be registered"));
+            let registered = RERANKERS
+                .iter()
+                .find(|r| r.name == canonical)
+                .unwrap_or_else(|| panic!("{canonical} must be in RERANKERS"));
+            let loader_dir = registered
+                .model_dir(probe)
+                .unwrap_or_else(|| panic!("{canonical} must have a model_dir"));
+            let loader_dir_name = loader_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_else(|| panic!("{canonical} model_dir must have a final segment"));
+            assert_eq!(
+                manifest.id, loader_dir_name,
+                "{canonical} manifest.id must match the loader's model_dir name so install and \
+                 loader agree on the on-disk directory"
+            );
+        }
     }
 }

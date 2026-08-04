@@ -47,19 +47,15 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // Immutable git pin: crates.io latest is 0.1.18, while f6a007b1 carries
-        // the 0.1.19 existing-only,
-        // schema-only open lane used to keep CASS archive and doctor opens
-        // bounded, in addition to the contentless-FTS5 reopen/catch-up fixes,
-        // bounded clean-page reclamation (#131), and fused composite-index
-        // equality-run counter used by CASS parity checks, and preserves the
-        // canonical contentless DDL when stale duplicate schema rows are
-        // skipped. Together these prevent accidental archive creation, false
-        // OutOfMemory failures, multi-hour row crossings during multi-million-
-        // row FTS rebuilds, and post-reopen loss of newly caught-up FTS rows.
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "f6a007b169ccd483f0e4e437f436d81357461718",
-        expected_version: "0.1.19",
+        // crates.io-only exact pin: fsqlite 0.1.9 carries the upstream #95
+        // BtCursor forward-progress fix plus the #106 MVCC grow fix,
+        // FTS5 reload/lazy-shadow fixes, and the latest large-index repair
+        // surface needed by cass refreshes.
+        // Empty `expected_git` signals
+        // `validate_manifest_dependency_spec` to skip git/rev checks.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.1.9",
         expected_features: &["fts5"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -93,9 +89,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "f6a007b169ccd483f0e4e437f436d81357461718",
-        expected_version: "0.1.19",
+        // crates.io-only exact pin aligned with the frankensqlite facade at 0.1.9.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.1.9",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -111,8 +108,8 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "6d24c532667aebdf31ecac8a9ddb457bef32b3f7",
-        expected_version: "0.1.10",
+        expected_rev: "a4923d4097899e6e9805cefe67bce70e1b04a289",
+        expected_version: "0.1.8",
         expected_features: &[
             "chatgpt",
             "connectors",
@@ -140,7 +137,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // `validate_manifest_dependency_spec` to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.9",
+        expected_version: "0.3.2",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -156,19 +153,18 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "frankensearch",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        // Pins the frankensearch rev carrying the pure-Rust `native` feature
-        // (frankentorch NativeEmbedder + NativeReranker), with frankentorch
-        // referenced by git rev inside frankensearch so the feature is
-        // git-consumable from cass (cass #308).
-        expected_rev: "f7fa7a020cf084ed1cc5e53926521e3a0d8743cc",
+        // Bumped from 831b3b13 to pick up bounded cass content-prefix
+        // indexing plus the self-contained Git dependency packaging fix.
+        expected_rev: "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
         expected_version: "0.3.2",
-        // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
-        // embedding + reranking are now pure-Rust via frankensearch's `native`
-        // feature, kept always-on here (no AVX/ONNX static-init hazard, so no
-        // separate `-baseline` build is needed). Bead tg5o9 retired the vacuous
-        // cass `semantic` feature; semantic readiness is now determined solely
-        // by runtime model/vector assets.
-        expected_features: &["ann", "hash", "lexical", "native"],
+        // cass#256: `fastembed-reranker` no longer appears in the static
+        // `[dependencies]` table; it is enabled by the cass `semantic`
+        // feature so the baseline build (`--no-default-features --features
+        // qr,encryption`) can drop the prebuilt Microsoft ONNX Runtime
+        // binary that crashes pre-AVX2 CPUs. The contract therefore only
+        // pins the always-on features here; the conditional one is
+        // validated by Cargo's own feature graph.
+        expected_features: &["ann", "hash", "lexical"],
         expected_default_features: Some(false),
         repo_rel: "../frankensearch",
         manifest_rel: "frankensearch/Cargo.toml",
@@ -281,6 +277,8 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed={STRICT_PATH_DEP_ENV}");
 
+    emit_platform_link_hints();
+
     let manifest_dir = match env::var("CARGO_MANIFEST_DIR") {
         Ok(value) => PathBuf::from(value),
         Err(err) => fatal(format!(
@@ -303,6 +301,14 @@ fn main() {
     let packaged_manifest = manifest_dir.join("Cargo.toml.orig").is_file();
     validate_path_dependency_contracts(&manifest_dir, &manifest, packaged_manifest);
     emit_vergen_metadata();
+}
+
+fn emit_platform_link_hints() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        // The aarch64-apple-darwin ONNX Runtime static archive used by ort-sys
+        // references CoreML symbols, but ort-sys only emits Foundation today.
+        println!("cargo:rustc-link-lib=framework=CoreML");
+    }
 }
 
 fn validate_path_dependency_contracts(
@@ -729,15 +735,16 @@ fn git_output(repo_root: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn emit_vergen_metadata() {
-    use vergen::{Build, Cargo, Emitter};
+    use vergen::{BuildBuilder, CargoBuilder, Emitter};
 
-    // vergen 10 replaced the `XxxBuilder::all_*()` constructors (which returned a
-    // `Result`) with bon-based config structs whose `all_*()` associated fns
-    // return the value directly. `Build::all_build()` / `Cargo::all_cargo()`
-    // preserve the previous "emit every build/cargo instruction" behavior.
     let mut emitter = Emitter::default();
-    let _ = emitter.add_instructions(&Build::all_build());
-    let _ = emitter.add_instructions(&Cargo::all_cargo());
+
+    if let Ok(build) = BuildBuilder::all_build() {
+        let _ = emitter.add_instructions(&build);
+    }
+    if let Ok(cargo) = CargoBuilder::all_cargo() {
+        let _ = emitter.add_instructions(&cargo);
+    }
 
     if let Err(err) = emitter.emit() {
         eprintln!("vergen emit skipped: {err}");

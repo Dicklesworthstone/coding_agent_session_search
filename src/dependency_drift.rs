@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SCHEMA_VERSION: &str = "cass.swarm.dependency_drift.v1";
-const STRICT_CHECK_COMMAND: &str = "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation";
+const STRICT_CHECK_COMMAND: &str = "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation";
 const FULL_CHECK_COMMAND: &str =
-    "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo check --all-targets";
-const FSQLITE_REGRESSION_COMMAND: &str = "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-fsqlite-target cargo test --lib cleanup_orphan_fk_rows -- --nocapture";
+    "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo check --all-targets";
+const FSQLITE_REGRESSION_COMMAND: &str = "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-fsqlite-target cargo test --lib cleanup_orphan_fk_rows -- --nocapture";
 
 #[derive(Clone, Copy)]
 struct DependencySpec {
@@ -951,7 +951,7 @@ mod tests {
             ),
         )?;
         ensure(
-            asupersync.version.as_deref() == Some("=0.3.9"),
+            asupersync.version.as_deref() == Some("=0.3.2"),
             "asupersync version pin should match Cargo.toml",
         )
     }

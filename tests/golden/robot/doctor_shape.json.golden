@@ -13,15 +13,6 @@
     "status": {
       "type": "string"
     },
-    "reason_code": {
-      "type": "null"
-    },
-    "degraded_reason_codes": {
-      "type": "array",
-      "items": {
-        "type": "unknown"
-      }
-    },
     "health_class": {
       "type": "string"
     },
@@ -506,23 +497,6 @@
         }
       }
     },
-    "budget": {
-      "type": "object",
-      "properties": {
-        "elapsed_ms": {
-          "type": "integer"
-        },
-        "budget_ms": {
-          "type": "integer"
-        },
-        "timed_out": {
-          "type": "boolean"
-        },
-        "recommended_next_probe": {
-          "type": "null"
-        }
-      }
-    },
     "retry_recommendation": {
       "type": "object",
       "properties": {
@@ -628,35 +602,6 @@
           }
         },
         "event_log_reference": {
-          "type": "string"
-        }
-      }
-    },
-    "root_cause": {
-      "type": "object",
-      "properties": {
-        "schema_version": {
-          "type": "integer"
-        },
-        "family": {
-          "type": "string"
-        },
-        "locus": {
-          "type": "string"
-        },
-        "confidence": {
-          "type": "string"
-        },
-        "evidence_refs": {
-          "type": "array",
-          "items": {
-            "type": "unknown"
-          }
-        },
-        "summary": {
-          "type": "string"
-        },
-        "recommended_next_probe": {
           "type": "string"
         }
       }
@@ -825,12 +770,6 @@
         },
         "fresh": {
           "type": "boolean"
-        },
-        "partial": {
-          "type": "boolean"
-        },
-        "partial_reason": {
-          "type": "null"
         },
         "last_indexed_at": {
           "type": "null"
@@ -1433,91 +1372,6 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
-        }
-      }
-    },
-    "storage_integrity": {
-      "type": "object",
-      "properties": {
-        "storage_state": {
-          "type": "string"
-        },
-        "source_of_truth_risk": {
-          "type": "string"
-        },
-        "archive_readability": {
-          "type": "string"
-        },
-        "checks_attempted": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "name": {
-                "type": "string"
-              },
-              "elapsed_ms": {
-                "type": "integer"
-              },
-              "timed_out": {
-                "type": "boolean"
-              },
-              "skipped_reason": {
-                "type": "string"
-              },
-              "read_only": {
-                "type": "boolean"
-              }
-            }
-          }
-        }
-      }
-    },
-    "daemon_runtime": {
-      "type": "object",
-      "properties": {
-        "schema_version": {
-          "type": "integer"
-        },
-        "state": {
-          "type": "string"
-        },
-        "observation": {
-          "type": "object",
-          "properties": {
-            "socket_path": {
-              "type": "string"
-            },
-            "data_dir": {
-              "type": "string"
-            },
-            "run_lock_present": {
-              "type": "boolean"
-            },
-            "socket_present": {
-              "type": "boolean"
-            },
-            "socket_connectable": {
-              "type": "boolean"
-            },
-            "connect_timed_out": {
-              "type": "boolean"
-            }
-          }
-        },
-        "recovery": {
-          "type": "object",
-          "properties": {
-            "action_needed": {
-              "type": "boolean"
-            },
-            "disposable_runtime_artifact": {
-              "type": "boolean"
-            },
-            "why": {
-              "type": "string"
-            }
           }
         }
       }

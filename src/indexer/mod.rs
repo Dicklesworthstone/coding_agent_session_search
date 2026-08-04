@@ -2,13 +2,11 @@ pub(crate) mod lexical_generation;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
 pub mod quarantine;
-pub mod quarantine_retry;
 pub mod redact_secrets;
 pub mod refresh_ledger;
 pub(crate) mod responsiveness;
 pub mod semantic;
 pub mod semantic_progress;
-pub(crate) mod staging_reclaim;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
 use self::refresh_ledger::{
@@ -28,7 +26,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,10 +34,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
 use frankensearch::index::VectorIndex as FsVectorIndex;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
-#[cfg(test)]
 use frankensqlite::compat::{
-    Transaction as FrankenTransaction, TransactionExt as FrankenTransactionExt,
+    ConnectionExt, ParamValue, RowExt, Transaction as FrankenTransaction,
+    TransactionExt as FrankenTransactionExt,
 };
 use fs2::FileExt;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
@@ -47,20 +44,16 @@ use notify::{RecursiveMode, Watcher, recommended_watcher};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use tempfile::Builder as TempDirBuilder;
 
-use crate::connector_ingest_diagnostics::{
-    ConnectorIngestDiagnostic, ConnectorIngestReport, ConnectorIngestRun, ProviderIngestSummary,
-};
 use crate::connectors::NormalizedConversation;
 #[cfg(test)]
 use crate::connectors::NormalizedMessage;
 use crate::connectors::{
-    Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector,
-    antigravity::AntigravityConnector, chatgpt::ChatGptConnector, claude_code::ClaudeCodeConnector,
-    clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
-    copilot::CopilotConnector, copilot_cli::CopilotCliConnector, cursor::CursorConnector,
-    factory::FactoryConnector, gemini::GeminiConnector, grok::GrokConnector, kimi::KimiConnector,
-    openclaw::OpenClawConnector, opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
-    qwen::QwenConnector, vibe::VibeConnector,
+    Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
+    claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
+    codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
+    cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
+    kimi::KimiConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
+    pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
 };
 use crate::model::conversation_packet::{
     CONVERSATION_PACKET_VERSION, ConversationPacket, ConversationPacketHashes,
@@ -78,17 +71,14 @@ use crate::search::vector_index::{
 use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
-#[cfg(test)]
-use crate::storage::sqlite::{DailyStatsRebuildResult, StatsAggregator, StatsDelta};
 use crate::storage::sqlite::{
-    FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,
-    LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
+    DailyStatsRebuildResult, FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,
+    LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, StatsAggregator, StatsDelta,
     seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
-    EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage_since,
-    packet_embedding_inputs_from_storage_with_progress, semantic_doc_id_for_input,
-    visit_packet_embedding_inputs_from_storage,
+    EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage,
+    packet_embedding_inputs_from_storage_since,
 };
 
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
@@ -108,7 +98,7 @@ const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 const PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT: usize = 256;
 const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
-const NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = DEFAULT_STREAMING_BATCH_LIMITS.max_conversations;
+const NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 4;
 const NON_WATCH_INGEST_CHUNK_SIZE_MAX: usize = 128;
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
@@ -250,65 +240,6 @@ fn should_skip_active_session_source(
         "skipping session source that appears to be actively written"
     );
     true
-}
-
-/// Whether `CASS_SKIP_SUBAGENTS` is enabled (#292). Subagent transcripts
-/// (Claude Code's `<project>/<session>/subagents/agent-*.jsonl`) are ephemeral
-/// one-task scratchpads whose conclusions already live in the parent session;
-/// on a subagent-heavy corpus they dominate the corpus by count and are the
-/// main source of false-positive OOM quarantines, so operators can exclude the
-/// whole class from indexing with one toggle. `0`/`false`/empty disables.
-fn skip_subagents_active() -> bool {
-    dotenvy::var("CASS_SKIP_SUBAGENTS")
-        .ok()
-        .map(|raw| {
-            let value = raw.trim();
-            !(value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false"))
-        })
-        .unwrap_or(false)
-}
-
-/// True when `source_path` is a subagent transcript — it lives directly inside a
-/// `subagents/` directory (e.g. `.../<session>/subagents/agent-1234.jsonl`).
-fn conversation_source_is_subagent(source_path: &Path) -> bool {
-    source_path
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .is_some_and(|name| name == "subagents")
-}
-
-/// Combined scan-time skip for the `CASS_SKIP_SUBAGENTS` toggle (#292): drop
-/// subagent-class transcripts before they are ingested, so they never enter the
-/// canonical DB / lexical index / raw-mirror and never trigger the OOM→quarantine
-/// path. Applied at every connector scan callback.
-fn should_skip_subagent_source(source_path: &Path) -> bool {
-    skip_subagents_active() && conversation_source_is_subagent(source_path)
-}
-
-#[cfg(test)]
-mod subagent_skip_tests {
-    use super::conversation_source_is_subagent;
-    use std::path::Path;
-
-    #[test]
-    fn detects_subagent_transcripts_by_parent_dir() {
-        // Claude Code subagent transcript: file directly inside a subagents/ dir.
-        assert!(conversation_source_is_subagent(Path::new(
-            "/home/u/.claude/projects/proj/session-1/subagents/agent-abc.jsonl"
-        )));
-        // A top-level session transcript is not a subagent.
-        assert!(!conversation_source_is_subagent(Path::new(
-            "/home/u/.claude/projects/proj/session-1.jsonl"
-        )));
-        // A file merely named like an agent but not under subagents/ is kept.
-        assert!(!conversation_source_is_subagent(Path::new(
-            "/home/u/.codex/sessions/agent-notes.jsonl"
-        )));
-        // A subagents/ dir higher up does not match a file nested deeper under it.
-        assert!(!conversation_source_is_subagent(Path::new(
-            "/home/u/subagents/archive/session.jsonl"
-        )));
-    }
 }
 
 #[cfg(unix)]
@@ -865,12 +796,6 @@ pub struct IndexingStats {
     pub index_ms: u64,
     /// Per-connector breakdown
     pub connectors: Vec<ConnectorStats>,
-    /// Per-provider source outcomes; unlike conversation counts this preserves
-    /// locked, encrypted, malformed, skipped, and discovered-only sources.
-    pub connector_summary: BTreeMap<String, ProviderIngestSummary>,
-    /// Actionable connector findings. These contain provenance and hashes, but
-    /// never message or malformed-line payload content.
-    pub connector_diagnostics: Vec<ConnectorIngestDiagnostic>,
     /// Agents discovered during scan
     pub agents_discovered: Vec<String>,
     /// Total conversations indexed
@@ -896,32 +821,6 @@ pub struct IndexingStats {
     /// True when SQLite ingest succeeded but inline lexical updates were
     /// deferred and the caller must rebuild lexical assets from the archive.
     pub lexical_update_deferred: bool,
-}
-
-fn record_connector_ingest_report(
-    progress: Option<&Arc<IndexingProgress>>,
-    report: ConnectorIngestReport,
-) {
-    let Some(progress) = progress else {
-        return;
-    };
-    let Ok(mut stats) = progress.stats.lock() else {
-        return;
-    };
-    stats
-        .connector_summary
-        .entry(report.provider)
-        .or_default()
-        .merge(report.summary);
-    stats.connector_diagnostics.extend(report.diagnostics);
-    stats.connector_diagnostics.sort_by(|left, right| {
-        left.provider
-            .cmp(&right.provider)
-            .then_with(|| left.source_path.cmp(&right.source_path))
-            .then_with(|| left.line_or_row.cmp(&right.line_or_row))
-            .then_with(|| left.failure_kind.cmp(&right.failure_kind))
-    });
-    stats.connector_diagnostics.dedup();
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -988,51 +887,13 @@ impl PartialEq<CanonicalMutationCounts> for NonWatchIngestOutcome {
     }
 }
 
-pub(crate) const INDEX_PHASE_PREPARING: usize = 0;
-pub(crate) const INDEX_PHASE_SCANNING: usize = 1;
-pub(crate) const INDEX_PHASE_LEXICAL_INDEXING: usize = 2;
-pub(crate) const INDEX_PHASE_SEMANTIC_INITIALIZE: usize = 3;
-pub(crate) const INDEX_PHASE_SEMANTIC_REPLAY: usize = 4;
-pub(crate) const INDEX_PHASE_SEMANTIC_EMBEDDING: usize = 5;
-pub(crate) const INDEX_PHASE_SEMANTIC_VECTOR_PUBLISH: usize = 6;
-pub(crate) const INDEX_PHASE_SEMANTIC_HNSW: usize = 7;
-pub(crate) const INDEX_PHASE_SEMANTIC_MANIFEST: usize = 8;
-pub(crate) const INDEX_PHASE_SEMANTIC_FINALIZE: usize = 9;
-
 #[derive(Debug, Default)]
 pub struct IndexingProgress {
     pub total: AtomicUsize,
     pub current: AtomicUsize,
-    /// #332: monotonic work-liveness tick. Producer threads bump it once per
-    /// parsed conversation (BEFORE batch publication) and the streaming
-    /// consumer bumps it per received/persisted batch, so the stall watchdog
-    /// can tell "actively parsing a large source artifact between coarse
-    /// batch publications" apart from a genuine wedge even while
-    /// `current`/`total` sit still.
-    pub activity: std::sync::atomic::AtomicU64,
-    /// #332: true when `total` is a final denominator for the current phase
-    /// (known connector count, known conversation total, exact semantic
-    /// counters); false while `total` is still "discovered so far" and can
-    /// expand (streaming ingest accumulation). Snapshot consumers suppress
-    /// ETA while the denominator is not final, because an expanding total
-    /// makes ETA regress by hours and useless for scheduling.
-    pub total_is_final: AtomicBool,
-    // Phase indicator. Values 0-2 cover canonical/lexical work; 3-9 identify
-    // the independently measured semantic pipeline stages above.
+    // Simple phase indicator: 0=Idle, 1=Scanning, 2=Indexing
     pub phase: AtomicUsize,
     pub is_rebuilding: AtomicBool,
-    /// Set by `run_index` while it is inside the post-publish finalize window —
-    /// specifically `close_storage_after_index`, which runs the (deferred,
-    /// possibly multi-GB) bulk-ingest WAL checkpoint via a synchronous,
-    /// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` on the
-    /// indexer thread. That checkpoint cannot report progress and, on a large
-    /// corpus (esp. macOS, where Darwin fsync/flock is slow), legitimately
-    /// takes minutes. The stall watchdog reads this flag so it does not misread
-    /// that active checkpoint as a #297 finalize wedge and kill the process
-    /// (exit 70) mid-write — which strands the un-truncated WAL and leaves the
-    /// canonical DB malformed to stock SQLite (#296/#321). Liveness is still
-    /// bounded: see `index_finalize_abort_threshold` (#319).
-    pub finalizing: AtomicBool,
     /// Number of coding agents discovered so far during scanning
     pub discovered_agents: AtomicUsize,
     /// Names of discovered agents (protected by mutex for concurrent access)
@@ -1061,14 +922,6 @@ pub struct IndexingProgress {
     pub rebuild_pipeline_producer_budget_wait_count: AtomicUsize,
     /// Producer-side milliseconds spent waiting on the in-flight byte budget.
     pub rebuild_pipeline_producer_budget_wait_ms: AtomicUsize,
-    /// Current park site of the rebuild page-production stage (#288):
-    /// `listing_db` / `waiting_result` / `waiting_turn` / `waiting_budget` /
-    /// `handoff_send` / `idle`. Empty when no rebuild pipeline is active.
-    pub rebuild_pipeline_producer_state: Mutex<String>,
-    /// Next page sequence the ordered reservation barrier will admit (#288).
-    pub rebuild_pipeline_reservation_next_sequence: AtomicU64,
-    /// Threads currently parked waiting on the in-flight byte budget (#288).
-    pub rebuild_pipeline_producer_budget_active_waiters: AtomicUsize,
     /// Producer-side waits on bounded sink handoff.
     pub rebuild_pipeline_producer_handoff_wait_count: AtomicUsize,
     /// Producer-side milliseconds spent waiting on bounded sink handoff.
@@ -1126,127 +979,18 @@ pub struct IndexingProgress {
 }
 
 impl IndexingProgress {
-    pub(crate) fn phase_label_for(phase: usize) -> &'static str {
+    fn phase_label_for(phase: usize) -> &'static str {
         match phase {
-            INDEX_PHASE_PREPARING => "preparing",
-            INDEX_PHASE_SCANNING => "scanning",
-            INDEX_PHASE_LEXICAL_INDEXING => "indexing",
-            INDEX_PHASE_SEMANTIC_INITIALIZE => "semantic_initialize",
-            INDEX_PHASE_SEMANTIC_REPLAY => "semantic_replay",
-            INDEX_PHASE_SEMANTIC_EMBEDDING => "semantic_embedding",
-            INDEX_PHASE_SEMANTIC_VECTOR_PUBLISH => "semantic_vector_publish",
-            INDEX_PHASE_SEMANTIC_HNSW => "semantic_hnsw",
-            INDEX_PHASE_SEMANTIC_MANIFEST => "semantic_manifest",
-            INDEX_PHASE_SEMANTIC_FINALIZE => "semantic_finalize",
+            1 => "scanning",
+            2 => "indexing",
             _ => "preparing",
         }
     }
 
-    pub(crate) fn phase_unit_for(phase: usize) -> &'static str {
-        match phase {
-            INDEX_PHASE_SCANNING => "connectors",
-            INDEX_PHASE_LEXICAL_INDEXING | INDEX_PHASE_SEMANTIC_REPLAY => "conversations",
-            INDEX_PHASE_SEMANTIC_EMBEDDING => "messages",
-            INDEX_PHASE_SEMANTIC_VECTOR_PUBLISH | INDEX_PHASE_SEMANTIC_HNSW => "vectors",
-            INDEX_PHASE_SEMANTIC_MANIFEST | INDEX_PHASE_SEMANTIC_FINALIZE => "steps",
-            _ => "items",
-        }
-    }
-
-    pub(crate) fn set_phase_progress(&self, phase: usize, current: usize, total: usize) {
-        // Publish counters before the phase code so a polling observer never
-        // sees a new phase paired with stale lexical totals.
-        self.total.store(total, Ordering::Relaxed);
-        self.current.store(current, Ordering::Relaxed);
-        // Semantic pipeline stages publish exact denominators.
-        self.total_is_final.store(true, Ordering::Relaxed);
-        self.phase.store(phase, Ordering::Relaxed);
-    }
-
-    pub(crate) fn update_phase_progress(&self, current: usize, total: usize) {
-        self.total.store(total, Ordering::Relaxed);
-        self.current.store(current, Ordering::Relaxed);
-    }
-
-    /// #332: record one unit of real work (a parsed conversation, a received
-    /// or persisted batch) without touching the published `current`/`total`
-    /// counters. The stall watchdog treats an advancing tick as forward
-    /// progress.
-    pub fn tick_activity(&self) {
-        self.activity
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
     /// Human-readable label for the current phase.
-    /// See the `INDEX_PHASE_*` constants for the canonical phase taxonomy.
+    /// 0 = preparing (pre-scan), 1 = scanning, 2 = indexing.
     pub fn phase_label(&self) -> &'static str {
         Self::phase_label_for(self.phase.load(Ordering::Relaxed))
-    }
-
-    /// True when the authoritative lexical rebuild pipeline holds no
-    /// in-flight, pending, buffered, or parked work — i.e. nothing is left
-    /// to do and nothing is actively trying to make progress. The stall
-    /// watchdog uses this to distinguish a genuinely wedged post-publish
-    /// finalize (#297: everything idle, yet the process never exits) from a
-    /// legitimately slow-but-active sort/rebuild (#294), which must never be
-    /// aborted.
-    pub fn rebuild_pipeline_is_quiescent(&self) -> bool {
-        let no_active_work = self.rebuild_pipeline_queue_depth.load(Ordering::Relaxed) == 0
-            && self
-                .rebuild_pipeline_inflight_message_bytes
-                .load(Ordering::Relaxed)
-                == 0
-            && self
-                .rebuild_pipeline_pending_batch_conversations
-                .load(Ordering::Relaxed)
-                == 0
-            && self
-                .rebuild_pipeline_pending_batch_message_bytes
-                .load(Ordering::Relaxed)
-                == 0
-            && self
-                .rebuild_pipeline_active_page_prep_jobs
-                .load(Ordering::Relaxed)
-                == 0
-            && self
-                .rebuild_pipeline_ordered_buffered_pages
-                .load(Ordering::Relaxed)
-                == 0
-            && self
-                .rebuild_pipeline_producer_budget_active_waiters
-                .load(Ordering::Relaxed)
-                == 0
-            && self
-                .rebuild_pipeline_staged_merge_active_jobs
-                .load(Ordering::Relaxed)
-                == 0
-            && self
-                .rebuild_pipeline_staged_merge_ready_artifacts
-                .load(Ordering::Relaxed)
-                == 0
-            && self
-                .rebuild_pipeline_staged_merge_ready_groups
-                .load(Ordering::Relaxed)
-                == 0
-            && self
-                .rebuild_pipeline_staged_shard_build_active_jobs
-                .load(Ordering::Relaxed)
-                == 0
-            && self
-                .rebuild_pipeline_staged_shard_build_pending_jobs
-                .load(Ordering::Relaxed)
-                == 0;
-        if !no_active_work {
-            return false;
-        }
-        // An empty producer state means no rebuild is active; "idle" means
-        // the producer parked with nothing queued. Any other park site
-        // (listing_db / waiting_result / waiting_turn / waiting_budget /
-        // handoff_send) means it is still trying to make progress.
-        self.rebuild_pipeline_producer_state
-            .lock()
-            .map(|state| state.is_empty() || state.as_str() == "idle")
-            .unwrap_or(false)
     }
 
     /// Capture a JSON snapshot of the current progress state, suitable for
@@ -1258,7 +1002,6 @@ impl IndexingProgress {
         let current = self.current.load(Ordering::Relaxed);
         let agents = self.discovered_agents.load(Ordering::Relaxed);
         let is_rebuilding = self.is_rebuilding.load(Ordering::Relaxed);
-        let finalizing = self.finalizing.load(Ordering::Relaxed);
         let agent_names: Vec<String> = self
             .discovered_agent_names
             .lock()
@@ -1293,17 +1036,6 @@ impl IndexingProgress {
             .load(Ordering::Relaxed);
         let rebuild_pipeline_producer_budget_wait_ms = self
             .rebuild_pipeline_producer_budget_wait_ms
-            .load(Ordering::Relaxed);
-        let rebuild_pipeline_producer_state = self
-            .rebuild_pipeline_producer_state
-            .lock()
-            .map(|value| value.clone())
-            .unwrap_or_default();
-        let rebuild_pipeline_reservation_next_sequence = self
-            .rebuild_pipeline_reservation_next_sequence
-            .load(Ordering::Relaxed);
-        let rebuild_pipeline_producer_budget_active_waiters = self
-            .rebuild_pipeline_producer_budget_active_waiters
             .load(Ordering::Relaxed);
         let rebuild_pipeline_producer_handoff_wait_count = self
             .rebuild_pipeline_producer_handoff_wait_count
@@ -1417,19 +1149,13 @@ impl IndexingProgress {
             })
             .unwrap_or_default();
 
-        let total_is_final = self.total_is_final.load(Ordering::Relaxed);
-        let activity = self.activity.load(std::sync::atomic::Ordering::Relaxed);
-
         // Derived rate + ETA for the indexing phase. Guard against divide-by-zero
-        // and bogus values when `total` isn't set yet. #332: ETA is only
-        // published against a FINAL denominator — while `total` is still
-        // "discovered so far" an ETA computed from it regresses by hours as
-        // discovery expands, so it is suppressed (rate stays available).
+        // and bogus values when `total` isn't set yet.
         let (rate_per_sec, eta_seconds) = if phase == 2 && elapsed_ms > 0 && current > 0 {
             let secs = (elapsed_ms as f64) / 1000.0;
             let rate = (current as f64) / secs.max(0.001);
             let remaining = total.saturating_sub(current) as f64;
-            let eta = if rate > 0.0 && total > 0 && total_is_final {
+            let eta = if rate > 0.0 && total > 0 {
                 Some(remaining / rate)
             } else {
                 None
@@ -1442,27 +1168,11 @@ impl IndexingProgress {
         serde_json::json!({
             "phase": Self::phase_label_for(phase),
             "phase_code": phase,
-            // #332: the unit `current`/`total` count in this phase, so
-            // dashboards never mix source artifacts, conversations, and
-            // vectors under one unlabeled shape.
-            "unit": Self::phase_unit_for(phase),
             "total": total,
-            // #332: false while `total` is a lazily expanding "discovered so
-            // far" count; true once it is a stable denominator.
-            "total_is_final": total_is_final,
             "current": current,
-            // #332: monotonic work-liveness tick (parsed conversations +
-            // received/persisted batches); advances during long parses even
-            // when `current` cannot.
-            "activity": activity,
             "discovered_agents": agents,
             "agent_names": agent_names,
             "is_rebuilding": is_rebuilding,
-            // #319: true while the indexer is inside the post-publish finalize
-            // WAL checkpoint (close_storage_after_index). A quiescent, phase-0,
-            // current==total snapshot with `finalizing: true` is an active
-            // final checkpoint, NOT a #297 wedge.
-            "finalizing": finalizing,
             "elapsed_ms": elapsed_ms,
             "rate_per_sec": rate_per_sec,
             "eta_seconds": eta_seconds,
@@ -1480,15 +1190,6 @@ impl IndexingProgress {
                 "budget_generation": rebuild_pipeline_budget_generation,
                 "producer_budget_wait_count": rebuild_pipeline_producer_budget_wait_count,
                 "producer_budget_wait_ms": rebuild_pipeline_producer_budget_wait_ms,
-                // #288 park-site telemetry: where the page-production stage is
-                // currently blocked, which page sequence the ordered
-                // reservation barrier admits next, and how many threads are
-                // parked on the byte budget right now (the cumulative
-                // producer_budget_wait_* counters above only advance AFTER a
-                // wait succeeds, so they cannot identify a live park).
-                "producer_state": non_empty_json_string(rebuild_pipeline_producer_state),
-                "reservation_next_sequence": rebuild_pipeline_reservation_next_sequence,
-                "producer_budget_active_waiters": rebuild_pipeline_producer_budget_active_waiters,
                 "producer_handoff_wait_count": rebuild_pipeline_producer_handoff_wait_count,
                 "producer_handoff_wait_ms": rebuild_pipeline_producer_handoff_wait_ms,
                 "host_loadavg_1m": rebuild_pipeline_host_loadavg_1m_milli.map(|value| {
@@ -1764,7 +1465,7 @@ fn lexical_population_strategy_requires_inline_tantivy(
 fn non_watch_ingest_chunk_size() -> usize {
     match dotenvy::var("CASS_NON_WATCH_INGEST_CHUNK_SIZE")
         .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
+        .and_then(|value| value.parse::<usize>().ok())
     {
         Some(0) => NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE,
         Some(value) if value > NON_WATCH_INGEST_CHUNK_SIZE_MAX => {
@@ -2014,15 +1715,6 @@ fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
     progress
         .rebuild_pipeline_producer_budget_wait_ms
         .store(0, Ordering::Relaxed);
-    if let Ok(mut producer_state) = progress.rebuild_pipeline_producer_state.lock() {
-        producer_state.clear();
-    }
-    progress
-        .rebuild_pipeline_reservation_next_sequence
-        .store(0, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_producer_budget_active_waiters
-        .store(0, Ordering::Relaxed);
     progress
         .rebuild_pipeline_producer_handoff_wait_count
         .store(0, Ordering::Relaxed);
@@ -2130,14 +1822,6 @@ fn capture_lexical_rebuild_pipeline_runtime(
         budget_generation,
         producer_budget_wait_count: producer_snapshot.budget_wait_count,
         producer_budget_wait_ms: producer_snapshot.budget_wait_ms,
-        producer_budget_waiter_count: flow_limiter.active_waiter_count(),
-        producer_state: producer_telemetry
-            .map(|_| {
-                LexicalRebuildProducerParkSite::label_for(producer_snapshot.producer_state)
-                    .to_string()
-            })
-            .unwrap_or_default(),
-        reservation_next_sequence: producer_snapshot.reservation_next_sequence,
         producer_handoff_wait_count: producer_snapshot.handoff_wait_count,
         producer_handoff_wait_ms: producer_snapshot.handoff_wait_ms,
         host_loadavg_1m_milli: lexical_rebuild_host_loadavg_1m_milli(),
@@ -2220,18 +1904,6 @@ fn refresh_lexical_rebuild_pipeline_runtime(
     progress
         .rebuild_pipeline_producer_budget_wait_ms
         .store(latest_runtime.producer_budget_wait_ms, Ordering::Relaxed);
-    if let Ok(mut producer_state) = progress.rebuild_pipeline_producer_state.lock() {
-        *producer_state = latest_runtime.producer_state.clone();
-    }
-    progress
-        .rebuild_pipeline_reservation_next_sequence
-        .store(latest_runtime.reservation_next_sequence, Ordering::Relaxed);
-    progress
-        .rebuild_pipeline_producer_budget_active_waiters
-        .store(
-            latest_runtime.producer_budget_waiter_count,
-            Ordering::Relaxed,
-        );
     progress.rebuild_pipeline_producer_handoff_wait_count.store(
         latest_runtime.producer_handoff_wait_count,
         Ordering::Relaxed,
@@ -2755,19 +2427,12 @@ fn should_skip_noop_final_lexical_checkpoint_refresh(
     initial_checkpoint_status: &MatchingLexicalRebuildStateStatus,
     exact_total_counts: Option<(usize, usize)>,
     canonical_mutations: CanonicalMutationCounts,
-    completed_checkpoint_present_at_run_end: bool,
 ) -> bool {
     !full_rebuild
         && !rebuild_was_required
         && exact_total_counts.is_none()
         && !canonical_mutations.changed()
         && initial_checkpoint_status.has_completed_checkpoint
-        // #289: the run-start status can go stale before the end of the run —
-        // the federated-bundle materialization that happens on the next writer
-        // open used to wipe the live directory's sidecars. Only skip the final
-        // refresh when the checkpoint file still exists at run end; if it went
-        // missing mid-run, fall through and re-persist it.
-        && completed_checkpoint_present_at_run_end
 }
 
 fn should_skip_post_full_scan_authoritative_rebuild(
@@ -4782,7 +4447,7 @@ impl LexicalRebuildShardBuildTelemetry {
         if let Some(amplification_milli) = result.amplification_milli {
             let conservative_amplification = amplification_milli
                 .max(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI);
-            let _ = self.observed_amplification_milli.try_update(
+            let _ = self.observed_amplification_milli.fetch_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |current| Some(current.max(conservative_amplification)),
@@ -4889,34 +4554,13 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                             .sum::<usize>();
                         let shard_message_bytes = work.message_bytes;
                         let build_started = Instant::now();
-                        // #282/#288: a panicking shard-build worker (a Tantivy
-                        // assert, an allocator abort, etc.) used to unwind
-                        // silently — sibling workers' `tx` clones kept the
-                        // result channel open, so the staging→publish consumer
-                        // parked forever (all threads on a condvar at the
-                        // handoff: the terminal-wedge signature). Mirror the
-                        // page-prep containment (see ~16456) and convert the
-                        // panic into the same `Error` teardown the consumer
-                        // already handles, so it aborts loudly instead.
-                        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                            || {
-                                #[cfg(test)]
-                                lexical_rebuild_shard_build_injected_panic_hook();
-                                build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
-                                    &work.shard_index_path,
-                                    &work.packets,
-                                    lexical_rebuild_worker_pool.as_deref(),
-                                    Some(work.writer_parallelism),
-                                )
-                            },
-                        )) {
-                            Ok(result) => result,
-                            Err(payload) => Err(anyhow::anyhow!(
-                                "lexical rebuild shard-build worker {worker_idx} panicked while building shard {}: {}",
-                                work.shard.shard_index,
-                                panic_payload_message(payload)
-                            )),
-                        };
+                        let result =
+                            build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
+                                &work.shard_index_path,
+                                &work.packets,
+                                lexical_rebuild_worker_pool.as_deref(),
+                                Some(work.writer_parallelism),
+                            );
                         let build_duration_ms =
                             u64::try_from(build_started.elapsed().as_millis()).unwrap_or(u64::MAX);
                         let index_size_bytes =
@@ -5002,27 +4646,11 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                             .iter()
                             .map(|artifact| artifact.index_path.clone())
                             .collect::<Vec<_>>();
-                        // #282: a panicking shard-merge worker used to unwind
-                        // silently, leaving the result channel open and parking
-                        // the final-frontier reducer forever on
-                        // `merge_result_rx.recv()`. Contain the panic and emit
-                        // the same `Error` teardown the reducer already handles.
-                        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                            || {
-                                #[cfg(test)]
-                                lexical_rebuild_shard_merge_injected_panic_hook();
-                                crate::search::tantivy::TantivyIndex::merge_compatible_index_directories(
-                                    &work.output_path,
-                                    &input_paths,
-                                )
-                            },
-                        )) {
-                            Ok(result) => result,
-                            Err(payload) => Err(anyhow::anyhow!(
-                                "lexical rebuild shard-merge worker {worker_idx} panicked while merging shards {first_shard_index}..={last_shard_index}: {}",
-                                panic_payload_message(payload)
-                            )),
-                        };
+                        let result =
+                            crate::search::tantivy::TantivyIndex::merge_compatible_index_directories(
+                                &work.output_path,
+                                &input_paths,
+                            );
                         match result {
                             Ok(merged_index) => {
                                 let docs = work
@@ -5248,12 +4876,6 @@ fn reduce_staged_lexical_final_merge_frontier_via_workers(
     max_parallel_jobs: usize,
     merge_work_tx: &Sender<LexicalRebuildShardMergeJob>,
     merge_result_rx: &Receiver<LexicalRebuildShardMergeMessage>,
-    // #282: a large final frontier can spend minutes here blocked on
-    // `merge_result_rx.recv()` with no shard/merge boundary in the outer drain
-    // loop, freezing `last_progress_at_ms` and tripping the stall-abort at
-    // 100%. Each completed reduction merge is real forward progress, so bump
-    // the lock-file progress atomic on every `Built` result.
-    progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<Vec<LexicalRebuildShardMergeArtifact>> {
     if frontier.len() <= 1 {
         return Ok(frontier);
@@ -5320,7 +4942,6 @@ fn reduce_staged_lexical_final_merge_frontier_via_workers(
         match message {
             LexicalRebuildShardMergeMessage::Built(result) => {
                 pending_jobs = pending_jobs.saturating_sub(1);
-                bump_index_run_lock_progress_if_present(progress_bump);
                 frontier.push(result.artifact);
                 frontier.sort_by_key(|artifact| {
                     (artifact.first_shard_index, artifact.last_shard_index)
@@ -6102,16 +5723,6 @@ pub(crate) struct LexicalRebuildPipelineRuntimeSnapshot {
     pub budget_generation: usize,
     pub producer_budget_wait_count: usize,
     pub producer_budget_wait_ms: usize,
-    #[serde(skip)]
-    pub producer_budget_waiter_count: usize,
-    /// Current park site of the page-production stage (#288). Transient
-    /// run-time telemetry only — never persisted into checkpoints.
-    #[serde(skip)]
-    pub producer_state: String,
-    /// Next page sequence the ordered reservation barrier will admit (#288).
-    /// Transient run-time telemetry only — never persisted into checkpoints.
-    #[serde(skip)]
-    pub reservation_next_sequence: u64,
     pub producer_handoff_wait_count: usize,
     pub producer_handoff_wait_ms: usize,
     pub host_loadavg_1m_milli: Option<u32>,
@@ -6143,14 +5754,6 @@ pub(crate) struct LexicalRebuildPipelineRuntimeSnapshot {
 }
 
 impl LexicalRebuildPipelineRuntimeSnapshot {
-    fn checkpoint_snapshot(&self) -> Self {
-        let mut snapshot = self.clone();
-        snapshot.producer_budget_waiter_count = 0;
-        snapshot.producer_state = String::new();
-        snapshot.reservation_next_sequence = 0;
-        snapshot
-    }
-
     fn is_observed(&self) -> bool {
         self.updated_at_ms > 0
             || self.queue_depth > 0
@@ -6163,9 +5766,6 @@ impl LexicalRebuildPipelineRuntimeSnapshot {
             || self.budget_generation > 0
             || self.producer_budget_wait_count > 0
             || self.producer_budget_wait_ms > 0
-            || self.producer_budget_waiter_count > 0
-            || !self.producer_state.is_empty()
-            || self.reservation_next_sequence > 0
             || self.producer_handoff_wait_count > 0
             || self.producer_handoff_wait_ms > 0
             || self.host_loadavg_1m_milli.is_some()
@@ -6319,7 +5919,7 @@ impl LexicalRebuildState {
     }
 
     fn set_runtime(&mut self, runtime: &LexicalRebuildPipelineRuntimeSnapshot) {
-        self.runtime = runtime.checkpoint_snapshot();
+        self.runtime = runtime.clone();
     }
 
     fn clear_runtime(&mut self) {
@@ -6371,20 +5971,6 @@ fn acquire_index_run_lock(
     db_path: &Path,
     mode: SearchMaintenanceMode,
 ) -> Result<IndexRunLockGuard> {
-    acquire_index_run_lock_with_job_kind(
-        data_dir,
-        db_path,
-        mode,
-        maintenance_job_kind_for_mode(mode),
-    )
-}
-
-fn acquire_index_run_lock_with_job_kind(
-    data_dir: &Path,
-    db_path: &Path,
-    mode: SearchMaintenanceMode,
-    job_kind: SearchMaintenanceJobKind,
-) -> Result<IndexRunLockGuard> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("creating cass data directory {}", data_dir.display()))?;
     let lock_path = data_dir.join("index-run.lock");
@@ -6424,7 +6010,7 @@ fn acquire_index_run_lock_with_job_kind(
         last_progress_at_ms_atomic: Arc::new(AtomicI64::new(now_ms)),
         db_path: crate::normalize_path_identity(db_path),
         job_id: String::new(),
-        job_kind,
+        job_kind: maintenance_job_kind_for_mode(mode),
         metadata_write_lock: Arc::new(Mutex::new(())),
     };
     guard.job_id = format!(
@@ -7331,7 +6917,6 @@ struct LexicalRebuildResponsivenessController {
     reason: String,
     clear_samples: usize,
     last_transition_at: Instant,
-    last_observed_producer_budget_wait_count: usize,
     last_observed_producer_handoff_wait_count: usize,
 }
 
@@ -7383,7 +6968,6 @@ impl LexicalRebuildResponsivenessController {
             reason,
             clear_samples: 0,
             last_transition_at: Instant::now(),
-            last_observed_producer_budget_wait_count: 0,
             last_observed_producer_handoff_wait_count: 0,
         }
     }
@@ -7413,20 +6997,13 @@ impl LexicalRebuildResponsivenessController {
     }
 
     fn record_first_durable_commit(&mut self) -> Option<LexicalRebuildBudgetTransition> {
-        self.promote_startup_to_steady("first_durable_commit_promoted_steady_budget")
-    }
-
-    fn promote_startup_to_steady(
-        &mut self,
-        reason: impl Into<String>,
-    ) -> Option<LexicalRebuildBudgetTransition> {
         if self.state != LexicalRebuildResponsivenessState::Startup {
             return None;
         }
 
         let old_budget = self.current_budget();
         self.state = LexicalRebuildResponsivenessState::Steady;
-        self.reason = reason.into();
+        self.reason = "first_durable_commit_promoted_steady_budget".to_string();
         self.clear_samples = 0;
         self.last_transition_at = Instant::now();
         let new_budget = self.current_budget();
@@ -7446,17 +7023,12 @@ impl LexicalRebuildResponsivenessController {
         &mut self,
         runtime: &LexicalRebuildPipelineRuntimeSnapshot,
     ) -> Option<LexicalRebuildBudgetTransition> {
-        let new_producer_budget_wait =
-            self.observe_new_producer_budget_wait(runtime.producer_budget_wait_count);
         let new_producer_handoff_wait =
             self.observe_new_producer_handoff_wait(runtime.producer_handoff_wait_count);
-        if self.policy != LexicalRebuildResponsivenessPolicy::Auto {
+        if self.policy != LexicalRebuildResponsivenessPolicy::Auto
+            || self.state == LexicalRebuildResponsivenessState::Startup
+        {
             return None;
-        }
-        if self.state == LexicalRebuildResponsivenessState::Startup {
-            return self
-                .detect_startup_budget_starvation(runtime, new_producer_budget_wait)
-                .and_then(|reason| self.promote_startup_to_steady(reason));
         }
 
         if let Some(reason) = self.detect_pressure(runtime, new_producer_handoff_wait) {
@@ -7527,40 +7099,10 @@ impl LexicalRebuildResponsivenessController {
         None
     }
 
-    fn observe_new_producer_budget_wait(&mut self, observed_count: usize) -> bool {
-        let new_wait_observed = observed_count > self.last_observed_producer_budget_wait_count;
-        self.last_observed_producer_budget_wait_count = observed_count;
-        new_wait_observed
-    }
-
     fn observe_new_producer_handoff_wait(&mut self, observed_count: usize) -> bool {
         let new_wait_observed = observed_count > self.last_observed_producer_handoff_wait_count;
         self.last_observed_producer_handoff_wait_count = observed_count;
         new_wait_observed
-    }
-
-    fn detect_startup_budget_starvation(
-        &self,
-        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
-        new_producer_budget_wait: bool,
-    ) -> Option<String> {
-        if self.startup_budget == self.steady_budget {
-            return None;
-        }
-        if new_producer_budget_wait {
-            return Some(format!(
-                "startup_producer_budget_wait_count_{}_promoted_steady_budget_before_first_durable_commit",
-                runtime.producer_budget_wait_count
-            ));
-        }
-        if runtime.producer_budget_waiter_count > 0 {
-            return Some(format!(
-                "startup_active_producer_budget_waiters_{}_promoted_steady_budget_before_first_durable_commit",
-                runtime.producer_budget_waiter_count
-            ));
-        }
-
-        None
     }
 
     fn detect_pressure(
@@ -7709,14 +7251,6 @@ impl LexicalRebuildPipelineBudgetSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LexicalRebuildFirstBudgetPromotionWait {
-    generation: usize,
-    commit_interval_conversations: usize,
-    commit_interval_messages: usize,
-    commit_interval_message_bytes: usize,
-}
-
 #[derive(Debug)]
 struct LexicalRebuildPipelineBudgetController {
     page_conversation_limit: AtomicUsize,
@@ -7787,16 +7321,6 @@ impl LexicalRebuildPipelineBudgetController {
         self.commit_interval_message_bytes
             .store(snapshot.commit_interval_message_bytes, Ordering::Relaxed);
         let new_generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        if lexical_pipeline_trace_enabled() {
-            tracing::info!(
-                new_generation,
-                page_conversation_limit = snapshot.page_conversation_limit,
-                batch_fetch_message_limit = snapshot.batch_fetch_message_limit,
-                batch_fetch_message_bytes_limit = snapshot.batch_fetch_message_bytes_limit,
-                max_message_bytes_in_flight = snapshot.max_message_bytes_in_flight,
-                "CASS_PIPELINE_TRACE lexical rebuild pipeline budget generation bump"
-            );
-        }
         let mut guard = self
             .generation_lock
             .lock()
@@ -7834,71 +7358,6 @@ impl LexicalRebuildPipelineBudgetController {
     }
 }
 
-/// Opt-in high-detail tracing for the lexical-rebuild flow-control path
-/// (#288). When truthy, the producer/worker park-site transitions, every
-/// budget-generation bump, and the periodic bounded-condvar-wait probes are
-/// emitted at INFO so a parked pipeline can be diagnosed from logs without a
-/// debugger; when unset the same probes stay at DEBUG/TRACE.
-fn lexical_pipeline_trace_enabled() -> bool {
-    dotenvy_truthy("CASS_PIPELINE_TRACE")
-}
-
-/// How long a lexical-rebuild flow-control condvar wait may park before the
-/// blocked predicate is logged and the wait re-arms. Pure observability: the
-/// waiting thread always continues waiting after logging (#288).
-const LEXICAL_PIPELINE_BLOCKED_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Current blocking site of the lexical-rebuild page-production stage
-/// (producer thread + ordered page-prep workers), published through an
-/// `AtomicU8` so the stall watchdog can report *where* the pipeline is
-/// parked instead of only the cumulative after-success wait counters
-/// (#288: `producer_budget_wait_count` kept growing while the controller
-/// reported `steady_budget_with_headroom` and every thread was parked —
-/// the payload never said which condvar held the pipeline).
-///
-/// Updated on entry to each blocking section and reset to `Idle` when the
-/// section completes. Multiple threads share the cell (last writer wins);
-/// in the all-parked starvation case there are no further writers, so the
-/// final value identifies a genuine park site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum LexicalRebuildProducerParkSite {
-    Idle = 0,
-    ListingDb = 1,
-    WaitingResult = 2,
-    WaitingTurn = 3,
-    WaitingBudget = 4,
-    HandoffSend = 5,
-}
-
-impl LexicalRebuildProducerParkSite {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::ListingDb => "listing_db",
-            Self::WaitingResult => "waiting_result",
-            Self::WaitingTurn => "waiting_turn",
-            Self::WaitingBudget => "waiting_budget",
-            Self::HandoffSend => "handoff_send",
-        }
-    }
-
-    fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::ListingDb,
-            2 => Self::WaitingResult,
-            3 => Self::WaitingTurn,
-            4 => Self::WaitingBudget,
-            5 => Self::HandoffSend,
-            _ => Self::Idle,
-        }
-    }
-
-    fn label_for(value: u8) -> &'static str {
-        Self::from_u8(value).as_str()
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LexicalRebuildProducerTelemetrySnapshot {
     page_prep_workers: usize,
@@ -7908,8 +7367,6 @@ struct LexicalRebuildProducerTelemetrySnapshot {
     budget_wait_ms: usize,
     handoff_wait_count: usize,
     handoff_wait_ms: usize,
-    producer_state: u8,
-    reservation_next_sequence: u64,
 }
 
 #[derive(Debug, Default)]
@@ -7921,17 +7378,11 @@ struct LexicalRebuildProducerTelemetry {
     budget_wait_ms: AtomicUsize,
     handoff_wait_count: AtomicUsize,
     handoff_wait_ms: AtomicUsize,
-    /// See [`LexicalRebuildProducerParkSite`].
-    producer_state: AtomicU8,
-    /// Mirror of `LexicalRebuildReservationOrder::next_sequence`, refreshed
-    /// around each ordered budget acquisition so the stall payload can show
-    /// which page sequence the reservation barrier is waiting to admit.
-    reservation_next_sequence: AtomicU64,
 }
 
 impl LexicalRebuildProducerTelemetry {
     fn saturating_add(counter: &AtomicUsize, value: usize) {
-        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(value))
         });
     }
@@ -7954,25 +7405,7 @@ impl LexicalRebuildProducerTelemetry {
             budget_wait_ms: self.budget_wait_ms.load(Ordering::Relaxed),
             handoff_wait_count: self.handoff_wait_count.load(Ordering::Relaxed),
             handoff_wait_ms: self.handoff_wait_ms.load(Ordering::Relaxed),
-            producer_state: self.producer_state.load(Ordering::Relaxed),
-            reservation_next_sequence: self.reservation_next_sequence.load(Ordering::Relaxed),
         }
-    }
-
-    fn set_producer_state(&self, state: LexicalRebuildProducerParkSite) {
-        let previous = self.producer_state.swap(state as u8, Ordering::Relaxed);
-        if previous != state as u8 && lexical_pipeline_trace_enabled() {
-            tracing::info!(
-                from = LexicalRebuildProducerParkSite::label_for(previous),
-                to = state.as_str(),
-                "CASS_PIPELINE_TRACE lexical rebuild page-production park-site transition"
-            );
-        }
-    }
-
-    fn record_reservation_next_sequence(&self, next_sequence: u64) {
-        self.reservation_next_sequence
-            .store(next_sequence, Ordering::Relaxed);
     }
 
     fn record(
@@ -8616,7 +8049,6 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
         Some(base_meta_fingerprint) => Some(base_meta_fingerprint.to_string()),
         None => index_meta_fingerprint(index_path)?,
     };
-    let checkpoint_runtime = runtime.checkpoint_snapshot();
     let current_processed_conversations = state.reported_processed_conversations();
     let current_indexed_docs = state.reported_indexed_docs();
     if processed_conversations < current_processed_conversations
@@ -8630,8 +8062,8 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
             current_indexed_docs,
             "ignoring stale lexical rebuild progress checkpoint update while preserving runtime telemetry"
         );
-        if state.runtime != checkpoint_runtime {
-            state.set_runtime(&checkpoint_runtime);
+        if state.runtime != *runtime {
+            state.set_runtime(runtime);
             persist_lexical_rebuild_state(index_path, state)?;
         }
         return Ok(());
@@ -8641,7 +8073,7 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
             && pending.processed_conversations == processed_conversations
             && pending.indexed_docs == indexed_docs
             && pending.base_meta_fingerprint == base_meta_fingerprint
-            && state.runtime == checkpoint_runtime
+            && state.runtime == *runtime
     });
     if already_recorded {
         return Ok(());
@@ -8653,7 +8085,7 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
         indexed_docs,
         base_meta_fingerprint,
     );
-    state.set_runtime(&checkpoint_runtime);
+    state.set_runtime(runtime);
     persist_lexical_rebuild_state(index_path, state)
 }
 
@@ -8932,56 +8364,6 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
     Ok(usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX))
 }
 
-/// Count the tantivy docs a *healthy* live lexical index should hold for the
-/// current canonical data: one per reachable (live-conversation) message that
-/// the authoritative rebuild sink does NOT drop as hard-noise.
-///
-/// The lexical sink (`prebuilt_docs`) emits no doc for a hard-noise message —
-/// empty content or a tool-ack (`is_hard_message_noise`) — so the true expected
-/// doc count is `reachable_messages - hard_noise`, never the raw
-/// `COUNT(*) FROM messages`. cass#317: comparing the observed doc count against
-/// the raw message count made any corpus carrying tool-ack traffic look
-/// permanently sparse, firing a full authoritative rebuild on every index/watch
-/// run (the run then preserves `last_scan_ts`, so the same rebuild repeats).
-///
-/// Exactness comes from reusing the sink's own inputs rather than a SQL
-/// approximation that could drift from Rust trim semantics:
-///   - iterate live conversations only, via `fetch_messages_for_lexical_rebuild`
-///     — orphaned `messages` rows (no live conversation) are never indexed by
-///     the sink, so they must not inflate the expectation;
-///   - that fetch already applies the #290 per-conversation content cap
-///     (`truncate_lexical_rebuild_conversation_content`), so a conversation whose
-///     trailing body is cleared to empty is classified as hard-noise exactly as
-///     the sink drops it;
-///   - classify with the same `is_hard_message_noise(lexical_rebuild_noise_role(
-///     is_tool_role), content)` predicate and precise tool-role mapping the sink
-///     uses.
-///
-/// Content is read one conversation at a time, so peak memory is bounded to a
-/// single conversation regardless of corpus size. Only called on the
-/// sparse-looking branch (observed already below the cheap raw upper bound), so
-/// the extra scan is paid lazily.
-fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
-    let conversation_ids: Vec<i64> = storage
-        .raw()
-        .query_map_collect(
-            "SELECT id FROM conversations",
-            &[] as &[ParamValue],
-            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
-        )
-        .context("listing conversations for the noise-adjusted lexical doc expectation")?;
-    let mut expected_docs = 0usize;
-    for conversation_id in conversation_ids {
-        for message in storage.fetch_messages_for_lexical_rebuild(conversation_id)? {
-            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
-            if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
-                expected_docs += 1;
-            }
-        }
-    }
-    Ok(expected_docs)
-}
-
 fn max_conversation_id_exact(storage: &FrankenStorage) -> Result<Option<i64>> {
     let max_conversation_id: i64 = storage
         .raw()
@@ -9009,18 +8391,6 @@ struct IncrementalCanonicalLexicalRepairContext {
     targeted_watch_once_only: bool,
     salvage_messages_imported: usize,
     canonical_messages: usize,
-    /// Noise-adjusted expected live tantivy doc count: the number of docs a
-    /// healthy live index holds for this canonical data. The lexical rebuild
-    /// sink emits NO doc for a hard-noise message (empty content / tool-ack —
-    /// `is_hard_message_noise`), so a healthy index has fewer docs than
-    /// `COUNT(*) FROM messages`. Comparing the observed doc count against the raw
-    /// `canonical_messages` made any corpus with tool-ack traffic look
-    /// permanently sparse and triggered a full authoritative rebuild on every
-    /// index/watch run (cass#317). This is the correct sparseness threshold; it
-    /// equals `canonical_messages` only when no reachable message is hard-noise
-    /// (and when it was not separately computed because the raw count already
-    /// looked covered). Always `<= canonical_messages`.
-    expected_lexical_docs: usize,
     tantivy_requires_rebuild: bool,
     observed_tantivy_docs: Option<usize>,
     /// True when a completed lexical-rebuild checkpoint records this exact
@@ -9078,18 +8448,12 @@ fn choose_incremental_canonical_lexical_repair_plan(
     }
 
     let observed_tantivy_docs = context.observed_tantivy_docs?;
-    // cass#317: compare against the noise-adjusted expected doc count, not the
-    // raw `canonical_messages`. The sink drops hard-noise messages (empty /
-    // tool-acks), so a healthy live index holds `expected_lexical_docs` docs
-    // (<= canonical_messages). Using the raw message count made any corpus with
-    // tool-ack traffic look permanently sparse and rebuilt every run.
-    if observed_tantivy_docs < context.expected_lexical_docs {
+    if observed_tantivy_docs < context.canonical_messages {
         if context.published_index_validated_for_current_data {
             tracing::warn!(
                 canonical_messages = context.canonical_messages,
-                expected_lexical_docs = context.expected_lexical_docs,
                 observed_tantivy_docs,
-                "completed lexical checkpoint matches the canonical DB, but the live lexical index is sparse below the noise-adjusted expectation; repairing derived search assets from SQLite"
+                "completed lexical checkpoint matches the canonical DB, but the live lexical index is sparse; repairing derived search assets from SQLite"
             );
         }
         return Some(IncrementalCanonicalLexicalRepairPlan {
@@ -9300,7 +8664,6 @@ fn should_repair_fallback_fts_after_full_index_run(
 enum FallbackFtsRepairOutcome {
     SkippedKnownHealthyForFingerprint { archive_fingerprint: String },
     SkippedUnsupportedPopulatedShadowReload { detail: String },
-    SkippedCorruptDerivedIndex { detail: String },
     Repaired(FtsConsistencyRepair),
 }
 
@@ -9314,18 +8677,6 @@ enum DailyStatsRepairOutcome {
         rows_created: i64,
         total_sessions: i64,
     },
-}
-
-fn nonfatal_fallback_fts_repair_outcome(detail: String) -> Option<FallbackFtsRepairOutcome> {
-    if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
-        &detail,
-    ) {
-        return Some(FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail });
-    }
-    if crate::storage::sqlite::fts_messages_integrity_error_from_message(&detail).is_some() {
-        return Some(FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail });
-    }
-    None
 }
 
 fn repair_fallback_fts_after_full_index_run(
@@ -9366,8 +8717,12 @@ fn repair_fallback_fts_after_full_index_run(
         Ok(storage) => storage,
         Err(err) => {
             let detail = format!("{err:#}");
-            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail) {
-                return Ok(Some(outcome));
+            if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
+                &detail,
+            ) {
+                return Ok(Some(
+                    FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail },
+                ));
             }
             return Err(err).with_context(|| {
                 format!(
@@ -9393,8 +8748,12 @@ fn repair_fallback_fts_after_full_index_run(
         Ok(repair) => repair,
         Err(err) => {
             let detail = format!("{err:#}");
-            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail) {
-                return Ok(Some(outcome));
+            if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
+                &detail,
+            ) {
+                return Ok(Some(
+                    FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail },
+                ));
             }
             return Err(err);
         }
@@ -10789,19 +10148,30 @@ fn repair_daily_stats_if_drifted(
         "daily_stats is missing or drifted; rebuilding from canonical conversations"
     );
 
-    // #329: the packet projection rebuild held one write transaction for the
-    // entire archive and materialized canonical message batches before the
-    // nominally bounded fallback even started. On the 967k-message field
-    // corpus that first path reached an internal OOM, then the fallback did the
-    // same. Production now has one authoritative implementation: the
-    // failure-atomic staging rebuild whose canonical message pages are driven
-    // by one prepared, row-streaming `(conversation_id, idx)` statement.
-    let rebuilt = storage.rebuild_daily_stats().with_context(|| {
-        format!(
-            "rebuilding daily_stats with streaming canonical scan before index planning for {}",
-            db_path.display()
-        )
-    })?;
+    let rebuilt = match rebuild_daily_stats_from_conversation_packets(storage, db_path) {
+        Ok(rebuilt) => rebuilt,
+        Err(error) if error_is_out_of_memory(&error) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %error,
+                "packet daily_stats rebuild ran out of memory; falling back to bounded storage rebuild"
+            );
+            storage.rebuild_daily_stats().with_context(|| {
+                format!(
+                    "rebuilding daily_stats with bounded fallback before index planning for {}",
+                    db_path.display()
+                )
+            })?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "rebuilding daily_stats before index planning for {}",
+                    db_path.display()
+                )
+            });
+        }
+    };
 
     tracing::info!(
         db_path = %db_path.display(),
@@ -10820,10 +10190,8 @@ fn repair_daily_stats_if_drifted(
     })
 }
 
-#[cfg(test)]
 const PACKET_DAILY_STATS_REBUILD_BATCH_SIZE: i64 = 256;
 
-#[cfg(test)]
 fn packet_daily_stats_provenance(
     conversation: &crate::storage::sqlite::LexicalRebuildConversationRow,
 ) -> LexicalRebuildPacketProvenance {
@@ -10839,7 +10207,6 @@ fn packet_daily_stats_provenance(
     }
 }
 
-#[cfg(test)]
 fn packet_daily_stats_message_count(projections: &ConversationPacketSinkProjections) -> i64 {
     let analytics = &projections.analytics;
     i64::try_from(
@@ -10852,12 +10219,10 @@ fn packet_daily_stats_message_count(projections: &ConversationPacketSinkProjecti
     .unwrap_or(i64::MAX)
 }
 
-#[cfg(test)]
 fn packet_daily_stats_total_chars(projections: &ConversationPacketSinkProjections) -> i64 {
     i64::try_from(projections.lexical.total_content_bytes).unwrap_or(i64::MAX)
 }
 
-#[cfg(test)]
 fn packet_update_daily_stats_batched_in_tx(
     tx: &FrankenTransaction<'_>,
     entries: &[(i64, String, String, StatsDelta)],
@@ -10892,7 +10257,6 @@ fn packet_update_daily_stats_batched_in_tx(
     Ok(total_affected)
 }
 
-#[cfg(test)]
 fn rebuild_daily_stats_from_conversation_packets(
     storage: &FrankenStorage,
     db_path: &Path,
@@ -11136,29 +10500,8 @@ struct StreamingByteLimiterState {
 #[derive(Debug)]
 struct StreamingByteLimiter {
     max_bytes_in_flight: AtomicUsize,
-    active_waiter_count: AtomicUsize,
     state: Mutex<StreamingByteLimiterState>,
     cv: Condvar,
-}
-
-#[derive(Debug)]
-struct ActiveStreamingByteWaiter<'a> {
-    active_waiter_count: &'a AtomicUsize,
-}
-
-impl<'a> ActiveStreamingByteWaiter<'a> {
-    fn new(active_waiter_count: &'a AtomicUsize) -> Self {
-        active_waiter_count.fetch_add(1, Ordering::Relaxed);
-        Self {
-            active_waiter_count,
-        }
-    }
-}
-
-impl Drop for ActiveStreamingByteWaiter<'_> {
-    fn drop(&mut self) {
-        self.active_waiter_count.fetch_sub(1, Ordering::Relaxed);
-    }
 }
 
 impl StreamingByteLimiter {
@@ -11166,7 +10509,6 @@ impl StreamingByteLimiter {
         debug_assert!(max_bytes_in_flight > 0);
         Self {
             max_bytes_in_flight: AtomicUsize::new(max_bytes_in_flight.max(1)),
-            active_waiter_count: AtomicUsize::new(0),
             state: Mutex::new(StreamingByteLimiterState {
                 bytes_in_flight: 0,
                 closed: false,
@@ -11187,7 +10529,6 @@ impl StreamingByteLimiter {
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut waited = false;
-        let mut active_waiter = None;
         let wait_started = Instant::now();
         loop {
             if state.closed {
@@ -11209,42 +10550,7 @@ impl StreamingByteLimiter {
             }
 
             waited = true;
-            active_waiter
-                .get_or_insert_with(|| ActiveStreamingByteWaiter::new(&self.active_waiter_count));
-            // #288: bounded wait so a parked pipeline periodically logs the
-            // blocked predicate (bytes in flight vs cap) instead of vanishing
-            // into an unbounded condvar park. Pure observability — the loop
-            // always re-arms and continues waiting.
-            let (next_state, timeout_result) = self
-                .cv
-                .wait_timeout(state, LEXICAL_PIPELINE_BLOCKED_WAIT_LOG_INTERVAL)
-                .unwrap_or_else(|e| e.into_inner());
-            state = next_state;
-            if timeout_result.timed_out() {
-                let waited_ms = wait_started.elapsed().as_millis() as u64;
-                let bytes_in_flight = state.bytes_in_flight;
-                let max_bytes_in_flight = self.max_bytes_in_flight.load(Ordering::Acquire);
-                let active_waiters = self.active_waiter_count.load(Ordering::Relaxed);
-                if lexical_pipeline_trace_enabled() {
-                    tracing::info!(
-                        requested_bytes,
-                        bytes_in_flight,
-                        max_bytes_in_flight,
-                        active_waiters,
-                        waited_ms,
-                        "CASS_PIPELINE_TRACE streaming byte budget still parked waiting for capacity"
-                    );
-                } else {
-                    tracing::debug!(
-                        requested_bytes,
-                        bytes_in_flight,
-                        max_bytes_in_flight,
-                        active_waiters,
-                        waited_ms,
-                        "streaming byte budget still parked waiting for capacity"
-                    );
-                }
-            }
+            state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -11295,10 +10601,6 @@ impl StreamingByteLimiter {
         self.max_bytes_in_flight.load(Ordering::Acquire)
     }
 
-    fn active_waiter_count(&self) -> usize {
-        self.active_waiter_count.load(Ordering::Relaxed)
-    }
-
     fn close(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
@@ -11331,7 +10633,6 @@ impl LexicalRebuildReservationOrder {
 
     fn wait_for_turn(&self, sequence: u64) -> Result<()> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let wait_started = Instant::now();
         loop {
             if state.closed {
                 return Err(anyhow::anyhow!(
@@ -11349,40 +10650,8 @@ impl LexicalRebuildReservationOrder {
             if sequence == state.next_sequence {
                 return Ok(());
             }
-            // #288: bounded wait so a parked pipeline periodically logs the
-            // blocked predicate instead of vanishing into an unbounded
-            // condvar park. Pure observability — the loop always re-arms.
-            let (next_state, timeout_result) = self
-                .cv
-                .wait_timeout(state, LEXICAL_PIPELINE_BLOCKED_WAIT_LOG_INTERVAL)
-                .unwrap_or_else(|e| e.into_inner());
-            state = next_state;
-            if timeout_result.timed_out() {
-                let waited_ms = wait_started.elapsed().as_millis() as u64;
-                if lexical_pipeline_trace_enabled() {
-                    tracing::info!(
-                        sequence,
-                        holds_turn = state.next_sequence,
-                        waited_ms,
-                        "CASS_PIPELINE_TRACE lexical rebuild page still parked waiting for ordered reservation turn"
-                    );
-                } else {
-                    tracing::debug!(
-                        sequence,
-                        holds_turn = state.next_sequence,
-                        waited_ms,
-                        "lexical rebuild page still parked waiting for ordered reservation turn"
-                    );
-                }
-            }
+            state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
         }
-    }
-
-    fn next_sequence(&self) -> u64 {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .next_sequence
     }
 
     fn finish_turn(&self, sequence: u64) {
@@ -11403,32 +10672,20 @@ impl LexicalRebuildReservationOrder {
 fn acquire_ordered_lexical_rebuild_page_budget(
     reservation_order: &LexicalRebuildReservationOrder,
     flow_limiter: &StreamingByteLimiter,
-    producer_telemetry: &LexicalRebuildProducerTelemetry,
     sequence: u64,
     page_message_bytes: usize,
 ) -> Result<(usize, Duration, bool)> {
-    producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::WaitingTurn);
-    producer_telemetry.record_reservation_next_sequence(reservation_order.next_sequence());
-    let turn = reservation_order.wait_for_turn(sequence);
-    producer_telemetry.record_reservation_next_sequence(reservation_order.next_sequence());
-    if let Err(err) = turn {
-        producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::Idle);
-        return Err(err);
-    }
-    producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::WaitingBudget);
-    let acquired = match flow_limiter.acquire_with_wait(page_message_bytes) {
+    reservation_order.wait_for_turn(sequence)?;
+    match flow_limiter.acquire_with_wait(page_message_bytes) {
         Ok(acquired) => {
             reservation_order.finish_turn(sequence);
-            producer_telemetry.record_reservation_next_sequence(reservation_order.next_sequence());
             Ok(acquired)
         }
         Err(err) => {
             reservation_order.close();
             Err(err)
         }
-    };
-    producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::Idle);
-    acquired
+    }
 }
 
 fn conversation_batch_footprint(conv: &NormalizedConversation) -> (usize, usize) {
@@ -11728,7 +10985,7 @@ fn spawn_connector_producer(
                 .cloned()
                 .map(ScanRoot::local)
                 .collect();
-            let mut ingest_diagnostics = capture_connector_sources_before_parse(
+            capture_connector_sources_before_parse(
                 conn.as_ref(),
                 &ctx,
                 &config.data_dir,
@@ -11745,10 +11002,6 @@ fn spawn_connector_producer(
                 ) {
                     return Ok(());
                 }
-                if should_skip_subagent_source(&conversation.source_path) {
-                    return Ok(());
-                }
-                ingest_diagnostics.observe_conversation(&mut conversation);
                 prepare_conversation_for_ingest(
                     &config.data_dir,
                     name,
@@ -11756,13 +11009,6 @@ fn spawn_connector_producer(
                     None,
                     &mut conversation,
                 );
-                // #332: each parsed conversation is live work even while the
-                // batch sender buffers it below publication thresholds — this
-                // tick keeps the stall watchdog from firing during a long
-                // parse of a large source artifact.
-                if let Some(p) = &config.progress {
-                    p.tick_activity();
-                }
                 batch_sender.push(conversation)
             }) {
                 Ok(()) => {
@@ -11796,7 +11042,6 @@ fn spawn_connector_producer(
                         return;
                     }
                     scan_succeeded = false;
-                    ingest_diagnostics.observe_scan_error(&ctx.data_dir, e.to_string());
                     tracing::warn!(connector = name, "local scan failed: {}", e);
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
@@ -11804,7 +11049,6 @@ fn spawn_connector_producer(
                     });
                 }
             }
-            record_connector_ingest_report(config.progress.as_ref(), ingest_diagnostics.finish());
         }
 
         // Scan explicitly configured additional roots. These may be true remote
@@ -11831,7 +11075,7 @@ fn spawn_connector_producer(
             );
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
-            let mut ingest_diagnostics = capture_connector_sources_before_parse(
+            capture_connector_sources_before_parse(
                 conn.as_ref(),
                 &ctx,
                 &config.data_dir,
@@ -11848,10 +11092,6 @@ fn spawn_connector_producer(
                 ) {
                     return Ok(());
                 }
-                if should_skip_subagent_source(&conversation.source_path) {
-                    return Ok(());
-                }
-                ingest_diagnostics.observe_conversation(&mut conversation);
                 prepare_conversation_for_ingest(
                     &config.data_dir,
                     name,
@@ -11868,11 +11108,6 @@ fn spawn_connector_producer(
                     batch_sender.mark_next_batch_discovered();
                 }
 
-                // #332: parsed-conversation liveness tick (see the local-scan
-                // callback above).
-                if let Some(p) = &config.progress {
-                    p.tick_activity();
-                }
                 batch_sender.push(conversation)
             }) {
                 Ok(()) => {
@@ -11920,7 +11155,6 @@ fn spawn_connector_producer(
                         return;
                     }
                     scan_succeeded = false;
-                    ingest_diagnostics.observe_scan_error(&root.path, e.to_string());
                     tracing::warn!(
                         connector = name,
                         root = %root.path.display(),
@@ -11932,7 +11166,6 @@ fn spawn_connector_producer(
                     });
                 }
             }
-            record_connector_ingest_report(config.progress.as_ref(), ingest_diagnostics.finish());
         }
 
         let scan_ms = scan_start.elapsed().as_millis() as u64;
@@ -12130,10 +11363,6 @@ fn run_streaming_consumer(
                         p.phase.store(2, Ordering::Relaxed); // Indexing
                         p.total.store(0, Ordering::Relaxed); // Reset - will accumulate as batches arrive
                         p.current.store(0, Ordering::Relaxed);
-                        // #332: this total is "discovered so far", not a
-                        // stable denominator — flag it so ETA is suppressed
-                        // instead of regressing as discovery expands it.
-                        p.total_is_final.store(false, Ordering::Relaxed);
                     }
                     switched_to_indexing = true;
                 }
@@ -12141,9 +11370,6 @@ fn run_streaming_consumer(
                 // Update progress total (we learn about sizes as batches arrive)
                 if let Some(p) = progress {
                     p.total.fetch_add(combined_batch_size, Ordering::Relaxed);
-                    // #332: a received batch is proof of live work even before
-                    // it is persisted and `current` advances.
-                    p.tick_activity();
                 }
 
                 // Track discovered agent names
@@ -12184,7 +11410,6 @@ fn run_streaming_consumer(
                                 }
                                 if let Some(p) = progress {
                                     p.total.fetch_add(extra_size, Ordering::Relaxed);
-                                    p.tick_activity();
                                 }
                                 combined_conversations.extend(extra_convs);
                                 combined_message_count += extra_msg_count;
@@ -12522,8 +11747,6 @@ fn run_streaming_index_with_connector_factories(
         p.phase.store(1, Ordering::Relaxed); // Scanning
         p.total.store(num_connectors, Ordering::Relaxed);
         p.current.store(0, Ordering::Relaxed);
-        // The connector count is a stable denominator for the scan phase.
-        p.total_is_final.store(true, Ordering::Relaxed);
         p.discovered_agents.store(0, Ordering::Relaxed);
         if let Ok(mut names) = p.discovered_agent_names.lock() {
             names.clear();
@@ -12676,8 +11899,6 @@ fn run_batch_index_with_connector_factories(
         // Track connector scan progress during discovery.
         p.total.store(connector_factories.len(), Ordering::Relaxed);
         p.current.store(0, Ordering::Relaxed);
-        // The connector count is a stable denominator for the scan phase.
-        p.total_is_final.store(true, Ordering::Relaxed);
         p.discovered_agents.store(0, Ordering::Relaxed);
         if let Ok(mut names) = p.discovered_agent_names.lock() {
             names.clear();
@@ -12745,7 +11966,7 @@ fn run_batch_index_with_connector_factories(
                         .cloned()
                         .map(ScanRoot::local)
                         .collect();
-                    let mut ingest_diagnostics = capture_connector_sources_before_parse(
+                    capture_connector_sources_before_parse(
                         conn.as_ref(),
                         &ctx,
                         &data_dir,
@@ -12764,9 +11985,6 @@ fn run_batch_index_with_connector_factories(
                                     &conv.source_path,
                                 )
                             });
-                            for conversation in &mut local_convs {
-                                ingest_diagnostics.observe_conversation(conversation);
-                            }
                             for conv in &mut local_convs {
                                 prepare_conversation_for_ingest(
                                     &data_dir,
@@ -12782,15 +12000,10 @@ fn run_batch_index_with_connector_factories(
                             // Note: agent was counted as discovered but scan failed
                             // This is acceptable as detection succeeded (agent exists)
                             scan_succeeded = false;
-                            ingest_diagnostics.observe_scan_error(&ctx.data_dir, e.to_string());
                             scan_errors.push(e.to_string());
                             tracing::warn!("scan failed for {}: {}", name, e);
                         }
                     }
-                    record_connector_ingest_report(
-                        progress_ref,
-                        ingest_diagnostics.finish(),
-                    );
                 }
 
                 if !additional_scan_roots.is_empty() {
@@ -12814,7 +12027,7 @@ fn run_batch_index_with_connector_factories(
                             vec![root.clone()],
                             root_since_ts,
                         );
-                        let mut ingest_diagnostics = capture_connector_sources_before_parse(
+                        capture_connector_sources_before_parse(
                             conn.as_ref(),
                             &ctx,
                             &data_dir,
@@ -12832,9 +12045,6 @@ fn run_batch_index_with_connector_factories(
                                         &conv.source_path,
                                     )
                                 });
-                                for conversation in &mut remote_convs {
-                                    ingest_diagnostics.observe_conversation(conversation);
-                                }
                                 for conv in &mut remote_convs {
                                     prepare_conversation_for_ingest(
                                         &data_dir,
@@ -12848,8 +12058,6 @@ fn run_batch_index_with_connector_factories(
                             }
                             Err(e) => {
                                 scan_succeeded = false;
-                                ingest_diagnostics
-                                .observe_scan_error(&root.path, e.to_string());
                                 scan_errors.push(format!(
                                     "remote scan failed for {}: {}",
                                     root.path.display(),
@@ -12862,10 +12070,6 @@ fn run_batch_index_with_connector_factories(
                                 );
                             }
                         }
-                        record_connector_ingest_report(
-                            progress_ref,
-                            ingest_diagnostics.finish(),
-                        );
                     }
                 }
 
@@ -12959,8 +12163,6 @@ fn run_batch_index_with_connector_factories(
         p.phase.store(2, Ordering::Relaxed); // Indexing
         p.total.store(total_conversations, Ordering::Relaxed);
         p.current.store(0, Ordering::Relaxed);
-        // The pre-counted conversation total is a stable denominator.
-        p.total_is_final.store(true, Ordering::Relaxed);
     }
 
     let index_start = std::time::Instant::now();
@@ -13125,30 +12327,14 @@ pub fn run_index(
     } else {
         SearchMaintenanceMode::Index
     };
-    let job_kind = if opts.semantic || opts.build_hnsw {
-        SearchMaintenanceJobKind::SemanticRebuild
-    } else {
-        maintenance_job_kind_for_mode(initial_lock_mode)
-    };
-    let mut index_run_lock = acquire_index_run_lock_with_job_kind(
-        &opts.data_dir,
-        &opts.db_path,
-        initial_lock_mode,
-        job_kind,
-    )?;
+    let mut index_run_lock =
+        acquire_index_run_lock(&opts.data_dir, &opts.db_path, initial_lock_mode)?;
     let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
         opts.data_dir.clone(),
         index_run_lock_heartbeat_interval(),
         Arc::clone(&index_run_lock.metadata_write_lock),
         Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
     );
-    // GH#324: reclaim staging debris stranded by previous hard-crashed runs
-    // now that we hold the exclusive index-run lock, and BEFORE the
-    // disk-headroom preflight below — otherwise a crash/restart loop's own
-    // debris trips the headroom guard and wedges indexing hard-down on a
-    // full disk it could have freed itself.
-    staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(&opts.data_dir, SystemTime::now())
-        .log();
     // F4: clone the atomic so deeply nested batch loops can bump progress
     // without holding a `&mut IndexRunLockGuard`. The clone is cheap
     // (single Arc bump) and lives only inside this function.
@@ -13346,19 +12532,6 @@ pub fn run_index(
     complete_preflight_phase!();
     let defer_checkpoints = !opts.watch;
     let mut reopened_after_writable_preflight = false;
-
-    // GH #344: an interrupted fallback-FTS rebuild can leave a queryable but
-    // partial contentless shadow. Inserting one targeted conversation into
-    // that state makes frankensqlite repeatedly re-encode the large partial
-    // table before progress reaches 1/1. Detect exact parity before even the
-    // writable no-op below and fail with the resumable doctor repair command.
-    if let Some(reason) = targeted_watch_once_fts_parity_problem(&storage, &opts)? {
-        storage.close_best_effort_in_place();
-        return Err(targeted_watch_once_unhealthy_fts_error(
-            &opts.db_path,
-            &reason,
-        ));
-    }
 
     preflight_phase!("watch_startup:writable_preflight");
     // CASS #162 item 2: Verify the connection is writable early, before the
@@ -13803,24 +12976,19 @@ pub fn run_index(
     complete_preflight_phase!();
     let mut needs_rebuild =
         should_force_authoritative_rebuild(canonical_storage_rebuilt, tantivy_requires_rebuild);
-    // #289: pass the real `tantivy_requires_rebuild` instead of hardcoding
-    // `authoritative_rebuild_required: true`. The hardcoded value made every
-    // plain populated incremental over the automatic-repair DB-size cap
-    // (default 1 GiB) report a deferred repair probe even when no
-    // authoritative rebuild was required, which suppressed the end-of-run
-    // lexical checkpoint refresh — including the cheap metadata-only
-    // bootstrap that rewrites a missing `.lexical-rebuild-state.json` — so a
-    // lost checkpoint could never converge on large archives.
     let large_incremental_authoritative_lexical_repair_probe_deferred =
         should_defer_incremental_authoritative_lexical_repair(
             &opts,
             canonical_storage_rebuilt,
             initial_canonical_sessions_before_salvage,
-            tantivy_requires_rebuild,
+            true,
             observed_tantivy_docs,
         );
-    let deferred_incremental_authoritative_lexical_repair =
-        large_incremental_authoritative_lexical_repair_probe_deferred;
+    let deferred_incremental_authoritative_lexical_repair = if tantivy_requires_rebuild {
+        large_incremental_authoritative_lexical_repair_probe_deferred
+    } else {
+        None
+    };
     if let Some(deferred) = &deferred_incremental_authoritative_lexical_repair {
         tracing::warn!(
             db_path = %opts.db_path.display(),
@@ -13841,15 +13009,43 @@ pub fn run_index(
         p.is_rebuilding.store(true, Ordering::Relaxed);
     }
 
-    // Keep the published lexical generation live until the authoritative
-    // rebuild has produced and validated its replacement. Fresh non-empty
-    // rebuilds already use `publish_staged_lexical_index`, whose atomic swap
-    // retains the prior generation only at commit time and rolls it back if
-    // publication fails. Eagerly renaming the live tree here created a much
-    // larger failure window: a killed or failed semantic run could strand the
-    // old generation at `*.bak` and leave lexical search empty or partial.
-    // The rebuild implementation below remains responsible for clearing only
-    // an unpublished/incomplete target when staged publication is impossible.
+    if needs_rebuild && !resume_lexical_rebuild {
+        // Back up the old index directory before wiping it so that users don't
+        // silently lose potentially hundreds of MB of indexed data when the
+        // schema hash changes (CASS #162).
+        if index_path.exists() {
+            // Find a unique backup name: index/v7.bak, index/v7.bak.1, ...
+            let mut backup_path = index_path.with_extension("bak");
+            let mut attempt = 1u32;
+            while backup_path.exists() {
+                backup_path = index_path.with_extension(format!("bak.{attempt}"));
+                attempt += 1;
+            }
+            match std::fs::rename(&index_path, &backup_path) {
+                Ok(()) => {
+                    tracing::warn!(
+                        old_index = %index_path.display(),
+                        backup = %backup_path.display(),
+                        canonical_storage_rebuilt,
+                        tantivy_requires_rebuild,
+                        "backed up existing Tantivy index before rebuild \
+                         (canonical db or index metadata changed); remove the backup \
+                         manually once you have confirmed the new index is healthy"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        old_index = %index_path.display(),
+                        backup = %backup_path.display(),
+                        error = %err,
+                        "failed to back up existing Tantivy index; \
+                         falling back to removal without backup"
+                    );
+                    let _ = std::fs::remove_dir_all(&index_path);
+                }
+            }
+        }
+    }
     // Record scan start time before scanning
     let scan_start_ts = FrankenStorage::now_millis();
 
@@ -14045,10 +13241,6 @@ pub fn run_index(
             targeted_watch_once_only,
             salvage_messages_imported: historical_salvage.messages_imported,
             canonical_messages: 0,
-            // Placeholder: the noise-adjusted expectation is a per-conversation
-            // content scan, computed lazily below only when the live index looks
-            // sparse against the cheap raw message-count upper bound (cass#317).
-            expected_lexical_docs: 0,
             tantivy_requires_rebuild,
             observed_tantivy_docs,
             // Placeholder: validating the published index opens the DB read-only
@@ -14074,31 +13266,16 @@ pub fn run_index(
         {
             preflight_phase!("watch_startup:count_total_messages");
             let canonical_messages = count_total_messages_exact(&storage)?;
-            // cass#317: the true sparseness threshold is the noise-adjusted
-            // expected doc count (reachable messages the sink actually indexes),
-            // not the raw `canonical_messages`. Only pay for that per-conversation
-            // content scan when the index looks sparse against the cheap raw upper
-            // bound — if `observed >= canonical_messages` it certainly covers the
-            // smaller noise-adjusted expectation, so no repair and no scan needed.
-            // Computed under the same `count_total_messages` preflight phase so
-            // the scan stays watchdog-covered without a new taxonomy sub-phase.
-            let expected_lexical_docs =
-                if observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages) {
-                    expected_live_lexical_doc_count(&storage)?
-                } else {
-                    canonical_messages
-                };
             complete_preflight_phase!();
             // #248 (coding_agent_session_search-raoug): only pay for the
             // published-index validation (a read-only DB open + fingerprint COUNT
-            // scans) when the live index actually looks sparse — i.e. below the
-            // noise-adjusted expectation, when it would otherwise trigger a
-            // from-scratch rebuild. A genuinely missing/invalid index rebuilds
-            // regardless (handled in
+            // scans) when the live index actually looks sparse — i.e. when it would
+            // otherwise trigger a from-scratch rebuild. A genuinely missing/invalid
+            // index rebuilds regardless (handled in
             // choose_incremental_canonical_lexical_repair_plan via
             // tantivy_requires_rebuild), so skip the check then.
             let published_index_validated_for_current_data = !tantivy_requires_rebuild
-                && observed_tantivy_docs.is_some_and(|docs| docs < expected_lexical_docs)
+                && observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages)
                 && !preflight_skip("watch_startup:published_index_validate")
                 && {
                     preflight_phase!("watch_startup:published_index_validate");
@@ -14112,7 +13289,6 @@ pub fn run_index(
             choose_incremental_canonical_lexical_repair_plan(
                 IncrementalCanonicalLexicalRepairContext {
                     canonical_messages,
-                    expected_lexical_docs,
                     published_index_validated_for_current_data,
                     ..repair_context
                 },
@@ -14579,42 +13755,9 @@ pub fn run_index(
                  incremental watch callback will handle new messages"
             );
         } else {
-            // The lexical pass may leave the shared progress atomics in phase
-            // 2 even though its last batch is complete. A semantic-aware stall
-            // watchdog still treats phase 2 as a genuine lexical wedge and can
-            // otherwise abort a healthy multi-minute embed with exit 70. Park
-            // the completed lexical pipeline in the quiescent phase-0 state
-            // before semantic work starts (the same invariant used by targeted
-            // semantic watch-once).
-            prepare_progress_for_semantic_build(opts.progress.as_ref());
-            let mut set_semantic_phase = |phase: &'static str| {
-                if let Err(err) = index_run_lock.set_phase(initial_lock_mode, phase) {
-                    tracing::debug!(
-                        sub_phase = phase,
-                        error = %err,
-                        "semantic index phase breadcrumb write failed (continuing)"
-                    );
-                }
-            };
-            set_semantic_phase("semantic:initialize");
-            set_semantic_progress_phase(
-                opts.progress.as_ref(),
-                &progress_bump,
-                INDEX_PHASE_SEMANTIC_INITIALIZE,
-                0,
-                0,
-            );
             tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
 
             let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
-            set_semantic_phase("semantic:replay");
-            set_semantic_progress_phase(
-                opts.progress.as_ref(),
-                &progress_bump,
-                INDEX_PHASE_SEMANTIC_REPLAY,
-                0,
-                0,
-            );
             let mut semantic_read_storage = FrankenStorage::open_readonly(&opts.db_path)
                 .with_context(|| {
                     format!(
@@ -14623,17 +13766,8 @@ pub fn run_index(
                     )
                 })?;
 
-            let mut embedding_inputs = packet_embedding_inputs_from_storage_with_progress(
-                &semantic_read_storage,
-                |current, total| {
-                    update_semantic_progress(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        current,
-                        total,
-                    );
-                },
-            )?;
+            let mut embedding_inputs =
+                packet_embedding_inputs_from_storage(&semantic_read_storage)?;
             tracing::info!(
                 message_count = embedding_inputs.len(),
                 packet_driven = true,
@@ -14645,25 +13779,7 @@ pub fn run_index(
             });
 
             // Generate embeddings
-            set_semantic_phase("semantic:embedding");
-            set_semantic_progress_phase(
-                opts.progress.as_ref(),
-                &progress_bump,
-                INDEX_PHASE_SEMANTIC_EMBEDDING,
-                0,
-                embedding_inputs.len(),
-            );
-            let embedded_messages = semantic_indexer.embed_messages_with_progress(
-                &embedding_inputs,
-                |current, total| {
-                    update_semantic_progress(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        current,
-                        total,
-                    );
-                },
-            )?;
+            let embedded_messages = semantic_indexer.embed_messages(&embedding_inputs)?;
             tracing::info!(
                 embedded_count = embedded_messages.len(),
                 "generated embeddings"
@@ -14672,26 +13788,8 @@ pub fn run_index(
             if !embedded_messages.is_empty() {
                 let embedded_doc_count = embedded_messages.len();
                 let build_started_at_ms = semantic_indexing_now_ms();
-                set_semantic_phase("semantic:vector_publish");
-                set_semantic_progress_phase(
-                    opts.progress.as_ref(),
-                    &progress_bump,
-                    INDEX_PHASE_SEMANTIC_VECTOR_PUBLISH,
-                    0,
-                    embedded_doc_count,
-                );
-                let vector_index = semantic_indexer.build_and_save_index_with_progress(
-                    embedded_messages,
-                    &opts.data_dir,
-                    |current| {
-                        update_semantic_progress(
-                            opts.progress.as_ref(),
-                            &progress_bump,
-                            current,
-                            embedded_doc_count,
-                        );
-                    },
-                )?;
+                let vector_index =
+                    semantic_indexer.build_and_save_index(embedded_messages, &opts.data_dir)?;
                 let index_path = crate::search::vector_index::vector_index_path(
                     &opts.data_dir,
                     semantic_indexer.embedder_id(),
@@ -14704,27 +13802,12 @@ pub fn run_index(
 
                 // Build HNSW index for approximate nearest neighbor search (if enabled)
                 if opts.build_hnsw {
-                    set_semantic_phase("semantic:hnsw");
-                    let vector_count = vector_index.record_count();
-                    set_semantic_progress_phase(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        INDEX_PHASE_SEMANTIC_HNSW,
-                        0,
-                        vector_count,
-                    );
                     let hnsw_path = semantic_indexer.build_hnsw_index(
                         &vector_index,
                         &opts.data_dir,
                         None, // Use default M
                         None, // Use default ef_construction
                     )?;
-                    update_semantic_progress(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        vector_count,
-                        vector_count,
-                    );
                     tracing::info!(
                         path = %hnsw_path.display(),
                         embedder = semantic_indexer.embedder_id(),
@@ -14738,14 +13821,6 @@ pub fn run_index(
                 // semantic_manifest.json pointed at stale metadata, so
                 // status reports `semantic: stale / available: false`
                 // even though semantic search works (issue #203).
-                set_semantic_phase("semantic:manifest");
-                set_semantic_progress_phase(
-                    opts.progress.as_ref(),
-                    &progress_bump,
-                    INDEX_PHASE_SEMANTIC_MANIFEST,
-                    0,
-                    1,
-                );
                 if let Err(err) = publish_direct_semantic_artifact(
                     &semantic_read_storage,
                     &opts.data_dir,
@@ -14760,23 +13835,13 @@ pub fn run_index(
                         error = %err,
                         "direct semantic artifact published to disk but \
                          manifest update failed; cass status may report \
-                        stale/unavailable until next backfill cycle"
+                         stale/unavailable until next backfill cycle"
                     );
-                } else {
-                    update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
                 }
             }
+            semantic_read_storage.close_best_effort_in_place();
 
             // Set watermark so incremental watch-mode embedding only sees new messages
-            set_semantic_phase("semantic:finalize");
-            set_semantic_progress_phase(
-                opts.progress.as_ref(),
-                &progress_bump,
-                INDEX_PHASE_SEMANTIC_FINALIZE,
-                0,
-                1,
-            );
-            semantic_read_storage.close_best_effort_in_place();
             if let Some(max_id) = embedding_inputs.iter().map(|e| e.message_id).max() {
                 persist::with_ephemeral_writer(
                     &storage,
@@ -14788,7 +13853,6 @@ pub fn run_index(
                     },
                 )?;
             }
-            update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
         }
     }
 
@@ -14866,7 +13930,6 @@ pub fn run_index(
         &initial_matching_lexical_checkpoint,
         exact_total_counts,
         scan_canonical_mutations,
-        lexical_rebuild_state_path(&index_path).is_file(),
     ) {
         tracing::info!(
             db_path = %opts.db_path.display(),
@@ -14925,13 +13988,6 @@ pub fn run_index(
                     db_path = %opts.db_path.display(),
                     error = %detail,
                     "skipping derived fallback FTS repair because frankensqlite cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical SQLite rows and Tantivy remain authoritative"
-                );
-            }
-            FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail } => {
-                tracing::warn!(
-                    db_path = %opts.db_path.display(),
-                    error = %detail,
-                    "derived fallback FTS remains corrupt after its best-effort repair; preserving the successful canonical SQLite and Tantivy build. Run 'cass doctor check --json' before an explicit fallback-FTS rebuild"
                 );
             }
             FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
@@ -15143,25 +14199,15 @@ pub fn run_index(
 
                     // Only attempt segment merge when the scan actually
                     // ingested something. Empty watch scans must not wake the
-                    // optimizer (#194), and targeted semantic watch-once must
-                    // proceed directly to reconciliation rather than spending
-                    // hours compacting an unrelated large lexical index (#336).
-                    if should_optimize_tantivy_after_watch_once_ingest(
-                        indexed,
-                        targeted_semantic_watch_once,
-                    ) && let Ok(mut guard) = t_index.lock()
+                    // optimizer. See issue #194.
+                    if indexed > 0
+                        && let Ok(mut guard) = t_index.lock()
                         && let Some(t_index) = guard.as_mut()
                         && let Err(e) = t_index.optimize_if_idle()
                     {
                         tracing::warn!(error = %e, "segment merge failed during watch");
                     }
                     if targeted_semantic_watch_once {
-                        // The lexical ingest is complete. Park its progress
-                        // atomics in the semantic-aware phase-0 state before
-                        // scanning/copying a potentially million-record FSVI.
-                        // Otherwise the generic phase-2 stall watchdog can
-                        // abort a healthy targeted semantic repair after 300 s.
-                        prepare_progress_for_semantic_build(opts_clone.progress.as_ref());
                         let stats = run_targeted_semantic_watch_once_publish(
                             &embedder_id,
                             &data_dir_for_semantic,
@@ -15303,20 +14349,6 @@ pub fn run_index(
         return Ok(());
     }
 
-    // #319/#321: `close_storage_after_index` runs the final WAL checkpoint of
-    // the deferred bulk-ingest WAL — a synchronous, `!Send` frankensqlite
-    // `conn.close()` + `wal_checkpoint(TRUNCATE)` that executes on THIS thread
-    // and cannot report progress. On a large corpus (the report: ~1.1 GB /
-    // ~290k-frame WAL) it legitimately takes minutes, especially on macOS.
-    // Signal the stall watchdog that we have entered that finalize window so it
-    // does not misread the quiescent, phase-0, current==total state as a #297
-    // finalize wedge and kill the process (exit 70) mid-checkpoint — which would
-    // strand the un-truncated WAL and leave the DB malformed (#296/#321). The
-    // watchdog still bounds this window (see `index_finalize_abort_threshold`),
-    // so a genuinely stuck finalize is still aborted.
-    if let Some(progress) = opts.progress.as_ref() {
-        progress.finalizing.store(true, Ordering::Relaxed);
-    }
     close_storage_after_index(storage, &opts.db_path, "index run")
 }
 
@@ -15328,13 +14360,7 @@ fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &
             db_path.display()
         )
     })?;
-    // The storage handle is already closed here, so the checkpoint should not be
-    // blocked; a `Blocked` outcome (e.g. another cass process holds a reader) is
-    // already surfaced via the WARN inside `query_final_wal_checkpoint`. Preserve
-    // the historically-lenient contract of this normal-close path (Ok even if the
-    // checkpoint could not fully truncate) — the abort path (#321) is the one that
-    // must branch on the outcome.
-    run_final_wal_checkpoint(db_path, context).map(|_outcome| ())
+    run_final_wal_checkpoint(db_path, context)
 }
 
 fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path, context: &str) {
@@ -15351,113 +14377,7 @@ fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path
     }
 }
 
-/// Result of a `PRAGMA wal_checkpoint(TRUNCATE)` issued during index finalize
-/// or the bounded stall-abort path.
-///
-/// The distinction is load-bearing for #321: a checkpoint that SQLite reports
-/// as `busy=1` (or that backfilled fewer frames than the WAL held) did **not**
-/// truncate the WAL, so the canonical DB is still a replay dependency on a
-/// large `*.db-wal` and stock `PRAGMA integrity_check` will fail. Callers must
-/// not report such a checkpoint as success.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinalWalCheckpointOutcome {
-    /// The WAL was fully checkpointed and truncated (`busy == 0` and every
-    /// logged frame was backfilled).
-    Completed,
-    /// The checkpoint was blocked by active readers/writers (`busy != 0`) or
-    /// left un-backfilled frames. The canonical WAL was NOT truncated.
-    Blocked {
-        busy: i64,
-        log_frames: i64,
-        checkpointed_frames: i64,
-    },
-}
-
-/// Classify a `wal_checkpoint` status row `(busy, log_frames, checkpointed)`.
-///
-/// A checkpoint only counts as [`FinalWalCheckpointOutcome::Completed`] when
-/// SQLite reports `busy == 0` AND every frame in the WAL log was backfilled
-/// (`checkpointed_frames >= log_frames`). Anything else — the #321 case of
-/// `busy=1, log_frames=289842, checkpointed_frames=0` being the canonical
-/// example — is [`FinalWalCheckpointOutcome::Blocked`] and must never be logged
-/// or reported as a successful checkpoint.
-fn classify_final_wal_checkpoint(
-    busy: i64,
-    log_frames: i64,
-    checkpointed_frames: i64,
-) -> FinalWalCheckpointOutcome {
-    let left_frames_uncheckpointed = log_frames > 0 && checkpointed_frames < log_frames;
-    if busy > 0 || left_frames_uncheckpointed {
-        FinalWalCheckpointOutcome::Blocked {
-            busy,
-            log_frames,
-            checkpointed_frames,
-        }
-    } else {
-        FinalWalCheckpointOutcome::Completed
-    }
-}
-
-/// Best-effort canonical-WAL checkpoint before a bounded abort/exit (#296).
-///
-/// The `cass index` stall-abort path exits via `std::process::exit(70)`, which
-/// skips destructors — so the canonical WAL is never checkpointed and a killed
-/// run leaves a multi-GB orphaned `*.db-wal` behind a tiny `*.db` (the #296
-/// symptom). This opens a *fresh, independent* frankensqlite connection to the
-/// canonical DB file (the wedged storage handle's workers are parked, but the
-/// file itself is checkpointable through a new connection) and runs
-/// `wal_checkpoint(TRUNCATE)` so the post-abort DB is recoverable by stock
-/// SQLite. Everything is best-effort: any failure is logged and swallowed so
-/// the abort still proceeds. Stale index-run locks are already reaped on the
-/// next startup by `read_search_maintenance_snapshot` (flock-based), so this
-/// focuses on the WAL.
-///
-/// #321: the abort races the still-running `run_index` thread, which holds the
-/// canonical storage handle open while it performs its own slow finalize
-/// checkpoint of the (deferred, multi-GB) WAL. That open handle makes this
-/// fresh-connection checkpoint report `busy=1 / checkpointed_frames=0` — a
-/// no-op. We must NOT log success in that case: the WAL is left un-truncated
-/// and stock SQLite integrity checks fail. Report the truth instead so the
-/// operator (and the next startup's recovery) know the WAL is still stranded.
-pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
-    let db_path = data_dir.join("agent_search.db");
-    if !db_path.exists() {
-        return;
-    }
-    match run_final_wal_checkpoint(&db_path, "stall abort") {
-        Ok(FinalWalCheckpointOutcome::Completed) => {
-            tracing::info!(
-                db_path = %db_path.display(),
-                "checkpointed canonical WAL before stall abort (#296)"
-            );
-        }
-        Ok(FinalWalCheckpointOutcome::Blocked {
-            busy,
-            log_frames,
-            checkpointed_frames,
-        }) => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                busy,
-                log_frames,
-                checkpointed_frames,
-                "WAL checkpoint before stall abort was blocked (busy or frames left \
-                 un-truncated); the canonical DB is left depending on an un-checkpointed \
-                 WAL and stock SQLite integrity checks will fail until the next clean run \
-                 checkpoints it (#296/#321)"
-            );
-        }
-        Err(err) => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "best-effort WAL checkpoint before stall abort failed; the WAL may remain uncheckpointed until the next clean run"
-            );
-        }
-    }
-}
-
-fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalCheckpointOutcome> {
+fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<()> {
     // Run this after closing the indexing storage handle: frankensqlite flushes
     // retained autocommit writes during close, and TRUNCATE avoids leaving the
     // completed bulk-ingest WAL for the next opener to replay.
@@ -15476,16 +14396,16 @@ fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalChe
             db_path.display()
         )
     });
-    let outcome = checkpoint_result?;
+    checkpoint_result?;
     close_result?;
-    Ok(outcome)
+    Ok(())
 }
 
 fn query_final_wal_checkpoint(
     conn: &frankensqlite::Connection,
     db_path: &Path,
     context: &str,
-) -> Result<FinalWalCheckpointOutcome> {
+) -> Result<()> {
     let rows = conn
         .query("PRAGMA wal_checkpoint(TRUNCATE);")
         .with_context(|| {
@@ -15510,32 +14430,28 @@ fn query_final_wal_checkpoint(
         .get_typed(2)
         .with_context(|| "reading final WAL checkpoint backfilled frame count")?;
 
-    let outcome = classify_final_wal_checkpoint(busy, log_frames, checkpointed_frames);
     if log_frames >= 0 {
-        match outcome {
-            FinalWalCheckpointOutcome::Blocked { .. } => {
-                tracing::warn!(
-                    db_path = %db_path.display(),
-                    context,
-                    busy,
-                    log_frames,
-                    checkpointed_frames,
-                    "final WAL checkpoint was blocked by active readers or left frames un-truncated"
-                );
-            }
-            FinalWalCheckpointOutcome::Completed => {
-                tracing::info!(
-                    db_path = %db_path.display(),
-                    context,
-                    log_frames,
-                    checkpointed_frames,
-                    "final WAL checkpoint completed after index run"
-                );
-            }
+        if busy > 0 {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                context,
+                busy,
+                log_frames,
+                checkpointed_frames,
+                "final WAL checkpoint was blocked by active readers"
+            );
+        } else {
+            tracing::info!(
+                db_path = %db_path.display(),
+                context,
+                log_frames,
+                checkpointed_frames,
+                "final WAL checkpoint completed after index run"
+            );
         }
     }
 
-    Ok(outcome)
+    Ok(())
 }
 
 fn restore_watch_steady_state_checkpoint_policy(storage: &FrankenStorage, watch_enabled: bool) {
@@ -15611,7 +14527,6 @@ struct SemanticContentFingerprint {
 enum TargetedSemanticWatchOnceMode {
     RebuildAll,
     AppendToExisting,
-    ReconcileExisting,
     AlreadyCovered,
 }
 
@@ -15625,74 +14540,7 @@ struct TargetedSemanticWatchOnceSelection {
     total_conversations: u64,
     current_db_fingerprint: String,
     manifest_before_db_fingerprint: Option<String>,
-    current_doc_ids: Option<HashSet<String>>,
     reason: &'static str,
-}
-
-#[derive(Debug)]
-struct CanonicalSemanticDocuments {
-    documents: Vec<(String, EmbeddingInput)>,
-    doc_ids: HashSet<String>,
-}
-
-impl CanonicalSemanticDocuments {
-    fn from_storage(storage: &FrankenStorage) -> Result<Self> {
-        Self::from_storage_missing_from(storage, None)
-    }
-
-    fn from_storage_missing_from(
-        storage: &FrankenStorage,
-        existing_doc_ids: Option<&HashSet<String>>,
-    ) -> Result<Self> {
-        let mut documents = Vec::new();
-        let mut doc_ids = HashSet::new();
-        visit_packet_embedding_inputs_from_storage(storage, |input| {
-            if is_hard_message_noise(semantic_role_name(input.role), &input.content) {
-                return Ok(());
-            }
-            let Some(doc_id) = semantic_doc_id_for_input(&input) else {
-                return Ok(());
-            };
-            if !doc_ids.insert(doc_id.clone()) {
-                anyhow::bail!(
-                    "canonical DB produced duplicate semantic document identity {doc_id}"
-                );
-            }
-            if existing_doc_ids.is_none_or(|existing| !existing.contains(&doc_id)) {
-                documents.push((doc_id, input));
-            }
-            Ok(())
-        })?;
-        Ok(Self { documents, doc_ids })
-    }
-
-    fn into_inputs(self) -> Vec<EmbeddingInput> {
-        self.documents.into_iter().map(|(_, input)| input).collect()
-    }
-}
-
-#[derive(Debug)]
-struct SemanticArtifactInventory {
-    reusable_main_doc_ids: HashSet<String>,
-    main_record_count: usize,
-    tombstone_count: usize,
-    wal_record_count: usize,
-    duplicate_live_doc_ids: HashSet<String>,
-}
-
-impl SemanticArtifactInventory {
-    fn live_record_count(&self) -> usize {
-        self.main_record_count
-            .saturating_sub(self.tombstone_count)
-            .saturating_add(self.wal_record_count)
-    }
-
-    fn is_compacted_unique_main(&self) -> bool {
-        self.tombstone_count == 0
-            && self.wal_record_count == 0
-            && self.duplicate_live_doc_ids.is_empty()
-            && self.reusable_main_doc_ids.len() == self.main_record_count
-    }
 }
 
 fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
@@ -15705,42 +14553,6 @@ fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
             .watch_once_paths
             .as_ref()
             .is_some_and(|paths| !paths.is_empty())
-}
-
-const fn should_optimize_tantivy_after_watch_once_ingest(
-    indexed_conversations: usize,
-    targeted_semantic_watch_once: bool,
-) -> bool {
-    indexed_conversations > 0 && !targeted_semantic_watch_once
-}
-
-fn prepare_progress_for_semantic_build(progress: Option<&Arc<IndexingProgress>>) {
-    reset_progress_to_idle(progress);
-}
-
-fn set_semantic_progress_phase(
-    progress: Option<&Arc<IndexingProgress>>,
-    progress_bump: &Arc<AtomicI64>,
-    phase: usize,
-    current: usize,
-    total: usize,
-) {
-    if let Some(progress) = progress {
-        progress.set_phase_progress(phase, current, total);
-    }
-    bump_index_run_lock_progress_atomic(progress_bump);
-}
-
-fn update_semantic_progress(
-    progress: Option<&Arc<IndexingProgress>>,
-    progress_bump: &Arc<AtomicI64>,
-    current: usize,
-    total: usize,
-) {
-    if let Some(progress) = progress {
-        progress.update_phase_progress(current, total);
-    }
-    bump_index_run_lock_progress_atomic(progress_bump);
 }
 
 fn parse_semantic_content_fingerprint(raw: &str) -> Option<SemanticContentFingerprint> {
@@ -15822,48 +14634,15 @@ fn validate_semantic_watch_once_artifact(
             index_path.display()
         )
     })?;
-    drop(index);
-    Ok(index_path)
-}
-
-fn inspect_semantic_artifact(index_path: &Path) -> Result<SemanticArtifactInventory> {
-    let index = FsVectorIndex::open(index_path).map_err(|err| {
-        anyhow::anyhow!(
-            "semantic watch-once cannot inventory vector artifact {}: {err}",
-            index_path.display()
-        )
-    })?;
-    let main_record_count = index.record_count();
-    let wal_record_count = index.wal_record_count();
-    let mut tombstone_count = 0usize;
-    let mut duplicate_live_doc_ids = HashSet::new();
-    let mut reusable_main_doc_ids = HashSet::with_capacity(main_record_count);
-    for record_index in 0..main_record_count {
-        if index.is_deleted(record_index) {
-            tombstone_count = tombstone_count.saturating_add(1);
-            continue;
-        }
-        let doc_id = index.doc_id_at(record_index).map_err(|err| {
-            anyhow::anyhow!(
-                "semantic watch-once cannot read document {record_index} from {}: {err}",
-                index_path.display()
-            )
-        })?;
-        if duplicate_live_doc_ids.contains(doc_id) {
-            continue;
-        }
-        if !reusable_main_doc_ids.insert(doc_id.to_owned()) {
-            reusable_main_doc_ids.remove(doc_id);
-            duplicate_live_doc_ids.insert(doc_id.to_owned());
-        }
+    let observed_docs = u64::try_from(index.record_count()).unwrap_or(u64::MAX);
+    if !observed_docs.eq(&artifact.doc_count) {
+        anyhow::bail!(
+            "semantic watch-once cannot prove existing vector prefix: manifest doc_count={} but index has {} records",
+            artifact.doc_count,
+            observed_docs
+        );
     }
-    Ok(SemanticArtifactInventory {
-        reusable_main_doc_ids,
-        main_record_count,
-        tombstone_count,
-        wal_record_count,
-        duplicate_live_doc_ids,
-    })
+    Ok(index_path)
 }
 
 fn semantic_artifact_is_append_only_prefix(
@@ -15891,6 +14670,12 @@ fn semantic_artifact_is_append_only_prefix(
     let observed_prefix_conversations =
         usize::try_from(prefix_conversations.max(0)).unwrap_or(usize::MAX);
     Ok(observed_prefix_conversations.eq(&artifact_fingerprint.total_conversations))
+}
+
+fn filter_semantic_watch_once_inputs(inputs: &mut Vec<EmbeddingInput>) {
+    inputs.retain(|message| {
+        !is_hard_message_noise(semantic_role_name(message.role), &message.content)
+    });
 }
 
 fn select_targeted_semantic_watch_once_inputs(
@@ -15927,21 +14712,45 @@ fn select_targeted_semantic_watch_once_inputs(
     let manifest_before_db_fingerprint = artifact
         .as_ref()
         .map(|artifact| artifact.db_fingerprint.clone());
-    let raw_max_message_id =
-        (current_fingerprint.max_message_id > 0).then_some(current_fingerprint.max_message_id);
+
+    if let Some(artifact) = artifact.as_ref()
+        && artifact.db_fingerprint.eq(&current_db_fingerprint)
+    {
+        let index_path = validate_semantic_watch_once_artifact(data_dir, artifact, indexer, tier)?;
+        return Ok(TargetedSemanticWatchOnceSelection {
+            mode: TargetedSemanticWatchOnceMode::AlreadyCovered,
+            inputs: Vec::new(),
+            raw_max_message_id: (current_fingerprint.max_message_id > 0)
+                .then_some(current_fingerprint.max_message_id),
+            tier,
+            index_path,
+            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
+            current_db_fingerprint,
+            manifest_before_db_fingerprint,
+            reason: "semantic_artifact_already_covers_db",
+        });
+    }
 
     if pre_watch_conversations == 0 {
-        let canonical_documents = CanonicalSemanticDocuments::from_storage(storage)?;
+        let mut inputs = packet_embedding_inputs_from_storage(storage)?;
+        let raw_max_message_id = inputs
+            .iter()
+            .filter_map(|input| i64::try_from(input.message_id).ok())
+            .max()
+            .or_else(|| {
+                (current_fingerprint.max_message_id > 0)
+                    .then_some(current_fingerprint.max_message_id)
+            });
+        filter_semantic_watch_once_inputs(&mut inputs);
         return Ok(TargetedSemanticWatchOnceSelection {
             mode: TargetedSemanticWatchOnceMode::RebuildAll,
-            inputs: canonical_documents.into_inputs(),
+            inputs,
             raw_max_message_id,
             tier,
             index_path: vector_index_path(data_dir, indexer.embedder_id()),
             total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
             current_db_fingerprint,
             manifest_before_db_fingerprint,
-            current_doc_ids: None,
             reason: "fresh_watch_once_db",
         });
     }
@@ -15952,87 +14761,49 @@ fn select_targeted_semantic_watch_once_inputs(
             tier.as_str()
         )
     })?;
+    let artifact_fingerprint = parse_semantic_content_fingerprint(&artifact.db_fingerprint)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "semantic watch-once cannot parse existing artifact fingerprint {}",
+                artifact.db_fingerprint
+            )
+        })?;
+    let artifact_fingerprint_conversations =
+        u64::try_from(artifact_fingerprint.total_conversations).unwrap_or(u64::MAX);
+    if !artifact
+        .conversation_count
+        .eq(&artifact_fingerprint_conversations)
+    {
+        anyhow::bail!(
+            "semantic watch-once cannot prove existing vector prefix: manifest conversation_count={} but fingerprint has {} conversations",
+            artifact.conversation_count,
+            artifact_fingerprint.total_conversations
+        );
+    }
     let index_path = validate_semantic_watch_once_artifact(data_dir, &artifact, indexer, tier)?;
-    let inventory = inspect_semantic_artifact(&index_path)?;
-    let canonical_documents = CanonicalSemanticDocuments::from_storage_missing_from(
-        storage,
-        Some(&inventory.reusable_main_doc_ids),
-    )?;
-    let exact_coverage = inventory.is_compacted_unique_main()
-        && inventory
-            .reusable_main_doc_ids
-            .eq(&canonical_documents.doc_ids);
-    if exact_coverage {
-        return Ok(TargetedSemanticWatchOnceSelection {
-            mode: TargetedSemanticWatchOnceMode::AlreadyCovered,
-            inputs: Vec::new(),
-            raw_max_message_id,
-            tier,
-            index_path,
-            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
-            current_db_fingerprint,
-            manifest_before_db_fingerprint,
-            current_doc_ids: None,
-            reason: "semantic_artifact_already_covers_db",
-        });
+    if !semantic_artifact_is_append_only_prefix(storage, artifact_fingerprint, current_fingerprint)?
+    {
+        anyhow::bail!(
+            "semantic watch-once cannot prove bounded coverage: existing semantic artifact is not an append-only prefix of the current DB"
+        );
     }
 
-    let CanonicalSemanticDocuments { documents, doc_ids } = canonical_documents;
-    let missing_inputs = documents
-        .into_iter()
-        .map(|(_, input)| input)
-        .collect::<Vec<_>>();
-    let artifact_fingerprint = parse_semantic_content_fingerprint(&artifact.db_fingerprint);
-    let manifest_matches_inventory =
-        artifact.doc_count == u64::try_from(inventory.live_record_count()).unwrap_or(u64::MAX);
-    let append_only_prefix = if let Some(artifact_fingerprint) = artifact_fingerprint {
-        let artifact_fingerprint_conversations =
-            u64::try_from(artifact_fingerprint.total_conversations).unwrap_or(u64::MAX);
-        artifact
-            .conversation_count
-            .eq(&artifact_fingerprint_conversations)
-            && semantic_artifact_is_append_only_prefix(
-                storage,
-                artifact_fingerprint,
-                current_fingerprint,
-            )?
-            && missing_inputs.iter().all(|input| {
-                i64::try_from(input.message_id)
-                    .is_ok_and(|message_id| message_id > artifact_fingerprint.max_message_id)
-            })
-    } else {
-        false
-    };
-    let can_append = inventory.is_compacted_unique_main()
-        && manifest_matches_inventory
-        && inventory.reusable_main_doc_ids.is_subset(&doc_ids)
-        && append_only_prefix;
-    if can_append {
-        return Ok(TargetedSemanticWatchOnceSelection {
-            mode: TargetedSemanticWatchOnceMode::AppendToExisting,
-            inputs: missing_inputs,
-            raw_max_message_id,
-            tier,
-            index_path,
-            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
-            current_db_fingerprint,
-            manifest_before_db_fingerprint,
-            current_doc_ids: None,
-            reason: "semantic_artifact_is_append_only_prefix",
-        });
-    }
-
+    let mut batch =
+        packet_embedding_inputs_from_storage_since(storage, artifact_fingerprint.max_message_id)?;
+    let raw_max_message_id = batch.raw_max_message_id.or_else(|| {
+        (current_fingerprint.max_message_id > 0).then_some(current_fingerprint.max_message_id)
+    });
+    filter_semantic_watch_once_inputs(&mut batch.inputs);
     Ok(TargetedSemanticWatchOnceSelection {
-        mode: TargetedSemanticWatchOnceMode::ReconcileExisting,
-        inputs: missing_inputs,
+        mode: TargetedSemanticWatchOnceMode::AppendToExisting,
+        inputs: batch.inputs,
         raw_max_message_id,
         tier,
         index_path,
         total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
         current_db_fingerprint,
         manifest_before_db_fingerprint,
-        current_doc_ids: Some(doc_ids),
-        reason: "semantic_artifact_reconciled_with_current_db",
+        reason: "semantic_artifact_is_append_only_prefix",
     })
 }
 
@@ -16060,17 +14831,6 @@ fn publish_semantic_watch_once_artifact(
     let mut manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
         anyhow::anyhow!("loading semantic manifest for semantic watch-once publish: {err}")
     })?;
-    if !matches!(
-        selection.mode,
-        TargetedSemanticWatchOnceMode::AlreadyCovered
-    ) && manifest.hnsw.as_ref().is_some_and(|hnsw| {
-        hnsw.base_tier == selection.tier && hnsw.embedder_id == indexer.embedder_id()
-    }) {
-        // Any append/rebuild/reconciliation changes the vector row set or
-        // ordering. The HNSW loader independently rejects that stale graph,
-        // but the durable manifest must stop advertising it as ready too.
-        manifest.hnsw = None;
-    }
     manifest.publish_artifact(ArtifactRecord {
         tier: selection.tier,
         embedder_id: indexer.embedder_id().to_string(),
@@ -16153,39 +14913,12 @@ fn run_targeted_semantic_watch_once_publish(
                     );
                 }
             }
-            let mut index = FsVectorIndex::open(&selection.index_path).map_err(|err| {
+            let index = FsVectorIndex::open(&selection.index_path).map_err(|err| {
                 anyhow::anyhow!(
                     "open appended semantic watch-once index {}: {err}",
                     selection.index_path.display()
                 )
             })?;
-            if index.wal_record_count() > 0 {
-                index.compact().map_err(|err| {
-                    anyhow::anyhow!("compact appended semantic watch-once index: {err}")
-                })?;
-            }
-            drop(index);
-            let inventory = inspect_semantic_artifact(&selection.index_path)?;
-            if !inventory.is_compacted_unique_main() {
-                anyhow::bail!(
-                    "semantic watch-once append did not publish a compact unique FSVI artifact"
-                );
-            }
-            u64::try_from(inventory.live_record_count()).unwrap_or(u64::MAX)
-        }
-        TargetedSemanticWatchOnceMode::ReconcileExisting => {
-            let current_doc_ids = selection.current_doc_ids.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "semantic reconciliation selection omitted canonical document identities"
-                )
-            })?;
-            let index = indexer.reconcile_index_with_canonical_documents(
-                embedded,
-                data_dir,
-                selection.tier,
-                &selection.current_db_fingerprint,
-                current_doc_ids,
-            )?;
             u64::try_from(index.record_count()).unwrap_or(u64::MAX)
         }
     };
@@ -16455,63 +15188,25 @@ fn anyhow_chain_indicates_retryable_storage_contention(err: &anyhow::Error) -> b
         .any(|cause| crate::storage::sqlite::retryable_storage_error_message(&cause.to_string()))
 }
 
-const DEFAULT_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-fn index_integrity_preflight_max_bytes() -> u64 {
-    dotenvy::var("CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES)
-}
-
-fn should_run_full_archive_quick_check(bundle_bytes: Option<u64>, max_bytes: u64) -> bool {
-    if max_bytes == 0 {
-        return true;
-    }
-    match bundle_bytes {
-        Some(bytes) => bytes <= max_bytes,
-        None => true,
-    }
-}
-
-fn archive_bundle_size_for_integrity_preflight(storage: &FrankenStorage) -> Option<u64> {
-    let db_path = storage.database_path().ok()?;
-    // A missing or unreadable main file must fail safe into the integrity walk.
-    // Sidecars are optional, and database_bundle_size_bytes already treats an
-    // absent WAL/SHM as zero while preserving filename bytes.
-    fs::metadata(&db_path).ok()?;
-    Some(database_bundle_size_bytes(&db_path))
-}
-
 fn full_rebuild_existing_storage_integrity_problem(
     storage: &FrankenStorage,
 ) -> Result<Option<String>> {
-    let bundle_bytes = archive_bundle_size_for_integrity_preflight(storage);
-    let max_bytes = index_integrity_preflight_max_bytes();
-    if should_run_full_archive_quick_check(bundle_bytes, max_bytes) {
-        let quick_check = match storage.raw().query_row_map(
-            "PRAGMA quick_check(1)",
-            &[] as &[ParamValue],
-            |row| row.get_typed::<String>(0),
-        ) {
-            Ok(status) => status,
-            Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
-                return Err(anyhow::anyhow!(
-                    "full rebuild archive integrity preflight hit transient storage contention: {err}"
-                ));
-            }
-            Err(err) => return Ok(Some(format!("quick_check failed: {err}"))),
-        };
-
-        if !quick_check.trim().eq_ignore_ascii_case("ok") {
-            return Ok(Some(format!("quick_check reported {quick_check:?}")));
+    let quick_check = match storage.raw().query_row_map(
+        "PRAGMA quick_check(1)",
+        &[] as &[ParamValue],
+        |row| row.get_typed::<String>(0),
+    ) {
+        Ok(status) => status,
+        Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+            return Err(anyhow::anyhow!(
+                "full rebuild archive integrity preflight hit transient storage contention: {err}"
+            ));
         }
-    } else {
-        tracing::warn!(
-            bundle_bytes = bundle_bytes.unwrap_or_default(),
-            max_bytes,
-            "skipping the O(database-size) PRAGMA quick_check before a large full rebuild; core-table canaries still run. Use 'cass doctor check --json' for the exhaustive scan, or set CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES=0 to force it here"
-        );
+        Err(err) => return Ok(Some(format!("quick_check failed: {err}"))),
+    };
+
+    if !quick_check.trim().eq_ignore_ascii_case("ok") {
+        return Ok(Some(format!("quick_check reported {quick_check:?}")));
     }
 
     for (table, sql) in [
@@ -16540,68 +15235,12 @@ fn full_rebuild_existing_storage_integrity_problem(
     Ok(None)
 }
 
-fn targeted_watch_once_fts_parity_problem(
-    storage: &FrankenStorage,
-    opts: &IndexOptions,
-) -> Result<Option<String>> {
-    let is_targeted_watch_once = opts
-        .watch_once_paths
-        .as_ref()
-        .is_some_and(|paths| !paths.is_empty())
-        && !opts.watch
-        && !opts.full
-        && !opts.force_rebuild;
-    if !is_targeted_watch_once {
-        return Ok(None);
-    }
-
-    let parity = storage.inspect_search_fallback_fts_parity()?;
-    match parity.status {
-        // A completely absent fallback shadow is the normal lazy state for a
-        // fresh/Tantivy-authoritative archive. It has no large partial table
-        // to re-encode, so targeted ingestion remains safe. Only a published
-        // shadow with bad or unprovable parity must stop canonical mutation.
-        crate::storage::sqlite::FtsShadowParityStatus::Healthy
-        | crate::storage::sqlite::FtsShadowParityStatus::Absent => Ok(None),
-        crate::storage::sqlite::FtsShadowParityStatus::Partial
-        | crate::storage::sqlite::FtsShadowParityStatus::Excess
-        | crate::storage::sqlite::FtsShadowParityStatus::Divergent
-        | crate::storage::sqlite::FtsShadowParityStatus::Unqueryable => Ok(Some(format!(
-            "derived canonical FTS shadow is {} before targeted watch-once mutation \
-             (canonical_messages={}, indexable_messages={}, indexed_messages={:?}, detail={:?})",
-            parity.status.as_str(),
-            parity.canonical_messages,
-            parity.indexable_messages,
-            parity.indexed_messages,
-            parity.detail
-        ))),
-    }
-}
-
-fn targeted_watch_once_unhealthy_fts_error(db_path: &Path, reason: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "targeted watch-once stopped before canonical mutation because {reason}. \
-         Run 'cass doctor --rebuild-canonical-fts --dry-run --json' to inspect the \
-         bounded repair plan, then apply it with \
-         'cass doctor --rebuild-canonical-fts --yes --json'. Retry watch-once only \
-         after the doctor reports exact canonical/FTS parity."
-    )
-    .context(format!("canonical archive: {}", db_path.display()))
-}
-
 fn canonical_archive_unhealthy_for_index_error(db_path: &Path, reason: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "canonical cass archive at {} is not safe for indexing: {reason}. \
          cass index will not replace or truncate the SQLite source of truth. \
-         Run 'cass doctor check --json' to inspect the archive. If the canonical \
-         rows are readable but a derived/FTS5 structure is corrupt, run \
-         'cass doctor --rebuild-canonical-fts --dry-run --json' and apply its safe \
-         parity repair with '--yes'. If the archive cannot be opened, recover the \
-         source tree from cass's own preserved events with \
-         'cass doctor --recover-from-archive <DIR>' (rebuilds source JSONL from the \
-         extra_json/extra_bin envelopes — no stock-sqlite .recover needed), then \
-         re-ingest with 'cass index --full'. An explicit backup restore via \
-         'cass doctor backups restore <id>' also remains available.",
+         Run 'cass doctor check --json' to inspect the archive, then use the \
+         doctor repair plan or recover from an explicit backup before indexing again.",
         db_path.display()
     )
 }
@@ -17016,9 +15655,6 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         Arc::clone(&index_run_lock.metadata_write_lock),
         Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
     );
-    // GH#324: this repair path also stages under the index root; sweep
-    // debris from previous crashed runs while we hold the exclusive lock.
-    staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(data_dir, SystemTime::now()).log();
 
     let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
         format!(
@@ -17230,46 +15866,6 @@ impl Drop for StreamingByteReservation<'_> {
     }
 }
 
-/// Test-only panic injection for the page-prep worker panic-containment
-/// regression test (#288). Armed by the test immediately before sending a
-/// work item; consumed (and disarmed) by the first
-/// `prepare_lexical_rebuild_page_work` call that observes it.
-#[cfg(test)]
-static LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC: AtomicBool = AtomicBool::new(false);
-
-#[cfg(test)]
-fn lexical_rebuild_page_prep_injected_panic_hook() {
-    if LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC.swap(false, Ordering::SeqCst) {
-        panic!("injected lexical rebuild page-prep panic for the #288 regression test");
-    }
-}
-
-/// Test-only panic injection for the shard-build worker panic-containment
-/// regression test (#282/#288). Armed by the test before sending shard-build
-/// work; consumed by the first build attempt inside the worker's catch_unwind.
-#[cfg(test)]
-static LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC: AtomicBool = AtomicBool::new(false);
-
-#[cfg(test)]
-fn lexical_rebuild_shard_build_injected_panic_hook() {
-    if LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.swap(false, Ordering::SeqCst) {
-        panic!("injected lexical rebuild shard-build panic for the #282 regression test");
-    }
-}
-
-/// Test-only panic injection for the shard-merge worker panic-containment
-/// regression test (#282). Armed by the test before sending a merge job;
-/// consumed by the first merge attempt inside the worker's catch_unwind.
-#[cfg(test)]
-static LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC: AtomicBool = AtomicBool::new(false);
-
-#[cfg(test)]
-fn lexical_rebuild_shard_merge_injected_panic_hook() {
-    if LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.swap(false, Ordering::SeqCst) {
-        panic!("injected lexical rebuild shard-merge panic for the #282 regression test");
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn prepare_lexical_rebuild_page_work(
     storage: &mut FrankenStorage,
@@ -17280,8 +15876,6 @@ fn prepare_lexical_rebuild_page_work(
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
     work: LexicalRebuildPagePrepWork,
 ) -> Result<LexicalRebuildSequencedPreparedPage> {
-    #[cfg(test)]
-    lexical_rebuild_page_prep_injected_panic_hook();
     let sequence = work.sequence;
     let conversation_ids = work
         .conversation_page
@@ -17293,7 +15887,6 @@ fn prepare_lexical_rebuild_page_work(
         acquire_ordered_lexical_rebuild_page_budget(
             reservation_order,
             flow_limiter,
-            producer_telemetry,
             sequence,
             work.pipeline_budget.batch_fetch_message_bytes_limit,
         )
@@ -17469,30 +16062,16 @@ fn spawn_lexical_rebuild_page_prep_workers(
 
                         while let Ok(work) = worker_rx.recv() {
                             let sequence = work.sequence;
-                            // #288: a panicking page-prep worker used to unwind
-                            // silently — the surviving workers' `result_tx`
-                            // clones kept the channel open, the producer's
-                            // `active_work` count never drained, and the
-                            // producer parked forever at `result_rx.recv()`
-                            // (the reporter's all-parked dump: queue_depth=0,
-                            // active_page_prep_jobs=0, inflight=0). Convert the
-                            // panic into the same teardown as the `Err` arm so
-                            // the producer observes a result and aborts loudly.
-                            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                || {
-                                    prepare_lexical_rebuild_page_work(
-                                        &mut storage,
-                                        worker_source_map.as_ref(),
-                                        worker_flow_limiter.as_ref(),
-                                        worker_reservation_order.as_ref(),
-                                        worker_producer_telemetry.as_ref(),
-                                        worker_pool.as_deref(),
-                                        work,
-                                    )
-                                },
-                            ));
-                            match outcome {
-                                Ok(Ok(prepared)) => {
+                            match prepare_lexical_rebuild_page_work(
+                                &mut storage,
+                                worker_source_map.as_ref(),
+                                worker_flow_limiter.as_ref(),
+                                worker_reservation_order.as_ref(),
+                                worker_producer_telemetry.as_ref(),
+                                worker_pool.as_deref(),
+                                work,
+                            ) {
+                                Ok(prepared) => {
                                     let reserved_bytes =
                                         lexical_rebuild_prepared_page_reserved_bytes(&prepared.page);
                                     if worker_result_tx
@@ -17504,22 +16083,11 @@ fn spawn_lexical_rebuild_page_prep_workers(
                                         break;
                                     }
                                 }
-                                Ok(Err(err)) => {
+                                Err(err) => {
                                     worker_reservation_order.close();
                                     let _ = worker_result_tx.send(LexicalRebuildPagePrepResult::Error {
                                         sequence,
                                         error: format!("{err:#}"),
-                                    });
-                                    break;
-                                }
-                                Err(payload) => {
-                                    worker_reservation_order.close();
-                                    let _ = worker_result_tx.send(LexicalRebuildPagePrepResult::Error {
-                                        sequence,
-                                        error: format!(
-                                            "lexical rebuild page-prep worker {worker_idx} panicked while preparing page sequence {sequence}: {}",
-                                            panic_payload_message(payload)
-                                        ),
                                     });
                                     break;
                                 }
@@ -17543,7 +16111,7 @@ fn spawn_lexical_rebuild_packet_producer(
     planned_shard_plan: Option<LexicalShardPlan>,
     page_size: i64,
     pipeline_channel_size: usize,
-    first_budget_promotion_wait: Option<LexicalRebuildFirstBudgetPromotionWait>,
+    first_budget_promotion_commit_thresholds: Option<(usize, usize, usize)>,
     pipeline_budget_controller: Arc<LexicalRebuildPipelineBudgetController>,
     tx: Sender<LexicalRebuildPipelineMessage>,
     flow_limiter: Arc<StreamingByteLimiter>,
@@ -17703,7 +16271,8 @@ fn spawn_lexical_rebuild_packet_producer(
                 let mut next_sequence_to_emit = 0u64;
                 let mut active_work = 0usize;
                 let mut enumeration_done = false;
-                let mut first_budget_promotion_observed = first_budget_promotion_wait.is_none();
+                let mut first_budget_promotion_observed =
+                    first_budget_promotion_commit_thresholds.is_none();
                 let mut handoff_conversations_since_budget = 0usize;
                 let mut handoff_messages_since_budget = 0usize;
                 let mut handoff_message_bytes_since_budget = 0usize;
@@ -17773,8 +16342,6 @@ fn spawn_lexical_rebuild_packet_producer(
                             .and_then(LexicalRebuildPlannedShardCursor::current)
                             .cloned();
                         let conversation_list_started = Instant::now();
-                        producer_telemetry
-                            .set_producer_state(LexicalRebuildProducerParkSite::ListingDb);
                         let conversation_page = if let Some(shard) = &current_planned_shard {
                             storage
                                 .list_conversations_for_lexical_rebuild_after_id_through_id(
@@ -17807,7 +16374,6 @@ fn spawn_lexical_rebuild_packet_producer(
                                     )
                                 })?
                         };
-                        producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::Idle);
                         let conversation_list_duration = conversation_list_started.elapsed();
 
                         if conversation_page.is_empty() {
@@ -17917,13 +16483,7 @@ fn spawn_lexical_rebuild_packet_producer(
                             Ok(()) => {}
                             Err(TrySendError::Full(message)) => {
                                 let handoff_wait_started = Instant::now();
-                                producer_telemetry.set_producer_state(
-                                    LexicalRebuildProducerParkSite::HandoffSend,
-                                );
-                                let handoff_send = tx.send(message);
-                                producer_telemetry
-                                    .set_producer_state(LexicalRebuildProducerParkSite::Idle);
-                                if handoff_send.is_err() {
+                                if tx.send(message).is_err() {
                                     reservation_order.close();
                                     flow_limiter.release(reserved_bytes);
                                     release_completed_lexical_rebuild_pages(
@@ -17977,56 +16537,49 @@ fn spawn_lexical_rebuild_packet_producer(
                         next_sequence_to_emit = next_sequence_to_emit.saturating_add(1);
 
                         if !first_budget_promotion_observed
-                            && let Some(first_budget_wait) = first_budget_promotion_wait
+                            && let Some((
+                                commit_interval_conversations,
+                                commit_interval_messages,
+                                commit_interval_message_bytes,
+                            )) = first_budget_promotion_commit_thresholds
+                            && should_commit_lexical_rebuild(
+                                handoff_conversations_since_budget,
+                                handoff_messages_since_budget,
+                                handoff_message_bytes_since_budget,
+                                commit_interval_conversations,
+                                commit_interval_messages,
+                                commit_interval_message_bytes,
+                            )
                         {
                             let observed_generation = pipeline_budget_controller.generation();
-                            if observed_generation > first_budget_wait.generation {
+                            tracing::info!(
+                                observed_generation,
+                                handoff_conversations_since_budget,
+                                handoff_messages_since_budget,
+                                handoff_message_bytes_since_budget,
+                                "lexical rebuild producer waiting for first durable budget promotion"
+                            );
+                            if pipeline_budget_controller.wait_for_update_after(
+                                observed_generation,
+                                lexical_rebuild_first_budget_promotion_wait(),
+                            ) {
                                 first_budget_promotion_observed = true;
                                 handoff_conversations_since_budget = 0;
                                 handoff_messages_since_budget = 0;
                                 handoff_message_bytes_since_budget = 0;
                                 tracing::info!(
-                                    initial_generation = first_budget_wait.generation,
-                                    observed_generation,
-                                    "lexical rebuild producer observed first budget promotion before waiting"
+                                    new_generation = pipeline_budget_controller.generation(),
+                                    "lexical rebuild producer observed first durable budget promotion"
                                 );
-                            } else if should_commit_lexical_rebuild(
-                                handoff_conversations_since_budget,
-                                handoff_messages_since_budget,
-                                handoff_message_bytes_since_budget,
-                                first_budget_wait.commit_interval_conversations,
-                                first_budget_wait.commit_interval_messages,
-                                first_budget_wait.commit_interval_message_bytes,
-                            ) {
-                                tracing::info!(
+                            } else {
+                                first_budget_promotion_observed = true;
+                                tracing::warn!(
                                     observed_generation,
-                                    handoff_conversations_since_budget,
-                                    handoff_messages_since_budget,
-                                    handoff_message_bytes_since_budget,
-                                    "lexical rebuild producer waiting for first durable budget promotion"
+                                    wait_ms = lexical_rebuild_first_budget_promotion_wait()
+                                        .as_millis()
+                                        as u64,
+                                    "lexical rebuild producer timed out waiting for first durable budget promotion; continuing with current budgets"
                                 );
-                                if pipeline_budget_controller.wait_for_update_after(
-                                    observed_generation,
-                                    lexical_rebuild_first_budget_promotion_wait(),
-                                ) {
-                                    first_budget_promotion_observed = true;
-                                    handoff_conversations_since_budget = 0;
-                                    handoff_messages_since_budget = 0;
-                                    handoff_message_bytes_since_budget = 0;
-                                    tracing::info!(
-                                        new_generation = pipeline_budget_controller.generation(),
-                                        "lexical rebuild producer observed first durable budget promotion"
-                                    );
-                                } else {
-                                    first_budget_promotion_observed = true;
-                                    tracing::warn!(
-                                        observed_generation,
-                                        wait_ms = lexical_rebuild_first_budget_promotion_wait()
-                                            .as_millis()
-                                            as u64,
-                                        "lexical rebuild producer timed out waiting for first durable budget promotion; continuing with current budgets"
-                                    );
-                                }
                             }
                         }
                     }
@@ -18035,11 +16588,7 @@ fn spawn_lexical_rebuild_packet_producer(
                         break;
                     }
 
-                    producer_telemetry
-                        .set_producer_state(LexicalRebuildProducerParkSite::WaitingResult);
-                    let page_prep_result = result_rx.recv();
-                    producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::Idle);
-                    match page_prep_result {
+                    match result_rx.recv() {
                         Ok(LexicalRebuildPagePrepResult::Prepared(prepared)) => {
                             active_work = active_work.saturating_sub(1);
                             producer_telemetry.record(
@@ -19047,8 +17596,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         p.total.store(total_conversations, Ordering::Relaxed);
         p.current
             .store(rebuild_state.processed_conversations, Ordering::Relaxed);
-        // The rebuild's conversation total is a stable denominator.
-        p.total_is_final.store(true, Ordering::Relaxed);
         p.discovered_agents.store(0, Ordering::Relaxed);
     }
     let lexical_rebuild_started = Instant::now();
@@ -19938,18 +18485,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         &mut enqueued_shards,
                         true,
                     )?;
-                    // #282: the staging→publish handoff wedged the stall
-                    // watchdog at 100% because a long final-merge / frontier
-                    // reduction crosses NO shard-or-merge result boundary for
-                    // minutes, so `last_progress_at_ms` froze and the abort
-                    // fired even though the merge workers were busy. Bump the
-                    // progress atomic on this busy-poll tick ONLY when work is
-                    // genuinely in flight (active shard builds or pending
-                    // merges) — never on a true zero-work deadlock, so the
-                    // watchdog still catches real wedges.
-                    if active_shard_build_jobs > 0 || merge_coordinator.pending_merge_jobs() > 0 {
-                        bump_index_run_lock_progress_if_present(progress_bump.as_ref());
-                    }
                 }
             }
         }
@@ -19969,7 +18504,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 shard_merge_settings.workers,
                 &merge_work_tx,
                 &merge_result_rx,
-                progress_bump.as_ref(),
             )?;
         }
         final_merge_input_artifacts = Some(reduced_final_merge_artifacts);
@@ -20087,12 +18621,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     let final_observed_messages = observed_messages.max(indexed_docs);
     let lexical_rebuild_duration = lexical_rebuild_started.elapsed();
     let publish_started = Instant::now();
-    // #282: entering the finalize→publish stretch (manifest persistence,
-    // fingerprinting, atomic swap) is a real forward-progress boundary after
-    // the merge drain loop exited. Bump the progress atomic so a slow publish
-    // on a large index does not freeze `last_progress_at_ms` and trip the
-    // stall-abort right at the staging→publish handoff.
-    bump_index_run_lock_progress_if_present(progress_bump.as_ref());
     let equivalence_evidence = equivalence_accumulator.finalize();
     let generation_manifest = persist_lexical_rebuild_generation_artifacts(
         &final_merge_artifact.publish_path,
@@ -20445,6 +18973,13 @@ fn rebuild_tantivy_from_db_with_options(
     commit_interval_conversations = current_budget.commit_interval_conversations;
     commit_interval_messages = current_budget.commit_interval_messages;
     commit_interval_message_bytes = current_budget.commit_interval_message_bytes;
+    let first_budget_promotion_commit_thresholds = responsiveness_controller
+        .waits_for_first_durable_commit()
+        .then_some((
+            commit_interval_conversations,
+            commit_interval_messages,
+            commit_interval_message_bytes,
+        ));
     let lexical_rebuild_flow_limiter = Arc::new(StreamingByteLimiter::new(
         responsiveness_controller
             .current_budget()
@@ -20453,14 +18988,6 @@ fn rebuild_tantivy_from_db_with_options(
     let pipeline_budget_controller = Arc::new(LexicalRebuildPipelineBudgetController::new(
         responsiveness_controller.current_budget(),
     ));
-    let first_budget_promotion_wait = responsiveness_controller
-        .waits_for_first_durable_commit()
-        .then_some(LexicalRebuildFirstBudgetPromotionWait {
-            generation: pipeline_budget_controller.generation(),
-            commit_interval_conversations,
-            commit_interval_messages,
-            commit_interval_message_bytes,
-        });
     let producer_telemetry = Arc::new(LexicalRebuildProducerTelemetry::default());
     refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
         &mut latest_pipeline_runtime,
@@ -20490,7 +19017,7 @@ fn rebuild_tantivy_from_db_with_options(
             staged_shard_plan.clone(),
             page_size,
             pipeline_channel_size,
-            first_budget_promotion_wait,
+            first_budget_promotion_commit_thresholds,
             pipeline_budget_controller.clone(),
             pipeline_tx
                 .take()
@@ -20606,8 +19133,6 @@ fn rebuild_tantivy_from_db_with_options(
         p.total.store(total_conversations, Ordering::Relaxed);
         p.current
             .store(rebuild_state.processed_conversations, Ordering::Relaxed);
-        // The rebuild's conversation total is a stable denominator.
-        p.total_is_final.store(true, Ordering::Relaxed);
         p.discovered_agents.store(0, Ordering::Relaxed);
     }
 
@@ -20618,7 +19143,7 @@ fn rebuild_tantivy_from_db_with_options(
             staged_shard_plan.clone(),
             page_size,
             pipeline_channel_size,
-            first_budget_promotion_wait,
+            first_budget_promotion_commit_thresholds,
             pipeline_budget_controller.clone(),
             pipeline_tx
                 .take()
@@ -20893,7 +19418,7 @@ fn rebuild_tantivy_from_db_with_options(
 
         let pipeline_result: Result<()> = (|| {
             loop {
-                match pipeline_rx.recv_timeout(Duration::from_millis(250)) {
+                match pipeline_rx.recv() {
                     Ok(LexicalRebuildPipelineMessage::Batch(prepared_page)) => {
                         if let Some(profile) = perf_profile.as_mut() {
                             profile.conversation_list_duration +=
@@ -21000,28 +19525,7 @@ fn rebuild_tantivy_from_db_with_options(
                         return Err(anyhow::anyhow!(error));
                     }
                     Ok(LexicalRebuildPipelineMessage::Done) => break,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
-                            &mut latest_pipeline_runtime,
-                            progress.as_ref(),
-                            lexical_rebuild_flow_limiter.as_ref(),
-                            Some(producer_telemetry.as_ref()),
-                            &mut responsiveness_controller,
-                            pipeline_budget_controller.as_ref(),
-                            &mut current_batch_conversation_limit,
-                            Some((
-                                &mut commit_interval_conversations,
-                                &mut commit_interval_messages,
-                                &mut commit_interval_message_bytes,
-                            )),
-                            LexicalRebuildPipelineSinkRuntimeSnapshot::new(
-                                pipeline_rx.len(),
-                                pending_batch.len(),
-                                pending_batch_message_bytes,
-                            ),
-                        );
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    Err(_) => {
                         return Err(anyhow::anyhow!(
                             "lexical rebuild pipeline channel closed before producer completion"
                         ));
@@ -21265,15 +19769,9 @@ fn ingest_batch_detailed(
         );
     }
 
-    // GH#320: bound the bulk-ingest WAL (and the pager memory plus finalize
-    // checkpoint debt that scale with it) at a safe between-transactions
-    // boundary.
-    persist::maybe_checkpoint_bulk_ingest_wal(storage, defer_checkpoints);
-
     // Update progress counter for all conversations at once
     if let Some(p) = progress {
         p.current.fetch_add(convs.len(), Ordering::Relaxed);
-        p.tick_activity();
     }
     bump_index_run_lock_progress_if_present(progress_bump);
     robot_trace_ingest_finish(
@@ -21324,11 +19822,6 @@ fn ingest_non_watch_batch_with_oom_split(
                 defer_checkpoints,
                 progress_bump,
             )?;
-            // #332: each persisted chunk is live work even while the outer
-            // batch's `current` bump waits for the whole batch to finish.
-            if let Some(p) = progress {
-                p.tick_activity();
-            }
             merged = merged.accumulate(outcome);
         }
         return Ok(merged);
@@ -21480,42 +19973,6 @@ fn ingest_non_watch_oom_retry_or_quarantine(
     }
 
     let conv = &convs[0];
-
-    // #298: mirror the watch-path plausibility gate. frankensqlite raises the
-    // same typed `FrankenError::OutOfMemory` for per-statement bounded
-    // allocation guards, so a NoMem on a small conversation with no real host
-    // memory pressure is not evidence of a poisoned conversation. Defer it
-    // (retried by the next index run) instead of quarantining.
-    let indexed_text_bytes = conversation_indexed_text_bytes(conv);
-    let small_conversation = indexed_text_bytes <= watch_oom_small_conversation_bytes();
-    let real_pressure = watch_oom_under_real_memory_pressure();
-    let should_quarantine = match real_pressure {
-        Some(true) => true,
-        Some(false) | None => !small_conversation,
-    };
-    if !should_quarantine {
-        tracing::warn!(
-            agent = %conv.agent_slug,
-            external_id = conv.external_id.as_deref().unwrap_or(""),
-            source_path = %conv.source_path.display(),
-            indexed_text_bytes,
-            real_memory_pressure = ?real_pressure,
-            error = %error,
-            "single non-watch conversation hit a bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) so the next index run retries it (#298)"
-        );
-        if let Some(progress) = progress {
-            progress.current.fetch_add(1, Ordering::Relaxed);
-        }
-        bump_index_run_lock_progress_if_present(progress_bump);
-        return Ok(NonWatchIngestOutcome {
-            canonical_mutations: CanonicalMutationCounts::default(),
-            quarantined_conversations: 0,
-            lexical_update_deferred: true,
-            scanned_connectors: BTreeSet::new(),
-            scan_had_errors: false,
-        });
-    }
-
     record_index_poison_conversation(data_dir, conv, &error)?;
     if let Some(progress) = progress {
         progress.current.fetch_add(1, Ordering::Relaxed);
@@ -21525,8 +19982,6 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         agent = %conv.agent_slug,
         external_id = conv.external_id.as_deref().unwrap_or(""),
         source_path = %conv.source_path.display(),
-        indexed_text_bytes,
-        real_memory_pressure = ?real_pressure,
         error = %error,
         "single non-watch conversation ran out of memory after deferred lexical retry; quarantined and continuing index refresh"
     );
@@ -21609,11 +20064,6 @@ struct WatchIngestBatchOutcome {
     batch_outcome: persist::PersistBatchOutcome,
     processed_conversations: usize,
     quarantined_conversations: usize,
-    /// Conversations skipped this pass by the #298 plausibility gate (bounded
-    /// NoMem, no real pressure). Not quarantined — but the watch watermark
-    /// must not advance past them or they would be silently dropped until
-    /// their source file changes again.
-    deferred_conversations: usize,
     max_payload_watermark_ms: Option<i64>,
 }
 
@@ -21626,9 +20076,6 @@ impl WatchIngestBatchOutcome {
         self.quarantined_conversations = self
             .quarantined_conversations
             .saturating_add(other.quarantined_conversations);
-        self.deferred_conversations = self
-            .deferred_conversations
-            .saturating_add(other.deferred_conversations);
         if let Some(ts) = other.max_payload_watermark_ms {
             self.max_payload_watermark_ms = Some(
                 self.max_payload_watermark_ms
@@ -21636,20 +20083,6 @@ impl WatchIngestBatchOutcome {
             );
         }
     }
-}
-
-/// How a watch ingest call should treat a single-conversation OOM (#298).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WatchOomIngestMode {
-    /// Normal batch ingest: the typed-OOM test injection may fire, and a
-    /// single-conversation OOM goes through the solo isolate-retry plus the
-    /// pressure/size gate before any quarantine decision.
-    Standard,
-    /// Solo isolate-retry re-entry: test injection is disabled and a
-    /// single-conversation OOM propagates as `Err` so the Standard-mode
-    /// caller's gate — not this re-entry — decides between deferring and
-    /// quarantining (and its logs stay truthful about what happened).
-    SoloIsolatedRetry,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -21662,34 +20095,9 @@ fn ingest_watch_batch_with_oom_split(
     defer_checkpoints: bool,
     capture_semantic_delta: bool,
 ) -> Result<WatchIngestBatchOutcome> {
-    ingest_watch_batch_with_oom_split_inner(
-        storage,
-        t_index,
-        data_dir,
-        convs,
-        progress,
-        defer_checkpoints,
-        capture_semantic_delta,
-        WatchOomIngestMode::Standard,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ingest_watch_batch_with_oom_split_inner(
-    storage: &FrankenStorage,
-    t_index: &mut TantivyIndex,
-    data_dir: &Path,
-    convs: &[NormalizedConversation],
-    progress: &Option<Arc<IndexingProgress>>,
-    defer_checkpoints: bool,
-    capture_semantic_delta: bool,
-    mode: WatchOomIngestMode,
-) -> Result<WatchIngestBatchOutcome> {
     debug_assert!(!convs.is_empty());
 
-    let batch_result = if matches!(mode, WatchOomIngestMode::Standard)
-        && should_inject_watch_ingest_test_oom(convs)
-    {
+    let batch_result = if should_inject_watch_ingest_test_oom(convs) {
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
         // exercises the downcast path that real frankensqlite OOMs hit, instead
         // of relying on the plain-string fallback.
@@ -21713,7 +20121,6 @@ fn ingest_watch_batch_with_oom_split_inner(
             batch_outcome,
             processed_conversations: convs.len(),
             quarantined_conversations: 0,
-            deferred_conversations: 0,
             max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
         }),
         Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
@@ -21725,7 +20132,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                 error = %error,
                 "watch ingest batch ran out of memory; retrying as smaller batches"
             );
-            let mut merged = ingest_watch_batch_with_oom_split_inner(
+            let mut merged = ingest_watch_batch_with_oom_split(
                 storage,
                 t_index,
                 data_dir,
@@ -21733,9 +20140,8 @@ fn ingest_watch_batch_with_oom_split_inner(
                 progress,
                 defer_checkpoints,
                 capture_semantic_delta,
-                mode,
             )?;
-            let right = ingest_watch_batch_with_oom_split_inner(
+            let right = ingest_watch_batch_with_oom_split(
                 storage,
                 t_index,
                 data_dir,
@@ -21743,159 +20149,32 @@ fn ingest_watch_batch_with_oom_split_inner(
                 progress,
                 defer_checkpoints,
                 capture_semantic_delta,
-                mode,
             )?;
             merged.merge(right);
             Ok(merged)
         }
         Err(error) if error_is_out_of_memory(&error) => {
-            // Solo isolate-retry re-entry: propagate the OOM so the
-            // Standard-mode caller's pressure/size gate decides between
-            // deferring and quarantining. Quarantining here would bypass that
-            // gate and make the caller's "ingested cleanly solo" log lie.
-            if matches!(mode, WatchOomIngestMode::SoloIsolatedRetry) {
-                return Err(error);
-            }
-
             let conv = &convs[0];
-
-            // #298: a typed `FrankenError::OutOfMemory` (NoMem) on the batch
-            // path is NOT proof of real host memory exhaustion — frankensqlite
-            // raises the same typed error for per-statement bounded allocation
-            // guards. Before quarantining a single small conversation that may
-            // well ingest fine in isolation, retry it solo (which the reporter
-            // confirmed succeeds) and only quarantine on a genuine, repeated
-            // failure under real memory pressure or for a genuinely large
-            // conversation.
-            let indexed_text_bytes = conversation_indexed_text_bytes(conv);
-            let small_conversation = indexed_text_bytes <= watch_oom_small_conversation_bytes();
-            let real_pressure = watch_oom_under_real_memory_pressure();
-
-            // Isolate-retry the single conversation solo. The retry runs in
-            // `SoloIsolatedRetry` mode so the typed-OOM test injection cannot
-            // re-fire and a repeated OOM comes back as `Err` for the gate
-            // below. Tests that need to model a *genuinely* poisoned
-            // conversation (solo ingest also OOMs) set
-            // `CASS_TEST_WATCH_SOLO_RETRY_OOM=1`.
-            let solo_retry = if should_force_watch_solo_retry_oom() {
-                Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
-            } else {
-                ingest_watch_batch_with_oom_split_inner(
-                    storage,
-                    t_index,
-                    data_dir,
-                    std::slice::from_ref(conv),
-                    progress,
-                    defer_checkpoints,
-                    capture_semantic_delta,
-                    WatchOomIngestMode::SoloIsolatedRetry,
-                )
-            };
-
-            match solo_retry {
-                Ok(outcome) => {
-                    // Solo ingest succeeded — the batch-path NoMem was a
-                    // bounded-guard false positive. Do not quarantine.
-                    tracing::info!(
-                        agent = %conv.agent_slug,
-                        external_id = conv.external_id.as_deref().unwrap_or(""),
-                        source_path = %conv.source_path.display(),
-                        indexed_text_bytes,
-                        "watch conversation hit a bounded-allocation NoMem in batch but ingested cleanly solo; not quarantining (#298)"
-                    );
-                    Ok(outcome)
-                }
-                Err(solo_error) if !error_is_out_of_memory(&solo_error) => {
-                    // The solo retry surfaced a *different* (non-OOM) error
-                    // — propagate it rather than mislabel it as OOM.
-                    Err(solo_error)
-                }
-                Err(solo_error) => {
-                    // Solo retry still hit OOM. Only quarantine if this is
-                    // real memory pressure or a genuinely large
-                    // conversation; otherwise keep it eligible for a later
-                    // retry instead of poisoning a small, replayable
-                    // conversation on a transient bounded-guard hit.
-                    let should_quarantine = match real_pressure {
-                        // Real host pressure: quarantine is justified.
-                        Some(true) => true,
-                        // Ample memory reported: only quarantine large
-                        // conversations; small ones stay eligible.
-                        Some(false) => !small_conversation,
-                        // Pressure unknowable (e.g. macOS): fall back to the
-                        // size gate — never quarantine a small conversation
-                        // on a typed NoMem we cannot attribute to real
-                        // pressure.
-                        None => !small_conversation,
-                    };
-                    if !should_quarantine {
-                        tracing::warn!(
-                            agent = %conv.agent_slug,
-                            external_id = conv.external_id.as_deref().unwrap_or(""),
-                            source_path = %conv.source_path.display(),
-                            indexed_text_bytes,
-                            real_memory_pressure = ?real_pressure,
-                            error = %solo_error,
-                            "watch conversation hit repeated bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) for later retry (#298)"
-                        );
-                        if let Some(progress) = progress {
-                            progress.current.fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Ok(WatchIngestBatchOutcome {
-                            batch_outcome: persist::PersistBatchOutcome::default(),
-                            processed_conversations: 1,
-                            quarantined_conversations: 0,
-                            deferred_conversations: 1,
-                            max_payload_watermark_ms: None,
-                        });
-                    }
-                    // Quarantine with the solo error so the record reflects
-                    // the genuine repeated failure.
-                    quarantine_single_watch_conversation(
-                        data_dir,
-                        conv,
-                        &solo_error,
-                        progress,
-                        indexed_text_bytes,
-                        real_pressure,
-                    )
-                }
+            record_watch_poison_conversation(data_dir, conv, &error)?;
+            if let Some(progress) = progress {
+                progress.current.fetch_add(1, Ordering::Relaxed);
             }
+            tracing::warn!(
+                agent = %conv.agent_slug,
+                external_id = conv.external_id.as_deref().unwrap_or(""),
+                source_path = %conv.source_path.display(),
+                error = %error,
+                "single watch conversation ran out of memory; quarantined and advancing watch progress"
+            );
+            Ok(WatchIngestBatchOutcome {
+                batch_outcome: persist::PersistBatchOutcome::default(),
+                processed_conversations: 1,
+                quarantined_conversations: 1,
+                max_payload_watermark_ms: None,
+            })
         }
         Err(error) => Err(error),
     }
-}
-
-/// Record a single watch conversation as poison and quarantine it, advancing
-/// watch progress so the watcher does not stall on a poison file.
-fn quarantine_single_watch_conversation(
-    data_dir: &Path,
-    conv: &NormalizedConversation,
-    error: &anyhow::Error,
-    progress: &Option<Arc<IndexingProgress>>,
-    indexed_text_bytes: usize,
-    real_memory_pressure: Option<bool>,
-) -> Result<WatchIngestBatchOutcome> {
-    record_watch_poison_conversation(data_dir, conv, error)?;
-    if let Some(progress) = progress {
-        progress.current.fetch_add(1, Ordering::Relaxed);
-    }
-    tracing::warn!(
-        agent = %conv.agent_slug,
-        external_id = conv.external_id.as_deref().unwrap_or(""),
-        source_path = %conv.source_path.display(),
-        indexed_text_bytes,
-        real_memory_pressure = ?real_memory_pressure,
-        error = %error,
-        "single watch conversation ran out of memory; quarantined and advancing watch progress"
-    );
-    Ok(WatchIngestBatchOutcome {
-        batch_outcome: persist::PersistBatchOutcome::default(),
-        processed_conversations: 1,
-        quarantined_conversations: 1,
-        deferred_conversations: 0,
-        max_payload_watermark_ms: None,
-    })
 }
 
 fn conversations_payload_watermark_ms(convs: &[NormalizedConversation]) -> Option<i64> {
@@ -21951,59 +20230,6 @@ fn error_is_out_of_memory(error: &anyhow::Error) -> bool {
         }
         error_message_is_exact_out_of_memory(&cause.to_string())
     })
-}
-
-/// Default ceiling, in bytes of *indexed text*, under which a watch-ingest
-/// `NoMem` is treated as a bounded-allocation-guard false positive rather than
-/// real host memory exhaustion (#298). frankensqlite raises the same typed
-/// `FrankenError::OutOfMemory` for per-statement bounded allocation limits
-/// (VDBE frame/register/pager guards) as it does for real OS pressure, so a
-/// small conversation that ingests fine solo must never be quarantined just
-/// because it tripped a bounded guard under concurrent batch load.
-const WATCH_OOM_SMALL_CONVERSATION_DEFAULT_BYTES: usize = 8 * 1024 * 1024;
-
-/// Default host-available-memory reserve (bytes). If the OS reports *less* than
-/// this much available memory when a watch `NoMem` fires, we treat it as real
-/// pressure and allow quarantine; otherwise the `NoMem` is a bounded-guard hit.
-const WATCH_OOM_REAL_PRESSURE_RESERVE_DEFAULT_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Indexed-text byte size of a single conversation — the sum of message content
-/// lengths. This is the right "size" signal for #298: the false-positive
-/// victims are multi-MB raw files (tool_result/thinking bulk) with only tens of
-/// KB of *indexed* text, so the materialized-file size is irrelevant here.
-fn conversation_indexed_text_bytes(conv: &NormalizedConversation) -> usize {
-    conv.messages
-        .iter()
-        .map(|message| message.content.len())
-        .fold(0usize, |acc, len| acc.saturating_add(len))
-}
-
-fn watch_oom_small_conversation_bytes() -> usize {
-    dotenvy::var("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .unwrap_or(WATCH_OOM_SMALL_CONVERSATION_DEFAULT_BYTES)
-}
-
-fn watch_oom_real_pressure_reserve_bytes() -> u64 {
-    dotenvy::var("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(WATCH_OOM_REAL_PRESSURE_RESERVE_DEFAULT_BYTES)
-}
-
-/// Whether a watch-ingest `NoMem` should be treated as *real* host memory
-/// pressure. Returns:
-/// - `Some(true)`  — host reports available memory below the configured reserve
-///   (real pressure; quarantine is justified after the solo retry fails).
-/// - `Some(false)` — host reports ample available memory (the `NoMem` is a
-///   bounded-allocation-guard false positive).
-/// - `None`        — memory pressure is unknowable on this platform
-///   (e.g. macOS has no `/proc/meminfo`); callers must fall back to the size
-///   gate / solo-retry result and must NOT assume pressure.
-fn watch_oom_under_real_memory_pressure() -> Option<bool> {
-    let available = responsiveness::available_memory_bytes()?;
-    Some(available <= watch_oom_real_pressure_reserve_bytes())
 }
 
 fn error_message_is_exact_out_of_memory(message: &str) -> bool {
@@ -22428,33 +20654,6 @@ fn clear_poison_jsonl_records(
     reason: &str,
     conversation_ids: &BTreeSet<String>,
 ) -> Result<usize> {
-    clear_poison_jsonl_records_where(data_dir, file_name, reason, |conversation_id, _| {
-        conversation_ids.contains(conversation_id)
-    })
-}
-
-fn clear_poison_jsonl_key_records(
-    data_dir: &Path,
-    file_name: &str,
-    reason: &str,
-    quarantine_keys: &BTreeSet<(String, i64)>,
-) -> Result<usize> {
-    clear_poison_jsonl_records_where(
-        data_dir,
-        file_name,
-        reason,
-        |conversation_id, schema_version| {
-            quarantine_keys.contains(&(conversation_id.to_string(), schema_version))
-        },
-    )
-}
-
-fn clear_poison_jsonl_records_where(
-    data_dir: &Path,
-    file_name: &str,
-    reason: &str,
-    should_clear_key: impl Fn(&str, i64) -> bool,
-) -> Result<usize> {
     let path = data_dir.join("quarantine").join(file_name);
     if !path.exists() {
         return Ok(0);
@@ -22481,9 +20680,7 @@ fn clear_poison_jsonl_records_where(
                     .then(|| poison_record_key_from_value(&value))
                     .flatten()
             })
-            .is_some_and(|(conversation_id, schema_version)| {
-                should_clear_key(&conversation_id, schema_version)
-            });
+            .is_some_and(|(conversation_id, _)| conversation_ids.contains(&conversation_id));
         if should_clear {
             cleared = cleared.saturating_add(1);
         } else {
@@ -22693,16 +20890,6 @@ pub fn conversation_ingest_quarantine_summary(
 ) -> ConversationIngestQuarantineSummary {
     let quarantine_dir = data_dir.join("quarantine");
     let mut keys = BTreeSet::<(String, i64)>::new();
-    // The circuit breaker fires on a *recent burst* of quarantines. A stable,
-    // already-triaged backlog of same-version irreducible failures recurs on
-    // every refresh (same `cass_version_at_quarantine`, `last_attempt_at` bumped)
-    // but its content is already searchable from a prior pass — surfacing that as
-    // a `critical` breaker (and thus `health_level=critical`) is a misreport
-    // (#290). So `recent_keys` counts only *fresh* recent quarantines: those that
-    // are retry-eligible (version-stale/legacy/new), i.e. NOT same-version
-    // re-skips. Same-version recurrences are still counted in the total backlog
-    // (`keys`) and reported as `degraded`, just not as a `critical` burst.
-    let current_version = current_cass_version();
     let mut recent_keys = BTreeSet::<(String, i64)>::new();
     let mut quarantine_files = Vec::new();
     let mut newest_last_attempt_at_ms: Option<i64> = None;
@@ -22719,9 +20906,7 @@ pub fn conversation_ingest_quarantine_summary(
             let last_attempt_at_ms = record.last_attempt_at.timestamp_millis();
             let summary_key = (key.conversation_id, i64::from(key.schema_version));
             keys.insert(summary_key.clone());
-            if last_attempt_at_ms >= recent_cutoff_ms
-                && record.is_version_stale_for_retry(current_version)
-            {
+            if last_attempt_at_ms >= recent_cutoff_ms {
                 recent_keys.insert(summary_key);
             }
             newest_last_attempt_at_ms = Some(
@@ -22750,10 +20935,6 @@ pub fn conversation_ingest_quarantine_summary(
                 continue;
             };
             let key = poison_record_key_from_value(&value);
-            let is_fresh_quarantine = poison_record_version_needs_retry(
-                poison_record_cass_version(&value),
-                current_version,
-            );
             if let Some(last_attempt_at_ms) = value
                 .get("last_attempt_at_ms")
                 .and_then(serde_json::Value::as_i64)
@@ -22765,7 +20946,6 @@ pub fn conversation_ingest_quarantine_summary(
             {
                 if let Some(key) = key.as_ref()
                     && last_attempt_at_ms >= recent_cutoff_ms
-                    && is_fresh_quarantine
                 {
                     recent_keys.insert(key.clone());
                 }
@@ -22815,400 +20995,6 @@ pub fn conversation_ingest_quarantine_summary(
     }
 }
 
-/// Build the set of quarantined conversation ids whose recorded source log is
-/// gone (so a retry could never succeed). The poison JSONL records carry the
-/// `source_path`; if a record has a path that no longer exists, that
-/// conversation is source-missing.
-fn quarantine_source_missing_ids(data_dir: &Path) -> BTreeSet<String> {
-    let quarantine_dir = data_dir.join("quarantine");
-    let mut missing = BTreeSet::new();
-    for file_name in [WATCH_INGEST_POISON_FILE, INDEX_INGEST_POISON_FILE] {
-        let path = quarantine_dir.join(file_name);
-        let Ok(contents) = fs::read_to_string(&path) else {
-            continue;
-        };
-        for line in contents.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-                continue;
-            };
-            let Some(conversation_id) = value
-                .get("conversation_id")
-                .and_then(serde_json::Value::as_str)
-            else {
-                continue;
-            };
-            if let Some(source_path) = value.get("source_path").and_then(serde_json::Value::as_str)
-                && !Path::new(source_path).exists()
-            {
-                missing.insert(conversation_id.to_string());
-            }
-        }
-    }
-    missing
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct QuarantineRetrySource {
-    provider: String,
-    source_path: PathBuf,
-    external_id: Option<String>,
-    workspace: Option<PathBuf>,
-    started_at: Option<i64>,
-    ended_at: Option<i64>,
-    message_count: Option<usize>,
-}
-
-/// Join structured quarantine keys back to the exact source log and connector
-/// recorded in the poison ledger. The ledger deliberately stores no message
-/// body, so retry reparses the authoritative source instead of replaying a
-/// stale or secret-bearing payload from quarantine metadata.
-fn quarantine_retry_sources(data_dir: &Path) -> BTreeMap<QuarantineKey, QuarantineRetrySource> {
-    let quarantine_dir = data_dir.join("quarantine");
-    let mut sources = BTreeMap::new();
-    for file_name in [WATCH_INGEST_POISON_FILE, INDEX_INGEST_POISON_FILE] {
-        let path = quarantine_dir.join(file_name);
-        let Ok(contents) = fs::read_to_string(&path) else {
-            continue;
-        };
-        for line in contents.lines() {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-                continue;
-            };
-            let Some((conversation_id, schema_version)) = poison_record_key_from_value(&value)
-            else {
-                continue;
-            };
-            let Ok(schema_version) = u32::try_from(schema_version) else {
-                continue;
-            };
-            let provider = value
-                .get("agent_slug")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|provider| !provider.is_empty())
-                .or_else(|| conversation_id.split('|').next().map(str::trim))
-                .map(str::to_string);
-            let source_path = value
-                .get("source_path")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|path| !path.is_empty());
-            let (Some(provider), Some(source_path)) = (provider, source_path) else {
-                continue;
-            };
-            sources.insert(
-                QuarantineKey::new(conversation_id, schema_version),
-                QuarantineRetrySource {
-                    provider,
-                    source_path: PathBuf::from(source_path),
-                    external_id: value
-                        .get("external_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string),
-                    workspace: value
-                        .get("workspace")
-                        .and_then(serde_json::Value::as_str)
-                        .map(PathBuf::from),
-                    started_at: value.get("started_at").and_then(serde_json::Value::as_i64),
-                    ended_at: value.get("ended_at").and_then(serde_json::Value::as_i64),
-                    message_count: value
-                        .get("message_count")
-                        .and_then(serde_json::Value::as_u64)
-                        .and_then(|count| usize::try_from(count).ok()),
-                },
-            );
-        }
-    }
-    sources
-}
-
-fn targeted_quarantine_retry(
-    data_dir: &Path,
-    key: &QuarantineKey,
-    source: Option<&QuarantineRetrySource>,
-) -> quarantine_retry::AttemptResult {
-    match targeted_quarantine_retry_inner(data_dir, key, source) {
-        Ok(result) => result,
-        Err(error) if error_is_out_of_memory(&error) => {
-            quarantine_retry::AttemptResult::OutOfMemory
-        }
-        Err(error) => quarantine_retry::AttemptResult::Failed(error.to_string()),
-    }
-}
-
-fn targeted_quarantine_retry_inner(
-    data_dir: &Path,
-    key: &QuarantineKey,
-    source: Option<&QuarantineRetrySource>,
-) -> Result<quarantine_retry::AttemptResult> {
-    let source = source.context("quarantine retry source metadata is missing")?;
-    if !source.source_path.is_file() {
-        anyhow::bail!(
-            "quarantine retry source is not a readable file: {}",
-            source.source_path.display()
-        );
-    }
-    let kind = ConnectorKind::from_slug(&source.provider).with_context(|| {
-        format!(
-            "quarantine retry does not recognize connector provider {}",
-            source.provider
-        )
-    })?;
-    let connector = kind.create_connector();
-    let root = ScanRoot::local(source.source_path.clone());
-    let context = crate::connectors::ScanContext::with_roots(
-        source.source_path.clone(),
-        vec![root.clone()],
-        None,
-    );
-    let conversations = connector.scan(&context).with_context(|| {
-        format!(
-            "targeted quarantine retry could not parse {}",
-            source.source_path.display()
-        )
-    })?;
-    let mut candidates = conversations
-        .into_iter()
-        .filter(|conversation| {
-            conversation.agent_slug == source.provider
-                && conversation.source_path == source.source_path
-                && source
-                    .started_at
-                    .is_none_or(|started_at| conversation.started_at == Some(started_at))
-                && source
-                    .ended_at
-                    .is_none_or(|ended_at| conversation.ended_at == Some(ended_at))
-                && source
-                    .message_count
-                    .is_none_or(|message_count| conversation.messages.len() == message_count)
-        })
-        .collect::<Vec<_>>();
-    if candidates.len() > 1
-        && let Some(expected_external_id) = source.external_id.as_deref()
-    {
-        candidates.retain(|conversation| {
-            conversation.external_id.as_deref() == Some(expected_external_id)
-        });
-    }
-    if candidates.len() != 1 {
-        anyhow::bail!(
-            "targeted quarantine retry expected exactly one matching conversation in {}, found {}",
-            source.source_path.display(),
-            candidates.len()
-        );
-    }
-    let mut conversation = candidates
-        .into_iter()
-        .next()
-        .context("targeted quarantine retry candidate disappeared")?;
-
-    // The same file may have originally been discovered through a directory
-    // root, while this retry intentionally scans only the exact source. Some
-    // connectors derive external_id/workspace from the scan root, so restore
-    // the canonical identity recorded at quarantine before preparing it again.
-    conversation.external_id.clone_from(&source.external_id);
-    conversation.workspace.clone_from(&source.workspace);
-
-    let origin = Origin::local();
-    prepare_conversation_for_ingest(
-        data_dir,
-        kind.slug(),
-        &origin,
-        Some(&root),
-        &mut conversation,
-    );
-    anyhow::ensure!(
-        poison_conversation_id(&conversation) == key.conversation_id,
-        "targeted quarantine retry identity changed after canonical preparation"
-    );
-    let conversations = [conversation];
-    let db_path = data_dir.join("agent_search.db");
-    let storage = FrankenStorage::open(&db_path)
-        .with_context(|| format!("opening quarantine retry archive {}", db_path.display()))?;
-    storage.run_migrations()?;
-    let index_path = index_dir(data_dir)?;
-    let mut lexical = TantivyIndex::open_or_create(&index_path)?;
-    let outcome = ingest_watch_batch_with_oom_split(
-        &storage,
-        &mut lexical,
-        data_dir,
-        &conversations,
-        &None,
-        true,
-        false,
-    )?;
-
-    if outcome.quarantined_conversations > 0 {
-        return Ok(quarantine_retry::AttemptResult::OutOfMemory);
-    }
-    if outcome.deferred_conversations > 0 {
-        return Ok(quarantine_retry::AttemptResult::Failed(
-            "targeted retry deferred after repeated out-of-memory without attributable host pressure"
-                .to_string(),
-        ));
-    }
-    if outcome.processed_conversations != 1 {
-        return Ok(quarantine_retry::AttemptResult::Failed(format!(
-            "targeted retry processed {} conversations instead of one",
-            outcome.processed_conversations
-        )));
-    }
-    if outcome.batch_outcome.lexical_update_deferred {
-        return Ok(quarantine_retry::AttemptResult::Failed(
-            outcome
-                .batch_outcome
-                .lexical_update_error
-                .unwrap_or_else(|| "targeted retry deferred its lexical update".to_string()),
-        ));
-    }
-    lexical.commit()?;
-    persist::with_ephemeral_writer(
-        &storage,
-        false,
-        "updating targeted quarantine retry last_indexed_at",
-        |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
-    )?;
-    Ok(quarantine_retry::AttemptResult::Reindexed)
-}
-
-/// Read-only dry-run for the live quarantine retry command.
-pub fn plan_quarantine_retry(
-    data_dir: &Path,
-    config: &quarantine_retry::RetryConfig,
-) -> quarantine_retry::RetryPlan {
-    let state = QuarantineState::load(data_dir);
-    let source_missing = quarantine_source_missing_ids(data_dir);
-    quarantine_retry::plan_retry(&state, current_cass_version(), config, &source_missing)
-}
-
-/// Operator-facing bounded quarantine retry (#292 ask #3, `cass quarantine
-/// retry`). Wires the internal bounded retry classifier
-/// ([`quarantine_retry::plan_retry`]) to a CLI action.
-///
-/// This is intentionally bounded: dry-run only classifies entries; `apply`
-/// reparses and persists exactly the quarantined conversation named by each
-/// eligible key. It never substitutes a broad corpus rebuild, never deletes a
-/// source log, and never clears a quarantine record before that exact replay
-/// has durably reached SQLite and the lexical index.
-pub fn run_quarantine_retry(
-    data_dir: &Path,
-    config: &quarantine_retry::RetryConfig,
-    apply: bool,
-) -> Result<quarantine_retry::RetryReport> {
-    let mut state = QuarantineState::load(data_dir);
-    let current_version = current_cass_version();
-    let source_missing = quarantine_source_missing_ids(data_dir);
-    let now = chrono::Utc::now();
-
-    // Plan first (always), so the report reflects the classification even on a
-    // dry run.
-    let plan = quarantine_retry::plan_retry(&state, current_version, config, &source_missing);
-
-    if !apply {
-        // Dry run: synthesize a report from the plan without mutating anything.
-        return Ok(quarantine_retry_report_from_plan(&plan, current_version));
-    }
-
-    let retry_sources = quarantine_retry_sources(data_dir);
-
-    let report = quarantine_retry::execute_retry(
-        &mut state,
-        current_version,
-        config,
-        &source_missing,
-        now,
-        |key| targeted_quarantine_retry(data_dir, key, retry_sources.get(key)),
-    );
-
-    // Persist the structured state (the durable resume checkpoint) and clear the
-    // matching poison JSONL records for cleared conversations.
-    state
-        .save(data_dir)
-        .context("persisting quarantine state after targeted retry")?;
-    let cleared_keys: BTreeSet<(String, i64)> = report
-        .entries
-        .iter()
-        .filter(|entry| entry.outcome == quarantine_retry::RetryOutcome::RetriedCleared)
-        .map(|entry| {
-            (
-                entry.conversation_id.clone(),
-                i64::from(entry.schema_version),
-            )
-        })
-        .collect();
-    if !cleared_keys.is_empty() {
-        for (file_name, reason) in [
-            (WATCH_INGEST_POISON_FILE, "watch-ingest-out-of-memory"),
-            (INDEX_INGEST_POISON_FILE, "index-ingest-out-of-memory"),
-        ] {
-            if let Err(err) =
-                clear_poison_jsonl_key_records(data_dir, file_name, reason, &cleared_keys)
-            {
-                tracing::warn!(
-                    data_dir = %data_dir.display(),
-                    file = file_name,
-                    error = %err,
-                    "failed to clear poison JSONL records after quarantine retry"
-                );
-            }
-        }
-    }
-
-    Ok(report)
-}
-
-/// Build a dry-run [`RetryReport`] from a [`RetryPlan`] without mutating state.
-fn quarantine_retry_report_from_plan(
-    plan: &quarantine_retry::RetryPlan,
-    current_version: &str,
-) -> quarantine_retry::RetryReport {
-    use quarantine_retry::{PlannedDisposition, RetryEntryResult, RetryOutcome};
-    let entries = plan
-        .entries
-        .iter()
-        .map(|entry| {
-            let outcome = match entry.disposition {
-                // On a dry run nothing is attempted; an eligible entry maps to
-                // the action that *would* happen (cleared → re-attempted next
-                // index).
-                PlannedDisposition::Retry => RetryOutcome::RetriedCleared,
-                PlannedDisposition::SkipIrreducible => RetryOutcome::SkippedIrreducible,
-                PlannedDisposition::SkipSourceMissing => RetryOutcome::SkippedSourceMissing,
-                PlannedDisposition::SkipBudgetExhausted => RetryOutcome::SkippedBudgetExhausted,
-            };
-            RetryEntryResult {
-                conversation_id: entry.conversation_id.clone(),
-                schema_version: entry.schema_version,
-                outcome,
-                attempt_count_before: entry.attempt_count,
-                reason: entry.last_reason.clone(),
-            }
-        })
-        .collect();
-    quarantine_retry::RetryReport {
-        current_version: current_version.to_string(),
-        total_quarantined_before: plan.total_quarantined,
-        attempted: 0,
-        cleared: 0,
-        re_quarantined_oom: 0,
-        re_quarantined_failed: 0,
-        skipped_source_missing: plan.skip_source_missing,
-        skipped_irreducible: plan.skip_irreducible,
-        skipped_budget_exhausted: plan.skip_budget_exhausted,
-        remaining_quarantined: plan.total_quarantined,
-        made_progress: false,
-        stalled: false,
-        resume_recommended: plan.resume_recommended,
-        entries,
-        summary: plan.summary.clone(),
-        next_safe_command: plan.next_safe_command.clone(),
-    }
-}
-
 fn ingest_quarantine_circuit_window_seconds() -> i64 {
     dotenvy::var("CASS_INGEST_QUARANTINE_CIRCUIT_WINDOW_SECS")
         .ok()
@@ -23237,20 +21023,6 @@ fn should_inject_watch_ingest_test_oom(_convs: &[NormalizedConversation]) -> boo
     false
 }
 
-/// Force the #298 solo isolate-retry to also OOM, so tests can exercise the
-/// genuine-quarantine path (a conversation that fails even in isolation).
-#[cfg(test)]
-fn should_force_watch_solo_retry_oom() -> bool {
-    dotenvy::var("CASS_TEST_WATCH_SOLO_RETRY_OOM")
-        .map(|value| value == "1")
-        .unwrap_or(false)
-}
-
-#[cfg(not(test))]
-fn should_force_watch_solo_retry_oom() -> bool {
-    false
-}
-
 #[cfg(test)]
 fn should_inject_non_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool {
     dotenvy::var("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS")
@@ -23266,8 +21038,7 @@ fn should_inject_non_watch_ingest_test_oom(_convs: &[NormalizedConversation]) ->
 
 /// Get all available connector factories.
 ///
-/// Delegates to the CASS connector registry, which applies local enrichment
-/// wrappers while preserving upstream FAD factories for all other connectors.
+/// Delegates to `franken_agent_detection::get_connector_factories()`.
 pub use crate::connectors::get_connector_factories;
 
 /// Detect all active roots for watching/scanning.
@@ -23309,7 +21080,6 @@ impl ConnectorKind {
             "codex" => Some(Self::Codex),
             "cline" => Some(Self::Cline),
             "gemini" => Some(Self::Gemini),
-            "antigravity" => Some(Self::Antigravity),
             "claude" => Some(Self::Claude),
             "clawdbot" => Some(Self::Clawdbot),
             "vibe" => Some(Self::Vibe),
@@ -23325,7 +21095,6 @@ impl ConnectorKind {
             "kimi" => Some(Self::Kimi),
             "copilot_cli" => Some(Self::CopilotCli),
             "qwen" => Some(Self::Qwen),
-            "grok" => Some(Self::Grok),
             _ => None,
         }
     }
@@ -23335,7 +21104,6 @@ impl ConnectorKind {
             Self::Codex => "codex",
             Self::Cline => "cline",
             Self::Gemini => "gemini",
-            Self::Antigravity => "antigravity",
             Self::Claude => "claude",
             Self::Clawdbot => "clawdbot",
             Self::Vibe => "vibe",
@@ -23351,7 +21119,6 @@ impl ConnectorKind {
             Self::Kimi => "kimi",
             Self::CopilotCli => "copilot_cli",
             Self::Qwen => "qwen",
-            Self::Grok => "grok",
         }
     }
 
@@ -23362,7 +21129,6 @@ impl ConnectorKind {
             Self::Codex => Box::new(CodexConnector::new()),
             Self::Cline => Box::new(ClineConnector::new()),
             Self::Gemini => Box::new(GeminiConnector::new()),
-            Self::Antigravity => Box::new(AntigravityConnector::new()),
             Self::Claude => Box::new(ClaudeCodeConnector::new()),
             Self::Clawdbot => Box::new(ClawdbotConnector::new()),
             Self::Vibe => Box::new(VibeConnector::new()),
@@ -23378,7 +21144,6 @@ impl ConnectorKind {
             Self::Kimi => Box::new(KimiConnector::new()),
             Self::CopilotCli => Box::new(CopilotCliConnector::new()),
             Self::Qwen => Box::new(QwenConnector::new()),
-            Self::Grok => Box::new(GrokConnector::new()),
         }
     }
 }
@@ -23758,7 +21523,7 @@ fn reindex_paths_with_semantic_delta(
             since_ts,
         );
 
-        let mut ingest_diagnostics = capture_connector_sources_before_parse(
+        capture_connector_sources_before_parse(
             conn.as_ref(),
             &ctx,
             &opts.data_dir,
@@ -23773,7 +21538,6 @@ fn reindex_paths_with_semantic_delta(
         let mut convs = match conn.scan(&ctx) {
             Ok(c) => c,
             Err(e) => {
-                ingest_diagnostics.observe_scan_error(&root.path, e.to_string());
                 tracing::debug!(
                     "watch scan failed for {:?} at {}: {}",
                     kind,
@@ -23804,11 +21568,6 @@ fn reindex_paths_with_semantic_delta(
         }
         let preserve_this_watch_watermark = preserve_watch_watermark || active_sources_skipped > 0;
 
-        for conversation in &mut convs {
-            ingest_diagnostics.observe_conversation(conversation);
-        }
-        record_connector_ingest_report(opts.progress.as_ref(), ingest_diagnostics.finish());
-
         // Provenance injection and path rewriting
         for conv in &mut convs {
             prepare_conversation_for_ingest(
@@ -23826,11 +21585,7 @@ fn reindex_paths_with_semantic_delta(
         // Update total and phase to indexing
         if let Some(p) = &opts.progress {
             p.total.fetch_add(convs.len(), Ordering::Relaxed);
-            // Watch batches accumulate the total as sessions arrive; it is
-            // never a stable denominator.
-            p.total_is_final.store(false, Ordering::Relaxed);
             p.phase.store(2, Ordering::Relaxed);
-            p.tick_activity();
         }
 
         let conv_count = convs.len();
@@ -23861,7 +21616,6 @@ fn reindex_paths_with_semantic_delta(
         let mut inserted_messages = 0usize;
         let mut processed_conversations = 0usize;
         let mut quarantined_conversations = 0usize;
-        let mut deferred_conversations = 0usize;
         {
             let storage = storage
                 .lock()
@@ -23903,8 +21657,6 @@ fn reindex_paths_with_semantic_delta(
                     processed_conversations.saturating_add(chunk_outcome.processed_conversations);
                 quarantined_conversations = quarantined_conversations
                     .saturating_add(chunk_outcome.quarantined_conversations);
-                deferred_conversations =
-                    deferred_conversations.saturating_add(chunk_outcome.deferred_conversations);
                 if let Some(delta) = semantic_delta.as_deref_mut() {
                     delta.extend_from_batch(
                         chunk_outcome.batch_outcome.semantic_delta_inputs,
@@ -23946,18 +21698,14 @@ fn reindex_paths_with_semantic_delta(
                 if !explicit_watch_once
                     && !preserve_this_watch_watermark
                     && chunk_outcome.quarantined_conversations == 0
-                    && chunk_outcome.deferred_conversations == 0
                     && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
                 {
                     save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-                } else if chunk_outcome.quarantined_conversations > 0
-                    || chunk_outcome.deferred_conversations > 0
-                {
+                } else if chunk_outcome.quarantined_conversations > 0 {
                     tracing::info!(
                         ?kind,
                         quarantined_conversations = chunk_outcome.quarantined_conversations,
-                        deferred_conversations = chunk_outcome.deferred_conversations,
-                        "preserving partial watch watermark so quarantined/deferred source can be retried"
+                        "preserving partial watch watermark so quarantined source can be retried"
                     );
                 } else if preserve_this_watch_watermark {
                     tracing::debug!(
@@ -24018,7 +21766,6 @@ fn reindex_paths_with_semantic_delta(
             && conv_count > 0
             && !preserve_this_watch_watermark
             && quarantined_conversations == 0
-            && deferred_conversations == 0
             && let Some(ts_val) = max_ts
         {
             // Once every chunk for this trigger has persisted without poison
@@ -24027,14 +21774,11 @@ fn reindex_paths_with_semantic_delta(
             // timestamps so an unexpected later failure cannot hide
             // unprocessed conversations that share the same source file.
             save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-        } else if !explicit_watch_once
-            && (quarantined_conversations > 0 || deferred_conversations > 0)
-        {
+        } else if !explicit_watch_once && quarantined_conversations > 0 {
             tracing::info!(
                 ?kind,
                 quarantined_conversations,
-                deferred_conversations,
-                "preserving final watch watermark so quarantined/deferred source can be retried"
+                "preserving final watch watermark so quarantined source can be retried"
             );
         } else if !explicit_watch_once && conv_count > 0 && preserve_this_watch_watermark {
             tracing::info!(
@@ -24104,8 +21848,6 @@ enum ConnectorKind {
     Cline,
     #[serde(rename = "gm", alias = "Gemini")]
     Gemini,
-    #[serde(rename = "ag", alias = "Antigravity")]
-    Antigravity,
     #[serde(rename = "cd", alias = "Claude")]
     Claude,
     #[serde(rename = "cb", alias = "Clawdbot")]
@@ -24136,8 +21878,6 @@ enum ConnectorKind {
     CopilotCli,
     #[serde(rename = "qw", alias = "Qwen")]
     Qwen,
-    #[serde(rename = "gk", alias = "Grok")]
-    Grok,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -24832,50 +22572,6 @@ fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
     }
 }
 
-/// Collapse a Claude Code `external_id` to a single canonical rooting so that
-/// the full-rebuild and incremental/watch ingest paths agree on the dedup key
-/// `(source_id, agent_id, external_id)` for the *same* session file (gh #302).
-///
-/// The Claude connector derives `external_id` by stripping the scan root from
-/// the session path. The two ingest paths use *different* scan roots for the
-/// same corpus:
-///
-/// - Full rebuild (`ScanContext::local_default` → `source_roots` →
-///   `projects_root_candidates()`) roots at `~/.claude/projects`, yielding a
-///   bare relative id: `-Users-…-proj/<uuid>.jsonl`.
-/// - The live `--watch` daemon roots at the connector's detected root
-///   (`detect_installed_agents` reports `~/.claude` for `claude`), yielding a
-///   `projects/`-prefixed id: `projects/-Users-…-proj/<uuid>.jsonl`.
-///
-/// Because the two forms differ only by the leading `projects/` segment, the
-/// path that runs second fails to match the existing row and inserts a
-/// duplicate. Canonicalizing to the bare form (the full-rebuild rooting) at this
-/// single ingest chokepoint makes every path produce one stable key, so dedup
-/// matches an existing row instead of accumulating duplicates as the watcher
-/// runs.
-fn canonicalize_claude_external_id(connector_name: &str, conv: &mut NormalizedConversation) {
-    if connector_name != "claude" {
-        return;
-    }
-    let Some(external_id) = conv.external_id.as_ref() else {
-        return;
-    };
-    // The connector emits OS-native separators from `Path::strip_prefix`, so
-    // strip a single leading `projects/` (or `projects\` on Windows) segment.
-    let canonical = external_id
-        .strip_prefix("projects/")
-        .or_else(|| external_id.strip_prefix("projects\\"));
-    if let Some(canonical) = canonical {
-        // Never canonicalize a bare `projects/<uuid>.jsonl` (no intervening
-        // workspace segment) away into a workspace-less id; the real Claude
-        // layout always has a `<workspace-slug>/<uuid>.jsonl` tail, so a stripped
-        // form that still contains a separator is the genuine bare relative id.
-        if canonical.contains('/') || canonical.contains('\\') {
-            conv.external_id = Some(canonical.to_string());
-        }
-    }
-}
-
 fn prepare_conversation_for_ingest(
     data_dir: &Path,
     connector_name: &str,
@@ -24884,7 +22580,6 @@ fn prepare_conversation_for_ingest(
     conv: &mut NormalizedConversation,
 ) {
     inject_provenance(conv, origin);
-    canonicalize_claude_external_id(connector_name, conv);
     if let Some(root) = workspace_rewrite_root {
         apply_workspace_rewrite(conv, root);
     }
@@ -24900,8 +22595,8 @@ fn capture_connector_sources_before_parse(
     fallback_roots: &[ScanRoot],
     since_ts: Option<i64>,
     active_source_filter: &ActiveSessionSourceFilter,
-) -> ConnectorIngestRun {
-    let (observed_sources, discovery_error) = match connector.discover_source_files(ctx) {
+) {
+    match connector.discover_source_files(ctx) {
         Ok(sources) if !sources.is_empty() => {
             let primary_source_count = sources
                 .iter()
@@ -24919,7 +22614,7 @@ fn capture_connector_sources_before_parse(
                     "deferring large primary source raw-mirror capture to per-conversation streaming path"
                 );
             }
-            for source in &sources {
+            for source in sources {
                 if should_skip_active_session_source(
                     active_source_filter,
                     &source.origin.source_id,
@@ -24932,21 +22627,8 @@ fn capture_connector_sources_before_parse(
                 {
                     continue;
                 }
-                capture_discovered_source_file_before_parse(data_dir, provider, source);
+                capture_discovered_source_file_before_parse(data_dir, provider, &source);
             }
-            (
-                sources
-                    .into_iter()
-                    .filter(|source| {
-                        !should_skip_active_session_source(
-                            active_source_filter,
-                            &source.origin.source_id,
-                            &source.source_path,
-                        )
-                    })
-                    .collect(),
-                None,
-            )
         }
         Ok(_) => {
             for root in fallback_roots {
@@ -24958,7 +22640,6 @@ fn capture_connector_sources_before_parse(
                     active_source_filter,
                 );
             }
-            (Vec::new(), None)
         }
         Err(error) => {
             tracing::warn!(
@@ -24975,14 +22656,8 @@ fn capture_connector_sources_before_parse(
                     active_source_filter,
                 );
             }
-            (Vec::new(), Some(error.to_string()))
         }
-    };
-    let mut run = ConnectorIngestRun::begin(provider, data_dir, ctx, &observed_sources);
-    if let Some(error) = discovery_error {
-        run.observe_scan_error(&ctx.data_dir, &error);
     }
-    run
 }
 
 fn should_skip_raw_mirror_capture_for_logical_source(path: &Path) -> bool {
@@ -25497,28 +23172,10 @@ pub mod persist {
     /// twice; this helper walks once and yields a slice of positional
     /// indices that `TantivyIndex::add_messages_from_packet` can use
     /// directly.
-    fn lexical_packet_for_persist(conv: &Conversation) -> ConversationPacket {
-        // #291 Gap A: the incremental/`--watch` inline ingest path materializes the
-        // whole conversation here, so a heavy (image/base64) conversation would
-        // OOM→bisect→quarantine exactly as the `--full` rebuild did before #290.
-        // Apply the same per-conversation lexical content cap that
-        // `fetch_messages_for_lexical_rebuild` applies on the `--full` path, so the
-        // watch daemon truncates indexed text instead of quarantining.
-        ConversationPacket::from_canonical_replay(
+    fn lexical_packet_for_persist(conv: &NormalizedConversation) -> ConversationPacket {
+        ConversationPacket::from_normalized_conversation(
             conv,
-            ConversationPacketProvenance {
-                source_id: conv.source_id.clone(),
-                origin_kind: crate::search::tantivy::normalized_index_origin_kind(
-                    &conv.source_id,
-                    None,
-                ),
-                origin_host: crate::search::tantivy::normalized_index_origin_host(
-                    conv.origin_host.as_deref(),
-                ),
-            },
-        )
-        .capped_for_inline_lexical_index(
-            crate::storage::sqlite::lexical_max_conversation_content_bytes(),
+            ConversationPacketProvenance::local(),
         )
     }
 
@@ -25896,30 +23553,12 @@ pub mod persist {
             .unwrap_or(60_000)
     }
 
-    /// WAL autocheckpoint threshold (pages) for the index writer.
-    ///
-    /// GH#320: bulk-import mode used to disable autocheckpoints entirely
-    /// (`0`), deferring the whole checkpoint to post-publish. That let the
-    /// WAL grow with the corpus (1 GB+ on large fleets) and — because the
-    /// frankensqlite pager keeps WAL-resident state in memory — drove the
-    /// ingest-phase physical footprint to roughly 3.5-4x the WAL size
-    /// (13-14 GB peaks on 16 GB hosts). A bounded-but-large threshold keeps
-    /// bulk import's amortized-checkpoint intent (one checkpoint per
-    /// ~256 MB of WAL at the default 4 KiB page size) while capping the
-    /// WAL-proportional memory. Operators can restore the old unbounded
-    /// behavior with `CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=0`.
-    pub(super) const BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES: i64 = 65_536;
-
     fn index_writer_wal_autocheckpoint_pages(defer_checkpoints: bool) -> i64 {
         dotenvy::var("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
             .filter(|v| *v >= 0)
-            .unwrap_or(if defer_checkpoints {
-                BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES
-            } else {
-                1000
-            })
+            .unwrap_or(if defer_checkpoints { 0 } else { 1000 })
     }
 
     fn defer_lexical_updates_enabled() -> bool {
@@ -25955,89 +23594,6 @@ pub mod persist {
             );
         } else {
             storage.mark_index_writer_busy_timeout_ms(busy_timeout_ms);
-        }
-    }
-
-    /// GH#320: WAL-size threshold (bytes) above which bulk ingest issues a
-    /// passive checkpoint between batches. `0` disables the bound and
-    /// restores the fully-deferred pre-#320 behavior.
-    ///
-    /// Rationale: bulk-import mode defers checkpoints so the hot insert loop
-    /// never stalls on backfill I/O, but a corpus-sized WAL (1-2 GB+ on
-    /// large fleets) drags a proportional slice of pager state into memory
-    /// and makes the single post-publish TRUNCATE checkpoint — the #319/#321
-    /// wedge window — enormous. A passive checkpoint at a batch boundary
-    /// never blocks on readers or writers (it backfills what it safely can
-    /// and returns), so this bounds both costs while keeping checkpoint I/O
-    /// amortized to once per ~half-GB of WAL.
-    pub(super) const BULK_INGEST_WAL_CHECKPOINT_DEFAULT_BYTES: u64 = 512 * 1024 * 1024;
-
-    fn bulk_ingest_wal_checkpoint_threshold_bytes() -> u64 {
-        dotenvy::var("CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(BULK_INGEST_WAL_CHECKPOINT_DEFAULT_BYTES)
-    }
-
-    /// Issue a best-effort `PRAGMA wal_checkpoint(PASSIVE)` on the primary
-    /// storage connection when the bulk-ingest WAL has outgrown the
-    /// configured threshold. Only active in deferred-checkpoint (non-watch)
-    /// mode; watch mode already runs with a small autocheckpoint. Failures
-    /// are logged and swallowed: a missed checkpoint only means the WAL
-    /// stays large until the next boundary or the finalize TRUNCATE.
-    pub(super) fn maybe_checkpoint_bulk_ingest_wal(
-        storage: &FrankenStorage,
-        defer_checkpoints: bool,
-    ) {
-        if !defer_checkpoints {
-            return;
-        }
-        let threshold = bulk_ingest_wal_checkpoint_threshold_bytes();
-        if threshold == 0 {
-            return;
-        }
-        let Ok(db_path) = storage.database_path() else {
-            return;
-        };
-        let mut wal_path = db_path.clone().into_os_string();
-        wal_path.push("-wal");
-        let wal_bytes = match std::fs::metadata(std::path::Path::new(&wal_path)) {
-            Ok(metadata) => metadata.len(),
-            Err(_) => return,
-        };
-        if wal_bytes < threshold {
-            return;
-        }
-        let started = std::time::Instant::now();
-        match storage.raw().query("PRAGMA wal_checkpoint(PASSIVE);") {
-            Ok(rows) => {
-                let status = rows.first().map(|row| {
-                    (
-                        row.get_typed::<i64>(0).unwrap_or(-1),
-                        row.get_typed::<i64>(1).unwrap_or(-1),
-                        row.get_typed::<i64>(2).unwrap_or(-1),
-                    )
-                });
-                let (busy, log_frames, checkpointed_frames) = status.unwrap_or((-1, -1, -1));
-                tracing::info!(
-                    db_path = %db_path.display(),
-                    wal_bytes,
-                    threshold_bytes = threshold,
-                    busy,
-                    log_frames,
-                    checkpointed_frames,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "bulk ingest passive WAL checkpoint (#320 memory/WAL bound)"
-                );
-            }
-            Err(err) => {
-                tracing::debug!(
-                    db_path = %db_path.display(),
-                    wal_bytes,
-                    error = %err,
-                    "bulk ingest passive WAL checkpoint failed; will retry at a later batch boundary"
-                );
-            }
         }
     }
 
@@ -26554,7 +24110,7 @@ pub mod persist {
 
         let mut skip_inline_lexical_updates = false;
         for (idx, outcome) in ordered {
-            let internal_conv = &internal_convs[idx];
+            let conv = &convs[idx];
             batch_outcome.record_insert_outcome(&outcome);
             if defer_lexical_updates || skip_inline_lexical_updates {
                 if capture_semantic_delta {
@@ -26573,7 +24129,7 @@ pub mod persist {
             match lexical_strategy {
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                 LexicalPopulationStrategy::InlineRebuildFromScan => {
-                    let packet = lexical_packet_for_persist(internal_conv);
+                    let packet = lexical_packet_for_persist(conv);
                     t_index
                         .as_deref_mut()
                         .expect("inline rebuild requires Tantivy writer")
@@ -26586,7 +24142,7 @@ pub mod persist {
                 }
                 LexicalPopulationStrategy::IncrementalInline => {
                     if !outcome.inserted_indices.is_empty() {
-                        let packet = lexical_packet_for_persist(internal_conv);
+                        let packet = lexical_packet_for_persist(conv);
                         let positional =
                             positional_indices_for_inserted(&packet, &outcome.inserted_indices);
                         if !positional.is_empty() {
@@ -26773,12 +24329,12 @@ pub mod persist {
         conv: &NormalizedConversation,
     ) -> Result<()> {
         tracing::info!(agent = %conv.agent_slug, messages = conv.messages.len(), "persist_conversation");
-        let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
         } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
+            let internal_conv = map_to_internal(conv);
             let agent = Agent {
                 id: None,
                 slug: conv.agent_slug.clone(),
@@ -26802,7 +24358,7 @@ pub mod persist {
         // ibuuh.32 sink migration; equivalence guaranteed by
         // tests::persist_packet_pipeline_matches_legacy_for_incremental_inline.
         if !defer_lexical_updates_enabled() && !inserted_indices.is_empty() {
-            let packet = lexical_packet_for_persist(&internal_conv);
+            let packet = lexical_packet_for_persist(conv);
             let positional = positional_indices_for_inserted(&packet, &inserted_indices);
             if !positional.is_empty() {
                 t_index.add_messages_from_packet(
@@ -26825,12 +24381,12 @@ pub mod persist {
     ) -> Result<()> {
         let total_started = Instant::now();
         let db_started = Instant::now();
-        let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
         } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
+            let internal_conv = map_to_internal(conv);
             let agent = Agent {
                 id: None,
                 slug: conv.agent_slug.clone(),
@@ -26852,7 +24408,7 @@ pub mod persist {
 
         if !defer_lexical_updates_enabled() && !inserted_indices.is_empty() {
             let packet_started = Instant::now();
-            let packet = lexical_packet_for_persist(&internal_conv);
+            let packet = lexical_packet_for_persist(conv);
             profile.packet_duration += packet_started.elapsed();
 
             let positional_started = Instant::now();
@@ -27018,13 +24574,11 @@ pub mod persist {
                 let cache_enabled = IndexingCache::is_enabled();
                 let mut cache = IndexingCache::new();
 
-                // Prepare data for batched insert without consuming the canonical
-                // conversations: the same redacted payload must feed both SQLite
-                // and the derived lexical sink after the transaction commits.
-                let mut prepared: Vec<(i64, Option<i64>, &Conversation)> =
+                // Prepare data for batched insert: (agent_id, workspace_id, Conversation)
+                let mut prepared: Vec<(i64, Option<i64>, Conversation)> =
                     Vec::with_capacity(convs.len());
 
-                for (conv, internal_conv) in convs.iter().zip(internal_convs.iter()) {
+                for (conv, internal_conv) in convs.iter().zip(internal_convs) {
                     let agent = Agent {
                         id: None,
                         slug: conv.agent_slug.clone(),
@@ -27064,12 +24618,14 @@ pub mod persist {
                     );
                 }
 
-                let chunk_size = serial_batch_chunk_size().min(prepared.len().max(1));
-                let mut outcomes = Vec::with_capacity(prepared.len());
+                let refs: Vec<(i64, Option<i64>, &Conversation)> =
+                    prepared.iter().map(|(a, w, c)| (*a, *w, c)).collect();
+                let chunk_size = serial_batch_chunk_size().min(refs.len().max(1));
+                let mut outcomes = Vec::with_capacity(refs.len());
 
-                for start in (0..prepared.len()).step_by(chunk_size) {
-                    let end = (start + chunk_size).min(prepared.len());
-                    let chunk_refs = &prepared[start..end];
+                for start in (0..refs.len()).step_by(chunk_size) {
+                    let end = (start + chunk_size).min(refs.len());
+                    let chunk_refs = &refs[start..end];
                     outcomes.extend(writer.insert_conversations_batched(chunk_refs)?);
                 }
 
@@ -27086,7 +24642,7 @@ pub mod persist {
             // set) and IncrementalInline (positional subset derived
             // from outcome.inserted_indices).
             let mut skip_inline_lexical_updates = false;
-            for (internal_conv, outcome) in internal_convs.iter().zip(outcomes.iter()) {
+            for (conv, outcome) in convs.iter().zip(outcomes.iter()) {
                 batch_outcome.record_insert_outcome(outcome);
                 if skip_inline_lexical_updates {
                     continue;
@@ -27094,7 +24650,7 @@ pub mod persist {
                 match lexical_strategy {
                     LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                     LexicalPopulationStrategy::InlineRebuildFromScan => {
-                        let packet = lexical_packet_for_persist(internal_conv);
+                        let packet = lexical_packet_for_persist(conv);
                         t_index
                             .as_deref_mut()
                             .expect("inline rebuild requires Tantivy writer")
@@ -27107,7 +24663,7 @@ pub mod persist {
                     }
                     LexicalPopulationStrategy::IncrementalInline => {
                         if !outcome.inserted_indices.is_empty() {
-                            let packet = lexical_packet_for_persist(internal_conv);
+                            let packet = lexical_packet_for_persist(conv);
                             let positional =
                                 positional_indices_for_inserted(&packet, &outcome.inserted_indices);
                             if !positional.is_empty() {
@@ -27302,13 +24858,7 @@ pub mod persist {
         #[serial]
         fn wal_autocheckpoint_defaults_follow_bulk_import_mode() {
             let _guard = set_env("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES", "-1");
-            // GH#320: bulk import is bounded (not 0/unbounded) so the WAL —
-            // and the pager memory that scales with it — cannot grow with
-            // the corpus during a full ingest.
-            assert_eq!(
-                index_writer_wal_autocheckpoint_pages(true),
-                BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES
-            );
+            assert_eq!(index_writer_wal_autocheckpoint_pages(true), 0);
             assert_eq!(index_writer_wal_autocheckpoint_pages(false), 1000);
         }
 
@@ -27529,14 +25079,8 @@ pub mod persist {
             apply_index_writer_checkpoint_policy(&storage, true);
             let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(
-                rows[0].get(0).unwrap(),
-                &SqliteValue::Integer(BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
-            );
-            assert_eq!(
-                storage.index_writer_checkpoint_pages(),
-                Some(BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
-            );
+            assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+            assert_eq!(storage.index_writer_checkpoint_pages(), Some(0));
 
             apply_index_writer_checkpoint_policy(&storage, false);
             let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
@@ -28029,40 +25573,6 @@ pub mod persist {
             );
         }
 
-        /// #289: the run-level probe binding used to hardcode
-        /// `authoritative_rebuild_required: true`, so every plain populated
-        /// incremental over the DB-size cap reported a deferred repair probe
-        /// even when no rebuild was required — which suppressed the
-        /// end-of-run checkpoint refresh (including the cheap metadata-only
-        /// bootstrap of a missing checkpoint) forever on large archives.
-        #[test]
-        #[serial]
-        fn large_incremental_repair_probe_not_deferred_when_no_rebuild_required() {
-            let _max_guard = set_env(
-                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
-                "8",
-            );
-            let _force_guard = set_env("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR", "0");
-            let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("agent_search.db");
-            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
-            let opts =
-                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
-
-            assert_eq!(
-                crate::indexer::should_defer_incremental_authoritative_lexical_repair(
-                    &opts,
-                    false,
-                    42,
-                    false,
-                    Some(7),
-                ),
-                None,
-                "a healthy lexical index must not report a deferred repair probe; \
-                 the final checkpoint refresh (and missing-checkpoint bootstrap) depends on it"
-            );
-        }
-
         #[test]
         #[serial]
         fn small_incremental_authoritative_lexical_repair_keeps_automatic_repair() {
@@ -28332,7 +25842,6 @@ pub mod persist {
                 targeted_watch_once_only: false,
                 salvage_messages_imported: 0,
                 canonical_messages: 0,
-                expected_lexical_docs: 0,
                 tantivy_requires_rebuild: true,
                 observed_tantivy_docs: None,
                 published_index_validated_for_current_data: false,
@@ -28393,7 +25902,6 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
-                        expected_lexical_docs: 42,
                         tantivy_requires_rebuild: true,
                         observed_tantivy_docs: None,
                         published_index_validated_for_current_data: false,
@@ -28418,7 +25926,6 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
-                        expected_lexical_docs: 42,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(3),
                         published_index_validated_for_current_data: false,
@@ -28486,72 +25993,12 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
-                        expected_lexical_docs: 42,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(42),
                         published_index_validated_for_current_data: false,
                     },
                 ),
                 None
-            );
-        }
-
-        #[test]
-        fn incremental_canonical_lexical_repair_plan_healthy_when_gap_is_only_hard_noise() {
-            // cass#317: the lexical sink drops hard-noise messages (empty /
-            // tool-acks), so a perfectly healthy live index has
-            // `expected_lexical_docs` docs (< raw `canonical_messages`). The
-            // observed doc count matching that noise-adjusted expectation must
-            // NOT be treated as sparse — otherwise a corpus with any tool-ack
-            // traffic rebuilds authoritatively on every index/watch run.
-            assert_eq!(
-                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
-                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
-                        full_refresh: false,
-                        force_rebuild: false,
-                        resume_lexical_rebuild: false,
-                        targeted_watch_once_only: false,
-                        salvage_messages_imported: 0,
-                        // 100 messages, 37 of them hard-noise → 63 expected docs.
-                        canonical_messages: 100,
-                        expected_lexical_docs: 63,
-                        tantivy_requires_rebuild: false,
-                        // The live index holds exactly the non-noise docs.
-                        observed_tantivy_docs: Some(63),
-                        published_index_validated_for_current_data: false,
-                    },
-                ),
-                None,
-                "a doc count equal to the noise-adjusted expectation is healthy, not sparse (#317)"
-            );
-        }
-
-        #[test]
-        fn incremental_canonical_lexical_repair_plan_repairs_real_loss_below_noise_expectation() {
-            // A genuine loss — observed BELOW the noise-adjusted expectation —
-            // must still repair. Subtracting hard-noise must not mask real doc
-            // loss: 63 expected, only 40 observed → repair.
-            assert_eq!(
-                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
-                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
-                        full_refresh: false,
-                        force_rebuild: false,
-                        resume_lexical_rebuild: false,
-                        targeted_watch_once_only: false,
-                        salvage_messages_imported: 0,
-                        canonical_messages: 100,
-                        expected_lexical_docs: 63,
-                        tantivy_requires_rebuild: false,
-                        observed_tantivy_docs: Some(40),
-                        published_index_validated_for_current_data: false,
-                    },
-                ),
-                Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
-                    canonical_messages: 100,
-                    observed_tantivy_docs: Some(40),
-                    reason: "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan",
-                }),
-                "loss below the noise-adjusted expectation must still repair (#317)"
             );
         }
 
@@ -28567,7 +26014,6 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
-                        expected_lexical_docs: 42,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(3),
                         published_index_validated_for_current_data: true,
@@ -28592,7 +26038,6 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
-                        expected_lexical_docs: 42,
                         tantivy_requires_rebuild: true,
                         observed_tantivy_docs: None,
                         published_index_validated_for_current_data: true,
@@ -28834,140 +26279,6 @@ pub mod persist {
             }
 
             t_index.commit().unwrap();
-        }
-
-        #[test]
-        #[serial]
-        fn incremental_lexical_redaction_matches_canonical_rebuild() {
-            use crate::search::query::{FieldMask, SearchClient, SearchFilters};
-
-            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
-            let _defer_guard = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
-            let _redact_guard = set_env("CASS_REDACT_SECRETS", "1");
-
-            let dir = tempfile::TempDir::new().unwrap();
-            let data_dir = dir.path().join("data");
-            std::fs::create_dir_all(&data_dir).unwrap();
-            let db_path = data_dir.join("agent_search.db");
-            let index_path = crate::search::tantivy::index_dir(&data_dir).unwrap();
-
-            let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
-            // Joined at compile time from two literals (no contiguous source literal)
-            // so the value still exercises redaction without tripping secret scanners.
-            let secret = concat!("sk_live_", "ABCdef0123456789AAAAbbbb0007");
-            let secret_tail = secret.trim_start_matches("sk_live_");
-            let safe_canary = "canary0007";
-            let conv = NormalizedConversation {
-                agent_slug: "codex".to_string(),
-                external_id: Some("incremental-redaction".to_string()),
-                title: Some(format!("Sensitive title {secret}")),
-                workspace: Some(std::path::PathBuf::from("/work/private")),
-                source_path: std::path::PathBuf::from("/logs/private-session.jsonl"),
-                started_at: Some(1_700_000_000_000),
-                ended_at: Some(1_700_000_001_000),
-                metadata: serde_json::json!({
-                    "cass": {
-                        "origin": {
-                            "source_id": "work-laptop",
-                            "kind": "ssh",
-                            "host": "devbox"
-                        }
-                    }
-                }),
-                messages: vec![NormalizedMessage {
-                    idx: 0,
-                    role: "user".to_string(),
-                    author: Some("tester".to_string()),
-                    created_at: Some(1_700_000_000_000),
-                    content: format!("safe marker {safe_canary}; secret {secret}"),
-                    extra: serde_json::json!({"credential": secret}),
-                    snippets: Vec::new(),
-                    invocations: Vec::new(),
-                }],
-            };
-
-            persist_conversations_batched(
-                &storage,
-                Some(&mut t_index),
-                &[conv],
-                LexicalPopulationStrategy::IncrementalInline,
-                false,
-            )
-            .expect("incremental persistence should succeed");
-            t_index.commit().unwrap();
-            drop(t_index);
-
-            let stable_hit = |client: &SearchClient| {
-                let leaked = client
-                    .search(
-                        secret_tail,
-                        SearchFilters::default(),
-                        10,
-                        0,
-                        FieldMask::FULL,
-                    )
-                    .unwrap();
-                assert!(
-                    leaked.is_empty(),
-                    "the raw secret tail must not be searchable: {leaked:?}"
-                );
-
-                let hits = client
-                    .search(
-                        safe_canary,
-                        SearchFilters::default(),
-                        10,
-                        0,
-                        FieldMask::FULL,
-                    )
-                    .unwrap();
-                assert_eq!(hits.len(), 1, "safe canary should find one redacted hit");
-                let hit = &hits[0];
-                for (field, value) in [
-                    ("title", hit.title.as_str()),
-                    ("snippet", hit.snippet.as_str()),
-                    ("content", hit.content.as_str()),
-                ] {
-                    assert!(
-                        !value.contains(secret) && !value.contains(secret_tail),
-                        "{field} leaked raw secret material: {value}"
-                    );
-                }
-                (
-                    hit.title.clone(),
-                    hit.snippet.clone(),
-                    hit.content.clone(),
-                    hit.source_path.clone(),
-                    hit.agent.clone(),
-                    hit.workspace.clone(),
-                    hit.workspace_original.clone(),
-                    hit.created_at,
-                    hit.line_number,
-                    hit.source_id.clone(),
-                    hit.origin_kind.clone(),
-                    hit.origin_host.clone(),
-                )
-            };
-
-            let incremental_client = SearchClient::open(&index_path, None)
-                .unwrap()
-                .expect("incremental lexical reader");
-            let incremental_hit = stable_hit(&incremental_client);
-            drop(incremental_client);
-
-            let rebuild = crate::indexer::rebuild_tantivy_from_db(&db_path, &data_dir, 1, None)
-                .expect("canonical lexical rebuild should succeed");
-            assert_eq!(rebuild.indexed_docs, 1);
-
-            let rebuilt_client = SearchClient::open(&index_path, None)
-                .unwrap()
-                .expect("rebuilt lexical reader");
-            let rebuilt_hit = stable_hit(&rebuilt_client);
-            assert_eq!(
-                incremental_hit, rebuilt_hit,
-                "incremental and canonical-rebuild hits must agree on stable fields"
-            );
         }
 
         #[test]
@@ -29953,7 +27264,7 @@ pub mod persist {
                 ],
             };
 
-            let packet = lexical_packet_for_persist(&map_to_internal(&conv));
+            let packet = lexical_packet_for_persist(&conv);
             assert_eq!(
                 packet.payload.messages.len(),
                 3,
@@ -30014,7 +27325,7 @@ pub mod persist {
 mod tests {
     use super::*;
     use crate::connectors::{
-        Connector, DetectionResult, NormalizedConversation, NormalizedMessage, ScanContext,
+        Connector, DetectionResult, NormalizedConversation, NormalizedMessage,
     };
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::sources::provenance::SourceKind;
@@ -31342,38 +28653,6 @@ mod tests {
             snapshot.last_progress_at_ms,
             Some(value),
             "snapshot reader must surface last_progress_at_ms; #258 stall detector is inert otherwise",
-        );
-
-        drop(guard);
-        Ok(())
-    }
-
-    #[test]
-    fn issue_342_semantic_index_lock_identifies_rebuild_job_and_phase() -> Result<()> {
-        use crate::search::asset_state::read_search_maintenance_snapshot;
-
-        let tmp = TempDir::new()?;
-        let db_path = tmp.path().join("agent_search.db");
-        std::fs::write(&db_path, b"placeholder")?;
-        let mut guard = acquire_index_run_lock_with_job_kind(
-            tmp.path(),
-            &db_path,
-            SearchMaintenanceMode::Index,
-            SearchMaintenanceJobKind::SemanticRebuild,
-        )?;
-        guard.set_phase(SearchMaintenanceMode::Index, "semantic:embedding")?;
-
-        let snapshot = read_search_maintenance_snapshot(tmp.path());
-        assert_eq!(
-            snapshot.job_kind,
-            Some(SearchMaintenanceJobKind::SemanticRebuild)
-        );
-        assert_eq!(snapshot.phase.as_deref(), Some("semantic:embedding"));
-        assert!(
-            snapshot
-                .job_id
-                .as_deref()
-                .is_some_and(|job_id| job_id.starts_with("semantic_rebuild-"))
         );
 
         drop(guard);
@@ -34029,7 +31308,6 @@ mod tests {
             2,
             &merge_work_tx,
             &merge_result_rx,
-            None,
         )
         .unwrap();
         assert_eq!(reduced.len(), 1);
@@ -36052,233 +33330,6 @@ mod tests {
     }
 
     #[test]
-    fn lexical_rebuild_responsiveness_controller_promotes_startup_on_budget_wait() {
-        let startup_budget =
-            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
-        let steady_budget =
-            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
-        let mut controller = LexicalRebuildResponsivenessController::new(
-            LexicalRebuildResponsivenessPolicy::Auto,
-            startup_budget,
-            steady_budget,
-            2,
-            true,
-            None,
-            None,
-        );
-
-        assert_eq!(controller.mode(), "startup");
-        assert_eq!(controller.current_budget(), startup_budget);
-        assert!(controller.waits_for_first_durable_commit());
-
-        let stalled_runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            producer_budget_wait_count: 1,
-            producer_budget_wait_ms: 7,
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-        let transition = controller
-            .observe_runtime(&stalled_runtime)
-            .expect("startup producer budget wait should promote before durable commit");
-        assert_eq!(transition.old_budget, startup_budget);
-        assert_eq!(transition.new_budget, steady_budget);
-        assert_eq!(transition.mode, "steady");
-        assert!(
-            transition.reason.contains(
-                "startup_producer_budget_wait_count_1_promoted_steady_budget_before_first_durable_commit"
-            ),
-            "unexpected transition reason: {}",
-            transition.reason
-        );
-        assert_eq!(controller.current_budget(), steady_budget);
-        assert!(!controller.waits_for_first_durable_commit());
-        assert!(
-            controller.record_first_durable_commit().is_none(),
-            "the later durable checkpoint should not double-promote"
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_responsiveness_controller_promotes_startup_on_active_budget_waiter() {
-        let startup_budget =
-            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
-        let steady_budget =
-            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
-        let mut controller = LexicalRebuildResponsivenessController::new(
-            LexicalRebuildResponsivenessPolicy::Auto,
-            startup_budget,
-            steady_budget,
-            2,
-            true,
-            None,
-            None,
-        );
-
-        let stalled_runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            producer_budget_waiter_count: 1,
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-        let transition = controller
-            .observe_runtime(&stalled_runtime)
-            .expect("active startup budget waiter should promote before the wait completes");
-        assert_eq!(transition.old_budget, startup_budget);
-        assert_eq!(transition.new_budget, steady_budget);
-        assert_eq!(transition.mode, "steady");
-        assert!(
-            transition.reason.contains(
-                "startup_active_producer_budget_waiters_1_promoted_steady_budget_before_first_durable_commit"
-            ),
-            "unexpected transition reason: {}",
-            transition.reason
-        );
-        assert_eq!(controller.current_budget(), steady_budget);
-    }
-
-    #[test]
-    fn lexical_rebuild_idle_refresh_promotes_startup_waiter_budget() {
-        let startup_budget =
-            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 64);
-        let steady_budget =
-            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
-        let mut controller = LexicalRebuildResponsivenessController::new(
-            LexicalRebuildResponsivenessPolicy::Auto,
-            startup_budget,
-            steady_budget,
-            2,
-            true,
-            None,
-            None,
-        );
-        let flow_limiter = Arc::new(StreamingByteLimiter::new(
-            startup_budget.max_message_bytes_in_flight,
-        ));
-        let first_reservation = flow_limiter
-            .acquire(startup_budget.max_message_bytes_in_flight)
-            .unwrap();
-        let (ready_tx, ready_rx) = bounded(1);
-        let (result_tx, result_rx) = bounded(1);
-        let waiter = {
-            let flow_limiter = Arc::clone(&flow_limiter);
-            thread::spawn(move || {
-                ready_tx.send(()).unwrap();
-                let reservation = flow_limiter.acquire(1).map_err(|err| err.to_string());
-                if let Ok(reserved_bytes) = reservation {
-                    flow_limiter.release(reserved_bytes);
-                    result_tx.send(Ok(reserved_bytes)).unwrap();
-                } else {
-                    result_tx.send(reservation).unwrap();
-                }
-            })
-        };
-        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        for _ in 0..100 {
-            if flow_limiter.active_waiter_count() > 0 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        if flow_limiter.active_waiter_count() != 1 {
-            flow_limiter.close();
-            flow_limiter.release(first_reservation);
-            let _ = result_rx.recv_timeout(Duration::from_secs(1));
-            waiter.join().unwrap();
-            panic!("expected one producer to be parked on startup byte budget");
-        }
-
-        let producer_telemetry = LexicalRebuildProducerTelemetry::default();
-        let pipeline_budget_controller =
-            LexicalRebuildPipelineBudgetController::new(startup_budget);
-        let mut latest_runtime = LexicalRebuildPipelineRuntimeSnapshot::default();
-        let mut current_batch_conversation_limit = startup_budget.page_conversation_limit;
-        let mut commit_interval_conversations = startup_budget.commit_interval_conversations;
-        let mut commit_interval_messages = startup_budget.commit_interval_messages;
-        let mut commit_interval_message_bytes = startup_budget.commit_interval_message_bytes;
-        refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
-            &mut latest_runtime,
-            None,
-            flow_limiter.as_ref(),
-            Some(&producer_telemetry),
-            &mut controller,
-            &pipeline_budget_controller,
-            &mut current_batch_conversation_limit,
-            Some((
-                &mut commit_interval_conversations,
-                &mut commit_interval_messages,
-                &mut commit_interval_message_bytes,
-            )),
-            LexicalRebuildPipelineSinkRuntimeSnapshot::new(0, 0, 0),
-        );
-
-        assert_eq!(controller.mode(), "steady");
-        assert_eq!(
-            flow_limiter.max_bytes_in_flight(),
-            steady_budget.max_message_bytes_in_flight
-        );
-        match result_rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(Ok(reservation)) => assert_eq!(reservation, 1),
-            Ok(Err(err)) => {
-                flow_limiter.release(first_reservation);
-                waiter.join().unwrap();
-                panic!("startup budget waiter failed before idle refresh woke it: {err}");
-            }
-            Err(err) => {
-                flow_limiter.close();
-                flow_limiter.release(first_reservation);
-                waiter.join().unwrap();
-                panic!("startup budget waiter was not woken by idle refresh: {err}");
-            }
-        }
-        flow_limiter.release(first_reservation);
-        waiter.join().unwrap();
-        assert_eq!(flow_limiter.active_waiter_count(), 0);
-        assert_eq!(
-            current_batch_conversation_limit,
-            steady_budget.page_conversation_limit
-        );
-        assert_eq!(
-            (
-                commit_interval_conversations,
-                commit_interval_messages,
-                commit_interval_message_bytes,
-            ),
-            (
-                steady_budget.commit_interval_conversations,
-                steady_budget.commit_interval_messages,
-                steady_budget.commit_interval_message_bytes,
-            )
-        );
-    }
-
-    #[test]
-    fn lexical_rebuild_responsiveness_controller_keeps_startup_on_live_inflight_cap_without_wait() {
-        let startup_budget =
-            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
-        let steady_budget =
-            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
-        let mut controller = LexicalRebuildResponsivenessController::new(
-            LexicalRebuildResponsivenessPolicy::Auto,
-            startup_budget,
-            steady_budget,
-            2,
-            true,
-            None,
-            None,
-        );
-
-        let stalled_runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            inflight_message_bytes: startup_budget.max_message_bytes_in_flight,
-            max_message_bytes_in_flight: startup_budget.max_message_bytes_in_flight,
-            active_page_prep_jobs: 1,
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-        assert!(
-            controller.observe_runtime(&stalled_runtime).is_none(),
-            "startup cap fullness alone is normal bounded backpressure, not starvation"
-        );
-        assert_eq!(controller.mode(), "startup");
-        assert_eq!(controller.current_budget(), startup_budget);
-    }
-
-    #[test]
     fn lexical_rebuild_responsiveness_controller_honors_pinned_conservative_mode() {
         let startup_budget =
             LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
@@ -36302,20 +33353,6 @@ mod tests {
             controller
                 .observe_runtime(&LexicalRebuildPipelineRuntimeSnapshot::default())
                 .is_none()
-        );
-        assert!(
-            controller
-                .observe_runtime(&LexicalRebuildPipelineRuntimeSnapshot {
-                    inflight_message_bytes: startup_budget.max_message_bytes_in_flight,
-                    max_message_bytes_in_flight: startup_budget.max_message_bytes_in_flight,
-                    active_page_prep_jobs: 1,
-                    producer_budget_wait_count: 1,
-                    producer_budget_wait_ms: 7,
-                    producer_budget_waiter_count: 1,
-                    ..LexicalRebuildPipelineRuntimeSnapshot::default()
-                })
-                .is_none(),
-            "pinned conservative mode must ignore startup escape telemetry"
         );
         assert_eq!(controller.current_budget(), startup_budget);
     }
@@ -36648,86 +33685,6 @@ mod tests {
             }
         }
         handle.join().unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn lexical_rebuild_packet_producer_skips_first_promotion_wait_after_early_generation_update() {
-        let _wait = set_env("CASS_TANTIVY_REBUILD_FIRST_BUDGET_PROMOTION_WAIT_MS", "25");
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("producer-early-budget-promotion.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_lexical_rebuild_fixture(&storage);
-        drop(storage);
-
-        let startup_budget =
-            lexical_rebuild_runtime_pipeline_budget_snapshot(1, 2, 1024, 2, 1, 1, 1);
-        let steady_budget =
-            lexical_rebuild_runtime_pipeline_budget_snapshot(2, 32, 64 * 1024, 2, 16, 32, 64);
-        let pipeline_budget_controller =
-            Arc::new(LexicalRebuildPipelineBudgetController::new(startup_budget));
-        let first_budget_promotion_wait = Some(LexicalRebuildFirstBudgetPromotionWait {
-            generation: pipeline_budget_controller.generation(),
-            commit_interval_conversations: startup_budget.commit_interval_conversations,
-            commit_interval_messages: startup_budget.commit_interval_messages,
-            commit_interval_message_bytes: startup_budget.commit_interval_message_bytes,
-        });
-        pipeline_budget_controller.update(steady_budget);
-
-        let logs = capture_logs(|| {
-            let (tx, rx) = bounded::<LexicalRebuildPipelineMessage>(2);
-            let flow_limiter = Arc::new(StreamingByteLimiter::new(
-                steady_budget.max_message_bytes_in_flight,
-            ));
-            let handle = spawn_lexical_rebuild_packet_producer(
-                db_path,
-                None,
-                None,
-                LEXICAL_REBUILD_PAGE_SIZE,
-                2,
-                first_budget_promotion_wait,
-                pipeline_budget_controller,
-                tx,
-                flow_limiter.clone(),
-                None,
-                Arc::new(LexicalRebuildProducerTelemetry::default()),
-            );
-
-            let mut batches = 0usize;
-            loop {
-                match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                    LexicalRebuildPipelineMessage::Batch(batch) => {
-                        batches = batches.saturating_add(1);
-                        release_lexical_rebuild_prepared_page_reservation(
-                            &batch,
-                            flow_limiter.as_ref(),
-                        );
-                    }
-                    LexicalRebuildPipelineMessage::Done => break,
-                    LexicalRebuildPipelineMessage::Error(error) => {
-                        panic!("producer returned error: {error}")
-                    }
-                }
-            }
-            handle.join().unwrap();
-            assert!(batches > 0);
-            assert_eq!(flow_limiter.bytes_in_flight(), 0);
-        });
-
-        assert!(
-            logs.contains(
-                "lexical rebuild producer observed first budget promotion before waiting"
-            ),
-            "producer should recognize an already-advanced budget generation without parking: {logs}"
-        );
-        assert!(
-            !logs.contains("lexical rebuild producer waiting for first durable budget promotion"),
-            "producer must not enter the old timeout path after an early generation update: {logs}"
-        );
-        assert!(
-            !logs.contains("timed out waiting for first durable budget promotion"),
-            "producer must not pay even the bounded first-promotion timeout: {logs}"
-        );
     }
 
     #[test]
@@ -37894,45 +34851,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_byte_limiter_reports_active_capacity_waiter() {
-        let limiter = Arc::new(StreamingByteLimiter::new(64));
-        let first = limiter.acquire(64).unwrap();
-        let (ready_tx, ready_rx) = bounded(1);
-        let (result_tx, result_rx) = bounded(1);
-        let waiter = {
-            let limiter = limiter.clone();
-            thread::spawn(move || {
-                ready_tx.send(()).unwrap();
-                let second = limiter.acquire(1).unwrap();
-                result_tx.send(second).unwrap();
-                limiter.release(second);
-            })
-        };
-
-        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        for _ in 0..100 {
-            if limiter.active_waiter_count() > 0 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            limiter.active_waiter_count(),
-            1,
-            "a producer parked on byte capacity must be visible before the wait completes"
-        );
-
-        limiter.release(first);
-        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
-        waiter.join().unwrap();
-        assert_eq!(
-            limiter.active_waiter_count(),
-            0,
-            "active waiter count must clear after the producer wakes"
-        );
-    }
-
-    #[test]
     fn streaming_byte_limiter_close_wakes_waiters() {
         let limiter = Arc::new(StreamingByteLimiter::new(64));
         let first = limiter.acquire(64).unwrap();
@@ -37952,17 +34870,6 @@ mod tests {
             result_rx.try_recv().is_err(),
             "waiter should remain blocked until the limiter is closed"
         );
-        for _ in 0..100 {
-            if limiter.active_waiter_count() > 0 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            limiter.active_waiter_count(),
-            1,
-            "waiter should be counted while blocked before close"
-        );
 
         limiter.close();
         let error = result_rx
@@ -37972,11 +34879,6 @@ mod tests {
         assert!(error.contains("closed"));
         limiter.release(first);
         waiter.join().unwrap();
-        assert_eq!(
-            limiter.active_waiter_count(),
-            0,
-            "active waiter count must clear when close wakes the blocked producer"
-        );
     }
 
     #[test]
@@ -38012,19 +34914,15 @@ mod tests {
     fn lexical_rebuild_reservation_order_keeps_later_pages_from_spending_budget_first() {
         let order = Arc::new(LexicalRebuildReservationOrder::new());
         let limiter = Arc::new(StreamingByteLimiter::new(64));
-        let telemetry = Arc::new(LexicalRebuildProducerTelemetry::default());
         let (ready_tx, ready_rx) = bounded(1);
         let (result_tx, result_rx) = bounded(1);
         let waiter = {
             let order = order.clone();
             let limiter = limiter.clone();
-            let telemetry = telemetry.clone();
             thread::spawn(move || {
                 ready_tx.send(()).unwrap();
-                let (reserved, _, _) = acquire_ordered_lexical_rebuild_page_budget(
-                    &order, &limiter, &telemetry, 1, 64,
-                )
-                .unwrap();
+                let (reserved, _, _) =
+                    acquire_ordered_lexical_rebuild_page_budget(&order, &limiter, 1, 64).unwrap();
                 result_tx.send(reserved).unwrap();
             })
         };
@@ -38039,22 +34937,9 @@ mod tests {
             0,
             "later pages must not reserve bytes before earlier sequences"
         );
-        let waiting_turn_deadline = Instant::now() + Duration::from_secs(2);
-        while telemetry.snapshot().producer_state
-            != LexicalRebuildProducerParkSite::WaitingTurn as u8
-            && Instant::now() < waiting_turn_deadline
-        {
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(
-            telemetry.snapshot().producer_state,
-            LexicalRebuildProducerParkSite::WaitingTurn as u8,
-            "a parked ordered reservation must publish the waiting_turn park site (#288)"
-        );
 
         let (first, _, _) =
-            acquire_ordered_lexical_rebuild_page_budget(&order, &limiter, &telemetry, 0, 1)
-                .unwrap();
+            acquire_ordered_lexical_rebuild_page_budget(&order, &limiter, 0, 1).unwrap();
         assert_eq!(first, 1);
         assert_eq!(limiter.bytes_in_flight(), 1);
         assert!(
@@ -38066,207 +34951,6 @@ mod tests {
         assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 64);
         limiter.release(64);
         waiter.join().unwrap();
-        assert_eq!(
-            telemetry.snapshot().producer_state,
-            LexicalRebuildProducerParkSite::Idle as u8,
-            "a completed ordered acquisition must settle the park site back to idle"
-        );
-        assert_eq!(
-            telemetry.snapshot().reservation_next_sequence,
-            2,
-            "the reservation barrier mirror must track the next admissible sequence"
-        );
-    }
-
-    /// #288 regression: a panic inside a page-prep worker must surface as a
-    /// `LexicalRebuildPagePrepResult::Error` on the result channel. Before
-    /// the catch_unwind containment, the panicking thread unwound silently,
-    /// the surviving workers kept the result channel open, and the producer
-    /// parked forever at `result_rx.recv()` — exactly the reporter's
-    /// all-parked thread dump (queue_depth=0, active_page_prep_jobs=0,
-    /// inflight=0).
-    #[test]
-    #[serial]
-    fn page_prep_worker_panic_surfaces_as_error_result_instead_of_parking_producer() {
-        let tmp = TempDir::new().unwrap();
-        let db_path = tmp.path().join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        storage.close().unwrap();
-
-        let worker_count = 2usize;
-        let (work_tx, work_rx) = bounded::<LexicalRebuildPagePrepWork>(worker_count);
-        let (result_tx, result_rx) = bounded::<LexicalRebuildPagePrepResult>(worker_count);
-        let flow_limiter = Arc::new(StreamingByteLimiter::new(1024));
-        let reservation_order = Arc::new(LexicalRebuildReservationOrder::new());
-        let telemetry = Arc::new(LexicalRebuildProducerTelemetry::default());
-        let worker_handles = spawn_lexical_rebuild_page_prep_workers(
-            worker_count,
-            db_path,
-            Arc::new(HashMap::new()),
-            work_rx,
-            result_tx,
-            Arc::clone(&flow_limiter),
-            Arc::clone(&reservation_order),
-            Arc::clone(&telemetry),
-            None,
-        )
-        .unwrap();
-
-        LEXICAL_REBUILD_PAGE_PREP_INJECTED_PANIC.store(true, Ordering::SeqCst);
-        work_tx
-            .send(LexicalRebuildPagePrepWork {
-                sequence: 0,
-                conversation_page: Vec::new(),
-                page_last_conversation_id: 0,
-                configured_page_size: 16,
-                planned_shard_index: None,
-                finishes_planned_shard: false,
-                conversation_list_duration: Duration::ZERO,
-                pipeline_budget: LexicalRebuildPipelineBudgetSnapshot::new(
-                    16, 64, 1024, 1024, 16, 64, 1024,
-                ),
-                budget_generation: 0,
-            })
-            .unwrap();
-
-        let result = result_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("a panicking page-prep worker must still emit an Error result (#288)");
-        match result {
-            LexicalRebuildPagePrepResult::Error { sequence, error } => {
-                assert_eq!(sequence, 0);
-                assert!(
-                    error.contains("panicked"),
-                    "error must identify the panic: {error}"
-                );
-                assert!(
-                    error.contains("injected lexical rebuild page-prep panic"),
-                    "error must preserve the panic payload text: {error}"
-                );
-            }
-            other => panic!("expected a page-prep Error result, got {other:?}"),
-        }
-
-        drop(work_tx);
-        for handle in worker_handles {
-            let _ = handle.join();
-        }
-    }
-
-    /// #282 regression: a panic inside a shard-build worker must surface as a
-    /// `LexicalRebuildShardBuildMessage::Error`. Before the catch_unwind
-    /// containment, the panicking worker unwound silently while sibling
-    /// workers kept the result channel open, so the staging→publish consumer
-    /// parked forever at the handoff (the terminal-wedge signature: all
-    /// threads on a condvar, governor spinning one core).
-    #[test]
-    #[serial]
-    fn shard_build_worker_panic_surfaces_as_error_result_instead_of_parking_consumer() {
-        let worker_count = 1usize;
-        let (work_tx, work_rx) = bounded::<LexicalRebuildShardBuildWork>(worker_count);
-        let (msg_tx, msg_rx) = bounded::<LexicalRebuildShardBuildMessage>(worker_count);
-        let flow_limiter = Arc::new(StreamingByteLimiter::new(1024));
-        let handles = spawn_lexical_rebuild_shard_builder_workers(
-            worker_count,
-            work_rx,
-            msg_tx,
-            Arc::clone(&flow_limiter),
-            None,
-        );
-
-        let tmp = TempDir::new().unwrap();
-        LEXICAL_REBUILD_SHARD_BUILD_INJECTED_PANIC.store(true, Ordering::SeqCst);
-        work_tx
-            .send(LexicalRebuildShardBuildWork {
-                shard: LexicalShardPlanShard {
-                    shard_index: 7,
-                    first_conversation_id: 0,
-                    last_conversation_id: 0,
-                    conversation_count: 0,
-                    message_count: 0,
-                    message_bytes: 0,
-                    conversation_id_fingerprint: String::new(),
-                    oversized_single_conversation: false,
-                },
-                packets: Vec::new(),
-                message_bytes: 0,
-                shard_index_path: tmp.path().join("shard-7"),
-                writer_parallelism: 1,
-            })
-            .unwrap();
-
-        let message = msg_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("a panicking shard-build worker must still emit an Error result (#282)");
-        match message {
-            LexicalRebuildShardBuildMessage::Error { shard_index, error } => {
-                assert_eq!(shard_index, 7);
-                assert!(
-                    error.contains("panicked"),
-                    "error must identify the panic: {error}"
-                );
-                assert!(
-                    error.contains("injected lexical rebuild shard-build panic"),
-                    "error must preserve the panic payload text: {error}"
-                );
-            }
-            other => panic!("expected a shard-build Error result, got {other:?}"),
-        }
-
-        drop(work_tx);
-        for handle in handles {
-            let _ = handle.join();
-        }
-    }
-
-    /// #282 regression: a panic inside a shard-merge worker must surface as a
-    /// `LexicalRebuildShardMergeMessage::Error`. Before the catch_unwind
-    /// containment, the panicking worker left the result channel open and the
-    /// final-frontier reducer parked forever on `merge_result_rx.recv()`.
-    #[test]
-    #[serial]
-    fn shard_merge_worker_panic_surfaces_as_error_result_instead_of_parking_reducer() {
-        let worker_count = 1usize;
-        let (job_tx, job_rx) = bounded::<LexicalRebuildShardMergeJob>(worker_count);
-        let (msg_tx, msg_rx) = bounded::<LexicalRebuildShardMergeMessage>(worker_count);
-        let handles = spawn_lexical_rebuild_shard_merge_workers(worker_count, job_rx, msg_tx);
-
-        let tmp = TempDir::new().unwrap();
-        LEXICAL_REBUILD_SHARD_MERGE_INJECTED_PANIC.store(true, Ordering::SeqCst);
-        job_tx
-            .send(LexicalRebuildShardMergeJob {
-                output_level: 3,
-                output_path: tmp.path().join("merge-out"),
-                input_artifacts: Vec::new(),
-            })
-            .unwrap();
-
-        let message = msg_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("a panicking shard-merge worker must still emit an Error result (#282)");
-        match message {
-            LexicalRebuildShardMergeMessage::Error {
-                output_level,
-                error,
-                ..
-            } => {
-                assert_eq!(output_level, 3);
-                assert!(
-                    error.contains("panicked"),
-                    "error must identify the panic: {error}"
-                );
-                assert!(
-                    error.contains("injected lexical rebuild shard-merge panic"),
-                    "error must preserve the panic payload text: {error}"
-                );
-            }
-            other => panic!("expected a shard-merge Error result, got {other:?}"),
-        }
-
-        drop(job_tx);
-        for handle in handles {
-            let _ = handle.join();
-        }
     }
 
     /// `coding_agent_session_search-wxsy8`: stress-pin the
@@ -39002,10 +35686,6 @@ mod tests {
     #[serial]
     fn streaming_consumer_quarantines_single_non_watch_oom_and_dedupes_record() {
         let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
-        // #298: this test models a *genuinely* poisoned conversation, so the
-        // small-conversation plausibility gate must be disabled — otherwise a
-        // tiny fixture conversation is deferred instead of quarantined.
-        let _small_gate_guard = set_env("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES", "0");
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -39075,402 +35755,37 @@ mod tests {
         }
     }
 
-    /// #298 gate (non-watch): a small conversation that hits a typed NoMem
-    /// with no real host memory pressure is deferred to the next index run —
-    /// never quarantined — because frankensqlite's bounded allocation guards
-    /// raise the same typed error without the host being out of memory.
     #[test]
     #[serial]
-    fn streaming_consumer_defers_small_non_watch_oom_without_quarantine() {
-        let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
-        // Pin the pressure probe to "never real pressure" so the size gate is
-        // what decides, deterministically, on any host.
-        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let db_path = data_dir.join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
-        let progress = Arc::new(IndexingProgress::default());
-        let conv = norm_conv(Some("defer-single"), vec![norm_msg(0, 1_700_000_000_000)]);
-
-        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
-        send_conversation_batches(&tx, "codex", vec![conv], true);
-        send_done(&tx, "codex", true);
-        drop(tx);
-
-        let (_discovered, outcome) = run_streaming_consumer(
-            rx,
-            1,
-            &storage,
-            &data_dir,
-            Some(&mut index),
-            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
-            &Some(progress.clone()),
-            LexicalPopulationStrategy::IncrementalInline,
-            Some(FrankenStorage::now_millis()),
-            None,
-        )
-        .expect("small-conversation NoMem without real pressure should defer, not fail");
-
-        assert_eq!(outcome.quarantined_conversations, 0);
-        assert!(outcome.lexical_update_deferred);
-        assert!(
-            !data_dir
-                .join("quarantine/index_ingest_poison.jsonl")
-                .exists(),
-            "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
-        );
-    }
-
-    /// #290: a stable, already-triaged backlog of *same-version* irreducible
-    /// quarantines (recurs on every refresh, content already searchable from a
-    /// prior pass) must NOT trip the recent-burst circuit breaker / `critical`
-    /// health, even when its size exceeds the breaker limit. It stays a
-    /// `degraded` advisory.
-    #[test]
-    #[serial]
-    fn same_version_quarantine_backlog_does_not_trip_circuit_breaker() -> Result<()> {
-        let _limit_guard = set_env("CASS_INGEST_QUARANTINE_CIRCUIT_LIMIT", "2");
-        let _window_guard = set_env("CASS_INGEST_QUARANTINE_CIRCUIT_WINDOW_SECS", "86400");
-
-        let tmp = TempDir::new()?;
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir)?;
-
-        // Five same-version irreducible quarantines, all attempted "now" (recent).
-        // record_attempt stamps the CURRENT cass version, so every entry is
-        // same-version (IrreducibleSameVersion) — the already-triaged backlog.
-        let now = chrono::Utc::now();
-        let mut state = QuarantineState::default();
-        for i in 0..5 {
-            let key = QuarantineKey::new(format!("conv-stable-{i}"), 3);
-            state.record_attempt(&key, "index-ingest-out-of-memory: out of memory", now);
-        }
-        state.save(&data_dir)?;
-
-        let summary = conversation_ingest_quarantine_summary(&data_dir);
-        anyhow::ensure!(
-            summary.quarantined_conversations == 5,
-            "all five conversations are still counted in the backlog total"
-        );
-        anyhow::ensure!(
-            summary.recent_quarantined_conversations == 0,
-            "same-version re-skips must not count toward the recent burst; got {}",
-            summary.recent_quarantined_conversations
-        );
-        anyhow::ensure!(
-            !summary.circuit_breaker_active,
-            "a stable same-version backlog must not trip the breaker / critical health"
-        );
-        anyhow::ensure!(
-            summary.status == "degraded",
-            "stable searchable backlog is a degraded advisory, not critical; got {}",
-            summary.status
-        );
-        Ok(())
-    }
-
-    /// #290 (contrapositive): a *fresh* recent burst of genuinely-new
-    /// (version-stale / never-triaged-under-this-binary) quarantines still trips
-    /// the circuit breaker / `critical` health, because those conversations'
-    /// content may be absent from the published index.
-    #[test]
-    #[serial]
-    fn fresh_version_stale_quarantine_burst_still_trips_circuit_breaker() -> Result<()> {
-        let _limit_guard = set_env("CASS_INGEST_QUARANTINE_CIRCUIT_LIMIT", "2");
-        let _window_guard = set_env("CASS_INGEST_QUARANTINE_CIRCUIT_WINDOW_SECS", "86400");
-
-        let tmp = TempDir::new()?;
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir)?;
-
-        let now = chrono::Utc::now();
-        let mut state = QuarantineState::default();
-        for i in 0..3 {
-            let key = QuarantineKey::new(format!("conv-fresh-{i}"), 3);
-            state.record_attempt(&key, "index-ingest-out-of-memory: out of memory", now);
-        }
-        // Rewrite each entry's version to an OLDER one so they are retry-eligible
-        // (version-stale) — i.e. a genuinely-new burst this binary has not triaged.
-        for record in state.entries.values_mut() {
-            record.cass_version_at_quarantine = Some("0.0.1-old".to_string());
-        }
-        state.save(&data_dir)?;
-
-        let summary = conversation_ingest_quarantine_summary(&data_dir);
-        anyhow::ensure!(
-            summary.recent_quarantined_conversations == 3,
-            "fresh version-stale quarantines count toward the recent burst; got {}",
-            summary.recent_quarantined_conversations
-        );
-        anyhow::ensure!(
-            summary.circuit_breaker_active,
-            "a fresh burst exceeding the limit must still trip the breaker"
-        );
-        anyhow::ensure!(
-            summary.status == "critical",
-            "a fresh burst is critical; got {}",
-            summary.status
-        );
-        Ok(())
-    }
-
-    /// xaztn: dry-run classifies without mutation; apply reparses exactly the
-    /// keyed source conversation and persists it before clearing quarantine.
-    #[test]
-    #[serial]
-    fn xaztn_targeted_quarantine_retry_reingests_exact_conversation() -> Result<()> {
-        let tmp = TempDir::new()?;
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir)?;
-        let source_path = tmp
-            .path()
-            .join(".codex/sessions/2026/07/rollout-retry.jsonl");
-        std::fs::create_dir_all(source_path.parent().context("source parent")?)?;
-        std::fs::write(
-            &source_path,
-            r#"{"timestamp":"2026-07-22T05:00:00.000Z","type":"session_meta","payload":{"id":"targeted-retry","cwd":"/data/projects/cass"}}
-{"timestamp":"2026-07-22T05:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"xaztn targeted quarantine retry"}]}}
-{"timestamp":"2026-07-22T05:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"targeted retry complete"}]}}
-"#,
-        )?;
-
-        let connector = CodexConnector::new();
-        let root = ScanRoot::local(source_path.clone());
-        let context =
-            crate::connectors::ScanContext::with_roots(source_path.clone(), vec![root], None);
-        let mut scanned = connector.scan(&context)?;
-        anyhow::ensure!(scanned.len() == 1, "fixture must parse one conversation");
-        let scanned_conversation = scanned
-            .first_mut()
-            .context("missing fixture conversation")?;
-        scanned_conversation.external_id = Some("sessions/2026/07/rollout-retry".to_string());
-        let conversation_id = poison_conversation_id(scanned_conversation);
-        let schema_version = u32::try_from(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)?;
-
-        let now = chrono::Utc::now();
-        let mut state = QuarantineState::default();
-        // One eligible (version-stale) entry + one irreducible (same-version).
-        let eligible = QuarantineKey::new(&conversation_id, schema_version);
-        let eligible_storage_key = format!("{conversation_id}::v{schema_version}");
-        state.record_attempt(&eligible, "index-ingest-out-of-memory: out of memory", now);
-        let irreducible_schema_version = schema_version.checked_add(1).context("schema version")?;
-        let irreducible = QuarantineKey::new(&conversation_id, irreducible_schema_version);
-        let irreducible_storage_key = format!("{conversation_id}::v{irreducible_schema_version}");
-        state.record_attempt(
-            &irreducible,
-            "index-ingest-out-of-memory: out of memory",
-            now,
-        );
-        // Demote the eligible entry to an older version so it is retry-eligible;
-        // the irreducible entry keeps the current version.
-        if let Some(record) = state.entries.get_mut(&eligible_storage_key) {
-            record.cass_version_at_quarantine = Some("0.0.1-old".to_string());
-        }
-        state.save(&data_dir)?;
-        let quarantine_dir = data_dir.join("quarantine");
-        std::fs::create_dir_all(&quarantine_dir)?;
-        std::fs::write(
-            quarantine_dir.join(INDEX_INGEST_POISON_FILE),
-            format!(
-                "{}\n{}\n",
-                serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "schema_version_at_quarantine": schema_version,
-                    "cass_version_at_quarantine": "0.0.1-old",
-                    "reason": "index-ingest-out-of-memory",
-                    "agent_slug": "codex",
-                    "external_id": scanned_conversation.external_id,
-                    "source_path": source_path.display().to_string(),
-                    "workspace": scanned_conversation.workspace.as_ref().map(|path| path.display().to_string()),
-                    "started_at": scanned_conversation.started_at,
-                    "ended_at": scanned_conversation.ended_at,
-                    "message_count": scanned_conversation.messages.len(),
-                }),
-                serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "schema_version_at_quarantine": irreducible_schema_version,
-                    "cass_version_at_quarantine": env!("CARGO_PKG_VERSION"),
-                    "reason": "index-ingest-out-of-memory",
-                    "agent_slug": "codex",
-                    "external_id": scanned_conversation.external_id,
-                    "source_path": source_path.display().to_string(),
-                    "workspace": scanned_conversation.workspace.as_ref().map(|path| path.display().to_string()),
-                    "started_at": scanned_conversation.started_at,
-                    "ended_at": scanned_conversation.ended_at,
-                    "message_count": scanned_conversation.messages.len(),
-                }),
-            ),
-        )?;
-
-        let config = quarantine_retry::RetryConfig::default();
-
-        let dry = plan_quarantine_retry(&data_dir, &config);
-        anyhow::ensure!(dry.total_quarantined == 2);
-        anyhow::ensure!(dry.planned_attempts == 1);
-        anyhow::ensure!(
-            dry.skip_irreducible == 1,
-            "the same-version entry is irreducible; got {}",
-            dry.skip_irreducible
-        );
-        anyhow::ensure!(QuarantineState::load(&data_dir).len() == 2);
-
-        let applied = run_quarantine_retry(&data_dir, &config, true)?;
-        anyhow::ensure!(
-            applied.cleared == 1,
-            "apply re-ingests and clears the one eligible entry; got {}",
-            applied.cleared
-        );
-        anyhow::ensure!(
-            applied.remaining_quarantined == 1,
-            "the irreducible entry remains; got {}",
-            applied.remaining_quarantined
-        );
-        let after = QuarantineState::load(&data_dir);
-        anyhow::ensure!(!after.entries.contains_key(&eligible_storage_key));
-        anyhow::ensure!(after.entries.contains_key(&irreducible_storage_key));
-        let poison_after =
-            std::fs::read_to_string(data_dir.join("quarantine").join(INDEX_INGEST_POISON_FILE))?;
-        anyhow::ensure!(!poison_after.contains(&format!(
-            "\"schema_version_at_quarantine\":{schema_version}"
-        )));
-        anyhow::ensure!(poison_after.contains(&format!(
-            "\"schema_version_at_quarantine\":{irreducible_schema_version}"
-        )));
-        let storage = FrankenStorage::open(&data_dir.join("agent_search.db"))?;
-        let message_count: i64 =
-            storage
-                .raw()
-                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))?;
-        anyhow::ensure!(
-            message_count == 2,
-            "targeted retry must persist two messages"
-        );
-        anyhow::ensure!(
-            source_path.is_file(),
-            "retry must not delete the source log"
-        );
-        Ok(())
-    }
-
-    /// #296: the best-effort pre-abort WAL checkpoint runs against a real
-    /// canonical DB and leaves a DB readable by a fresh connection (no panic,
-    /// no orphaned WAL). A missing DB is a clean no-op.
-    #[test]
-    #[serial]
-    fn best_effort_abort_wal_checkpoint_truncates_and_is_noop_when_absent() -> Result<()> {
-        let tmp = TempDir::new()?;
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir)?;
-
-        // No DB yet -> clean no-op (must not panic).
-        best_effort_abort_wal_checkpoint(&data_dir);
-
-        // Create a canonical DB with some content and an active WAL.
-        let db_path = data_dir.join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path)?;
-        storage.run_migrations()?;
-        drop(storage);
-
-        // Checkpoint should succeed and leave a readable DB.
-        best_effort_abort_wal_checkpoint(&data_dir);
-        anyhow::ensure!(
-            db_path.exists(),
-            "DB file should still exist after checkpoint"
-        );
-        // A fresh connection can open and query it.
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned())?;
-        let _ = conn.query("PRAGMA quick_check;");
-        conn.close().ok();
-        Ok(())
-    }
-
-    /// #321: a `wal_checkpoint(TRUNCATE)` that SQLite reports as blocked
-    /// (`busy != 0`) or that leaves frames un-backfilled did NOT truncate the
-    /// WAL, so it must never be classified as a completed checkpoint. The
-    /// canonical reproducer from the field is `busy=1, log_frames=289842,
-    /// checkpointed_frames=0` — the abort path used to log
-    /// "checkpointed canonical WAL before stall abort (#296)" success on
-    /// exactly that no-op, masking a 1.1 GB stranded WAL and a malformed DB.
-    #[test]
-    fn final_wal_checkpoint_blocked_status_is_not_completed() {
-        // The exact field reproducer: blocked by an active reader, nothing moved.
-        assert_eq!(
-            classify_final_wal_checkpoint(1, 289_842, 0),
-            FinalWalCheckpointOutcome::Blocked {
-                busy: 1,
-                log_frames: 289_842,
-                checkpointed_frames: 0,
-            },
-            "busy=1 checkpoint must classify as Blocked, never Completed"
-        );
-
-        // A clean TRUNCATE: not busy, every logged frame backfilled.
-        assert_eq!(
-            classify_final_wal_checkpoint(0, 128, 128),
-            FinalWalCheckpointOutcome::Completed,
-            "busy=0 with all frames backfilled is the only Completed case"
-        );
-
-        // Not busy, but a partial backfill still means the WAL was not fully
-        // truncated -> Blocked (do not report success).
-        assert_eq!(
-            classify_final_wal_checkpoint(0, 128, 40),
-            FinalWalCheckpointOutcome::Blocked {
-                busy: 0,
-                log_frames: 128,
-                checkpointed_frames: 40,
-            },
-            "a partial checkpoint must not be reported as completed"
-        );
-
-        // An empty WAL (nothing to do) is trivially completed.
-        assert_eq!(
-            classify_final_wal_checkpoint(0, 0, 0),
-            FinalWalCheckpointOutcome::Completed,
-            "an already-empty WAL is a completed no-op"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn non_watch_ingest_chunk_size_defaults_and_clamps() -> Result<()> {
+    fn non_watch_ingest_chunk_size_defaults_and_clamps() {
         {
             let _env = unset_env_var("CASS_NON_WATCH_INGEST_CHUNK_SIZE");
-            anyhow::ensure!(
-                non_watch_ingest_chunk_size() == NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE,
-                "unset chunk size should use the default"
+            assert_eq!(
+                non_watch_ingest_chunk_size(),
+                NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE
             );
         }
 
         {
             let _env = set_env("CASS_NON_WATCH_INGEST_CHUNK_SIZE", "0");
-            anyhow::ensure!(
-                non_watch_ingest_chunk_size() == NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE,
-                "zero chunk size should use the default"
+            assert_eq!(
+                non_watch_ingest_chunk_size(),
+                NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE
             );
         }
 
         {
             let _env = set_env("CASS_NON_WATCH_INGEST_CHUNK_SIZE", "2");
-            anyhow::ensure!(
-                non_watch_ingest_chunk_size() == 2,
-                "valid explicit chunk size should be honored"
-            );
+            assert_eq!(non_watch_ingest_chunk_size(), 2);
         }
 
         {
             let _env = set_env("CASS_NON_WATCH_INGEST_CHUNK_SIZE", "99999");
-            anyhow::ensure!(
-                non_watch_ingest_chunk_size() == NON_WATCH_INGEST_CHUNK_SIZE_MAX,
-                "oversized chunk size should clamp to the safety cap"
+            assert_eq!(
+                non_watch_ingest_chunk_size(),
+                NON_WATCH_INGEST_CHUNK_SIZE_MAX
             );
         }
-        Ok(())
     }
 
     #[test]
@@ -39487,21 +35802,14 @@ mod tests {
         let progress_tracker = Arc::new(IndexingProgress::default());
         let progress = Some(progress_tracker.clone());
         let progress_bump = Arc::new(AtomicI64::new(1));
-        let conversations: Vec<_> = [
-            ("chunked-non-watch-0", 0_i64),
-            ("chunked-non-watch-1", 1_i64),
-            ("chunked-non-watch-2", 2_i64),
-            ("chunked-non-watch-3", 3_i64),
-            ("chunked-non-watch-4", 4_i64),
-        ]
-        .iter()
-        .map(|(external_id, offset)| {
-            norm_conv(
-                Some(external_id),
-                vec![norm_msg(0, 1_700_000_000_000 + offset)],
-            )
-        })
-        .collect();
+        let conversations: Vec<_> = (0..5)
+            .map(|idx| {
+                norm_conv(
+                    Some(&format!("chunked-non-watch-{idx}")),
+                    vec![norm_msg(0, 1_700_000_000_000 + i64::from(idx))],
+                )
+            })
+            .collect();
 
         let outcome = ingest_non_watch_batch_with_oom_split(
             &storage,
@@ -39514,19 +35822,13 @@ mod tests {
             Some(&progress_bump),
         )?;
 
-        anyhow::ensure!(
-            outcome.inserted_conversations == conversations.len(),
-            "chunked ingest should insert every conversation"
+        assert_eq!(outcome.inserted_conversations, conversations.len());
+        assert_eq!(outcome.inserted_messages, conversations.len());
+        assert_eq!(
+            progress_tracker.current.load(Ordering::Relaxed),
+            conversations.len()
         );
-        anyhow::ensure!(
-            outcome.inserted_messages == conversations.len(),
-            "chunked ingest should insert every message"
-        );
-        anyhow::ensure!(
-            progress_tracker.current.load(Ordering::Relaxed) == conversations.len(),
-            "progress counter should reflect all chunked conversations"
-        );
-        anyhow::ensure!(
+        assert!(
             progress_bump.load(Ordering::Relaxed) > 1,
             "chunked ingest must refresh the run-lock heartbeat before the enclosing scan completes"
         );
@@ -39536,10 +35838,7 @@ mod tests {
                 .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
                     row.get_typed(0)
                 })?;
-        anyhow::ensure!(
-            conversation_count == i64::try_from(conversations.len())?,
-            "storage should contain every chunked conversation"
-        );
+        assert_eq!(conversation_count as usize, conversations.len());
         Ok(())
     }
 
@@ -40045,9 +36344,8 @@ mod tests {
             }
         );
         assert_eq!(
-            wal_autocheckpoint,
-            persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES,
-            "startup watch ingest should use the bounded bulk-import WAL checkpoint cadence"
+            wal_autocheckpoint, 0,
+            "startup watch ingest should defer WAL auto-checkpoints"
         );
     }
 
@@ -40080,10 +36378,7 @@ mod tests {
 
         let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
 
         let second = vec![norm_conv(Some("checkpoint-b"), vec![norm_msg(0, 2_000)])];
         ingest_batch(
@@ -40124,10 +36419,7 @@ mod tests {
 
         let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
     }
 
     #[test]
@@ -40141,10 +36433,7 @@ mod tests {
 
         persist::apply_index_writer_checkpoint_policy(&storage, true);
         let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
 
         prepare_storage_for_final_checkpoint(&storage, &db_path, "test index close");
 
@@ -41356,19 +37645,6 @@ mod tests {
     }
 
     #[test]
-    fn full_rebuild_integrity_preflight_size_gate_is_bounded_and_fail_safe() {
-        let gib = 1024_u64 * 1024 * 1024;
-
-        assert!(should_run_full_archive_quick_check(Some(2 * gib), 2 * gib));
-        assert!(!should_run_full_archive_quick_check(
-            Some(2 * gib + 1),
-            2 * gib
-        ));
-        assert!(should_run_full_archive_quick_check(Some(64 * gib), 0));
-        assert!(should_run_full_archive_quick_check(None, 2 * gib));
-    }
-
-    #[test]
     fn full_rebuild_integrity_preflight_accepts_healthy_current_schema() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("healthy-current-schema.db");
@@ -41669,7 +37945,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn repair_daily_stats_if_drifted_bypasses_the_unbounded_packet_rebuild() {
+    fn repair_daily_stats_if_drifted_falls_back_after_packet_rebuild_oom() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -41720,8 +37996,6 @@ mod tests {
             .unwrap();
 
         let _oom_guard = set_env("CASS_TEST_PACKET_DAILY_STATS_REBUILD_OOM", "1");
-        // #329: this fault injection would fail the legacy packet path. The
-        // production repair must no longer enter it at all.
         assert_eq!(
             repair_daily_stats_if_drifted(&storage, &db_path, None).unwrap(),
             DailyStatsRepairOutcome::Rebuilt {
@@ -41735,7 +38009,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_daily_stats_projection_matches_streaming_storage_rebuild() {
+    fn repair_daily_stats_if_drifted_packet_rebuild_matches_legacy_storage_rebuild() {
         fn load_daily_stats_rows(
             storage: &FrankenStorage,
         ) -> Vec<(i64, String, String, i64, i64, i64)> {
@@ -41888,8 +38162,11 @@ mod tests {
 
         storage.raw().execute("DELETE FROM daily_stats").unwrap();
         assert_eq!(
-            rebuild_daily_stats_from_conversation_packets(&storage, &db_path).unwrap(),
-            expected_rebuild
+            repair_daily_stats_if_drifted(&storage, &db_path, None).unwrap(),
+            DailyStatsRepairOutcome::Rebuilt {
+                rows_created: expected_rebuild.rows_created,
+                total_sessions: expected_rebuild.total_sessions,
+            }
         );
         assert_eq!(load_daily_stats_rows(&storage), expected_rows);
     }
@@ -42083,129 +38360,6 @@ mod tests {
     }
 
     #[test]
-    fn targeted_watch_once_allows_absent_lazy_fts_shadow() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let opts = watch_once_skip_test_options(
-            data_dir,
-            Some(vec![tmp.path().join("not-opened-by-this-unit-test.jsonl")]),
-        );
-        let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        assert_eq!(
-            storage
-                .inspect_search_fallback_fts_parity()
-                .expect("inspect the fresh lazy FTS schema")
-                .status,
-            crate::storage::sqlite::FtsShadowParityStatus::Absent,
-            "a fresh archive must exercise the genuinely absent lazy-shadow path"
-        );
-
-        assert_eq!(
-            targeted_watch_once_fts_parity_problem(&storage, &opts)
-                .expect("inspect absent FTS parity"),
-            None,
-            "an absent lazy shadow has no partial artifact to re-encode and must not block fresh targeted ingestion"
-        );
-    }
-
-    #[test]
-    fn targeted_watch_once_refuses_partial_fts_before_canonical_mutation() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let session = tmp.path().join("rollout-partial-fts.jsonl");
-        std::fs::write(
-            &session,
-            concat!(
-                "{\"timestamp\":\"2026-07-17T12:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"watch-once-partial\",\"cwd\":\"/tmp\"}}\n",
-                "{\"timestamp\":\"2026-07-17T12:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"must not be ingested\"}]}}\n"
-            ),
-        )
-        .unwrap();
-        let opts = watch_once_skip_test_options(data_dir, Some(vec![session]));
-        let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let agent_id = storage
-            .ensure_agent(&Agent {
-                id: None,
-                slug: "codex".into(),
-                name: "Codex".into(),
-                version: None,
-                kind: AgentKind::Cli,
-            })
-            .unwrap();
-        storage
-            .insert_conversation_tree(
-                agent_id,
-                None,
-                &Conversation {
-                    id: None,
-                    agent_slug: "codex".into(),
-                    workspace: None,
-                    external_id: Some("existing-partial".into()),
-                    title: Some("Existing partial fixture".into()),
-                    source_path: tmp.path().join("existing.jsonl"),
-                    started_at: Some(1_700_000_000_000),
-                    ended_at: Some(1_700_000_000_001),
-                    approx_tokens: None,
-                    metadata_json: serde_json::Value::Null,
-                    messages: vec![Message {
-                        id: None,
-                        idx: 0,
-                        role: MessageRole::User,
-                        author: None,
-                        created_at: Some(1_700_000_000_001),
-                        content: "indexed before interruption".into(),
-                        extra_json: serde_json::Value::Null,
-                        snippets: Vec::new(),
-                    }],
-                    source_id: LOCAL_SOURCE_ID.into(),
-                    origin_host: None,
-                },
-            )
-            .unwrap();
-        storage.rebuild_fts().unwrap();
-        let conversation_id: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT id FROM conversations LIMIT 1",
-                &[] as &[ParamValue],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        storage
-            .raw()
-            .execute_compat(
-                "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, 1, 'assistant', 'missing after interruption')",
-                &[ParamValue::from(conversation_id)] as &[ParamValue],
-            )
-            .unwrap();
-        assert!(
-            targeted_watch_once_fts_parity_problem(&storage, &opts)
-                .unwrap()
-                .is_some()
-        );
-        drop(storage);
-
-        let error = run_index(opts.clone(), None)
-            .expect_err("partial FTS must stop targeted watch-once before ingest");
-        let error_chain = format!("{error:#}");
-        assert!(
-            error_chain.contains("stopped before canonical mutation"),
-            "actionable fail-fast diagnostic: {error:#}"
-        );
-        let storage = FrankenStorage::open_readonly(&opts.db_path).unwrap();
-        assert_eq!(storage.total_conversation_count().unwrap(), 1);
-        assert_eq!(storage.total_message_count().unwrap(), 2);
-        let parity = storage.inspect_search_fallback_fts_parity().unwrap();
-        assert_eq!(
-            parity.status,
-            crate::storage::sqlite::FtsShadowParityStatus::Partial
-        );
-        assert_eq!(parity.indexed_messages, Some(1));
-    }
-
-    #[test]
     fn readonly_canonical_force_rebuild_fast_path_is_narrow() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -42355,26 +38509,6 @@ mod tests {
         assert!(!should_repair_fallback_fts_after_full_index_run(
             false, true
         ));
-    }
-
-    #[test]
-    fn fallback_fts_repair_classifies_missing_shadow_as_nonfatal_derived_damage() {
-        let outcome = nonfatal_fallback_fts_repair_outcome(
-            "inserting 10000 fallback rows: table not found: fts_messages_data".to_string(),
-        );
-        assert!(matches!(
-            outcome,
-            Some(FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail })
-                if detail.contains("fts_messages_data")
-        ));
-
-        assert_eq!(
-            nonfatal_fallback_fts_repair_outcome(
-                "disk I/O error while opening canonical messages".to_string()
-            ),
-            None,
-            "canonical I/O failures must remain fatal"
-        );
     }
 
     #[test]
@@ -44276,103 +40410,6 @@ mod tests {
                 .docs,
             1,
             "the retained backup should preserve the previously published live index"
-        );
-    }
-
-    /// Regression for GH #333: an authoritative rebuild must not move the
-    /// currently searchable generation out of the live path before its staged
-    /// replacement is ready. The injected publication failure models a killed
-    /// or failed post-lexical/semantic run: the command must fail while the
-    /// exact prior live document surface remains searchable.
-    #[test]
-    #[serial]
-    fn run_index_authoritative_rebuild_failure_preserves_prior_live_generation() {
-        const ENOSPC_RAW_OS_ERROR: i32 = 28;
-
-        let tmp = TempDir::new().unwrap();
-        let home = tmp.path().join("home");
-        let data_dir = home.join("cass-data");
-        fs::create_dir_all(&data_dir).unwrap();
-        let db_path = data_dir.join("db.sqlite");
-        let mut storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-        storage.close_best_effort_in_place();
-
-        let index_path = index_dir(&data_dir).unwrap();
-        let prior_conv = norm_conv(
-            Some("gh333-prior-live"),
-            vec![norm_msg(0, 1_700_013_000_000)],
-        );
-        let mut prior_live = TantivyIndex::open_or_create(&index_path).unwrap();
-        prior_live
-            .add_messages_with_conversation_id(&prior_conv, &prior_conv.messages, Some(1_300))
-            .unwrap();
-        prior_live.commit().unwrap();
-        drop(prior_live);
-        assert_eq!(
-            crate::search::tantivy::searchable_index_summary(&index_path)
-                .unwrap()
-                .unwrap()
-                .docs,
-            1
-        );
-
-        // Force the normal run_index preflight down the authoritative rebuild
-        // path without using --force-rebuild's readonly fast path.
-        fs::write(
-            index_path.join("schema_hash.json"),
-            br#"{"schema_hash":"gh333-stale-schema"}"#,
-        )
-        .unwrap();
-
-        let _home = set_env("HOME", &home.to_string_lossy());
-        let _codex_home = set_env("CODEX_HOME", &home.join(".codex-empty").to_string_lossy());
-        let _ignore_sources = ignore_sources_config();
-        let progress = Arc::new(IndexingProgress::default());
-        let opts = IndexOptions {
-            full: false,
-            force_rebuild: false,
-            watch: false,
-            watch_once_paths: None,
-            db_path,
-            data_dir: data_dir.clone(),
-            semantic: false,
-            build_hnsw: false,
-            embedder: "hash".to_string(),
-            progress: Some(progress),
-            watch_interval_secs: 30,
-        };
-
-        #[cfg(target_os = "linux")]
-        let _fault = inject_lexical_publish_rename_failure_once(
-            LexicalPublishRenameSite::LinuxParkPriorLiveToCanonicalSidecar,
-            ENOSPC_RAW_OS_ERROR,
-        );
-        #[cfg(not(target_os = "linux"))]
-        let _fault = inject_lexical_publish_rename_failure_once(
-            LexicalPublishRenameSite::NonLinuxPublishStagedLive,
-            ENOSPC_RAW_OS_ERROR,
-        );
-
-        let error = run_index(opts, None)
-            .expect_err("injected staged publication failure must fail the index command");
-        assert!(
-            format!("{error:#}").contains("rolled back")
-                || format!("{error:#}").contains("publishing staged lexical index"),
-            "failure should retain staged-publication context: {error:#}"
-        );
-        assert_eq!(
-            crate::search::tantivy::searchable_index_summary(&index_path)
-                .unwrap()
-                .unwrap()
-                .docs,
-            1,
-            "failed authoritative publication must preserve the prior searchable generation"
-        );
-        assert!(
-            !index_path.with_extension("bak").exists(),
-            "run_index must not strand the published generation in the obsolete eager .bak path"
         );
     }
 
@@ -46442,118 +42479,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn connector_diagnostics_mixed_corpus_indexes_valid_records_and_quarantines_bad_line() {
-        use crate::search::query::{FieldMask, SearchClient, SearchFilters};
-
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("cass-data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let codex_session = tmp
-            .path()
-            .join(".codex/sessions/2026/07/22/rollout-mixed.jsonl");
-        std::fs::create_dir_all(codex_session.parent().unwrap()).unwrap();
-        std::fs::write(
-            &codex_session,
-            r#"{"timestamp":"2026-07-22T06:00:00.000Z","type":"session_meta","payload":{"id":"mixed-codex","cwd":"/workspace/mixed"}}
-{"timestamp":"2026-07-22T06:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"stmh6-codex-searchable"}]}}
-{malformed connector line}
-{"timestamp":"2026-07-22T06:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"stmh6-codex-tail-searchable"}]}}
-"#,
-        )
-        .unwrap();
-
-        let amp_threads = tmp.path().join("amp/threads");
-        std::fs::create_dir_all(&amp_threads).unwrap();
-        let amp_session = amp_threads.join("未来-thread-名前.json");
-        std::fs::write(
-            &amp_session,
-            r#"{"id":"mixed-amp","messages":[{"role":"user","content":"stmh6-amp-searchable"}]}"#,
-        )
-        .unwrap();
-
-        let progress = Arc::new(IndexingProgress::default());
-        let opts = super::IndexOptions {
-            full: false,
-            watch: false,
-            force_rebuild: false,
-            watch_once_paths: Some(vec![codex_session.clone(), amp_session.clone()]),
-            db_path: data_dir.join("db.sqlite"),
-            data_dir: data_dir.clone(),
-            semantic: false,
-            build_hnsw: false,
-            embedder: "fastembed".to_string(),
-            progress: Some(Arc::clone(&progress)),
-            watch_interval_secs: 30,
-        };
-        let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let state = Mutex::new(HashMap::new());
-        let storage = Mutex::new(storage);
-        let t_index = Mutex::new(None);
-        let roots = vec![
-            (
-                ConnectorKind::Codex,
-                ScanRoot::local(codex_session.parent().unwrap().to_path_buf()),
-            ),
-            (ConnectorKind::Amp, ScanRoot::local(amp_threads)),
-        ];
-
-        let indexed = reindex_paths(
-            &opts,
-            vec![codex_session, amp_session],
-            &roots,
-            &state,
-            &storage,
-            &t_index,
-            &index_path,
-            false,
-        )
-        .unwrap();
-        assert_eq!(indexed, 2);
-
-        let message_count: i64 = storage
-            .lock()
-            .unwrap()
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
-            .unwrap();
-        assert_eq!(message_count, 3);
-
-        let stats = progress.stats.lock().unwrap();
-        let codex = stats.connector_summary.get("codex").unwrap();
-        assert_eq!(codex.partially_indexed, 1);
-        let amp = stats.connector_summary.get("amp").unwrap();
-        assert_eq!(amp.indexed, 1);
-        assert_eq!(stats.connector_diagnostics.len(), 1);
-        assert_eq!(
-            stats.connector_diagnostics[0].failure_kind,
-            crate::connector_ingest_diagnostics::IngestFailureKind::MalformedJsonLine
-        );
-        assert_eq!(stats.connector_diagnostics[0].line_or_row, Some(3));
-        drop(stats);
-        drop(t_index);
-
-        let client = SearchClient::open(&index_path, None).unwrap().unwrap();
-        for marker in ["stmh6-codex-tail-searchable", "stmh6-amp-searchable"] {
-            let hits = client
-                .search(marker, SearchFilters::default(), 10, 0, FieldMask::FULL)
-                .unwrap();
-            assert!(
-                !hits.is_empty(),
-                "missing searchable mixed-corpus marker: {marker}"
-            );
-        }
-
-        let quarantine =
-            std::fs::read_to_string(data_dir.join("quarantine/connector_ingest_lines.json"))
-                .unwrap();
-        assert!(!quarantine.contains("{malformed connector line}"));
-        assert!(quarantine.contains("payload_blake3"));
-    }
-
-    #[test]
-    #[serial]
     fn run_index_watch_once_reindexes_changed_explicit_codex_path_already_in_db() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("cass-data");
@@ -46657,57 +42582,6 @@ mod tests {
             .semantic_watch_once
             .clone()
             .context("semantic watch-once proof")
-    }
-
-    #[test]
-    fn targeted_semantic_watch_once_bypasses_unrelated_lexical_optimization() {
-        assert!(!should_optimize_tantivy_after_watch_once_ingest(0, false));
-        assert!(!should_optimize_tantivy_after_watch_once_ingest(0, true));
-        assert!(should_optimize_tantivy_after_watch_once_ingest(1, false));
-        assert!(!should_optimize_tantivy_after_watch_once_ingest(1, true));
-    }
-
-    #[test]
-    fn issue_342_semantic_build_replaces_stale_lexical_progress_with_initialize_phase() {
-        let progress = Arc::new(IndexingProgress::default());
-        let progress_bump = Arc::new(AtomicI64::new(0));
-        progress.phase.store(2, Ordering::Relaxed);
-        progress.total.store(1, Ordering::Relaxed);
-        progress.current.store(1, Ordering::Relaxed);
-        progress.is_rebuilding.store(true, Ordering::Relaxed);
-        progress
-            .rebuild_pipeline_staged_shard_build_active_jobs
-            .store(1, Ordering::Relaxed);
-
-        prepare_progress_for_semantic_build(Some(&progress));
-        assert_eq!(
-            progress.phase.load(Ordering::Relaxed),
-            INDEX_PHASE_PREPARING,
-            "shared targeted semantic repair must remain in its opaque phase"
-        );
-        assert_eq!(progress.total.load(Ordering::Relaxed), 1);
-        assert_eq!(progress.current.load(Ordering::Relaxed), 1);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        set_semantic_progress_phase(
-            Some(&progress),
-            &progress_bump,
-            INDEX_PHASE_SEMANTIC_INITIALIZE,
-            0,
-            0,
-        );
-
-        assert_eq!(
-            progress.phase.load(Ordering::Relaxed),
-            INDEX_PHASE_SEMANTIC_INITIALIZE
-        );
-        assert_eq!(progress.total.load(Ordering::Relaxed), 0);
-        assert_eq!(progress.current.load(Ordering::Relaxed), 0);
-        assert!(!progress.is_rebuilding.load(Ordering::Relaxed));
-        assert!(
-            progress.rebuild_pipeline_is_quiescent(),
-            "semantic initialization must not inherit lexical pipeline activity"
-        );
     }
 
     #[test]
@@ -46847,280 +42721,6 @@ mod tests {
         anyhow::ensure!(
             matches!(index.record_count(), 4),
             "wrong vector record count"
-        );
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn run_index_semantic_watch_once_reconciles_deleted_prefix_conversation() -> Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let data_dir = tmp.path().join("cass-data");
-        std::fs::create_dir_all(&data_dir)?;
-        let first = tmp
-            .path()
-            .join(".codex")
-            .join("sessions")
-            .join("2026")
-            .join("05")
-            .join("28")
-            .join("rollout-semantic-watch-once-reconcile-first.jsonl");
-        let second = first.with_file_name("rollout-semantic-watch-once-reconcile-second.jsonl");
-        let third = first.with_file_name("rollout-semantic-watch-once-reconcile-third.jsonl");
-        write_semantic_watch_once_codex_session(
-            &first,
-            "semantic-watch-once-reconcile-first",
-            "swonce-reconcile-one",
-        )?;
-        write_semantic_watch_once_codex_session(
-            &second,
-            "semantic-watch-once-reconcile-second",
-            "swonce-reconcile-two",
-        )?;
-        write_semantic_watch_once_codex_session(
-            &third,
-            "semantic-watch-once-reconcile-third",
-            "swonce-reconcile-three",
-        )?;
-
-        run_index(
-            semantic_watch_once_opts(&data_dir, &first, Arc::new(IndexingProgress::default())),
-            None,
-        )?;
-        run_index(
-            semantic_watch_once_opts(&data_dir, &second, Arc::new(IndexingProgress::default())),
-            None,
-        )?;
-
-        let index_path = vector_index_path(&data_dir, "fnv1a-384");
-        let before_index = FsVectorIndex::open(&index_path)?;
-        let mut before_vectors = HashMap::new();
-        for record_index in 0..before_index.record_count() {
-            let doc_id = before_index.doc_id_at(record_index)?.to_string();
-            before_vectors.insert(doc_id, before_index.vector_at_f32(record_index)?);
-        }
-        drop(before_index);
-        let mut manifest = SemanticManifest::load_or_default(&data_dir)?;
-        manifest.publish_hnsw(crate::search::semantic_manifest::HnswRecord {
-            base_tier: SemanticTierKind::Fast,
-            embedder_id: "fnv1a-384".to_string(),
-            ef_search: 64,
-            index_path: "vector_index/hnsw-fnv1a-384.chsw".to_string(),
-            size_bytes: 1,
-            built_at_ms: 1,
-            ready: true,
-        });
-        manifest.save(&data_dir)?;
-
-        let storage = FrankenStorage::open(&data_dir.join("db.sqlite"))?;
-        let removed_conversation_id: i64 = storage.raw().query_row_map(
-            "SELECT id FROM conversations ORDER BY id ASC LIMIT 1",
-            &[],
-            |row| row.get_typed(0),
-        )?;
-        for statement in [
-            "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
-            "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
-            "DELETE FROM messages WHERE conversation_id = ?1",
-            "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
-            "DELETE FROM conversations WHERE id = ?1",
-        ] {
-            storage
-                .raw()
-                .execute_compat(statement, &[ParamValue::from(removed_conversation_id)])?;
-        }
-        drop(storage);
-
-        let progress = Arc::new(IndexingProgress::default());
-        run_index(
-            semantic_watch_once_opts(&data_dir, &third, Arc::clone(&progress)),
-            None,
-        )?;
-
-        let stats = semantic_watch_once_stats(&progress)?;
-        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
-        anyhow::ensure!(
-            matches!(
-                stats.reason.as_str(),
-                "semantic_artifact_reconciled_with_current_db"
-            ),
-            "wrong reason: {}",
-            stats.reason
-        );
-        anyhow::ensure!(matches!(stats.selected_docs, 2), "wrong selected doc count");
-        anyhow::ensure!(matches!(stats.embedded_docs, 2), "wrong embedded doc count");
-
-        let storage = FrankenStorage::open(&data_dir.join("db.sqlite"))?;
-        let current_message_ids: HashSet<u64> = storage
-            .raw()
-            .query_map_collect(
-                "SELECT m.id
-                 FROM messages AS m
-                 INNER JOIN conversations AS c ON c.id = m.conversation_id",
-                &[],
-                |row| row.get_typed::<i64>(0),
-            )?
-            .into_iter()
-            .filter_map(message_id_from_db)
-            .collect();
-        let manifest = SemanticManifest::load_or_default(&data_dir)?;
-        let artifact = manifest.fast_tier.as_ref().context("fast artifact")?;
-        anyhow::ensure!(
-            manifest.hnsw.is_none(),
-            "reconciliation must invalidate the now-stale HNSW manifest record"
-        );
-        anyhow::ensure!(matches!(artifact.conversation_count, 2));
-        anyhow::ensure!(matches!(artifact.doc_count, 4));
-        anyhow::ensure!(matches!(
-            artifact.db_fingerprint.as_str(),
-            "content-v1:2:3:6"
-        ));
-
-        let after_index = FsVectorIndex::open(&index_path)?;
-        anyhow::ensure!(matches!(after_index.record_count(), 4));
-        anyhow::ensure!(matches!(after_index.wal_record_count(), 0));
-        let mut retained_vectors_checked = 0usize;
-        for record_index in 0..after_index.record_count() {
-            anyhow::ensure!(
-                !after_index.is_deleted(record_index),
-                "reconciled semantic index retained a tombstone"
-            );
-            let doc_id = after_index.doc_id_at(record_index)?;
-            let parsed = crate::search::vector_index::parse_semantic_doc_id(doc_id)
-                .with_context(|| format!("parse semantic doc id {doc_id}"))?;
-            anyhow::ensure!(
-                current_message_ids.contains(&parsed.message_id),
-                "stale semantic message {} survived reconciliation",
-                parsed.message_id
-            );
-            if let Some(before_vector) = before_vectors.get(doc_id) {
-                anyhow::ensure!(
-                    after_index.vector_at_f32(record_index)?.eq(before_vector),
-                    "retained semantic vector changed for {doc_id}"
-                );
-                retained_vectors_checked = retained_vectors_checked.saturating_add(1);
-            }
-        }
-        anyhow::ensure!(
-            matches!(retained_vectors_checked, 2),
-            "expected both unchanged messages to retain their vectors"
-        );
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn run_index_semantic_watch_once_reconciles_same_id_content_replacement() -> Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let data_dir = tmp.path().join("cass-data");
-        std::fs::create_dir_all(&data_dir)?;
-        let session = tmp
-            .path()
-            .join(".codex")
-            .join("sessions")
-            .join("2026")
-            .join("05")
-            .join("28")
-            .join("rollout-semantic-watch-once-content-replacement.jsonl");
-        write_semantic_watch_once_codex_session(
-            &session,
-            "semantic-watch-once-content-replacement",
-            "swonce-content-before",
-        )?;
-        run_index(
-            semantic_watch_once_opts(&data_dir, &session, Arc::new(IndexingProgress::default())),
-            None,
-        )?;
-
-        let index_path = vector_index_path(&data_dir, "fnv1a-384");
-        let before_index = FsVectorIndex::open(&index_path)?;
-        let mut before_vectors = HashMap::new();
-        for record_index in 0..before_index.record_count() {
-            let doc_id = before_index.doc_id_at(record_index)?.to_owned();
-            before_vectors.insert(doc_id, before_index.vector_at_f32(record_index)?);
-        }
-        drop(before_index);
-
-        let storage = FrankenStorage::open(&data_dir.join("db.sqlite"))?;
-        let changed_message_id: i64 = storage.raw().query_row_map(
-            "SELECT id FROM messages ORDER BY id ASC LIMIT 1",
-            &[],
-            |row| row.get_typed(0),
-        )?;
-        let stale_doc_id = before_vectors
-            .keys()
-            .find(|doc_id| {
-                crate::search::vector_index::parse_semantic_doc_id(doc_id).is_some_and(|parsed| {
-                    i64::try_from(parsed.message_id).ok() == Some(changed_message_id)
-                })
-            })
-            .cloned()
-            .context("semantic document for changed message")?;
-        storage.raw().execute_compat(
-            "UPDATE messages SET content = ?1 WHERE id = ?2",
-            &[
-                ParamValue::from("swonce-content-after replacement semantic content"),
-                ParamValue::from(changed_message_id),
-            ],
-        )?;
-        let canonical_documents = CanonicalSemanticDocuments::from_storage(&storage)?;
-        anyhow::ensure!(
-            !canonical_documents.doc_ids.contains(&stale_doc_id),
-            "same-ID replacement unexpectedly preserved the stale semantic identity"
-        );
-        let expected_doc_ids = canonical_documents.doc_ids.clone();
-        let storage = Mutex::new(storage);
-
-        let stats = run_targeted_semantic_watch_once_publish("hash", &data_dir, &storage, 1, 1)?;
-        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
-        anyhow::ensure!(
-            matches!(
-                stats.reason.as_str(),
-                "semantic_artifact_reconciled_with_current_db"
-            ),
-            "wrong reason: {}",
-            stats.reason
-        );
-        anyhow::ensure!(matches!(stats.selected_docs, 1), "wrong selected doc count");
-        anyhow::ensure!(matches!(stats.embedded_docs, 1), "wrong embedded doc count");
-        anyhow::ensure!(
-            stats
-                .manifest_before_db_fingerprint
-                .eq(&stats.manifest_after_db_fingerprint),
-            "count/max fingerprint should remain unchanged for a same-ID replacement"
-        );
-
-        let after_index = FsVectorIndex::open(&index_path)?;
-        anyhow::ensure!(matches!(after_index.record_count(), 2));
-        anyhow::ensure!(matches!(after_index.wal_record_count(), 0));
-        let mut after_doc_ids = HashSet::new();
-        let mut retained_vectors_checked = 0usize;
-        for record_index in 0..after_index.record_count() {
-            anyhow::ensure!(
-                !after_index.is_deleted(record_index),
-                "reconciled semantic index retained a tombstone"
-            );
-            let doc_id = after_index.doc_id_at(record_index)?.to_owned();
-            after_doc_ids.insert(doc_id.clone());
-            if let Some(before_vector) = before_vectors.get(&doc_id) {
-                anyhow::ensure!(
-                    after_index.vector_at_f32(record_index)?.eq(before_vector),
-                    "unchanged semantic vector changed for {doc_id}"
-                );
-                retained_vectors_checked = retained_vectors_checked.saturating_add(1);
-            }
-        }
-        anyhow::ensure!(
-            after_doc_ids.eq(&expected_doc_ids),
-            "published semantic identities do not match the canonical DB"
-        );
-        anyhow::ensure!(
-            !after_doc_ids.contains(&stale_doc_id),
-            "stale same-ID content vector survived reconciliation"
-        );
-        anyhow::ensure!(
-            matches!(retained_vectors_checked, 1),
-            "expected the unchanged message vector to be copied exactly"
         );
         Ok(())
     }
@@ -47298,29 +42898,12 @@ mod tests {
         let mut state = HashMap::new();
         state.insert(ConnectorKind::Codex, 123);
         state.insert(ConnectorKind::Gemini, 456);
-        state.insert(ConnectorKind::Grok, 789);
 
         save_watch_state(&data_dir, &state).unwrap();
 
         let loaded = load_watch_state(&data_dir);
         assert_eq!(loaded.get(&ConnectorKind::Codex), Some(&123));
         assert_eq!(loaded.get(&ConnectorKind::Gemini), Some(&456));
-        assert_eq!(loaded.get(&ConnectorKind::Grok), Some(&789));
-    }
-
-    #[test]
-    fn grok_connector_kind_maps_runtime_slug_and_compact_wire_key() {
-        assert_eq!(ConnectorKind::from_slug("grok"), Some(ConnectorKind::Grok));
-        assert_eq!(ConnectorKind::Grok.slug(), "grok");
-        assert_eq!(
-            serde_json::to_string(&ConnectorKind::Grok).unwrap(),
-            "\"gk\""
-        );
-        assert_eq!(
-            serde_json::from_str::<ConnectorKind>("\"Grok\"").unwrap(),
-            ConnectorKind::Grok,
-            "legacy human-readable watch-state keys remain accepted"
-        );
     }
 
     #[test]
@@ -47617,13 +43200,6 @@ mod tests {
         .unwrap();
 
         let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "1");
-        // #298: model a *genuinely* poisoned conversation — the solo isolate
-        // retry also OOMs, and the size gate is disabled so even a small
-        // conversation is allowed to quarantine. This preserves the original
-        // intent of this test (watermark preserved + poison recorded) under the
-        // new solo-retry-before-quarantine behavior.
-        let _solo_oom_guard = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
-        let _small_gate_guard = set_env("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES", "0");
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
             full: false,
@@ -47671,198 +43247,6 @@ mod tests {
                 .exists(),
             "watch OOM should still be recorded for operator visibility"
         );
-    }
-
-    /// #298 gate: a small conversation whose solo isolate-retry also OOMs must
-    /// be deferred — not quarantined — when there is no real host memory
-    /// pressure, so a bounded-allocation false positive can never poison a
-    /// small, replayable conversation.
-    #[test]
-    #[serial]
-    fn watch_reindex_defers_small_conversation_when_solo_retry_also_ooms() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("watch-oom-defer-small");
-        let amp_dir = data_dir.join("amp");
-        std::fs::create_dir_all(&amp_dir).unwrap();
-        let now_u128 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let created_at = i64::try_from(now_u128)
-            .unwrap_or(i64::MAX)
-            .saturating_add(10_000);
-        let amp_file = amp_dir.join("thread-watch-oom-defer-small.json");
-        std::fs::write(
-            &amp_file,
-            format!(
-                r#"{{"id":"thread-watch-oom-defer-small","messages":[{{"role":"user","text":"defer me","createdAt":{created_at}}}]}}"#
-            ),
-        )
-        .unwrap();
-
-        let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "1");
-        let _solo_oom_guard = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
-        // Pin the pressure probe to "never real pressure" so the size gate is
-        // what decides, deterministically, on any host.
-        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
-        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
-        let opts = super::IndexOptions {
-            full: false,
-            watch: true,
-            force_rebuild: false,
-            db_path: data_dir.join("agent_search.db"),
-            data_dir: data_dir.clone(),
-            semantic: false,
-            build_hnsw: false,
-            embedder: "fastembed".to_string(),
-            progress: None,
-            watch_once_paths: None,
-            watch_interval_secs: 30,
-        };
-
-        let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
-        let state = std::sync::Mutex::new(std::collections::HashMap::new());
-        let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
-        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
-
-        let indexed = reindex_paths(
-            &opts,
-            vec![amp_file],
-            &roots,
-            &state,
-            &storage,
-            &t_index,
-            &index_path,
-            false,
-        )
-        .unwrap();
-
-        assert_eq!(indexed, 1);
-        assert!(
-            load_watch_state(&data_dir).is_empty(),
-            "deferred watch sources must remain eligible for later retry"
-        );
-        assert!(
-            !data_dir
-                .join("quarantine/watch_ingest_poison.jsonl")
-                .exists(),
-            "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
-        );
-    }
-
-    /// #298 differential: a conversation that OOMs in batch ingest but ingests
-    /// cleanly when isolated solo must NOT be quarantined. This is the exact
-    /// false-positive the reporter hit — small/medium conversations that index
-    /// fine solo were poisoned on the `--watch` batch path.
-    #[test]
-    #[serial]
-    fn watch_batch_oom_that_succeeds_solo_is_not_quarantined() {
-        let tmp = TempDir::new().unwrap();
-        let xdg = tmp.path().join("xdg_watch_batch_oom_solo_ok");
-        std::fs::create_dir_all(&xdg).unwrap();
-        let prev = dotenvy::var("XDG_DATA_HOME").ok();
-        unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
-
-        // Inject a typed OOM on any batch of >= 2 conversations, but leave the
-        // solo isolate-retry untouched (it disables injection), so each
-        // conversation succeeds when re-ingested alone. Do NOT force the solo
-        // retry to OOM — that is the whole point of the differential.
-        let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "2");
-        let _chunk_guard = set_env("CASS_WATCH_INGEST_CHUNK_SIZE", "4");
-        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
-
-        let data_dir = xdg.join("amp");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let amp_dir = data_dir.join("amp");
-        std::fs::create_dir_all(&amp_dir).unwrap();
-        let now_u128 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let base_ts = i64::try_from(now_u128)
-            .unwrap_or(i64::MAX)
-            .saturating_add(10_000);
-        let mut paths = Vec::new();
-        for idx in 0..4 {
-            let path = amp_dir.join(format!("thread-batch-oom-solo-ok-{idx}.json"));
-            std::fs::write(
-                &path,
-                format!(
-                    r#"{{"id":"thread-batch-oom-solo-ok-{idx}","messages":[{{"role":"user","text":"p{idx}","createdAt":{}}}]}}"#,
-                    base_ts + i64::from(idx)
-                ),
-            )
-            .unwrap();
-            paths.push(path);
-        }
-
-        let progress = Arc::new(super::IndexingProgress::default());
-        let opts = super::IndexOptions {
-            full: false,
-            watch: true,
-            force_rebuild: false,
-            db_path: data_dir.join("agent_search.db"),
-            data_dir: data_dir.clone(),
-            semantic: false,
-            build_hnsw: false,
-            embedder: "fastembed".to_string(),
-            progress: Some(progress.clone()),
-            watch_once_paths: None,
-            watch_interval_secs: 30,
-        };
-
-        let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
-        let state = std::sync::Mutex::new(std::collections::HashMap::new());
-        let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
-        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
-
-        let indexed = reindex_paths(
-            &opts,
-            paths,
-            &roots,
-            &state,
-            &storage,
-            &t_index,
-            &index_path,
-            false,
-        )
-        .unwrap();
-
-        assert_eq!(indexed, 4);
-        assert_eq!(progress.current.load(Ordering::Relaxed), 4);
-        let conversation_rows: i64 = storage
-            .lock()
-            .unwrap()
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM conversations",
-                &[] as &[ParamValue],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            conversation_rows, 4,
-            "all 4 conversations must persist via the solo isolate-retry"
-        );
-        assert!(
-            !data_dir
-                .join("quarantine/watch_ingest_poison.jsonl")
-                .exists(),
-            "conversations that ingest fine solo must not be quarantined on a batch-path bounded NoMem (#298)"
-        );
-
-        if let Some(prev) = prev {
-            unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
-        } else {
-            unsafe { std::env::remove_var("XDG_DATA_HOME") };
-        }
     }
 
     #[test]
@@ -49018,63 +44402,6 @@ mod tests {
                 CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES
             ))
         );
-    }
-
-    #[test]
-    fn claude_external_id_canonicalized_so_full_and_watch_paths_dedupe() {
-        // gh #302: the full-rebuild path roots Claude at `~/.claude/projects`
-        // (bare relative id) while the live `--watch` daemon roots at
-        // `~/.claude` (detect_installed_agents reports `~/.claude`), yielding a
-        // `projects/`-prefixed id for the SAME session file. Canonicalization at
-        // the ingest chokepoint must collapse both to one stable dedup key.
-        let rel = "-Users-mrm-Developer-proj/7b85f067-dead-beef-cafe-000000000000.jsonl";
-
-        // Full-rebuild form (bare).
-        let mut bare = norm_conv(Some(rel), vec![]);
-        bare.agent_slug = "claude".into();
-        canonicalize_claude_external_id("claude", &mut bare);
-
-        // Watch-daemon form (projects/-prefixed) for the identical session.
-        let mut prefixed = norm_conv(Some(&format!("projects/{rel}")), vec![]);
-        prefixed.agent_slug = "claude".into();
-        canonicalize_claude_external_id("claude", &mut prefixed);
-
-        assert_eq!(
-            bare.external_id, prefixed.external_id,
-            "both ingest paths must produce the same external_id for the same session"
-        );
-        assert_eq!(
-            bare.external_id.as_deref(),
-            Some(rel),
-            "canonical form is the bare full-rebuild rooting"
-        );
-    }
-
-    #[test]
-    fn claude_external_id_canonicalize_is_scoped_and_conservative() {
-        // Only the `claude` connector is touched; other connectors that may
-        // legitimately carry a leading `projects/` segment are left untouched.
-        let mut codex = norm_conv(Some("projects/foo/bar.jsonl"), vec![]);
-        canonicalize_claude_external_id("codex", &mut codex);
-        assert_eq!(codex.external_id.as_deref(), Some("projects/foo/bar.jsonl"));
-
-        // A degenerate id with no workspace segment after `projects/` is left
-        // alone — stripping it would invent a bare uuid id that never collides
-        // with a real `<workspace>/<uuid>.jsonl` key, so this can only be a
-        // genuinely different id (defensive: never over-strip).
-        let mut shallow = norm_conv(Some("projects/loose.jsonl"), vec![]);
-        canonicalize_claude_external_id("claude", &mut shallow);
-        assert_eq!(shallow.external_id.as_deref(), Some("projects/loose.jsonl"));
-
-        // Already-bare ids are unchanged.
-        let mut bare = norm_conv(Some("-Users-x-proj/abc.jsonl"), vec![]);
-        canonicalize_claude_external_id("claude", &mut bare);
-        assert_eq!(bare.external_id.as_deref(), Some("-Users-x-proj/abc.jsonl"));
-
-        // None stays None.
-        let mut empty = norm_conv(None, vec![]);
-        canonicalize_claude_external_id("claude", &mut empty);
-        assert_eq!(empty.external_id, None);
     }
 
     #[test]
@@ -50310,95 +45637,6 @@ mod tests {
     }
 
     #[test]
-    fn persist_pending_lexical_rebuild_progress_treats_active_waiters_as_transient() {
-        let tmp = TempDir::new().unwrap();
-        let index_path = tmp.path().join("index");
-        fs::create_dir_all(&index_path).unwrap();
-        fs::write(index_path.join("meta.json"), b"stable-meta").unwrap();
-
-        let base_runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            queue_depth: 1,
-            inflight_message_bytes: 1_024,
-            max_message_bytes_in_flight: 4_096,
-            pending_batch_conversations: 1,
-            pending_batch_message_bytes: 2_048,
-            page_prep_workers: 2,
-            active_page_prep_jobs: 1,
-            ordered_buffered_pages: 0,
-            budget_generation: 1,
-            producer_budget_wait_count: 1,
-            producer_budget_wait_ms: 3,
-            producer_handoff_wait_count: 0,
-            producer_handoff_wait_ms: 0,
-            host_loadavg_1m_milli: None,
-            controller_mode: "startup".to_string(),
-            controller_reason: "seeded-runtime".to_string(),
-            staged_merge_workers_max: 0,
-            staged_merge_allowed_jobs: 0,
-            staged_merge_active_jobs: 0,
-            staged_merge_ready_artifacts: 0,
-            staged_merge_ready_groups: 0,
-            staged_merge_controller_reason: String::new(),
-            staged_shard_build_workers_max: 0,
-            staged_shard_build_allowed_jobs: 0,
-            staged_shard_build_active_jobs: 0,
-            staged_shard_build_pending_jobs: 0,
-            staged_shard_build_controller_reason: String::new(),
-            updated_at_ms: 1_733_000_111_000_i64,
-            ..LexicalRebuildPipelineRuntimeSnapshot::default()
-        };
-        let mut state = LexicalRebuildState::new(
-            LexicalRebuildDbState {
-                db_path: "/tmp/agent_search.db".to_string(),
-                total_conversations: 12,
-                total_messages: 24,
-                storage_fingerprint: "seed:12".to_string(),
-            },
-            LEXICAL_REBUILD_PAGE_SIZE,
-        );
-        state.record_pending_commit(Some(6), 6, 12, index_meta_fingerprint(&index_path).unwrap());
-        state.set_runtime(&base_runtime);
-        state.updated_at_ms = 1_234;
-        persist_lexical_rebuild_state(&index_path, &state).unwrap();
-        let before = fs::read(lexical_rebuild_state_path(&index_path)).unwrap();
-
-        let live_runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            producer_budget_waiter_count: 2,
-            ..base_runtime.clone()
-        };
-        assert!(
-            live_runtime.is_observed(),
-            "the live active-waiter signal should still count for the controller"
-        );
-
-        persist_pending_lexical_rebuild_progress(
-            &index_path,
-            &mut state,
-            Some(6),
-            6,
-            12,
-            &live_runtime,
-        )
-        .unwrap();
-
-        assert_eq!(
-            state.updated_at_ms, 1_234,
-            "active waiter count alone should not rewrite the durable checkpoint"
-        );
-        assert_eq!(state.runtime, base_runtime);
-        assert_eq!(
-            fs::read(lexical_rebuild_state_path(&index_path)).unwrap(),
-            before,
-            "serde-skipped active waiter telemetry should not churn checkpoint bytes"
-        );
-        let persisted = load_lexical_rebuild_state(&index_path)
-            .unwrap()
-            .expect("checkpoint should remain readable");
-        assert_eq!(persisted.runtime, base_runtime);
-        assert_eq!(persisted.runtime.producer_budget_waiter_count, 0);
-    }
-
-    #[test]
     fn stale_stage_heartbeat_does_not_rewind_rebuild_checkpoint() {
         let tmp = TempDir::new().unwrap();
         let index_path = tmp.path().join("index");
@@ -51464,7 +46702,6 @@ mod tests {
             },
             exact_counts,
             no_mutations,
-            true,
         ));
         assert!(!should_skip_noop_final_lexical_checkpoint_refresh(
             true,
@@ -51478,7 +46715,6 @@ mod tests {
             },
             exact_counts,
             no_mutations,
-            true,
         ));
         assert!(!should_skip_noop_final_lexical_checkpoint_refresh(
             false,
@@ -51492,7 +46728,6 @@ mod tests {
             },
             exact_counts,
             no_mutations,
-            true,
         ));
         assert!(!should_skip_noop_final_lexical_checkpoint_refresh(
             false,
@@ -51506,7 +46741,6 @@ mod tests {
             },
             Some((1, 2)),
             no_mutations,
-            true,
         ));
         assert!(!should_skip_noop_final_lexical_checkpoint_refresh(
             false,
@@ -51520,7 +46754,6 @@ mod tests {
             },
             exact_counts,
             changed,
-            true,
         ));
         assert!(!should_skip_noop_final_lexical_checkpoint_refresh(
             false,
@@ -51534,25 +46767,6 @@ mod tests {
             },
             exact_counts,
             no_mutations,
-            true,
-        ));
-        // #289: a run-start completed checkpoint is not enough — if the
-        // checkpoint file vanished mid-run (e.g. the federated-bundle
-        // materialization replaced the live directory), the final refresh
-        // must run so the checkpoint is re-persisted.
-        assert!(!should_skip_noop_final_lexical_checkpoint_refresh(
-            false,
-            false,
-            &MatchingLexicalRebuildStateStatus {
-                has_pending_resume: false,
-                has_completed_checkpoint: true,
-                completed_indexed_docs: Some(0),
-                completed_exact_totals: Some((0, 0)),
-                completed_storage_fingerprint: Some("content-v1:0:0:0".to_string()),
-            },
-            exact_counts,
-            no_mutations,
-            false,
         ));
     }
 
@@ -51706,239 +46920,6 @@ mod tests {
             .map(|(name, _)| name)
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["codex"]);
-    }
-
-    #[test]
-    fn cass_connector_registry_only_replaces_codex_factory() {
-        let upstream = franken_agent_detection::get_connector_factories();
-        let configured = get_connector_factories();
-        assert_eq!(configured.len(), upstream.len());
-
-        for ((configured_name, configured_factory), (upstream_name, upstream_factory)) in
-            configured.into_iter().zip(upstream)
-        {
-            assert_eq!(configured_name, upstream_name);
-            if configured_name == "codex" {
-                assert!(!std::ptr::fn_addr_eq(configured_factory, upstream_factory));
-            } else {
-                assert!(std::ptr::fn_addr_eq(configured_factory, upstream_factory));
-            }
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn configured_codex_factory_indexes_searchable_modern_tool_calls_once() {
-        let temp = TempDir::new().unwrap();
-        let codex_home = temp.path().join(".codex");
-        let sessions = codex_home.join("sessions/2026/05/08");
-        fs::create_dir_all(&sessions).unwrap();
-        fs::write(
-            sessions.join("rollout-modern.jsonl"),
-            r#"{"timestamp":"2026-05-08T23:09:00.000Z","type":"session_meta","payload":{"id":"modern-id","cwd":"/data/projects/ntm","cli_version":"0.49.0"}}
-{"timestamp":"2026-05-08T23:09:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"investigate cass"}]}}
-{"timestamp":"2026-05-08T23:09:02.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"git log --grep='cass339toolargsneedle'\"}","call_id":"call-modern-1"}}
-"#,
-        )
-        .unwrap();
-
-        let _codex_home_guard = set_env_var("CODEX_HOME", codex_home.to_string_lossy());
-        let _sources_guard = set_env_var("CASS_IGNORE_SOURCES_CONFIG", "1");
-        let factory = configured_connector_factories()
-            .into_iter()
-            .find_map(|(name, factory)| (name == "codex").then_some(factory))
-            .expect("configured Codex factory");
-        let data_dir = temp.path().join("data");
-        fs::create_dir_all(&data_dir).unwrap();
-        let scan_context = ScanContext::local_default(data_dir.clone(), None);
-        let upstream_conversations = franken_agent_detection::CodexConnector::new()
-            .scan(&scan_context)
-            .unwrap();
-        let conversations = factory().scan(&scan_context).unwrap();
-        let repeated_conversations = factory().scan(&scan_context).unwrap();
-
-        assert_eq!(upstream_conversations.len(), 1);
-        assert_eq!(conversations.len(), 1);
-        assert_eq!(repeated_conversations.len(), 1);
-        let upstream = &upstream_conversations[0];
-        let conversation = &conversations[0];
-        let repeated = &repeated_conversations[0];
-        assert_eq!(conversation.agent_slug, upstream.agent_slug);
-        assert_eq!(conversation.external_id, upstream.external_id);
-        assert_eq!(conversation.title, upstream.title);
-        assert_eq!(conversation.workspace, upstream.workspace);
-        assert_eq!(conversation.source_path, upstream.source_path);
-        assert_eq!(conversation.started_at, upstream.started_at);
-        assert_eq!(conversation.ended_at, upstream.ended_at);
-        assert_eq!(conversation.metadata, upstream.metadata);
-        let stable_message_identity = |conversation: &NormalizedConversation| {
-            conversation
-                .messages
-                .iter()
-                .map(|message| {
-                    (
-                        message.idx,
-                        message.role.clone(),
-                        message.author.clone(),
-                        message.created_at,
-                        message.extra.clone(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            stable_message_identity(conversation),
-            stable_message_identity(upstream),
-            "enrichment must preserve upstream message identity and order"
-        );
-        assert_eq!(
-            stable_message_identity(repeated),
-            stable_message_identity(conversation),
-            "repeated enrichment scans must preserve message identity and order"
-        );
-
-        let tool_calls = conversations
-            .iter()
-            .flat_map(|conversation| &conversation.messages)
-            .filter(|message| {
-                message
-                    .invocations
-                    .iter()
-                    .any(|invocation| invocation.call_id.as_deref() == Some("call-modern-1"))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(tool_calls.len(), 1, "tool call must remain deduplicated");
-        let tool_call = tool_calls[0];
-        assert_eq!(
-            tool_call.invocations.len(),
-            1,
-            "the enriched tool-call message must contain exactly one invocation"
-        );
-        assert!(
-            tool_call
-                .content
-                .contains("git log --grep='cass339toolargsneedle'")
-        );
-        let invocation = &tool_call.invocations[0];
-        assert_eq!(invocation.name, "exec_command");
-        assert_eq!(invocation.call_id.as_deref(), Some("call-modern-1"));
-        assert_eq!(
-            invocation
-                .arguments
-                .as_ref()
-                .and_then(|arguments| arguments.get("cmd"))
-                .and_then(serde_json::Value::as_str),
-            Some("git log --grep='cass339toolargsneedle'")
-        );
-        let repeated_tool_calls = repeated
-            .messages
-            .iter()
-            .filter(|message| {
-                message
-                    .invocations
-                    .iter()
-                    .any(|invocation| invocation.call_id.as_deref() == Some("call-modern-1"))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(repeated_tool_calls.len(), 1);
-        assert_eq!(repeated_tool_calls[0].invocations.len(), 1);
-        assert_eq!(repeated_tool_calls[0].content, tool_call.content);
-        assert_eq!(repeated_tool_calls[0].invocations, tool_call.invocations);
-
-        let db_path = data_dir.join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let index_path = index_dir(&data_dir).unwrap();
-        let mut lexical_index = TantivyIndex::open_or_create(&index_path).unwrap();
-        let opts = IndexOptions {
-            full: true,
-            force_rebuild: false,
-            watch: false,
-            watch_once_paths: None,
-            db_path,
-            data_dir,
-            semantic: false,
-            build_hnsw: false,
-            embedder: "fastembed".to_string(),
-            progress: None,
-            watch_interval_secs: 30,
-        };
-        let outcome = run_batch_index_with_connector_factories(
-            &storage,
-            Some(&mut lexical_index),
-            &opts,
-            None,
-            LexicalPopulationStrategy::IncrementalInline,
-            Vec::new(),
-            vec![("codex", factory)],
-            FrankenStorage::now_millis(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(outcome.canonical_mutations.inserted_conversations, 1);
-        assert_eq!(
-            outcome.canonical_mutations.inserted_messages,
-            conversation.messages.len()
-        );
-        lexical_index.commit().unwrap();
-
-        let persisted_messages = storage
-            .raw()
-            .query_map_collect(
-                "SELECT idx, role, created_at, content FROM messages ORDER BY idx",
-                &[] as &[ParamValue],
-                |row| {
-                    Ok((
-                        row.get_typed::<i64>(0)?,
-                        row.get_typed::<String>(1)?,
-                        row.get_typed::<Option<i64>>(2)?,
-                        row.get_typed::<String>(3)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(persisted_messages.len(), conversation.messages.len());
-        let persisted_tool_calls = persisted_messages
-            .iter()
-            .filter(|(_, _, _, content)| content.contains("git log --grep='cass339toolargsneedle'"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            persisted_tool_calls.len(),
-            1,
-            "the production indexer must persist one enriched tool call"
-        );
-        assert_eq!(persisted_tool_calls[0].0, tool_call.idx);
-        assert_eq!(
-            persisted_tool_calls[0].1, "agent",
-            "the indexer intentionally canonicalizes assistant roles to agent"
-        );
-        assert_eq!(persisted_tool_calls[0].2, tool_call.created_at);
-
-        let (reader, fields) = frankensearch::lexical::cass_open_search_reader(
-            &index_path,
-            frankensearch::lexical::ReloadPolicy::Manual,
-        )
-        .unwrap();
-        let filters = frankensearch::lexical::CassQueryFilters {
-            agents: Default::default(),
-            workspaces: Default::default(),
-            created_from: None,
-            created_to: None,
-            source_filter: frankensearch::lexical::CassSourceFilter::All,
-        };
-        let query = frankensearch::lexical::cass_build_tantivy_query(
-            "cass339toolargsneedle",
-            &filters,
-            &fields,
-        );
-        let lexical_matches = reader
-            .searcher()
-            .search(&*query, &frankensearch::lexical::Count)
-            .unwrap();
-        assert_eq!(
-            lexical_matches, 1,
-            "tool-call arguments must reach the production lexical index"
-        );
     }
 
     #[test]

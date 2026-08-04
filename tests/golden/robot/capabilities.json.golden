@@ -3347,7 +3347,22 @@
     },
     {
       "name": "CASS_TRACE_FILE",
-      "description": "Default JSONL trace path for command execution spans."
+      "description": "Default cass-trace-v1 JSONL path for bounded diagnostics and command summaries."
+    },
+    {
+      "name": "CASS_TRACE_FILTER",
+      "default": "warn,coding_agent_search=debug,cass=debug,cass::redact::memo=warn",
+      "description": "Trace-file EnvFilter. The default retains CASS DEBUG plus global WARN/ERROR events, while suppressing routine redaction-memo DEBUG churn."
+    },
+    {
+      "name": "CASS_TRACE_MAX_BYTES",
+      "default": "16777216",
+      "description": "Hard trace-file byte ceiling, clamped to 4096..1073741824 bytes."
+    },
+    {
+      "name": "CASS_TRACE_MAX_EVENTS",
+      "default": "50000",
+      "description": "Hard trace-file diagnostic-event ceiling, clamped to 16..10000000 events."
     },
     {
       "name": "CASS_INDEX_NO_PROGRESS_EVENTS",

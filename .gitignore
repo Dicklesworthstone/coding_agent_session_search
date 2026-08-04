@@ -279,3 +279,12 @@ fuzz/fuzz/
 
 # Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
 /beads_compliance_audit/
+# br doctor per-run artifacts
+.doctor/
+
+# frankensqlite VFS namespace lock sidecars (machine-local, created next to any opened DB)
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+# index-run lock metadata sidecar (machine-local runtime state; the committed
+# fixture ships only the empty index-run.lock)
+tests/fixtures/**/index-run.lock.meta

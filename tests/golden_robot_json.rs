@@ -14,7 +14,7 @@
 //! ## Regenerating a golden
 //!
 //! ```bash
-//! UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_robot_json
+//! UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json
 //! git diff tests/golden/        # review EVERY change
 //! git add tests/golden/
 //! git commit -m "Update robot-mode goldens: <reason>"
@@ -25,10 +25,6 @@
 
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::expected_index_dir;
-use coding_agent_search::subsystem_coverage_matrix::matrix_report;
-use frankensqlite::Connection;
-use frankensqlite::compat::ConnectionExt;
-use frankensqlite::params;
 use serde_json::{Value, json};
 use std::error::Error;
 use std::fs;
@@ -64,87 +60,6 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
         // scaling is covered by responsiveness unit tests.
         .env("CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES", "536870912");
     cmd
-}
-
-fn seed_analytics_incidents_fixture(test_home: &Path) -> PathBuf {
-    let db_path = test_home.join("analytics-incidents.db");
-    let conn = Connection::open(db_path.to_string_lossy().into_owned())
-        .expect("open analytics incidents fixture db");
-    conn.execute_batch(
-        "CREATE TABLE agents (
-             id INTEGER PRIMARY KEY,
-             slug TEXT NOT NULL
-         );
-         CREATE TABLE conversations (
-             id INTEGER PRIMARY KEY,
-             agent_id INTEGER NOT NULL,
-             workspace_id INTEGER,
-             source_id TEXT,
-             external_id TEXT,
-             source_path TEXT NOT NULL,
-             started_at INTEGER,
-             ended_at INTEGER,
-             origin_host TEXT
-         );
-         CREATE TABLE messages (
-             id INTEGER PRIMARY KEY,
-             conversation_id INTEGER NOT NULL,
-             idx INTEGER NOT NULL,
-             content TEXT NOT NULL
-         );
-         INSERT INTO agents(id, slug) VALUES (1, 'codex'), (2, 'claude_code');",
-    )
-    .expect("create analytics incidents fixture schema");
-
-    let primary_path = test_home
-        .join("sessions/codex-primary.jsonl")
-        .to_string_lossy()
-        .into_owned();
-    let ordinary_path = test_home
-        .join("sessions/codex-ordinary.jsonl")
-        .to_string_lossy()
-        .into_owned();
-    conn.execute_compat(
-        "INSERT INTO conversations(
-             id, agent_id, workspace_id, source_id, external_id,
-             source_path, started_at, origin_host
-         ) VALUES (1, 1, 10, 'local', 'primary-session', ?1, 200, NULL)",
-        params![primary_path.as_str()],
-    )
-    .expect("insert primary incident conversation");
-    conn.execute_compat(
-        "INSERT INTO conversations(
-             id, agent_id, workspace_id, source_id, external_id,
-             source_path, started_at, origin_host
-         ) VALUES (
-             2, 2, 20, 'remote-fixture', 'remote-session',
-             '/remote/archive/remote-session.jsonl', 300, 'fixture-host'
-         )",
-        params![],
-    )
-    .expect("insert remote incident conversation");
-    conn.execute_compat(
-        "INSERT INTO conversations(
-             id, agent_id, workspace_id, source_id, external_id,
-             source_path, started_at, origin_host
-         ) VALUES (3, 1, 10, 'local', 'ordinary-session', ?1, 100, NULL)",
-        params![ordinary_path.as_str()],
-    )
-    .expect("insert ordinary conversation");
-    conn.execute_batch(
-        "INSERT INTO messages(id, conversation_id, idx, content) VALUES
-             (1, 1, 0,
-              'cass health_class degraded recommended_action inspect semantic_fallback_lexical model missing database is locked busy'),
-             (2, 1, 1,
-              'cass index-ingest-out-of-memory quarantined_conversations=1'),
-             (3, 2, 0,
-              'cass source sync ssh permission denied auth timeout'),
-             (4, 3, 0,
-              'ordinary application note with no operational markers');",
-    )
-    .expect("insert analytics incidents fixture messages");
-    drop(conn);
-    db_path
 }
 
 fn write_quarantined_manifest(generation_dir: &std::path::Path) {
@@ -912,58 +827,6 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
 
 /// Compare `actual` against the golden at `tests/golden/<name>`. Writes /
 /// overwrites the golden when `UPDATE_GOLDENS=1` is set in the env.
-fn describe_golden_difference(
-    line_number: usize,
-    expected_line: Option<&str>,
-    actual_line: Option<&str>,
-    expected_len: usize,
-    actual_len: usize,
-) -> String {
-    match (expected_line, actual_line) {
-        (Some(expected_line), Some(actual_line)) => {
-            format!("line {line_number}: expected {expected_line:?}, actual {actual_line:?}")
-        }
-        (Some(expected_line), None) => {
-            format!("line {line_number}: expected {expected_line:?}, actual reached end of file")
-        }
-        (None, Some(actual_line)) => {
-            format!("line {line_number}: expected reached end of file, actual {actual_line:?}")
-        }
-        (None, None) => format!(
-            "line contents match, but byte lengths differ (expected {expected_len}, actual {actual_len})"
-        ),
-    }
-}
-
-fn first_golden_difference(expected: &str, actual: &str) -> String {
-    let mut expected_lines = expected.lines();
-    let mut actual_lines = actual.lines();
-
-    for line_number in 1.. {
-        let expected_line = expected_lines.next();
-        let actual_line = actual_lines.next();
-        if expected_line.is_some() && expected_line == actual_line {
-            continue;
-        }
-        return describe_golden_difference(
-            line_number,
-            expected_line,
-            actual_line,
-            expected.len(),
-            actual.len(),
-        );
-    }
-
-    describe_golden_difference(0, None, None, expected.len(), actual.len())
-}
-
-fn strip_one_final_line_ending(input: &str) -> &str {
-    input
-        .strip_suffix("\r\n")
-        .or_else(|| input.strip_suffix('\n'))
-        .unwrap_or(input)
-}
-
 fn assert_golden(name: &str, actual: &str) {
     let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -981,27 +844,24 @@ fn assert_golden(name: &str, actual: &str) {
         panic!(
             "Golden file missing or unreadable: {}\n{err}\n\n\
              Run with UPDATE_GOLDENS=1 to create it, then review and commit:\n\
-             \tUPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_robot_json\n\
+             \tUPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json\n\
              \tgit diff tests/golden/\n\
              \tgit add tests/golden/",
             golden_path.display(),
         )
     });
 
-    let comparable_expected = strip_one_final_line_ending(&expected);
-    let comparable_actual = strip_one_final_line_ending(actual);
-    if comparable_actual != comparable_expected {
-        let first_difference = first_golden_difference(comparable_expected, comparable_actual);
+    if actual != expected {
         // Dump actual next to golden for easy diffing.
         let actual_path = golden_path.with_extension("actual");
         std::fs::write(&actual_path, actual).expect("write .actual file");
         panic!(
             "GOLDEN MISMATCH: {name}\n\n\
              Expected: {}\n\
-             Actual:   {} (first difference: {first_difference})\n\n\
+             Actual:   {}\n\n\
              diff the two files to see the drift, then either:\n\
              \t- fix the code if this was unintentional, or\n\
-             \t- regenerate: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_robot_json \\\n\
+             \t- regenerate: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json \\\n\
              \t              && git diff tests/golden/ && git add tests/golden/",
             golden_path.display(),
             actual_path.display(),
@@ -1251,29 +1111,6 @@ fn models_status_shape_matches_golden() {
 }
 
 #[test]
-fn fleet_upgrade_rehearsal_shape_matches_golden() {
-    // `cass fleet upgrade-rehearsal --json` (bead sc8sp) against an isolated
-    // empty data dir + config dir covers only the local host. The exact
-    // version/platform/disposition values depend on the build host and target,
-    // so we pin the JSON *shape* (field names + types) — deterministic across
-    // hosts and the canonical contract lock for this surface. Concrete values
-    // (disposition labels, safe commands, mode, verification) are asserted by
-    // tests/e2e_fleet_upgrade_rehearsal_gate.rs against the real binary.
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let rehearsal = capture_robot_json_value(
-        test_home.path(),
-        &["fleet", "upgrade-rehearsal", "--json"],
-        ExpectStatus::ExitOk,
-    );
-    let canonical =
-        serde_json::to_string_pretty(&json_value_schema(&rehearsal)).expect("pretty-print JSON");
-    assert_golden(
-        "robot/fleet_upgrade_rehearsal_shape.json.golden",
-        &canonical,
-    );
-}
-
-#[test]
 fn health_json_matches_golden() {
     // `cass health --json` reports readiness for an isolated empty HOME:
     // status=not_initialized, healthy=false, db.exists=false,
@@ -1310,35 +1147,6 @@ fn health_shape_matches_golden() {
 }
 
 #[test]
-fn onboarding_json_matches_golden() {
-    // `cass onboarding --json` on an isolated empty HOME: no providers detected,
-    // no semantic model, no archive DB → recommended_action=discover_sources,
-    // mutation_free=true. Read-only; deterministic; paths scrub to [TEST_HOME].
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let scrubbed = capture_robot_json(
-        test_home.path(),
-        &["onboarding", "--json"],
-        ExpectStatus::ExitAny,
-    );
-    assert_golden("robot/onboarding.json.golden", &scrubbed);
-}
-
-#[test]
-fn onboarding_shape_matches_golden() {
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let onboarding = capture_robot_json(
-        test_home.path(),
-        &["onboarding", "--json"],
-        ExpectStatus::ExitAny,
-    );
-    let onboarding: Value =
-        serde_json::from_str(&onboarding).expect("parse scrubbed onboarding JSON");
-    let canonical =
-        serde_json::to_string_pretty(&json_value_schema(&onboarding)).expect("pretty-print JSON");
-    assert_golden("robot/onboarding_shape.json.golden", &canonical);
-}
-
-#[test]
 fn diag_json_matches_golden() {
     // `cass diag --json` is the artifact-inventory surface that
     // ibuuh.36's verification matrix wants frozen alongside manifest
@@ -1361,99 +1169,6 @@ fn diag_shape_matches_golden() {
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&diag)).expect("pretty-print JSON");
     assert_golden("robot/diag_shape.json.golden", &canonical);
-}
-
-#[test]
-fn storage_json_matches_golden() {
-    // `cass storage --json` (#292.4) is the read-only footprint surface:
-    // per-component bytes that sum to a total. Against an isolated empty
-    // HOME with an absent data dir every component is zero and the layout
-    // is fully deterministic, so freezing it catches drift on any
-    // component key, ordering, or the bytes-sum-to-total invariant.
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let scrubbed = capture_robot_json(
-        test_home.path(),
-        &["storage", "--json"],
-        ExpectStatus::ExitOk,
-    );
-    assert_golden("robot/storage.json.golden", &scrubbed);
-}
-
-#[test]
-fn storage_shape_matches_golden() {
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let storage = capture_robot_json_value(
-        test_home.path(),
-        &["storage", "--json"],
-        ExpectStatus::ExitOk,
-    );
-    let canonical =
-        serde_json::to_string_pretty(&json_value_schema(&storage)).expect("pretty-print JSON");
-    assert_golden("robot/storage_shape.json.golden", &canonical);
-}
-
-#[test]
-fn dedup_dry_run_no_db_matches_golden() {
-    // `cass dedup --json` (#302 ask #2) defaults to a dry-run. Against an
-    // isolated empty HOME the database is absent, so the surface reports a
-    // deterministic "nothing to do" envelope (db_exists=false, zero
-    // counts, dry_run=true) that we freeze to catch contract drift.
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let scrubbed = capture_robot_json(test_home.path(), &["dedup", "--json"], ExpectStatus::ExitOk);
-    assert_golden("robot/dedup_no_db.json.golden", &scrubbed);
-}
-
-#[test]
-fn dedup_shape_matches_golden() {
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let dedup =
-        capture_robot_json_value(test_home.path(), &["dedup", "--json"], ExpectStatus::ExitOk);
-    let canonical =
-        serde_json::to_string_pretty(&json_value_schema(&dedup)).expect("pretty-print JSON");
-    assert_golden("robot/dedup_shape.json.golden", &canonical);
-}
-
-#[test]
-fn quarantine_list_empty_matches_golden() {
-    // `cass quarantine list --json` (#292 ask #3) against an isolated empty
-    // HOME has no quarantine_state.json, so the surface reports an empty,
-    // deterministic envelope (zero entries, breaker inactive) that we freeze.
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let scrubbed = capture_robot_json(
-        test_home.path(),
-        &["quarantine", "list", "--json"],
-        ExpectStatus::ExitOk,
-    );
-    assert_golden("robot/quarantine_list_empty.json.golden", &scrubbed);
-}
-
-#[test]
-fn quarantine_clear_shape_matches_golden() {
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let clear = capture_robot_json_value(
-        test_home.path(),
-        &["quarantine", "clear", "--json"],
-        ExpectStatus::ExitOk,
-    );
-    let canonical =
-        serde_json::to_string_pretty(&json_value_schema(&clear)).expect("pretty-print JSON");
-    assert_golden("robot/quarantine_clear_shape.json.golden", &canonical);
-}
-
-#[test]
-fn quarantine_retry_shape_matches_golden() {
-    // `cass quarantine retry --json` is the read-only plan by default. An
-    // isolated empty HOME yields a deterministic empty RetryPlan whose schema
-    // freezes the new xaztn robot contract without applying any mutation.
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let retry = capture_robot_json_value(
-        test_home.path(),
-        &["quarantine", "retry", "--json"],
-        ExpectStatus::ExitOk,
-    );
-    let canonical =
-        serde_json::to_string_pretty(&json_value_schema(&retry)).expect("pretty-print JSON");
-    assert_golden("robot/quarantine_retry_shape.json.golden", &canonical);
 }
 
 #[test]
@@ -1775,36 +1490,6 @@ fn stats_json_missing_db_error_envelope_shape_matches_golden() {
 }
 
 #[test]
-fn analytics_incidents_json_matches_golden() {
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let db_path = seed_analytics_incidents_fixture(test_home.path());
-    let db_path = db_path.to_str().expect("utf8 fixture db path");
-    let scrubbed = capture_robot_json(
-        test_home.path(),
-        &[
-            "--db",
-            db_path,
-            "analytics",
-            "incidents",
-            "--json",
-            "--limit",
-            "2",
-            "--max-sessions",
-            "10",
-            "--max-messages",
-            "100",
-            "--max-bytes",
-            "1000000",
-            "--budget-ms",
-            "60000",
-        ],
-        ExpectStatus::ExitOk,
-    );
-    let scrubbed = format!("{scrubbed}\n");
-    assert_golden("robot/analytics_incidents.json.golden", &scrubbed);
-}
-
-#[test]
 fn introspect_json_matches_golden() {
     // `cass introspect --json` is the full API schema surface — every
     // subcommand, its flags, positional args, and response-schema
@@ -1837,24 +1522,6 @@ fn introspect_shape_matches_golden() {
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&introspect)).expect("pretty-print JSON");
     assert_golden("robot/introspect_shape.json.golden", &canonical);
-}
-
-#[test]
-fn introspect_subsystem_coverage_matches_executable_matrix() -> Result<(), String> {
-    let test_home = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let introspect = capture_robot_json_value(
-        test_home.path(),
-        &["introspect", "--json"],
-        ExpectStatus::ExitOk,
-    );
-    let published = introspect
-        .get("subsystem_coverage")
-        .ok_or_else(|| "introspect output omits subsystem_coverage".to_string())?;
-    let expected = serde_json::to_value(matrix_report()).map_err(|error| error.to_string())?;
-    if !published.eq(&expected) {
-        return Err("introspect subsystem_coverage drifted from matrix_report()".to_string());
-    }
-    Ok(())
 }
 
 #[derive(Debug)]

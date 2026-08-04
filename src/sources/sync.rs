@@ -120,6 +120,25 @@ fn remote_spec_for_shell_bound_copy(host: &str, remote_path: &str) -> String {
     format!("{host}:{}", quote_remote_shell_path(remote_path))
 }
 
+fn command_output_with_timeout(
+    mut cmd: Command,
+    timeout_secs: u64,
+) -> std::io::Result<std::process::Output> {
+    let timeout_secs = timeout_secs.max(1);
+    configure_child_process_group(&mut cmd);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    match cmd.spawn().and_then(|child| {
+        wait_for_child_output_with_timeout(child, Duration::from_secs(timeout_secs))
+    })? {
+        Some(output) => Ok(output),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("command exceeded {timeout_secs}s timeout"),
+        )),
+    }
+}
+
 fn remote_spec_for_rsync(host: &str, remote_path: &str, protect_args_supported: bool) -> String {
     if protect_args_supported {
         // With --protect-args, rsync handles its own escaping over the wire
@@ -131,12 +150,13 @@ fn remote_spec_for_rsync(host: &str, remote_path: &str, protect_args_supported: 
 }
 
 fn run_rsync_command(
-    timeout_str: &str,
+    timeout_secs: u64,
     ssh_opts: &str,
     remote_spec: &str,
     local_path_str: &str,
     arg_protection: RsyncArgProtection,
 ) -> std::io::Result<std::process::Output> {
+    let timeout_str = timeout_secs.max(1).to_string();
     let mut cmd = Command::new("rsync");
     cmd.args(["-avz", "--links", "--safe-links", "--stats", "--partial"]);
     if let Some(flag) = arg_protection.flag() {
@@ -144,14 +164,14 @@ fn run_rsync_command(
     }
     cmd.args([
         "--timeout",
-        timeout_str,
+        &timeout_str,
         "-e",
         ssh_opts,
         "--",
         remote_spec,
         local_path_str,
     ]);
-    cmd.output()
+    command_output_with_timeout(cmd, timeout_secs)
 }
 
 fn rsync_arg_protection_remote_rejected(stderr: &str) -> bool {
@@ -467,194 +487,11 @@ impl SyncMethod {
             Self::Sftp => "sftp",
         }
     }
-
-    pub fn auth_source(self) -> &'static str {
-        match self {
-            Self::Rsync | Self::Scp => "system-openssh",
-            Self::WslRsync => "wsl-openssh",
-            Self::Sftp => "ssh2-agent-or-key-file",
-        }
-    }
-
-    pub fn fallback_rationale(self) -> &'static str {
-        match self {
-            Self::Rsync => "native rsync over OpenSSH is the first-choice delta transport",
-            Self::WslRsync => {
-                "native rsync was unavailable; WSL rsync keeps OpenSSH-style auth before copy fallbacks"
-            }
-            Self::Scp => {
-                "rsync transports were unavailable; system scp keeps OpenSSH agent and config auth before ssh2 fallback"
-            }
-            Self::Sftp => {
-                "native rsync, WSL rsync, and system scp were unavailable; ssh2 SFTP is the last-resort fallback"
-            }
-        }
-    }
-
-    fn preference_rank(self) -> usize {
-        match self {
-            Self::Rsync => 0,
-            Self::WslRsync => 1,
-            Self::Scp => 2,
-            Self::Sftp => 3,
-        }
-    }
-
-    fn unavailable_reason(self) -> &'static str {
-        match self {
-            Self::Rsync => "native rsync was unavailable or failed its version probe",
-            Self::WslRsync => {
-                if cfg!(target_os = "windows") {
-                    "WSL rsync was unavailable or failed its version probe"
-                } else {
-                    "WSL rsync is only considered on Windows"
-                }
-            }
-            Self::Scp => "system scp was unavailable or failed its executable probe",
-            Self::Sftp => "ssh2 SFTP is only used after preferred transports are unavailable",
-        }
-    }
-
-    fn was_prior_transport_attempted(self) -> bool {
-        !matches!(self, Self::WslRsync) || cfg!(target_os = "windows")
-    }
-
-    pub fn transport_decision(self) -> SyncTransportDecision {
-        self.transport_decision_with_failure(None)
-    }
-
-    pub fn transport_decision_with_failure(
-        self,
-        failure_reason: Option<&str>,
-    ) -> SyncTransportDecision {
-        let attempted_transports = [Self::Rsync, Self::WslRsync, Self::Scp, Self::Sftp]
-            .into_iter()
-            .map(|method| transport_attempt_for(self, method, failure_reason))
-            .collect();
-
-        SyncTransportDecision {
-            chosen_transport: self.as_str().to_string(),
-            auth_source: self.auth_source().to_string(),
-            fallback_rationale: self.fallback_rationale().to_string(),
-            attempted_transports,
-            failure_reason: failure_reason.map(str::to_string),
-        }
-    }
 }
 
 impl std::fmt::Display for SyncMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SyncTransportAttempt {
-    pub transport: String,
-    pub attempted: bool,
-    pub available: bool,
-    pub status: String,
-    pub auth_source: String,
-    pub fallback_rationale: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SyncTransportDecision {
-    pub chosen_transport: String,
-    pub auth_source: String,
-    pub fallback_rationale: String,
-    pub attempted_transports: Vec<SyncTransportAttempt>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure_reason: Option<String>,
-}
-
-impl SyncTransportDecision {
-    fn not_run(failure_reason: &str) -> Self {
-        let attempted_transports = [
-            SyncMethod::Rsync,
-            SyncMethod::WslRsync,
-            SyncMethod::Scp,
-            SyncMethod::Sftp,
-        ]
-        .into_iter()
-        .map(|method| SyncTransportAttempt {
-            transport: method.as_str().to_string(),
-            attempted: false,
-            available: false,
-            status: "not_attempted".to_string(),
-            auth_source: method.auth_source().to_string(),
-            fallback_rationale: method.fallback_rationale().to_string(),
-            failure_reason: Some(format!(
-                "not reached because sync validation failed: {failure_reason}"
-            )),
-        })
-        .collect();
-
-        Self {
-            chosen_transport: "not_run".to_string(),
-            auth_source: "not_applicable".to_string(),
-            fallback_rationale: "sync validation failed before transport selection".to_string(),
-            attempted_transports,
-            failure_reason: Some(failure_reason.to_string()),
-        }
-    }
-}
-
-fn transport_attempt_for(
-    chosen: SyncMethod,
-    method: SyncMethod,
-    failure_reason: Option<&str>,
-) -> SyncTransportAttempt {
-    let (attempted, available, status, failure_reason) =
-        match method.preference_rank().cmp(&chosen.preference_rank()) {
-            std::cmp::Ordering::Less => {
-                if method.was_prior_transport_attempted() {
-                    (
-                        true,
-                        false,
-                        "unavailable",
-                        Some(method.unavailable_reason().to_string()),
-                    )
-                } else {
-                    (
-                        false,
-                        false,
-                        "not_applicable",
-                        Some(method.unavailable_reason().to_string()),
-                    )
-                }
-            }
-            std::cmp::Ordering::Equal => (
-                true,
-                true,
-                if failure_reason.is_some() {
-                    "failed"
-                } else {
-                    "chosen"
-                },
-                failure_reason.map(str::to_string),
-            ),
-            std::cmp::Ordering::Greater => (
-                false,
-                false,
-                "not_attempted",
-                Some(format!(
-                    "not reached because {} was selected",
-                    chosen.as_str()
-                )),
-            ),
-        };
-
-    SyncTransportAttempt {
-        transport: method.as_str().to_string(),
-        attempted,
-        available,
-        status: status.to_string(),
-        auth_source: method.auth_source().to_string(),
-        fallback_rationale: method.fallback_rationale().to_string(),
-        failure_reason,
     }
 }
 
@@ -675,53 +512,6 @@ pub struct PathSyncResult {
     pub error: Option<String>,
     /// Duration of the sync operation.
     pub duration_ms: u64,
-}
-
-impl PathSyncResult {
-    pub fn failure_reason(&self) -> Option<&'static str> {
-        self.error.as_deref().map(sync_failure_reason)
-    }
-}
-
-pub fn sync_failure_reason(error: &str) -> &'static str {
-    let lower = error.to_ascii_lowercase();
-
-    if is_host_key_verification_failure(error) || lower.contains("host key verification") {
-        "host_key_verification"
-    } else if lower.contains("no host configured") {
-        "missing_host"
-    } else if lower.contains("no paths configured") {
-        "missing_paths"
-    } else if lower.contains("invalid source definition") {
-        "invalid_source"
-    } else if lower.contains("permission denied")
-        || lower.contains("no valid authentication")
-        || lower.contains("authentication failed")
-        || lower.contains("publickey")
-    {
-        "authentication"
-    } else if lower.contains("invalid source path") || lower.contains("paths[") {
-        "invalid_path"
-    } else if lower.contains("connection timed out") || lower.contains("timed out") {
-        "connection_timeout"
-    } else if lower.contains("connection refused") {
-        "connection_refused"
-    } else if lower.contains("failed to execute") && lower.contains("os error 2") {
-        "command_unavailable"
-    } else if lower.contains("no such file") || lower.contains("not found") {
-        "remote_path_not_found"
-    } else if lower.contains("failed to create") || lower.contains("refusing to write") {
-        "local_io"
-    } else {
-        "transfer_failed"
-    }
-}
-
-fn failure_prevents_transport_selection(reason: &str) -> bool {
-    matches!(
-        reason,
-        "missing_host" | "missing_paths" | "invalid_source" | "invalid_path"
-    )
 }
 
 /// Report from syncing an entire source.
@@ -810,22 +600,6 @@ impl SyncReport {
                 SyncResult::Failed(errors.join("; "))
             }
         }
-    }
-
-    pub fn transport_decision(&self) -> SyncTransportDecision {
-        let failure_reason = if self.successful_paths() == 0 {
-            self.path_results
-                .iter()
-                .find_map(PathSyncResult::failure_reason)
-        } else {
-            None
-        };
-        if let Some(reason) = failure_reason
-            && failure_prevents_transport_selection(reason)
-        {
-            return SyncTransportDecision::not_run(reason);
-        }
-        self.method.transport_decision_with_failure(failure_reason)
     }
 }
 
@@ -1219,9 +993,8 @@ impl SyncEngine {
             "starting rsync"
         );
 
-        let timeout_str = self.transfer_timeout.to_string();
         let output = match run_rsync_command(
-            &timeout_str,
+            self.transfer_timeout,
             &ssh_opts,
             &remote_spec,
             local_path_str,
@@ -1258,7 +1031,7 @@ impl SyncEngine {
 
             let fallback_remote_spec = remote_spec_for_rsync(host, &expanded_path, false);
             let retry = match run_rsync_command(
-                &timeout_str,
+                self.transfer_timeout,
                 &ssh_opts,
                 &fallback_remote_spec,
                 local_path_str,
@@ -1437,7 +1210,7 @@ impl SyncEngine {
             "starting wsl rsync"
         );
 
-        let output = match cmd.output() {
+        let output = match command_output_with_timeout(cmd, self.transfer_timeout) {
             Ok(o) => o,
             Err(e) => {
                 return PathSyncResult {
@@ -1756,7 +1529,7 @@ impl SyncEngine {
                 temp_path_str,
             ]);
 
-            let output = match cmd.output() {
+            let output = match command_output_with_timeout(cmd, self.transfer_timeout) {
                 Ok(o) => o,
                 Err(e) => {
                     return PathSyncResult {
@@ -3916,163 +3689,6 @@ Total transferred file size: 1,234 bytes
             assert_eq!(method.as_str(), expected);
             assert_eq!(method.to_string(), expected);
         }
-    }
-
-    #[test]
-    fn test_sync_transport_decision_records_preference_order() {
-        let decision = SyncMethod::Scp.transport_decision();
-
-        assert_eq!(decision.chosen_transport, "scp");
-        assert_eq!(decision.auth_source, "system-openssh");
-        assert!(
-            decision
-                .fallback_rationale
-                .contains("system scp keeps OpenSSH")
-        );
-        assert_eq!(decision.attempted_transports.len(), 4);
-
-        let rsync = &decision.attempted_transports[0];
-        assert_eq!(rsync.transport, "rsync");
-        assert!(rsync.attempted);
-        assert!(!rsync.available);
-        assert_eq!(rsync.status, "unavailable");
-        assert_eq!(
-            rsync.failure_reason.as_deref(),
-            Some("native rsync was unavailable or failed its version probe")
-        );
-
-        let wsl_rsync = &decision.attempted_transports[1];
-        assert_eq!(wsl_rsync.transport, "wsl-rsync");
-        if cfg!(target_os = "windows") {
-            assert!(wsl_rsync.attempted);
-            assert_eq!(wsl_rsync.status, "unavailable");
-        } else {
-            assert!(!wsl_rsync.attempted);
-            assert_eq!(wsl_rsync.status, "not_applicable");
-        }
-
-        let scp = &decision.attempted_transports[2];
-        assert_eq!(scp.transport, "scp");
-        assert!(scp.attempted);
-        assert!(scp.available);
-        assert_eq!(scp.status, "chosen");
-
-        let sftp = &decision.attempted_transports[3];
-        assert_eq!(sftp.transport, "sftp");
-        assert!(!sftp.attempted);
-        assert_eq!(sftp.status, "not_attempted");
-    }
-
-    #[test]
-    fn test_wsl_and_sftp_transport_decisions_are_explicit() {
-        let wsl = SyncMethod::WslRsync.transport_decision();
-        assert_eq!(wsl.chosen_transport, "wsl-rsync");
-        assert_eq!(wsl.auth_source, "wsl-openssh");
-        assert_eq!(wsl.attempted_transports[1].status, "chosen");
-        assert_eq!(wsl.attempted_transports[2].status, "not_attempted");
-
-        let sftp = SyncMethod::Sftp.transport_decision();
-        assert_eq!(sftp.chosen_transport, "sftp");
-        assert_eq!(sftp.auth_source, "ssh2-agent-or-key-file");
-        assert_eq!(sftp.attempted_transports[3].status, "chosen");
-        assert!(
-            sftp.fallback_rationale
-                .contains("ssh2 SFTP is the last-resort fallback")
-        );
-    }
-
-    #[test]
-    fn test_sync_failure_reason_classification() {
-        assert_eq!(
-            sync_failure_reason("Source has no host configured"),
-            "missing_host"
-        );
-        assert_eq!(
-            sync_failure_reason("Source has no paths configured"),
-            "missing_paths"
-        );
-        assert_eq!(
-            sync_failure_reason("Invalid source definition: SSH host cannot contain whitespace"),
-            "invalid_source"
-        );
-        assert_eq!(
-            sync_failure_reason("Permission denied (publickey)"),
-            "authentication"
-        );
-        assert_eq!(
-            sync_failure_reason("Invalid source path: paths[0] cannot be empty"),
-            "invalid_path"
-        );
-        assert_eq!(
-            sync_failure_reason("connection timed out after 10 seconds"),
-            "connection_timeout"
-        );
-        assert_eq!(
-            sync_failure_reason("rsync: change_dir failed: No such file or directory"),
-            "remote_path_not_found"
-        );
-    }
-
-    #[test]
-    fn test_sync_report_transport_decision_carries_failure_reason() {
-        let mut report = SyncReport::new("laptop", SyncMethod::Scp);
-        report.add_path_result(PathSyncResult {
-            remote_path: "~/.codex/sessions".to_string(),
-            success: false,
-            error: Some("Permission denied (publickey)".to_string()),
-            ..Default::default()
-        });
-
-        let decision = report.transport_decision();
-
-        assert_eq!(decision.chosen_transport, "scp");
-        assert_eq!(decision.failure_reason.as_deref(), Some("authentication"));
-        assert_eq!(
-            decision.attempted_transports[2].failure_reason.as_deref(),
-            Some("authentication")
-        );
-        assert_eq!(decision.attempted_transports[2].status, "failed");
-    }
-
-    #[test]
-    fn test_sync_report_transport_decision_is_not_run_for_validation_failure() {
-        let report = SyncReport::failed("missing-host", SyncError::NoHost);
-
-        let decision = report.transport_decision();
-
-        assert_eq!(decision.chosen_transport, "not_run");
-        assert_eq!(decision.auth_source, "not_applicable");
-        assert_eq!(decision.failure_reason.as_deref(), Some("missing_host"));
-        assert!(
-            decision
-                .attempted_transports
-                .iter()
-                .all(|attempt| !attempt.attempted && attempt.status == "not_attempted"),
-            "validation failure must not claim a transport was attempted: {decision:?}"
-        );
-    }
-
-    #[test]
-    fn test_sync_report_transport_decision_ignores_partial_path_failure() {
-        let mut report = SyncReport::new("laptop", SyncMethod::Scp);
-        report.add_path_result(PathSyncResult {
-            remote_path: "~/.codex/sessions".to_string(),
-            success: false,
-            error: Some("Permission denied (publickey)".to_string()),
-            ..Default::default()
-        });
-        report.add_path_result(PathSyncResult {
-            remote_path: "~/.claude/projects".to_string(),
-            success: true,
-            files_transferred: 1,
-            ..Default::default()
-        });
-
-        let decision = report.transport_decision();
-
-        assert_eq!(decision.chosen_transport, "scp");
-        assert_eq!(decision.failure_reason, None);
-        assert_eq!(decision.attempted_transports[2].status, "chosen");
     }
 
     #[test]

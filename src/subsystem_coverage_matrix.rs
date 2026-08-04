@@ -332,8 +332,8 @@ pub fn subsystem_coverage_matrix() -> Vec<SubsystemCoverage> {
             subsystem: "models",
             owning_beads: &[".5", ".5.1", ".5.5"],
             failure_modes: &[
-                "fm-models-fastembed-missing",
-                "fm-models-onnx-load-failure",
+                "fm-models-native-minilm-missing",
+                "fm-models-native-load-failure",
                 "fm-models-checksum-mismatch",
             ],
             mandatory_proofs: &[ProofLevel::Integration],

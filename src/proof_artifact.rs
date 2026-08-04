@@ -16,10 +16,16 @@
 //! without invoking anything — so the classification can be trusted as the single
 //! source of truth for closeout docs and quality gates.
 
-use std::io;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use walkdir::WalkDir;
 
 /// Stable schema version for the proof-artifact wire format.
 pub const PROOF_ARTIFACT_SCHEMA_VERSION: u32 = 1;
@@ -348,9 +354,964 @@ impl ProofManifest {
     }
 }
 
+/// Stable schema for one immutable, run-scoped E2E evidence bundle.
+pub const E2E_RUN_BUNDLE_SCHEMA_VERSION: u32 = 2;
+/// Canonical manifest filename inside a run directory.
+pub const E2E_RUN_MANIFEST_FILENAME: &str = "manifest.json";
+/// Completion receipt written only after the manifest is durable.
+pub const E2E_RUN_COMPLETION_FILENAME: &str = "complete.json";
+const REQUIRED_E2E_ACCEPTANCE_GATES: [&str; 6] = [
+    "cargo-tests",
+    "jsonl-schema",
+    "bounded-capture-complete",
+    "artifact-set-nonempty",
+    "trace-artifacts-nonempty",
+    "required-event-coverage",
+];
+
+fn e2e_manifest_path(root: &Path) -> PathBuf {
+    root.join(E2E_RUN_MANIFEST_FILENAME) // ubs:ignore — fixed control filename, never caller input.
+}
+
+fn e2e_completion_path(root: &Path) -> PathBuf {
+    root.join(E2E_RUN_COMPLETION_FILENAME) // ubs:ignore — fixed control filename, never caller input.
+}
+
+/// Fail-closed errors for E2E run creation and verification.
+#[derive(Debug, Error)]
+pub enum E2eRunBundleError {
+    #[error("invalid E2E run id `{0}`; expected 8-128 ASCII alphanumeric, `_`, or `-` bytes")]
+    InvalidRunId(String),
+    #[error("invalid RCH worker id `{0}`; expected 1-64 ASCII alphanumeric, `_`, or `-` bytes")]
+    InvalidWorkerId(String),
+    #[error("invalid {field} digest `{value}`; expected {expected} lowercase hexadecimal bytes")]
+    InvalidDigest {
+        field: &'static str,
+        value: String,
+        expected: usize,
+    },
+    #[error("unsafe E2E bundle entry `{path}`: {reason}")]
+    UnsafeEntry { path: String, reason: String },
+    #[error("invalid E2E bundle manifest: {0}")]
+    InvalidManifest(String),
+    #[error("I/O error at `{path}`: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid JSON in `{path}`: {source}")]
+    Json {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+fn bundle_io(path: &Path, source: io::Error) -> E2eRunBundleError {
+    E2eRunBundleError::Io {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
+fn bundle_json(path: &Path, source: serde_json::Error) -> E2eRunBundleError {
+    E2eRunBundleError::Json {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
+fn invalid_manifest(message: impl fmt::Display) -> E2eRunBundleError {
+    E2eRunBundleError::InvalidManifest(message.to_string())
+}
+
+fn unsafe_bundle_entry(path: &Path, reason: impl fmt::Display) -> E2eRunBundleError {
+    E2eRunBundleError::UnsafeEntry {
+        path: path.display().to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+/// Validate a collision-resistant run id before using it in any path or shell handoff.
+pub fn validate_e2e_run_id(run_id: &str) -> Result<(), E2eRunBundleError> {
+    if !(8..=128).contains(&run_id.len())
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        || !run_id
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !run_id
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err(E2eRunBundleError::InvalidRunId(run_id.to_string()));
+    }
+    Ok(())
+}
+
+/// Validate the explicit RCH worker id used by both compilation and SSH handoff.
+pub fn validate_rch_worker_id(worker_id: &str) -> Result<(), E2eRunBundleError> {
+    if worker_id.is_empty()
+        || worker_id.len() > 64
+        || !worker_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        || !worker_id
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !worker_id
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err(E2eRunBundleError::InvalidWorkerId(worker_id.to_string()));
+    }
+    Ok(())
+}
+
+fn validate_hex_digest(
+    field: &'static str,
+    value: &str,
+    expected: usize,
+) -> Result<(), E2eRunBundleError> {
+    if value.len() != expected
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(E2eRunBundleError::InvalidDigest {
+            field,
+            value: value.to_string(),
+            expected,
+        });
+    }
+    Ok(())
+}
+
+/// Validate the exact committed source and working-tree digest bound into a run.
+pub fn validate_e2e_source_identity(
+    source_sha: &str,
+    source_diff_sha256: &str,
+    source_tree_sha256: &str,
+) -> Result<(), E2eRunBundleError> {
+    validate_hex_digest("source_sha", source_sha, 40)?;
+    validate_hex_digest("source_diff_sha256", source_diff_sha256, 64)?;
+    validate_hex_digest("source_tree_sha256", source_tree_sha256, 64)
+}
+
+fn validate_worker_hostname(hostname: &str) -> Result<(), E2eRunBundleError> {
+    if hostname.is_empty()
+        || hostname.len() > 255
+        || !hostname.is_ascii()
+        || !hostname
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(E2eRunBundleError::InvalidManifest(
+            "worker_hostname must be 1-255 ASCII hostname bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relative_artifact_path(path: &Path) -> Result<String, E2eRunBundleError> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(E2eRunBundleError::UnsafeEntry {
+            path: path.display().to_string(),
+            reason: "path must be a non-empty normalized relative path".to_string(),
+        });
+    }
+    path.to_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| E2eRunBundleError::UnsafeEntry {
+            path: path.display().to_string(),
+            reason: "path is not valid UTF-8".to_string(),
+        })
+}
+
+fn reject_aliasing_file(path: &Path, metadata: &fs::Metadata) -> Result<(), E2eRunBundleError> {
+    if !metadata.is_file() {
+        return Err(E2eRunBundleError::UnsafeEntry {
+            path: path.display().to_string(),
+            reason: "entry is not a regular file".to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(E2eRunBundleError::UnsafeEntry {
+                path: path.display().to_string(),
+                reason: format!(
+                    "regular file has {} hard links; immutable bundles require one owner",
+                    metadata.nlink()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, E2eRunBundleError> {
+    let mut file = File::open(path).map_err(|error| bundle_io(path, error))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| bundle_io(path, error))?;
+        if read == 0 {
+            break;
+        }
+        let chunk = buffer
+            .get(..read)
+            .ok_or_else(|| invalid_manifest("read returned more bytes than the hash buffer"))?;
+        hasher.update(chunk);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn is_transient_e2e_source_entry(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let Some(Component::Normal(first)) = relative.components().next() else {
+        return false;
+    };
+    let Some(name) = first.to_str() else {
+        return false;
+    };
+    matches!(
+        name,
+        ".git" | ".beads" | ".rch-tmp" | "target" | "test-results"
+    ) || name.starts_with(".rch-target-")
+}
+
+/// Hash every non-transient source file using GNU `sha256sum --zero` framing.
+///
+/// RCH clean overlays do not contain `.git`, and Cargo/RCH create transient
+/// output directories while the runner is starting. Those top-level transport
+/// and output directories are excluded; every other entry is part of the
+/// source identity. Symbolic links, hard links, non-files, and non-UTF-8 paths
+/// fail closed so an overlay cannot alias bytes outside the attested tree.
+pub fn e2e_source_tree_sha256(root: &Path) -> Result<String, E2eRunBundleError> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|error| bundle_io(root, error))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(unsafe_bundle_entry(
+            root,
+            "source root must be a real directory",
+        ));
+    }
+
+    let mut files = Vec::new();
+    let entries = WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_transient_e2e_source_entry(root, entry.path()));
+    for entry in entries {
+        let entry = entry.map_err(invalid_manifest)?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(path).map_err(|error| bundle_io(path, error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(unsafe_bundle_entry(
+                path,
+                "symbolic source entries are forbidden",
+            ));
+        }
+        if metadata.is_dir() {
+            continue;
+        }
+        reject_aliasing_file(path, &metadata)?;
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| unsafe_bundle_entry(path, "source entry is outside its root"))?;
+        let relative = validate_relative_artifact_path(relative)?;
+        if relative.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(unsafe_bundle_entry(
+                path,
+                "source path contains an ASCII control byte",
+            ));
+        }
+        files.push((relative, path.to_path_buf()));
+    }
+    files.sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+
+    let mut tree_hasher = Sha256::new();
+    for (relative, path) in files {
+        let file_sha256 = sha256_file(&path)?;
+        tree_hasher.update(file_sha256.as_bytes());
+        tree_hasher.update(b"  ");
+        tree_hasher.update(relative.as_bytes());
+        tree_hasher.update([0]);
+    }
+    Ok(hex::encode(tree_hasher.finalize()))
+}
+
+/// The schema recognized for one captured artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum E2eRunArtifactSchema {
+    Raw,
+    Jsonl,
+    E2eLogV1,
+    CassTraceV1,
+}
+
+/// One immutable file declared by an E2E run manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eRunArtifact {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub events: u64,
+    pub schema: E2eRunArtifactSchema,
+}
+
+/// One gate evaluated before a bundle may be cited as a pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eRunGateResult {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+/// Aggregated, deterministic statistics over the declared file set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eRunAggregates {
+    pub files: u64,
+    pub bytes: u64,
+    pub events: u64,
+    pub trace_files: u64,
+    pub trace_bytes: u64,
+    pub trace_events: u64,
+    pub event_histogram: BTreeMap<String, u64>,
+}
+
+/// Exact source, worker, command, outcome, and artifact identity for one run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eRunBundleManifest {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub source_sha: String,
+    pub source_diff_sha256: String,
+    pub source_tree_sha256: String,
+    pub worker_id: String,
+    pub worker_hostname: String,
+    pub command: Vec<String>,
+    pub command_sha256: String,
+    pub cargo_exit_code: i32,
+    pub started_at_unix_ms: u64,
+    pub ended_at_unix_ms: u64,
+    pub files: Vec<E2eRunArtifact>,
+    pub aggregates: E2eRunAggregates,
+    pub gates: Vec<E2eRunGateResult>,
+    pub complete: bool,
+}
+
+impl E2eRunBundleManifest {
+    /// A citable pass requires a completed manifest, a successful test command,
+    /// a non-empty artifact set, and every named gate to pass.
+    #[must_use]
+    pub fn is_acceptance_pass(&self) -> bool {
+        self.complete
+            && self.cargo_exit_code == 0
+            && !self.files.is_empty()
+            && self.gates.iter().all(|gate| gate.passed)
+            && REQUIRED_E2E_ACCEPTANCE_GATES.iter().all(|required| {
+                self.gates
+                    .iter()
+                    .any(|gate| gate.name == *required && gate.passed)
+            })
+    }
+}
+
+/// Durable receipt binding the completion marker to the exact manifest bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eRunCompletionReceipt {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub manifest_sha256: String,
+    pub finalized_at_unix_ms: u64,
+}
+
+/// Caller-supplied facts used to create one run manifest.
+#[derive(Debug, Clone)]
+pub struct E2eRunBundleMetadata {
+    pub run_id: String,
+    pub source_sha: String,
+    pub source_diff_sha256: String,
+    pub source_tree_sha256: String,
+    pub worker_id: String,
+    pub worker_hostname: String,
+    pub command: Vec<String>,
+    pub cargo_exit_code: i32,
+    pub started_at_unix_ms: u64,
+    pub ended_at_unix_ms: u64,
+    pub gates: Vec<E2eRunGateResult>,
+}
+
+/// Optional exact expectations checked again after worker-to-local transfer.
+#[derive(Debug, Clone, Default)]
+pub struct E2eRunBundleExpectation {
+    pub run_id: Option<String>,
+    pub source_sha: Option<String>,
+    pub source_diff_sha256: Option<String>,
+    pub source_tree_sha256: Option<String>,
+    pub worker_id: Option<String>,
+    pub worker_hostname: Option<String>,
+}
+
+fn increment_event_histogram(histogram: &mut BTreeMap<String, u64>, event: &str) {
+    *histogram.entry(event.to_string()).or_insert(0) += 1;
+}
+
+fn inspect_jsonl_artifact(
+    path: &Path,
+) -> Result<(u64, E2eRunArtifactSchema, BTreeMap<String, u64>), E2eRunBundleError> {
+    let file = File::open(path).map_err(|error| bundle_io(path, error))?;
+    let mut events = 0_u64;
+    let mut schema = None;
+    let mut histogram = BTreeMap::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| bundle_io(path, error))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&line).map_err(|source| bundle_json(path, source))?;
+        let line_schema = if value.get("schema_version").and_then(|value| value.as_str())
+            == Some("cass-trace-v1")
+        {
+            E2eRunArtifactSchema::CassTraceV1
+        } else if value
+            .get("event")
+            .and_then(|value| value.as_str())
+            .is_some()
+        {
+            E2eRunArtifactSchema::E2eLogV1
+        } else {
+            E2eRunArtifactSchema::Jsonl
+        };
+        if let Some(expected) = schema
+            && expected != line_schema
+        {
+            return Err(invalid_manifest(format_args!(
+                "{} mixes {:?} and {:?} records",
+                path.display(),
+                expected,
+                line_schema
+            )));
+        }
+        schema = Some(line_schema);
+        events = events.saturating_add(1);
+        let event = match line_schema {
+            E2eRunArtifactSchema::CassTraceV1 => value
+                .pointer("/fields/event")
+                .or_else(|| value.pointer("/fields/message"))
+                .and_then(serde_json::Value::as_str),
+            E2eRunArtifactSchema::E2eLogV1 => {
+                value.get("event").and_then(serde_json::Value::as_str)
+            }
+            E2eRunArtifactSchema::Raw | E2eRunArtifactSchema::Jsonl => None,
+        };
+        if let Some(event) = event {
+            increment_event_histogram(&mut histogram, event);
+        }
+    }
+    let schema = schema.unwrap_or_else(|| {
+        if path.file_name().and_then(|name| name.to_str()) == Some("trace.jsonl") {
+            E2eRunArtifactSchema::CassTraceV1
+        } else {
+            E2eRunArtifactSchema::Jsonl
+        }
+    });
+    Ok((events, schema, histogram))
+}
+
+fn inspect_artifact(
+    root: &Path,
+    path: &Path,
+) -> Result<(E2eRunArtifact, BTreeMap<String, u64>), E2eRunBundleError> {
+    let symlink_metadata = fs::symlink_metadata(path).map_err(|error| bundle_io(path, error))?;
+    if symlink_metadata.file_type().is_symlink() {
+        return Err(E2eRunBundleError::UnsafeEntry {
+            path: path.display().to_string(),
+            reason: "symbolic links are forbidden".to_string(),
+        });
+    }
+    reject_aliasing_file(path, &symlink_metadata)?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| E2eRunBundleError::UnsafeEntry {
+            path: path.display().to_string(),
+            reason: format!("entry is outside bundle root {}", root.display()),
+        })?;
+    let relative = validate_relative_artifact_path(relative)?;
+    let bytes = symlink_metadata.len();
+    let is_jsonl = path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+        || path.file_name().and_then(|name| name.to_str()) == Some("cass.log");
+    let (events, schema, histogram) = if is_jsonl {
+        inspect_jsonl_artifact(path)?
+    } else {
+        (0, E2eRunArtifactSchema::Raw, BTreeMap::new())
+    };
+    Ok((
+        E2eRunArtifact {
+            path: relative,
+            sha256: sha256_file(path)?,
+            bytes,
+            events,
+            schema,
+        },
+        histogram,
+    ))
+}
+
+fn collect_run_artifacts(
+    root: &Path,
+) -> Result<(Vec<E2eRunArtifact>, E2eRunAggregates), E2eRunBundleError> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|error| bundle_io(root, error))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(E2eRunBundleError::UnsafeEntry {
+            path: root.display().to_string(),
+            reason: "bundle root must be a real directory".to_string(),
+        });
+    }
+
+    let mut files = Vec::new();
+    let mut aggregates = E2eRunAggregates::default();
+    for entry in WalkDir::new(root).min_depth(1).follow_links(false) {
+        let entry = entry.map_err(invalid_manifest)?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(path).map_err(|error| bundle_io(path, error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(unsafe_bundle_entry(path, "symbolic links are forbidden"));
+        }
+        if metadata.is_dir() {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| invalid_manifest(path.display()))?;
+        if relative == Path::new(E2E_RUN_MANIFEST_FILENAME)
+            || relative == Path::new(E2E_RUN_COMPLETION_FILENAME)
+        {
+            continue;
+        }
+        let (artifact, histogram) = inspect_artifact(root, path)?;
+        aggregates.files = aggregates.files.saturating_add(1);
+        aggregates.bytes = aggregates.bytes.saturating_add(artifact.bytes);
+        aggregates.events = aggregates.events.saturating_add(artifact.events);
+        if artifact.schema == E2eRunArtifactSchema::CassTraceV1 {
+            aggregates.trace_files = aggregates.trace_files.saturating_add(1);
+            aggregates.trace_bytes = aggregates.trace_bytes.saturating_add(artifact.bytes);
+            aggregates.trace_events = aggregates.trace_events.saturating_add(artifact.events);
+        }
+        for (event, count) in histogram {
+            *aggregates.event_histogram.entry(event).or_insert(0) += count;
+        }
+        files.push(artifact);
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((files, aggregates))
+}
+
+fn write_durable_json<T: Serialize>(path: &Path, value: &T) -> Result<Vec<u8>, E2eRunBundleError> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|source| E2eRunBundleError::Json {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| E2eRunBundleError::InvalidManifest(path.display().to_string()))?;
+    let temp = parent.join(format!(
+        ".{}.partial-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("bundle"),
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp)
+        .map_err(|error| bundle_io(&temp, error))?;
+    file.write_all(&bytes)
+        .map_err(|error| bundle_io(&temp, error))?;
+    file.sync_all().map_err(|error| bundle_io(&temp, error))?;
+    fs::rename(&temp, path).map_err(|error| bundle_io(path, error))?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| bundle_io(parent, error))?;
+    Ok(bytes)
+}
+
+fn hash_command_argument(hasher: &mut Sha256, argument: &str) {
+    hasher.update(argument.len().to_string().as_bytes());
+    hasher.update(b":");
+    hasher.update(argument.as_bytes());
+    hasher.update(b"\n");
+}
+
+fn command_sha256(command: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cass-e2e-command-v1\n");
+    for argument in command {
+        hash_command_argument(&mut hasher, argument);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn validate_e2e_command(command: &[String]) -> Result<(), E2eRunBundleError> {
+    let mut prefix = command.iter();
+    if prefix.next().map(String::as_str) != Some("cargo")
+        || prefix.next().map(String::as_str) != Some("test")
+    {
+        return Err(invalid_manifest(
+            "command must begin with the exact `cargo test` argv",
+        ));
+    }
+    if command.iter().any(|argument| {
+        argument.is_empty()
+            || !argument.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'_' | b'.' | b'/' | b':' | b'=' | b'+' | b',' | b'@' | b'-'
+                    )
+            })
+    }) {
+        return Err(invalid_manifest(
+            "command arguments must be non-empty shell-independent ASCII argv",
+        ));
+    }
+    let cargo_arguments = || {
+        command
+            .iter()
+            .take_while(|argument| argument.as_str() != "--")
+    };
+    if !cargo_arguments().any(|argument| argument == "--locked") {
+        return Err(invalid_manifest(
+            "command must contain `--locked` before the test-harness separator",
+        ));
+    }
+    if !cargo_arguments().any(|argument| argument == "--test") {
+        return Err(invalid_manifest(
+            "command must name an explicit `--test` target",
+        ));
+    }
+    if cargo_arguments().any(|argument| argument == "--no-run") {
+        return Err(invalid_manifest(
+            "command cannot use `--no-run` as acceptance evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_manifest_shape(manifest: &E2eRunBundleManifest) -> Result<(), E2eRunBundleError> {
+    if manifest.schema_version != E2E_RUN_BUNDLE_SCHEMA_VERSION {
+        return Err(E2eRunBundleError::InvalidManifest(format!(
+            "unsupported schema version {}",
+            manifest.schema_version
+        )));
+    }
+    validate_e2e_run_id(&manifest.run_id)?;
+    validate_rch_worker_id(&manifest.worker_id)?;
+    validate_e2e_source_identity(
+        &manifest.source_sha,
+        &manifest.source_diff_sha256,
+        &manifest.source_tree_sha256,
+    )?;
+    validate_hex_digest("command_sha256", &manifest.command_sha256, 64)?;
+    validate_worker_hostname(&manifest.worker_hostname)?;
+    validate_e2e_command(&manifest.command)?;
+    if command_sha256(&manifest.command)
+        .cmp(&manifest.command_sha256)
+        .is_ne()
+    {
+        return Err(E2eRunBundleError::InvalidManifest(
+            "command_sha256 does not match command".to_string(),
+        ));
+    }
+    if manifest.ended_at_unix_ms < manifest.started_at_unix_ms {
+        return Err(E2eRunBundleError::InvalidManifest(
+            "end timestamp precedes start timestamp".to_string(),
+        ));
+    }
+    if !manifest.complete {
+        return Err(E2eRunBundleError::InvalidManifest(
+            "manifest is not marked complete".to_string(),
+        ));
+    }
+    let mut file_paths = BTreeSet::new();
+    for artifact in &manifest.files {
+        let relative = validate_relative_artifact_path(Path::new(&artifact.path))?;
+        if relative == E2E_RUN_MANIFEST_FILENAME || relative == E2E_RUN_COMPLETION_FILENAME {
+            return Err(invalid_manifest(format_args!(
+                "control file `{relative}` must not appear in the artifact list"
+            )));
+        }
+        if file_paths.contains(&relative) {
+            return Err(invalid_manifest(format_args!(
+                "duplicate artifact path `{relative}`"
+            )));
+        }
+        file_paths.insert(relative);
+        validate_hex_digest("artifact sha256", &artifact.sha256, 64)?;
+    }
+    let mut gate_names = BTreeSet::new();
+    for gate in &manifest.gates {
+        if gate.name.is_empty() || gate.detail.is_empty() || !gate_names.insert(gate.name.as_str())
+        {
+            return Err(invalid_manifest(
+                "gate names must be non-empty and unique, and gate details must be non-empty",
+            ));
+        }
+    }
+    let missing_gates = REQUIRED_E2E_ACCEPTANCE_GATES
+        .iter()
+        .filter(|required| !gate_names.contains(*required))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_gates.is_empty() {
+        return Err(E2eRunBundleError::InvalidManifest(format!(
+            "missing required acceptance gates: {}",
+            missing_gates.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Finalize the already-populated run directory with a durable manifest and receipt.
+///
+/// Existing manifest/receipt files are never overwritten. A crash before the
+/// receipt leaves an explicitly incomplete, recoverable directory that cannot
+/// pass verification.
+pub fn finalize_e2e_run_bundle(
+    root: &Path,
+    metadata: E2eRunBundleMetadata,
+) -> Result<E2eRunBundleManifest, E2eRunBundleError> {
+    validate_e2e_run_id(&metadata.run_id)?;
+    validate_rch_worker_id(&metadata.worker_id)?;
+    validate_e2e_source_identity(
+        &metadata.source_sha,
+        &metadata.source_diff_sha256,
+        &metadata.source_tree_sha256,
+    )?;
+    validate_worker_hostname(&metadata.worker_hostname)?;
+    let root_name = root.file_name().and_then(|name| name.to_str());
+    if root_name != Some(metadata.run_id.as_str()) {
+        return Err(E2eRunBundleError::InvalidManifest(format!(
+            "bundle root `{}` does not end in run id `{}`",
+            root.display(),
+            metadata.run_id
+        )));
+    }
+    for control in [E2E_RUN_MANIFEST_FILENAME, E2E_RUN_COMPLETION_FILENAME] {
+        let path = if control == E2E_RUN_MANIFEST_FILENAME {
+            e2e_manifest_path(root)
+        } else {
+            e2e_completion_path(root)
+        };
+        if fs::symlink_metadata(&path).is_ok() {
+            return Err(invalid_manifest(format_args!(
+                "refusing to overwrite existing control file `{}`",
+                path.display()
+            )));
+        }
+    }
+    let (files, aggregates) = collect_run_artifacts(root)?;
+    let mut gates = metadata.gates;
+    gates.push(E2eRunGateResult {
+        name: "artifact-set-nonempty".to_string(),
+        passed: !files.is_empty(),
+        detail: format!("{} declared files", files.len()),
+    });
+    gates.push(E2eRunGateResult {
+        name: "trace-artifacts-nonempty".to_string(),
+        passed: aggregates.trace_files > 0 && aggregates.trace_events > 0,
+        detail: format!(
+            "{} trace files, {} events, {} bytes",
+            aggregates.trace_files, aggregates.trace_events, aggregates.trace_bytes
+        ),
+    });
+    let required_events = ["run_start", "test_start", "test_end", "run_end"];
+    let missing_events = required_events
+        .iter()
+        .filter(|event| !aggregates.event_histogram.contains_key(**event))
+        .copied()
+        .collect::<Vec<_>>();
+    gates.push(E2eRunGateResult {
+        name: "required-event-coverage".to_string(),
+        passed: missing_events.is_empty(),
+        detail: if missing_events.is_empty() {
+            "run_start, test_start, test_end, and run_end are present".to_string()
+        } else {
+            format!(
+                "missing aggregate event types: {}",
+                missing_events.join(", ")
+            )
+        },
+    });
+    let manifest = E2eRunBundleManifest {
+        schema_version: E2E_RUN_BUNDLE_SCHEMA_VERSION,
+        run_id: metadata.run_id,
+        source_sha: metadata.source_sha,
+        source_diff_sha256: metadata.source_diff_sha256,
+        source_tree_sha256: metadata.source_tree_sha256,
+        worker_id: metadata.worker_id,
+        worker_hostname: metadata.worker_hostname,
+        command_sha256: command_sha256(&metadata.command),
+        command: metadata.command,
+        cargo_exit_code: metadata.cargo_exit_code,
+        started_at_unix_ms: metadata.started_at_unix_ms,
+        ended_at_unix_ms: metadata.ended_at_unix_ms,
+        files,
+        aggregates,
+        gates,
+        complete: true,
+    };
+    validate_manifest_shape(&manifest)?;
+    let manifest_path = e2e_manifest_path(root);
+    let manifest_bytes = write_durable_json(&manifest_path, &manifest)?;
+    let receipt = E2eRunCompletionReceipt {
+        schema_version: E2E_RUN_BUNDLE_SCHEMA_VERSION,
+        run_id: manifest.run_id.clone(),
+        manifest_sha256: hex::encode(Sha256::digest(&manifest_bytes)),
+        finalized_at_unix_ms: manifest.ended_at_unix_ms,
+    };
+    write_durable_json(&e2e_completion_path(root), &receipt)?;
+    Ok(manifest)
+}
+
+fn read_regular_control_file(path: &Path) -> Result<Vec<u8>, E2eRunBundleError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| bundle_io(path, error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(E2eRunBundleError::UnsafeEntry {
+            path: path.display().to_string(),
+            reason: "symbolic control file is forbidden".to_string(),
+        });
+    }
+    reject_aliasing_file(path, &metadata)?;
+    fs::read(path).map_err(|error| bundle_io(path, error))
+}
+
+/// Recompute every file identity and aggregate after transfer, rejecting stale,
+/// missing, extra, aliased, or path-injected evidence.
+pub fn verify_e2e_run_bundle(
+    root: &Path,
+    expected: &E2eRunBundleExpectation,
+) -> Result<E2eRunBundleManifest, E2eRunBundleError> {
+    let manifest_path = e2e_manifest_path(root);
+    let manifest_bytes = read_regular_control_file(&manifest_path)?;
+    let manifest: E2eRunBundleManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|source| E2eRunBundleError::Json {
+            path: manifest_path.display().to_string(),
+            source,
+        })?;
+    validate_manifest_shape(&manifest)?;
+    if root.file_name().and_then(|name| name.to_str()) != Some(manifest.run_id.as_str()) {
+        return Err(E2eRunBundleError::InvalidManifest(
+            "bundle directory name does not match manifest run_id".to_string(),
+        ));
+    }
+    for (label, actual, wanted) in [
+        (
+            "run_id",
+            manifest.run_id.as_str(),
+            expected.run_id.as_deref(),
+        ),
+        (
+            "source_sha",
+            manifest.source_sha.as_str(),
+            expected.source_sha.as_deref(),
+        ),
+        (
+            "source_diff_sha256",
+            manifest.source_diff_sha256.as_str(),
+            expected.source_diff_sha256.as_deref(),
+        ),
+        (
+            "source_tree_sha256",
+            manifest.source_tree_sha256.as_str(),
+            expected.source_tree_sha256.as_deref(),
+        ),
+        (
+            "worker_id",
+            manifest.worker_id.as_str(),
+            expected.worker_id.as_deref(),
+        ),
+        (
+            "worker_hostname",
+            manifest.worker_hostname.as_str(),
+            expected.worker_hostname.as_deref(),
+        ),
+    ] {
+        if let Some(wanted) = wanted
+            && actual != wanted
+        {
+            return Err(invalid_manifest(format_args!(
+                "{label} mismatch: expected `{wanted}`, found `{actual}`"
+            )));
+        }
+    }
+    let receipt_path = e2e_completion_path(root);
+    let receipt_bytes = read_regular_control_file(&receipt_path)?;
+    let receipt: E2eRunCompletionReceipt =
+        serde_json::from_slice(&receipt_bytes).map_err(|source| E2eRunBundleError::Json {
+            path: receipt_path.display().to_string(),
+            source,
+        })?;
+    let manifest_digest = hex::encode(Sha256::digest(&manifest_bytes));
+    if receipt
+        .schema_version
+        .cmp(&E2E_RUN_BUNDLE_SCHEMA_VERSION)
+        .is_ne()
+        || receipt.run_id.cmp(&manifest.run_id).is_ne()
+        || receipt.manifest_sha256.cmp(&manifest_digest).is_ne()
+        || receipt
+            .finalized_at_unix_ms
+            .cmp(&manifest.ended_at_unix_ms)
+            .is_ne()
+    {
+        return Err(E2eRunBundleError::InvalidManifest(
+            "completion receipt does not bind the exact manifest bytes".to_string(),
+        ));
+    }
+
+    let (actual_files, actual_aggregates) = collect_run_artifacts(root)?;
+    if actual_files != manifest.files {
+        return Err(E2eRunBundleError::InvalidManifest(
+            "declared file set, bytes, schema, event count, or SHA-256 does not match disk"
+                .to_string(),
+        ));
+    }
+    if actual_aggregates != manifest.aggregates {
+        return Err(E2eRunBundleError::InvalidManifest(
+            "aggregate counts or event histogram do not match disk".to_string(),
+        ));
+    }
+    Ok(manifest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn base_run() -> ProofRun {
         ProofRun {
@@ -604,5 +1565,540 @@ mod tests {
             "{}",
             emitted_empty.path
         );
+    }
+
+    fn bundle_metadata(run_id: &str) -> E2eRunBundleMetadata {
+        E2eRunBundleMetadata {
+            run_id: run_id.to_string(),
+            source_sha: "a".repeat(40),
+            source_diff_sha256: "b".repeat(64),
+            source_tree_sha256: "c".repeat(64),
+            worker_id: "vmi1149989".to_string(),
+            worker_hostname: "worker-a".to_string(),
+            command: vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "--locked".to_string(),
+                "--test".to_string(),
+                "e2e_semantic_search".to_string(),
+                "--".to_string(),
+                "--test-threads=1".to_string(),
+            ],
+            cargo_exit_code: 0,
+            started_at_unix_ms: 1_000,
+            ended_at_unix_ms: 2_000,
+            gates: vec![
+                E2eRunGateResult {
+                    name: "cargo-tests".to_string(),
+                    passed: true,
+                    detail: "exit 0".to_string(),
+                },
+                E2eRunGateResult {
+                    name: "jsonl-schema".to_string(),
+                    passed: true,
+                    detail: "validator exit 0".to_string(),
+                },
+                E2eRunGateResult {
+                    name: "bounded-capture-complete".to_string(),
+                    passed: true,
+                    detail: "all command output captured".to_string(),
+                },
+            ],
+        }
+    }
+
+    type BundleTestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn populated_bundle(parent: &Path, run_id: &str) -> BundleTestResult<PathBuf> {
+        let root = parent.join(run_id);
+        std::fs::create_dir_all(root.join("suite/test"))?;
+        std::fs::write(
+            root.join("suite/test/trace.jsonl"),
+            concat!(
+                "{\"schema_version\":\"cass-trace-v1\",\"timestamp\":\"2026-01-01T00:00:00Z\",",
+                "\"level\":\"INFO\",\"target\":\"cass::search\",\"trace_id\":\"trace-a\",",
+                "\"test_id\":\"suite/test\",\"fields\":{\"event\":\"command_summary\"}}\n"
+            ),
+        )?;
+        std::fs::write(
+            root.join("suite/test/events.jsonl"),
+            concat!(
+                "{\"ts\":\"2026-01-01T00:00:00Z\",\"event\":\"run_start\",",
+                "\"run_id\":\"fixture\",\"runner\":\"rust\"}\n",
+                "{\"ts\":\"2026-01-01T00:00:01Z\",\"event\":\"test_start\",",
+                "\"run_id\":\"fixture\",\"runner\":\"rust\"}\n",
+                "{\"ts\":\"2026-01-01T00:00:02Z\",\"event\":\"test_end\",",
+                "\"run_id\":\"fixture\",\"runner\":\"rust\"}\n",
+                "{\"ts\":\"2026-01-01T00:00:03Z\",\"event\":\"run_end\",",
+                "\"run_id\":\"fixture\",\"runner\":\"rust\"}\n",
+            ),
+        )?;
+        std::fs::write(root.join("suite/test/stdout"), b"bounded output\n")?;
+        Ok(root)
+    }
+
+    fn expected_bundle_error<T>(
+        result: Result<T, E2eRunBundleError>,
+        context: &str,
+    ) -> BundleTestResult<E2eRunBundleError> {
+        match result {
+            Ok(_) => Err(format!("{context}: operation unexpectedly succeeded").into()),
+            Err(error) => Ok(error),
+        }
+    }
+
+    fn bundle_test_failure(arguments: fmt::Arguments<'_>) -> Box<dyn std::error::Error> {
+        arguments.to_string().into()
+    }
+
+    fn bundle_error_contains(error: &E2eRunBundleError, needle: &str) -> bool {
+        error.to_string().contains(needle)
+    }
+
+    #[test]
+    fn run_and_worker_ids_reject_path_and_shell_injection() -> BundleTestResult {
+        for invalid in ["", "short", "../escape", "run id", "-leading", "trailing-"] {
+            if validate_e2e_run_id(invalid).is_ok() {
+                return Err(bundle_test_failure(format_args!(
+                    "accepted invalid run id {invalid:?}"
+                )));
+            }
+        }
+        for valid in [
+            "acceptance-20260728-a1b2c3",
+            "run_12345678",
+            "ABCdef-012345",
+        ] {
+            validate_e2e_run_id(valid)?;
+        }
+        for invalid in ["", "../worker", "worker id", "-worker", "worker-"] {
+            if validate_rch_worker_id(invalid).is_ok() {
+                return Err(bundle_test_failure(format_args!(
+                    "accepted invalid worker id {invalid:?}"
+                )));
+            }
+        }
+        validate_rch_worker_id("vmi1149989")?;
+        validate_rch_worker_id("a")?;
+        validate_e2e_source_identity(&"a".repeat(40), &"b".repeat(64), &"c".repeat(64))?;
+        if validate_e2e_source_identity(&"A".repeat(40), &"b".repeat(64), &"c".repeat(64)).is_ok() {
+            return Err("accepted uppercase source digest".into());
+        }
+        if validate_e2e_source_identity(&"a".repeat(40), &"b".repeat(64), &"C".repeat(64)).is_ok() {
+            return Err("accepted uppercase source-tree digest".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_digest_is_order_independent_and_shell_framed() -> BundleTestResult {
+        let first = tempfile::TempDir::new()?;
+        let second = tempfile::TempDir::new()?;
+        std::fs::create_dir_all(first.path().join("src"))?;
+        std::fs::create_dir_all(second.path().join("src"))?;
+        std::fs::write(first.path().join("src/z.rs"), b"z\n")?;
+        std::fs::write(first.path().join("Cargo.toml"), b"[package]\n")?;
+        std::fs::write(second.path().join("Cargo.toml"), b"[package]\n")?;
+        std::fs::write(second.path().join("src/z.rs"), b"z\n")?;
+
+        let first_digest = e2e_source_tree_sha256(first.path())?;
+        let second_digest = e2e_source_tree_sha256(second.path())?;
+        if first_digest.cmp(&second_digest).is_ne() {
+            return Err("source-tree digest depends on filesystem creation order".into());
+        }
+
+        let cargo_digest = hex::encode(Sha256::digest(b"[package]\n"));
+        let source_digest = hex::encode(Sha256::digest(b"z\n"));
+        let mut expected = Sha256::new();
+        expected.update(cargo_digest.as_bytes());
+        expected.update(b"  Cargo.toml\0");
+        expected.update(source_digest.as_bytes());
+        expected.update(b"  src/z.rs\0");
+        let expected = hex::encode(expected.finalize());
+        if first_digest.cmp(&expected).is_ne() {
+            return Err(format!(
+                "source-tree digest does not match sha256sum --zero framing: expected {expected}, found {first_digest}"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_digest_detects_changed_and_extra_source_files() -> BundleTestResult {
+        let dir = tempfile::TempDir::new()?;
+        std::fs::create_dir_all(dir.path().join("src"))?;
+        std::fs::write(dir.path().join("src/lib.rs"), b"pub fn original() {}\n")?;
+        let original = e2e_source_tree_sha256(dir.path())?;
+
+        std::fs::write(dir.path().join("src/lib.rs"), b"pub fn changed() {}\n")?;
+        let changed = e2e_source_tree_sha256(dir.path())?;
+        if changed == original {
+            return Err("changed source bytes preserved the tree digest".into());
+        }
+
+        std::fs::write(dir.path().join("src/extra.rs"), b"pub fn extra() {}\n")?;
+        let extra = e2e_source_tree_sha256(dir.path())?;
+        if extra == changed {
+            return Err("extra source file preserved the tree digest".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_digest_ignores_only_declared_top_level_transients() -> BundleTestResult {
+        let dir = tempfile::TempDir::new()?;
+        std::fs::create_dir_all(dir.path().join("src/target"))?;
+        std::fs::write(dir.path().join("src/target/tracked.rs"), b"tracked\n")?;
+        let original = e2e_source_tree_sha256(dir.path())?;
+
+        for transient in [
+            ".git",
+            ".beads",
+            ".rch-tmp",
+            ".rch-target-debug",
+            "target",
+            "test-results",
+        ] {
+            let transient_root = dir.path().join(transient);
+            std::fs::create_dir_all(&transient_root)?;
+            std::fs::write(transient_root.join("ignored"), transient.as_bytes())?;
+        }
+        let with_transients = e2e_source_tree_sha256(dir.path())?;
+        if with_transients != original {
+            return Err("declared top-level transport output changed source digest".into());
+        }
+
+        std::fs::write(dir.path().join("src/target/tracked.rs"), b"changed\n")?;
+        if e2e_source_tree_sha256(dir.path())? == with_transients {
+            return Err("nested directory with a transient name was incorrectly excluded".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_tree_digest_rejects_symlink_and_hardlink_aliases() -> BundleTestResult {
+        use std::os::unix::fs::symlink;
+
+        let symlink_dir = tempfile::TempDir::new()?;
+        std::fs::write(symlink_dir.path().join("real"), b"source\n")?;
+        symlink("real", symlink_dir.path().join("alias"))?;
+        let symlink_error =
+            expected_bundle_error(e2e_source_tree_sha256(symlink_dir.path()), "symlink source")?;
+        if !bundle_error_contains(&symlink_error, "symbolic source entries") {
+            return Err(format!("unexpected symlink source error: {symlink_error}").into());
+        }
+
+        let hardlink_dir = tempfile::TempDir::new()?;
+        let first = hardlink_dir.path().join("first");
+        std::fs::write(&first, b"source\n")?;
+        std::fs::hard_link(&first, hardlink_dir.path().join("second"))?;
+        let hardlink_error = expected_bundle_error(
+            e2e_source_tree_sha256(hardlink_dir.path()),
+            "hardlink source",
+        )?;
+        if !bundle_error_contains(&hardlink_error, "hard links") {
+            return Err(format!("unexpected hardlink source error: {hardlink_error}").into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn command_digest_has_a_fixed_shell_reproducible_test_vector() -> BundleTestResult {
+        let command =
+            ["cargo", "test", "--locked", "--test", "e2e_semantic_search"].map(ToString::to_string);
+        let actual = command_sha256(&command);
+        let expected = "f3cd72a9cac25d52fe925957068c8f3a58a2bad11dffe64d0fab10587c2cb088";
+        if actual.as_str().cmp(expected).is_ne() {
+            return Err(
+                format!("command digest mismatch: expected {expected}, found {actual}").into(),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_rejects_an_incomplete_or_reclassified_cargo_command() -> BundleTestResult {
+        for (run_id, command, expected_error) in [
+            (
+                "acceptance-20260728-missing-target",
+                vec!["cargo", "test", "--locked"],
+                "explicit `--test` target",
+            ),
+            (
+                "acceptance-20260728-unlocked",
+                vec!["cargo", "test", "--test", "e2e_semantic_search"],
+                "`--locked` before",
+            ),
+            (
+                "acceptance-20260728-no-run",
+                vec![
+                    "cargo",
+                    "test",
+                    "--locked",
+                    "--test",
+                    "e2e_semantic_search",
+                    "--no-run",
+                ],
+                "cannot use `--no-run`",
+            ),
+            (
+                "acceptance-20260728-shell-text",
+                vec!["cargo", "test", "--locked", "--test", "e2e semantic search"],
+                "shell-independent ASCII argv",
+            ),
+        ] {
+            let parent = tempfile::TempDir::new()?;
+            let root = populated_bundle(parent.path(), run_id)?;
+            let mut metadata = bundle_metadata(run_id);
+            metadata.command = command.into_iter().map(ToString::to_string).collect();
+            let error = expected_bundle_error(
+                finalize_e2e_run_bundle(&root, metadata),
+                "incomplete command",
+            )?;
+            if !bundle_error_contains(&error, expected_error) {
+                return Err(bundle_test_failure(format_args!(
+                    "unexpected command validation error: {error}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn finalized_bundle_round_trips_exact_files_and_receipt() -> BundleTestResult {
+        let parent = tempfile::TempDir::new()?;
+        let run_id = "acceptance-20260728-roundtrip";
+        let root = populated_bundle(parent.path(), run_id)?;
+        let manifest = finalize_e2e_run_bundle(&root, bundle_metadata(run_id))?;
+        if !manifest.is_acceptance_pass()
+            || manifest.aggregates.files != 3
+            || manifest.aggregates.trace_files != 1
+            || manifest.aggregates.trace_events != 1
+            || manifest
+                .aggregates
+                .event_histogram
+                .get("command_summary")
+                .copied()
+                != Some(1)
+        {
+            return Err(format!("unexpected finalized manifest: {manifest:?}").into());
+        }
+
+        let verified = verify_e2e_run_bundle(
+            &root,
+            &E2eRunBundleExpectation {
+                run_id: Some(run_id.to_string()),
+                source_sha: Some("a".repeat(40)),
+                source_diff_sha256: Some("b".repeat(64)),
+                source_tree_sha256: Some("c".repeat(64)),
+                worker_id: Some("vmi1149989".to_string()),
+                worker_hostname: None,
+            },
+        )?;
+        if verified.ne(&manifest) {
+            return Err("verified bundle differs from finalized manifest".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn acceptance_requires_every_named_producer_and_automatic_gate() -> BundleTestResult {
+        let parent = tempfile::TempDir::new()?;
+        let run_id = "acceptance-20260728-required-gates";
+        let root = populated_bundle(parent.path(), run_id)?;
+        let mut metadata = bundle_metadata(run_id);
+        metadata
+            .gates
+            .retain(|gate| gate.name != "bounded-capture-complete");
+        let error = expected_bundle_error(
+            finalize_e2e_run_bundle(&root, metadata),
+            "manifest missing a required producer gate",
+        )?;
+        if !error
+            .to_string()
+            .contains("missing required acceptance gates: bounded-capture-complete")
+        {
+            return Err(format!("unexpected error: {error}").into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unfinalized_bundle_without_control_files_never_verifies() -> BundleTestResult {
+        let parent = tempfile::TempDir::new()?;
+        let run_id = "acceptance-20260728-unfinalized";
+        let root = populated_bundle(parent.path(), run_id)?;
+        let error = expected_bundle_error(
+            verify_e2e_run_bundle(&root, &E2eRunBundleExpectation::default()),
+            "unfinalized bundle",
+        )?;
+        if !error.to_string().contains("manifest.json") {
+            return Err(format!("unexpected error: {error}").into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn changed_or_extra_file_cannot_reuse_a_valid_receipt() -> BundleTestResult {
+        let changed_parent = tempfile::TempDir::new()?;
+        let changed_id = "acceptance-20260728-changed";
+        let changed_root = populated_bundle(changed_parent.path(), changed_id)?;
+        finalize_e2e_run_bundle(&changed_root, bundle_metadata(changed_id))?;
+        std::fs::write(changed_root.join("suite/test/stdout"), b"tampered\n")?;
+        let changed_error = expected_bundle_error(
+            verify_e2e_run_bundle(&changed_root, &E2eRunBundleExpectation::default()),
+            "changed artifact",
+        )?;
+        if !changed_error.to_string().contains("declared file set") {
+            return Err(format!("unexpected changed-file error: {changed_error}").into());
+        }
+
+        let extra_parent = tempfile::TempDir::new()?;
+        let extra_id = "acceptance-20260728-extra";
+        let extra_root = populated_bundle(extra_parent.path(), extra_id)?;
+        finalize_e2e_run_bundle(&extra_root, bundle_metadata(extra_id))?;
+        std::fs::write(extra_root.join("untracked-extra"), b"stale evidence\n")?;
+        let extra_error = expected_bundle_error(
+            verify_e2e_run_bundle(&extra_root, &E2eRunBundleExpectation::default()),
+            "extra artifact",
+        )?;
+        if !extra_error.to_string().contains("declared file set") {
+            return Err(format!("unexpected extra-file error: {extra_error}").into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn worker_or_source_drift_fails_after_integrity_verification() -> BundleTestResult {
+        let parent = tempfile::TempDir::new()?;
+        let run_id = "acceptance-20260728-drift";
+        let root = populated_bundle(parent.path(), run_id)?;
+        finalize_e2e_run_bundle(&root, bundle_metadata(run_id))?;
+        let expectations = [
+            E2eRunBundleExpectation {
+                worker_id: Some("vmi1152480".to_string()),
+                ..Default::default()
+            },
+            E2eRunBundleExpectation {
+                source_sha: Some("c".repeat(40)),
+                ..Default::default()
+            },
+            E2eRunBundleExpectation {
+                source_diff_sha256: Some("d".repeat(64)),
+                ..Default::default()
+            },
+            E2eRunBundleExpectation {
+                source_tree_sha256: Some("e".repeat(64)),
+                ..Default::default()
+            },
+        ];
+        for expectation in expectations {
+            let error = expected_bundle_error(
+                verify_e2e_run_bundle(&root, &expectation),
+                "provenance drift",
+            )?;
+            if !bundle_error_contains(&error, "mismatch") {
+                return Err(bundle_test_failure(format_args!(
+                    "unexpected provenance error: {error}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_and_hardlink_aliases_are_rejected_before_manifest_creation() -> BundleTestResult {
+        use std::os::unix::fs::symlink;
+
+        let symlink_parent = tempfile::TempDir::new()?;
+        let symlink_id = "acceptance-20260728-symlink";
+        let symlink_root = populated_bundle(symlink_parent.path(), symlink_id)?;
+        let outside = symlink_parent.path().join("outside");
+        std::fs::write(&outside, b"outside\n")?;
+        symlink(&outside, symlink_root.join("suite/test/alias"))?;
+        let symlink_error = expected_bundle_error(
+            finalize_e2e_run_bundle(&symlink_root, bundle_metadata(symlink_id)),
+            "symlink artifact",
+        )?;
+        if !symlink_error.to_string().contains("symbolic links") {
+            return Err(format!("unexpected symlink error: {symlink_error}").into());
+        }
+
+        let hardlink_parent = tempfile::TempDir::new()?;
+        let hardlink_id = "acceptance-20260728-hardlink";
+        let hardlink_root = populated_bundle(hardlink_parent.path(), hardlink_id)?;
+        std::fs::hard_link(
+            hardlink_root.join("suite/test/stdout"),
+            hardlink_root.join("suite/test/stdout-alias"),
+        )?;
+        let hardlink_error = expected_bundle_error(
+            finalize_e2e_run_bundle(&hardlink_root, bundle_metadata(hardlink_id)),
+            "hardlink artifact",
+        )?;
+        if !hardlink_error.to_string().contains("hard links") {
+            return Err(format!("unexpected hardlink error: {hardlink_error}").into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn two_run_ids_never_consume_each_others_artifacts() -> BundleTestResult {
+        let parent = tempfile::TempDir::new()?;
+        let left_id = "acceptance-20260728-left";
+        let right_id = "acceptance-20260728-right";
+        let left = populated_bundle(parent.path(), left_id)?;
+        let right = populated_bundle(parent.path(), right_id)?;
+        std::fs::write(left.join("left-only"), b"left\n")?;
+        std::fs::write(right.join("right-only"), b"right\n")?;
+        let left_manifest = finalize_e2e_run_bundle(&left, bundle_metadata(left_id))?;
+        let right_manifest = finalize_e2e_run_bundle(&right, bundle_metadata(right_id))?;
+        let left_isolated = left_manifest
+            .files
+            .iter()
+            .any(|artifact| artifact.path == "left-only")
+            && left_manifest
+                .files
+                .iter()
+                .all(|artifact| artifact.path != "right-only");
+        let right_isolated = right_manifest
+            .files
+            .iter()
+            .any(|artifact| artifact.path == "right-only")
+            && right_manifest
+                .files
+                .iter()
+                .all(|artifact| artifact.path != "left-only");
+        if !left_isolated || !right_isolated {
+            return Err("parallel run manifests consumed each other's artifacts".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_underlying_cargo_is_integrity_valid_but_never_an_acceptance_pass() -> BundleTestResult
+    {
+        let parent = tempfile::TempDir::new()?;
+        let run_id = "acceptance-20260728-failed";
+        let root = populated_bundle(parent.path(), run_id)?;
+        let mut metadata = bundle_metadata(run_id);
+        metadata.cargo_exit_code = 101;
+        let cargo_gate = metadata
+            .gates
+            .first_mut()
+            .ok_or("test metadata did not contain the cargo-tests gate")?;
+        cargo_gate.passed = false;
+        cargo_gate.detail = "exit 101".to_string();
+        let manifest = finalize_e2e_run_bundle(&root, metadata)?;
+        if manifest.is_acceptance_pass() {
+            return Err("failed cargo run passed acceptance".into());
+        }
+        let verified = verify_e2e_run_bundle(&root, &E2eRunBundleExpectation::default())?;
+        if verified.cargo_exit_code != 101 || verified.is_acceptance_pass() {
+            return Err(format!("failed cargo run verified incorrectly: {verified:?}").into());
+        }
+        Ok(())
     }
 }

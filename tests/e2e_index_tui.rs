@@ -1,10 +1,8 @@
-use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::search::tantivy::expected_index_dir;
 use std::fs;
 use std::path::Path;
 
 mod util;
-use util::EnvGuard;
 use util::e2e_log::{E2eError, E2eErrorContext, E2ePerformanceMetrics, PhaseTracker};
 
 fn truncate_output(bytes: &[u8], max_len: usize) -> String {
@@ -37,7 +35,6 @@ fn make_codex_fixture(root: &Path) {
 #[test]
 fn index_then_tui_once_headless() {
     let tracker = tracker_for("index_then_tui_once_headless");
-    let _trace_guard = tracker.trace_env_guard();
 
     // Phase: setup fixtures
     let setup_start = tracker.start("setup_fixtures", Some("Creating isolated test environment"));
@@ -45,18 +42,19 @@ fn index_then_tui_once_headless() {
     // Isolate from the developer machine's real session dirs (HOME-based connectors).
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
 
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
 
     // Codex fixture under CODEX_HOME to satisfy detection.
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
     make_codex_fixture(&data_dir);
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_codex_home(&data_dir);
     tracker.end(
         "setup_fixtures",
         Some("Test environment ready"),
@@ -65,12 +63,14 @@ fn index_then_tui_once_headless() {
 
     // Phase: run index
     let index_start = tracker.start("run_index", Some("Running cass index --full"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
         .arg(&data_dir)
         .current_dir(&home)
+        .env("XDG_DATA_HOME", &xdg)
         .output()
         .expect("failed to spawn cass index");
     if !output.status.success() {
@@ -107,12 +107,14 @@ fn index_then_tui_once_headless() {
 
     // Phase: run TUI in headless mode
     let tui_start = tracker.start("run_tui", Some("Smoke-testing TUI in headless mode"));
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
         .arg("--once")
         .current_dir(&home)
+        .env("XDG_DATA_HOME", &xdg)
         .env("TUI_HEADLESS", "1")
         .output()
         .expect("failed to spawn cass tui");

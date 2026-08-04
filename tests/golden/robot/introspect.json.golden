@@ -1,449 +1,6 @@
 {
   "api_version": 1,
   "contract_version": "1",
-  "subsystem_coverage": {
-    "schema_version": 1,
-    "subsystem_count": 15,
-    "complete": true,
-    "subsystems": [
-      {
-        "subsystem": "analytics",
-        "owning_beads": [
-          ".15.4",
-          ".9.4"
-        ],
-        "failure_modes": [
-          "fm-analytics-rebuild-grouped-aggregate",
-          "fm-analytics-charts-saturating-zero"
-        ],
-        "mandatory_proofs": [
-          "unit",
-          "golden"
-        ],
-        "proof_artifacts": [
-          "src/metric_integrity.rs",
-          "tests/analytics_cost_pricing_table_contract.rs"
-        ],
-        "optional_diagnostics": [
-          "live analytics rollup tail under doctor --fix"
-        ],
-        "fixture_provenance": "synthetic usage-ledger rows; no real session content",
-        "log_expectation": "deterministic --lib result line; proof-log when wired into doctor rebuild",
-        "redaction": "no-user-content",
-        "closure_evidence": "cargo test --lib metric_integrity + analytics contract test path/count"
-      },
-      {
-        "subsystem": "bookmarks",
-        "owning_beads": [
-          ".15.4"
-        ],
-        "failure_modes": [
-          "fm-bookmarks-silent-row-decode",
-          "fm-bookmarks-import-non-atomic"
-        ],
-        "mandatory_proofs": [
-          "unit",
-          "integration"
-        ],
-        "proof_artifacts": [
-          "src/bookmarks.rs",
-          "src/metric_integrity.rs"
-        ],
-        "optional_diagnostics": [],
-        "fixture_provenance": "synthetic bookmark rows; labels may embed workspace paths",
-        "log_expectation": "deterministic --lib result line; no structured log required for pure core",
-        "redaction": "local-only",
-        "closure_evidence": "cargo test --lib bookmarks result line"
-      },
-      {
-        "subsystem": "cache",
-        "owning_beads": [
-          ".15.2"
-        ],
-        "failure_modes": [
-          "fm-cache-tantivy-searcher-stale"
-        ],
-        "mandatory_proofs": [
-          "integration"
-        ],
-        "proof_artifacts": [
-          "src/daemon_runtime_state.rs",
-          "tests/search_caching.rs",
-          "tests/regex_cache.rs"
-        ],
-        "optional_diagnostics": [
-          "live searcher generation/reload tail"
-        ],
-        "fixture_provenance": "synthetic generation counters; no user content",
-        "log_expectation": "deterministic --lib result line for SearcherCacheOutcome",
-        "redaction": "no-user-content",
-        "closure_evidence": "cargo test --lib daemon_runtime_state + search_caching"
-      },
-      {
-        "subsystem": "cli_robot",
-        "owning_beads": [
-          ".2.4",
-          ".11.1",
-          ".11.5",
-          ".12.6"
-        ],
-        "failure_modes": [
-          "fm-cli-robot-schema-drift",
-          "fm-cli-exit-code-regression",
-          "fm-cli-golden-snapshot-drift"
-        ],
-        "mandatory_proofs": [
-          "e2e",
-          "golden",
-          "logs"
-        ],
-        "proof_artifacts": [
-          "tests/e2e_robot_smoke_gate.rs",
-          "tests/cli_robot.rs",
-          "tests/cli_robot_log_hygiene.rs"
-        ],
-        "optional_diagnostics": [],
-        "fixture_provenance": "isolated empty data dir; real cass binary dispatch",
-        "log_expectation": "PhaseTracker structured log + manifest per .12.3 (E2E_LOG=1)",
-        "redaction": "no-user-content",
-        "closure_evidence": "cargo test --test e2e_robot_smoke_gate + golden robot JSON diff"
-      },
-      {
-        "subsystem": "connectors",
-        "owning_beads": [
-          ".15.1",
-          ".3.1",
-          ".14.1"
-        ],
-        "failure_modes": [
-          "fm-connectors-jsonl-parse-error",
-          "fm-connectors-cursor-vscdb-locked",
-          "fm-connectors-chatgpt-encrypted-undecipherable",
-          "fm-connectors-amp-stem-prefix-unsafe",
-          "fm-indexer-aider-external-id-collision"
-        ],
-        "mandatory_proofs": [
-          "unit",
-          "integration",
-          "golden"
-        ],
-        "proof_artifacts": [
-          "src/connector_ingest_diagnostics.rs",
-          "tests/connector_cursor.rs",
-          "tests/connector_chatgpt.rs",
-          "tests/connector_aider.rs",
-          "tests/connector_amp.rs"
-        ],
-        "optional_diagnostics": [
-          "per-provider live ingest probe"
-        ],
-        "fixture_provenance": "per-provider synthetic session files; encrypted blob is non-decipherable by design",
-        "log_expectation": "deterministic --lib result line; per-provider conformance fixtures",
-        "redaction": "local-only",
-        "closure_evidence": "cargo test --lib connector_ingest_diagnostics + per-provider conformance"
-      },
-      {
-        "subsystem": "daemon",
-        "owning_beads": [
-          ".15.2",
-          ".2.2",
-          ".4.1"
-        ],
-        "failure_modes": [
-          "fm-daemon-stale-pidfile-socket",
-          "fm-daemon-fd-leak-on-tryclone"
-        ],
-        "mandatory_proofs": [
-          "integration"
-        ],
-        "proof_artifacts": [
-          "src/daemon_runtime_state.rs",
-          "tests/daemon_client_integration.rs"
-        ],
-        "optional_diagnostics": [
-          "live socket bind/stale-cleanup observation"
-        ],
-        "fixture_provenance": "synthetic runtime artifacts; flock .spawnlock, no pidfile",
-        "log_expectation": "deterministic --lib result line for DaemonRuntimeState",
-        "redaction": "no-user-content",
-        "closure_evidence": "cargo test --lib daemon_runtime_state + daemon_client_integration"
-      },
-      {
-        "subsystem": "html_export",
-        "owning_beads": [
-          ".15.3",
-          ".10.5",
-          ".12.3",
-          ".13.3"
-        ],
-        "failure_modes": [
-          "fm-html-export-markdown-injection",
-          "fm-html-export-encryption-failure",
-          "fm-encryption-nonce-type-safety",
-          "fm-encryption-utf8-byte-slicing"
-        ],
-        "mandatory_proofs": [
-          "integration",
-          "golden",
-          "e2e"
-        ],
-        "proof_artifacts": [
-          "tests/html_export_sanitization_security.rs",
-          "tests/html_export_integration.rs",
-          "tests/html_export_e2e.rs"
-        ],
-        "optional_diagnostics": [],
-        "fixture_provenance": "synthetic malicious markdown/script inputs; encrypted body is ciphertext",
-        "log_expectation": "structured proof-log for the real-binary export run; encrypted bodies stay ciphertext",
-        "redaction": "redact-required",
-        "closure_evidence": "cargo test --test html_export_sanitization_security + golden html_export diff"
-      },
-      {
-        "subsystem": "indexer",
-        "owning_beads": [
-          ".1",
-          ".4",
-          ".11.2",
-          ".12.5",
-          ".14.4"
-        ],
-        "failure_modes": [
-          "fm-indexer-stale-lexical-publish-backups",
-          "fm-indexer-tantivy-corrupt-or-stale",
-          "fm-indexer-fsvi-vector-orphan",
-          "fm-indexer-zero-results-regression",
-          "fm-indexer-edge-ngram-mismatch",
-          "fm-indexer-double-saturating-sub"
-        ],
-        "mandatory_proofs": [
-          "integration",
-          "golden"
-        ],
-        "proof_artifacts": [
-          "tests/indexer_tantivy.rs",
-          "tests/atomic_swap_publish_crash_window.rs",
-          "src/search/regression_corpus.rs"
-        ],
-        "optional_diagnostics": [
-          "live publish/backup retention tail"
-        ],
-        "fixture_provenance": "synthetic index trees + crash-window fixtures; SQLite is source of truth",
-        "log_expectation": "proof-log over publish/atomic-swap runs; deterministic regression-corpus replay",
-        "redaction": "no-user-content",
-        "closure_evidence": "cargo test --lib search::regression_corpus + atomic_swap_publish_crash_window"
-      },
-      {
-        "subsystem": "models",
-        "owning_beads": [
-          ".5",
-          ".5.1",
-          ".5.5"
-        ],
-        "failure_modes": [
-          "fm-models-fastembed-missing",
-          "fm-models-onnx-load-failure",
-          "fm-models-checksum-mismatch"
-        ],
-        "mandatory_proofs": [
-          "integration"
-        ],
-        "proof_artifacts": [
-          "tests/cli_model_lifecycle_contract.rs",
-          "tests/e2e_analytics_models.rs"
-        ],
-        "optional_diagnostics": [
-          "live model download (opt-in; never CI-required)"
-        ],
-        "fixture_provenance": "missing/mismatched model dirs; no network at test time",
-        "log_expectation": "deterministic contract test result line; live download is opt-in only",
-        "redaction": "no-user-content",
-        "closure_evidence": "cargo test --test cli_model_lifecycle_contract"
-      },
-      {
-        "subsystem": "pages",
-        "owning_beads": [
-          ".15.4",
-          ".13.2",
-          ".13.4",
-          ".12.6"
-        ],
-        "failure_modes": [
-          "fm-pages-render-parity-drift",
-          "fm-pages-export-sanitization"
-        ],
-        "mandatory_proofs": [
-          "integration",
-          "golden"
-        ],
-        "proof_artifacts": [
-          "tests/pages_export_golden.rs",
-          "tests/pages_pipeline_e2e.rs",
-          "tests/pages_error_handling_e2e.rs"
-        ],
-        "optional_diagnostics": [
-          "CI-only browser E2E (never local)"
-        ],
-        "fixture_provenance": "synthetic conversations; exported page content is sanitized",
-        "log_expectation": "golden page artifact diff; CI browser logs for render fidelity",
-        "redaction": "redact-required",
-        "closure_evidence": "cargo test --test pages_export_golden result line + golden diff"
-      },
-      {
-        "subsystem": "search",
-        "owning_beads": [
-          ".1",
-          ".4",
-          ".5",
-          ".7",
-          ".11.2",
-          ".15.2"
-        ],
-        "failure_modes": [
-          "fm-search-rrf-fast-unwrap-panic",
-          "fm-search-regex-pipe-in-charclass"
-        ],
-        "mandatory_proofs": [
-          "unit",
-          "integration",
-          "golden"
-        ],
-        "proof_artifacts": [
-          "src/search/regression_corpus.rs",
-          "tests/search_pipeline.rs",
-          "tests/spec_search_determinism.rs"
-        ],
-        "optional_diagnostics": [
-          "live semantic refinement tail"
-        ],
-        "fixture_provenance": "synthetic corpus; query/results stay local",
-        "log_expectation": "deterministic regression-corpus + determinism spec result lines",
-        "redaction": "local-only",
-        "closure_evidence": "cargo test --lib search::regression_corpus + spec_search_determinism"
-      },
-      {
-        "subsystem": "sources",
-        "owning_beads": [
-          ".8",
-          ".8.1",
-          ".8.2",
-          ".8.4",
-          ".8.5"
-        ],
-        "failure_modes": [
-          "fm-sources-rsync-not-on-path",
-          "fm-sources-toml-malformed",
-          "fm-sources-toctou-existence-race"
-        ],
-        "mandatory_proofs": [
-          "unit",
-          "integration",
-          "golden"
-        ],
-        "proof_artifacts": [
-          "src/source_doctor_health.rs",
-          "tests/e2e_sources.rs",
-          "tests/setup_workflow.rs"
-        ],
-        "optional_diagnostics": [
-          "live SSH source probe (opt-in)"
-        ],
-        "fixture_provenance": "synthetic sources.toml + mirror dirs; no SSH session opened at test time",
-        "log_expectation": "deterministic --lib result line; structured logs for e2e source flows",
-        "redaction": "local-only",
-        "closure_evidence": "cargo test --lib source_doctor_health + e2e_sources"
-      },
-      {
-        "subsystem": "storage",
-        "owning_beads": [
-          ".14",
-          ".14.1",
-          ".14.4",
-          ".9.4"
-        ],
-        "failure_modes": [
-          "fm-storage-frankensqlite-openread-cursor",
-          "fm-storage-pragma-integrity-fail",
-          "fm-storage-wal-multiprocess-corruption",
-          "fm-storage-rusqlite-frankensqlite-incompat",
-          "fm-storage-schema-version-drift",
-          "fm-storage-busy-lock-timeout",
-          "fm-storage-stale-wal-orphan",
-          "fm-storage-sql-fmt-injection-risk"
-        ],
-        "mandatory_proofs": [
-          "integration",
-          "golden",
-          "e2e"
-        ],
-        "proof_artifacts": [
-          "tests/e2e_storage_failure_fixture_gate.rs",
-          "tests/storage.rs",
-          "tests/storage_migration_safety.rs"
-        ],
-        "optional_diagnostics": [
-          "live integrity-check sweep"
-        ],
-        "fixture_provenance": "deterministic raw-byte corrupt fixtures; DB preserved byte-identical",
-        "log_expectation": "structured proof-log over the real-binary storage-failure gate",
-        "redaction": "no-user-content",
-        "closure_evidence": "cargo test --test e2e_storage_failure_fixture_gate result line"
-      },
-      {
-        "subsystem": "tui",
-        "owning_beads": [
-          ".15.4",
-          ".13.2",
-          ".13.4",
-          ".12.6"
-        ],
-        "failure_modes": [
-          "fm-tui-render-parity-drift",
-          "fm-tui-human-robot-mismatch"
-        ],
-        "mandatory_proofs": [
-          "integration",
-          "golden",
-          "e2e"
-        ],
-        "proof_artifacts": [
-          "tests/e2e_human_robot_parity_gate.rs",
-          "tests/tui_smoke.rs",
-          "tests/e2e_tui_smoke_flows.rs"
-        ],
-        "optional_diagnostics": [
-          "live TUI asciicast capture"
-        ],
-        "fixture_provenance": "headless TUI fixtures; human summaries carry redacted fields verbatim",
-        "log_expectation": "structured proof-log over the human/robot parity gate",
-        "redaction": "redact-required",
-        "closure_evidence": "cargo test --test e2e_human_robot_parity_gate result line"
-      },
-      {
-        "subsystem": "update_check",
-        "owning_beads": [
-          ".15.4"
-        ],
-        "failure_modes": [
-          "fm-update-shell-injection",
-          "fm-update-clock-rollback"
-        ],
-        "mandatory_proofs": [
-          "unit"
-        ],
-        "proof_artifacts": [
-          "src/update_check.rs",
-          "src/metric_integrity.rs"
-        ],
-        "optional_diagnostics": [
-          "live update-channel probe (opt-in)"
-        ],
-        "fixture_provenance": "synthetic version strings + clock values; no network at test time",
-        "log_expectation": "deterministic --lib result line for sanitized-arg and clock-rollback paths",
-        "redaction": "no-user-content",
-        "closure_evidence": "cargo test --lib update_check result line"
-      }
-    ]
-  },
   "global_flags": [
     {
       "name": "db",
@@ -673,7 +230,7 @@
         },
         {
           "name": "semantic",
-          "description": "Build semantic vector index after text indexing. Progress reports canonical replay, embedding, vector publish, optional HNSW, manifest publish, and finalization as distinct phases. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable stall diagnostics, or CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only while still reporting semantic phase progress",
+          "description": "Build semantic vector index after text indexing",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -683,7 +240,7 @@
         },
         {
           "name": "build-hnsw",
-          "description": "Build HNSW index for approximate nearest neighbor search (requires --semantic). Enables O(log n) search with `--approximate` at query time. Native HNSW construction is an opaque phase: cass reports its vector total but does not synthesize forward progress the backend cannot expose",
+          "description": "Build HNSW index for approximate nearest neighbor search (requires --semantic). Enables O(log n) search with `--approximate` flag at query time",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -820,8 +377,7 @@
             "wrap",
             "sources",
             "analytics",
-            "doctor",
-            "recipes"
+            "doctor"
           ]
         }
       ],
@@ -1105,7 +661,7 @@
         },
         {
           "name": "daemon",
-          "description": "Auto-spawn the warm-model daemon when one is not already running. Search discovers and uses an existing daemon by default; if daemon inference is unavailable, it lazily falls back to direct inference",
+          "description": "Use daemon for warm model inference (faster repeated queries). If daemon is unavailable, falls back to direct inference",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -1127,7 +683,7 @@
         },
         {
           "name": "two-tier",
-          "description": "Request the quality-refined tier of the two-tier search pipeline. The one-shot CLI emits the final quality result set; the interactive TUI is the surface that displays fast results first and refines them in place",
+          "description": "Enable two-tier progressive search: fast results immediately, refined via daemon. Returns initial results from fast embedder (~1ms), then refines with quality embedder via daemon (~130ms). Best of both worlds for interactive search",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -1149,7 +705,7 @@
         },
         {
           "name": "quality-only",
-          "description": "Quality-only search: wait for full transformer model results. Uses an existing daemon when available and lazily falls back to the installed local model; higher latency than --fast-only, but more accurate",
+          "description": "Quality-only search: wait for full transformer model results. Higher latency (~130ms) but most accurate semantic matching. Requires daemon to be available; falls back to fast if unavailable",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -1576,93 +1132,6 @@
       "has_json_output": true
     },
     {
-      "name": "storage",
-      "description": "On-disk storage footprint breakdown by component (DB, WAL, lexical index, raw mirror, semantic, quarantine)",
-      "arguments": [
-        {
-          "name": "data-dir",
-          "description": "Override data dir",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        },
-        {
-          "name": "json",
-          "description": "Output as JSON (`--robot` also works)",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "robot-format",
-          "description": "Output format for robot mode (overrides --json when specified)",
-          "arg_type": "option",
-          "value_type": "enum",
-          "required": false,
-          "enum_values": [
-            "json",
-            "jsonl",
-            "compact",
-            "sessions",
-            "toon"
-          ]
-        }
-      ],
-      "has_json_output": true
-    },
-    {
-      "name": "dedup",
-      "description": "Collapse pre-existing duplicate conversation rows (projects/<rel> vs <rel> external_id twins) created before the dedup fix",
-      "arguments": [
-        {
-          "name": "data-dir",
-          "description": "Override data dir",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        },
-        {
-          "name": "json",
-          "description": "Output as JSON (`--robot` also works)",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "apply",
-          "description": "Actually delete the duplicate rows. Without this, runs as a dry-run (inspect only, no mutation)",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "robot-format",
-          "description": "Output format for robot mode (overrides --json when specified)",
-          "arg_type": "option",
-          "value_type": "enum",
-          "required": false,
-          "enum_values": [
-            "json",
-            "jsonl",
-            "compact",
-            "sessions",
-            "toon"
-          ]
-        }
-      ],
-      "has_json_output": true
-    },
-    {
       "name": "status",
       "description": "Quick health check for agents: index freshness, db stats, recommended action",
       "arguments": [
@@ -1778,74 +1247,6 @@
           "value_type": "integer",
           "required": false,
           "default": "300"
-        },
-        {
-          "name": "robot-format",
-          "description": "Output format for robot mode (overrides --json when specified)",
-          "arg_type": "option",
-          "value_type": "enum",
-          "required": false,
-          "enum_values": [
-            "json",
-            "jsonl",
-            "compact",
-            "sessions",
-            "toon"
-          ]
-        }
-      ],
-      "has_json_output": true
-    },
-    {
-      "name": "support-bundle",
-      "description": "Assemble a redacted, share-safe recovery/support evidence bundle",
-      "arguments": [
-        {
-          "name": "data-dir",
-          "description": "Override data dir",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        },
-        {
-          "name": "json",
-          "description": "Output as JSON (`--robot` also works)",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "stale-threshold",
-          "description": "Staleness threshold in seconds (default: 300)",
-          "arg_type": "option",
-          "value_type": "integer",
-          "required": false,
-          "default": "300"
-        },
-        {
-          "name": "include-full-paths",
-          "description": "Include full filesystem paths in the bundle (default: basename-only)",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "include-raw-evidence",
-          "description": "Include raw session/tool payloads in the bundle (default: suppressed)",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
         },
         {
           "name": "robot-format",
@@ -2002,13 +1403,6 @@
           "required": false
         },
         {
-          "name": "conversation-id",
-          "description": "Exact canonical archive conversation row id",
-          "arg_type": "option",
-          "value_type": "integer",
-          "required": false
-        },
-        {
           "name": "line",
           "short": "n",
           "description": "Line number to show (1-indexed)",
@@ -2091,160 +1485,6 @@
           "value_type": "integer",
           "required": false,
           "default": "300"
-        },
-        {
-          "name": "robot-format",
-          "description": "Output format for robot mode (overrides --json when specified)",
-          "arg_type": "option",
-          "value_type": "enum",
-          "required": false,
-          "enum_values": [
-            "json",
-            "jsonl",
-            "compact",
-            "sessions",
-            "toon"
-          ]
-        }
-      ],
-      "has_json_output": true
-    },
-    {
-      "name": "onboarding",
-      "description": "First-run source onboarding + readiness wizard. Read-only: explains what CASS found, what it will index, what is missing, and the single safest next command. Scriptable via `--json`; never launches a bare TUI",
-      "arguments": [
-        {
-          "name": "data-dir",
-          "description": "Override data dir",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        },
-        {
-          "name": "json",
-          "description": "Output as JSON (for automation)",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "robot-format",
-          "description": "Output format for robot mode (overrides --json when specified)",
-          "arg_type": "option",
-          "value_type": "enum",
-          "required": false,
-          "enum_values": [
-            "json",
-            "jsonl",
-            "compact",
-            "sessions",
-            "toon"
-          ]
-        }
-      ],
-      "has_json_output": true
-    },
-    {
-      "name": "guide",
-      "description": "Intent-to-command planner and gated runner for guided safe workflows. Dry-run is the default. `--apply` automatically evaluates only closed, read-only proof adapters and requires an explicit confirmation for each mutating step; macro strings are never evaluated by a shell. Maps an operator intent (fix-ci, investigate-search-miss, prepare-release, repair-assets, export-session, onboard-source, support-capsule) to an exact safe command plan — steps, prerequisites, proof gates, forbidden shortcuts, rch target-dir hints, cost/risk, privacy notes, and stop conditions. Never launches a bare TUI. Omit the intent to list the known intents",
-      "arguments": [
-        {
-          "name": "intent",
-          "description": "Operator intent to plan (omit to list the known intents). Multiple words are joined, e.g. `cass guide rebuild index`",
-          "arg_type": "positional",
-          "value_type": "string",
-          "required": false,
-          "repeatable": true
-        },
-        {
-          "name": "fixture",
-          "description": "Deterministic preflight-facts source: a JSON file shaped like `{ \"facts\": { \"<fact>\": true, ... }, \"intent\"?: \"<intent>\" }`",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        },
-        {
-          "name": "data-dir",
-          "description": "Override data dir",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        },
-        {
-          "name": "apply",
-          "description": "Enter gated apply mode (`--run` is an alias). Without this flag the transcript is a deterministic, fully read-only dry-run",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "confirm-step",
-          "description": "Confirm one exact mutating step number. Repeat for multiple steps; confirmation never carries across steps",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false,
-          "repeatable": true
-        },
-        {
-          "name": "confirm-fact",
-          "description": "Confirm an operator-context preflight fact as true. Repeatable; the confirmation is recorded in the robot transcript",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false,
-          "repeatable": true
-        },
-        {
-          "name": "accept-privacy-tier",
-          "description": "Accept the exact declared privacy tier (`redacted` or `sensitive`). A generic yes is intentionally not accepted",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
-          "name": "accept-cost-risk",
-          "description": "Accept the exact declared cost-risk band (`medium` or `high`) after reviewing the resource what-if result",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
-          "name": "allow-rch",
-          "description": "Permit steps whose macro policy requires rch offload. This does not permit a shell or an unallowlisted executable",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "confirm-stop-conditions-clear",
-          "description": "Assert that every declared stop condition was checked and is clear. An observed triggered stop condition always wins over this assertion",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "json",
-          "description": "Output as JSON (for automation)",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
         },
         {
           "name": "robot-format",
@@ -2366,35 +1606,6 @@
           ]
         },
         {
-          "name": "recover-from-archive",
-          "description": "Rebuild the source JSONL tree from the canonical archive's preserved `extra_json`/`extra_bin` events into `<DIR>`, so a corrupt archive can be re-ingested from cass's own data with `cass index --full` (no stock-sqlite `.recover` needed). Opens the archive read-only",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        },
-        {
-          "name": "rebuild-canonical-fts",
-          "description": "Safely inspect or repair the canonical FTS5 shadow. Exact dry-run parity uses fused covering-index parent-run counts plus bounded primary-key probes; partial shadows resume in bounded batches and recreation is failure-atomic. Supports `--dry-run`; mutation requires `--yes` and never modifies canonical rows",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "cleanup-interrupted-artifacts",
-          "description": "Quarantine interrupted `raw_mirror_capture` staging artifacts that block doctor mutation, instead of forcing a manual `rm` inside the data dir. Requires `--yes`; artifacts are renamed into a quarantine dir, never deleted",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2501,13 +1712,6 @@
           "required": false
         },
         {
-          "name": "since",
-          "description": "Only sessions active since this ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS), keyword (`today`, `yesterday`), or relative offset (`-7d`, `-24h`). Filters on the session's recorded last-activity timestamp (ended_at, falling back to started_at)",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
           "name": "json",
           "description": "Output as JSON (for automation)",
           "arg_type": "flag",
@@ -2543,7 +1747,7 @@
     },
     {
       "name": "resume",
-      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini, Antigravity)",
+      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini)",
       "arguments": [
         {
           "name": "path",
@@ -3318,68 +2522,6 @@
       "has_json_output": true
     },
     {
-      "name": "quarantine",
-      "description": "Inspect and manage the conversation-ingest quarantine (list / clear)",
-      "arguments": [],
-      "has_json_output": false
-    },
-    {
-      "name": "forget",
-      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets",
-      "arguments": [
-        {
-          "name": "source-glob",
-          "description": "Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`)",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": true
-        },
-        {
-          "name": "db",
-          "description": "Override db path",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        },
-        {
-          "name": "apply",
-          "description": "Actually delete the matching conversations. Without this, runs as a dry-run (inspect only)",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "json",
-          "description": "Output as JSON (`--robot` also works)",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "robot-format",
-          "description": "Output format for robot mode (overrides --json when specified)",
-          "arg_type": "option",
-          "value_type": "enum",
-          "required": false,
-          "enum_values": [
-            "json",
-            "jsonl",
-            "compact",
-            "sessions",
-            "toon"
-          ]
-        }
-      ],
-      "has_json_output": true
-    },
-    {
       "name": "mirror",
       "description": "Inspect and prune raw-mirror evidence under explicit operator control",
       "arguments": [],
@@ -3394,18 +2536,6 @@
     {
       "name": "models",
       "description": "Manage semantic search models",
-      "arguments": [],
-      "has_json_output": false
-    },
-    {
-      "name": "fleet",
-      "description": "Fleet-safe upgrade rehearsal and bounded post-upgrade verification",
-      "arguments": [],
-      "has_json_output": false
-    },
-    {
-      "name": "lessons",
-      "description": "Mine and query durable lessons from local evidence (commits, beads, proofs)",
       "arguments": [],
       "has_json_output": false
     },
@@ -3426,89 +2556,6 @@
       "description": "Token usage, tool, and model analytics",
       "arguments": [],
       "has_json_output": false
-    },
-    {
-      "name": "release-verify",
-      "description": "Verify release distribution channels (GitHub, Homebrew, Scoop, crates.io, installer)",
-      "arguments": [
-        {
-          "name": "from",
-          "description": "Read a ReleaseVerifyRequest JSON from a file (or `-` for stdin) and evaluate it offline. Mutually exclusive with --live",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        },
-        {
-          "name": "live",
-          "description": "Gather live per-channel observations over the network (explicit opt-in)",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "expected-version",
-          "description": "Expected release version under test (required for --live)",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
-          "name": "repo",
-          "description": "GitHub owner/repo for the release channel (defaults to the cass repo)",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
-          "name": "crate-name",
-          "description": "crates.io crate name (defaults to the cass crate)",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
-          "name": "homebrew-formula-url",
-          "description": "Raw URL of the Homebrew formula file (enables the homebrew channel)",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
-          "name": "scoop-manifest-url",
-          "description": "Raw URL of the Scoop manifest JSON (enables the scoop channel)",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
-          "name": "json",
-          "description": "Output as JSON (`--robot` also works). Default for this command",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "robot-format",
-          "description": "Output format for robot mode (overrides --json when specified)",
-          "arg_type": "option",
-          "value_type": "enum",
-          "required": false,
-          "enum_values": [
-            "json",
-            "jsonl",
-            "compact",
-            "sessions",
-            "toon"
-          ]
-        }
-      ],
-      "has_json_output": true
     },
     {
       "name": "daemon",
@@ -3547,360 +2594,6 @@
     }
   ],
   "response_schemas": {
-    "analytics-incidents": {
-      "type": "object",
-      "description": "cass analytics incidents --json: bounded read-only incident mining over canonical archive conversations/messages.",
-      "properties": {
-        "command": {
-          "type": "string",
-          "const": "analytics/incidents"
-        },
-        "data": {
-          "type": "object",
-          "properties": {
-            "schema_version": {
-              "type": "integer",
-              "const": 2
-            },
-            "count_scope": {
-              "type": "string",
-              "enum": [
-                "all_matching_candidates",
-                "scanned_candidates_partial",
-                "no_verified_results_hard_timeout"
-              ]
-            },
-            "scan_units": {
-              "type": "object",
-              "properties": {
-                "files": {
-                  "type": "string"
-                },
-                "lines": {
-                  "type": "string"
-                },
-                "bytes": {
-                  "type": "string"
-                },
-                "candidate_order": {
-                  "type": "string"
-                },
-                "message_fragment_chars": {
-                  "type": "integer"
-                }
-              },
-              "required": [
-                "files",
-                "lines",
-                "bytes",
-                "candidate_order",
-                "message_fragment_chars"
-              ]
-            },
-            "discovery": {
-              "type": "object",
-              "properties": {
-                "caps": {
-                  "type": "object",
-                  "properties": {
-                    "max_files": {
-                      "type": "integer"
-                    },
-                    "max_lines": {
-                      "type": "integer"
-                    },
-                    "max_bytes": {
-                      "type": "integer"
-                    },
-                    "budget_ms": {
-                      "type": "integer"
-                    },
-                    "max_evidence": {
-                      "type": "integer"
-                    }
-                  },
-                  "required": [
-                    "max_files",
-                    "max_lines",
-                    "max_bytes",
-                    "budget_ms",
-                    "max_evidence"
-                  ]
-                },
-                "files_considered": {
-                  "type": "integer"
-                },
-                "files_scanned": {
-                  "type": "integer"
-                },
-                "lines_scanned": {
-                  "type": "integer"
-                },
-                "bytes_scanned": {
-                  "type": "integer"
-                },
-                "elapsed_ms": {
-                  "type": "integer"
-                },
-                "stop_reason": {
-                  "type": "string",
-                  "enum": [
-                    "completed",
-                    "files-capped",
-                    "lines-capped",
-                    "bytes-capped",
-                    "message-fragment-capped",
-                    "timed-out"
-                  ]
-                },
-                "timed_out": {
-                  "type": "boolean"
-                },
-                "partial": {
-                  "type": "boolean"
-                },
-                "evidence_truncated": {
-                  "type": "boolean"
-                },
-                "evidence": {
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "properties": {
-                      "file": {
-                        "type": "string"
-                      },
-                      "line": {
-                        "type": "integer"
-                      },
-                      "category": {
-                        "type": "string"
-                      },
-                      "reason": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "file",
-                      "line"
-                    ]
-                  }
-                }
-              },
-              "required": [
-                "caps",
-                "files_considered",
-                "files_scanned",
-                "lines_scanned",
-                "bytes_scanned",
-                "elapsed_ms",
-                "stop_reason",
-                "timed_out",
-                "partial",
-                "evidence_truncated",
-                "evidence"
-              ]
-            },
-            "top_sessions": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "conversation_id": {
-                    "type": "integer"
-                  },
-                  "session_id": {
-                    "type": "string"
-                  },
-                  "agent": {
-                    "type": "string"
-                  },
-                  "host": {
-                    "type": "string"
-                  },
-                  "source_id": {
-                    "type": "string"
-                  },
-                  "origin_host": {
-                    "type": [
-                      "string",
-                      "null"
-                    ]
-                  },
-                  "source_path": {
-                    "type": "string"
-                  },
-                  "exists_state": {
-                    "type": "string",
-                    "enum": [
-                      "exists",
-                      "archive_only",
-                      "unknown"
-                    ]
-                  },
-                  "hit_count": {
-                    "type": "integer"
-                  },
-                  "category_breadth": {
-                    "type": "integer"
-                  },
-                  "dominant_categories": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  "evidence_summaries": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "category": {
-                          "type": "string"
-                        },
-                        "hit_count": {
-                          "type": "integer"
-                        },
-                        "content_fingerprints": {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
-                        },
-                        "evidence_paths": {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
-                        }
-                      },
-                      "required": [
-                        "category",
-                        "hit_count",
-                        "content_fingerprints",
-                        "evidence_paths"
-                      ]
-                    }
-                  },
-                  "redaction_status": {
-                    "type": "string",
-                    "enum": [
-                      "redacted",
-                      "not_applicable"
-                    ]
-                  },
-                  "suggested_command": {
-                    "type": "object",
-                    "properties": {
-                      "kind": {
-                        "type": "string",
-                        "const": "view"
-                      },
-                      "argv": {
-                        "type": "array",
-                        "description": "Executable argv preserving the effective --db and exact --conversation-id archive identity.",
-                        "items": {
-                          "type": "string"
-                        }
-                      },
-                      "display": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "kind",
-                      "argv",
-                      "display"
-                    ]
-                  }
-                },
-                "required": [
-                  "conversation_id",
-                  "session_id",
-                  "agent",
-                  "host",
-                  "source_id",
-                  "source_path",
-                  "exists_state",
-                  "hit_count",
-                  "category_breadth",
-                  "dominant_categories",
-                  "evidence_summaries",
-                  "redaction_status",
-                  "suggested_command"
-                ]
-              }
-            },
-            "total_sessions": {
-              "type": "integer"
-            },
-            "total_hits": {
-              "type": "integer"
-            },
-            "top_sessions_truncated": {
-              "type": "boolean"
-            },
-            "redaction": {
-              "type": "object",
-              "properties": {
-                "private_text_policy": {
-                  "type": "string",
-                  "const": "suppress_all"
-                },
-                "hash_strategy": {
-                  "type": "string",
-                  "const": "blake3_256_v1"
-                },
-                "fields_emitted": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                },
-                "fields_suppressed": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                },
-                "opt_in_flags": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              },
-              "required": [
-                "private_text_policy",
-                "hash_strategy",
-                "fields_emitted",
-                "fields_suppressed",
-                "opt_in_flags"
-              ]
-            }
-          },
-          "required": [
-            "schema_version",
-            "count_scope",
-            "scan_units",
-            "discovery",
-            "top_sessions",
-            "total_sessions",
-            "total_hits",
-            "top_sessions_truncated",
-            "redaction"
-          ]
-        },
-        "_meta": {
-          "type": "object"
-        }
-      },
-      "required": [
-        "command",
-        "data",
-        "_meta"
-      ]
-    },
     "api-version": {
       "type": "object",
       "properties": {
@@ -5153,62 +3846,6 @@
           "type": "object",
           "additionalProperties": true
         },
-        "root_cause": {
-          "type": "object",
-          "description": "Likely root-cause family attributed from observed diagnostic signals. family/locus/confidence are kebab-case taxonomy values (see introspect root_cause_taxonomy); evidence_refs carry the structured signals behind the call; recommended_next_probe is the cheapest bounded confirm. family=unknown + confidence=unknown means no signal implicated a family (not a failure). Complements doctor incidents[]; branch on family/confidence, not summary prose.",
-          "properties": {
-            "schema_version": {
-              "type": "integer"
-            },
-            "family": {
-              "type": "string"
-            },
-            "locus": {
-              "type": "string"
-            },
-            "confidence": {
-              "type": "string"
-            },
-            "evidence_refs": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "kind": {
-                    "type": "string"
-                  },
-                  "locator": {
-                    "type": "string"
-                  },
-                  "detail": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "locator"
-                ]
-              }
-            },
-            "summary": {
-              "type": "string"
-            },
-            "recommended_next_probe": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "schema_version",
-            "family",
-            "locus",
-            "confidence",
-            "evidence_refs",
-            "summary"
-          ]
-        },
         "primary_incident_id": {
           "type": [
             "string",
@@ -5427,15 +4064,6 @@
             },
             "fresh": {
               "type": "boolean"
-            },
-            "partial": {
-              "type": "boolean"
-            },
-            "partial_reason": {
-              "type": [
-                "string",
-                "null"
-              ]
             },
             "last_indexed_at": {
               "type": [
@@ -10148,89 +8776,6 @@
         },
         "capabilities_url": {
           "type": "string"
-        },
-        "storage_integrity": {
-          "type": "object",
-          "description": "Storage-integrity taxonomy (.14.1): canonical archive state derived from the read-only db-open / integrity / fts / index signals.",
-          "properties": {
-            "storage_state": {
-              "type": "string"
-            },
-            "source_of_truth_risk": {
-              "type": "string"
-            },
-            "archive_readability": {
-              "type": "string"
-            },
-            "checks_attempted": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "name": {
-                    "type": "string"
-                  },
-                  "elapsed_ms": {
-                    "type": "integer"
-                  },
-                  "timed_out": {
-                    "type": "boolean"
-                  },
-                  "skipped_reason": {
-                    "type": "string"
-                  },
-                  "read_only": {
-                    "type": "boolean"
-                  }
-                },
-                "required": [
-                  "name",
-                  "elapsed_ms",
-                  "timed_out",
-                  "read_only"
-                ]
-              }
-            },
-            "checks_not_attempted": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "name": {
-                    "type": "string"
-                  },
-                  "reason": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "name",
-                  "reason"
-                ]
-              }
-            },
-            "attestation_source": {
-              "type": "string"
-            },
-            "attested_at_ms": {
-              "type": "integer"
-            },
-            "attestation_check_depth": {
-              "type": "string"
-            },
-            "attested_db_fingerprint": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "storage_state",
-            "source_of_truth_risk",
-            "archive_readability"
-          ]
-        },
-        "daemon_runtime": {
-          "type": "object",
-          "additionalProperties": true
         }
       },
       "required": [
@@ -10272,8 +8817,7 @@
         "coverage_risk",
         "source_authority",
         "candidate_staging",
-        "checks",
-        "daemon_runtime"
+        "checks"
       ]
     },
     "doctor-archive-normalize": {
@@ -28533,46 +27077,6 @@
             }
           }
         },
-        "search_completeness": {
-          "type": "object",
-          "description": "Whether quarantined conversations make search incomplete. quarantine_status=degraded means known conversations are excluded from results (distinct from a merely stale index). Ordinary search still runs (can_search=true); coverage_suspect=true when the ingest circuit breaker tripped on a recent quarantine burst. next_command is always a safe inspect/retry pointer.",
-          "properties": {
-            "quarantine_status": {
-              "type": "string",
-              "enum": [
-                "ok",
-                "degraded"
-              ]
-            },
-            "quarantined_conversations": {
-              "type": "integer"
-            },
-            "complete": {
-              "type": "boolean"
-            },
-            "can_search": {
-              "type": "boolean"
-            },
-            "coverage_suspect": {
-              "type": "boolean"
-            },
-            "impact": {
-              "type": "string"
-            },
-            "next_command": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "quarantine_status",
-            "quarantined_conversations",
-            "complete",
-            "can_search",
-            "coverage_suspect",
-            "impact",
-            "next_command"
-          ]
-        },
         "responsiveness": {
           "type": "object",
           "description": "Machine-responsiveness governor telemetry. Explains why the indexer is running at reduced fan-out and what pressure triggered any recent shrinkage.",
@@ -28685,15 +27189,6 @@
                 },
                 "fresh": {
                   "type": "boolean"
-                },
-                "partial": {
-                  "type": "boolean"
-                },
-                "partial_reason": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
                 },
                 "last_indexed_at": {
                   "type": [
@@ -29592,103 +28087,6 @@
         "contract_version": {
           "type": "string"
         },
-        "subsystem_coverage": {
-          "type": "object",
-          "properties": {
-            "schema_version": {
-              "type": "integer"
-            },
-            "subsystem_count": {
-              "type": "integer"
-            },
-            "complete": {
-              "type": "boolean"
-            },
-            "subsystems": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "subsystem": {
-                    "type": "string"
-                  },
-                  "owning_beads": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  "failure_modes": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  "mandatory_proofs": {
-                    "type": "array",
-                    "items": {
-                      "type": "string",
-                      "enum": [
-                        "unit",
-                        "integration",
-                        "golden",
-                        "e2e",
-                        "logs"
-                      ]
-                    }
-                  },
-                  "proof_artifacts": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  "optional_diagnostics": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  "fixture_provenance": {
-                    "type": "string"
-                  },
-                  "log_expectation": {
-                    "type": "string"
-                  },
-                  "redaction": {
-                    "type": "string",
-                    "enum": [
-                      "no-user-content",
-                      "local-only",
-                      "redact-required"
-                    ]
-                  },
-                  "closure_evidence": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "subsystem",
-                  "owning_beads",
-                  "failure_modes",
-                  "mandatory_proofs",
-                  "proof_artifacts",
-                  "optional_diagnostics",
-                  "fixture_provenance",
-                  "log_expectation",
-                  "redaction",
-                  "closure_evidence"
-                ]
-              }
-            }
-          },
-          "required": [
-            "schema_version",
-            "subsystem_count",
-            "complete",
-            "subsystems"
-          ]
-        },
         "global_flags": {
           "type": "array",
           "items": {
@@ -29914,11 +28312,6 @@
           "additionalProperties": true,
           "description": "Opaque lifecycle block describing cache state, missing files, and consent status."
         },
-        "model_acquisition": {
-          "type": "object",
-          "additionalProperties": true,
-          "description": "Hardened acquisition contract: state (absent|partial_download|ready|checksum_mismatch|quarantined_corrupt|budget_blocked|offline_blocked|disabled_by_policy|baseline_no_semantic|incompatible_runtime|runtime_load_failed), runtime, source, cost_class, expected_download_bytes, fallback_mode, next_step, next_command, state_detail, rollback_guidance, fingerprint{revision,content_digest,marker_token}, and skipped_network_reason (the typed proof cass never auto-downloads outside `cass models install`)."
-        },
         "files": {
           "type": "array",
           "items": {
@@ -29958,11 +28351,6 @@
         "cache_lifecycle": {
           "type": "object",
           "additionalProperties": true
-        },
-        "model_acquisition": {
-          "type": "object",
-          "additionalProperties": true,
-          "description": "Hardened acquisition contract (same shape as models-status.model_acquisition): state, runtime, source, cost_class, fingerprint, and skipped_network_reason proving verify never auto-downloads."
         },
         "error": {
           "type": [
@@ -30531,15 +28919,6 @@
                 "null"
               ]
             },
-            "refinement_level": {
-              "type": "string"
-            },
-            "semantic_fallback_reason": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "wildcard_fallback": {
               "type": "boolean"
             },
@@ -30554,29 +28933,6 @@
                 },
                 "shortfall": {
                   "type": "integer"
-                },
-                "outcomes": {
-                  "type": "object",
-                  "properties": {
-                    "hit": {
-                      "type": "integer"
-                    },
-                    "cold_miss": {
-                      "type": "integer"
-                    },
-                    "stale_generation_miss": {
-                      "type": "integer"
-                    },
-                    "forced_reload": {
-                      "type": "integer"
-                    },
-                    "reload_failure": {
-                      "type": "integer"
-                    },
-                    "fallback": {
-                      "type": "integer"
-                    }
-                  }
                 },
                 "prewarm_scheduled": {
                   "type": "integer"
@@ -31019,15 +29375,6 @@
                     },
                     "fresh": {
                       "type": "boolean"
-                    },
-                    "partial": {
-                      "type": "boolean"
-                    },
-                    "partial_reason": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
                     },
                     "last_indexed_at": {
                       "type": [
@@ -31674,46 +30021,6 @@
                 }
               }
             },
-            "search_completeness": {
-              "type": "object",
-              "description": "Whether quarantined conversations make search incomplete. quarantine_status=degraded means known conversations are excluded from results (distinct from a merely stale index). Ordinary search still runs (can_search=true); coverage_suspect=true when the ingest circuit breaker tripped on a recent quarantine burst. next_command is always a safe inspect/retry pointer.",
-              "properties": {
-                "quarantine_status": {
-                  "type": "string",
-                  "enum": [
-                    "ok",
-                    "degraded"
-                  ]
-                },
-                "quarantined_conversations": {
-                  "type": "integer"
-                },
-                "complete": {
-                  "type": "boolean"
-                },
-                "can_search": {
-                  "type": "boolean"
-                },
-                "coverage_suspect": {
-                  "type": "boolean"
-                },
-                "impact": {
-                  "type": "string"
-                },
-                "next_command": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "quarantine_status",
-                "quarantined_conversations",
-                "complete",
-                "can_search",
-                "coverage_suspect",
-                "impact",
-                "next_command"
-              ]
-            },
             "index_freshness": {
               "type": "object",
               "properties": {
@@ -31731,18 +30038,6 @@
                 },
                 "fresh": {
                   "type": "boolean"
-                },
-                "partial": {
-                  "type": [
-                    "boolean",
-                    "null"
-                  ]
-                },
-                "partial_reason": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
                 },
                 "last_indexed_at": {
                   "type": [
@@ -31769,85 +30064,6 @@
                   "type": "integer"
                 }
               }
-            },
-            "storage_integrity": {
-              "type": "object",
-              "description": "Storage-integrity taxonomy (.14.1): canonical archive state derived from the read-only db-open / integrity / fts / index signals.",
-              "properties": {
-                "storage_state": {
-                  "type": "string"
-                },
-                "source_of_truth_risk": {
-                  "type": "string"
-                },
-                "archive_readability": {
-                  "type": "string"
-                },
-                "checks_attempted": {
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "properties": {
-                      "name": {
-                        "type": "string"
-                      },
-                      "elapsed_ms": {
-                        "type": "integer"
-                      },
-                      "timed_out": {
-                        "type": "boolean"
-                      },
-                      "skipped_reason": {
-                        "type": "string"
-                      },
-                      "read_only": {
-                        "type": "boolean"
-                      }
-                    },
-                    "required": [
-                      "name",
-                      "elapsed_ms",
-                      "timed_out",
-                      "read_only"
-                    ]
-                  }
-                },
-                "checks_not_attempted": {
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "properties": {
-                      "name": {
-                        "type": "string"
-                      },
-                      "reason": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "name",
-                      "reason"
-                    ]
-                  }
-                },
-                "attestation_source": {
-                  "type": "string"
-                },
-                "attested_at_ms": {
-                  "type": "integer"
-                },
-                "attestation_check_depth": {
-                  "type": "string"
-                },
-                "attested_db_fingerprint": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "storage_state",
-                "source_of_truth_risk",
-                "archive_readability"
-              ]
             },
             "timeout_ms": {
               "type": [
@@ -32069,15 +30285,6 @@
             },
             "fresh": {
               "type": "boolean"
-            },
-            "partial": {
-              "type": "boolean"
-            },
-            "partial_reason": {
-              "type": [
-                "string",
-                "null"
-              ]
             },
             "last_indexed_at": {
               "type": [
@@ -33885,15 +32092,6 @@
             "fresh": {
               "type": "boolean"
             },
-            "partial": {
-              "type": "boolean"
-            },
-            "partial_reason": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "last_indexed_at": {
               "type": [
                 "string",
@@ -34797,10 +32995,6 @@
             "proof_notes"
           ]
         },
-        "daemon_runtime": {
-          "type": "object",
-          "additionalProperties": true
-        },
         "doctor_summary": {
           "type": "object",
           "description": "Doctor summary block embedded by health/status so agents can decide whether doctor inspection is needed without running repair.",
@@ -35467,181 +33661,6 @@
           "type": "object",
           "additionalProperties": true
         },
-        "search_completeness": {
-          "type": "object",
-          "description": "Whether quarantined conversations make search incomplete. quarantine_status=degraded means known conversations are excluded from results (distinct from a merely stale index). Ordinary search still runs (can_search=true); coverage_suspect=true when the ingest circuit breaker tripped on a recent quarantine burst. next_command is always a safe inspect/retry pointer.",
-          "properties": {
-            "quarantine_status": {
-              "type": "string",
-              "enum": [
-                "ok",
-                "degraded"
-              ]
-            },
-            "quarantined_conversations": {
-              "type": "integer"
-            },
-            "complete": {
-              "type": "boolean"
-            },
-            "can_search": {
-              "type": "boolean"
-            },
-            "coverage_suspect": {
-              "type": "boolean"
-            },
-            "impact": {
-              "type": "string"
-            },
-            "next_command": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "quarantine_status",
-            "quarantined_conversations",
-            "complete",
-            "can_search",
-            "coverage_suspect",
-            "impact",
-            "next_command"
-          ]
-        },
-        "root_cause": {
-          "type": "object",
-          "description": "Likely root-cause family attributed from observed diagnostic signals. family/locus/confidence are kebab-case taxonomy values (see introspect root_cause_taxonomy); evidence_refs carry the structured signals behind the call; recommended_next_probe is the cheapest bounded confirm. family=unknown + confidence=unknown means no signal implicated a family (not a failure). Complements doctor incidents[]; branch on family/confidence, not summary prose.",
-          "properties": {
-            "schema_version": {
-              "type": "integer"
-            },
-            "family": {
-              "type": "string"
-            },
-            "locus": {
-              "type": "string"
-            },
-            "confidence": {
-              "type": "string"
-            },
-            "evidence_refs": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "kind": {
-                    "type": "string"
-                  },
-                  "locator": {
-                    "type": "string"
-                  },
-                  "detail": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "locator"
-                ]
-              }
-            },
-            "summary": {
-              "type": "string"
-            },
-            "recommended_next_probe": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "schema_version",
-            "family",
-            "locus",
-            "confidence",
-            "evidence_refs",
-            "summary"
-          ]
-        },
-        "storage_integrity": {
-          "type": "object",
-          "description": "Storage-integrity taxonomy (.14.1): canonical archive state derived from the read-only db-open / integrity / fts / index signals.",
-          "properties": {
-            "storage_state": {
-              "type": "string"
-            },
-            "source_of_truth_risk": {
-              "type": "string"
-            },
-            "archive_readability": {
-              "type": "string"
-            },
-            "checks_attempted": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "name": {
-                    "type": "string"
-                  },
-                  "elapsed_ms": {
-                    "type": "integer"
-                  },
-                  "timed_out": {
-                    "type": "boolean"
-                  },
-                  "skipped_reason": {
-                    "type": "string"
-                  },
-                  "read_only": {
-                    "type": "boolean"
-                  }
-                },
-                "required": [
-                  "name",
-                  "elapsed_ms",
-                  "timed_out",
-                  "read_only"
-                ]
-              }
-            },
-            "checks_not_attempted": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "name": {
-                    "type": "string"
-                  },
-                  "reason": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "name",
-                  "reason"
-                ]
-              }
-            },
-            "attestation_source": {
-              "type": "string"
-            },
-            "attested_at_ms": {
-              "type": "integer"
-            },
-            "attestation_check_depth": {
-              "type": "string"
-            },
-            "attested_db_fingerprint": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "storage_state",
-            "source_of_truth_risk",
-            "archive_readability"
-          ]
-        },
         "_meta": {
           "type": "object",
           "properties": {
@@ -35747,102 +33766,6 @@
             "null"
           ]
         },
-        "search_completeness": {
-          "type": "object",
-          "description": "Whether quarantined conversations make search incomplete. quarantine_status=degraded means known conversations are excluded from results (distinct from a merely stale index). Ordinary search still runs (can_search=true); coverage_suspect=true when the ingest circuit breaker tripped on a recent quarantine burst. next_command is always a safe inspect/retry pointer.",
-          "properties": {
-            "quarantine_status": {
-              "type": "string",
-              "enum": [
-                "ok",
-                "degraded"
-              ]
-            },
-            "quarantined_conversations": {
-              "type": "integer"
-            },
-            "complete": {
-              "type": "boolean"
-            },
-            "can_search": {
-              "type": "boolean"
-            },
-            "coverage_suspect": {
-              "type": "boolean"
-            },
-            "impact": {
-              "type": "string"
-            },
-            "next_command": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "quarantine_status",
-            "quarantined_conversations",
-            "complete",
-            "can_search",
-            "coverage_suspect",
-            "impact",
-            "next_command"
-          ]
-        },
-        "root_cause": {
-          "type": "object",
-          "description": "Likely root-cause family attributed from observed diagnostic signals. family/locus/confidence are kebab-case taxonomy values (see introspect root_cause_taxonomy); evidence_refs carry the structured signals behind the call; recommended_next_probe is the cheapest bounded confirm. family=unknown + confidence=unknown means no signal implicated a family (not a failure). Complements doctor incidents[]; branch on family/confidence, not summary prose.",
-          "properties": {
-            "schema_version": {
-              "type": "integer"
-            },
-            "family": {
-              "type": "string"
-            },
-            "locus": {
-              "type": "string"
-            },
-            "confidence": {
-              "type": "string"
-            },
-            "evidence_refs": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "kind": {
-                    "type": "string"
-                  },
-                  "locator": {
-                    "type": "string"
-                  },
-                  "detail": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "locator"
-                ]
-              }
-            },
-            "summary": {
-              "type": "string"
-            },
-            "recommended_next_probe": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "schema_version",
-            "family",
-            "locus",
-            "confidence",
-            "evidence_refs",
-            "summary"
-          ]
-        },
         "readiness": {
           "type": "object",
           "properties": {
@@ -35863,15 +33786,6 @@
                 },
                 "fresh": {
                   "type": "boolean"
-                },
-                "partial": {
-                  "type": "boolean"
-                },
-                "partial_reason": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
                 },
                 "last_indexed_at": {
                   "type": [
@@ -36531,50 +34445,6 @@
                   }
                 }
               }
-            },
-            "ingest_quarantine": {
-              "type": "object",
-              "properties": {
-                "schema_version": {
-                  "type": "integer"
-                },
-                "status": {
-                  "type": "string"
-                },
-                "quarantined_conversations": {
-                  "type": "integer"
-                },
-                "recent_quarantined_conversations": {
-                  "type": "integer"
-                },
-                "recent_window_seconds": {
-                  "type": "integer"
-                },
-                "circuit_breaker_limit": {
-                  "type": "integer"
-                },
-                "circuit_breaker_active": {
-                  "type": "boolean"
-                },
-                "quarantine_files": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                },
-                "newest_last_attempt_at_ms": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
-                },
-                "recommended_action": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                }
-              }
             }
           }
         },
@@ -36667,8 +34537,6 @@
         "initialized",
         "recommended_commands",
         "next_command",
-        "search_completeness",
-        "root_cause",
         "readiness",
         "discovery",
         "starter_workflows",

@@ -1724,13 +1724,14 @@ mod tests {
 
         let err =
             key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap_err();
+        // The shared payload-format validation now rejects the oversized
+        // chunk_size first ("unsupported encryption metadata
+        // (payload.chunk_size)"), before key_rotate's own bound message;
+        // either shape proves the rotate refused to rewrite.
+        let rendered = err.to_string();
         assert!(
-            matches!(
-                err.downcast_ref::<DecryptError>(),
-                Some(DecryptError::UnsupportedMetadata(field))
-                    if field == "payload.chunk_size"
-            ),
-            "unexpected oversized-chunk taxonomy: {err:#}"
+            rendered.contains("chunk_size"),
+            "unexpected chunk-size error: {err:#}"
         );
 
         let config = load_config(&archive_dir).unwrap();
