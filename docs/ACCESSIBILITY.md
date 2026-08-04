@@ -119,7 +119,7 @@ Run accessibility tests:
 cd tests && npm run test:e2e
 
 # Rust accessibility tests
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-accessibility-target cargo test --test pages_accessibility_e2e
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-accessibility-target cargo test --test pages_accessibility_e2e
 ```
 
 ### Manual Testing Checklist

@@ -1,12 +1,13 @@
 analytics:
 
-# cass analytics — Token, Tool, and Model Analytics
+# cass analytics — Usage Analytics and Bounded Incident Mining
 
 ## Subcommands
   status    Row counts, freshness, coverage, drift warnings
   tokens    Token usage over time with dimensional breakdowns
   tools     Per-tool invocation counts and derived metrics
   models    Top models by usage and coverage statistics
+  incidents Bounded recurrent CASS-incident mining over the canonical archive
   rebuild   Rebuild/backfill rollup tables with progress output
   validate  Check rollup invariants and detect data drift
 
@@ -31,8 +32,9 @@ analytics:
 
 ### analytics status
   data.tables: [{ table, exists, row_count, min_day_id, max_day_id, last_updated }]
-  data.coverage: { total_messages, message_metrics_coverage_pct, api_token_coverage_pct,
-                   model_name_coverage_pct, estimate_only_pct }
+  data.coverage: { total_messages, <metric>_pct, <metric>_status, <metric>_display }
+    Metrics: message_metrics_coverage, api_token_coverage, model_name_coverage, estimate_only
+    <metric>_pct is number|null; status preserves true-zero, no-data, schema, and rebuild states.
   data.drift: { signals: [{ signal, detail, severity }], track_a_fresh, track_b_fresh }
   data.recommended_action: string
 
@@ -64,6 +66,33 @@ analytics:
   Models only available for connectors that report model names
     (claude_code, codex, pi_agent, factory, opencode, cursor).
 
+### analytics incidents
+  Read-only; keyset-scans canonical archive rows newest-id-first.
+  data.schema_version: 2
+  data.count_scope: all_matching_candidates | scanned_candidates_partial | no_verified_results_hard_timeout
+  data.discovery: { caps, files_considered, files_scanned, lines_scanned,
+                    bytes_scanned, elapsed_ms, stop_reason, timed_out, partial,
+                    evidence_truncated, evidence }
+  data.top_sessions: [{ conversation_id, session_id, agent, host, source_id,
+                        origin_host?, source_path, exists_state, hit_count,
+                        category_breadth, dominant_categories, evidence_summaries,
+                        redaction_status, suggested_command: { kind, argv, display } }]
+  data.total_sessions, data.total_hits, data.top_sessions_truncated: ranked-scope totals
+  data.scan_units.message_fragment_chars: per-message inspection bound (4096)
+    Oversized messages stop with discovery.stop_reason=message-fragment-capped.
+  data.redaction: { private_text_policy, hash_strategy, fields_emitted,
+                    fields_suppressed, opt_in_flags }
+  --limit N           Ranked sessions returned (1..100; default 10)
+  --max-sessions N    Archive conversations scanned (1..10000; default 2000)
+    This bounds the newest-row candidate window before dimensional filters.
+  --max-messages N    Archive messages inspected (default 250000)
+  --max-bytes N       UTF-8 content bytes inspected (default 268435456)
+  --budget-ms N       Hard wall-clock result budget (default 8000)
+  Raw prompt/tool text is always suppressed. source_path is retained only as the
+  actionable archive pointer; evidence paths are basename-redacted.
+  suggested_command.argv carries --db and --conversation-id for exact replay.
+  Example: cass analytics incidents --limit 10 --json
+
 ### analytics rebuild
   data.track: string ('a')
   data.tracks_rebuilt: [string]
@@ -87,6 +116,9 @@ analytics:
 ## Coverage & Uncertainty Semantics
   - api_token_coverage_pct: % of messages with API token data (from Claude, Codex).
   - estimate_only_pct: % of messages with content-estimated tokens only (chars/4 heuristic).
+  - *_pct is null when no trustworthy number exists; inspect *_status and *_display.
+  - status values: value, true-zero, no-data, aggregate-failed, schema-incompatible,
+    rebuild-required, invalid-input. A true zero is never conflated with missing data.
   - When coverage is low, derived metrics are unreliable estimates, not ground truth.
   - Content token estimates are always available (heuristic); API tokens are sparse.
 

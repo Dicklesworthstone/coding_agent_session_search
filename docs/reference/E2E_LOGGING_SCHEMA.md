@@ -4,16 +4,266 @@ Unified JSONL schema for all E2E test runs across Rust, Shell scripts, and Playw
 
 ## Overview
 
-All E2E test infrastructure emits structured JSONL logs to `test-results/e2e/`.
-Each line is a self-contained JSON object representing a single event.
+All acceptance evidence is scoped to one validated run ID under
+`test-results/e2e/runs/<run_id>/`. Each JSONL line is a self-contained event.
+No acceptance command searches the process-global results tree, and a stale
+file from another run can never satisfy the current run's gates.
 
 ## Output Files
 
-| Runner | Output File |
+| Runner | Run-scoped output |
 |--------|-------------|
-| Rust E2E tests | `test-results/e2e/rust_e2e_<timestamp>.jsonl` |
-| Shell scripts | `test-results/e2e/shell_<script>_<timestamp>.jsonl` |
-| Playwright | `test-results/e2e/playwright_<timestamp>.jsonl` |
+| Run executor | `test-results/e2e/runs/<run_id>/run.jsonl` |
+| Rust E2E tests | `test-results/e2e/runs/<run_id>/rust_<timestamp>_<nonce>.jsonl` or a per-test `cass.log` |
+| Shell scripts | `test-results/e2e/runs/<run_id>/shell_<script>_<timestamp>_<nonce>.jsonl` |
+| CLI traces | `test-results/e2e/runs/<run_id>/<suite>/<test>/trace.jsonl` |
+
+The external `CASS_E2E_RUN_ID` is accepted only when it is 8-128 ASCII
+alphanumeric, `_`, or `-` bytes, begins and ends alphanumerically, and names a
+previously absent directory. Without that variable, developer-focused tests
+retain their ordinary non-acceptance output paths.
+
+## Immutable strict-RCH run bundles
+
+Bundle schema v2 is content-addressed. `e2e-run-bundle` executes explicit Cargo
+test targets, captures bounded stdout/stderr, validates the selected run's
+JSONL, and writes:
+
+- `manifest.json`: source SHA, clean diff digest, canonical source-tree digest,
+  exact worker ID and hostname, complete Cargo command and command digest,
+  timestamps, exit status, every file's relative path/SHA-256/byte
+  count/event count/schema, deterministic aggregates, and named gate outcomes.
+- `complete.json`: a completion receipt binding the exact manifest bytes.
+
+Both control files are created without overwrite and fsynced. Verification
+walks the directory again and rejects missing or extra files, changed bytes,
+path traversal, symlinks, hard links, duplicate declarations, receipt
+tampering, source drift, worker drift, failed tests, failed schema validation,
+truncated command capture, empty artifacts, empty traces, or missing aggregate
+`run_start`, `test_start`, `test_end`, and `run_end` coverage.
+
+The repository acceptance entry point requires an explicit RCH worker. It pins
+RCH to the committed source SHA and uses `--clean-overlay --no-overlay`, which
+streams a fresh Git archive into an isolated remote root without applying
+ambient workspace changes. It runs and finalizes the bundle in that root on
+the same exact worker. It resolves that worker's SSH user and host from
+`rch --json workers list` and joins that exact host to the unique identity
+reported by `rch --json workers discover`; the opaque worker ID is never assumed
+to be an SSH alias. It takes the remote manifest path only from the runner's
+versioned JSON receipt rather than inferring a project directory from
+`remote_base` or searching for whichever artifact happens to exist. It copies
+exactly that named remote run into a fresh local staging directory. The
+committed acceptance script then independently recomputes the receipt, command
+digest, exact file set, regular-file/link policy, every file
+hash/size/event count/schema, aggregate counts, and event histogram without
+invoking local Cargo. It performs the remaining aggregate gates and only then
+publishes the run at
+`test-results/e2e/runs/<run_id>/`.
+Failed or incomplete staging directories are retained for diagnosis and cannot
+be mistaken for published passes.
+
+SSH discovery, probes, and rsync handoff are bounded by a validated
+`CASS_E2E_HANDOFF_TIMEOUT_SECONDS` value (900 seconds by default), an SSH
+connect timeout, and server-alive failure detection. A timeout is a failed
+handoff, never permission to inspect an older local bundle.
+
+The concurrency contract requires two distinct explicitly resolved workers.
+RCH deliberately excludes simultaneous jobs for the same project from one
+worker checkout, so treating one worker as a concurrency target would test only
+the scheduler's rejection path. The contract creates the same uniquely named
+contradictory stale witness locally and on both workers before launching either
+child run. All three stale copies remain present after the two no-mock runs,
+while both independently verified reports and manifests bind their expected
+worker and run ID and prove they consumed no stale copy. The test never deletes
+a previous local or remote witness.
+
+The runner emits one flushed `e2e-run-started` JSON receipt after creating its
+absent run directory, then one `e2e-run-finalized` receipt only after the
+manifest and completion receipt are durable. If execution fails between those
+points, the acceptance script uses only the validated started-receipt path to
+retrieve and retain the unfinalized directory; it never publishes it.
+
+Before dispatch, the caller requires a clean committed source tree apart from
+tracker-only `.beads/` and retained `test-results/` state. It rejects tracked
+symlinks, submodules, and control-byte paths, then hashes every other tracked
+file in byte-sorted relative-path order. After Cargo starts the runner in the
+fresh overlay, the worker independently walks all non-transient entries and
+recomputes that source-tree digest without requiring `.git`. Symbolic links,
+hard links, non-files, non-UTF-8/control-byte paths, changed bytes, missing
+files, or extra source files fail before the test command begins. The worker
+repeats the same check after the test and schema commands and before sealing the
+manifest, so source mutation during execution leaves only an explicitly
+incomplete diagnostic run.
+
+The only top-level entries omitted from source-tree identity are the explicit
+transport/output surfaces `.git`, `.beads`, `.rch-tmp`, `.rch-target-*`,
+`target`, and `test-results`. A same-named directory below another source
+directory remains covered. The language-neutral digest stream is the
+concatenation, in byte-sorted relative-path order, of:
+
+```text
+<lowercase-file-sha256><two spaces><relative-path><NUL>
+```
+
+The final SHA-256 of that stream is `source_tree_sha256`. This is exactly GNU
+`sha256sum --zero` framing, so the shell caller and Rust worker verify the same
+bytes independently.
+
+The command digest has a language-neutral framing so Rust and shell verification
+cannot accidentally hash different argument boundaries:
+
+```text
+cass-e2e-command-v1\n
+<argument-0-byte-count>:<argument-0>\n
+<argument-1-byte-count>:<argument-1>\n
+...
+```
+
+This verifier deliberately remains a small shell/jq/SHA-256 handoff rather
+than copying the remote debug runner: the application facade can make that
+binary enormous, while the run's raw evidence is small and bounded. Failed
+remote jobs therefore remain inspectable even when RCH does not perform its
+ordinary successful-build artifact retrieval.
+
+```bash
+RCH_WORKER=ovh-a ./scripts/e2e_logging_acceptance_test.sh
+
+# Prove two simultaneous no-mock semantic runs on distinct exact workers remain
+# isolated from one another and from retained contradictory stale runs on the
+# caller and both workers.
+RCH_WORKER=ovh-a ./scripts/e2e_logging_acceptance_test.sh \
+  --concurrency-contract \
+  --peer-worker ovh-b
+
+# Exercise one explicit target/filter while developing the bundle contract.
+RCH_WORKER=ovh-a ./scripts/e2e_logging_acceptance_test.sh \
+  --contract-only \
+  --contract-target e2e_semantic_search \
+  --contract-filter parallel_cass_children_keep_corpus_and_trace_artifacts_isolated
+
+# Re-verify one already-published immutable run; current checkout drift is not
+# substituted for the provenance sealed in that run.
+./scripts/e2e_logging_acceptance_test.sh \
+  --quick \
+  --run-id acceptance-20260728T120000Z-a1b2c3
+```
+
+### Per-test CLI trace artifacts
+
+Rust E2E tests that use `PhaseTracker::trace_env_guard()` also route child
+`cass` processes to:
+
+`test-results/e2e/runs/<run_id>/<suite>/<test>/trace.jsonl`
+
+This file is valid JSONL. It is a CLI diagnostic stream rather than an E2E
+runner-event stream, so every record has the tracing envelope
+`schema_version, timestamp, level, target, trace_id, test_id, fields`. CASS
+targets (`coding_agent_search` and `cass`) retain DEBUG detail, except routine
+`cass::redact::memo` hit/miss bookkeeping is pinned to WARN so trace redaction
+does not generate self-amplifying diagnostics. Memo invalidation/quarantine
+warnings and all other WARN/ERROR events remain visible. This keeps useful
+phase and failure evidence while excluding high-volume dependency telemetry
+such as per-token SQL parser DEBUG events. The built-in filter also publishes a
+DEBUG max-level hint, so TRACE callsites are disabled before event fields are
+constructed; per-character tokenizer TRACE instrumentation cannot recreate the
+logging storm that this bounded surface is intended to prevent.
+
+The trace is bounded to 512 KiB per test by the E2E guard, and the semantic E2E
+suite has a 10 MiB aggregate gate enforced after the run. Production
+`--trace-file` output defaults to 16 MiB and 50,000 diagnostic events.
+`CASS_TRACE_MAX_BYTES` can override the byte ceiling (clamped to
+4 KiB..1 GiB), `CASS_TRACE_MAX_EVENTS` can override the event ceiling (clamped
+to 16..10,000,000), and `CASS_TRACE_FILTER` can override the filter using
+`tracing_subscriber::EnvFilter` syntax. Appending fails closed when an existing
+file is oversized, invalid JSON, has a malformed envelope, or uses another
+schema; CASS never truncates or mixes a legacy trace into this artifact. Trace
+paths are single-writer:
+concurrent processes targeting one file fail cleanly instead of interleaving
+records.
+
+If the diagnostic stream reaches its byte or event budget, it remains valid
+JSONL and includes a receipt like:
+
+```json
+{
+  "schema_version": "cass-trace-v1",
+  "timestamp": "2026-01-26T12:00:02.500Z",
+  "level": "WARN",
+  "target": "cass::trace",
+  "trace_id": "82a0d1",
+  "test_id": "test-results/e2e/e2e_semantic_search/semantic_search_restarts",
+  "fields": {
+    "event": "trace_truncated",
+    "reason": "byte_budget",
+    "artifact_complete": false,
+    "max_bytes": 524288,
+    "max_events": 4096,
+    "bytes_written_before_receipt": 456321,
+    "events_written_before_receipt": 1802,
+    "suppressed_events": 1204,
+    "suppressed_bytes": 873102,
+    "suppression_reasons": {
+      "byte_budget": 1204,
+      "event_budget": 0,
+      "oversize_event": 0
+    },
+    "suppressed_targets": [
+      {"target": "cass::semantic", "count": 1204}
+    ],
+    "suppressed_target_overflow_events": 0,
+    "failure_tail_events": 3,
+    "failure_tail_bytes": 1402,
+    "failure_tail_dropped_events": 0,
+    "filtered_events": 96077,
+    "filtered_targets": [
+      {"target": "fsqlite.parse", "count": 96077}
+    ],
+    "filtered_target_overflow_events": 0
+  }
+}
+```
+
+When only the intentional target filter suppresses events, the corresponding
+record is `fields.event="trace_filter_summary"` with
+`artifact_complete=true`. Filtered and budget-suppressed target counts are kept
+separate and ordered deterministically by count then target. The top eight of
+each class are retained (two under very small byte ceilings); the respective
+remainder is summed in
+`filtered_target_overflow_events` or
+`suppressed_target_overflow_events`.
+At very small byte ceilings, if even those bounded target lists cannot fit the
+reserved tail, CASS writes `receipt_compact=true`, omits the lists, and assigns
+all affected counts to the corresponding overflow fields. The receipt still
+retains the limit, suppression-reason, filtered-event, and WARN/ERROR-tail
+totals.
+
+The byte ceiling reserves a bounded tail for late WARN/ERROR events. When the
+ordinary diagnostic head is full, the newest high-severity records are retained
+in that tail and the receipt reports how many were written or displaced. After
+the head first reaches its byte or event ceiling it remains closed, so the
+artifact is a deterministic prefix plus the bounded high-severity tail rather
+than a discontinuous sample of later small diagnostics. Reopening the same
+artifact for another child command recovers that closed state from the prior
+truncation receipt. The separate command summary then records the final outcome
+even if no more diagnostic events fit.
+
+Every successfully parsed child invocation that opens the trace artifact
+appends a redacted `fields.event="command_summary"` record with command,
+duration, exit code, request/trace IDs, and structured failure details.
+Secret-bearing fields,
+sensitive CLI flag values, recognized token patterns, private home/workspace
+paths, emails, and hostnames are redacted. Arguments, correlation values, and
+error text are length-bounded; if the detailed summary cannot fit its reserved
+tail, a compact `summary_truncated=true` outcome record is written instead.
+
+Both E2E logging acceptance paths execute the same canonical run-bundle entry
+point. Reports live outside the immutable bytes under
+`test-results/e2e/reports/<run_id>.txt` and include source/worker/command
+identity, manifest and receipt hashes, trace files/bytes/events, target
+histograms, receipts, command outcomes, and every manifest gate. A failed test
+target, malformed line, missing command outcome, incomplete event lifecycle,
+empty full-run trace set, per-test overflow, semantic aggregate overflow,
+handoff ambiguity, or digest mismatch makes acceptance fail.
 
 ## Common Fields (All Events)
 
@@ -231,13 +481,16 @@ The `scripts/tests/run_all.sh` runner (P6.14j) aggregates all JSONL files:
 
 ```bash
 # Count failures
-jq -s '[.[] | select(.event == "test_end" and .result.status == "fail")] | length' test-results/e2e/*.jsonl
+find test-results/e2e/runs/<run_id> -type f -name '*.jsonl' \
+  -exec jq -s '[.[] | select(.event == "test_end" and .result.status == "fail")] | length' {} +
 
 # Get failed test names
-jq -r 'select(.event == "test_end" and .result.status == "fail") | .test.name' test-results/e2e/*.jsonl
+find test-results/e2e/runs/<run_id> -type f -name '*.jsonl' \
+  -exec jq -r 'select(.event == "test_end" and .result.status == "fail") | .test.name' {} +
 
 # Total duration by runner
-jq -s 'group_by(.runner) | map({runner: .[0].runner, total_ms: [.[] | select(.event == "run_end") | .summary.duration_ms] | add})' test-results/e2e/*.jsonl
+find test-results/e2e/runs/<run_id> -type f -name '*.jsonl' \
+  -exec jq -s 'group_by(.runner) | map({runner: .[0].runner, total_ms: [.[] | select(.event == "run_end") | .summary.duration_ms] | add})' {} +
 ```
 
 ## Backward Compatibility

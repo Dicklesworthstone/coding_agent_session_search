@@ -356,6 +356,70 @@ impl ConversationPacket {
         Self::from_payload(payload, ConversationPacketBuilder::RawConnectorScan)
     }
 
+    /// Cap cumulative lexical content at `cap` bytes for the incremental-inline
+    /// Tantivy add path (#291 Gap A) — the analogue of the `--full` rebuild cap
+    /// (`truncate_lexical_rebuild_conversation_content`). This packet exists
+    /// solely to feed `TantivyIndex::add_messages_from_packet`, so it truncates
+    /// message content (on a UTF-8 boundary; later messages cleared; message
+    /// rows preserved so per-message accounting is unchanged) and re-derives
+    /// hashes/projections from the capped payload to stay internally consistent.
+    /// The canonical store is unaffected — it is persisted from the conversation
+    /// separately, with full content. No-op when content is within the cap.
+    #[must_use]
+    pub fn capped_for_inline_lexical_index(mut self, cap: usize) -> Self {
+        let original_bytes: usize = self
+            .payload
+            .messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum();
+        if original_bytes <= cap {
+            return self;
+        }
+
+        let mut used = 0usize;
+        for message in &mut self.payload.messages {
+            if used >= cap {
+                message.content.clear();
+                continue;
+            }
+            let remaining = cap - used;
+            if message.content.len() <= remaining {
+                used += message.content.len();
+            } else {
+                // Largest byte length <= remaining that ends on a UTF-8 boundary.
+                let mut boundary = remaining;
+                while boundary > 0 && !message.content.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                message.content.truncate(boundary);
+                used += boundary;
+            }
+        }
+
+        let capped_bytes: usize = self
+            .payload
+            .messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum();
+        tracing::warn!(
+            diagnostic = "lexical_content_truncated",
+            external_id = self.payload.identity.external_id.as_deref().unwrap_or(""),
+            source_path = %self.payload.identity.source_path,
+            original_bytes,
+            capped_bytes,
+            cap,
+            "incremental-inline lexical packet content exceeded the per-conversation cap; truncated indexed text to stay within budget instead of OOM-quarantining (#291)"
+        );
+
+        // Re-derive hashes + projections from the capped payload so the packet
+        // stays internally consistent while preserving which authoritative
+        // builder supplied the payload.
+        let builder = self.diagnostics.builder;
+        Self::from_payload(self.payload, builder)
+    }
+
     pub fn from_canonical_replay(
         conversation: &Conversation,
         provenance: ConversationPacketProvenance,
@@ -794,6 +858,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn capped_for_inline_lexical_index_truncates_and_preserves_rows() {
+        // #291 Gap A: two 600-byte messages (1200 total) capped to 1000.
+        let mut conv = raw_conversation();
+        conv.messages[0].content = "a".repeat(600);
+        conv.messages[1].content = "b".repeat(600);
+        let packet = ConversationPacket::from_normalized_conversation(
+            &conv,
+            ConversationPacketProvenance::local(),
+        )
+        .capped_for_inline_lexical_index(1000);
+
+        // Message rows preserved (structure unchanged; only indexed text dropped).
+        assert_eq!(packet.payload.messages.len(), 2);
+        // First message kept whole (600), second truncated to the remaining 400.
+        assert_eq!(packet.payload.messages[0].content.len(), 600);
+        assert_eq!(packet.payload.messages[1].content.len(), 400);
+        let total: usize = packet
+            .payload
+            .messages
+            .iter()
+            .map(|m| m.content.len())
+            .sum();
+        assert!(total <= 1000, "cumulative content {total} exceeds cap");
+        // Projections were re-derived from the capped payload (internally consistent).
+        assert!(packet.projections.lexical.total_content_bytes <= 1000);
+        assert_eq!(
+            packet.diagnostics.builder,
+            ConversationPacketBuilder::RawConnectorScan
+        );
+    }
+
+    #[test]
+    fn capped_for_inline_lexical_index_is_noop_within_budget() {
+        let conv = raw_conversation();
+        let baseline = ConversationPacket::from_normalized_conversation(
+            &conv,
+            ConversationPacketProvenance::local(),
+        );
+        let capped = baseline
+            .clone()
+            .capped_for_inline_lexical_index(8 * 1024 * 1024);
+        assert_eq!(baseline, capped, "cap within budget must be a no-op");
+    }
+
     fn canonical_conversation() -> Conversation {
         Conversation {
             id: Some(42),
@@ -838,6 +947,24 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn capped_canonical_packet_preserves_builder_diagnostics() {
+        let mut conv = canonical_conversation();
+        conv.messages[0].content = "a".repeat(600);
+        conv.messages[1].content = "b".repeat(600);
+
+        let packet =
+            ConversationPacket::from_canonical_replay(&conv, ConversationPacketProvenance::local())
+                .capped_for_inline_lexical_index(1000);
+
+        assert_eq!(packet.payload.messages[0].content.len(), 600);
+        assert_eq!(packet.payload.messages[1].content.len(), 400);
+        assert_eq!(
+            packet.diagnostics.builder,
+            ConversationPacketBuilder::CanonicalReplay
+        );
     }
 
     #[test]

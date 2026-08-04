@@ -1,7 +1,7 @@
 //! Model manager for lazy loading embedder and reranker models.
 //!
 //! This module provides lazy-loaded access to embedding and reranking models,
-//! supporting graceful fallback when models are unavailable.
+//! while reporting model-load failures truthfully to daemon clients.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,7 +12,6 @@ use tracing::{info, warn};
 use crate::search::embedder::{Embedder, EmbedderError, EmbedderResult};
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::fastembed_reranker::FastEmbedReranker;
-use crate::search::hash_embedder::HashEmbedder;
 use crate::search::reranker::{Reranker, RerankerError, RerankerResult, rerank_texts};
 
 /// Model manager that handles lazy loading of embedder and reranker models.
@@ -22,7 +21,6 @@ pub struct ModelManager {
     reranker: RwLock<Option<Arc<dyn Reranker>>>,
     embedder_name: RwLock<String>,
     reranker_name: RwLock<String>,
-    fallback_embedder: Arc<HashEmbedder>,
 }
 
 impl ModelManager {
@@ -34,7 +32,6 @@ impl ModelManager {
             reranker: RwLock::new(None),
             embedder_name: RwLock::new("not-loaded".to_string()),
             reranker_name: RwLock::new("not-loaded".to_string()),
-            fallback_embedder: Arc::new(HashEmbedder::new(384)),
         }
     }
 
@@ -49,7 +46,7 @@ impl ModelManager {
             .read()
             .as_ref()
             .map(|e| e.id().to_string())
-            .unwrap_or_else(|| "hash-384".to_string())
+            .unwrap_or_else(|| "not-loaded".to_string())
     }
 
     /// Get the embedder name.
@@ -116,11 +113,9 @@ impl ModelManager {
                 Ok(())
             }
             Err(e) => {
-                warn!(error = %e, "Failed to load embedder, using hash fallback");
-                *embedder_guard = Some(self.fallback_embedder.clone());
-                *self.embedder_name.write() = "hash-fallback".to_string();
-                // Return Ok since we have a fallback
-                Ok(())
+                warn!(error = %e, "Failed to load MiniLM embedder");
+                *self.embedder_name.write() = "load-failed".to_string();
+                Err(e)
             }
         }
     }
@@ -246,17 +241,17 @@ mod tests {
     }
 
     #[test]
-    fn test_embedder_fallback_on_missing_model() {
-        // Use a directory without models
-        let manager = ModelManager::new(&PathBuf::from("/tmp/nonexistent"));
+    fn test_missing_model_is_reported_without_hash_substitution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty_data_dir = tempfile::tempdir()?;
+        let manager = ModelManager::new(empty_data_dir.path());
 
-        // Should succeed with fallback
         let result = manager.warm_embedder();
-        assert!(result.is_ok());
-
-        // Should be using hash fallback
-        assert!(manager.embedder_loaded());
-        assert_eq!(manager.embedder_name(), "hash-fallback");
+        assert!(result.is_err());
+        assert!(!manager.embedder_loaded());
+        assert_eq!(manager.embedder_id(), "not-loaded");
+        assert_eq!(manager.embedder_name(), "load-failed");
+        Ok(())
     }
 
     #[test]
@@ -270,24 +265,23 @@ mod tests {
     fn test_unload_all() {
         let manager = ModelManager::new(&test_data_dir());
         let _ = manager.warm_embedder();
-
-        assert!(manager.embedder_loaded());
+        assert_eq!(manager.embedder_name(), "load-failed");
 
         manager.unload_all();
 
         assert!(!manager.embedder_loaded());
         assert!(!manager.reranker_loaded());
+        assert_eq!(manager.embedder_name(), "not-loaded");
     }
 
     #[test]
-    fn test_embed_with_fallback() {
-        let manager = ModelManager::new(&PathBuf::from("/tmp/nonexistent"));
+    fn test_embed_reports_missing_model() -> Result<(), Box<dyn std::error::Error>> {
+        let empty_data_dir = tempfile::tempdir()?;
+        let manager = ModelManager::new(empty_data_dir.path());
 
-        // Should work with fallback
         let result = manager.embed("test text");
-        assert!(result.is_ok());
-
-        let embedding = result.unwrap();
-        assert_eq!(embedding.len(), 384);
+        assert!(result.is_err());
+        assert!(!manager.embedder_loaded());
+        Ok(())
     }
 }

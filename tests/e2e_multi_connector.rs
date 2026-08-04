@@ -6,12 +6,10 @@
 //! - Agent filtering correctly isolates connector results
 //! - Results are properly attributed to their source connector
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use std::fs;
 use std::path::Path;
 
 mod util;
-use util::EnvGuard;
 use util::e2e_log::{E2eError, E2eErrorContext, E2ePerformanceMetrics, PhaseTracker};
 
 fn tracker_for(test_name: &str) -> PhaseTracker {
@@ -100,16 +98,11 @@ fn make_amp_fixture(root: &Path) {
 )]
 fn multi_connector_pipeline() {
     let tracker = tracker_for("multi_connector_pipeline");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let xdg_data = home.join("xdg_data");
 
     fs::create_dir_all(&xdg_data).unwrap();
-
-    // Override env vars
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg_data.to_string_lossy());
 
     // Setup fixture roots
     let dot_codex = home.join(".codex");
@@ -117,8 +110,10 @@ fn multi_connector_pipeline() {
     let dot_gemini = home.join(".gemini");
     let dot_config = home.join(".config");
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", dot_codex.to_string_lossy());
-    let _guard_gemini = EnvGuard::set("GEMINI_HOME", dot_gemini.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&dot_codex);
 
     // Phase: Create fixtures for all connectors
     let phase_start = tracker.start("setup_fixtures", Some("Create fixtures for 5 connectors"));
@@ -140,7 +135,8 @@ fn multi_connector_pipeline() {
         "run_index_full",
         Some("Run full index across all connectors"),
     );
-    let idx_output = cargo_bin_cmd!("cass")
+    let idx_output = command_env
+        .cass_assert_command()
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -185,7 +181,8 @@ fn multi_connector_pipeline() {
         Some("Search and verify all 5 connector results"),
     );
     let search_start = std::time::Instant::now();
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .arg("search")
         .arg("user")
         .arg("--robot")
@@ -282,7 +279,8 @@ fn multi_connector_pipeline() {
     );
     fs::write(sessions.join("rollout-2.jsonl"), content).unwrap();
 
-    let incr_idx_output = cargo_bin_cmd!("cass")
+    let incr_idx_output = command_env
+        .cass_assert_command()
         .arg("index")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -319,7 +317,8 @@ fn multi_connector_pipeline() {
         );
     }
 
-    let output_inc = cargo_bin_cmd!("cass")
+    let output_inc = command_env
+        .cass_assert_command()
         .arg("search")
         .arg("codex_new")
         .arg("--robot")
@@ -351,7 +350,8 @@ fn multi_connector_pipeline() {
         Some("Verify agent filter isolates results"),
     );
     let filter_start = std::time::Instant::now();
-    let output_filter = cargo_bin_cmd!("cass")
+    let output_filter = command_env
+        .cass_assert_command()
         .arg("search")
         .arg("user")
         .arg("--agent")
@@ -436,7 +436,6 @@ fn make_claude_session(
 #[test]
 fn multi_connector_codex_and_claude() {
     let tracker = tracker_for("multi_connector_codex_and_claude");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -444,8 +443,10 @@ fn multi_connector_codex_and_claude() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Phase: Create fixtures
     let phase_start = tracker.start("setup_fixtures", Some("Create Codex and Claude sessions"));
@@ -471,7 +472,8 @@ fn multi_connector_codex_and_claude() {
 
     // Phase: Index
     let phase_start = tracker.start("run_index", Some("Run full index"));
-    let idx_output = cargo_bin_cmd!("cass")
+    let idx_output = command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -508,7 +510,8 @@ fn multi_connector_codex_and_claude() {
         Some("Search shared term across connectors"),
     );
     let search_start = std::time::Instant::now();
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["search", "multitest", "--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -578,7 +581,6 @@ fn multi_connector_codex_and_claude() {
 #[test]
 fn multi_connector_agent_filter_isolation() {
     let tracker = tracker_for("multi_connector_agent_filter_isolation");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -586,8 +588,10 @@ fn multi_connector_agent_filter_isolation() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Phase: Setup
     let phase_start = tracker.start(
@@ -616,7 +620,8 @@ fn multi_connector_agent_filter_isolation() {
 
     // Phase: Index
     let phase_start = tracker.start("run_index", Some("Run full index"));
-    let idx_output = cargo_bin_cmd!("cass")
+    let idx_output = command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -650,7 +655,8 @@ fn multi_connector_agent_filter_isolation() {
     // Phase: Filter by codex
     let phase_start = tracker.start("filter_codex", Some("Search with agent=codex filter"));
     let codex_start = std::time::Instant::now();
-    let codex_output = cargo_bin_cmd!("cass")
+    let codex_output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "isolationtest",
@@ -721,7 +727,8 @@ fn multi_connector_agent_filter_isolation() {
         Some("Search with agent=claude_code filter"),
     );
     let claude_start = std::time::Instant::now();
-    let claude_output = cargo_bin_cmd!("cass")
+    let claude_output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "isolationtest",
@@ -793,7 +800,6 @@ fn multi_connector_agent_filter_isolation() {
 #[test]
 fn multi_connector_unique_content() {
     let tracker = tracker_for("multi_connector_unique_content");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -801,8 +807,10 @@ fn multi_connector_unique_content() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Phase: Setup
     let phase_start = tracker.start(
@@ -831,7 +839,8 @@ fn multi_connector_unique_content() {
 
     // Phase: Index
     let phase_start = tracker.start("run_index", Some("Run full index"));
-    let idx_output = cargo_bin_cmd!("cass")
+    let idx_output = command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -867,7 +876,8 @@ fn multi_connector_unique_content() {
         "search_codex_unique",
         Some("Search for codex-specific term"),
     );
-    let codex_output = cargo_bin_cmd!("cass")
+    let codex_output = command_env
+        .cass_assert_command()
         .args(["search", "codexonly_xyzzy", "--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -920,7 +930,8 @@ fn multi_connector_unique_content() {
         "search_claude_unique",
         Some("Search for claude-specific term"),
     );
-    let claude_output = cargo_bin_cmd!("cass")
+    let claude_output = command_env
+        .cass_assert_command()
         .args(["search", "claudeonly_plugh", "--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -978,7 +989,6 @@ fn multi_connector_unique_content() {
 #[test]
 fn multi_connector_aggregation() {
     let tracker = tracker_for("multi_connector_aggregation");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -986,8 +996,10 @@ fn multi_connector_aggregation() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Phase: Setup
     let phase_start = tracker.start(
@@ -1030,7 +1042,8 @@ fn multi_connector_aggregation() {
 
     // Phase: Index
     let phase_start = tracker.start("run_index", Some("Run full index"));
-    let idx_output = cargo_bin_cmd!("cass")
+    let idx_output = command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -1064,7 +1077,8 @@ fn multi_connector_aggregation() {
     // Phase: Aggregation search
     let phase_start = tracker.start("search_aggregate", Some("Search with agent aggregation"));
     let agg_start = std::time::Instant::now();
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "aggtest",
@@ -1153,7 +1167,6 @@ fn multi_connector_aggregation() {
 #[test]
 fn multi_connector_incremental_index() {
     let tracker = tracker_for("multi_connector_incremental_index");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -1161,8 +1174,10 @@ fn multi_connector_incremental_index() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Phase: Create initial sessions
     let phase_start = tracker.start(
@@ -1191,7 +1206,8 @@ fn multi_connector_incremental_index() {
 
     // Phase: Full index
     let phase_start = tracker.start("run_full_index", Some("Run full index"));
-    let idx_output = cargo_bin_cmd!("cass")
+    let idx_output = command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -1227,7 +1243,8 @@ fn multi_connector_incremental_index() {
         "verify_initial_index",
         Some("Verify initial sessions indexed"),
     );
-    let output1 = cargo_bin_cmd!("cass")
+    let output1 = command_env
+        .cass_assert_command()
         .args(["search", "incrtest", "--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -1275,7 +1292,8 @@ fn multi_connector_incremental_index() {
     );
 
     let incr_start = std::time::Instant::now();
-    let incr_idx_output = cargo_bin_cmd!("cass")
+    let incr_idx_output = command_env
+        .cass_assert_command()
         .args(["index", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -1325,7 +1343,8 @@ fn multi_connector_incremental_index() {
         "verify_incremental",
         Some("Verify all sessions indexed after incremental"),
     );
-    let output2 = cargo_bin_cmd!("cass")
+    let output2 = command_env
+        .cass_assert_command()
         .args(["search", "incrtest", "--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)
@@ -1377,7 +1396,6 @@ fn multi_connector_incremental_index() {
 #[test]
 fn multi_connector_multiple_agent_filter() {
     let tracker = tracker_for("multi_connector_multiple_agent_filter");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -1385,8 +1403,10 @@ fn multi_connector_multiple_agent_filter() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Phase: Setup
     let phase_start = tracker.start(
@@ -1415,7 +1435,8 @@ fn multi_connector_multiple_agent_filter() {
 
     // Phase: Index
     let phase_start = tracker.start("run_index", Some("Run full index"));
-    let idx_output = cargo_bin_cmd!("cass")
+    let idx_output = command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -1452,7 +1473,8 @@ fn multi_connector_multiple_agent_filter() {
         Some("Search with multiple --agent filters"),
     );
     let search_start = std::time::Instant::now();
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args([
             "search",
             "multiagent",
@@ -1526,7 +1548,6 @@ fn multi_connector_multiple_agent_filter() {
 #[test]
 fn multi_connector_empty_connector() {
     let tracker = tracker_for("multi_connector_empty_connector");
-    let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -1534,8 +1555,10 @@ fn multi_connector_empty_connector() {
 
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&codex_home);
 
     // Phase: Setup (only codex, no claude)
     let phase_start = tracker.start(
@@ -1557,7 +1580,8 @@ fn multi_connector_empty_connector() {
 
     // Phase: Index with missing connector
     let phase_start = tracker.start("run_index", Some("Index with non-existent claude_home"));
-    let idx_output = cargo_bin_cmd!("cass")
+    let idx_output = command_env
+        .cass_assert_command()
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
@@ -1597,7 +1621,8 @@ fn multi_connector_empty_connector() {
         "verify_results",
         Some("Search and verify codex-only results"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .args(["search", "singleconnector", "--robot", "--data-dir"])
         .arg(&data_dir)
         .env("HOME", home)

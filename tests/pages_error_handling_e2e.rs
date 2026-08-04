@@ -422,7 +422,15 @@ fn test_error_messages_are_user_friendly() {
             "archive",
         ),
         (Box::new(DecryptError::IntegrityCheckFailed), "corrupt"),
+        (
+            Box::new(DecryptError::CorruptPayload("chunk authentication".into())),
+            "corrupt",
+        ),
         (Box::new(DecryptError::UnsupportedVersion(1)), "version"),
+        (
+            Box::new(DecryptError::UnsupportedMetadata("compression".into())),
+            "unsupported",
+        ),
         (Box::new(DbError::CorruptDatabase("test".into())), "corrupt"),
         (Box::new(DbError::InvalidQuery("test".into())), "search"),
     ];
@@ -445,7 +453,9 @@ fn test_error_messages_no_technical_jargon() {
         Box::new(DecryptError::EmptyPassword),
         Box::new(DecryptError::InvalidFormat("header".into())),
         Box::new(DecryptError::IntegrityCheckFailed),
+        Box::new(DecryptError::CorruptPayload("cipher authentication".into())),
         Box::new(DecryptError::UnsupportedVersion(2)),
+        Box::new(DecryptError::UnsupportedMetadata("compression".into())),
         Box::new(DecryptError::CryptoError("GCM tag mismatch".into())),
         Box::new(DbError::CorruptDatabase("sqlite error".into())),
         Box::new(DbError::InvalidQuery("FTS5 syntax".into())),
@@ -515,7 +525,9 @@ fn test_all_errors_have_suggestions() {
         DecryptError::EmptyPassword,
         DecryptError::InvalidFormat("test".into()),
         DecryptError::IntegrityCheckFailed,
+        DecryptError::CorruptPayload("chunk authentication".into()),
         DecryptError::UnsupportedVersion(2),
+        DecryptError::UnsupportedMetadata("compression".into()),
         DecryptError::NoMatchingKeySlot,
         DecryptError::CryptoError("test".into()),
     ];
@@ -554,7 +566,9 @@ fn test_error_codes_exist_and_unique() {
         Box::new(DecryptError::EmptyPassword),
         Box::new(DecryptError::InvalidFormat("".into())),
         Box::new(DecryptError::IntegrityCheckFailed),
+        Box::new(DecryptError::CorruptPayload("".into())),
         Box::new(DecryptError::UnsupportedVersion(0)),
+        Box::new(DecryptError::UnsupportedMetadata("compression".into())),
         Box::new(DecryptError::NoMatchingKeySlot),
         Box::new(DecryptError::CryptoError("".into())),
     ];

@@ -1,0 +1,12 @@
+{
+  "storage_version": 1,
+  "entries": {
+    "conv-current::v3": {
+      "first_attempt_at": "2026-06-01T12:00:00Z",
+      "last_attempt_at": "2026-06-01T12:00:00Z",
+      "attempt_count": 1,
+      "last_reason": "index-ingest-out-of-memory: 4.2 GiB",
+      "cass_version_at_quarantine": "0.6.13"
+    }
+  }
+}

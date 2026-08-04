@@ -18,16 +18,16 @@ CASS uses a **multi-layered hybrid search architecture** combining lexical (BM25
   - Boolean query support (AND, OR, NOT)
 
 ### Secondary: Vector Index (Semantic Search)
-- **Format**: Custom binary format "CVVI" (Cass Vector Index)
+- **Format**: frankensearch FSVI (`.fsvi`)
 - **Features**:
   - Quantization support (F32 or F16 for memory efficiency)
   - Memory-mapped file access for performance
-  - Fixed-size row structure (70 bytes per entry) for efficient seeking
-  - Content-addressed deduplication (SHA256 hashing)
-  - Variable dimension embeddings
+  - Header-bound embedder ID, vector-space revision, and dimension
+  - Cass metadata encoded in stable document IDs
+  - Atomic rebuild/publish through cass semantic indexing
 
 ### Tertiary: SQLite
-- **Role**: Fallback and metadata storage
+- **Role**: Source of truth for conversations, messages, and metadata
 - **Features**: Connection pooling, schema management
 
 ---
@@ -197,13 +197,13 @@ CachedHit {
 // Purpose: Preload index pages into OS cache
 // Mechanism:
 //   - Debounced channel: at most one reload every WARM_DEBOUNCE_MS (300ms typical)
-//   - Background tokio task runs index reader reload
+//   - Dedicated cass-warm-worker thread runs index reader reload
 //   - Executes tiny test search (limit: 1 doc) to page in data
 //   - Non-blocking: doesn't impact user input
 
 // Benefits:
 //   - Next user search benefits from hot OS cache
-//   - Graceful handling: spawn fails silently if no Tokio runtime
+//   - Graceful handling: worker creation is optional and non-blocking
 ```
 
 ### Layer 3: Merge Optimization
@@ -263,11 +263,12 @@ if is_prefix_only(query) {
 - **Example**: `search "rust async await"` → matches documents with these terms
 
 ### Mode 2: Semantic Search
-- **Embedder**: FastEmbed (MiniLM model or hash-based fallback)
+- **Embedder**: Pure-Rust native MiniLM (`all-MiniLM-L6-v2`)
 - **Quantization**: F32 or F16 for memory efficiency
 - **Speed**: Depends on embedder, ~100-500ms for inference
 - **Best for**: Concept matching, paraphrases
-- **Fallback**: Hash-based embedder (deterministic, no model download)
+- **Unavailable model behavior**: Explicit semantic mode reports unavailable; hybrid mode fails open to lexical
+- **Explicit fast/degraded tier**: Hash vectors are deterministic and require an explicit hash/fast-only selection
 
 ### Mode 3: Hybrid Search (RRF Fusion)
 - **Algorithm**: Reciprocal Rank Fusion (RRF)
@@ -401,7 +402,7 @@ fn deduplicate_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
 tantivy = "*"                    # Full-text indexing & BM25
 
 # Semantic search
-fastembed = { features = ["ort-download-binaries"] }
+frankensearch = { default-features = false, features = ["lexical", "ann", "native"] }
 
 # Cache management
 lru = "*"                        # LRU cache for prefix reuse
@@ -415,11 +416,11 @@ parking_lot = "*"                # Fast synchronization primitives
 crossbeam-channel = "*"          # Multi-producer MPMC channels
 
 # Async/threading
-tokio = { features = ["rt-multi-thread", "macros", "time"] }
+asupersync = "*"                 # Structured async runtime
 rayon = "*"                      # Parallel iteration
 
 # Persistence
-rusqlite = { features = ["bundled", "modern_sqlite"] }
+frankensqlite = { features = ["fts5"] }
 
 # Hashing
 crc32fast = "*"                  # Fast CRC for checksums
@@ -460,18 +461,18 @@ LRU cache:         Bounded by configurable limits
 Documents indexed:    Millions (Tantivy designed for scale)
 Segment count:        Auto-merged when >= 4 (cooldown: 5min)
 Query complexity:     Boolean expressions with arbitrary nesting
-Concurrent searches:  Multi-threaded Tokio runtime
+Concurrent searches:  Multi-threaded search workers
 ```
 
 ---
 
 ## 11. KEY OPTIMIZATION DECISIONS
 
-1. **Custom CVVI Format** instead of vector DB:
-   - Direct memory-mapped binary format
-   - Row-oriented for cache locality
-   - Content hash for deduplication
-   - No external dependencies
+1. **frankensearch FSVI** instead of an external vector service:
+   - Direct memory-mapped index format
+   - F16/F32 quantization
+   - Embedder revision and dimension are validated before use
+   - Runs entirely in-process
 
 2. **Prefix Cache** over full result set cache:
    - Smaller memory footprint
@@ -572,7 +573,7 @@ Concurrent searches:  Multi-threaded Tokio runtime
 1. **Deterministic** - Same query always produces same results
 2. **Offline-first** - No external service calls for lexical search
 3. **Composable** - Lexical + semantic can be mixed via RRF
-4. **Progressive** - Gracefully degrades (hash embedder fallback)
+4. **Progressive** - Hybrid gracefully fails open to lexical search; hash mode is explicit
 5. **Auditable** - Provenance fields track source of all results
 6. **Responsive** - Multi-layer caching for fast interactivity
 7. **Maintainable** - Clear separation: Tantivy (lexical), Vector (semantic), SQLite (metadata)
@@ -588,8 +589,7 @@ Concurrent searches:  Multi-threaded Tokio runtime
 | Phrase | Tantivy PhraseQuery | 20-100ms | Index size | Exact sequence |
 | Boolean | Tantivy BooleanQuery | 50-500ms | Query-size | Complex expressions |
 | Time filter | RangeQuery | 10-100ms | Minimal | Date-based filtering |
-| Semantic | FastEmbed + Vector | 100-1000ms | ~Vector size | Concept matching |
+| Semantic | Native MiniLM + FSVI | 100-1000ms | ~Vector size | Concept matching |
 | Hybrid | RRF fusion | 100-1500ms | ~Both sizes | Best of both |
 | Caching | LRU Bloom filter | <5ms | Bounded | Interactive typing |
 | Dedupe | HashMap | <1ms | Minimal | Noise filtering |
-

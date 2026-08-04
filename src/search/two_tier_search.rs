@@ -431,7 +431,7 @@ impl TwoTierIndex {
             .map(|i| FsVectorHit {
                 index: i as u32,
                 score: 0.0,
-                doc_id: self.doc_ids[i].encode(),
+                doc_id: self.doc_ids[i].encode().into(),
             })
             .collect();
 
@@ -469,28 +469,34 @@ impl TwoTierIndex {
             return vec![0.0; indices.len()];
         };
 
-        let hits: Vec<FsVectorHit> = indices
-            .iter()
-            .filter_map(|&idx| {
-                if idx < self.metadata.doc_count {
-                    Some(FsVectorHit {
-                        index: idx as u32,
-                        score: 0.0,
-                        doc_id: self.doc_ids[idx].encode(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        match fs_index.quality_scores_for_hits(query_vec, &hits) {
-            Ok(scores) => scores.into_iter().map(|s| s.unwrap_or(0.0)).collect(),
-            Err(e) => {
-                warn!(error = %e, "frankensearch quality scoring failed; using zero scores");
-                vec![0.0; indices.len()]
+        // Keep the result positionally aligned with `indices`: out-of-range
+        // indices score 0.0 in place rather than being dropped, so callers
+        // that zip scores against their candidate list can never misalign.
+        let mut positions: Vec<usize> = Vec::with_capacity(indices.len());
+        let mut hits: Vec<FsVectorHit> = Vec::with_capacity(indices.len());
+        for (position, &idx) in indices.iter().enumerate() {
+            if idx < self.metadata.doc_count {
+                positions.push(position);
+                hits.push(FsVectorHit {
+                    index: idx as u32,
+                    score: 0.0,
+                    doc_id: self.doc_ids[idx].encode().into(),
+                });
             }
         }
+
+        let mut aligned = vec![0.0; indices.len()];
+        match fs_index.quality_scores_for_hits(query_vec, &hits) {
+            Ok(scores) => {
+                for (position, score) in positions.into_iter().zip(scores) {
+                    aligned[position] = score.unwrap_or(0.0);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "frankensearch quality scoring failed; using zero scores");
+            }
+        }
+        aligned
     }
 
     /// Convert frankensearch VectorHits to cass ScoredResults.

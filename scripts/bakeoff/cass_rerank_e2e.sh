@@ -81,8 +81,8 @@ log "cass version: $($CASS_BIN --version 2>/dev/null || echo 'unknown')"
 MODEL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/cass/models/ms-marco-MiniLM-L-6-v2"
 if [[ ! -d "$MODEL_DIR" ]]; then
     log_warn "Reranker model not installed at: $MODEL_DIR"
-    log "To install, download the ms-marco-MiniLM-L-6-v2 ONNX model"
-    log "Required files: model.onnx, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json"
+    log "To install, acquire the native ms-marco-MiniLM-L-6-v2 safetensors model"
+    log "Required files: model.safetensors, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json"
     # Continue anyway for CI - tests will skip if model unavailable
 fi
 

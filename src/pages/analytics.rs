@@ -13,6 +13,7 @@
 //! - `workspace_summary.json` - Per-workspace breakdown
 //! - `timeline.json` - Activity over time (daily/weekly/monthly)
 //! - `top_terms.json` - Common topics/terms from titles
+//! - `analytics_status.json` - Robot-parity readiness, coverage, drift, and next action
 //!
 //! # Example
 //!
@@ -33,6 +34,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 use tracing::info;
+
+/// Build the exact `analytics status` data projection for a Pages bundle.
+/// Interactive and config-driven exporters share this route to robot truth.
+pub fn robot_status_projection(db_path: &Path) -> Result<serde_json::Value> {
+    let db = super::open_existing_sqlite_db(db_path)
+        .with_context(|| format!("Failed to open analytics source {}", db_path.display()))?;
+    crate::analytics::query::query_status(&db, &crate::analytics::AnalyticsFilter::default())
+        .map(|status| status.to_json())
+        .map_err(|error| anyhow::anyhow!("Failed to query analytics readiness: {error}"))
+}
 
 /// Stop words to filter out from term extraction.
 const STOP_WORDS: &[&str] = &[
@@ -267,6 +278,10 @@ pub struct AnalyticsBundle {
     pub workspace_summary: WorkspaceSummary,
     pub agent_summary: AgentSummary,
     pub top_terms: TopTerms,
+    /// The exact data object returned by `cass analytics status --json` for
+    /// this database. Pages renders this instead of inventing an independent
+    /// readiness interpretation that can contradict the robot surface.
+    pub analytics_status: serde_json::Value,
 }
 
 impl AnalyticsBundle {
@@ -309,8 +324,17 @@ impl AnalyticsBundle {
         crate::pages::write_file_durably(&terms_path, terms_json.as_bytes())
             .context("Failed to write top_terms.json")?;
 
+        // Write analytics_status.json. This is intentionally the same
+        // projection as the robot command, including nullable numeric values,
+        // metric status/display fields, drift, and recommended_action.
+        let status_path = dir.join("analytics_status.json");
+        let status_json = serde_json::to_string_pretty(&self.analytics_status)
+            .context("Failed to serialize analytics_status")?;
+        crate::pages::write_file_durably(&status_path, status_json.as_bytes())
+            .context("Failed to write analytics_status.json")?;
+
         info!(
-            "Analytics written to {:?}: statistics.json, timeline.json, workspace_summary.json, agent_summary.json, top_terms.json",
+            "Analytics written to {:?}: statistics.json, timeline.json, workspace_summary.json, agent_summary.json, top_terms.json, analytics_status.json",
             dir
         );
 
@@ -338,6 +362,12 @@ impl<'a> AnalyticsGenerator<'a> {
         let workspace_summary = self.generate_workspace_summary()?;
         let agent_summary = self.generate_agent_summary()?;
         let top_terms = self.generate_top_terms()?;
+        let analytics_status = crate::analytics::query::query_status(
+            self.db,
+            &crate::analytics::AnalyticsFilter::default(),
+        )
+        .map_err(|error| anyhow::anyhow!("Failed to query analytics readiness: {error}"))?
+        .to_json();
 
         Ok(AnalyticsBundle {
             statistics,
@@ -345,6 +375,7 @@ impl<'a> AnalyticsGenerator<'a> {
             workspace_summary,
             agent_summary,
             top_terms,
+            analytics_status,
         })
     }
 
@@ -1492,6 +1523,7 @@ mod tests {
         assert!(output_dir.path().join("workspace_summary.json").exists());
         assert!(output_dir.path().join("agent_summary.json").exists());
         assert!(output_dir.path().join("top_terms.json").exists());
+        assert!(output_dir.path().join("analytics_status.json").exists());
     }
 
     #[test]
@@ -1507,6 +1539,8 @@ mod tests {
         assert!(!bundle.timeline.daily.is_empty() || bundle.timeline.monthly.is_empty());
         assert!(!bundle.workspace_summary.workspaces.is_empty());
         assert!(!bundle.agent_summary.agents.is_empty());
+        assert!(bundle.analytics_status["coverage"].is_object());
+        assert!(bundle.analytics_status["recommended_action"].is_string());
         // top_terms might be empty depending on stop word filtering
     }
 
@@ -1524,5 +1558,9 @@ mod tests {
         assert!(bundle.workspace_summary.workspaces.is_empty());
         assert!(bundle.agent_summary.agents.is_empty());
         assert!(bundle.top_terms.terms.is_empty());
+        assert_eq!(
+            bundle.analytics_status["coverage"]["message_metrics_coverage_status"],
+            "no-data"
+        );
     }
 }

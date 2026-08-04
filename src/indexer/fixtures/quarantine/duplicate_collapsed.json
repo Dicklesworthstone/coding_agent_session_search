@@ -1,0 +1,12 @@
+{
+  "storage_version": 1,
+  "entries": {
+    "conv-hot-poison::v1": {
+      "first_attempt_at": "2026-05-20T00:00:00Z",
+      "last_attempt_at": "2026-05-24T18:45:00Z",
+      "attempt_count": 5,
+      "last_reason": "index-ingest-out-of-memory: 4.4 GiB",
+      "cass_version_at_quarantine": "0.6.13"
+    }
+  }
+}

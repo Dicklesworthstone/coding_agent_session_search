@@ -6,7 +6,7 @@
 //!   3. No stale entries exist in the golden that aren't in source
 //!
 //! Regenerate:
-//!   UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_error_envelope
+//!   UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_error_envelope
 //!
 //! Then review:
 //!   git diff tests/golden/robot/error_envelope_kinds.json.golden
@@ -116,7 +116,7 @@ fn build_golden_json(kinds: &BTreeMap<String, Vec<i32>>) -> serde_json::Value {
             "description": "Canonical error kind taxonomy for cass robot-mode error envelopes",
             "rule": "All err.kind values MUST be kebab-case per AGENTS.md",
             "total_kinds": kinds.len(),
-            "regenerate": "UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_error_envelope",
+            "regenerate": "UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_error_envelope",
         },
         "kinds": kinds_obj,
     })
@@ -161,7 +161,7 @@ fn error_kinds_golden_coverage() {
     let golden_content = std::fs::read_to_string(&golden).unwrap_or_else(|err| {
         panic!(
             "Golden file missing: {}\n{err}\n\n\
-             Run: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_error_envelope",
+             Run: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_error_envelope",
             golden.display(),
         )
     });
@@ -172,7 +172,7 @@ fn error_kinds_golden_coverage() {
     assert_eq!(
         golden_json["_meta"], expected_json["_meta"],
         "Error envelope golden metadata drift detected.\n\n\
-         Regenerate: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_error_envelope"
+         Regenerate: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_error_envelope"
     );
     let golden_kinds = golden_json["kinds"].as_object().expect("kinds object");
 
@@ -210,7 +210,7 @@ fn error_kinds_golden_coverage() {
     assert!(
         errors.is_empty(),
         "Error envelope golden drift detected:\n{}\n\n\
-         Regenerate: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_error_envelope",
+         Regenerate: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_error_envelope",
         errors.join("\n\n")
     );
 
@@ -236,7 +236,7 @@ fn error_kinds_exit_codes_match_golden() {
     let golden_content = std::fs::read_to_string(&golden).unwrap_or_else(|err| {
         panic!(
             "Golden file missing: {}\n{err}\n\n\
-             Run: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_error_envelope",
+             Run: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_error_envelope",
             golden.display(),
         )
     });
@@ -266,7 +266,7 @@ fn error_kinds_exit_codes_match_golden() {
     assert!(
         mismatches.is_empty(),
         "Exit code mismatches between source and golden:\n{}\n\n\
-         Regenerate: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_error_envelope",
+         Regenerate: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_error_envelope",
         mismatches.join("\n")
     );
 }

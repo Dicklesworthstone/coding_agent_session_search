@@ -10,11 +10,11 @@
       "active": true,
       "installed": false,
       "state": "not_acquired",
-      "state_detail": "model not acquired (user consent required); missing model.onnx, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json",
+      "state_detail": "model not acquired (user consent required); missing model.safetensors, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json",
       "next_step": "Run `cass models install`, or keep using lexical search.",
       "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
       "license": "Apache-2.0",
-      "total_size_bytes": 90872535,
+      "total_size_bytes": 91335697,
       "installed_size_bytes": 0,
       "observed_file_bytes": 0,
       "policy_source": "semantic_policy",
@@ -24,7 +24,7 @@
         "state": {
           "state": "not_acquired",
           "missing_files": [
-            "model.onnx",
+            "model.safetensors",
             "tokenizer.json",
             "config.json",
             "special_tokens_map.json",
@@ -32,16 +32,36 @@
           ],
           "needs_consent": true
         },
-        "required_size_bytes": 90872535,
+        "required_size_bytes": 91335697,
         "installed_size_bytes": 0,
         "policy_source": "semantic_policy"
       },
+      "model_acquisition": {
+        "state": "absent",
+        "usable": false,
+        "runtime": "not_probed",
+        "source": "unknown",
+        "cost_class": "small",
+        "expected_download_bytes": 91335697,
+        "offline_install_available": true,
+        "skipped_network_reason": "explicit_install_required",
+        "fallback_mode": "lexical",
+        "next_step": "install_model",
+        "next_command": "cass models install --model minilm --json",
+        "state_detail": "no embedding model acquired; lexical search works, semantic is opt-in via explicit install",
+        "rollback_guidance": null,
+        "fingerprint": {
+          "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+          "content_digest": "abc2dc4a9e7019632f0a15d3401597967f4840151f9cdcdf7953f10ca864251a",
+          "marker_token": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf:abc2dc4a9e701963"
+        }
+      },
       "files": [
         {
-          "name": "onnx/model.onnx",
-          "local_name": "model.onnx",
+          "name": "model.safetensors",
+          "local_name": "model.safetensors",
           "actual_path": null,
-          "expected_size": 90405214,
+          "expected_size": 90868376,
           "actual_size": 0,
           "exists": false,
           "size_match": false
@@ -83,173 +103,17 @@
           "size_match": false
         }
       ]
-    },
-    {
-      "registry_name": "snowflake-arctic-s",
-      "model_id": "snowflake-arctic-embed-s",
-      "model_dir": "[TEST_HOME]/coding-agent-search/models/snowflake-arctic-embed-s",
-      "active": false,
-      "installed": false,
-      "state": "not_acquired",
-      "state_detail": "model not acquired (user consent required); missing model.onnx, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json",
-      "next_step": "Run `cass models install`, or keep using lexical search.",
-      "revision": "e596f507467533e48a2e17c007f0e1dacc837b33",
-      "license": "Apache-2.0",
-      "total_size_bytes": 133807972,
-      "installed_size_bytes": 0,
-      "observed_file_bytes": 0,
-      "policy_source": "semantic_policy",
-      "cache_lifecycle": {
-        "model_id": "snowflake-arctic-embed-s",
-        "model_dir": "[TEST_HOME]/coding-agent-search/models/snowflake-arctic-embed-s",
-        "state": {
-          "state": "not_acquired",
-          "missing_files": [
-            "model.onnx",
-            "tokenizer.json",
-            "config.json",
-            "special_tokens_map.json",
-            "tokenizer_config.json"
-          ],
-          "needs_consent": true
-        },
-        "required_size_bytes": 133807972,
-        "installed_size_bytes": 0,
-        "policy_source": "semantic_policy"
-      },
-      "files": [
-        {
-          "name": "onnx/model.onnx",
-          "local_name": "model.onnx",
-          "actual_path": null,
-          "expected_size": 133093492,
-          "actual_size": 0,
-          "exists": false,
-          "size_match": false
-        },
-        {
-          "name": "tokenizer.json",
-          "local_name": "tokenizer.json",
-          "actual_path": null,
-          "expected_size": 711649,
-          "actual_size": 0,
-          "exists": false,
-          "size_match": false
-        },
-        {
-          "name": "config.json",
-          "local_name": "config.json",
-          "actual_path": null,
-          "expected_size": 703,
-          "actual_size": 0,
-          "exists": false,
-          "size_match": false
-        },
-        {
-          "name": "special_tokens_map.json",
-          "local_name": "special_tokens_map.json",
-          "actual_path": null,
-          "expected_size": 695,
-          "actual_size": 0,
-          "exists": false,
-          "size_match": false
-        },
-        {
-          "name": "tokenizer_config.json",
-          "local_name": "tokenizer_config.json",
-          "actual_path": null,
-          "expected_size": 1433,
-          "actual_size": 0,
-          "exists": false,
-          "size_match": false
-        }
-      ]
-    },
-    {
-      "registry_name": "nomic-embed",
-      "model_id": "nomic-embed-text-v1.5",
-      "model_dir": "[TEST_HOME]/coding-agent-search/models/nomic-embed-text-v1.5",
-      "active": false,
-      "installed": false,
-      "state": "budget_blocked",
-      "state_detail": "model requires 548025888 bytes but policy allows 314572800 bytes",
-      "next_step": "Increase the semantic model budget or keep using lexical search.",
-      "revision": "e5cf08aadaa33385f5990def41f7a23405aec398",
-      "license": "Apache-2.0",
-      "total_size_bytes": 548025888,
-      "installed_size_bytes": 0,
-      "observed_file_bytes": 0,
-      "policy_source": "semantic_policy",
-      "cache_lifecycle": {
-        "model_id": "nomic-embed-text-v1.5",
-        "model_dir": "[TEST_HOME]/coding-agent-search/models/nomic-embed-text-v1.5",
-        "state": {
-          "state": "budget_blocked",
-          "required_bytes": 548025888,
-          "max_bytes": 314572800
-        },
-        "required_size_bytes": 548025888,
-        "installed_size_bytes": 0,
-        "policy_source": "semantic_policy"
-      },
-      "files": [
-        {
-          "name": "onnx/model.onnx",
-          "local_name": "model.onnx",
-          "actual_path": null,
-          "expected_size": 547310275,
-          "actual_size": 0,
-          "exists": false,
-          "size_match": false
-        },
-        {
-          "name": "tokenizer.json",
-          "local_name": "tokenizer.json",
-          "actual_path": null,
-          "expected_size": 711396,
-          "actual_size": 0,
-          "exists": false,
-          "size_match": false
-        },
-        {
-          "name": "config.json",
-          "local_name": "config.json",
-          "actual_path": null,
-          "expected_size": 2331,
-          "actual_size": 0,
-          "exists": false,
-          "size_match": false
-        },
-        {
-          "name": "special_tokens_map.json",
-          "local_name": "special_tokens_map.json",
-          "actual_path": null,
-          "expected_size": 695,
-          "actual_size": 0,
-          "exists": false,
-          "size_match": false
-        },
-        {
-          "name": "tokenizer_config.json",
-          "local_name": "tokenizer_config.json",
-          "actual_path": null,
-          "expected_size": 1191,
-          "actual_size": 0,
-          "exists": false,
-          "size_match": false
-        }
-      ]
     }
   ],
   "model_id": "all-minilm-l6-v2",
   "model_dir": "[TEST_HOME]/coding-agent-search/models/all-MiniLM-L6-v2",
   "installed": false,
   "state": "not_acquired",
-  "state_detail": "model not acquired (user consent required); missing model.onnx, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json",
+  "state_detail": "model not acquired (user consent required); missing model.safetensors, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json",
   "next_step": "Run `cass models install`, or keep using lexical search.",
   "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
   "license": "Apache-2.0",
-  "total_size_bytes": 90872535,
+  "total_size_bytes": 91335697,
   "installed_size_bytes": 0,
   "observed_file_bytes": 0,
   "policy_source": "semantic_policy",
@@ -259,7 +123,7 @@
     "state": {
       "state": "not_acquired",
       "missing_files": [
-        "model.onnx",
+        "model.safetensors",
         "tokenizer.json",
         "config.json",
         "special_tokens_map.json",
@@ -267,16 +131,36 @@
       ],
       "needs_consent": true
     },
-    "required_size_bytes": 90872535,
+    "required_size_bytes": 91335697,
     "installed_size_bytes": 0,
     "policy_source": "semantic_policy"
   },
+  "model_acquisition": {
+    "state": "absent",
+    "usable": false,
+    "runtime": "not_probed",
+    "source": "unknown",
+    "cost_class": "small",
+    "expected_download_bytes": 91335697,
+    "offline_install_available": true,
+    "skipped_network_reason": "explicit_install_required",
+    "fallback_mode": "lexical",
+    "next_step": "install_model",
+    "next_command": "cass models install --model minilm --json",
+    "state_detail": "no embedding model acquired; lexical search works, semantic is opt-in via explicit install",
+    "rollback_guidance": null,
+    "fingerprint": {
+      "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+      "content_digest": "abc2dc4a9e7019632f0a15d3401597967f4840151f9cdcdf7953f10ca864251a",
+      "marker_token": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf:abc2dc4a9e701963"
+    }
+  },
   "files": [
     {
-      "name": "onnx/model.onnx",
-      "local_name": "model.onnx",
+      "name": "model.safetensors",
+      "local_name": "model.safetensors",
       "actual_path": null,
-      "expected_size": 90405214,
+      "expected_size": 90868376,
       "actual_size": 0,
       "exists": false,
       "size_match": false

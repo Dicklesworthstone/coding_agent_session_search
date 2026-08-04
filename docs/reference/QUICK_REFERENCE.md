@@ -54,7 +54,7 @@ CASS achieves **sub-10ms** interactive search through a 6-layer optimization str
 3. **Warm Worker** (background index reload) → Pre-paged OS cache
 4. **Segment Merging** (automatic on 4+ segments) → Fewer segments to search
 5. **Schema Versioning** → Automatic rebuild on schema mismatch
-6. **Lazy Semantic** → Optional, graceful fallback (hash-based embedder)
+6. **Lazy Semantic** → Optional MiniLM; hybrid queries fail open to lexical
 
 ---
 
@@ -75,7 +75,8 @@ Tantivy Full-Text Search [5-100ms typical]
     └─ BM25 scoring
     ↓
 Optional: Semantic Search [100-1000ms]
-    └─ FastEmbed embeddings (or hash fallback)
+    ├─ Native MiniLM embeddings when installed
+    └─ Explicit hash mode when requested (degraded, non-semantic)
     ↓
 Optional: RRF Hybrid Fusion [+100-500ms]
     └─ Reciprocal Rank Fusion (K=60)
@@ -119,7 +120,7 @@ Return Ranked Results
 | Suffix wildcard (*foo) | 100-500ms | RegexQuery scan |
 | Boolean complex | 50-500ms | BooleanQuery nesting |
 | Time range filter | 10-100ms | RangeQuery |
-| Semantic search | 100-1000ms | FastEmbed inference |
+| Semantic search | 100-1000ms | Native MiniLM inference (frankensearch) |
 | Hybrid (RRF) | 100-1500ms | Dual execution |
 
 ---
@@ -252,41 +253,25 @@ This prevents subtle field-ID mismatches.
 
 ---
 
-## Custom CVVI Format (Vector Index)
+## Frankensearch FSVI Format (Vector Index)
 
-Binary format for semantic search vectors:
+The frankensearch vector index stores semantic vectors in `.fsvi` artifacts:
 
 ```
-Header (variable):
-  Magic:             "CVVI" (4 bytes)
-  Version:           u16
-  EmbedderID:        string
-  EmbedderRevision:  string
-  Dimension:         u32
-  Quantization:      u8 (0=F32, 1=F16)
-  Count:             u32
-  HeaderCRC32:       u32
+Header contract:
+  Embedder ID + exact vector-space revision
+  Dimension + quantization (F32/F16)
+  Record count and format integrity metadata
 
-Rows (70 bytes each):
-  MessageID:    u64
-  CreatedAtMs:  i64
-  AgentID:      u32
-  WorkspaceID:  u32
-  SourceID:     u32
-  Role:         u8 (user/assistant/system/tool)
-  ChunkIdx:     u8 (0 for single-chunk)
-  VecOffset:    u64 (offset in vector slab)
-  ContentHash:  [u8; 32] (SHA256)
-
-Vector Slab:
-  All vectors concatenated, 32-byte aligned
-  Each component: F32 (4 bytes) or F16 (2 bytes)
+Records:
+  Stable cass document ID (message/chunk/provenance metadata)
+  Quantized vector payload
 ```
 
 **Advantages:**
-- No external vector DB dependency
+- No external vector service
 - Memory-mapped for efficient access
-- Content-addressed dedup (SHA256)
+- Rejects mixed embedder revisions or dimensions
 - F16 quantization saves 50% memory
 
 ---
@@ -300,7 +285,7 @@ User stops typing for 300ms
   ↓
 Warm worker triggers (debounced MPMC channel)
   ↓
-Background tokio task:
+Dedicated `cass-warm-worker` thread:
   1. Call reader.reload() (no-op if fresh)
   2. Run mini search (limit: 1 doc) to page in OS cache
   3. Record reload metrics
@@ -336,12 +321,12 @@ Merge triggered:
 
 ```toml
 tantivy = "*"              # Full-text search engine (BM25)
-fastembed = "*"            # ML embeddings (MiniLM)
+frankensearch = { features = ["lexical", "ann", "native"] } # BM25 + native MiniLM + vectors
 lru = "*"                  # LRU cache for prefix reuse
 half = "*"                 # F16 quantization
 memmap2 = "*"              # Memory-mapped vectors
-tokio = "*"                # Async runtime (warm worker)
-rusqlite = "*"             # SQLite (metadata/fallback)
+asupersync = "*"           # Async runtime (warm worker)
+frankensqlite = "*"        # SQLite source of truth
 ```
 
 ---
@@ -485,10 +470,10 @@ Key test patterns found in `tests/`:
 └── src/search/
     ├── query.rs                      ← 6583 lines: SearchClient, caching, RRF
     ├── tantivy.rs                    ← Index mgmt, schema, merging
-    ├── vector_index.rs               ← CVVI format, semantic filtering
+    ├── vector_index.rs               ← frankensearch FSVI facade, semantic filtering
     ├── embedder.rs                   ← Embedder trait
-    ├── fastembed_embedder.rs         ← ML embeddings
-    └── hash_embedder.rs              ← Hash-based fallback
+    ├── fastembed_embedder.rs         ← Native MiniLM embeddings
+    └── hash_embedder.rs              ← Explicit hash-vector tier
 ```
 
 ---
@@ -496,6 +481,6 @@ Key test patterns found in `tests/`:
 ## Further Reading
 
 - **Tantivy docs**: https://docs.rs/tantivy/
-- **FastEmbed docs**: https://github.com/qdrant/fastembed
+- **frankensearch source**: https://github.com/Dicklesworthstone/frankensearch
 - **RRF paper**: https://dl.acm.org/doi/10.1145/312624.312649
 - **BM25 algorithm**: https://en.wikipedia.org/wiki/Okapi_BM25

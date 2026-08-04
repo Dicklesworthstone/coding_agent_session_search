@@ -5,7 +5,7 @@
 //! loudly instead of silently changing downstream observability.
 //!
 //! Regenerate with:
-//! `UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_memo_trace`
+//! `UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_memo_trace`
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use coding_agent_search::indexer::semantic::{EmbeddingInput, SemanticIndexer};
@@ -139,7 +139,7 @@ fn assert_golden(name: &str, actual: &str) -> Result<()> {
         anyhow!(
             "Golden file missing or unreadable: {}\n{err}\n\n\
              Run with UPDATE_GOLDENS=1 to create it, then review and commit:\n\
-             \tUPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_memo_trace\n\
+             \tUPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_memo_trace\n\
              \tgit diff tests/golden/\n\
              \tgit add tests/golden/",
             golden_path.display(),
@@ -155,7 +155,7 @@ fn assert_golden(name: &str, actual: &str) -> Result<()> {
              Expected: {}\n\
              Actual:   {}\n\n\
              diff the two files, then either fix the code or regenerate with:\n\
-             \tUPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_memo_trace",
+             \tUPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_memo_trace",
             golden_path.display(),
             actual_path.display(),
         );

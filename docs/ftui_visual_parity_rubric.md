@@ -193,9 +193,9 @@ Canonical machine-readable manifest:
 Run from repo root:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-ftui-parity-target cargo test --test e2e_tui_smoke_flows tui_pty_search_detail_and_quit_flow -- --nocapture
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-ftui-parity-target cargo test --test e2e_tui_smoke_flows tui_pty_help_overlay_open_close_flow -- --nocapture
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-ftui-parity-target cargo test --test e2e_tui_smoke_flows tui_pty_launch_quit_and_terminal_cleanup -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-ftui-parity-target cargo test --test e2e_tui_smoke_flows tui_pty_search_detail_and_quit_flow -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-ftui-parity-target cargo test --test e2e_tui_smoke_flows tui_pty_help_overlay_open_close_flow -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-ftui-parity-target cargo test --test e2e_tui_smoke_flows tui_pty_launch_quit_and_terminal_cleanup -- --nocapture
 ```
 
 These commands refresh deterministic PTY artifacts under:

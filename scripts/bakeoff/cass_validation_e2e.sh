@@ -129,7 +129,7 @@ RERANK_MISSING=0
 if [[ "$RERANK" == "1" ]]; then
     RERANK_DIR="$DATA_DIR/models/ms-marco-MiniLM-L-6-v2"
     REQUIRED_RERANK_FILES=(
-        "model.onnx"
+        "model.safetensors"
         "tokenizer.json"
         "config.json"
         "special_tokens_map.json"

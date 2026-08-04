@@ -18,7 +18,7 @@
 //! | Name | ID | Dimension | Type | Notes |
 //! |------|-----|-----------|------|-------|
 //! | minilm | minilm-384 | 384 | ML | Default semantic embedder |
-//! | hash | fnv1a-384 | 384 | Hash | Always available fallback |
+//! | hash | fnv1a-384 | 384 | Hash | Explicit fast/degraded mode |
 //!
 //! # Example
 //!
@@ -46,7 +46,7 @@ use super::hash_embedder::HashEmbedder;
 /// Default embedder name when none specified.
 pub const DEFAULT_EMBEDDER: &str = "minilm";
 
-/// Hash embedder name (always available).
+/// Hash embedder name (always available when explicitly requested).
 pub const HASH_EMBEDDER: &str = "hash";
 
 /// Information about a registered embedder.
@@ -76,14 +76,9 @@ pub struct RegisteredEmbedder {
     pub is_baseline: bool,
 }
 
-/// Files required for any ONNX-based embedder.
-pub const REQUIRED_ONNX_FILES: &[&str] = &[
-    "model.onnx",
-    "tokenizer.json",
-    "config.json",
-    "special_tokens_map.json",
-    "tokenizer_config.json",
-];
+/// Files required for the pure-Rust (frankentorch) embedder: a safetensors
+/// weight file plus the tokenizer. The ONNX backend was removed in cass #308.
+pub const REQUIRED_NATIVE_MODEL_FILES: &[&str] = &["model.safetensors", "tokenizer.json"];
 
 /// Eligibility cutoff for bake-off (models must be released on/after this date).
 pub const BAKEOFF_ELIGIBILITY_CUTOFF: &str = "2025-11-01";
@@ -118,8 +113,8 @@ impl RegisteredEmbedder {
         if !self.requires_model_files {
             return &[];
         }
-        // All ONNX-based embedders use the same file structure
-        REQUIRED_ONNX_FILES
+        // The native MiniLM embedder uses a safetensors bundle.
+        REQUIRED_NATIVE_MODEL_FILES
     }
 
     /// Get missing model files for this embedder.
@@ -167,8 +162,9 @@ impl RegisteredEmbedder {
 
 /// Static registry of all supported embedders.
 ///
-/// Models marked with `bakeoff_eligible: true` are candidates for the embedding bake-off
-/// (released after 2025-11-01). The baseline (minilm) is not eligible but used for comparison.
+/// MiniLM is the only architecture verified by the pure-Rust native backend.
+/// Hash vectors remain available for the explicit fast/degraded tier, but are
+/// never selected as a silent substitute for a missing semantic model.
 pub static EMBEDDERS: &[RegisteredEmbedder] = &[
     // === Baseline (not eligible for bake-off) ===
     RegisteredEmbedder {
@@ -183,38 +179,13 @@ pub static EMBEDDERS: &[RegisteredEmbedder] = &[
         size_bytes: 90_000_000,
         is_baseline: true,
     },
-    // === Bake-off Eligible Models (released >= 2025-11-01, verified checksums) ===
-    RegisteredEmbedder {
-        name: "snowflake-arctic-s",
-        id: "snowflake-arctic-s-384",
-        dimension: 384,
-        is_semantic: true,
-        description: "Snowflake Arctic Embed S - small, fast, MiniLM-compatible dimension",
-        requires_model_files: true,
-        release_date: "2025-11-10",
-        huggingface_id: "Snowflake/snowflake-arctic-embed-s",
-        size_bytes: 130_000_000,
-        is_baseline: false,
-    },
-    RegisteredEmbedder {
-        name: "nomic-embed",
-        id: "nomic-embed-768",
-        dimension: 768,
-        is_semantic: true,
-        description: "Nomic Embed Text v1.5 - long context, Matryoshka support",
-        requires_model_files: true,
-        release_date: "2025-11-05",
-        huggingface_id: "nomic-ai/nomic-embed-text-v1.5",
-        size_bytes: 280_000_000,
-        is_baseline: false,
-    },
-    // === Fallback (always available) ===
+    // === Explicit fast/degraded tier (always available) ===
     RegisteredEmbedder {
         name: "hash",
         id: "fnv1a-384",
         dimension: 384,
         is_semantic: false,
-        description: "FNV-1a feature hashing - lexical fallback, always available",
+        description: "FNV-1a feature hashing - explicit fast/degraded vectors, always available",
         requires_model_files: false,
         release_date: "2020-01-01",
         huggingface_id: "",
@@ -274,16 +245,18 @@ impl EmbedderRegistry {
             .expect("default embedder must exist")
     }
 
-    /// Get the best available embedder (ML if available, hash fallback).
+    /// Get the preferred semantic embedder.
+    ///
+    /// If MiniLM is not installed this still returns its registry entry, so a
+    /// caller either reports the missing model or fails open to lexical search.
+    /// Hash vectors must be selected explicitly by name or tier.
     pub fn best_available(&self) -> &'static RegisteredEmbedder {
-        // Try ML embedders first
         for e in EMBEDDERS.iter().filter(|e| e.is_semantic) {
             if e.is_available(&self.data_dir) {
                 return e;
             }
         }
-        // Fall back to hash
-        self.get(HASH_EMBEDDER).expect("hash embedder must exist")
+        self.default_embedder()
     }
 
     /// Get all bake-off eligible embedders.
@@ -388,8 +361,7 @@ fn load_embedder_by_name(data_dir: &Path, name: &str) -> EmbedderResult<Arc<dyn 
             let embedder = HashEmbedder::default();
             Ok(Arc::new(embedder))
         }
-        // All ONNX-based embedders (baseline and bake-off candidates)
-        "minilm" | "snowflake-arctic-s" | "nomic-embed" => {
+        "minilm" => {
             let embedder = FastEmbedder::load_by_name(data_dir, name)?;
             Ok(Arc::new(embedder))
         }
@@ -501,12 +473,13 @@ mod tests {
     }
 
     #[test]
-    fn test_best_available_fallback() {
+    fn test_best_available_never_silently_substitutes_hash() {
         let (_tmp, registry) = registry_fixture();
 
-        // Without model files, best_available should return hash
+        // A missing quality model must fail open at the search layer; selecting
+        // a same-dimensional hash vector space here would silently mix contracts.
         let best = registry.best_available();
-        assert_eq!(best.name, "hash");
+        assert_eq!(best.name, "minilm");
     }
 
     #[test]
@@ -518,11 +491,16 @@ mod tests {
     }
 
     #[test]
-    fn test_get_embedder_default_no_models() {
+    fn test_get_embedder_default_no_models_reports_missing_minilm() -> Result<(), String> {
         let tmp = tempdir().unwrap();
-        // Without model files, should fall back to hash
-        let embedder = get_embedder(tmp.path(), None).unwrap();
-        assert_eq!(embedder.id(), "fnv1a-384");
+        let error = match get_embedder(tmp.path(), None) {
+            Ok(_) => return Err("missing MiniLM silently selected an embedder".into()),
+            Err(error) => error,
+        };
+        if !matches!(error, EmbedderError::EmbedderUnavailable { .. }) {
+            return Err(format!("unexpected error shape: {error:?}"));
+        }
+        Ok(())
     }
 
     #[test]
@@ -543,7 +521,7 @@ mod tests {
         let minilm = registry.get("minilm").unwrap();
         let missing = minilm.missing_files(tmp.path());
         assert!(!missing.is_empty());
-        assert!(missing.contains(&"model.onnx".to_string()));
+        assert!(missing.contains(&"model.safetensors".to_string()));
     }
 
     #[test]
@@ -562,17 +540,11 @@ mod tests {
     // ==================== Bake-off Tests ====================
 
     #[test]
-    fn test_bakeoff_eligible_count() {
+    fn test_no_unloadable_embedder_is_bakeoff_eligible() {
         let (_tmp, registry) = registry_fixture();
 
         let eligible = registry.bakeoff_eligible();
-        // Should have exactly 2 eligible models: snowflake, nomic
-        assert_eq!(
-            eligible.len(),
-            2,
-            "Expected 2 eligible models, got {}",
-            eligible.len()
-        );
+        assert!(eligible.is_empty());
 
         // MiniLM should NOT be in the eligible list (it's the baseline)
         assert!(
@@ -584,16 +556,6 @@ mod tests {
         assert!(
             !eligible.iter().any(|e| e.name == "hash"),
             "hash should not be in eligible list"
-        );
-
-        // Verify the correct models are in the eligible list
-        assert!(
-            eligible.iter().any(|e| e.name == "snowflake-arctic-s"),
-            "snowflake should be in eligible list"
-        );
-        assert!(
-            eligible.iter().any(|e| e.name == "nomic-embed"),
-            "nomic should be in eligible list"
         );
     }
 
@@ -648,24 +610,10 @@ mod tests {
     }
 
     #[test]
-    fn test_eligible_embedder_metadata() {
+    fn test_unverified_architectures_are_not_registered() {
         let (_tmp, registry) = registry_fixture();
-
-        // Check snowflake (eligible candidate, same dimension as minilm)
-        let snowflake = registry.get("snowflake-arctic-s").unwrap();
-        assert!(snowflake.is_bakeoff_eligible());
-        let metadata = snowflake.to_model_metadata();
-        assert!(!metadata.is_baseline);
-        assert!(metadata.is_eligible());
-        assert_eq!(metadata.dimension, Some(384));
-
-        // Check nomic (eligible candidate)
-        let nomic = registry.get("nomic-embed").unwrap();
-        assert!(nomic.is_bakeoff_eligible());
-        let metadata = nomic.to_model_metadata();
-        assert!(!metadata.is_baseline);
-        assert!(metadata.is_eligible());
-        assert_eq!(metadata.dimension, Some(768));
+        assert!(registry.get("snowflake-arctic-s").is_none());
+        assert!(registry.get("nomic-embed").is_none());
     }
 
     #[test]

@@ -1,0 +1,67 @@
+{
+  "project": "cass",
+  "commits": [
+    {
+      "sha": "abc123",
+      "subject": "fix(rch): preflight broken on remote",
+      "timestamp_ms": 100000
+    },
+    {
+      "sha": "fsql99",
+      "subject": "feat(frankensqlite-group-by): use SUM(0) in grouped query",
+      "timestamp_ms": 300000
+    },
+    {
+      "sha": "leak01",
+      "subject": "fix(export): redact path in exported summary",
+      "body": "reported by realuser@corp.example from /home/realuser/private/notes digest 0123456789abcdef0123456789abcdef0123456789abcdef",
+      "timestamp_ms": 50000
+    },
+    {
+      "sha": "sec01",
+      "subject": "fix(update): validate version chars to prevent shell injection",
+      "timestamp_ms": 400000
+    },
+    {
+      "sha": "feat01",
+      "subject": "feat(storage): atomic-swap lexical publish via renameat2",
+      "timestamp_ms": 500000
+    }
+  ],
+  "beads": [
+    {
+      "id": "bd-rch-1",
+      "title": "fix(rch): preflight broken on remote",
+      "issue_type": "bug",
+      "status": "closed",
+      "labels": ["rch"],
+      "updated_ms": 200000
+    },
+    {
+      "id": "bd-fsql-2",
+      "title": "frankensqlite group-by workaround",
+      "close_reason": "abandoned: bare 0 in grouped query does not work, rolled back",
+      "issue_type": "task",
+      "status": "closed",
+      "labels": ["frankensqlite-group-by"],
+      "updated_ms": 100000
+    },
+    {
+      "id": "bd-rch-patch-3",
+      "title": "rch local patch override recipe",
+      "close_reason": "deprecated: local patch override no longer needed; superseded by git pin",
+      "issue_type": "task",
+      "status": "closed",
+      "labels": ["rch-local-patch"],
+      "updated_ms": 60000
+    }
+  ],
+  "proofs": [
+    {
+      "name": "storage_publish_gate",
+      "status": "pass",
+      "command": "cargo test --test e2e_storage_failure_fixture_gate",
+      "timestamp_ms": 10000
+    }
+  ]
+}

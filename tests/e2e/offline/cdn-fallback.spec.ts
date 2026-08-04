@@ -1,8 +1,16 @@
-import { test, expect, gotoFile, waitForPageReady, countMessages, collectConsoleErrors } from '../setup/test-utils';
+import {
+  test,
+  expect,
+  gotoFile,
+  waitForPageReady,
+  countMessages,
+  collectBrowserErrors,
+} from '../setup/test-utils';
 
 test.describe('CDN Fallback - No-CDN Mode', () => {
   test('renders correctly without CDN resources', async ({ page, noCdnExportPath }) => {
     test.skip(!noCdnExportPath, 'No-CDN export path not available');
+    const browserErrors = collectBrowserErrors(page);
 
     await gotoFile(page, noCdnExportPath);
     await waitForPageReady(page);
@@ -16,6 +24,9 @@ test.describe('CDN Fallback - No-CDN Mode', () => {
       window.getComputedStyle(el).backgroundColor
     );
     expect(bodyBgColor).not.toBe('');
+    await page.waitForTimeout(500);
+    expect(browserErrors.pageErrors).toEqual([]);
+    expect(browserErrors.consoleErrors).toEqual([]);
   });
 
   test('no external resource URLs in no-cdn export', async ({ page, noCdnExportPath }) => {
@@ -117,32 +128,76 @@ test.describe('CDN Fallback - Network Blocking', () => {
     }
   });
 
-  test('fallback classes applied when Tailwind unavailable', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test(
+    'fallback classes and legible content survive CDN failure',
+    async ({ page, exportPath }, testInfo) => {
+      test.skip(!exportPath, 'Export path not available');
 
-    // Block Tailwind
-    await page.route('**/*.tailwindcss.com/**', (route) => route.abort());
+      const browserErrors = collectBrowserErrors(page);
+      const failedRequests: string[] = [];
+      page.on('requestfailed', (request) => failedRequests.push(request.url()));
 
-    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
-    await waitForPageReady(page);
+      // Block both current jsDelivr assets and the legacy Tailwind host before
+      // navigation so stylesheet/script onerror handlers exercise real fallback.
+      await page.route('https://cdn.jsdelivr.net/**', (route) => route.abort());
+      await page.route('https://cdn.tailwindcss.com/**', (route) => route.abort());
 
-    // Wait for error handler to run
-    await page.waitForTimeout(2000);
+      await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
+      await waitForPageReady(page);
 
-    // Check if fallback class is applied
-    const bodyClasses = await page.locator('body').getAttribute('class');
-    const htmlClasses = await page.locator('html').getAttribute('class');
+      // Wait for error handlers to run.
+      await page.waitForTimeout(2000);
 
-    // Might have 'no-tailwind' or 'offline' class
-    const hasFallbackIndicator =
-      (bodyClasses?.includes('no-tailwind') || bodyClasses?.includes('offline')) ||
-      (htmlClasses?.includes('no-tailwind') || htmlClasses?.includes('offline'));
+      const bodyClasses = await page.locator('body').getAttribute('class');
+      const htmlClasses = await page.locator('html').getAttribute('class');
 
-    // This is optional - the page should work regardless
-    // Just verify the page is functional
-    const messageCount = await countMessages(page);
-    expect(messageCount).toBeGreaterThan(0);
-  });
+      // A failed CDN must become an explicit fallback state, not a silent style
+      // dependency. Prism-only failures are also acceptable for older exports.
+      const hasFallbackIndicator =
+        bodyClasses?.includes('no-tailwind') ||
+        bodyClasses?.includes('no-prism') ||
+        bodyClasses?.includes('offline') ||
+        htmlClasses?.includes('no-tailwind') ||
+        htmlClasses?.includes('no-prism') ||
+        htmlClasses?.includes('offline');
+
+      const messageCount = await countMessages(page);
+      expect(messageCount).toBeGreaterThan(0);
+      expect(hasFallbackIndicator).toBe(true);
+      expect(browserErrors.pageErrors).toEqual([]);
+      expect(failedRequests.some((url) => url.includes('cdn.'))).toBe(true);
+
+      const legibility = await page.locator('body').evaluate((element) => {
+        const style = window.getComputedStyle(element);
+        return {
+          color: style.color,
+          backgroundColor: style.backgroundColor,
+          fontFamily: style.fontFamily,
+        };
+      });
+      expect(legibility.color).not.toBe('');
+      expect(legibility.backgroundColor).not.toBe('');
+      expect(legibility.fontFamily).not.toBe('');
+
+      await testInfo.attach('cdn-degradation-diagnostics', {
+        body: Buffer.from(
+          JSON.stringify(
+            {
+              failedRequests,
+              consoleErrors: browserErrors.consoleErrors,
+              pageErrors: browserErrors.pageErrors,
+              bodyClasses,
+              htmlClasses,
+              legibility,
+            },
+            null,
+            2
+          )
+        ),
+        contentType: 'application/json',
+      });
+    }
+  );
 });
 
 test.describe('Offline Mode Simulation', () => {

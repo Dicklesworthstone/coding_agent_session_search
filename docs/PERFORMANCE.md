@@ -61,38 +61,38 @@ directory so local agent sessions do not consume the development machine.
 Run all benchmarks with default settings:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-target cargo bench
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-target cargo bench
 ```
 
 Run specific benchmark suite:
 
 ```bash
 # Crypto benchmarks
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-crypto-target cargo bench --bench crypto_perf
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-crypto-target cargo bench --bench crypto_perf
 
 # Database benchmarks
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-db-target cargo bench --bench db_perf
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-db-target cargo bench --bench db_perf
 
 # Export/compression benchmarks
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-export-target cargo bench --bench export_perf
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-export-target cargo bench --bench export_perf
 
 # Search benchmarks
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-search-target cargo bench --bench search_perf
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-search-target cargo bench --bench search_perf
 
 # Answer-pack planner/render benchmarks
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-pack-target cargo bench --bench search_perf -- answer_pack
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-pack-target cargo bench --bench search_perf -- answer_pack
 
 # Fast answer-pack SLO report with p50/p95 stage timings
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-pack-target cargo test --test robot_perf answer_pack_planner_and_render_p95_under_slo -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-pack-target cargo test --test robot_perf answer_pack_planner_and_render_p95_under_slo -- --nocapture
 
 # Indexing benchmarks
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-index-target cargo bench --bench index_perf
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-index-target cargo bench --bench index_perf
 
 # Cache microbenchmarks
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-cache-target cargo bench --bench cache_micro
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-cache-target cargo bench --bench cache_micro
 
 # Full runtime benchmarks
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-runtime-target cargo bench --bench runtime_perf
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-runtime-target cargo bench --bench runtime_perf
 ```
 
 ### Filtered Benchmarks
@@ -101,13 +101,13 @@ Run specific benchmark functions:
 
 ```bash
 # Only Argon2 benchmarks
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-filter-target cargo bench -- argon2
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-filter-target cargo bench -- argon2
 
 # Only compression benchmarks
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-filter-target cargo bench -- compress
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-filter-target cargo bench -- compress
 
 # Only scaling benchmarks
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-filter-target cargo bench -- scaling
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-filter-target cargo bench -- scaling
 ```
 
 ### CI/Release Benchmarks
@@ -116,13 +116,13 @@ For thorough benchmarking with more samples:
 
 ```bash
 # Increase sample size for more accurate results
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-release-target cargo bench -- --sample-size 100
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-release-target cargo bench -- --sample-size 100
 
 # Save baseline for regression detection
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-baseline-target cargo bench -- --save-baseline main
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-baseline-target cargo bench -- --save-baseline main
 
 # Compare against baseline
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-baseline-target cargo bench -- --baseline main
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-baseline-target cargo bench -- --baseline main
 ```
 
 ## Benchmark Suites
@@ -275,7 +275,7 @@ Full runtime benchmarks:
 
 ```bash
 # Using perf (Linux)
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-profile-search-target perf record --call-graph dwarf cargo bench --bench search_perf
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-profile-search-target perf record --call-graph dwarf cargo bench --bench search_perf
 # Retrieve the generated perf.data from the rch worker before opening it locally.
 perf report
 
@@ -287,12 +287,12 @@ perf report
 
 ```bash
 # Using heaptrack (Linux)
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-profile-db-target heaptrack cargo bench --bench db_perf
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-profile-db-target heaptrack cargo bench --bench db_perf
 # Retrieve the generated heaptrack profile from the rch worker before opening it locally.
 heaptrack_gui heaptrack.*.gz
 
 # Using DHAT (via valgrind)
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-profile-cache-target valgrind --tool=dhat cargo bench --bench cache_micro
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-profile-cache-target valgrind --tool=dhat cargo bench --bench cache_micro
 ```
 
 ### Flamegraphs
@@ -301,7 +301,7 @@ rch exec -- env CARGO_TARGET_DIR=/tmp/cass-profile-cache-target valgrind --tool=
 # Ensure cargo-flamegraph is already installed on the rch worker.
 
 # Generate flamegraph
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-flamegraph-target cargo flamegraph --bench search_perf -- --bench
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-flamegraph-target cargo flamegraph --bench search_perf -- --bench
 ```
 
 ## Baseline Results

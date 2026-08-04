@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "applied": false,
+  "dry_run": true,
+  "db_path": "[TEST_HOME]/coding-agent-search/agent_search.db",
+  "db_exists": false,
+  "conversations_collapsed": 0,
+  "messages_removed": 0,
+  "lexical_rebuilt": false,
+  "pairs": [],
+  "recommended_action": "No database found. Run 'cass index --full' first."
+}

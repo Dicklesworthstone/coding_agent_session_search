@@ -302,8 +302,17 @@ impl BookmarkStore {
             )?;
             let exists: i64 = exists_row
                 .first()
-                .and_then(|row| row.get_typed(0).ok())
-                .unwrap_or(0);
+                .ok_or_else(|| {
+                    frankensqlite::FrankenError::Internal(
+                        "bookmark schema-incompatible: duplicate probe returned no row".to_string(),
+                    )
+                })?
+                .get_typed(0)
+                .map_err(|error| {
+                    frankensqlite::FrankenError::Internal(format!(
+                        "bookmark schema-incompatible: duplicate probe decode failed: {error}"
+                    ))
+                })?;
 
             if exists == 0 {
                 bookmark.id = 0; // Reset ID for new insert
@@ -339,7 +348,7 @@ fn row_to_bookmark(row: &frankensqlite::Row) -> Result<Bookmark, frankensqlite::
         id: row.get_typed(0)?,
         title: row.get_typed(1)?,
         source_path: row.get_typed(2)?,
-        line_number: line_number_from_db(row.get_typed::<Option<i64>>(3)?),
+        line_number: line_number_from_db(row.get_typed::<Option<i64>>(3)?)?,
         agent: row.get_typed(4)?,
         workspace: row.get_typed(5)?,
         note: row.get_typed(6)?,
@@ -382,8 +391,18 @@ fn line_number_to_db(line_number: Option<usize>) -> Result<Option<i64>> {
         .transpose()
 }
 
-fn line_number_from_db(line_number: Option<i64>) -> Option<usize> {
-    line_number.and_then(|n| usize::try_from(n).ok())
+fn line_number_from_db(
+    line_number: Option<i64>,
+) -> Result<Option<usize>, frankensqlite::FrankenError> {
+    line_number
+        .map(|number| {
+            usize::try_from(number).map_err(|_| {
+                frankensqlite::FrankenError::Internal(format!(
+                    "bookmark schema-incompatible: line_number {number} is outside the supported non-negative range"
+                ))
+            })
+        })
+        .transpose()
 }
 
 fn current_timestamp() -> i64 {
@@ -570,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn test_negative_line_number_from_db_is_sanitized() {
+    fn test_negative_line_number_from_db_reports_schema_incompatibility() {
         let (store, _dir) = test_store();
         let now = current_timestamp();
         store
@@ -593,9 +612,11 @@ mod tests {
             )
             .unwrap();
 
-        let bookmarks = store.list(None).unwrap();
-        assert_eq!(bookmarks.len(), 1);
-        assert_eq!(bookmarks[0].line_number, None);
+        let error = store
+            .list(None)
+            .expect_err("incompatible bookmark rows must not decode through a default");
+        assert!(error.to_string().contains("bookmark schema-incompatible"));
+        assert!(error.to_string().contains("line_number -12"));
     }
 
     #[test]
@@ -646,5 +667,30 @@ mod tests {
         assert_eq!(store.count().unwrap(), 2);
         assert!(store.is_bookmarked("/same.rs", None).unwrap());
         assert!(store.is_bookmarked("/same.rs", Some(10)).unwrap());
+    }
+
+    #[test]
+    fn test_import_rolls_back_all_rows_when_late_row_is_invalid() -> anyhow::Result<()> {
+        if usize::BITS <= 63 {
+            return Ok(());
+        }
+
+        let (store, _dir) = test_store();
+        let bookmarks = vec![
+            Bookmark::new("Valid first row", "/valid.rs", "agent", "/w"),
+            Bookmark::new("Invalid second row", "/invalid.rs", "agent", "/w")
+                .with_line((i64::MAX as usize).saturating_add(1)),
+        ];
+        let json = serde_json::to_string(&bookmarks)?;
+
+        let Err(error) = store.import_json(&json) else {
+            anyhow::bail!("invalid imports must abort the whole transaction");
+        };
+        anyhow::ensure!(
+            error.to_string().contains("line number exceeds i64 range"),
+            "unexpected import error: {error}"
+        );
+        anyhow::ensure!(store.count()? == 0, "the first insert must roll back");
+        Ok(())
     }
 }

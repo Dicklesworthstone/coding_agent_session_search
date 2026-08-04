@@ -1,0 +1,224 @@
+{
+  "command": "analytics/incidents",
+  "data": {
+    "schema_version": 2,
+    "count_scope": "all_matching_candidates",
+    "scan_units": {
+      "files": "archive_conversations",
+      "lines": "archive_messages",
+      "bytes": "utf8_message_content_inspected",
+      "candidate_order": "newest_archive_row_first",
+      "message_fragment_chars": 4096
+    },
+    "discovery": {
+      "schema_version": 1,
+      "caps": {
+        "max_files": 10,
+        "max_lines": 100,
+        "max_bytes": 1000000,
+        "budget_ms": 60000,
+        "max_evidence": 50
+      },
+      "files_considered": 3,
+      "files_scanned": 3,
+      "lines_scanned": 4,
+      "bytes_scanned": 280,
+      "elapsed_ms": "[ELAPSED_MS]",
+      "stop_reason": "completed",
+      "timed_out": false,
+      "partial": false,
+      "evidence_truncated": false,
+      "evidence": [
+        {
+          "file": "remote-session.jsonl",
+          "line": 1,
+          "category": "remote_sync_auth",
+          "reason": "content_fingerprint=3ed58f9549f8eeda18cd151ebb448edd71ffda372d99ab1096dbd610b0c882f6"
+        },
+        {
+          "file": "codex-primary.jsonl",
+          "line": 1,
+          "category": "cass_status_health",
+          "reason": "content_fingerprint=be87f683fcc9482acb4ac87676532b4f0c09f876323980a8e92fea9ddf38e749"
+        },
+        {
+          "file": "codex-primary.jsonl",
+          "line": 1,
+          "category": "storage_busy_corrupt",
+          "reason": "content_fingerprint=be87f683fcc9482acb4ac87676532b4f0c09f876323980a8e92fea9ddf38e749"
+        },
+        {
+          "file": "codex-primary.jsonl",
+          "line": 1,
+          "category": "semantic",
+          "reason": "content_fingerprint=be87f683fcc9482acb4ac87676532b4f0c09f876323980a8e92fea9ddf38e749"
+        },
+        {
+          "file": "codex-primary.jsonl",
+          "line": 2,
+          "category": "quarantine_oom",
+          "reason": "content_fingerprint=fad8354d9903431c6270d9d365d3b2b4352f9a8afaf6b43a72ee7453ebe04729"
+        }
+      ]
+    },
+    "top_sessions": [
+      {
+        "conversation_id": 1,
+        "session_id": "primary-session",
+        "agent": "codex",
+        "host": "local",
+        "source_path": "[TEST_HOME]/sessions/codex-primary.jsonl",
+        "source_id": "local",
+        "exists_state": "archive_only",
+        "hit_count": 4,
+        "category_breadth": 4,
+        "dominant_categories": [
+          "cass_status_health",
+          "quarantine_oom",
+          "semantic",
+          "storage_busy_corrupt"
+        ],
+        "redaction_status": "redacted",
+        "evidence_summaries": [
+          {
+            "category": "cass_status_health",
+            "hit_count": 1,
+            "content_fingerprints": [
+              "be87f683fcc9482acb4ac87676532b4f0c09f876323980a8e92fea9ddf38e749"
+            ],
+            "evidence_paths": [
+              "codex-primary.jsonl"
+            ]
+          },
+          {
+            "category": "quarantine_oom",
+            "hit_count": 1,
+            "content_fingerprints": [
+              "fad8354d9903431c6270d9d365d3b2b4352f9a8afaf6b43a72ee7453ebe04729"
+            ],
+            "evidence_paths": [
+              "codex-primary.jsonl"
+            ]
+          },
+          {
+            "category": "semantic",
+            "hit_count": 1,
+            "content_fingerprints": [
+              "be87f683fcc9482acb4ac87676532b4f0c09f876323980a8e92fea9ddf38e749"
+            ],
+            "evidence_paths": [
+              "codex-primary.jsonl"
+            ]
+          },
+          {
+            "category": "storage_busy_corrupt",
+            "hit_count": 1,
+            "content_fingerprints": [
+              "be87f683fcc9482acb4ac87676532b4f0c09f876323980a8e92fea9ddf38e749"
+            ],
+            "evidence_paths": [
+              "codex-primary.jsonl"
+            ]
+          }
+        ],
+        "suggested_command": {
+          "kind": "view",
+          "argv": [
+            "cass",
+            "--db",
+            "[TEST_HOME]/analytics-incidents.db",
+            "view",
+            "[TEST_HOME]/sessions/codex-primary.jsonl",
+            "--source",
+            "local",
+            "--conversation-id",
+            "1",
+            "--json"
+          ],
+          "display": "cass --db [TEST_HOME]/analytics-incidents.db view [TEST_HOME]/sessions/codex-primary.jsonl --source local --conversation-id 1 --json"
+        }
+      },
+      {
+        "conversation_id": 2,
+        "session_id": "remote-session",
+        "agent": "claude_code",
+        "host": "fixture-host",
+        "source_path": "/remote/archive/remote-session.jsonl",
+        "source_id": "remote-fixture",
+        "origin_host": "fixture-host",
+        "exists_state": "unknown",
+        "hit_count": 1,
+        "category_breadth": 1,
+        "dominant_categories": [
+          "remote_sync_auth"
+        ],
+        "redaction_status": "redacted",
+        "evidence_summaries": [
+          {
+            "category": "remote_sync_auth",
+            "hit_count": 1,
+            "content_fingerprints": [
+              "3ed58f9549f8eeda18cd151ebb448edd71ffda372d99ab1096dbd610b0c882f6"
+            ],
+            "evidence_paths": [
+              "remote-session.jsonl"
+            ]
+          }
+        ],
+        "suggested_command": {
+          "kind": "view",
+          "argv": [
+            "cass",
+            "--db",
+            "[TEST_HOME]/analytics-incidents.db",
+            "view",
+            "/remote/archive/remote-session.jsonl",
+            "--source",
+            "remote-fixture",
+            "--conversation-id",
+            "2",
+            "--json"
+          ],
+          "display": "cass --db [TEST_HOME]/analytics-incidents.db view /remote/archive/remote-session.jsonl --source remote-fixture --conversation-id 2 --json"
+        }
+      }
+    ],
+    "total_sessions": 2,
+    "total_hits": 5,
+    "top_sessions_truncated": false,
+    "redaction": {
+      "private_text_policy": "suppress_all",
+      "hash_strategy": "blake3_256_v1",
+      "fields_emitted": [
+        "conversation_id",
+        "session_id",
+        "agent",
+        "host",
+        "source_path",
+        "source_id",
+        "origin_host",
+        "exists_state",
+        "hit_count",
+        "category",
+        "category_breadth",
+        "dominant_categories",
+        "redaction_status",
+        "evidence_summaries",
+        "content_fingerprints",
+        "evidence_paths",
+        "suggested_command"
+      ],
+      "fields_suppressed": [
+        "raw_prompt_text",
+        "raw_tool_payload",
+        "raw_snippet"
+      ],
+      "opt_in_flags": []
+    }
+  },
+  "_meta": {
+    "elapsed_ms": "[ELAPSED_MS]",
+    "filters_applied": [],
+    "data_dir": null
+  }
+}

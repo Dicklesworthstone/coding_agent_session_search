@@ -94,6 +94,64 @@
               }
             }
           },
+          "model_acquisition": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string"
+              },
+              "usable": {
+                "type": "boolean"
+              },
+              "runtime": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "cost_class": {
+                "type": "string"
+              },
+              "expected_download_bytes": {
+                "type": "integer"
+              },
+              "offline_install_available": {
+                "type": "boolean"
+              },
+              "skipped_network_reason": {
+                "type": "string"
+              },
+              "fallback_mode": {
+                "type": "string"
+              },
+              "next_step": {
+                "type": "string"
+              },
+              "next_command": {
+                "type": "string"
+              },
+              "state_detail": {
+                "type": "string"
+              },
+              "rollback_guidance": {
+                "type": "null"
+              },
+              "fingerprint": {
+                "type": "object",
+                "properties": {
+                  "revision": {
+                    "type": "string"
+                  },
+                  "content_digest": {
+                    "type": "string"
+                  },
+                  "marker_token": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
           "files": {
             "type": "array",
             "items": {
@@ -196,6 +254,64 @@
         },
         "policy_source": {
           "type": "string"
+        }
+      }
+    },
+    "model_acquisition": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string"
+        },
+        "usable": {
+          "type": "boolean"
+        },
+        "runtime": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "cost_class": {
+          "type": "string"
+        },
+        "expected_download_bytes": {
+          "type": "integer"
+        },
+        "offline_install_available": {
+          "type": "boolean"
+        },
+        "skipped_network_reason": {
+          "type": "string"
+        },
+        "fallback_mode": {
+          "type": "string"
+        },
+        "next_step": {
+          "type": "string"
+        },
+        "next_command": {
+          "type": "string"
+        },
+        "state_detail": {
+          "type": "string"
+        },
+        "rollback_guidance": {
+          "type": "null"
+        },
+        "fingerprint": {
+          "type": "object",
+          "properties": {
+            "revision": {
+              "type": "string"
+            },
+            "content_digest": {
+              "type": "string"
+            },
+            "marker_token": {
+              "type": "string"
+            }
+          }
         }
       }
     },

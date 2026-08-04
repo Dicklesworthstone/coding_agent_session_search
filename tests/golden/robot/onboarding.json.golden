@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "providers": [],
+  "excluded_providers": [],
+  "estimated_index_sessions": 0,
+  "semantic_ready": false,
+  "remote_hint": "no remote sources configured; run cass sources add <ssh-host> to include other machines (additive)",
+  "recommended_action": "discover_sources",
+  "recommended_command": "cass sources discover --json",
+  "rollback_note": "read-only discovery; nothing is written until you run an explicit add/index",
+  "mutation_free": true,
+  "data_dir": "[TEST_HOME]/coding-agent-search",
+  "indexed_conversation_count": 0
+}

@@ -15,7 +15,816 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
-## Unreleased
+## [Unreleased]
+
+Post-v0.6.23 GitHub-issue triage: the second half of the
+[#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368)
+FTS5 corruption-opacity defects, three fresh v0.6.x reports, and the genuine
+engine fix for the shipped
+[#369](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/369)
+FTS5 leaf-overflow (implemented + tested in frankensqlite, pending a dependency
+re-pin).
+
+### Fixed
+
+- **[#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368)
+  defect 2 -- readiness no longer reports "search usable" while search hard-fails
+  on a corrupt FTS structure**
+  ([`9bce58f4`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/9bce58f4),
+  headline accuracy
+  [`49efd299`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/49efd299)).
+  A non-quarantine asset-inspection error (the lexical-fingerprint open failing
+  on a corrupt FTS5 structure) fell through the `fresh=false ->
+  StaleButSearchable` mapping, and the fingerprint open was skipped entirely for
+  DBs > 256 MiB. Both fixed at the shared root, so `status`/`doctor`/`support-bundle`
+  are all truthful; non-regressing for the absent-shadow (Tantivy-served) case.
+  3 of 4 #368 defects now resolved (defect 3 is frankensqlite-blocked).
+
+- **[#350](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/350)
+  -- targeted `--watch-once <paths>` bounds to its paths instead of scanning the
+  whole archive**
+  ([`64b73dca`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/64b73dca)).
+  A populated archive whose derived index looked stale silently broadened a
+  targeted watch-once into a full-corpus rebuild (`processed_conversations=16301`
+  for one changed session). The gate now bounds work to the supplied paths and
+  defers any broader rebuild, as the plain-index path does.
+
+- **[#353](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/353)
+  -- the lexical-repair forever-defer loop is broken**
+  ([`47fb0724`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/47fb0724)).
+  Search deferred on a content-fingerprint mismatch while `cass index`
+  re-preserved the stale checkpoint fingerprint above the 1 GiB auto-repair cap
+  -- repeating every run. The deferred branch now runs a cheap, doc-count-gated
+  metadata refresh that advances the fingerprint only when the live Tantivy index
+  is provably equivalent (breaking the loop) and safely no-ops otherwise (never
+  masking real staleness).
+
+- **[#369](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/369)
+  -- clearer doctor diagnostic for the oversized-leaf FTS shadow**
+  ([`99fb72d4`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/99fb72d4)),
+  and the genuine engine fix (a multi-leaf FTS5 segment writer that partitions an
+  oversized flush across leaves) implemented + tested in frankensqlite (branch
+  `fts5-multileaf-cass369`, commit `30d31d51`), pending a dependency re-pin.
+
+### Added (observability)
+
+- **Half-built canonical FTS shadow surfaced in `status`/`index --json`** (zn1xn
+  F5,
+  [`ee39e37f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ee39e37f)):
+  a skipped/failed derived fallback-FTS repair records a durable marker exposed
+  additively under `/index/fallback_fts_repair`, so agents see a half-rebuilt
+  shadow immediately rather than only when doctor's next parity check catches it.
+
+- **Persistent lexical-repair deferral streak surfaced** (zn1xn F4,
+  [`3ac90b85`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/3ac90b85)):
+  a consecutive-deferral counter + reason under `/index/lexical_repair_deferred`,
+  exposing the recurring full-rebuild amplification that was previously only a
+  stderr warn.
+
+- **Memory-pressure attribution in ingest poison records**
+  ([#364](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/364),
+  [`83346cc4`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/83346cc4)):
+  a quarantine now records whether it was genuine host pressure vs a
+  precautionary large-conversation quarantine.
+
+### Investigated / tracked
+
+- **[#345](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/345)**
+  (FTS dry-run content faults) and
+  **[#349](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/349)**
+  (base-schema migration OOM on legacy internal-content `fts_messages`) are
+  documented with precise findings: both need frankensqlite enhancements
+  (index-only rowid projection; bounded WITHOUT-ROWID teardown) -- the same class
+  as #368 defect 3. #364's chunked single-conversation ingest core (a perf
+  optimization; the conversation is already indexed via a deferred rebuild) has a
+  full implementation design on its tracking bead.
+
+---
+
+## [v0.6.23] -- 2026-07-30
+
+**Everything landed in the 128 commits between the [v0.6.22 GitHub
+Release](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.6.22)
+(2026-07-06) and 2026-07-30: a hybrid semantic search subsystem plus
+operations/incident observability, two connector expansions (Grok Build;
+current Kimi Code + Oh My Pi), a late-July GitHub-issue triage wave (37
+issues closed in the window), the first half of the
+[#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368)
+FTS5 corruption-opacity defects, and a pinned-dependency wave
+(frankensqlite `62a58ee3` hotfix, franken-agent-detection `1557300b`,
+frankensearch `ad8e29ea`, asupersync `=0.3.9`). Shipping this as a release
+binary also unblocks
+[#352](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/352),
+which was open only because the resumable fast-backfill fix (#348) existed
+solely on `main`. 61 tracked workstreams were closed in
+`.beads/issues.jsonl` over the same window.**
+
+### Added
+
+- **Grok Build (xAI's official `grok` coding CLI) is now a covered connector**
+  (#328). Detection was already scaffolded; the parser + factory land via
+  `franken-agent-detection` 0.1.10 (`6d24c532`). Sessions under
+  `$GROK_HOME/sessions/<percent-encoded-cwd>/<session-uuid>/` are read from
+  `updates.jsonl` — the ACP session-update stream the CLI's own docs call the
+  authoritative conversation log — with `summary.json` supplying title,
+  workspace (`info.cwd`), timestamps, and model, and `chat_history.jsonl`
+  serving as a fallback so real user prompts still index when every model
+  call in a session failed. Streaming chunk kinds coalesce, `tool_call` /
+  `tool_call_update` events become tool messages with structured
+  invocations, and unknown update kinds are skipped tolerantly. Registered
+  end-to-end: connector factory, watch-root `ConnectorKind` (`gk`), source
+  discovery/raw-mirror coverage, and the `capabilities --json` inventory
+  (now 23 connectors).
+
+- **Current Kimi Code layout + Oh My Pi coverage**
+  ([#351](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/351);
+  commits
+  [`71aefb7e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/71aefb7e),
+  [`8c01f50c`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8c01f50c)).
+  The Kimi connector now reads the modern `$KIMI_CODE_HOME` (default
+  `~/.kimi-code`) tree — `sessions/<workDirKey>/<sessionId>/state.json`
+  plus per-agent `agents/<agentId>/wire.jsonl` transcripts with the new
+  event envelope (prompt-echo dedup, `tool.result` folded onto the
+  originating call, collision-free `<sessionId>:<agentId>` sub-agent IDs) —
+  while legacy `~/.kimi` behavior is preserved verbatim. Oh My Pi (`omp`)
+  surfaces in the pi_agent connector: `.omp/agent` probe roots plus
+  per-session sub-agent transcripts. Fresh-eyes hardening in the final
+  `1557300b` pin: canonical scan-root dedup for symlinked `~/.kimi` →
+  `~/.kimi-code`, `KIMI_CODE_HOME` override replaces (not prepends) the
+  default roots, and out-of-order/duplicate tool results surface as
+  standalone tool messages instead of dropping.
+
+- **Lightweight semantic + hybrid search subsystem with trust-scored
+  reranking** (commit
+  [`31f8c14b`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/31f8c14b)).
+  Embedders behind an `embedder_registry` (FNV-1a feature hashing as an
+  explicit degraded mode, pure-Rust native MiniLM), pure-Rust cross-encoder
+  reranking with RRF-style fusion, and trust scoring/correlation weighting
+  results, with storage-integrity and contention diagnostics keeping the
+  vector path safe.
+
+- **Analytics, operations dashboard, and guided-ops observability** (commit
+  [`ebc181ae`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ebc181ae)).
+  Operator-facing analytics (derive/query/types), the operations dashboard
+  and pages bundle/wizard, and the daemon/indexer/storage plumbing behind
+  them, gated by e2e contracts (onboarding, lessons, guided-ops golden,
+  operations-dashboard contract, bounded quarantine-retry, robot-json).
+
+- **Incident discovery, classification, and redaction for support bundles**
+  (commits
+  [`48c5ee78`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/48c5ee78),
+  [`3699aca3`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/3699aca3),
+  [`ee78f33d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ee78f33d)).
+  Raw session evidence is classified into incident categories and passed
+  through a redaction policy/manifest before it leaves the process, archive
+  discovery and replay are hard-bounded, and the top incident-bearing
+  sessions are summarized for the bundle.
+
+- **Immutable, schema-versioned semantic generation manifests with atomic
+  pointer publish** (commit
+  [`7009b076`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/7009b076)).
+  Generations persist under `generations/<id>/` and are never mutated after
+  publish; `current.json` swaps only after the target generation's manifest
+  validates, so a restarted consumer resolves exact, digest-verified
+  artifacts instead of conventional vector filenames — and serving consumes
+  the exact FSVI artifacts (commit
+  [`e6198947`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e6198947)).
+
+- **Additive budget-envelope metadata on robot payloads** (commit
+  [`e1ad3575`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e1ad3575)):
+  optional top-level `budget` accounting (token/row/time) that existing
+  consumers ignore and budget-aware clients read.
+
+- **`cass sessions --since`, and crash-orphaned lexical staging dirs are
+  reclaimed at startup**
+  ([#324](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/324);
+  commit
+  [`4fddb21f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/4fddb21f)
+  — one crash loop had leaked 410 GB of `cass-lexical-*` staging overnight).
+  `cass sessions --limit` also stays off the full-scan path via an
+  `INDEXED BY` hint
+  ([#323](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/323);
+  commit
+  [`46ccb036`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/46ccb036)).
+
+- **`cass doctor` full-verify mode for the raw-mirror integrity check**
+  (commit
+  [`d6c2093e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d6c2093e)),
+  and **encrypted-archive KDF parameter / key-slot validation on decrypt**
+  (commit
+  [`5a679b02`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5a679b02)).
+
+### Changed
+
+- **FrankenSQLite is pinned to the FTS5 overlong-term hotfix branch**
+  `fts5-overlong-hotfix-cass362` @ `62a58ee3` (`0.1.19`), closing
+  [#362](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/362)
+  (commit
+  [`19b664d2`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/19b664d2)):
+  terms over 1024 bytes are skipped at a shared capped tokenizer factory —
+  a 91,548-byte token (normal data in coding-agent corpora) previously
+  corrupted the `%_data` segment write and blocked every repair path,
+  including from-scratch rebuilds; the porter stemmer passes >64-byte
+  tokens through unstemmed; and a failed pending-flush is a hard error
+  instead of silently writing an empty structure row. Pin journey inside
+  this window: `=0.1.13` → `=0.1.18` (commit
+  [`aa92a453`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/aa92a453))
+  → crates.io family (commit
+  [`3abf6165`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/3abf6165))
+  → the git hotfix pin, because upstream main has moved to an async-first
+  API and the full forward bump is a separate validated pass.
+
+- **franken-agent-detection advanced to `1557300b`** (0.1.10): `6d24c532`
+  (Grok Build parser/factory, commit
+  [`aa92a453`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/aa92a453))
+  → `f7f38440` (OpenCode remote-root scan isolation, so local
+  `opencode.db` sessions are no longer double-tagged under configured
+  remote SSH sources —
+  [#357](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/357);
+  commit
+  [`e2151f95`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e2151f95))
+  → `1a258873` (Kimi Code / Oh My Pi, commit
+  [`71aefb7e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/71aefb7e))
+  → `1557300b` (fresh-eyes hardening, commit
+  [`8c01f50c`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8c01f50c)).
+
+- **frankensearch pinned to `ad8e29ea`** with the explicit
+  `lexical_tantivy` CASS compatibility surface and cancellation-safe facade
+  opening (commits
+  [`e6198947`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e6198947),
+  [`b976d49d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/b976d49d)
+  — the latter also enforces exact dependency and daemon identity
+  contracts).
+
+- **asupersync `=0.3.5` → `=0.3.9`** (commits
+  [`047f70a4`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/047f70a4),
+  [`aa92a453`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/aa92a453)).
+
+- **Release engineering**: simplified per-target release matrix and
+  installer version/artifact handling (commit
+  [`f83da705`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f83da705));
+  the fresh-clone CI guard rejects only sibling-path `[patch]` overrides,
+  so the checked-in hotfix pins build from a clean clone
+  ([#361](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/361) /
+  [#365](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/365);
+  commit
+  [`472983c2`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/472983c2)).
+
+### Fixed
+
+- **`cass forget --robot` and `cass upgrade` parse again, and no longer sit
+  in the typo-attractor net**
+  ([#367](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/367);
+  commits
+  [`d62bb6a5`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d62bb6a5),
+  [`d887ae20`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d887ae20)).
+  `forget`/`upgrade` joined `CANONICAL_TOP_LEVEL_COMMANDS` — the list is
+  now pinned to the clap tree in both directions — and side-effect commands
+  are matched exactly only: the Levenshtein-2 net had made `cass format`
+  hard-fail on `forget`'s required `--source-glob` and made `cass parade`
+  silently *execute* the upgrade release-check.
+
+- **cass dies quietly on stdout EPIPE**
+  ([#356](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/356);
+  commit
+  [`87a39572`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/87a39572))
+  via the default SIGPIPE disposition — an early-exiting pipe consumer no
+  longer produces a SIGABRT and a macOS crash report.
+
+- **Watch-once no longer quarantines a session on a false OOM**
+  ([#364](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/364),
+  the quarantine-poisoning half; commit
+  [`ef7e2595`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ef7e2595)):
+  an ingest `NoMem` while the host reports ample memory now defers instead
+  of quarantining the session. The issue stays open for its remaining half.
+
+- **Stall-watchdog liveness across the ingest → staged-shard-build
+  hand-off**
+  ([#366](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/366)
+  and the watchdog half of
+  [#359](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/359);
+  mitigates #329/#345; commits
+  [`368467d6`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/368467d6),
+  [`8b42750a`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8b42750a)).
+  `cass index --full --force-rebuild` on a large corpus no longer aborts
+  (exit 70) in a legitimate hand-off window; park-site flapping between
+  waiting states no longer resets the stall clock; and an optional FTS
+  repair failure no longer fails a completed `index --full`.
+
+- **Truthful deferral verdicts for large archives**
+  ([#359](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/359);
+  commit
+  [`5fb24973`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5fb24973)).
+  Plain `cass index` now states when it deferred the authoritative lexical
+  rebuild and names `cass index --full` as the completing command, and the
+  `checkpoint_incomplete` hint is size-aware instead of recommending the
+  exact command that defers again. "index completed" is also no longer
+  printed after a failed run (commit
+  [`8b42750a`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8b42750a)).
+
+- **`cass sources add` merges `--preset` with explicit `--path` instead of
+  silently dropping the custom paths**
+  ([#358](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/358)),
+  and **doctor flags a queryable-but-partial canonical FTS shadow
+  (PartialParity) instead of passing it**
+  ([#355](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/355))
+  — commit
+  [`2c85eeaf`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/2c85eeaf),
+  with the parity warning noting that small drift during an active index
+  run is transient (commit
+  [`8b42750a`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8b42750a)).
+
+- **First half of the #368 FTS5-corruption failure chain**
+  ([#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368),
+  defects 1 and 4 of 4; commit
+  [`d887ae20`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d887ae20)).
+  Every fingerprint-failure render site now formats the full `anyhow` chain
+  with `{err:#}`, so the root cause (`fts5: corrupt %_data record ...`) is
+  no longer swallowed by the outer "opening readonly storage" context. A
+  `doctor --fix` that crashed mid-repair now self-heals its stale
+  mutation-lock state — evidence-gated (flock acquirable *and* heartbeat
+  beyond a 24 h bound), markers moved (never deleted) into
+  `doctor/reclaimed/<ts>-stale-repair-state/` with a `receipt.json` — where
+  it previously left a 9-day dead end with no way out. And the new
+  `DoctorFtsTableState::ShadowCorrupt` classification warns on a queryable
+  `fts_messages` whose docsize shadow cannot be counted instead of passing
+  with the error buried. Defects 2–3 remain open.
+
+- **Resumed semantic candidate selection remains bounded across sparse parent
+  gaps** (#348). Resume scans now stream eligible rows once from the canonical
+  global message cursor and retain only the smallest bounded set of
+  conversation IDs. This removes thousands of per-parent probes (and their
+  multi-gigabyte allocator growth) while preserving exact ascending
+  conversation checkpoint order even when message IDs arrive out of order.
+  A 6,668-parent-gap regression proves bounded row visits, memory, and time.
+
+- **Semantic CLI searches discover an already-running embedding daemon by
+  default without eagerly loading a local model** (#347). Explicit `--daemon`
+  additionally permits auto-spawn, while `--no-daemon` keeps direct local
+  inference. The local quality embedder is lazy and only initializes on daemon
+  fallback. Every daemon response must identify the embedder that owns the
+  active vector index, and fast-only mode is pinned to the hash vector space,
+  so a same-width but incompatible vector can never silently contaminate an
+  index.
+
+- **Large-archive doctor inventory and raw-mirror accounting are streaming and
+  bounded** (#330). Source inventory aggregation now happens in bounded Rust
+  maps over one-row metadata streams instead of a FrankenSQLite
+  `GROUP BY`/`ORDER BY` materialization. Raw-mirror message counts use one
+  narrow composite-index stream (or one legacy table-scan fallback) instead of
+  a correlated full message scan per conversation. Plan regressions forbid
+  temporary sorters and verify exact counts on sparse fixtures.
+
+- **`daily_stats` recovery no longer attempts an archive-sized packet rebuild
+  before its nominal fallback** (#329). Production now has one authoritative,
+  failure-atomic staging rebuild. Canonical messages are read through one
+  prepared, row-streaming composite-index scan, with bounded pages, explicit
+  phase/cursor diagnostics, retry shrinkage on memory pressure, and exact,
+  idempotent publication. Packet projection remains test-only as an oracle.
+
+- **Canonical FTS doctor repair now scales to multi-million-message archives**
+  (#345). Exact dry-run parity is classified from canonical, indexed, and
+  intersection cardinalities using fused composite-index parent-run counts and
+  a single shadow-driven primary-key probe stream instead of repeatedly
+  rescanning 4,096-row keyset pages or retaining the complete shadow rowid
+  domain. The FrankenSQLite
+  pin was advanced to 0.1.18 (superseded later in this same release by the
+  `62a58ee3` hotfix pin — see *Changed*), whose fused composite-index equality-run
+  counter supplies the bounded canonical count and whose bounded clean-page
+  reclamation prevents the false `OutOfMemory` failure observed while creating
+  an absent FTS shadow inside a 24 GiB cgroup. Failure-atomic publication and
+  canonical-row preservation are unchanged.
+
+- **`cass status --json` no longer synthesizes `storage_state: "ok"` from
+  openability alone** (#331). When the only probe that ran is `db_open`, the
+  lightweight readiness surfaces (`status --json`, `search --robot-meta`) now
+  report the honest `storage_state: "unchecked"` / `source_of_truth_risk:
+  "unknown"` with an explicit `checks_not_attempted: [quick_check]` entry.
+  `ok` is reserved for real structural evidence: the doctor's completed
+  integrity probe now persists a fingerprinted attestation
+  (`integrity_attestation.json`, keyed on db+WAL size/mtime, 7-day TTL) that
+  status projects with `attestation_source: "cached"` — including a cached
+  FAIL, which projects `integrity_failed`/`high`, gates top-level
+  `healthy: false`, and adds an explicit recovery warning, so a
+  quick_check-provable corrupted archive can no longer read as healthy just
+  because it still opens.
+
+- **`cass index --full` no longer emits false `stall_detected` events during
+  active parsing, and progress ETAs no longer regress as discovery expands
+  the total** (#332). The stall watchdog now watches a monotonic
+  work-liveness tick (`activity`: parsed conversations on the producer side,
+  received/persisted batches and chunks on the consumer side) in addition to
+  the published `current` counter, so a long parse of one large source
+  artifact between coarse batch publications is forward progress, not a
+  stall. Progress snapshots additionally carry `unit` (connectors /
+  conversations / messages / vectors per phase) and `total_is_final`;
+  `eta_seconds` is suppressed while `total` is still a lazily expanding
+  "discovered so far" count instead of regressing by hours.
+
+- **Semantic rebuilds are failure-atomic, and the index → embed hand-off no
+  longer deadlocks (fastembed) or panics (hash)**
+  ([#333](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/333);
+  commit
+  [`486801f9`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/486801f9)
+  — the same commit fixed the macOS daemon-socket refusal on the symlinked
+  `/tmp` → `/private/tmp` parent,
+  [#346](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/346)).
+  Semantic rebuild progress is reported
+  ([#342](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/342);
+  commit
+  [`93401d54`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/93401d54)),
+  and resumed semantic selection is bounded
+  ([#343](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/343);
+  commit
+  [`75e66a17`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/75e66a17),
+  completed by the #348 work above).
+
+- **Canonical FTS repair is resumable and failure-atomic**
+  ([#344](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/344);
+  commit
+  [`77c16b07`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/77c16b07)).
+  The same change gives `doctor --rebuild-canonical-fts --dry-run`
+  unconditional precedence over `--yes` — the non-mutating preview that
+  [#354](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/354)
+  reported as missing.
+
+- **Connector regressions**: Gemini CLI's current `session-*.jsonl`
+  sessions ingest again
+  ([#341](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/341);
+  commit
+  [`11900a44`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/11900a44));
+  the Codex connector preserves modern `function_call` arguments in
+  searchable content
+  ([#339](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/339);
+  commit
+  [`8eb80495`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8eb80495));
+  mutable watch-once semantic artifacts reconcile
+  ([#336](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/336);
+  commit
+  [`af95327b`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/af95327b));
+  guide planner aliases are disambiguated
+  ([#337](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/337);
+  commit
+  [`84d71f25`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/84d71f25)).
+
+- **Early-window indexer reliability**: the post-publish WAL checkpoint is
+  no longer killed as a finalize wedge
+  ([#319](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/319) /
+  [#321](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/321);
+  commit
+  [`e4360670`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e4360670));
+  a corrupt derived fallback-FTS after a successful full index run is
+  non-fatal
+  ([#327](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/327);
+  commit
+  [`8110944f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8110944f));
+  deferred-checkpoint mode uses the bounded bulk-import WAL cadence instead
+  of disabling autocheckpoint (commit
+  [`968a5f3c`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/968a5f3c)).
+
+- **Storage/doctor/fleet batch (2026-07-22)**: embedder verification,
+  quality-eval sanitization, and FTS5 duplicate recovery (commit
+  [`78d25b7f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/78d25b7f));
+  the daemon reconciles the semantic index with canonical messages (commit
+  [`ada71e79`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ada71e79));
+  `daily_stats` rebuild stays bounded (commit
+  [`51ca7e9f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/51ca7e9f));
+  sources-doctor assesses local storage without mutating the source path
+  (commit
+  [`34676c12`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/34676c12))
+  and prefers preservation evidence over the generic unreadable-path signal
+  (commit
+  [`a5edfe67`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/a5edfe67));
+  fleet doctor state stays truthful (commit
+  [`52e03506`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/52e03506))
+  and unsuccessful upgrade rehearsals fail (commit
+  [`28c92ca1`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/28c92ca1));
+  repro emits a runnable, share-safe rerun contract (commit
+  [`82927dfc`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/82927dfc)).
+
+- **Test-infrastructure and pinned-dependency fallout**: frankensqlite VFS
+  namespace lock sidecars (`-fsqlite-ns-gate` / `-fsqlite-ns-use`) are
+  never treated as historical bundles in salvage (commit
+  [`d3adf9da`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d3adf9da))
+  and are skipped by the archive-export / support-bundle manifest walkers
+  and candidate promotion (commit
+  [`d887ae20`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d887ae20));
+  pre-existing lib-suite breakage was repaired so `main` is green (commit
+  [`a37c9069`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/a37c9069));
+  introspect golden coverage is bound to the executable matrix (commit
+  [`fdf28d22`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/fdf28d22));
+  compatibility and manifest proofs were hardened (commit
+  [`9d02210c`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/9d02210c));
+  and the E2E suite binds strict-RCH evidence to immutable runs (commits
+  [`78ea1ecb`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/78ea1ecb),
+  [`29b87cd6`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/29b87cd6)),
+  isolates child-process environments (commit
+  [`704a49f1`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/704a49f1)),
+  and bounds semantic trace artifacts (commit
+  [`aefd6357`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/aefd6357)).
+
+> **Still open after this release**:
+> [#329](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/329)
+> (daily_stats RSS on a 967k-message corpus),
+> [#345](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/345)
+> (dry-run cost on a large partial shadow),
+> [#349](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/349) /
+> [#350](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/350)
+> (macOS migration OOM / watch-once scan breadth),
+> [#353](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/353)
+> (status/search fingerprint disagreement — circular mechanism analyzed and
+> an equivalence-gated repair designed on the tracker), the remaining half
+> of
+> [#364](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/364),
+> and defects 2–3 of
+> [#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368).
+
+## [v0.6.20] -- 2026-06-30
+
+**Linux x86-64 reliability release: a pure-Rust embedder backend (no more
+ONNX runtime), two indexer fixes for watch-mode and large-batch memory, the
+`cass upgrade` installer-asset repair, and the modern-Codex transcript fix
+via a `franken-agent-detection` bump.**
+
+### Changed
+
+- **Dropped the ONNX runtime / fastembed stack for a pure-Rust native
+  embedder + reranker** (commit
+  [`82547d35`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/82547d35), #308). The default MiniLM
+  quality-tier embedder no longer depends on `onnxruntime`, which on Linux
+  x86-64 (AVX2) failed with `LayerNormalization ... GetElementType is not
+  implemented` and embedded 0 docs → stall-abort exit 70. A single binary now
+  serves all x86_64 (the `-baseline` AVX split is obsolete).
+
+### Fixed
+
+- **`cass index --watch` deterministic exit-70 crash-loop** (commit
+  [`345f1ccc`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/345f1ccc), #311). The F4 stall
+  watchdog's #297 finalize-wedge abort fired on a `--watch` daemon's normal
+  quiescent idle (phase 0, `current >= total`, pipeline quiescent), exiting 70
+  every ~300s. The watchdog is now watch-aware: that resting state is treated
+  as healthy idle in watch mode, while genuine phase-2 wedges (and the oneshot
+  post-publish wedge #297 was written for) are still detected and aborted.
+- **`cass models backfill --tier quality` memory-blowup / CPU-spin** (commit
+  [`345f1ccc`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/345f1ccc), #309). Fixed-128-row
+  embed batches padded every row to the longest member, so one long message
+  inflated the padded tensor to multiple GB. Length-aware batching now caps
+  both row count and `row_count × max_canonical_len` (default 16 KiB, env
+  `CASS_SEMANTIC_EMBED_BATCH_CHAR_BUDGET`), order-preserving and embedder-agnostic.
+- **`cass upgrade` 404** (#310). The v0.6.18/v0.6.19 GitHub Releases were
+  missing the installer assets the self-updater fetches; they were restored
+  (`install.sh`/`install.ps1` + `SHA256SUMS` rows) and verified end-to-end.
+  Future releases go through the canonical `release.yml`, which attaches them.
+- **Modern Codex transcripts** via **`franken-agent-detection` 0.1.8 → 0.1.9**
+  (commit [`c60943e7`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/c60943e7), upstream #13). The
+  Codex connector now captures modern `output_text` assistant messages and
+  `response_item` tool calls/outputs that were previously dropped.
+
+## [v0.6.9] -- 2026-05-30
+
+**Two correctness fixes uncovered by a fresh-eyes review of the v0.6.7
+watchdog: ARM memory-ordering soundness + lock-file write-race against
+the heartbeat thread.**
+
+### Fixed
+
+- **ARM (AArch64) memory-ordering soundness for watchdog state
+  observation** (commit [`f20e6497`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f20e6497), INV2). The v0.6.7
+  `WatchStartupPreflightState::enter` wrote `current_step_idx` first
+  (Relaxed) then `step_started_at_ms` (Relaxed). On ARM's
+  weakly-ordered memory model — production targets
+  `aarch64-unknown-linux-gnu` and `aarch64-apple-darwin` — the watchdog
+  thread could observe these two Relaxed stores out of order: new
+  `step_idx` with stale `step_started_at_ms == 0`, computing
+  `elapsed_ms = now_ms - 0 ≈ 1.7×10¹² ms`, exceeding any timeout, and
+  firing a spurious `_TIMEOUT` on the very first poll tick after step
+  entry. Fix: write `step_started_at_ms` first (Relaxed), then
+  `current_step_idx` with `Release` ordering; watchdog loads
+  `current_step_idx` with `Acquire`. The Release-Acquire pair
+  establishes happens-before so the subsequent `step_started_at_ms`
+  load sees the value written before the Release store.
+
+- **Watchdog `_TIMEOUT` breadcrumb no longer silently overwritten by
+  the heartbeat thread** (same commit, INV3). The v0.6.7
+  `rewrite_lock_phase_for_timeout` did NOT hold
+  `metadata_write_lock` during its lock-file rewrite, so a heartbeat
+  tick interleaving between the watchdog's `set_len(0)`/write and the
+  process exit could overwrite the `_TIMEOUT` breadcrumb with the
+  prior-phase content. Operators reading `cass health --json` after
+  the abort would see no `_TIMEOUT` suffix, defeating the diagnostic
+  feature. Fix: watchdog now acquires `metadata_write_lock` for the
+  duration of the rewrite. Regression test:
+  `watchdog_timeout_rewrite_serialised_by_metadata_write_lock`.
+
+### Notes
+
+- Same fresh-eyes-review meta-pattern as v0.6.5 (#256 partial fix) and
+  v0.6.8 (cross-surface accumulator storm). Each pass keeps finding
+  real bugs. Recommend continuing the review-pass discipline.
+- v0.6.7 and v0.6.8 BOTH ship the ARM bug. v0.6.9 is recommended for
+  all users; v0.6.7/v0.6.8 should be yanked from crates.io after
+  v0.6.9 confirms green on the prebuilt-binary smoke tests.
+
+## [v0.6.8] -- 2026-05-30
+
+**Cross-surface retry-storm fix uncovered by a fresh-eyes review of the
+v0.6.7 legacy quarantine retry (`is_version_stale_for_retry`).**
+
+### Fixed
+
+- **Stale-poison version accumulator no longer false-positives when one
+  surface stamps `cass_version_at_quarantine = current_version` but the
+  other surface's save fails** (commit [`7510d6c1`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/7510d6c1)). The v0.6.7 retry
+  logic checked each surface independently — if `mark_stale_index_ingest_jsonl_retry_attempted`
+  succeeded (stamped JSONL with current_version) but
+  `mark_stale_index_ingest_structured_retry_attempted` failed at the
+  structured-state save step (disk full / permissions / etc.), the next
+  scan would see:
+  - JSONL: `cass_version_at_quarantine == current_version` → no-op
+  - Structured: `cass_version_at_quarantine == None` → "legacy, retry
+    eligible"
+  And retrigger a full quarantine scan every single run forever.
+
+  Fix: `StalePoisonVersionAccumulator` gains an `already_current_keys:
+  BTreeSet<(String, i64)>` cross-surface dedup. When ANY surface observes
+  `cass_version == current_version` for a key, the key is added to
+  `already_current_keys` and removed from `stale_keys`/`legacy_keys`.
+  Order-independent: the final state is always "not stale" if any surface
+  says current, regardless of observation order.
+
+  Regression test:
+  `cross_surface_current_version_suppresses_legacy_structured_entry`.
+
+### Notes
+
+- The bug shape is the exact same as the inert-#258-writer the FIRST
+  fresh-eyes review caught (and as #256's partial-fix that the third
+  review caught). Each fresh-eyes pass continues to yield real defects.
+
+## [v0.6.7] -- 2026-05-30
+
+**watch_startup wedge hardening + legacy quarantine retry. Closes [cass#258
+ask #5](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/258) (legacy quarantine entries) and ships the user-facing defensive
+infrastructure that v0.6.6 set up via the sub-phase taxonomy. Reporter of
+[cass#265](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/265) can unblock today via `CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1`.**
+
+### Fixed
+
+- **Legacy v0.5.1-era `index-ingest-out-of-memory` quarantine entries are
+  now retry-eligible** (commit [`e5898858`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e5898858)). Pre-v0.6.x quarantine
+  entries have `attempt_count=1` but LACK the `cass_version_at_quarantine`
+  field, so the v0.6.x retry gate silently skipped them — they remained
+  quarantined forever even after the underlying v0.5.x ingest-OOM bug was
+  fixed. Read-side fix: `QuarantineRecord::is_version_stale_for_retry`
+  returns `true` for `None` (legacy entries pre-date the bug-fix the gate
+  is gated on, so retry is the right default). Regression test:
+  `legacy_entry_missing_cass_version_deserialises_and_is_retry_eligible`.
+
+### Added
+
+- **Per-op `watch_startup` preflight watchdog with skip env vars** (commit
+  [`5348ff2a`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5348ff2a), 733 insertions). Each of the 14 documented preflight sub-phases
+  now arms a watchdog at entry (`state.enter(step_idx, now_ms)`) and
+  disarms at exit (`state.exit()`). Default timeout
+  `CASS_PREFLIGHT_OP_TIMEOUT_SECS=180` (clamp `[1, 3600]`). When the
+  watchdog fires:
+  - The lock file's `phase=` breadcrumb is rewritten to
+    `watch_startup:<step>_TIMEOUT` (so operators see exactly which step
+    wedged).
+  - All other lock fields (pid, started_at_ms, db_path, mode, job_id,
+    job_kind) are preserved verbatim.
+  - The process exits with a clear error message.
+- **Per-op skip env vars** for the four wedge-candidate operations
+  (`CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1`,
+  `CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES=1`,
+  `CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES=1`,
+  `CASS_SKIP_PREFLIGHT_PUBLISHED_INDEX_VALIDATE=1`). Operators on cass#265
+  can set the relevant variable as a workaround while the underlying
+  fsqlite issue is rooted out. The reporter's empirical evidence points
+  most strongly at `cleanup_orphan_fk_rows`.
+- Regression test
+  `watch_startup_preflight_watchdog_fires_on_wedged_step` simulates a
+  wedge by calling `state.enter` and never exiting; asserts within 750 ms
+  that `state.tripped == true`, the lock-file `phase=` is rewritten to
+  the `*_TIMEOUT` form, and all other fields are preserved.
+
+### Recommended diagnostic workflow for cass#265
+
+If you're hitting the `watch_startup` wedge:
+
+1. Upgrade to v0.6.7.
+2. Re-run `cass index --watch`.
+3. If it still wedges, the watchdog will exit at +180s with the wedged
+   step in the error message and in the lock file's `phase=` breadcrumb.
+4. Set the corresponding `CASS_SKIP_PREFLIGHT_<NAME>=1` env var as a
+   workaround.
+5. Report the wedged step on [cass#265](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/265) so the underlying fsqlite issue
+   can be narrowed.
+
+### Notes
+
+- v0.6.7 ships diagnostic infrastructure + workarounds, NOT a root-cause
+  fix to the underlying fsqlite wedge. The root cause is most likely a
+  multi-level B-tree forward-scan path in fsqlite that the
+  `cleanup_orphan_fk_rows` SQL query triggers; the actual fix lives in
+  frankensqlite and will land in a future fsqlite release + cass repin.
+
+## [v0.6.6] -- 2026-05-29
+
+**Investigation-cluster release for [cass#265](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/265) (`watch_startup` wedge persists). Adds the sub-phase
+breadcrumb taxonomy needed to narrow the wedge down from "preflight"
+(14 operations) to a specific step. Diagnostic-only; v0.6.7 ships the
+operator-facing workarounds.**
+
+### Added
+
+- **`WATCH_STARTUP_SUB_PHASE_TAXONOMY`** — 14 documented preflight
+  sub-phase strings (commit [`fad3f03d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/fad3f03d)). Each preflight operation now
+  calls `set_phase(WatchStartup::SubPhase::*)` so the on-disk lock
+  file's `phase=` breadcrumb reflects which step is currently
+  executing. Operator visibility into the 14-step preflight block
+  (previously all reported as `phase=watch_startup`).
+- Regression test
+  `watch_startup_sub_phase_taxonomy_is_documented_and_stable` pins the
+  14 strings as a public operator contract.
+- Regression test `set_phase_writes_sub_phase_breadcrumb_and_bumps_progress`
+  exercises the new `set_phase` writer through `acquire_index_run_lock`
+  and asserts on-disk `phase=` updates, `mode=` invariance,
+  strict-monotonic `last_progress_at_ms`, and atomic-mirror consistency.
+
+### Notes
+
+- v0.6.6 ships the diagnostic infrastructure only. The reporter of
+  [cass#265](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/265)
+  needed to re-run cass against their corpus and share the
+  `phase=watch_startup:<step>` string at +150s. v0.6.7 (this is the
+  v0.6.7 entry below — read up) supersedes the manual workflow with
+  an automated watchdog that fails fast at the wedged step.
+
+## [v0.6.5] -- 2026-05-28
+
+**Definitive close-out of cass#256 via a feature-gated `semantic` build, plus the cass#258 follow-on liveness work that v0.6.4's `last_progress_at_ms` plumbing left half-done.**
+
+### Pre-AVX2 Windows + Linux baseline binaries (cass#256 — fully closed)
+
+v0.6.3 added `RUSTFLAGS=-C target-cpu=x86-64-v2` as a defense-in-depth measure for the Windows release codegen. v0.6.4's CHANGELOG correction acknowledged that this was *necessary but not sufficient*: the `fastembed` crate enables `ort-download-binaries-rustls-tls`, which links prebuilt Microsoft ONNX Runtime binaries that already carry AVX/AVX2/FMA-dispatched code. `RUSTFLAGS` only constrains `rustc`'s own codegen and cannot reach object code linked from a vendor prebuilt, so `cass --version` continued to die with `STATUS_ILLEGAL_INSTRUCTION` (`0xC000001D`) on Ivy Bridge hardware (confirmed by reporter @Dlows-Vibe on an i7-3770K). v0.6.5 closes this for good.
+
+- **New `semantic` Cargo feature ([`d9b98126`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d9b98126)).** `fastembed` is now `optional = true`, and the `frankensqlite/fastembed-reranker` re-pull is gated behind the same flag. The umbrella feature is declared as `semantic = ["dep:fastembed", "frankensearch/fastembed-reranker"]` and is included in `default = ["qr", "encryption", "semantic"]`, so the default `cargo build` / `cargo install` path is byte-for-byte equivalent to v0.6.4 and existing users see no behavioural change. Disabling the feature (`--no-default-features --features qr,encryption`) drops the entire ONNX Runtime stack from the link line, including the AVX2-dispatched prebuilt objects.
+- **Two new baseline-build release artifacts.** The release workflow now produces `cass-windows-amd64-baseline.zip` and `cass-linux-amd64-baseline.tar.gz` alongside the regular artifacts. Both are built with `--no-default-features --features qr,encryption` and have an end-to-end smoke test in CI that asserts `cass --version` runs cleanly on the GitHub-hosted runner. They ship with the same `.sig`/`.crt`/`.sha256` sidecars as every other artifact. Hard-float / SSE2-baseline amd64 hardware (Sandy Bridge, Ivy Bridge, pre-Excavator AMD) can run these binaries; everything except `cass search --mode semantic`, `cass index --backfill quality`, and the embedding-tier maintenance paths continues to work.
+- **install.sh / install.ps1 runtime AVX2 detection ([`fb75daab`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/fb75daab)).** Both installers now probe the host for AVX2 before choosing an asset. On Linux they read `/proc/cpuinfo`; on Windows-under-MSYS they prefer real CPU flags, then fall back to `wmic cpu get name` / `Get-CimInstance Win32_Processor` model-name heuristics and `Avx2.IsSupported` via PowerShell .NET intrinsics; on ARM/macOS they keep the canonical artifact name. When AVX2 is not detected, the installers pull the `-baseline` artifact automatically. `CASS_FORCE_BASELINE=1` forces the baseline selection on AVX2-capable hosts (useful for testing and for operators who do not need embeddings). A startup AVX2 self-check inside the binary itself remains gated to `semantic` builds so the baseline binary does not abort on pre-AVX2 hosts. JSON goldens were refreshed to reflect the new asset-list shape.
+
+The `RUSTFLAGS=-C target-cpu=x86-64-v2` pin on the canonical Windows build stays as defense-in-depth for the Rust-codegen layer.
+
+### `IndexRunLockGuard` atomic progress bump + ms-precision (cass#258 follow-on)
+
+v0.6.4 introduced the separate `last_progress_at_ms` lock-file field that distinguishes "the heartbeat is alive" from "the indexing thread is making forward progress". Field reports on long single-mode indexing runs surfaced a remaining false-positive: when the indexer was busy with a single multi-batch phase that does not trigger `write_metadata`/`set_mode` calls, `last_progress_at_ms` could stay frozen long enough for `cass health --robot` to flip to `status: "stalled"` even though the indexer was healthy and making batch-level progress.
+
+- **`IndexRunLockGuard::last_progress_at_ms_atomic: Arc<AtomicI64>` ([`397d0443`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/397d0443)).** A lock-free atomic now carries the canonical progress timestamp. The indexer calls a cheap `bump_progress()` after every batch (typed-source replay, embed batch, staging write, checkpoint save, publish), and the background `IndexRunLockHeartbeat` thread folds the in-memory atomic into the on-disk `last_progress_at_ms=` field on every refresh tick. The lock-file fold preserves the v0.6.4 invariant — only the indexer can advance `last_progress_at_ms`, the heartbeat just persists what the indexer already wrote in memory — but it eliminates the per-batch lock-file write cost. The result is that `cass status --json` now reports `last_progress_age_ms` on the order of single-digit milliseconds during normal indexing, instead of seconds-old timestamps that only refresh on phase boundaries.
+- **`now_ms` ms-precision plumbing through `InspectSearchAssetsInput`.** The maintenance coordination layer was downgrading the new ms-resolution timestamps to seconds before evaluating the stall threshold, which discarded most of the precision the atomic bump bought us. `InspectSearchAssetsInput` and `evaluate_maintenance_coordination` now thread `now_ms: i64` end-to-end, and the stall threshold comparison is fully ms-precision. Single-mode indexing runs on archives that exceed the v0.6.4 stall threshold no longer false-positive `stalled` in `cass health` / `cass status --json` / the search-side single-flight coordinator.
+
+### Other
+
+- The `## Unreleased` placeholder note added during v0.6.4 has been folded into this entry; the v0.6.3 entry's correction block remains in place as the historical record of the partial-fix → complete-fix transition for cass#256.
+
+## [v0.6.4] -- 2026-05-27
+
+**Critical fix: upstream frankensqlite BtCursor infinite-loop on multi-level B-trees (cass#259), bundled with the v0.6.3-era cass#258 stalled-status liveness work and the cass#257 quality semantic backfill telemetry that landed during the same window.**
+
+### BtCursor forward-progress on multi-level B-trees (cass#259)
+
+Bumped the `frankensqlite` / `fsqlite-types` pin from the published [`0.1.4`](https://crates.io/crates/fsqlite/0.1.4) release up to the newly published [`0.1.5`](https://crates.io/crates/fsqlite/0.1.5) crates.io release, switching back to the registry source (no more git rev pin in `Cargo.toml`; the `[patch.crates-io]` bridge that v0.6.3 carried as a temporary forward-progress hold for `fsqlite-types` is gone). `fsqlite` 0.1.5 contains the upstream [frankensqlite#95 BtCursor forward-progress fix](https://github.com/Dicklesworthstone/frankensqlite/issues/95): a `BtCursor` traversing a B-tree whose root page split into an interior + multiple leaf pages could re-enter the same leaf indefinitely because the cursor stack popped past the interior parent without advancing the parent's child-index cursor before re-descending. The visible symptom on cass was a `cass index` / `cass status --json` / `cass search` process pinning a single core at 100% with zero forward progress on any non-trivial archive (~100 MB+ SQLite DB, or ~50k+ conversations indexed) — the exact wedge profile @blueraz0r reported in #258 and that the v0.6.3 fsqlite 0.1.4 bump did *not* fully close. Reproduces deterministically on a v13 schema once the canonical conversations B-tree grows past its single-leaf-root size; reproducer notes are on the upstream issue. Operators who hit the v0.6.3 wedge should retest under v0.6.4 with no DB surgery required — the cursor fix is purely in the read path and does not require reindexing.
+
+### Forward-progress liveness for wedged rebuilds (cass#258)
+
+@blueraz0r's v0.6.2 [#258 watcher report](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/258) exposed a structural gap in cass's liveness signaling: a wedged indexer (one CPU-bound thread, all other workers parked) was reported as `status: "rebuilding", rebuild.active: true` for 4+ hours because the background `IndexRunLockHeartbeat` thread kept refreshing `index-run.lock`'s `updated_at_ms` field independently of whether the indexing thread was actually making progress. `cass health`, `cass status`, and the maintenance coordination layer all consumed `updated_at_ms` as their liveness signal and were therefore fooled. v0.6.3's fsqlite 0.1.4 bump is the strong candidate to fix the underlying spin (same upstream root cause as #254/#255 — see the v0.6.3 release notes), but the structural liveness gap is fixed here regardless so the next indexer wedge of this shape will no longer be silent.
+
+- **`IndexRunLockGuard` now writes a separate `last_progress_at_ms` field that ONLY the indexing thread updates** — on every `write_metadata`/`set_mode` call (mode/phase transitions the indexer itself initiates are, by definition, forward progress). The background heartbeat refreshes `updated_at_ms=` only and preserves `last_progress_at_ms=` verbatim. A new regression test (`heartbeat_preserves_last_progress_at_ms_field_for_stall_detection`) pins this invariant against future drift.
+- **`cass health --robot` and `cass status --json` now report `status: "stalled"`** (distinct from `"rebuilding"`) when the rebuild is nominally active but the indexing thread has been silent for longer than `CASS_REBUILD_STALL_DETECT_SECS` (default 120s, set to 0 to disable). The structured rebuild block also exposes `stalled: bool`, `last_progress_at` (RFC3339), and `last_progress_age_ms`. The `evaluate_maintenance_coordination` layer also degrades stalled snapshots to `Stale` so search-side single-flight callers route around wedged workers instead of attaching to them.
+- **`IndexStallWatchdog` no longer short-circuits on `phase_code == 0`.** The previous `if phase_code == 0 || ...` gate at the top of `IndexStallWatchdog::observe` was exactly why #258's watcher emitted zero `stall_detected` events during the 4 h wedge — `phase` never advanced past the Preparing pseudo-phase, so the watchdog stayed silent. The repeat guard `stall_reported_for_phase == Some(phase_code)` still prevents log spam from a single stalled phase. Regression test: `watchdog_fires_on_phase_zero_startup_wedge`.
+
+Tests: `tests/.../search::asset_state::tests::lexical_state_reports_stalled_when_progress_is_stale_despite_fresh_heartbeat`, `..._stays_building_when_progress_is_recent`, `..._does_not_stall_when_legacy_lock_omits_progress_field`, `..._coordination_reports_stale_when_forward_progress_is_stuck`; `indexer::tests::heartbeat_preserves_last_progress_at_ms_field_for_stall_detection`; `stall_diagnostics_tests::watchdog_fires_on_phase_zero_startup_wedge`.
+
+### Quality semantic backfill hardening (cass#257)
+
+Three sub-fixes from @DanielsLoud's comprehensive [cass#257](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/257) proposal landed independently so they can be reverted in isolation if needed. The SQL-shape perf optimizations and batch-watchdog env vars from the same proposal are deferred to a follow-up issue until we have telemetry-driven thresholds.
+
+- **Progress JSONL sink for quality semantic backfill telemetry.** Setting `CASS_SEMANTIC_PROGRESS_JSONL=/abs/path/to/progress.jsonl` appends one JSON object per transition event during semantic backfill. 16 named events (`selection_{start,done}`, `packet_replay_{start,progress,done}`, `embed_batch_{start,done}`, `staging_write_{start,done}`, `checkpoint_save_{start,done}`, `publish_{start,done}`, `error`, `cancelled`, `complete`) carry a wall-clock timestamp, phase + sub-phase classification, batch/row counters, byte counts (so a stalled query is distinguishable from a stalled model), wall-time delta since the sink opened, and a cheap RSS estimate. The sink is silent when the env var is unset, so it has zero cost on the normal operator path. Best-effort writes — a failed write logs at debug and never crashes a backfill that would otherwise succeed.
+- **Per-message `last_message_id` checkpoint cursor with durable resume.** The semantic checkpoint manifest now persists the highest canonical message PK embedded in the most recent batch, in addition to the existing conversation offset. Resume strictly filters out messages with `id <= last_message_id`, so an interrupted bounded backfill never re-embeds messages already staged. The manifest format version bumped 1→2; pre-#257 binaries reading a v2 manifest get a clean `UnsupportedVersion` error, and post-#257 binaries reading a v1 manifest fall back to the conversation offset gracefully with a one-shot warning that resume granularity is coarser than ideal until the next checkpoint save.
+- **`cass status` quality-tier-aware reporting.** The status JSON now carries two additive fields: `semantic.quality_tier_published` (true when the quality vector index is published and matches the current DB fingerprint, independent of the fast/progressive stack) and `semantic.semantic_only_search_available` (true when at least one tier is queryable). Operators querying with `--mode semantic` against a quality-only published index no longer see the surface incorrectly reporting "building/unavailable" just because the progressive/hybrid stack hasn't been backfilled.
+
+Tests: `tests/cass_257_semantic_progress_jsonl.rs` (sub-fix 1, end-to-end against a fixture corpus), `tests/cass_257_checkpoint_last_message_id.rs` (sub-fix 2, write-kill-restart resume + forward-compat fallback), `tests/cass_257_status_quality_tier_aware.rs` (sub-fix 3, JSON-shape assertions against a quality-only fixture).
+
+## [v0.6.3] -- 2026-05-27
+
+**Critical fixes: v0.6.2 startup panic / indexing-and-query stall (upstream frankensqlite regression) and Windows binary illegal-instruction on pre-AVX2 CPUs.**
+
+- **`cass` no longer panics on startup with "range end index 27 out of range for slice of length 25" (#254).** Bumped the `frankensqlite` / `fsqlite-types` pin from the buggy git rev `b3c841b`/`68426d3e` (which was carried inside v0.6.2 to ship the #252 witness cap) up to the published [`0.1.4`](https://crates.io/crates/fsqlite) crates.io release. `fsqlite` 0.1.4 fixes the upstream [#93 `execute_join_select` panic](https://github.com/Dicklesworthstone/frankensqlite/issues/93): a virtual-table cursor over a v13 schema with an FTS5 vtable was over-counting the row width by the hidden rowid column, producing an off-by-two slice-end index in the join driver. The panic fired on `cass --verbose`, `cass status --json`, `cass search`, `cass stats`, and the `cass index --watch` startup phase for any DB that had an FTS5 virtual table on it (every v0.6.1+ install). The dependency bump landed in commit [`2566b32f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/2566b32f); this release tags it and ships rebuilt binaries.
+- **Full / incremental / watch rebuilds and `cass search`/`cass stats` no longer spin at ~99% CPU forever on 0/N conversations (#255).** Same root cause as #254 — the panic-then-restart loop inside the upstream frankensqlite query executor presented to operators as an apparent indexing stall: high CPU, growing RSS, zero progress on the `current_conversations` counter, `page_prep_workers: 0`, `controller_mode: pinned_steady`, and `lsof` showing only the SQLite DB plus its lock file (no Tantivy shard FDs). The witness cap (#252 fix) prevented the OOM symptom but the query plan still trapped inside the buggy `execute_join_select` path. The fsqlite 0.1.4 bump unblocks query execution end-to-end. Reproduced on Linux x86_64 (#254 reporter, #255 reporter) and macOS arm64 (#255 reporter follow-up). The 0.1.4 release also carries the FTS5 delete-all+reinsert PrimaryKeyViolation fix ([fsqlite #94](https://github.com/Dicklesworthstone/frankensqlite/issues/94)), which was the secondary failure mode that surfaced once the slice panic was bypassed via DB surgery in the field.
+- **Windows binary on pre-AVX2 CPUs (#256) — PARTIAL FIX ONLY; see correction below.** The v0.6.2 `cass-windows-amd64.zip` artifact illegal-instructioned (`STATUS_ILLEGAL_INSTRUCTION` / `0xC000001D`) at process start on Sandy/Ivy Bridge hardware (e.g. Intel Core i7-3770K, 2012). The release workflow now pins the Windows build to `RUSTFLAGS=-C target-cpu=x86-64-v2` — the SSE4.2 + POPCNT microarchitecture level that matches every 64-bit Windows host shipped since ~2009. Linux and macOS jobs were already on the conservative default `x86-64`/`apple-arm64` baseline and do not need changes.
+
+> **⚠️ Correction (2026-05-28):** The `RUSTFLAGS=-C target-cpu=x86-64-v2` constraint above is **necessary but not sufficient** for #256. Reporter @Dlows-Vibe empirically confirmed that v0.6.3 (and v0.6.4) still crash on Ivy Bridge with the same `0xC000001D` exit. Root cause: the `fastembed` feature in `Cargo.toml` enables `ort-download-binaries-rustls-tls`, which downloads **prebuilt Microsoft ONNX Runtime binaries** at build time. Those prebuilts ship with AVX/AVX2/FMA-dispatched code already compiled in — `RUSTFLAGS` only constrains `rustc`'s own codegen and cannot reach object code linked from a vendor prebuilt. The crash fires in static init before any user code runs, which is why even `cass --version` dies.
+>
+> **Status:** #256 has been reopened. The complete fix requires feature-gating the `fastembed`/`ort` stack so that a separate `cass-windows-amd64-baseline.zip` artifact (no embeddings, pure CPU baseline) can ship for pre-AVX2 hardware. Tracking in v0.6.5. The RUSTFLAGS constraint stays in the workflow as defense-in-depth for the Rust-codegen layer.
 
 ## [v0.6.9] -- 2026-05-30
 

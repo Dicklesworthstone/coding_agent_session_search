@@ -47,7 +47,6 @@ fn bundle_creates_complete_structure() -> Result<()> {
     use std::fs;
 
     let tracker = tracker_for("bundle_creates_complete_structure");
-    let _trace_guard = tracker.trace_env_guard();
 
     let phase_start = tracker.start("setup", Some("Create test fixtures"));
     let temp = tempfile::TempDir::new()?;
@@ -171,7 +170,6 @@ fn bundle_integrity_manifest_valid() -> Result<()> {
     use std::fs;
 
     let tracker = tracker_for("bundle_integrity_manifest_valid");
-    let _trace_guard = tracker.trace_env_guard();
 
     let phase_start = tracker.start("setup", Some("Create test fixtures"));
     let temp = tempfile::TempDir::new()?;
@@ -274,7 +272,6 @@ fn bundle_site_metadata_correct() -> Result<()> {
     use std::fs;
 
     let tracker = tracker_for("bundle_site_metadata_correct");
-    let _trace_guard = tracker.trace_env_guard();
 
     let temp = tempfile::TempDir::new()?;
     let encrypted_dir = temp.path().join("encrypted");
@@ -323,7 +320,6 @@ fn bundle_site_metadata_correct() -> Result<()> {
 #[test]
 fn preview_ephemeral_port_binding() {
     let tracker = tracker_for("preview_ephemeral_port_binding");
-    let _trace_guard = tracker.trace_env_guard();
 
     let phase_start = tracker.start("get_ports", Some("Get ephemeral ports"));
 
@@ -364,7 +360,6 @@ fn preview_config_defaults() {
     use coding_agent_search::pages::preview::PreviewConfig;
 
     let tracker = tracker_for("preview_config_defaults");
-    let _trace_guard = tracker.trace_env_guard();
 
     let config = PreviewConfig::default();
 
@@ -387,7 +382,6 @@ fn preview_error_display() {
     use std::path::PathBuf;
 
     let tracker = tracker_for("preview_error_display");
-    let _trace_guard = tracker.trace_env_guard();
 
     // Test BindFailed display
     let bind_err = PreviewError::BindFailed {
@@ -459,7 +453,6 @@ fn preview_serves_static_files() -> Result<()> {
     use std::net::TcpStream;
 
     let tracker = tracker_for("preview_serves_static_files");
-    let _trace_guard = tracker.trace_env_guard();
 
     // Setup: Create a temp site directory with test files
     let phase_start = tracker.start("setup", Some("Create test site"));
@@ -568,7 +561,6 @@ fn preview_blocks_traversal() -> Result<()> {
     use std::net::TcpStream;
 
     let tracker = tracker_for("preview_blocks_traversal");
-    let _trace_guard = tracker.trace_env_guard();
 
     let temp = tempfile::TempDir::new()?;
     let site_dir = temp.path();
@@ -612,7 +604,6 @@ fn integration_build_and_preview() -> Result<()> {
     use std::net::TcpStream;
 
     let tracker = tracker_for("integration_build_and_preview");
-    let _trace_guard = tracker.trace_env_guard();
 
     // Phase 1: Build a real bundle
     let phase_start = tracker.start("build_bundle", Some("Build encrypted bundle"));
@@ -709,7 +700,6 @@ fn integration_preview_accepts_bundle_root() -> Result<()> {
     use std::net::TcpStream;
 
     let tracker = tracker_for("integration_preview_accepts_bundle_root");
-    let _trace_guard = tracker.trace_env_guard();
 
     let phase_start = tracker.start("build_bundle", Some("Build encrypted bundle"));
     let temp = tempfile::TempDir::new()?;

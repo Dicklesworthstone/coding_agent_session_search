@@ -23,6 +23,42 @@ fn gemini_parses_jsonl_fixture() {
     assert_eq!(c.messages[0].content, "Gemini hello");
 }
 
+/// Regression for CASS #341: current Gemini CLI sessions are event-sourced
+/// `session-*.jsonl` streams rather than one legacy JSON object.
+#[test]
+fn gemini_replays_current_jsonl_session_format() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let chats_dir = tmp.path().join("project").join("chats");
+    fs::create_dir_all(&chats_dir).unwrap();
+    fs::write(
+        chats_dir.join("session-2026-07-09T04-00-s1.jsonl"),
+        concat!(
+            r#"{"kind":"main","sessionId":"s1","projectHash":"h1","startTime":"2026-07-09T04:00:00Z"}"#,
+            "\n",
+            r#"{"$set":{"lastUpdated":"2026-07-09T04:00:01Z","messages":[{"id":"m1","type":"user","timestamp":"2026-07-09T04:00:00Z","content":[{"text":"hello"}]}]}}"#,
+            "\n",
+            r#"{"id":"m2","type":"gemini","timestamp":"2026-07-09T04:00:01Z","content":"current answer"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let conversations = GeminiConnector::new()
+        .scan(&ScanContext {
+            data_dir: tmp.path().to_path_buf(),
+            scan_roots: Vec::new(),
+            since_ts: None,
+        })
+        .expect("scan current Gemini JSONL");
+
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].external_id.as_deref(), Some("s1"));
+    assert_eq!(conversations[0].messages.len(), 2);
+    assert_eq!(conversations[0].messages[0].content, "hello");
+    assert_eq!(conversations[0].messages[1].content, "current answer");
+    assert_eq!(conversations[0].messages[1].role, "assistant");
+}
+
 /// Test role mapping: "model" → "assistant"
 #[test]
 fn gemini_maps_model_role_to_assistant() {

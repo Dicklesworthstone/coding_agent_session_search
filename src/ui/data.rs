@@ -340,7 +340,7 @@ fn ui_conversation_row_parts(
     Ok((convo_id, convo, workspace))
 }
 
-fn load_conversation_by_id_uncached(
+pub(crate) fn load_conversation_by_id_uncached(
     storage: &FrankenStorage,
     conversation_id: i64,
 ) -> Result<Option<ConversationView>> {

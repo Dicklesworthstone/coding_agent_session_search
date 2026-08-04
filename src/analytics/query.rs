@@ -1070,9 +1070,11 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
     let api_coverage_pct = if has_message_metrics && mm.row_count > 0 {
         let api_count =
             query_message_metrics_filtered_count(conn, filter, Some("api_data_source = 'api'"));
-        (api_count as f64 / mm.row_count as f64) * 100.0
+        super::derive::safe_pct(api_count, mm.row_count)
+    } else if total_messages > 0 {
+        crate::metric_integrity::MetricOutcome::RebuildRequired
     } else {
-        0.0
+        crate::metric_integrity::MetricOutcome::NoData
     };
 
     let model_coverage_pct = if has_token_usage && tu.row_count > 0 {
@@ -1081,23 +1083,31 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
             filter,
             Some("model_name IS NOT NULL AND TRIM(model_name) != ''"),
         );
-        (with_model as f64 / tu.row_count as f64) * 100.0
+        super::derive::safe_pct(with_model, tu.row_count)
+    } else if total_messages > 0 {
+        crate::metric_integrity::MetricOutcome::RebuildRequired
     } else {
-        0.0
+        crate::metric_integrity::MetricOutcome::NoData
     };
 
     let estimate_only_pct = if has_token_usage && tu.row_count > 0 {
         let estimates =
             query_token_usage_filtered_count(conn, filter, Some("data_source = 'estimated'"));
-        (estimates as f64 / tu.row_count as f64) * 100.0
+        super::derive::safe_pct(estimates, tu.row_count)
+    } else if total_messages > 0 {
+        crate::metric_integrity::MetricOutcome::RebuildRequired
     } else {
-        0.0
+        crate::metric_integrity::MetricOutcome::NoData
     };
 
     let mm_coverage_pct = if total_messages > 0 {
-        (mm.row_count as f64 / total_messages as f64) * 100.0
+        if has_message_metrics {
+            super::derive::safe_pct(mm.row_count, total_messages)
+        } else {
+            crate::metric_integrity::MetricOutcome::RebuildRequired
+        }
     } else {
-        0.0
+        crate::metric_integrity::MetricOutcome::NoData
     };
 
     let mut drift_signals: Vec<DriftSignal> = Vec::new();
@@ -1204,10 +1214,10 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
         ],
         coverage: CoverageInfo {
             total_messages,
-            message_metrics_coverage_pct: (mm_coverage_pct * 100.0).round() / 100.0,
-            api_token_coverage_pct: (api_coverage_pct * 100.0).round() / 100.0,
-            model_name_coverage_pct: (model_coverage_pct * 100.0).round() / 100.0,
-            estimate_only_pct: (estimate_only_pct * 100.0).round() / 100.0,
+            message_metrics_coverage_pct: mm_coverage_pct,
+            api_token_coverage_pct: api_coverage_pct,
+            model_name_coverage_pct: model_coverage_pct,
+            estimate_only_pct,
         },
         drift: DriftInfo {
             signals: drift_signals,
@@ -2229,6 +2239,8 @@ fn query_track_b_breakdown_from_token_usage(
                 Metric::PlanCount => 0,
                 Metric::CoveragePct => {
                     super::derive::safe_pct(bucket.api_coverage_message_count, bucket.message_count)
+                        .as_value()
+                        .unwrap_or_default()
                         .round() as i64
                 }
                 Metric::MessageCount => bucket.message_count,
@@ -2467,6 +2479,8 @@ fn query_track_a_breakdown_from_raw(
                 Metric::PlanCount => bucket.plan_message_count,
                 Metric::CoveragePct => {
                     super::derive::safe_pct(bucket.api_coverage_message_count, bucket.message_count)
+                        .as_value()
+                        .unwrap_or_default()
                         .round() as i64
                 }
                 Metric::MessageCount => bucket.message_count,
@@ -2805,7 +2819,9 @@ fn read_breakdown_rows_track_a(
                 let pct = super::derive::safe_pct(
                     bucket.api_coverage_message_count,
                     bucket.message_count,
-                );
+                )
+                .as_value()
+                .unwrap_or_default();
                 pct.round() as i64
             }
             // Track A has no cost column; expose stable zero values.
@@ -2874,6 +2890,8 @@ fn read_breakdown_rows_track_b(
         let value = match metric {
             Metric::CoveragePct => {
                 super::derive::safe_pct(bucket.api_coverage_message_count, bucket.message_count)
+                    .as_value()
+                    .unwrap_or_default()
                     .round() as i64
             }
             Metric::ContentEstTotal => bucket.content_tokens_est_total,
@@ -4912,8 +4930,14 @@ mod tests {
         let result = query_status(&conn, &filter).unwrap();
 
         assert_eq!(status_table_row_count(&result, "token_usage"), 2);
-        assert_eq!(result.coverage.model_name_coverage_pct, 100.0);
-        assert_eq!(result.coverage.estimate_only_pct, 0.0);
+        assert_eq!(
+            result.coverage.model_name_coverage_pct,
+            crate::metric_integrity::MetricOutcome::Value(100.0)
+        );
+        assert_eq!(
+            result.coverage.estimate_only_pct,
+            crate::metric_integrity::MetricOutcome::TrueZero
+        );
     }
 
     #[test]
@@ -4943,7 +4967,10 @@ mod tests {
 
         assert_eq!(status_table_row_count(&result, "token_usage"), 1);
         assert_eq!(result.coverage.total_messages, 1);
-        assert_eq!(result.coverage.estimate_only_pct, 100.0);
+        assert_eq!(
+            result.coverage.estimate_only_pct,
+            crate::metric_integrity::MetricOutcome::Value(100.0)
+        );
     }
 
     fn status_table_row_count(result: &StatusResult, table: &str) -> i64 {
@@ -4976,10 +5003,22 @@ mod tests {
         assert_eq!(status_table_row_count(&result, "usage_daily"), 1);
         assert_eq!(status_table_row_count(&result, "token_usage"), 2);
         assert_eq!(status_table_row_count(&result, "token_daily_stats"), 1);
-        assert_eq!(result.coverage.message_metrics_coverage_pct, 100.0);
-        assert_eq!(result.coverage.api_token_coverage_pct, 100.0);
-        assert_eq!(result.coverage.model_name_coverage_pct, 100.0);
-        assert_eq!(result.coverage.estimate_only_pct, 0.0);
+        assert_eq!(
+            result.coverage.message_metrics_coverage_pct,
+            crate::metric_integrity::MetricOutcome::Value(100.0)
+        );
+        assert_eq!(
+            result.coverage.api_token_coverage_pct,
+            crate::metric_integrity::MetricOutcome::Value(100.0)
+        );
+        assert_eq!(
+            result.coverage.model_name_coverage_pct,
+            crate::metric_integrity::MetricOutcome::Value(100.0)
+        );
+        assert_eq!(
+            result.coverage.estimate_only_pct,
+            crate::metric_integrity::MetricOutcome::TrueZero
+        );
         assert_eq!(result.recommended_action, "none");
     }
 
@@ -5054,10 +5093,22 @@ mod tests {
         assert_eq!(result.coverage.total_messages, 1);
         assert_eq!(status_table_row_count(&result, "message_metrics"), 1);
         assert_eq!(status_table_row_count(&result, "token_usage"), 1);
-        assert_eq!(result.coverage.message_metrics_coverage_pct, 100.0);
-        assert_eq!(result.coverage.api_token_coverage_pct, 100.0);
-        assert_eq!(result.coverage.model_name_coverage_pct, 100.0);
-        assert_eq!(result.coverage.estimate_only_pct, 0.0);
+        assert_eq!(
+            result.coverage.message_metrics_coverage_pct,
+            crate::metric_integrity::MetricOutcome::Value(100.0)
+        );
+        assert_eq!(
+            result.coverage.api_token_coverage_pct,
+            crate::metric_integrity::MetricOutcome::Value(100.0)
+        );
+        assert_eq!(
+            result.coverage.model_name_coverage_pct,
+            crate::metric_integrity::MetricOutcome::Value(100.0)
+        );
+        assert_eq!(
+            result.coverage.estimate_only_pct,
+            crate::metric_integrity::MetricOutcome::TrueZero
+        );
     }
 
     #[test]
@@ -5079,7 +5130,10 @@ mod tests {
 
         assert_eq!(result.coverage.total_messages, 2);
         assert_eq!(status_table_row_count(&result, "message_metrics"), 2);
-        assert_eq!(result.coverage.message_metrics_coverage_pct, 100.0);
+        assert_eq!(
+            result.coverage.message_metrics_coverage_pct,
+            crate::metric_integrity::MetricOutcome::Value(100.0)
+        );
     }
 
     #[test]
@@ -5161,8 +5215,14 @@ mod tests {
 
         assert_eq!(status_table_row_count(&result, "token_usage"), 0);
         assert_eq!(status_table_row_count(&result, "token_daily_stats"), 0);
-        assert_eq!(result.coverage.model_name_coverage_pct, 0.0);
-        assert_eq!(result.coverage.estimate_only_pct, 0.0);
+        assert_eq!(
+            result.coverage.model_name_coverage_pct,
+            crate::metric_integrity::MetricOutcome::RebuildRequired
+        );
+        assert_eq!(
+            result.coverage.estimate_only_pct,
+            crate::metric_integrity::MetricOutcome::RebuildRequired
+        );
         assert_eq!(result.recommended_action, "rebuild_track_b");
     }
 

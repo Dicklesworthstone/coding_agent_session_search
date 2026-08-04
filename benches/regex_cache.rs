@@ -1,6 +1,6 @@
 use coding_agent_search::search::tantivy::{build_schema, fields_from_schema};
 use criterion::{Criterion, criterion_group, criterion_main};
-use frankensearch::lexical::{Field, cass_regex_query_cached, cass_regex_query_uncached};
+use frankensearch::lexical_tantivy::{Field, cass_regex_query_cached, cass_regex_query_uncached};
 use std::hint::black_box;
 
 fn content_field() -> Field {

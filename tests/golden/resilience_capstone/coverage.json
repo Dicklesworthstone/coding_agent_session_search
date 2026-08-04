@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "subsystem_count": 15,
+  "acceptance_checks": [
+    "deterministic_json",
+    "no_robot_stdout_pollution",
+    "no_subsystem_coverage_gaps",
+    "robot_human_no_contradiction",
+    "safe_next_commands",
+    "stable_redaction"
+  ],
+  "subsystems": [
+    {
+      "subsystem": "analytics",
+      "mode": "matrix-attested",
+      "evidence": "src/metric_integrity.rs",
+      "owning_beads": [
+        ".15.4",
+        ".9.4"
+      ]
+    },
+    {
+      "subsystem": "bookmarks",
+      "mode": "matrix-attested",
+      "evidence": "src/bookmarks.rs",
+      "owning_beads": [
+        ".15.4"
+      ]
+    },
+    {
+      "subsystem": "cache",
+      "mode": "matrix-attested",
+      "evidence": "src/daemon_runtime_state.rs",
+      "owning_beads": [
+        ".15.2"
+      ]
+    },
+    {
+      "subsystem": "cli_robot",
+      "mode": "e2e-live",
+      "evidence": "cass triage/health/status/capabilities/diag/doctor --json dispatch",
+      "owning_beads": [
+        ".2.4",
+        ".11.1",
+        ".11.5",
+        ".12.6"
+      ]
+    },
+    {
+      "subsystem": "connectors",
+      "mode": "e2e-live",
+      "evidence": "seeded Codex rollout ingested via cass index --full",
+      "owning_beads": [
+        ".15.1",
+        ".3.1",
+        ".14.1"
+      ]
+    },
+    {
+      "subsystem": "daemon",
+      "mode": "matrix-attested",
+      "evidence": "src/daemon_runtime_state.rs",
+      "owning_beads": [
+        ".15.2",
+        ".2.2",
+        ".4.1"
+      ]
+    },
+    {
+      "subsystem": "html_export",
+      "mode": "matrix-attested",
+      "evidence": "tests/html_export_sanitization_security.rs",
+      "owning_beads": [
+        ".15.3",
+        ".10.5",
+        ".12.3",
+        ".13.3"
+      ]
+    },
+    {
+      "subsystem": "indexer",
+      "mode": "e2e-live",
+      "evidence": "cass index --full over a seeded Codex fixture",
+      "owning_beads": [
+        ".1",
+        ".4",
+        ".11.2",
+        ".12.5",
+        ".14.4"
+      ]
+    },
+    {
+      "subsystem": "models",
+      "mode": "e2e-live",
+      "evidence": "cass models status --json (no-download lexical fallback)",
+      "owning_beads": [
+        ".5",
+        ".5.1",
+        ".5.5"
+      ]
+    },
+    {
+      "subsystem": "pages",
+      "mode": "matrix-attested",
+      "evidence": "tests/pages_export_golden.rs",
+      "owning_beads": [
+        ".15.4",
+        ".13.2",
+        ".13.4",
+        ".12.6"
+      ]
+    },
+    {
+      "subsystem": "search",
+      "mode": "e2e-live",
+      "evidence": "cass search --robot over fresh (empty stdout error) + indexed (hits)",
+      "owning_beads": [
+        ".1",
+        ".4",
+        ".5",
+        ".7",
+        ".11.2",
+        ".15.2"
+      ]
+    },
+    {
+      "subsystem": "sources",
+      "mode": "e2e-live",
+      "evidence": "cass sources doctor --json",
+      "owning_beads": [
+        ".8",
+        ".8.1",
+        ".8.2",
+        ".8.4",
+        ".8.5"
+      ]
+    },
+    {
+      "subsystem": "storage",
+      "mode": "e2e-live",
+      "evidence": "status.storage_integrity + doctor --check storage signals",
+      "owning_beads": [
+        ".14",
+        ".14.1",
+        ".14.4",
+        ".9.4"
+      ]
+    },
+    {
+      "subsystem": "tui",
+      "mode": "matrix-attested",
+      "evidence": "tests/e2e_human_robot_parity_gate.rs",
+      "owning_beads": [
+        ".15.4",
+        ".13.2",
+        ".13.4",
+        ".12.6"
+      ]
+    },
+    {
+      "subsystem": "update_check",
+      "mode": "matrix-attested",
+      "evidence": "src/update_check.rs",
+      "owning_beads": [
+        ".15.4"
+      ]
+    }
+  ]
+}

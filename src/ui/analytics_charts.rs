@@ -136,6 +136,8 @@ pub struct AnalyticsChartData {
     pub model_tokens: Vec<(String, f64)>,
     /// Coverage percentage (0..100).
     pub coverage_pct: f64,
+    /// Truth state for coverage; `coverage_pct` is only the numeric projection.
+    pub coverage_metric: crate::metric_integrity::MetricOutcome,
     /// Total messages across all data.
     pub total_messages: i64,
     /// Total API tokens across all data.
@@ -169,8 +171,12 @@ pub struct AnalyticsChartData {
     pub agent_plan_messages: Vec<(String, f64)>,
     /// Plan message share (% of total messages that are plan messages).
     pub plan_message_pct: f64,
+    /// Truth state for the plan-message percentage.
+    pub plan_message_metric: crate::metric_integrity::MetricOutcome,
     /// Plan API token share (% of API tokens attributed to plans).
     pub plan_api_token_share: f64,
+    /// Truth state for the plan-token percentage.
+    pub plan_api_token_metric: crate::metric_integrity::MetricOutcome,
     /// True when analytics rollups were auto-rebuilt during the latest load.
     pub auto_rebuilt: bool,
     /// Captures auto-rebuild errors; data may still be partially available.
@@ -453,7 +459,8 @@ pub fn load_chart_data(
         analytics::query::query_status(conn, &filter),
         load_errors
     ) {
-        data.coverage_pct = status.coverage.api_token_coverage_pct;
+        data.coverage_metric = status.coverage.api_token_coverage_pct;
+        data.coverage_pct = data.coverage_metric.as_value().unwrap_or_default();
     }
 
     // Per-agent plan message breakdown.
@@ -485,18 +492,36 @@ pub fn load_chart_data(
     }
 
     // Derive plan share percentages from totals.
-    if data.total_messages > 0 {
-        data.plan_message_pct =
-            data.total_plan_messages as f64 / data.total_messages as f64 * 100.0;
-    }
-    if data.total_api_tokens > 0 {
-        let plan_token_total: f64 = data.daily_plan_messages.iter().map(|(_, v)| *v).sum();
-        if plan_token_total > 0.0 && data.total_api_tokens > 0 {
-            data.plan_api_token_share = plan_token_total / data.total_api_tokens as f64 * 100.0;
-        }
-    }
+    data.plan_message_metric =
+        percent_outcome(data.total_plan_messages as f64, data.total_messages as f64);
+    data.plan_message_pct = data.plan_message_metric.as_value().unwrap_or_default();
+    let plan_token_total: f64 = data.daily_plan_messages.iter().map(|(_, v)| *v).sum();
+    data.plan_api_token_metric = percent_outcome(plan_token_total, data.total_api_tokens as f64);
+    data.plan_api_token_share = data.plan_api_token_metric.as_value().unwrap_or_default();
 
     data
+}
+
+fn percent_outcome(numerator: f64, denominator: f64) -> crate::metric_integrity::MetricOutcome {
+    match crate::metric_integrity::safe_ratio(numerator, denominator) {
+        crate::metric_integrity::MetricOutcome::Value(value) => {
+            crate::metric_integrity::MetricOutcome::finite(value * 100.0)
+        }
+        crate::metric_integrity::MetricOutcome::TrueZero => {
+            crate::metric_integrity::MetricOutcome::TrueZero
+        }
+        other => other,
+    }
+}
+
+pub(crate) fn format_metric_percent(
+    outcome: crate::metric_integrity::MetricOutcome,
+    decimals: usize,
+) -> String {
+    match outcome.as_value() {
+        Some(value) => format!("{value:.decimals$}%"),
+        None => crate::metric_integrity::chart_cell(outcome),
+    }
 }
 
 fn resolve_workspace_filter_ids(
@@ -935,7 +960,7 @@ fn render_kpi_tiles(
 
     render_kpi_tile(
         "API Cvg",
-        &format!("{:.0}%", data.coverage_pct),
+        &format_metric_percent(data.coverage_metric, 0),
         &[],                            // no sparkline for coverage
         PackedRgba::rgb(150, 200, 255), // light blue
         PackedRgba::rgb(80, 120, 180),  // muted blue
@@ -2861,8 +2886,8 @@ pub fn render_coverage(
     let api_empty = bar_width.saturating_sub(api_filled);
     let line1 = truncate_with_ellipsis(
         &format!(
-            " API Token Coverage: {:.1}%  [{}{}]",
-            data.coverage_pct,
+            " API Token Coverage: {}  [{}{}]",
+            format_metric_percent(data.coverage_metric, 1),
             "\u{2588}".repeat(api_filled),
             "\u{2591}".repeat(api_empty),
         ),
@@ -3415,6 +3440,11 @@ mod tests {
         assert!(data.daily_tokens.is_empty());
         assert_eq!(data.total_messages, 0);
         assert_eq!(data.coverage_pct, 0.0);
+        assert_eq!(
+            data.coverage_metric,
+            crate::metric_integrity::MetricOutcome::NoData
+        );
+        assert_eq!(format_metric_percent(data.coverage_metric, 1), "—");
     }
 
     #[test]

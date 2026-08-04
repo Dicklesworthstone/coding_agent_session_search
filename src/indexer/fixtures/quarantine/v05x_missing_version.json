@@ -1,0 +1,11 @@
+{
+  "storage_version": 1,
+  "entries": {
+    "conv-legacy::v1": {
+      "first_attempt_at": "2025-11-01T00:00:00Z",
+      "last_attempt_at": "2025-11-01T00:00:00Z",
+      "attempt_count": 1,
+      "last_reason": "index-ingest-out-of-memory: out of memory"
+    }
+  }
+}

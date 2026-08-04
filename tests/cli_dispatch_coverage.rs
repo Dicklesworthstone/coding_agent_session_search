@@ -556,6 +556,130 @@ fn seed_analytics_remote_source_tools_fixture(temp_home: &TempDir) {
     .unwrap();
 }
 
+struct AnalyticsIncidentsFixture {
+    db_path: PathBuf,
+    local_source_path: PathBuf,
+    remote_source_path: PathBuf,
+    secret_prompt_fragment: &'static str,
+}
+
+fn seed_analytics_incidents_fixture(temp_home: &TempDir) -> AnalyticsIncidentsFixture {
+    const SECRET_PROMPT_FRAGMENT: &str = "sk_live_CASS_INCIDENT_SECRET_0123456789";
+
+    let data_dir = temp_home.path().join(".local/share/coding-agent-search");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let local_workspace = temp_home.path().join("local incident workspace");
+    let remote_workspace = temp_home.path().join("remote incident workspace");
+    fs::create_dir_all(&local_workspace).unwrap();
+    fs::create_dir_all(&remote_workspace).unwrap();
+
+    let local_source_path = local_workspace.join("incident session's evidence.jsonl");
+    fs::write(&local_source_path, "{\"fixture\":true}\n").unwrap();
+    let remote_source_path = remote_workspace.join("remote incident.jsonl");
+
+    let codex_id = storage
+        .ensure_agent(&sample_agent("codex", "Codex"))
+        .unwrap();
+    let claude_id = storage
+        .ensure_agent(&sample_agent("claude", "Claude Code"))
+        .unwrap();
+    let local_workspace_id = storage
+        .ensure_workspace(&local_workspace, Some("local-incident-workspace"))
+        .unwrap();
+    let remote_workspace_id = storage
+        .ensure_workspace(&remote_workspace, Some("remote-incident-workspace"))
+        .unwrap();
+
+    let started_at = 1_770_000_000_000_i64;
+    let mut local = sample_conversation(
+        "codex",
+        &local_workspace,
+        &local_source_path,
+        "local-incident-session",
+        "Local incident fixture",
+        started_at,
+        vec![
+            sample_message(
+                0,
+                MessageRole::User,
+                started_at,
+                &format!(
+                    "health_class=unhealthy recommended_action=cass health; \
+                     err.kind=OpenRead; index-ingest-out-of-memory; \
+                     semantic_fallback_lexical; database is locked in agent_search.db; \
+                     private credential {SECRET_PROMPT_FRAGMENT}"
+                ),
+            ),
+            sample_message(
+                1,
+                MessageRole::Agent,
+                started_at + 1,
+                "zero_result_diagnosis found candidate_workspaces for cass search",
+            ),
+        ],
+    );
+    local.source_id = "local".to_string();
+    storage
+        .insert_conversation_tree(codex_id, Some(local_workspace_id), &local)
+        .unwrap();
+
+    let mut remote = sample_conversation(
+        "claude",
+        &remote_workspace,
+        &remote_source_path,
+        "remote-incident-session",
+        "Remote incident fixture",
+        started_at + 10,
+        vec![sample_message(
+            0,
+            MessageRole::User,
+            started_at + 10,
+            "index-ingest-out-of-memory and semantic_fallback_lexical on cass",
+        )],
+    );
+    remote.source_id = "remote-ci".to_string();
+    remote.origin_host = Some("ts1".to_string());
+    storage
+        .insert_conversation_tree(claude_id, Some(remote_workspace_id), &remote)
+        .unwrap();
+
+    drop(storage);
+
+    AnalyticsIncidentsFixture {
+        db_path,
+        local_source_path,
+        remote_source_path,
+        secret_prompt_fragment: SECRET_PROMPT_FRAGMENT,
+    }
+}
+
+fn run_analytics_incidents(temp_home: &TempDir, extra_args: &[&str]) -> (Value, String) {
+    let mut cmd = base_cmd(temp_home.path());
+    cmd.args(["analytics", "incidents"]);
+    cmd.args(extra_args);
+    cmd.timeout(Duration::from_secs(30));
+    let output = cmd.output().expect("run analytics incidents");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "analytics incidents failed: status={:?}\nstdout={stdout}\nstderr={stderr}",
+        output.status.code()
+    );
+    let json = serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
+        panic!("analytics incidents stdout is not JSON: {error}\n{stdout}")
+    });
+    (json, stderr)
+}
+
+fn normalize_incident_parity_fields(value: &mut Value) {
+    value["_meta"]["elapsed_ms"] = json!(0);
+    value["data"]["discovery"]["elapsed_ms"] = json!(0);
+}
+
 // =============================================================================
 // Completions command tests
 // =============================================================================
@@ -2115,6 +2239,139 @@ fn sessions_json_reports_recent_and_current_workspace_sessions() {
     );
 }
 
+/// cass#323: `--limit` must truncate the result (counts are backfilled only
+/// for surviving sessions) and `--since` must bound the enumeration window
+/// by recorded activity timestamps.
+#[test]
+fn sessions_json_since_bounds_window_and_limit_truncates() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let session_old = tmp.path().join("since-old.jsonl");
+    let session_new = tmp.path().join("since-new.jsonl");
+    fs::write(&session_old, "{\"session\":\"old\"}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    fs::write(&session_new, "{\"session\":\"new\"}\n").unwrap();
+
+    let claude_id = storage
+        .ensure_agent(&sample_agent("claude_code", "Claude Code"))
+        .unwrap();
+    let workspace_id = storage
+        .ensure_workspace(&workspace, Some("workspace"))
+        .unwrap();
+
+    // Old session: started/ended 2023-11-14.
+    let old_started = 1_700_000_000_000_i64;
+    storage
+        .insert_conversation_tree(
+            claude_id,
+            Some(workspace_id),
+            &sample_conversation(
+                "claude_code",
+                &workspace,
+                &session_old,
+                "since-old",
+                "Old Session",
+                old_started,
+                vec![
+                    sample_message(0, MessageRole::User, old_started, "old question"),
+                    sample_message(1, MessageRole::Agent, old_started + 1, "old answer"),
+                ],
+            ),
+        )
+        .unwrap();
+    // New session: started/ended 2024-12-24.
+    let new_started = 1_735_000_000_000_i64;
+    storage
+        .insert_conversation_tree(
+            claude_id,
+            Some(workspace_id),
+            &sample_conversation(
+                "claude_code",
+                &workspace,
+                &session_new,
+                "since-new",
+                "New Session",
+                new_started,
+                vec![
+                    sample_message(0, MessageRole::User, new_started, "new question"),
+                    sample_message(1, MessageRole::Agent, new_started + 1, "new answer"),
+                    sample_message(2, MessageRole::User, new_started + 2, "follow-up"),
+                ],
+            ),
+        )
+        .unwrap();
+
+    // --since between the two sessions keeps only the newer one.
+    let mut since_cmd = base_cmd(tmp.path());
+    since_cmd.args([
+        "sessions",
+        "--json",
+        "--since",
+        "2024-06-01",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    let since_output = since_cmd.assert().success().get_output().clone();
+    let since_json: Value =
+        serde_json::from_slice(&since_output.stdout).expect("valid sessions json");
+    let since_sessions = since_json["sessions"].as_array().expect("sessions array");
+    assert_eq!(
+        since_sessions.len(),
+        1,
+        "--since should exclude the session that ended before the cutoff"
+    );
+    assert_eq!(
+        since_sessions[0]["path"].as_str().unwrap(),
+        session_new.to_string_lossy()
+    );
+    // Counts are backfilled after the limit push-down; they must stay exact.
+    assert_eq!(since_sessions[0]["message_count"], 3);
+    assert_eq!(since_sessions[0]["human_turns"], 2);
+
+    // --limit 1 returns exactly one session, with exact counts.
+    let mut limit_cmd = base_cmd(tmp.path());
+    limit_cmd.args([
+        "sessions",
+        "--json",
+        "--limit",
+        "1",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    let limit_output = limit_cmd.assert().success().get_output().clone();
+    let limit_json: Value =
+        serde_json::from_slice(&limit_output.stdout).expect("valid sessions json");
+    let limit_sessions = limit_json["sessions"].as_array().expect("sessions array");
+    assert_eq!(limit_sessions.len(), 1, "--limit 1 should truncate to one");
+    assert_eq!(
+        limit_sessions[0]["path"].as_str().unwrap(),
+        session_new.to_string_lossy(),
+        "most recently modified session should win the single slot"
+    );
+    assert_eq!(limit_sessions[0]["message_count"], 3);
+    assert_eq!(limit_sessions[0]["human_turns"], 2);
+
+    // An unparseable --since is a usage error, not a silent full scan.
+    let mut bad_cmd = base_cmd(tmp.path());
+    bad_cmd.args([
+        "sessions",
+        "--json",
+        "--since",
+        "not-a-date",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    bad_cmd.assert().failure();
+}
+
 #[test]
 fn sessions_json_keeps_local_file_metadata_for_trimmed_local_source_id() {
     let tmp = TempDir::new().unwrap();
@@ -2670,6 +2927,7 @@ fn analytics_help_lists_expected_subcommands() {
         .stdout(contains("tokens"))
         .stdout(contains("tools"))
         .stdout(contains("models"))
+        .stdout(contains("incidents"))
         .stdout(contains("rebuild"))
         .stdout(contains("validate"));
 }
@@ -2735,6 +2993,7 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
             "analytics/models",
             vec!["analytics", "models", "--group-by", "month"],
         ),
+        ("analytics/incidents", vec!["analytics", "incidents"]),
         ("analytics/rebuild", vec!["analytics", "rebuild", "--force"]),
         ("analytics/validate", vec!["analytics", "validate", "--fix"]),
     ];
@@ -2813,6 +3072,21 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
                 assert!(
                     data["by_api_tokens"].is_object(),
                     "analytics/models should expose by_api_tokens: {json}"
+                );
+            }
+            "analytics/incidents" => {
+                assert_eq!(data["schema_version"], 2);
+                assert!(
+                    data["discovery"].is_object(),
+                    "analytics/incidents should expose bounded discovery: {json}"
+                );
+                assert!(
+                    data["top_sessions"].is_array(),
+                    "analytics/incidents should expose top_sessions: {json}"
+                );
+                assert!(
+                    data["redaction"].is_object(),
+                    "analytics/incidents should expose redaction provenance: {json}"
                 );
             }
             "analytics/rebuild" => {
@@ -2894,6 +3168,381 @@ fn parse_analytics_tokens_with_shared_flags() {
             assert!(common.json);
         }
         other => panic!("expected analytics tokens command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_analytics_incidents_with_caps_and_shared_flags() {
+    let cli = parse_cli_ok(
+        [
+            "cass",
+            "analytics",
+            "incidents",
+            "--limit",
+            "7",
+            "--max-sessions",
+            "11",
+            "--max-messages",
+            "222",
+            "--max-bytes",
+            "3333",
+            "--budget-ms",
+            "4444",
+            "--agent",
+            "codex",
+            "--workspace",
+            "/tmp/incident-workspace",
+            "--source",
+            "remote-ci",
+            "--json",
+        ],
+        "parse analytics incidents with caps and shared flags",
+    );
+
+    match cli.command {
+        Some(Commands::Analytics(AnalyticsCommand::Incidents {
+            common,
+            limit,
+            max_sessions,
+            max_messages,
+            max_bytes,
+            budget_ms,
+        })) => {
+            assert_eq!(limit, 7);
+            assert_eq!(max_sessions, 11);
+            assert_eq!(max_messages, 222);
+            assert_eq!(max_bytes, 3333);
+            assert_eq!(budget_ms, 4444);
+            assert_eq!(common.agent, vec!["codex"]);
+            assert_eq!(common.workspace, vec!["/tmp/incident-workspace"]);
+            assert_eq!(common.source.as_deref(), Some("remote-ci"));
+            assert!(common.json);
+        }
+        other => panic!("expected analytics incidents command, got {other:?}"),
+    }
+}
+
+#[test]
+fn analytics_incidents_robot_output_is_redacted_provenanced_and_read_only() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = seed_analytics_incidents_fixture(&tmp);
+    let db_before = fs::read(&fixture.db_path).expect("read database before incident scan");
+
+    let (json, stderr) = run_analytics_incidents(
+        &tmp,
+        &[
+            "--agent",
+            "codex",
+            "--source",
+            "local",
+            "--limit",
+            "5",
+            "--max-sessions",
+            "10",
+            "--max-messages",
+            "100",
+            "--max-bytes",
+            "1048576",
+            "--budget-ms",
+            "60000",
+            "--json",
+        ],
+    );
+    let db_after = fs::read(&fixture.db_path).expect("read database after incident scan");
+
+    assert_eq!(
+        db_after, db_before,
+        "incident analytics must not mutate the DB"
+    );
+    assert!(
+        stderr.trim().is_empty(),
+        "robot stderr should be quiet: {stderr}"
+    );
+    assert_eq!(json["command"], "analytics/incidents");
+    assert_eq!(json["data"]["schema_version"], 2);
+    assert_eq!(json["data"]["count_scope"], "all_matching_candidates");
+    assert_eq!(
+        json["data"]["scan_units"],
+        json!({
+            "files": "archive_conversations",
+            "lines": "archive_messages",
+            "bytes": "utf8_message_content_inspected",
+            "candidate_order": "newest_archive_row_first",
+            "message_fragment_chars": 4096
+        })
+    );
+    assert_eq!(json["data"]["discovery"]["partial"], false);
+    assert_eq!(json["data"]["discovery"]["stop_reason"], "completed");
+    assert_eq!(json["data"]["total_sessions"], 1);
+    assert!(json["data"]["total_hits"].as_u64().unwrap_or(0) >= 5);
+    assert_eq!(json["data"]["top_sessions_truncated"], false);
+
+    let sessions = json["data"]["top_sessions"]
+        .as_array()
+        .expect("top_sessions array");
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    let source_path = fixture.local_source_path.to_string_lossy().to_string();
+    assert_eq!(session["session_id"], "local-incident-session");
+    assert_eq!(session["agent"], "codex");
+    assert_eq!(session["host"], "local");
+    assert_eq!(session["source_path"], source_path);
+    assert_eq!(session["source_id"], "local");
+    assert_eq!(session["exists_state"], "exists");
+    assert_eq!(session["redaction_status"], "redacted");
+    assert!(session["category_breadth"].as_u64().unwrap_or(0) >= 5);
+    assert!(
+        session["dominant_categories"]
+            .as_array()
+            .is_some_and(|categories| !categories.is_empty())
+    );
+
+    assert_eq!(session["suggested_command"]["kind"], "view");
+    let conversation_id = session["conversation_id"]
+        .as_i64()
+        .expect("canonical conversation id");
+    let canonical_db_path = fs::canonicalize(&fixture.db_path)
+        .expect("canonical fixture database path")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        session["suggested_command"]["argv"],
+        json!([
+            "cass",
+            "--db",
+            canonical_db_path,
+            "view",
+            source_path,
+            "--source",
+            "local",
+            "--conversation-id",
+            conversation_id.to_string(),
+            "--json"
+        ])
+    );
+    assert!(
+        session["suggested_command"]["display"]
+            .as_str()
+            .is_some_and(|display| display.starts_with("cass --db ")
+                && display.ends_with(&format!(
+                    " --source local --conversation-id {conversation_id} --json"
+                )))
+    );
+
+    // Prove the returned argv remains exact even after a newer archive row is
+    // inserted with the same source/path identity.
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&fixture.db_path)
+        .expect("reopen incident fixture");
+    let codex_id = storage
+        .ensure_agent(&sample_agent("codex", "Codex"))
+        .expect("resolve codex agent");
+    let mut newer = sample_conversation(
+        "codex",
+        &fixture.local_source_path,
+        &fixture.local_source_path,
+        "newer-same-path-session",
+        "Newer same-path fixture",
+        1_880_000_000_000,
+        vec![sample_message(
+            0,
+            MessageRole::User,
+            1_880_000_000_000,
+            "NEWER_SAME_PATH_ROW_MUST_NOT_BE_OPENED",
+        )],
+    );
+    newer.source_id = "local".to_string();
+    storage
+        .insert_conversation_tree(codex_id, None, &newer)
+        .expect("insert newer same-path row");
+    drop(storage);
+
+    let argv = session["suggested_command"]["argv"]
+        .as_array()
+        .expect("suggested argv")
+        .iter()
+        .map(|argument| argument.as_str().expect("string argv"))
+        .collect::<Vec<_>>();
+    let mut followup = base_cmd(tmp.path());
+    followup.args(&argv[1..]);
+    followup.timeout(Duration::from_secs(30));
+    let followup_output = followup.output().expect("execute suggested view argv");
+    assert!(
+        followup_output.status.success(),
+        "suggested argv failed: {}",
+        String::from_utf8_lossy(&followup_output.stderr)
+    );
+    let followup_json: Value =
+        serde_json::from_slice(&followup_output.stdout).expect("suggested view output JSON");
+    let followup_serialized = serde_json::to_string(&followup_json).unwrap();
+    assert!(followup_serialized.contains(fixture.secret_prompt_fragment));
+    assert!(!followup_serialized.contains("NEWER_SAME_PATH_ROW_MUST_NOT_BE_OPENED"));
+
+    let evidence = session["evidence_summaries"]
+        .as_array()
+        .expect("evidence_summaries array");
+    assert!(!evidence.is_empty());
+    for summary in evidence {
+        for fingerprint in summary["content_fingerprints"]
+            .as_array()
+            .expect("content_fingerprints array")
+        {
+            assert_eq!(fingerprint.as_str().map(str::len), Some(64));
+        }
+        for path in summary["evidence_paths"]
+            .as_array()
+            .expect("evidence_paths array")
+        {
+            assert_eq!(path, "incident session's evidence.jsonl");
+        }
+    }
+
+    assert_eq!(
+        json["data"]["redaction"]["private_text_policy"],
+        "suppress_all"
+    );
+    assert_eq!(json["data"]["redaction"]["hash_strategy"], "blake3_256_v1");
+    assert_eq!(json["data"]["redaction"]["opt_in_flags"], json!([]));
+    let serialized = serde_json::to_string(&json).unwrap();
+    assert!(!serialized.contains(fixture.secret_prompt_fragment));
+    assert!(!serialized.contains("private credential"));
+    assert!(!serialized.contains("raw_prompt_text\":"));
+    assert!(!serialized.contains("raw_tool_payload\":"));
+}
+
+#[test]
+fn analytics_incidents_strict_session_cap_is_explicitly_partial() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = seed_analytics_incidents_fixture(&tmp);
+    let (json, _) = run_analytics_incidents(
+        &tmp,
+        &[
+            "--limit",
+            "5",
+            "--max-sessions",
+            "1",
+            "--max-messages",
+            "100",
+            "--max-bytes",
+            "1048576",
+            "--budget-ms",
+            "60000",
+            "--json",
+        ],
+    );
+
+    let discovery = &json["data"]["discovery"];
+    assert_eq!(json["data"]["count_scope"], "scanned_candidates_partial");
+    assert_eq!(discovery["partial"], true);
+    assert_eq!(discovery["timed_out"], false);
+    assert_eq!(discovery["stop_reason"], "files-capped");
+    assert_eq!(discovery["caps"]["max_files"], 1);
+    assert_eq!(discovery["files_scanned"], 1);
+    assert_eq!(discovery["files_considered"], 1);
+    assert_eq!(json["data"]["total_sessions"], 1);
+    assert_eq!(json["data"]["top_sessions_truncated"], false);
+
+    let top = &json["data"]["top_sessions"][0];
+    assert_eq!(top["session_id"], "remote-incident-session");
+    assert_eq!(top["agent"], "claude");
+    assert_eq!(top["host"], "ts1");
+    assert_eq!(top["source_id"], "remote-ci");
+    assert_eq!(
+        top["source_path"],
+        fixture.remote_source_path.to_string_lossy().to_string()
+    );
+    assert_eq!(top["exists_state"], "unknown");
+}
+
+#[test]
+fn analytics_incidents_source_agent_filters_and_human_robot_output_are_in_parity() {
+    let tmp = TempDir::new().unwrap();
+    let _fixture = seed_analytics_incidents_fixture(&tmp);
+
+    let filter_args = [
+        "--agent",
+        "claude",
+        "--source",
+        "remote-ci",
+        "--limit",
+        "5",
+        "--max-sessions",
+        "10",
+        "--max-messages",
+        "100",
+        "--max-bytes",
+        "1048576",
+        "--budget-ms",
+        "60000",
+    ];
+    let mut robot_args = filter_args.to_vec();
+    robot_args.push("--json");
+    let (mut robot, robot_stderr) = run_analytics_incidents(&tmp, &robot_args);
+    let (mut human, human_stderr) = run_analytics_incidents(&tmp, &filter_args);
+
+    assert!(robot_stderr.trim().is_empty());
+    assert!(
+        human_stderr.contains("analytics incidents"),
+        "human mode should identify the command: {human_stderr}"
+    );
+    assert_eq!(robot["data"]["total_sessions"], 1);
+    assert_eq!(robot["data"]["top_sessions"][0]["agent"], "claude");
+    assert_eq!(robot["data"]["top_sessions"][0]["source_id"], "remote-ci");
+    assert_eq!(robot["data"]["top_sessions"][0]["host"], "ts1");
+    assert!(
+        robot["_meta"]["filters_applied"]
+            .as_array()
+            .is_some_and(|filters| filters.contains(&json!("agent=claude")))
+    );
+    assert!(
+        robot["_meta"]["filters_applied"]
+            .as_array()
+            .is_some_and(|filters| filters.contains(&json!("source=remote-ci")))
+    );
+
+    normalize_incident_parity_fields(&mut robot);
+    normalize_incident_parity_fields(&mut human);
+    assert_eq!(
+        human, robot,
+        "human and robot modes must project the same data"
+    );
+
+    let (no_cross_source, _) = run_analytics_incidents(
+        &tmp,
+        &["--agent", "codex", "--source", "remote-ci", "--json"],
+    );
+    assert_eq!(no_cross_source["data"]["total_sessions"], 0);
+    assert_eq!(no_cross_source["data"]["total_hits"], 0);
+    assert_eq!(no_cross_source["data"]["top_sessions"], json!([]));
+}
+
+#[test]
+fn analytics_incidents_rejects_zero_and_oversized_caps_before_opening_storage() {
+    let tmp = TempDir::new().unwrap();
+    for args in [
+        ["--limit", "0"],
+        ["--limit", "101"],
+        ["--max-sessions", "0"],
+        ["--max-sessions", "10001"],
+        ["--max-messages", "0"],
+        ["--max-bytes", "0"],
+        ["--budget-ms", "0"],
+    ] {
+        let mut cmd = base_cmd(tmp.path());
+        cmd.args(["analytics", "incidents", args[0], args[1], "--json"]);
+        let output = cmd.output().expect("run invalid analytics incidents cap");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "invalid cap should use the usage exit code: {args:?}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "robot usage failures keep stdout data-only: {args:?}"
+        );
+        let stderr: Value = serde_json::from_slice(&output.stderr)
+            .unwrap_or_else(|error| panic!("invalid-cap stderr is not JSON for {args:?}: {error}"));
+        assert_eq!(stderr["error"]["kind"], "usage", "args={args:?}");
+        assert_eq!(stderr["error"]["retryable"], false, "args={args:?}");
     }
 }
 

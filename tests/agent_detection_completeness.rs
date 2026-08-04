@@ -125,7 +125,7 @@ fn connector_factories_all_instantiate_and_detect() {
     // Required base connectors always present
     for required in [
         "codex", "cline", "gemini", "claude", "clawdbot", "vibe", "amp", "aider", "pi_agent",
-        "factory", "openclaw", "copilot",
+        "factory", "openclaw", "copilot", "grok",
     ] {
         assert!(
             unique.contains(required),
@@ -146,7 +146,7 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 20, "Expected 20 connector factories");
+    assert_eq!(slugs.len(), 23, "Expected 23 connector factories");
 }
 
 // ---------------------------------------------------------------------------

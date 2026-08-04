@@ -1,0 +1,214 @@
+{
+  "fixture_id": "guided-ops-integrated",
+  "description": "Cross-surface warning fixture for the guided operations golden gate",
+  "sources": {
+    "workflow_macros": {
+      "macro": "fix-ci-regression",
+      "facts": {
+        "ci_logs_available": true,
+        "failure_reproduced": true,
+        "privacy_review_complete": false
+      }
+    },
+    "privacy_exposure": {
+      "providers": [
+        {
+          "name": "codex",
+          "source_class": "local-session-history",
+          "enabled": true,
+          "roots": [
+            "/home/private-user/.codex/sessions"
+          ],
+          "file_count": 7,
+          "total_bytes": 4096,
+          "unreadable_count": 1,
+          "symlink_count": 0,
+          "secret_sample_count": 1,
+          "secret_samples": [
+            "private-user@example.invalid"
+          ]
+        }
+      ],
+      "excluded_agents": [
+        "private-agent"
+      ],
+      "raw_mirror": {
+        "enabled": false,
+        "manifest_count": 0,
+        "total_storage_bytes": 0
+      },
+      "exports": {
+        "chatgpt_encrypted_present": true,
+        "html_export_tier": "redacted"
+      },
+      "support_capsule": {
+        "requested": true
+      },
+      "repro_capsule": {
+        "requested": true
+      },
+      "source_mirror_capture": {
+        "requested": false
+      }
+    },
+    "resource_plan": {
+      "host": {
+        "profile": "laptop",
+        "cpu_count": 2,
+        "memory_total_mb": 1024,
+        "memory_available_mb": 256,
+        "disk_available_mb": 200
+      },
+      "cass": {
+        "db_size_mb": 5000,
+        "message_count": 2000000,
+        "semantic_model_installed": false,
+        "active_rebuild": true
+      },
+      "build_pressure": {
+        "level": "high"
+      }
+    },
+    "dependency_drift": {
+      "network": {
+        "upstream_status": "not_checked"
+      },
+      "dependencies": [
+        {
+          "name": "frankensearch",
+          "package": "frankensearch",
+          "manifest_table": "dependencies",
+          "manifest_key": "frankensearch",
+          "source_kind": "git",
+          "git": "https://example.invalid/frankensearch.git",
+          "manifest_status": "missing-rev",
+          "sibling_path": "../frankensearch",
+          "sibling_status": "clean",
+          "local_head": "1111111111111111111111111111111111111111",
+          "dirty": false,
+          "required_downstream_tests": [
+            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation",
+            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo check --all-targets"
+          ]
+        }
+      ]
+    },
+    "repro_capsule": {
+      "incident_kind": "ci-failure",
+      "cass_version": "0.6.22",
+      "command": "search /home/private-user/work/session.jsonl for private-user@example.invalid",
+      "transcript": "failed command referenced private session content at /home/private-user/work/session.jsonl",
+      "env": {
+        "os": "linux",
+        "home": "/home/private-user",
+        "email": "private-user@example.invalid"
+      },
+      "health_excerpt": {
+        "index_present": false,
+        "path": "/home/private-user/.local/share/cass/index"
+      },
+      "evidence_refs": [
+        "/home/private-user/work/session.jsonl:42"
+      ],
+      "expected": "shared fixture reproduction succeeds",
+      "actual": "failed command observed",
+      "private_session_text": "PRIVATE_SESSION_MARKER_NEVER_EMIT private-user@example.invalid",
+      "privacy_tier": "redacted"
+    },
+    "operations_dashboard": {
+      "current_goal": "investigate /home/private-user/work without exposing PRIVATE_SESSION_MARKER_NEVER_EMIT",
+      "guide": {
+        "intent": {
+          "raw": "fix-ci"
+        },
+        "recommended_action": "satisfy-prerequisites-then-follow-plan",
+        "plan": {
+          "macro_id": "fix-ci-regression",
+          "prerequisites": [
+            {
+              "fact": "privacy_review_complete",
+              "status": "unmet"
+            }
+          ],
+          "required_proof_gates": [
+            "guided-ops-golden"
+          ]
+        }
+      },
+      "workflow_macros": {
+        "macros": [
+          {
+            "id": "fix-ci-regression",
+            "title": "Diagnose CI safely",
+            "readiness": "blocked",
+            "privacy_tier": "redacted",
+            "missing_preflight_facts": [
+              "privacy_review_complete"
+            ]
+          }
+        ]
+      },
+      "resource_plan": {
+        "status": "warning",
+        "summary": {
+          "readiness": "blocked",
+          "recommended_action": "free-disk-before-action",
+          "blocked_count": 4,
+          "high_risk_count": 6,
+          "warning_count": 6
+        }
+      },
+      "privacy_exposure": {
+        "status": "warning",
+        "summary": {
+          "readiness": "opt-in-required",
+          "recommended_action": "confirm-required-opt-ins"
+        },
+        "risk_categories": [
+          {
+            "category": "private session text at /home/private-user/work",
+            "severity": "high",
+            "count": 1,
+            "blocking": true
+          }
+        ]
+      },
+      "repro_capsules": [
+        {
+          "local_ref": "artifacts/repro-capsule.json",
+          "payload": {
+            "status": "ok",
+            "manifest": {
+              "capsule_id": "capsule-blake3:guidedopsfixture",
+              "incident_kind": "ci-failure"
+            },
+            "capsule": {
+              "session_text": "PRIVATE_SESSION_MARKER_NEVER_EMIT"
+            },
+            "rerun": {
+              "targets_live_data": false,
+              "command_template": "cass swarm repro-capsule --json --fixture repro-capsule.fixture.json"
+            }
+          }
+        }
+      ],
+      "search_results": {
+        "results": [
+          {
+            "content": "PRIVATE_SESSION_MARKER_NEVER_EMIT",
+            "trust": {
+              "trust_tier": "stale",
+              "confidence": "medium",
+              "stale_reason": "aged_out",
+              "recommended_followup": "inspect private-user@example.invalid",
+              "provenance_refs": [
+                "commit:abcdef123456"
+              ]
+            }
+          }
+        ]
+      },
+      "next_proof_command": "cass swarm evidence --json"
+    }
+  }
+}

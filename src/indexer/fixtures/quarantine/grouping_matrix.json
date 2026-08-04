@@ -1,0 +1,25 @@
+{
+  "storage_version": 1,
+  "entries": {
+    "conv-b::v2": {
+      "first_attempt_at": "2026-06-02T00:00:00Z",
+      "last_attempt_at": "2026-06-02T00:00:00Z",
+      "attempt_count": 1,
+      "last_reason": "index-ingest-out-of-memory: 4.0 GiB",
+      "cass_version_at_quarantine": "0.6.13"
+    },
+    "conv-a::v1": {
+      "first_attempt_at": "2026-01-10T00:00:00Z",
+      "last_attempt_at": "2026-01-10T00:00:00Z",
+      "attempt_count": 3,
+      "last_reason": "index-ingest-out-of-memory: 3.7 GiB",
+      "cass_version_at_quarantine": "0.5.1"
+    },
+    "conv-c::v1": {
+      "first_attempt_at": "2026-04-04T00:00:00Z",
+      "last_attempt_at": "2026-04-04T00:00:00Z",
+      "attempt_count": 1,
+      "last_reason": "index-ingest-out-of-memory: legacy carry-over"
+    }
+  }
+}

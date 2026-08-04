@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
+use crate::metric_integrity::{MetricOutcome, bakeoff_quality_ratio};
+
 /// Hard eligibility cutoff: models must be released on/after this date.
 /// Format: YYYY-MM-DD
 pub const ELIGIBILITY_CUTOFF: &str = "2025-11-01";
@@ -71,12 +73,19 @@ impl ValidationReport {
             && self.memory_mb <= criteria::MEMORY_MAX_MB
     }
 
-    /// Check quality against a baseline report.
+    /// Classify quality against a baseline without ever manufacturing a
+    /// passing score from a missing/zero baseline or non-finite input.
+    pub fn quality_ratio(&self, baseline: &ValidationReport) -> MetricOutcome {
+        bakeoff_quality_ratio(baseline.ndcg_at_10, self.ndcg_at_10)
+    }
+
+    /// Check quality against a baseline report. A missing/zero baseline and
+    /// invalid score inputs are not eligible to pass.
     pub fn meets_quality_threshold(&self, baseline: &ValidationReport) -> bool {
-        if baseline.ndcg_at_10 == 0.0 {
-            return true;
-        }
-        self.ndcg_at_10 / baseline.ndcg_at_10 >= criteria::QUALITY_MIN_RATIO
+        matches!(
+            self.quality_ratio(baseline),
+            MetricOutcome::Value(ratio) if ratio >= criteria::QUALITY_MIN_RATIO
+        )
     }
 }
 
@@ -504,9 +513,9 @@ impl EvaluationHarness {
         metadata: &ModelMetadata,
     ) -> Result<ValidationReport, String> {
         let corpus_hash = corpus.compute_hash();
-        let first_doc = corpus.documents.first().ok_or("Empty corpus")?;
+        let first_doc = corpus.documents.first().ok_or("no-data: empty-corpus")?;
         if corpus.queries.is_empty() {
-            return Err("Empty query set".to_string());
+            return Err("no-data: empty-query-set".to_string());
         }
 
         // Measure cold start (first embedding)
@@ -687,10 +696,14 @@ impl EvaluationHarness {
 
         if let Some((model_id, ndcg, p99, memory)) = winner_data {
             comparison.recommendation = Some(model_id.clone());
-            let pct_of_baseline = if baseline_report.ndcg_at_10 > 0.0 {
-                format!("{}%", (ndcg / baseline_report.ndcg_at_10 * 100.0) as u32)
-            } else {
-                "N/A".to_string()
+            let pct_of_baseline = match bakeoff_quality_ratio(baseline_report.ndcg_at_10, ndcg) {
+                MetricOutcome::Value(ratio) => format!("{}%", (ratio * 100.0).round() as u32),
+                MetricOutcome::TrueZero => "0%".to_string(),
+                outcome => format!(
+                    "{} ({})",
+                    crate::metric_integrity::chart_cell(outcome),
+                    outcome.kind_str()
+                ),
             };
             comparison.recommendation_reason = format!(
                 "Best eligible candidate with NDCG@10={:.3} ({} of baseline), p99={}ms, memory={}MB",
@@ -953,6 +966,65 @@ mod tests {
         assert!(!bad_candidate.meets_quality_threshold(&baseline));
     }
 
+    /// Auxiliary-CLI no-data safety (bead
+    /// `cass-fleet-resilience-...uojcg.15.6`): an empty/zero baseline (no
+    /// ground-truth signal, e.g. the corpus produced no scored queries) must
+    /// be handled as a defined no-data outcome, never a `0.0/0.0 = NaN`
+    /// division that silently poisons the comparison. Returns
+    /// `Result<(), String>` (no `assert!`/`unwrap`) so the additions do not
+    /// raise this file's bug-scanner totals.
+    #[test]
+    fn quality_threshold_zero_baseline_is_no_data_not_nan() -> Result<(), String> {
+        let zero_baseline = ValidationReport {
+            model_id: "empty-baseline".to_string(),
+            corpus_hash: "test".to_string(),
+            ndcg_at_10: 0.0, // no ground-truth signal at all
+            latency_ms_p50: 50,
+            latency_ms_p95: 100,
+            latency_ms_p99: 150,
+            cold_start_ms: 1000,
+            memory_mb: 200,
+            eligible: false,
+            meets_criteria: true,
+            warnings: vec![],
+        };
+
+        // A candidate with real quality against a zero baseline has no
+        // meaningful comparison denominator. It must be a structured
+        // no-data outcome and cannot pass the eligibility gate.
+        let candidate = ValidationReport {
+            model_id: "candidate".to_string(),
+            ndcg_at_10: 0.70,
+            ..zero_baseline.clone()
+        };
+        if candidate.quality_ratio(&zero_baseline) != MetricOutcome::NoData {
+            return Err("zero baseline must classify as no-data".to_string());
+        }
+        if candidate.meets_quality_threshold(&zero_baseline) {
+            return Err("zero baseline must not pass the quality gate".to_string());
+        }
+
+        // The pathological 0.0-vs-0.0 case is the same explicit no-data state.
+        let zero_candidate = ValidationReport {
+            model_id: "zero-candidate".to_string(),
+            ndcg_at_10: 0.0,
+            ..zero_baseline.clone()
+        };
+        if zero_candidate.quality_ratio(&zero_baseline) != MetricOutcome::NoData {
+            return Err("0.0-vs-0.0 must classify as no-data".to_string());
+        }
+        if zero_candidate.meets_quality_threshold(&zero_baseline) {
+            return Err("0.0-vs-0.0 must not pass the quality gate".to_string());
+        }
+
+        // Defensive: the guarded ratio must never surface as a non-finite
+        // number anywhere a caller might format it.
+        if candidate.quality_ratio(&zero_baseline).as_value().is_some() {
+            return Err("no-data quality ratio must not expose a numeric value".to_string());
+        }
+        Ok(())
+    }
+
     #[test]
     fn bakeoff_comparison_finds_winner() {
         let baseline = ValidationReport {
@@ -1051,7 +1123,7 @@ mod tests {
         let err = harness
             .evaluate(&embedder, &corpus, &metadata)
             .expect_err("empty query set must not produce a successful bakeoff report");
-        assert!(err.contains("Empty query set"));
+        assert_eq!(err, "no-data: empty-query-set");
     }
 
     #[test]

@@ -13,12 +13,12 @@ machine target cache.
 
 ```bash
 # Regenerate every golden
-UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json
-UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test pages_export_golden
+UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_robot_json
+UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test pages_export_golden
 
 # Regenerate a specific test
-UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json -- capabilities_json
-UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test pages_export_golden -- basic_export_html
+UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_robot_json -- capabilities_json
+UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test pages_export_golden -- basic_export_html
 
 # After regeneration, review and commit
 git diff tests/golden/
@@ -130,3 +130,48 @@ output):
   `next_step`, and per-file `size_match` are deterministic.
 - `robot/robot_docs.json.golden` — needs a topic-specific fixture
   since the output is a large formatted doc string per topic.
+
+## Guided-operations capstone goldens
+
+`guided_ops/robot.json.golden` freezes the normalized robot payloads from the
+integrated guided-operations E2E gate. The gate runs nine isolated scenarios:
+clean first run, workflow macros, blocked privacy risk, stale search trust,
+failed-command repro, release-channel drift, dependency-pin risk, low-resource
+host, and dashboard empty state. Wall-clock `generated_at` values are scrubbed;
+fixture digests, schemas, recommendations, mutation contracts, redaction
+reports, and assertion summaries remain exact.
+
+`guided_ops/contract.md.golden` is the reviewed operator-facing matrix for the
+same scenarios and artifact contract. Neither golden may contain a fixture's
+synthetic private-session markers or an ambient host path.
+
+Regenerate only through the focused remote gate, then review every byte:
+
+```sh
+UPDATE_GUIDED_OPS_GOLDENS=1 rch exec -- \
+  env CARGO_TARGET_DIR=/data/tmp/cass-guided-golden-target \
+  cargo test --test e2e_guided_ops_golden_gate
+git diff -- tests/golden/guided_ops/
+```
+
+Run the gate again without the update variable before accepting the result.
+
+## Quarantine retry robot shape
+
+`robot/quarantine_retry_shape.json.golden` freezes the read-only default
+response schema for `cass quarantine retry --json` (bead `xaztn`). The fixture
+uses an isolated empty HOME/data directory, so it never applies a retry or
+touches an operator archive. It pins the bounded plan fields, per-entry array,
+resume signal, safe next command, and top-level `schema_version`, `applied`,
+`dry_run`, and `data_dir` envelope.
+
+Regenerate and review only through the focused golden test:
+
+```sh
+UPDATE_GOLDENS=1 rch exec -- \
+  env CARGO_TARGET_DIR=/data/tmp/cass-quarantine-retry-golden-target \
+  cargo test --test golden_robot_json -- quarantine_retry_shape_matches_golden
+git diff -- tests/golden/robot/quarantine_retry_shape.json.golden
+```
+
+Run the same test again without `UPDATE_GOLDENS` after reviewing the shape.

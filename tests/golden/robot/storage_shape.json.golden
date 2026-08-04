@@ -1,0 +1,58 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer"
+    },
+    "data_dir": {
+      "type": "string"
+    },
+    "data_dir_exists": {
+      "type": "boolean"
+    },
+    "db_path": {
+      "type": "string"
+    },
+    "db_exists": {
+      "type": "boolean"
+    },
+    "total_bytes": {
+      "type": "integer"
+    },
+    "total_human": {
+      "type": "string"
+    },
+    "total_file_count": {
+      "type": "integer"
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "component": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "integer"
+          },
+          "human": {
+            "type": "string"
+          },
+          "file_count": {
+            "type": "integer"
+          },
+          "percent_of_total": {
+            "type": "number"
+          },
+          "derived_reclaimable": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

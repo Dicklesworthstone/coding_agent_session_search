@@ -498,6 +498,7 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "cursor" | "cursor_ai" => "agent-cursor",
         "chatgpt" | "openai" => "agent-chatgpt",
         "gemini" | "gemini_cli" | "google" => "agent-gemini",
+        "antigravity" | "agy" => "agent-antigravity",
         "aider" => "agent-aider",
         "copilot" | "copilot_cli" | "github_copilot" | "github_copilot_cli" => "agent-copilot",
         "cody" | "sourcegraph" => "agent-cody",
@@ -511,6 +512,7 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "vibe" | "mistral" => "agent-chatgpt",
         "crush" => "agent-amp",
         "hermes" => "agent-hermes",
+        "openhands" | "open_hands" => "agent-aider",
         _ => "agent-default",
     }
 }
@@ -524,6 +526,7 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "cursor" | "cursor_ai" => "Cursor",
         "chatgpt" | "openai" => "ChatGPT",
         "gemini" | "gemini_cli" | "google" => "Gemini",
+        "antigravity" | "agy" => "Antigravity",
         "aider" => "Aider",
         "copilot" | "github_copilot" => "GitHub Copilot",
         "copilot_cli" | "github_copilot_cli" => "GitHub Copilot CLI",
@@ -543,6 +546,7 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "hermes" => "Hermes",
         "kimi" => "Kimi",
         "qwen" => "Qwen",
+        "openhands" | "open_hands" => "OpenHands",
         _ => "AI Assistant",
     }
 }

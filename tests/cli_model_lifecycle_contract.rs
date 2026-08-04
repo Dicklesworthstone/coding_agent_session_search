@@ -401,7 +401,7 @@ fn models_backfill_keeps_semantic_work_data_dir_and_db_scoped() -> Result<(), St
 //   2. --from-file <empty-dir>
 //      - exit 21, err.kind == "model", err.code == 21,
 //        err.retryable == false, hint enumerates the required file set
-//        (model.onnx, tokenizer.json, config.json, ...).
+//        (model.safetensors, tokenizer.json, config.json, ...).
 // ========================================================================
 
 #[test]
@@ -578,10 +578,10 @@ fn models_install_from_file_empty_dir_emits_required_file_error() {
         .expect("hint must be a string");
     // Hint must enumerate the expected file set so operators can
     // assemble the air-gap bundle correctly. At minimum it names
-    // model.onnx and tokenizer.json.
+    // model.safetensors and tokenizer.json.
     assert!(
-        hint.contains("model.onnx"),
-        "hint must name the required model.onnx file; got: {hint:?}"
+        hint.contains("model.safetensors"),
+        "hint must name the required model.safetensors file; got: {hint:?}"
     );
     assert!(
         hint.contains("tokenizer.json"),

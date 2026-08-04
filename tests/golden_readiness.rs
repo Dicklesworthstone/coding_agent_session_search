@@ -6,7 +6,7 @@
 //! `recommended_action` fails loudly at commit time.
 //!
 //! Regenerate with:
-//! `UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_readiness`
+//! `UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_readiness`
 
 use assert_cmd::Command;
 use coding_agent_search::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
@@ -112,7 +112,7 @@ fn assert_golden(name: &str, actual: &str) {
         panic!(
             "Golden file missing or unreadable: {}\n{err}\n\n\
              Run with UPDATE_GOLDENS=1 to create it, then review and commit:\n\
-             \tUPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_readiness\n\
+             \tUPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_readiness\n\
              \tgit diff tests/golden/\n\
              \tgit add tests/golden/",
             golden_path.display(),
@@ -127,7 +127,7 @@ fn assert_golden(name: &str, actual: &str) {
              Expected: {}\n\
              Actual:   {}\n\n\
              diff the two files, then either fix the code or regenerate with:\n\
-             \tUPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_readiness",
+             \tUPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_readiness",
             golden_path.display(),
             actual_path.display(),
         );

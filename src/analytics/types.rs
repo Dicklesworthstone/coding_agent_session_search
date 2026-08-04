@@ -319,7 +319,9 @@ impl UsageBucket {
             },
             "coverage": {
                 "api_coverage_message_count": self.api_coverage_message_count,
-                "api_coverage_pct": derived.api_coverage_pct,
+                "api_coverage_pct": derived.api_coverage_pct.as_value(),
+                "api_coverage_status": derived.api_coverage_pct.kind_str(),
+                "api_coverage_display": crate::metric_integrity::chart_cell(derived.api_coverage_pct),
             },
             "derived": {
                 "api_tokens_per_assistant_msg": derived.api_tokens_per_assistant_msg,
@@ -404,7 +406,9 @@ impl BreakdownRow {
             "value": self.value,
             "message_count": self.message_count,
             "derived": {
-                "api_coverage_pct": derived.api_coverage_pct,
+                "api_coverage_pct": derived.api_coverage_pct.as_value(),
+                "api_coverage_status": derived.api_coverage_pct.kind_str(),
+                "api_coverage_display": crate::metric_integrity::chart_cell(derived.api_coverage_pct),
                 "tool_calls_per_1k_api_tokens": derived.tool_calls_per_1k_api_tokens,
                 "plan_message_pct": derived.plan_message_pct,
             },
@@ -566,10 +570,10 @@ impl TableInfo {
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct CoverageInfo {
     pub total_messages: i64,
-    pub message_metrics_coverage_pct: f64,
-    pub api_token_coverage_pct: f64,
-    pub model_name_coverage_pct: f64,
-    pub estimate_only_pct: f64,
+    pub message_metrics_coverage_pct: crate::metric_integrity::MetricOutcome,
+    pub api_token_coverage_pct: crate::metric_integrity::MetricOutcome,
+    pub model_name_coverage_pct: crate::metric_integrity::MetricOutcome,
+    pub estimate_only_pct: crate::metric_integrity::MetricOutcome,
 }
 
 /// Drift detection output.
@@ -621,10 +625,18 @@ impl StatusResult {
             "tables": tables_json,
             "coverage": {
                 "total_messages": self.coverage.total_messages,
-                "message_metrics_coverage_pct": self.coverage.message_metrics_coverage_pct,
-                "api_token_coverage_pct": self.coverage.api_token_coverage_pct,
-                "model_name_coverage_pct": self.coverage.model_name_coverage_pct,
-                "estimate_only_pct": self.coverage.estimate_only_pct,
+                "message_metrics_coverage_pct": self.coverage.message_metrics_coverage_pct.as_value(),
+                "message_metrics_coverage_status": self.coverage.message_metrics_coverage_pct.kind_str(),
+                "message_metrics_coverage_display": crate::metric_integrity::chart_cell(self.coverage.message_metrics_coverage_pct),
+                "api_token_coverage_pct": self.coverage.api_token_coverage_pct.as_value(),
+                "api_token_coverage_status": self.coverage.api_token_coverage_pct.kind_str(),
+                "api_token_coverage_display": crate::metric_integrity::chart_cell(self.coverage.api_token_coverage_pct),
+                "model_name_coverage_pct": self.coverage.model_name_coverage_pct.as_value(),
+                "model_name_coverage_status": self.coverage.model_name_coverage_pct.kind_str(),
+                "model_name_coverage_display": crate::metric_integrity::chart_cell(self.coverage.model_name_coverage_pct),
+                "estimate_only_pct": self.coverage.estimate_only_pct.as_value(),
+                "estimate_only_status": self.coverage.estimate_only_pct.kind_str(),
+                "estimate_only_display": crate::metric_integrity::chart_cell(self.coverage.estimate_only_pct),
             },
             "drift": {
                 "signals": signals_json,
@@ -669,7 +681,7 @@ pub struct UnpricedModelsReport {
 /// Computed ratios from a [`UsageBucket`].
 #[derive(Debug, Clone, Serialize)]
 pub struct DerivedMetrics {
-    pub api_coverage_pct: f64,
+    pub api_coverage_pct: crate::metric_integrity::MetricOutcome,
     pub api_tokens_per_assistant_msg: Option<f64>,
     pub content_tokens_per_user_msg: Option<f64>,
     pub tool_calls_per_1k_api_tokens: Option<f64>,

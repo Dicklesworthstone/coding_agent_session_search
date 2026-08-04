@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "data_dir": "[TEST_HOME]/coding-agent-search",
+  "data_dir_exists": false,
+  "db_path": "[TEST_HOME]/coding-agent-search/agent_search.db",
+  "db_exists": false,
+  "total_bytes": 0,
+  "total_human": "0 bytes",
+  "total_file_count": 0,
+  "components": [
+    {
+      "component": "canonical_db",
+      "label": "Canonical DB (agent_search.db)",
+      "bytes": 0,
+      "human": "0 bytes",
+      "file_count": 0,
+      "percent_of_total": 0.0,
+      "derived_reclaimable": false
+    },
+    {
+      "component": "db_wal",
+      "label": "DB WAL (agent_search.db-wal)",
+      "bytes": 0,
+      "human": "0 bytes",
+      "file_count": 0,
+      "percent_of_total": 0.0,
+      "derived_reclaimable": true
+    },
+    {
+      "component": "db_shm",
+      "label": "DB shared-memory (agent_search.db-shm)",
+      "bytes": 0,
+      "human": "0 bytes",
+      "file_count": 0,
+      "percent_of_total": 0.0,
+      "derived_reclaimable": true
+    },
+    {
+      "component": "lexical_index",
+      "label": "Lexical index (index/)",
+      "bytes": 0,
+      "human": "0 bytes",
+      "file_count": 0,
+      "percent_of_total": 0.0,
+      "derived_reclaimable": true
+    },
+    {
+      "component": "raw_mirror",
+      "label": "Raw mirror (raw-mirror/)",
+      "bytes": 0,
+      "human": "0 bytes",
+      "file_count": 0,
+      "percent_of_total": 0.0,
+      "derived_reclaimable": false
+    },
+    {
+      "component": "semantic_index",
+      "label": "Semantic index (vector_index/, semantic/)",
+      "bytes": 0,
+      "human": "0 bytes",
+      "file_count": 0,
+      "percent_of_total": 0.0,
+      "derived_reclaimable": true
+    },
+    {
+      "component": "quarantine",
+      "label": "Quarantine (quarantine/, doctor-quarantine/)",
+      "bytes": 0,
+      "human": "0 bytes",
+      "file_count": 0,
+      "percent_of_total": 0.0,
+      "derived_reclaimable": true
+    },
+    {
+      "component": "backups",
+      "label": "Backups (backups/)",
+      "bytes": 0,
+      "human": "0 bytes",
+      "file_count": 0,
+      "percent_of_total": 0.0,
+      "derived_reclaimable": true
+    },
+    {
+      "component": "other",
+      "label": "Other (remotes, caches, locks, misc)",
+      "bytes": 0,
+      "human": "0 bytes",
+      "file_count": 0,
+      "percent_of_total": 0.0,
+      "derived_reclaimable": false
+    }
+  ]
+}

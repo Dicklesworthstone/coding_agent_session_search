@@ -4,7 +4,7 @@
 //! small fragments. Regenerate with:
 //!
 //! ```bash
-//! UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test pages_export_golden
+//! UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test pages_export_golden
 //! git diff tests/golden/html_export/        # review every exported HTML diff
 //! git add tests/golden/html_export/
 //! ```
@@ -215,7 +215,7 @@ fn assert_golden(name: &str, actual: &str) {
                 !missing_golden,
                 "Golden file missing or unreadable: {}\n{err}\n\n\
              Run with UPDATE_GOLDENS=1 to create it, then review and commit:\n\
-             \tUPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test pages_export_golden\n\
+             \tUPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test pages_export_golden\n\
              \tgit diff tests/golden/html_export/",
                 golden_path.display(),
             );

@@ -3,26 +3,38 @@
 //! Processes embedding jobs on a dedicated thread using sync primitives.
 //! Adapted from xf's async worker to cass's sync daemon architecture.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use tracing::{debug, error, info, warn};
 
 use crate::indexer::semantic::{
-    EmbeddingInput, SemanticIndexer, message_id_from_db, saturating_u32_from_i64,
+    EmbeddingInput, SemanticIndexer, expected_vector_space_revision, message_id_from_db,
+    saturating_u32_from_i64, semantic_doc_id_for_input,
 };
-use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
+use crate::search::canonicalize::canonicalize_for_embedding;
 use crate::search::fastembed_embedder::FastEmbedder;
-use crate::search::vector_index::{
-    VectorIndex, parse_semantic_doc_id, role_code_from_str, vector_index_path,
-};
+use crate::search::semantic_manifest::TierKind;
+use crate::search::vector_index::{VectorIndex, role_code_from_str, vector_index_path};
 use crate::storage::sqlite::FrankenStorage;
 
 const HASH_EMBEDDER_MODEL: &str = "hash";
 const DEFAULT_SEMANTIC_MODEL: &str = "minilm";
+
+/// How many documents to embed per progress/cancellation checkpoint. Matches
+/// the healthy MiniLM batch size observed in cass#257 telemetry.
+const EMBED_PROGRESS_CHUNK_SIZE: usize = 128;
+
+/// How an embedding pass ended: normally, or via a user cancel (which must be
+/// recorded as cancelled, not failed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingPassOutcome {
+    Completed,
+    Cancelled,
+}
 
 /// Configuration for a single embedding job.
 #[derive(Debug, Clone)]
@@ -69,6 +81,15 @@ pub enum WorkerMessage {
     Shutdown,
 }
 
+/// The (db_path, model) pass the worker thread is currently embedding, used
+/// by the handle to decide whether a cancel targets the running job or only
+/// needs database-level cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunningEmbeddingPass {
+    db_path: String,
+    model: String,
+}
+
 /// Handle for sending messages to the background worker.
 #[derive(Clone)]
 pub struct EmbeddingWorkerHandle {
@@ -76,6 +97,8 @@ pub struct EmbeddingWorkerHandle {
     /// Shared cancel flag — set directly from the handle so cancellation
     /// takes effect even while `process_job` is running on the worker thread.
     cancel_flag: Arc<AtomicBool>,
+    /// The pass currently running on the worker thread, if any.
+    running_pass: Arc<Mutex<Option<RunningEmbeddingPass>>>,
 }
 
 impl EmbeddingWorkerHandle {
@@ -88,10 +111,25 @@ impl EmbeddingWorkerHandle {
 
     /// Cancel embedding jobs for a db_path.
     ///
-    /// Sets the cancel flag directly (so the running job sees it immediately)
-    /// AND sends a Cancel message for database-level cleanup.
+    /// Sets the cancel flag directly — but only when the worker is currently
+    /// running a pass for that `db_path` (and `model_id`, when given) — so a
+    /// cancel aimed at one data dir can never abort another client's job.
+    /// Always sends a Cancel message for database-level cleanup.
     pub fn cancel(&self, db_path: String, model_id: Option<String>) -> Result<(), String> {
-        self.cancel_flag.store(true, Ordering::SeqCst);
+        let targets_running_job = self
+            .running_pass
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .is_some_and(|running| {
+                running.db_path == db_path
+                    && model_id
+                        .as_deref()
+                        .is_none_or(|model| running.model == model)
+            });
+        if targets_running_job {
+            self.cancel_flag.store(true, Ordering::SeqCst);
+        }
         self.sender
             .send(WorkerMessage::Cancel { db_path, model_id })
             .map_err(|e| format!("worker channel closed: {e}"))
@@ -109,6 +147,7 @@ impl EmbeddingWorkerHandle {
 pub struct EmbeddingWorker {
     receiver: Receiver<WorkerMessage>,
     cancel_flag: Arc<AtomicBool>,
+    running_pass: Arc<Mutex<Option<RunningEmbeddingPass>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +156,41 @@ enum WorkerEmbedderKind {
     FastEmbed {
         model_name: String,
         embedder_id: String,
+        dimension: usize,
     },
+}
+
+#[derive(Debug, Default)]
+struct ExistingIndexState {
+    path_exists: bool,
+    readable: bool,
+    compatible: bool,
+    active_doc_counts: HashMap<String, usize>,
+    record_count: usize,
+    tombstone_count: usize,
+    wal_record_count: usize,
+}
+
+impl ExistingIndexState {
+    fn active_count(&self, doc_id: &str) -> usize {
+        if !self.compatible {
+            return 0;
+        }
+        self.active_doc_counts.get(doc_id).copied().unwrap_or(0)
+    }
+
+    fn exactly_matches(&self, current_doc_ids: &HashSet<String>) -> bool {
+        self.path_exists
+            && self.readable
+            && self.compatible
+            && self.tombstone_count == 0
+            && self.wal_record_count == 0
+            && self.record_count == current_doc_ids.len()
+            && self.active_doc_counts.len() == current_doc_ids.len()
+            && current_doc_ids
+                .iter()
+                .all(|doc_id| self.active_count(doc_id) == 1)
+    }
 }
 
 fn resolve_embedder_kind(
@@ -133,13 +206,9 @@ fn resolve_embedder_kind(
 
     let normalized_name = match model_name.to_ascii_lowercase().as_str() {
         "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => DEFAULT_SEMANTIC_MODEL,
-        "snowflake-arctic-s" | "snowflake-arctic-s-384" | "snowflake-arctic-embed-s" => {
-            "snowflake-arctic-s"
-        }
-        "nomic-embed" | "nomic-embed-768" | "nomic-embed-text-v1.5" => "nomic-embed",
         _ => {
             anyhow::bail!(
-                "unsupported semantic model '{model_name}' for daemon embedding worker; supported: minilm, snowflake-arctic-s, nomic-embed"
+                "unsupported semantic model '{model_name}' for daemon embedding worker; the pure-Rust native backend supports only minilm (all-MiniLM-L6-v2)"
             );
         }
     };
@@ -150,6 +219,7 @@ fn resolve_embedder_kind(
     Ok(WorkerEmbedderKind::FastEmbed {
         model_name: normalized_name.to_string(),
         embedder_id: config.embedder_id,
+        dimension: config.dimension,
     })
 }
 
@@ -162,13 +232,16 @@ impl EmbeddingWorker {
     pub fn new() -> (Self, EmbeddingWorkerHandle) {
         let (sender, receiver) = std::sync::mpsc::channel();
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let running_pass = Arc::new(Mutex::new(None));
         let handle = EmbeddingWorkerHandle {
             sender,
             cancel_flag: Arc::clone(&cancel_flag),
+            running_pass: Arc::clone(&running_pass),
         };
         let worker = Self {
             receiver,
             cancel_flag,
+            running_pass,
         };
         (worker, handle)
     }
@@ -220,11 +293,6 @@ impl EmbeddingWorker {
         let messages = storage.fetch_messages_for_embedding()?;
         let total_docs = saturating_i64_from_usize(messages.len());
 
-        if total_docs == 0 {
-            info!(db_path = %config.db_path, "No messages to embed");
-            return Ok(());
-        }
-
         info!(
             db_path = %config.db_path,
             total_docs,
@@ -244,17 +312,36 @@ impl EmbeddingWorker {
             let job_id = storage.upsert_embedding_job(&config.db_path, model_name, total_docs)?;
             storage.start_embedding_job(job_id)?;
 
-            match self.generate_embeddings_and_save(
+            if let Ok(mut guard) = self.running_pass.lock() {
+                *guard = Some(RunningEmbeddingPass {
+                    db_path: config.db_path.clone(),
+                    model: model_name.clone(),
+                });
+            }
+            let pass_result = self.generate_embeddings_and_save(
                 &storage,
                 &messages,
                 model_name,
                 *use_semantic,
                 job_id,
                 index_path,
-            ) {
-                Ok(()) => {
+                db_path,
+            );
+            if let Ok(mut guard) = self.running_pass.lock() {
+                *guard = None;
+            }
+
+            match pass_result {
+                Ok(EmbeddingPassOutcome::Completed) => {
                     storage.complete_embedding_job(job_id)?;
                     info!(model = model_name, "Embedding pass completed");
+                }
+                Ok(EmbeddingPassOutcome::Cancelled) => {
+                    // A user cancel is not a failure — record it as cancelled
+                    // so job status matches what actually happened.
+                    let _ = storage.cancel_embedding_jobs(&config.db_path, Some(model_name));
+                    info!(model = model_name, "Embedding pass cancelled");
+                    return Ok(());
                 }
                 Err(e) => {
                     let err_msg = format!("{e:#}");
@@ -290,6 +377,7 @@ impl EmbeddingWorker {
     }
 
     /// Generate embeddings for messages and save the vector index.
+    #[allow(clippy::too_many_arguments)]
     fn generate_embeddings_and_save(
         &self,
         storage: &FrankenStorage,
@@ -298,20 +386,21 @@ impl EmbeddingWorker {
         use_semantic: bool,
         job_id: i64,
         index_path: &Path,
-    ) -> anyhow::Result<()> {
+        db_path: &Path,
+    ) -> anyhow::Result<EmbeddingPassOutcome> {
         let embedder_kind = resolve_embedder_kind(model_name, use_semantic)?;
 
-        // Load existing index to check for unchanged documents
-        let existing_hashes = self.load_existing_hashes(index_path, &embedder_kind);
-
-        // Prepare inputs, skipping unchanged documents
-        let mut inputs: Vec<EmbeddingInput> = Vec::new();
+        // Build the canonical identities before deciding what to embed. A
+        // message-id-to-hash map is insufficient here: doc IDs also encode
+        // metadata, duplicate live records are possible, and an edited row's
+        // old identity must be removed rather than merely appended around.
+        let mut canonical_inputs: Vec<(String, EmbeddingInput)> = Vec::new();
         let mut skipped_count = 0usize;
         let mut completed = 0i64;
 
         for msg in messages {
             if self.cancel_flag.load(Ordering::SeqCst) {
-                return Err(anyhow::anyhow!("job cancelled"));
+                return Ok(EmbeddingPassOutcome::Cancelled);
             }
 
             let canonical = canonicalize_for_embedding(&msg.content);
@@ -320,7 +409,6 @@ impl EmbeddingWorker {
                 continue;
             }
 
-            let hash = content_hash(&canonical);
             let role = role_code_from_str(&msg.role).unwrap_or(0);
 
             // Invalid/negative IDs indicate corrupted data; skip rather than collapsing to 0.
@@ -333,20 +421,11 @@ impl EmbeddingWorker {
                 continue;
             };
 
-            // Check if this document is unchanged - skip re-embedding if hash matches
-            if let Some(existing_hash) = existing_hashes.get(&message_id)
-                && *existing_hash == hash
-            {
-                skipped_count += 1;
-                completed += 1;
-                continue;
-            }
-
             // Clamp to a stable range instead of silently wrapping/failing.
             let agent_id = saturating_u32_from_i64(msg.agent_id);
             let workspace_id = saturating_u32_from_i64(msg.workspace_id.unwrap_or(0));
 
-            inputs.push(EmbeddingInput {
+            let input = EmbeddingInput {
                 message_id,
                 created_at_ms: msg.created_at.unwrap_or(0),
                 agent_id,
@@ -355,24 +434,63 @@ impl EmbeddingWorker {
                 role,
                 chunk_idx: 0,
                 content: canonical,
-            });
-
-            completed += 1;
-            if completed % 100 == 0 {
-                let _ = storage.update_job_progress(job_id, completed);
-                debug!(job_id, completed, "Embedding progress");
-            }
+            };
+            let Some(doc_id) = semantic_doc_id_for_input(&input) else {
+                completed += 1;
+                continue;
+            };
+            canonical_inputs.push((doc_id, input));
         }
 
-        if inputs.is_empty() {
+        let current_doc_ids = canonical_inputs
+            .iter()
+            .map(|(doc_id, _)| doc_id.clone())
+            .collect::<HashSet<_>>();
+        if current_doc_ids.len() != canonical_inputs.len() {
+            anyhow::bail!("daemon embedding input contains duplicate canonical document IDs");
+        }
+
+        let existing_state = self.load_existing_index_state(index_path, &embedder_kind);
+        if existing_state.exactly_matches(&current_doc_ids) {
+            let final_completed = saturating_i64_from_usize(messages.len());
+            let _ = storage.update_job_progress(job_id, final_completed);
+            info!(
+                model = model_name,
+                skipped = canonical_inputs.len(),
+                "Semantic index already exactly matches the canonical database"
+            );
+            return Ok(EmbeddingPassOutcome::Completed);
+        }
+
+        let inputs = canonical_inputs
+            .into_iter()
+            .filter_map(|(doc_id, input)| {
+                if existing_state.active_count(&doc_id) == 1 {
+                    skipped_count += 1;
+                    completed += 1;
+                    None
+                } else {
+                    Some(input)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // `completed` so far counts only documents that are genuinely done
+        // (empty, invalid, or unchanged). Documents queued for embedding are
+        // counted as their chunk finishes, so job progress reflects the
+        // expensive embedding work instead of racing to ~100% during the
+        // cheap scan phase.
+        let _ = storage.update_job_progress(job_id, completed);
+
+        if inputs.is_empty() && !existing_state.path_exists {
             let final_completed = saturating_i64_from_usize(messages.len());
             let _ = storage.update_job_progress(job_id, final_completed);
             info!(
                 model = model_name,
                 skipped = skipped_count,
-                "No documents to embed - all unchanged"
+                "No canonical documents and no semantic index to reconcile"
             );
-            return Ok(());
+            return Ok(EmbeddingPassOutcome::Completed);
         }
 
         info!(
@@ -383,27 +501,53 @@ impl EmbeddingWorker {
         );
 
         // Create the appropriate embedder/indexer
-        let indexer = match embedder_kind {
+        let indexer = match &embedder_kind {
             WorkerEmbedderKind::Hash => SemanticIndexer::new(HASH_EMBEDDER_MODEL, None)?,
-            WorkerEmbedderKind::FastEmbed { ref model_name, .. } => {
+            WorkerEmbedderKind::FastEmbed { model_name, .. } => {
                 SemanticIndexer::new(model_name, Some(index_path))?
             }
         };
 
-        // Embed messages
-        let embedded = indexer.embed_messages(&inputs)?;
+        // Embed in bounded chunks so a long semantic pass reports progress
+        // and honors cancellation between chunks instead of running as one
+        // opaque, uncancellable block.
+        let mut embedded = Vec::with_capacity(inputs.len());
+        for chunk in inputs.chunks(EMBED_PROGRESS_CHUNK_SIZE) {
+            if self.cancel_flag.load(Ordering::SeqCst) {
+                return Ok(EmbeddingPassOutcome::Cancelled);
+            }
+            embedded.extend(indexer.embed_messages(chunk)?);
+            completed += saturating_i64_from_usize(chunk.len());
+            let _ = storage.update_job_progress(job_id, completed);
+            debug!(job_id, completed, "Embedding progress");
+        }
 
         // Update final progress
         let final_completed = saturating_i64_from_usize(messages.len());
         let _ = storage.update_job_progress(job_id, final_completed);
 
-        // Append to existing vector index, or create a new one if none exists.
-        // Using append_to_index preserves previously-indexed unchanged documents
-        // that were skipped by the dedup check above.
+        // Existing artifacts are reconciled through a private candidate and
+        // atomic publish. This removes stale identities, collapses duplicate
+        // live records, clears tombstones/WAL state, and preserves exact
+        // unchanged vectors without exposing a half-updated index.
         let save_path = vector_index_path(index_path, indexer.embedder_id());
-        if save_path.exists() {
-            let appended = indexer.append_to_index(embedded, index_path)?;
-            info!(appended, "Appended to existing vector index");
+        if existing_state.path_exists {
+            let tier = match &embedder_kind {
+                WorkerEmbedderKind::Hash => TierKind::Fast,
+                WorkerEmbedderKind::FastEmbed { .. } => TierKind::Quality,
+            };
+            let db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(db_path)?;
+            let reconciled = indexer.reconcile_index_with_canonical_documents(
+                embedded,
+                index_path,
+                tier,
+                &db_fingerprint,
+                &current_doc_ids,
+            )?;
+            info!(
+                published = reconciled.record_count(),
+                "Reconciled semantic index with canonical documents"
+            );
         } else {
             let _index = indexer.build_and_save_index(embedded, index_path)?;
         }
@@ -415,55 +559,78 @@ impl EmbeddingWorker {
             "Saved vector index"
         );
 
-        Ok(())
+        Ok(EmbeddingPassOutcome::Completed)
     }
 
-    /// Load content hashes from an existing vector index for dedup.
-    fn load_existing_hashes(
+    /// Load exact active document identities from an existing vector index.
+    fn load_existing_index_state(
         &self,
         index_path: &Path,
         embedder_kind: &WorkerEmbedderKind,
-    ) -> HashMap<u64, [u8; 32]> {
+    ) -> ExistingIndexState {
         let embedder_id = match embedder_kind {
             WorkerEmbedderKind::Hash => "fnv1a-384",
             WorkerEmbedderKind::FastEmbed { embedder_id, .. } => embedder_id.as_str(),
+        };
+        let expected_dimension = match embedder_kind {
+            WorkerEmbedderKind::Hash => crate::search::hash_embedder::DEFAULT_DIMENSION,
+            WorkerEmbedderKind::FastEmbed { dimension, .. } => *dimension,
         };
 
         let fsvi_path = vector_index_path(index_path, embedder_id);
 
         if !fsvi_path.exists() {
-            return HashMap::new();
+            return ExistingIndexState::default();
         }
 
         match VectorIndex::open(&fsvi_path) {
             Ok(index) => {
-                let mut hashes = HashMap::new();
+                let compatible =
+                    expected_vector_space_revision(embedder_id).is_some_and(|expected_revision| {
+                        index.embedder_id() == embedder_id
+                            && index.dimension() == expected_dimension
+                            && index.embedder_revision() == expected_revision
+                    });
+                let mut active_doc_counts = HashMap::new();
                 for idx in 0..index.record_count() {
+                    if index.is_deleted(idx) {
+                        continue;
+                    }
                     let doc_id_str = match index.doc_id_at(idx) {
                         Ok(doc_id) => doc_id,
                         Err(_) => continue,
                     };
-
-                    if let Some(parsed) = parse_semantic_doc_id(doc_id_str)
-                        && let Some(hash) = parsed.content_hash
-                    {
-                        hashes.insert(parsed.message_id, hash);
-                    }
+                    *active_doc_counts.entry(doc_id_str.to_owned()).or_insert(0) += 1;
                 }
                 debug!(
                     path = %fsvi_path.display(),
-                    count = hashes.len(),
-                    "Loaded existing hashes for dedup"
+                    active = active_doc_counts.len(),
+                    records = index.record_count(),
+                    tombstones = index.tombstone_count(),
+                    wal_records = index.wal_record_count(),
+                    compatible,
+                    "Loaded existing semantic identities for reconciliation"
                 );
-                hashes
+                ExistingIndexState {
+                    path_exists: true,
+                    readable: true,
+                    compatible,
+                    active_doc_counts,
+                    record_count: index.record_count(),
+                    tombstone_count: index.tombstone_count(),
+                    wal_record_count: index.wal_record_count(),
+                }
             }
             Err(e) => {
                 warn!(
                     path = %fsvi_path.display(),
                     error = %e,
-                    "Failed to load existing index for dedup"
+                    "Failed to load existing index for reconciliation"
                 );
-                HashMap::new()
+                ExistingIndexState {
+                    path_exists: true,
+                    ..ExistingIndexState::default()
+                }
             }
         }
     }
@@ -491,7 +658,48 @@ mod tests {
         WorkerEmbedderKind::FastEmbed {
             model_name: model_name.to_string(),
             embedder_id: embedder_id.to_string(),
+            dimension: 384,
         }
+    }
+
+    #[test]
+    fn cancel_only_flags_matching_running_pass() {
+        let (worker, handle) = EmbeddingWorker::new();
+        if let Ok(mut guard) = worker.running_pass.lock() {
+            *guard = Some(RunningEmbeddingPass {
+                db_path: "/data/a.db".to_string(),
+                model: "minilm".to_string(),
+            });
+        }
+
+        // Different db_path: must not abort the running job.
+        assert!(handle.cancel("/data/b.db".to_string(), None).is_ok());
+        assert!(
+            !worker.cancel_flag.load(Ordering::SeqCst),
+            "cancel for another db_path must not flag the running job"
+        );
+
+        // Same db_path but different model: must not abort the running pass.
+        assert!(
+            handle
+                .cancel("/data/a.db".to_string(), Some("hash".to_string()))
+                .is_ok()
+        );
+        assert!(
+            !worker.cancel_flag.load(Ordering::SeqCst),
+            "cancel for another model must not flag the running pass"
+        );
+
+        // Matching target: flags the running job.
+        assert!(
+            handle
+                .cancel("/data/a.db".to_string(), Some("minilm".to_string()))
+                .is_ok()
+        );
+        assert!(
+            worker.cancel_flag.load(Ordering::SeqCst),
+            "cancel matching the running pass must set the flag"
+        );
     }
 
     #[test]
@@ -577,6 +785,95 @@ mod tests {
     }
 
     #[test]
+    fn daemon_embedding_reconciles_edited_and_removed_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let index_path = temp.path().join("semantic");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let (worker, _handle) = EmbeddingWorker::new();
+        let job_id = storage
+            .upsert_embedding_job(&db_path.to_string_lossy(), HASH_EMBEDDER_MODEL, 1)
+            .unwrap();
+        storage.start_embedding_job(job_id).unwrap();
+
+        let first = crate::storage::sqlite::MessageForEmbedding {
+            message_id: 41,
+            created_at: Some(1_700_000_000_000),
+            agent_id: 7,
+            workspace_id: Some(9),
+            source_id_hash: 11,
+            role: "assistant".to_string(),
+            content: "the original semantic content".to_string(),
+        };
+        assert_eq!(
+            worker
+                .generate_embeddings_and_save(
+                    &storage,
+                    std::slice::from_ref(&first),
+                    HASH_EMBEDDER_MODEL,
+                    false,
+                    job_id,
+                    &index_path,
+                    &db_path,
+                )
+                .unwrap(),
+            EmbeddingPassOutcome::Completed
+        );
+
+        let fsvi_path = vector_index_path(&index_path, "fnv1a-384");
+        let initial = VectorIndex::open(&fsvi_path).unwrap();
+        assert_eq!(initial.record_count(), 1);
+        let original_doc_id = initial.doc_id_at(0).unwrap().to_owned();
+        drop(initial);
+
+        let edited = crate::storage::sqlite::MessageForEmbedding {
+            content: "the corrected semantic content".to_string(),
+            ..first
+        };
+        assert_eq!(
+            worker
+                .generate_embeddings_and_save(
+                    &storage,
+                    std::slice::from_ref(&edited),
+                    HASH_EMBEDDER_MODEL,
+                    false,
+                    job_id,
+                    &index_path,
+                    &db_path,
+                )
+                .unwrap(),
+            EmbeddingPassOutcome::Completed
+        );
+
+        let reconciled = VectorIndex::open(&fsvi_path).unwrap();
+        assert_eq!(reconciled.record_count(), 1);
+        assert_eq!(reconciled.tombstone_count(), 0);
+        assert_eq!(reconciled.wal_record_count(), 0);
+        let edited_doc_id = reconciled.doc_id_at(0).unwrap().to_owned();
+        assert_ne!(edited_doc_id, original_doc_id);
+        drop(reconciled);
+
+        assert_eq!(
+            worker
+                .generate_embeddings_and_save(
+                    &storage,
+                    &[],
+                    HASH_EMBEDDER_MODEL,
+                    false,
+                    job_id,
+                    &index_path,
+                    &db_path,
+                )
+                .unwrap(),
+            EmbeddingPassOutcome::Completed
+        );
+        let emptied = VectorIndex::open(&fsvi_path).unwrap();
+        assert_eq!(emptied.record_count(), 0);
+        assert_eq!(emptied.tombstone_count(), 0);
+        assert_eq!(emptied.wal_record_count(), 0);
+    }
+
+    #[test]
     fn test_resolve_embedder_kind_hash_aliases() {
         assert_eq!(
             resolve_embedder_kind("hash", false).unwrap(),
@@ -597,7 +894,7 @@ mod tests {
     /// short-circuit would still be rescued by the name match and
     /// silently pass. This test pins the flag-only contract by
     /// passing semantic model names with `use_semantic=false`: every
-    /// registered FastEmbedder name MUST resolve to `Hash` purely
+    /// any configured name MUST resolve to `Hash` purely
     /// because the flag is false, regardless of name.
     #[test]
     fn test_resolve_embedder_kind_use_semantic_false_short_circuits_regardless_of_name() {
@@ -606,10 +903,7 @@ mod tests {
             "minilm-384",
             "all-minilm-l6-v2",
             "fastembed",
-            "snowflake-arctic-s",
-            "snowflake-arctic-embed-s",
-            "nomic-embed",
-            "nomic-embed-text-v1.5",
+            "legacy-unavailable-model",
             "MINILM",
         ] {
             assert_eq!(
@@ -639,15 +933,15 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_embedder_kind_registered_fastembed_models() {
-        assert_eq!(
-            resolve_embedder_kind("snowflake-arctic-s", true).unwrap(),
-            fast_embed_kind("snowflake-arctic-s", "snowflake-arctic-s-384")
-        );
-        assert_eq!(
-            resolve_embedder_kind("nomic-embed-text-v1.5", true).unwrap(),
-            fast_embed_kind("nomic-embed", "nomic-embed-768")
-        );
+    fn test_resolve_embedder_kind_rejects_unverified_native_topologies() -> anyhow::Result<()> {
+        for model in ["snowflake-arctic-s", "nomic-embed-text-v1.5"] {
+            let Err(error) = resolve_embedder_kind(model, true) else {
+                anyhow::bail!("unverified model topology {model} was accepted");
+            };
+            let message = format!("{error:#}");
+            assert!(message.contains("supports only minilm"), "{message}");
+        }
+        Ok(())
     }
 
     #[test]

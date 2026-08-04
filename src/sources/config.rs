@@ -687,6 +687,7 @@ pub fn get_preset_paths(preset: &str) -> Result<Vec<String>, ConfigError> {
                 .into(),
             "~/Library/Application Support/com.openai.chat".into(),
             "~/.gemini/tmp".into(),
+            "~/.gemini/antigravity-cli".into(),
             "~/.pi/agent/sessions".into(),
             "~/Library/Application Support/opencode/storage".into(),
             "~/.continue/sessions".into(),
@@ -701,6 +702,7 @@ pub fn get_preset_paths(preset: &str) -> Result<Vec<String>, ConfigError> {
             "~/.config/Cursor/User/globalStorage/saoudrizwan.claude-dev".into(),
             "~/.config/Cursor/User/globalStorage/rooveterinaryinc.roo-cline".into(),
             "~/.gemini/tmp".into(),
+            "~/.gemini/antigravity-cli".into(),
             "~/.pi/agent/sessions".into(),
             "~/.local/share/opencode/storage".into(),
             "~/.continue/sessions".into(),
@@ -2135,9 +2137,13 @@ paths = ["~/.claude/projects"]
         let macos = get_preset_paths("macos-defaults").unwrap();
         assert!(!macos.is_empty());
         assert!(macos.iter().any(|p| p.contains(".claude")));
+        // Antigravity (agy) history is synced from its own subtree, distinct
+        // from the legacy Gemini CLI's ~/.gemini/tmp.
+        assert!(macos.iter().any(|p| p.contains("antigravity-cli")));
 
         let linux = get_preset_paths("linux-defaults").unwrap();
         assert!(!linux.is_empty());
+        assert!(linux.iter().any(|p| p.contains("antigravity-cli")));
 
         assert!(get_preset_paths("unknown").is_err());
     }

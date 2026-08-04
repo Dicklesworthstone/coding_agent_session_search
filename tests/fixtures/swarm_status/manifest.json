@@ -2,7 +2,7 @@
   "schema_version": 1,
   "contract": "cass.swarm.status.v1",
   "golden_update_workflow": {
-    "command_shape": "UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-swarm-status-golden-target cargo test --test swarm_status_contract",
+    "command_shape": "UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-swarm-status-golden-target cargo test --test swarm_status_contract",
     "review_command": "git diff -- tests/fixtures/swarm_status tests/golden/swarm_status tests/swarm_status_contract.rs",
     "review_required": true,
     "uses_live_services": false

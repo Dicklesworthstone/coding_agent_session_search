@@ -50,10 +50,13 @@
     "pi_agent",
     "factory",
     "openclaw",
+    "antigravity",
     "kimi",
+    "openhands",
     "copilot",
     "copilot_cli",
     "qwen",
+    "grok",
     "crush",
     "hermes"
   ],
@@ -286,7 +289,7 @@
         },
         {
           "name": "semantic",
-          "description": "Build semantic vector index after text indexing",
+          "description": "Build semantic vector index after text indexing. Progress reports canonical replay, embedding, vector publish, optional HNSW, manifest publish, and finalization as distinct phases. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable stall diagnostics, or CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only while still reporting semantic phase progress",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -296,7 +299,7 @@
         },
         {
           "name": "build-hnsw",
-          "description": "Build HNSW index for approximate nearest neighbor search (requires --semantic). Enables O(log n) search with `--approximate` flag at query time",
+          "description": "Build HNSW index for approximate nearest neighbor search (requires --semantic). Enables O(log n) search with `--approximate` at query time. Native HNSW construction is an opaque phase: cass reports its vector total but does not synthesize forward progress the backend cannot expose",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -433,7 +436,8 @@
             "wrap",
             "sources",
             "analytics",
-            "doctor"
+            "doctor",
+            "recipes"
           ]
         }
       ],
@@ -717,7 +721,7 @@
         },
         {
           "name": "daemon",
-          "description": "Use daemon for warm model inference (faster repeated queries). If daemon is unavailable, falls back to direct inference",
+          "description": "Auto-spawn the warm-model daemon when one is not already running. Search discovers and uses an existing daemon by default; if daemon inference is unavailable, it lazily falls back to direct inference",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -739,7 +743,7 @@
         },
         {
           "name": "two-tier",
-          "description": "Enable two-tier progressive search: fast results immediately, refined via daemon. Returns initial results from fast embedder (~1ms), then refines with quality embedder via daemon (~130ms). Best of both worlds for interactive search",
+          "description": "Request the quality-refined tier of the two-tier search pipeline. The one-shot CLI emits the final quality result set; the interactive TUI is the surface that displays fast results first and refines them in place",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -761,7 +765,7 @@
         },
         {
           "name": "quality-only",
-          "description": "Quality-only search: wait for full transformer model results. Higher latency (~130ms) but most accurate semantic matching. Requires daemon to be available; falls back to fast if unavailable",
+          "description": "Quality-only search: wait for full transformer model results. Uses an existing daemon when available and lazily falls back to the installed local model; higher latency than --fast-only, but more accurate",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -1188,6 +1192,93 @@
       "has_json_output": true
     },
     {
+      "name": "storage",
+      "description": "On-disk storage footprint breakdown by component (DB, WAL, lexical index, raw mirror, semantic, quarantine)",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "dedup",
+      "description": "Collapse pre-existing duplicate conversation rows (projects/<rel> vs <rel> external_id twins) created before the dedup fix",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "apply",
+          "description": "Actually delete the duplicate rows. Without this, runs as a dry-run (inspect only, no mutation)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
       "name": "status",
       "description": "Quick health check for agents: index freshness, db stats, recommended action",
       "arguments": [
@@ -1303,6 +1394,74 @@
           "value_type": "integer",
           "required": false,
           "default": "300"
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "support-bundle",
+      "description": "Assemble a redacted, share-safe recovery/support evidence bundle",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "stale-threshold",
+          "description": "Staleness threshold in seconds (default: 300)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false,
+          "default": "300"
+        },
+        {
+          "name": "include-full-paths",
+          "description": "Include full filesystem paths in the bundle (default: basename-only)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "include-raw-evidence",
+          "description": "Include raw session/tool payloads in the bundle (default: suppressed)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "robot-format",
@@ -1459,6 +1618,13 @@
           "required": false
         },
         {
+          "name": "conversation-id",
+          "description": "Exact canonical archive conversation row id",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
           "name": "line",
           "short": "n",
           "description": "Line number to show (1-indexed)",
@@ -1541,6 +1707,160 @@
           "value_type": "integer",
           "required": false,
           "default": "300"
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "onboarding",
+      "description": "First-run source onboarding + readiness wizard. Read-only: explains what CASS found, what it will index, what is missing, and the single safest next command. Scriptable via `--json`; never launches a bare TUI",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "guide",
+      "description": "Intent-to-command planner and gated runner for guided safe workflows. Dry-run is the default. `--apply` automatically evaluates only closed, read-only proof adapters and requires an explicit confirmation for each mutating step; macro strings are never evaluated by a shell. Maps an operator intent (fix-ci, investigate-search-miss, prepare-release, repair-assets, export-session, onboard-source, support-capsule) to an exact safe command plan — steps, prerequisites, proof gates, forbidden shortcuts, rch target-dir hints, cost/risk, privacy notes, and stop conditions. Never launches a bare TUI. Omit the intent to list the known intents",
+      "arguments": [
+        {
+          "name": "intent",
+          "description": "Operator intent to plan (omit to list the known intents). Multiple words are joined, e.g. `cass guide rebuild index`",
+          "arg_type": "positional",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "fixture",
+          "description": "Deterministic preflight-facts source: a JSON file shaped like `{ \"facts\": { \"<fact>\": true, ... }, \"intent\"?: \"<intent>\" }`",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "apply",
+          "description": "Enter gated apply mode (`--run` is an alias). Without this flag the transcript is a deterministic, fully read-only dry-run",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "confirm-step",
+          "description": "Confirm one exact mutating step number. Repeat for multiple steps; confirmation never carries across steps",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "confirm-fact",
+          "description": "Confirm an operator-context preflight fact as true. Repeatable; the confirmation is recorded in the robot transcript",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "accept-privacy-tier",
+          "description": "Accept the exact declared privacy tier (`redacted` or `sensitive`). A generic yes is intentionally not accepted",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "accept-cost-risk",
+          "description": "Accept the exact declared cost-risk band (`medium` or `high`) after reviewing the resource what-if result",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "allow-rch",
+          "description": "Permit steps whose macro policy requires rch offload. This does not permit a shell or an unallowlisted executable",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "confirm-stop-conditions-clear",
+          "description": "Assert that every declared stop condition was checked and is clear. An observed triggered stop condition always wins over this assertion",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "robot-format",
@@ -1662,6 +1982,35 @@
           ]
         },
         {
+          "name": "recover-from-archive",
+          "description": "Rebuild the source JSONL tree from the canonical archive's preserved `extra_json`/`extra_bin` events into `<DIR>`, so a corrupt archive can be re-ingested from cass's own data with `cass index --full` (no stock-sqlite `.recover` needed). Opens the archive read-only",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "rebuild-canonical-fts",
+          "description": "Safely inspect or repair the canonical FTS5 shadow. Exact dry-run parity uses fused covering-index parent-run counts plus bounded primary-key probes; partial shadows resume in bounded batches and recreation is failure-atomic. Supports `--dry-run`; mutation requires `--yes` and never modifies canonical rows",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "cleanup-interrupted-artifacts",
+          "description": "Quarantine interrupted `raw_mirror_capture` staging artifacts that block doctor mutation, instead of forcing a manual `rm` inside the data dir. Requires `--yes`; artifacts are renamed into a quarantine dir, never deleted",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -1768,6 +2117,13 @@
           "required": false
         },
         {
+          "name": "since",
+          "description": "Only sessions active since this ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS), keyword (`today`, `yesterday`), or relative offset (`-7d`, `-24h`). Filters on the session's recorded last-activity timestamp (ended_at, falling back to started_at)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
           "name": "json",
           "description": "Output as JSON (for automation)",
           "arg_type": "flag",
@@ -1803,7 +2159,7 @@
     },
     {
       "name": "resume",
-      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini)",
+      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini, Antigravity)",
       "arguments": [
         {
           "name": "path",
@@ -2578,6 +2934,68 @@
       "has_json_output": true
     },
     {
+      "name": "quarantine",
+      "description": "Inspect and manage the conversation-ingest quarantine (list / clear)",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
+      "name": "forget",
+      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets",
+      "arguments": [
+        {
+          "name": "source-glob",
+          "description": "Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": true
+        },
+        {
+          "name": "db",
+          "description": "Override db path",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "apply",
+          "description": "Actually delete the matching conversations. Without this, runs as a dry-run (inspect only)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
       "name": "mirror",
       "description": "Inspect and prune raw-mirror evidence under explicit operator control",
       "arguments": [],
@@ -2592,6 +3010,18 @@
     {
       "name": "models",
       "description": "Manage semantic search models",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
+      "name": "fleet",
+      "description": "Fleet-safe upgrade rehearsal and bounded post-upgrade verification",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
+      "name": "lessons",
+      "description": "Mine and query durable lessons from local evidence (commits, beads, proofs)",
       "arguments": [],
       "has_json_output": false
     },
@@ -2612,6 +3042,89 @@
       "description": "Token usage, tool, and model analytics",
       "arguments": [],
       "has_json_output": false
+    },
+    {
+      "name": "release-verify",
+      "description": "Verify release distribution channels (GitHub, Homebrew, Scoop, crates.io, installer)",
+      "arguments": [
+        {
+          "name": "from",
+          "description": "Read a ReleaseVerifyRequest JSON from a file (or `-` for stdin) and evaluate it offline. Mutually exclusive with --live",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "live",
+          "description": "Gather live per-channel observations over the network (explicit opt-in)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "expected-version",
+          "description": "Expected release version under test (required for --live)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "repo",
+          "description": "GitHub owner/repo for the release channel (defaults to the cass repo)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "crate-name",
+          "description": "crates.io crate name (defaults to the cass crate)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "homebrew-formula-url",
+          "description": "Raw URL of the Homebrew formula file (enables the homebrew channel)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "scoop-manifest-url",
+          "description": "Raw URL of the Scoop manifest JSON (enables the scoop channel)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works). Default for this command",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "daemon",
@@ -2795,6 +3308,18 @@
       "description": "Default structured output format: json, jsonl, compact, sessions, or toon."
     },
     {
+      "name": "CASS_SEARCH_TIMEOUT_MS",
+      "description": "Default search/pack timeout in milliseconds (0 = no timeout). The --timeout flag overrides; also configurable via [search].timeout_ms in ~/.config/cass/cass.toml. Alias: CASS_SEARCH_TIMEOUT."
+    },
+    {
+      "name": "CASS_SEARCH_LIMIT",
+      "description": "Default search/pack result limit (0 = no limit, RAM-capped). The --limit flag overrides; also [search].limit in ~/.config/cass/cass.toml."
+    },
+    {
+      "name": "CASS_SEARCH_MODE",
+      "description": "Default search/pack mode: lexical, semantic, or hybrid. The --mode flag overrides; also [search].mode in ~/.config/cass/cass.toml."
+    },
+    {
       "name": "TOON_DEFAULT_FORMAT",
       "description": "Fallback structured output format for tools that support TOON."
     },
@@ -2822,12 +3347,37 @@
     },
     {
       "name": "CASS_TRACE_FILE",
-      "description": "Default JSONL trace path for command execution spans."
+      "description": "Default cass-trace-v1 JSONL path for bounded diagnostics and command summaries."
+    },
+    {
+      "name": "CASS_TRACE_FILTER",
+      "default": "warn,coding_agent_search=debug,cass=debug,cass::redact::memo=warn",
+      "description": "Trace-file EnvFilter. The default retains CASS DEBUG plus global WARN/ERROR events, while suppressing routine redaction-memo DEBUG churn."
+    },
+    {
+      "name": "CASS_TRACE_MAX_BYTES",
+      "default": "16777216",
+      "description": "Hard trace-file byte ceiling, clamped to 4096..1073741824 bytes."
+    },
+    {
+      "name": "CASS_TRACE_MAX_EVENTS",
+      "default": "50000",
+      "description": "Hard trace-file diagnostic-event ceiling, clamped to 16..10000000 events."
     },
     {
       "name": "CASS_INDEX_NO_PROGRESS_EVENTS",
       "default": "0",
       "description": "Suppress NDJSON progress events from cass index --json when set to 1."
+    },
+    {
+      "name": "CASS_INDEX_STALL_DETECT_SECS",
+      "default": "120",
+      "description": "Seconds without measured phase progress before cass index emits diagnostics; 0 disables detection."
+    },
+    {
+      "name": "CASS_INDEX_STALL_ABORT_SECS",
+      "default": "300",
+      "description": "Seconds without progress before an abort-eligible lexical stall exits 70; 0 keeps stalls report-only. Semantic phases are report-only."
     },
     {
       "name": "CASS_SEMANTIC_EMBEDDER",
@@ -3023,7 +3573,7 @@
       "wrong": "cass commands --json",
       "canonical": "cass robot-docs commands",
       "accepted": true,
-      "behavior": "Non-command robot-docs topic shorthands such as commands, schemas, examples, env, paths, exit-codes, and guide route to robot-docs instead of search."
+      "behavior": "Non-command robot-docs topic shorthands such as commands, schemas, examples, env, paths, exit-codes, and quickstart route to robot-docs instead of search. The guide name remains the dedicated guided-operations planner."
     },
     {
       "wrong": "cass search \"query\" limit=5",

@@ -1,0 +1,99 @@
+# Golden: human readiness summaries (bead 13.2)
+# Regenerate: RCH_CARGO_WRAPPER_BYPASS=1 UPDATE_GOLDENS=1 cargo test \
+#   --lib search::human_readiness_summary::tests::golden_human_summaries
+
+========================================
+case: local_stale_quarantine
+----------------------------------------
+≈ Search ready (index stale)
+  Search usable now: yes
+  Why: Search is fully correct for everything already indexed; only the most recent sessions may not appear yet.
+  Missing/stale: lexical index lags recent ingests (lexical=stale_but_searchable) — search works, a refresh picks up the newest sessions; 133 artifact(s) quarantined (advisory; results are unaffected)
+  Safest next step: lexical index is stale; refresh to pick up recent ingests (search still works) → `cass index`
+  State codes: class=stale_searchable db=available lexical=stale_but_searchable semantic=hybrid_ready source=complete archive_risk=low binary=current next=refresh_lexical
+
+========================================
+case: ts1_high_archive_risk
+----------------------------------------
+✓ Search ready
+  Search usable now: yes
+  Why: All derived search assets are converged; results are complete and current.
+  Safest next step: high archive risk: back up the canonical archive before any repair → `cass doctor --json   # review the backup-first plan before --fix`
+  State codes: class=ready db=available lexical=ready semantic=hybrid_ready source=complete archive_risk=high binary=current next=backup_then_repair
+
+========================================
+case: ts2_fast_health_slow_status
+----------------------------------------
+✓ Search ready
+  Search usable now: yes
+  Why: All derived search assets are converged; results are complete and current.
+  Missing/stale: semantic refinement still backfilling (semantic=backfilling); hybrid quality improves on its own
+  Safest next step: semantic backfill in progress; hybrid refinement will catch up on its own
+  State codes: class=ready db=available lexical=ready semantic=backfilling source=complete archive_risk=low binary=current next=wait_for_semantic
+
+========================================
+case: csd_missing_lexical_metadata
+----------------------------------------
+✗ Search unavailable (no index)
+  Search usable now: no
+  Why: No usable lexical index exists yet, so search returns nothing until it is rebuilt from the canonical archive.
+  Safest next step: lexical index unavailable; rebuild it from the canonical database → `cass index --full`
+  State codes: class=missing db=available lexical=missing semantic=absent source=complete archive_risk=none binary=current next=repair_lexical
+
+========================================
+case: css_stale_existing_index
+----------------------------------------
+≈ Search ready (index stale)
+  Search usable now: yes
+  Why: Search is fully correct for everything already indexed; only the most recent sessions may not appear yet.
+  Missing/stale: lexical index lags recent ingests (lexical=stale_but_searchable) — search works, a refresh picks up the newest sessions
+  Safest next step: lexical index is stale; refresh to pick up recent ingests (search still works) → `cass index`
+  State codes: class=stale_searchable db=available lexical=stale_but_searchable semantic=hybrid_ready source=complete archive_risk=low binary=current next=refresh_lexical
+
+========================================
+case: mac_mini_max_stale_old_binary
+----------------------------------------
+≈ Search ready (index stale)
+  Search usable now: yes
+  Why: Search is fully correct for everything already indexed; only the most recent sessions may not appear yet.
+  Missing/stale: lexical index lags recent ingests (lexical=stale_but_searchable) — search works, a refresh picks up the newest sessions; this binary is older than the fleet baseline (binary=outdated…
+  Safest next step: binary is older than the fleet baseline; upgrade before relying on derived assets → `cass self-update`
+  State codes: class=stale_searchable db=available lexical=stale_but_searchable semantic=fast_tier_ready source=complete archive_risk=low binary=outdated next=upgrade_binary
+
+========================================
+case: mac_mini_old_unreachable
+----------------------------------------
+? Host unreachable
+  Search usable now: no
+  Why: The host backing this node did not answer the probe, so no local state is trustworthy; retry from a reachable node.
+  Safest next step: host unreachable; retry from a reachable fleet node before acting
+  State codes: class=unreachable db=unreachable lexical=missing semantic=absent source=unknown archive_risk=unknown binary=unknown next=host_unreachable
+
+========================================
+case: converged_all_green
+----------------------------------------
+✓ Search ready
+  Search usable now: yes
+  Why: All derived search assets are converged; results are complete and current.
+  Safest next step: all derived assets converged; no action required
+  State codes: class=ready db=available lexical=ready semantic=hybrid_ready source=complete archive_risk=none binary=current next=none
+
+========================================
+case: ready_semantic_absent
+----------------------------------------
+✓ Search ready
+  Search usable now: yes
+  Why: All derived search assets are converged; results are complete and current.
+  Missing/stale: semantic refinement unavailable (semantic=absent); results are lexical-only until a model is installed
+  Safest next step: semantic tier absent; install the model for hybrid refinement (lexical works now) → `cass models install`
+  State codes: class=ready db=available lexical=ready semantic=absent source=complete archive_risk=none binary=current next=install_semantic_model
+
+========================================
+case: ready_semantic_policy_disabled
+----------------------------------------
+✓ Search ready
+  Search usable now: yes
+  Why: All derived search assets are converged; results are complete and current.
+  Missing/stale: semantic refinement disabled by policy (semantic=policy_disabled) — intentional, not a fault
+  Safest next step: all derived assets converged; no action required
+  State codes: class=ready db=available lexical=ready semantic=policy_disabled source=complete archive_risk=none binary=current next=none

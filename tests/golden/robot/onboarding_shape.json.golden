@@ -1,0 +1,47 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer"
+    },
+    "providers": {
+      "type": "array",
+      "items": {
+        "type": "unknown"
+      }
+    },
+    "excluded_providers": {
+      "type": "array",
+      "items": {
+        "type": "unknown"
+      }
+    },
+    "estimated_index_sessions": {
+      "type": "integer"
+    },
+    "semantic_ready": {
+      "type": "boolean"
+    },
+    "remote_hint": {
+      "type": "string"
+    },
+    "recommended_action": {
+      "type": "string"
+    },
+    "recommended_command": {
+      "type": "string"
+    },
+    "rollback_note": {
+      "type": "string"
+    },
+    "mutation_free": {
+      "type": "boolean"
+    },
+    "data_dir": {
+      "type": "string"
+    },
+    "indexed_conversation_count": {
+      "type": "integer"
+    }
+  }
+}

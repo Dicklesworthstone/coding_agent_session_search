@@ -319,6 +319,7 @@ mod tests {
             recovery_secret: Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             generate_qr: false,
             generated_docs: Vec::new(),
+            analytics_status: None,
         };
 
         let builder = BundleBuilder::with_config(config);
@@ -358,6 +359,10 @@ mod tests {
             recovery_secret: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             generate_qr: false,
             generated_docs: Vec::new(),
+            analytics_status: Some(serde_json::json!({
+                "coverage": { "api_token_coverage_status": "no-data" },
+                "recommended_action": "rebuild_track_b"
+            })),
         };
 
         let builder = BundleBuilder::with_config(config);
@@ -369,6 +374,8 @@ mod tests {
         assert!(!result.site_dir.join("qr-code.svg").exists());
         assert!(!result.site_dir.join("integrity-fingerprint.txt").exists());
         assert!(!result.site_dir.join("master-key.json").exists());
+        let analytics_status = fs::read_to_string(result.site_dir.join("analytics_status.json"))?;
+        assert!(analytics_status.contains("rebuild_track_b"));
 
         // Verify config.json doesn't contain DEK or secrets
         let _config_content = fs::read_to_string(result.site_dir.join("config.json"))?;

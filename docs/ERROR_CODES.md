@@ -86,6 +86,28 @@ Error codes follow the format `E<category><number>`:
 - If persisting, download the archive again
 - Report the issue if it continues
 
+### E1008: Unsupported Metadata
+
+**Message**: "This archive uses unsupported encryption metadata."
+
+**Cause**: The archive requests an encryption, compression, chunking, or key-derivation option that this CASS build does not support.
+
+**Resolution**:
+- Update to the latest version of CASS
+- If you created the archive, export it again with a supported format
+- Do not retry the same archive as though the password were wrong
+
+### E1009: Corrupt Payload
+
+**Message**: "The encrypted archive payload is corrupted or tampered with."
+
+**Cause**: Archive metadata was readable, but an encrypted chunk failed authentication or decompression.
+
+**Resolution**:
+- Download or copy the archive again from the original source
+- Re-export the archive if the source remains available
+- Treat unexpected payload changes as possible tampering
+
 ## Database Errors (E2xxx)
 
 ### E2001: Corrupt Database

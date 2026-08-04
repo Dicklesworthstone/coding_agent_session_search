@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "data_dir": "[TEST_HOME]/coding-agent-search",
+  "quarantined_conversations": 0,
+  "circuit_breaker_active": false,
+  "recommended_action": null,
+  "entries": []
+}

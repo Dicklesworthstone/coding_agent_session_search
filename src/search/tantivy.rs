@@ -14,7 +14,7 @@ use crate::model::conversation_packet::{
 use crate::search::canonicalize::is_hard_message_noise;
 use crate::sources::provenance::LOCAL_SOURCE_ID;
 use anyhow::{Context, Error, Result};
-use frankensearch::lexical::{
+use frankensearch::lexical_tantivy::{
     CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument as FsCassDocument,
     CassDocumentRef as FsCassDocumentRef, CassFields as FsCassFields,
     CassMergeStatus as FsCassMergeStatus, CassTantivyIndex as FsCassTantivyIndex, Index,
@@ -422,6 +422,27 @@ const FEDERATED_SEARCH_MANIFEST_FILE: &str = "federated-search-manifest.json";
 const FEDERATED_SEARCH_MANIFEST_VERSION: u32 = 1;
 const FEDERATED_SEARCH_MANIFEST_KIND: &str = "cass-federated-lexical-index";
 const EVIDENCE_BUNDLE_MANIFEST_TEMP_FILE: &str = "evidence-bundle-manifest.json.tmp";
+
+/// Cass-owned sidecar metadata files that live alongside the Tantivy
+/// artifacts in the published lexical index directory (path helpers:
+/// `lexical_rebuild_state_path` / `lexical_refresh_ledger_path` /
+/// `lexical_rebuild_equivalence_evidence_path` in `crate::indexer` and
+/// `LEXICAL_GENERATION_MANIFEST_FILE` in `crate::indexer::lexical_generation`).
+///
+/// `materialize_federated_search_bundle_for_write` must carry these over when
+/// it flattens a federated shard bundle back into a single mutable index:
+/// the materialized directory atomically replaces the live one, and dropping
+/// the just-persisted `.lexical-rebuild-state.json` checkpoint sent every
+/// subsequent search into the "lexical rebuild checkpoint missing" WARN +
+/// repeated-authoritative-rebuild loop (#289). The federated manifest itself
+/// is intentionally absent here: after materialization the bundle is no
+/// longer federated.
+const LEXICAL_SIDECAR_FILES_CARRIED_ACROSS_MATERIALIZATION: &[&str] = &[
+    ".lexical-rebuild-state.json",
+    ".lexical-refresh-ledger.json",
+    "lexical-generation-manifest.json",
+    ".lexical-rebuild-equivalence.json",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchableIndexSummary {
@@ -1068,6 +1089,38 @@ fn materialize_federated_search_bundle_for_write(index_path: &Path) -> Result<()
                 index_path.display()
             )
         })?;
+
+    // #289: the atomic swap below replaces the entire live directory, so any
+    // cass sidecar metadata (rebuild checkpoint, refresh ledger, generation
+    // manifest, equivalence evidence) that is not carried into the
+    // materialized directory is silently destroyed. Losing the completed
+    // rebuild checkpoint in particular makes every later search WARN about a
+    // missing checkpoint and re-arms heavyweight authoritative rebuilds.
+    for sidecar in LEXICAL_SIDECAR_FILES_CARRIED_ACROSS_MATERIALIZATION {
+        let source = index_path.join(sidecar);
+        match fs::symlink_metadata(&source) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                fs::copy(&source, materialized_index_path.join(sidecar)).with_context(|| {
+                    format!(
+                        "carrying lexical sidecar {} across federated materialization of {}",
+                        sidecar,
+                        index_path.display()
+                    )
+                })?;
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "checking lexical sidecar {} before federated materialization of {}",
+                        sidecar,
+                        index_path.display()
+                    )
+                });
+            }
+        }
+    }
 
     if ensure_replaceable_federated_materialization_root(index_path)? {
         fs::remove_dir_all(index_path).with_context(|| {
@@ -1999,14 +2052,15 @@ mod tests {
 
     #[test]
     fn generate_edge_ngrams_prefixes() {
-        let out = frankensearch::lexical::cass_generate_edge_ngrams("hello world");
+        let out = frankensearch::lexical_tantivy::cass_generate_edge_ngrams("hello world");
         assert!(out.contains("he"));
         assert!(out.contains("world"));
     }
 
     #[test]
     fn build_preview_truncates_with_ellipsis() {
-        let preview = frankensearch::lexical::cass_build_preview("abcdefghijklmnopqrstuvwxyz", 10);
+        let preview =
+            frankensearch::lexical_tantivy::cass_build_preview("abcdefghijklmnopqrstuvwxyz", 10);
         assert_eq!(preview, "abcdefghij…");
     }
 
@@ -2830,6 +2884,92 @@ mod tests {
         assert!(
             !published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
             "materialization should replace the federated bundle manifest"
+        );
+    }
+
+    /// Materialization-direction counterpart of the publish-direction
+    /// contract test
+    /// `publish_staged_lexical_index_moves_generation_audit_files_with_the_staged_directory`
+    /// (src/indexer/mod.rs): flattening a federated bundle back into a
+    /// mutable index must carry the cass sidecar metadata — most importantly
+    /// the just-persisted completed rebuild checkpoint — into the
+    /// materialized directory instead of wiping it with the federated root
+    /// (#289).
+    #[test]
+    fn open_or_create_materialization_carries_lexical_sidecar_files() {
+        let root = TempDir::new().expect("temp dir");
+        let shard_a = root.path().join("shard-a");
+        let shard_b = root.path().join("shard-b");
+        let published = root.path().join("published");
+
+        for (shard_path, external_id, conversation_id) in
+            [(&shard_a, "side-a", 10), (&shard_b, "side-b", 20)]
+        {
+            let mut shard_index =
+                TantivyIndex::open_or_create(shard_path).expect("create sidecar shard");
+            let conv = NormalizedConversation {
+                agent_slug: "codex".to_string(),
+                external_id: Some(external_id.to_string()),
+                title: Some(external_id.to_string()),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                started_at: Some(1_700_000_003_000),
+                ended_at: Some(1_700_000_003_100),
+                metadata: Value::Null,
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_003_010),
+                    content: format!("{external_id} content"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                }],
+            };
+            shard_index
+                .add_conversation_with_id(&conv, Some(conversation_id))
+                .expect("index sidecar shard");
+            shard_index.commit().expect("commit sidecar shard");
+        }
+
+        publish_federated_searchable_index_directories(&published, &[&shard_a, &shard_b])
+            .expect("publish federated bundle");
+        assert!(
+            published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
+            "test fixture should start in federated bundle form"
+        );
+
+        // Simulate the post-publish state from #289: the staged rebuild has
+        // just persisted its completed checkpoint + audit sidecars into the
+        // freshly published (federated) live directory.
+        let sidecar_payloads = LEXICAL_SIDECAR_FILES_CARRIED_ACROSS_MATERIALIZATION
+            .iter()
+            .map(|sidecar| {
+                let payload = format!("{{\"sidecar\":\"{sidecar}\",\"completed\":true}}");
+                fs::write(published.join(sidecar), &payload).expect("write sidecar fixture");
+                (*sidecar, payload)
+            })
+            .collect::<Vec<_>>();
+
+        let mutable_index =
+            TantivyIndex::open_or_create(&published).expect("materialize mutable index");
+        let reader = mutable_index.reader().expect("reader");
+        reader.reload().expect("reload");
+        assert_eq!(reader.searcher().num_docs(), 2);
+
+        for (sidecar, payload) in &sidecar_payloads {
+            assert_eq!(
+                fs::read_to_string(published.join(sidecar)).unwrap_or_else(|err| panic!(
+                    "lexical sidecar {sidecar} must survive federated materialization: {err}"
+                )),
+                *payload,
+                "lexical sidecar {sidecar} must be carried byte-for-byte"
+            );
+        }
+        assert!(
+            !published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
+            "the federated manifest must not be carried into the materialized mutable index"
         );
     }
 

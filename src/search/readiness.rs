@@ -209,6 +209,911 @@ impl ReadinessSnapshot {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Canonical derived-asset truth table (bead
+// cass-fleet-resilience-20260608-uojcg.1.1)
+// ---------------------------------------------------------------------------
+//
+// The `ReadinessSnapshot` above is the lexical-vs-semantic *search* axis.
+// The fleet/session analysis from 2026-06-08 showed agents reconciling a
+// much wider field set by hand across `health` / `status` / `doctor` /
+// `search --robot-meta`: canonical DB open result, configured-source
+// coverage, scan watermark, last completed projection, lexical asset
+// metadata (presence/hash/fingerprint/freshness), semantic tier state,
+// quarantine exclusions, source-path availability, active rebuild/repair
+// state, archive risk, and the single safe next command.
+//
+// `DerivedAssetTruthTable` is the one shared shape every readiness surface
+// projects into its JSON. It *composes* `ReadinessSnapshot` for the
+// search axis rather than re-deriving lexical/semantic states, and derives
+// a single `SafeNextCommand` so CLI, TUI, fleet doctor, and robot payloads
+// agree on the recommended next move. The derivation is conservative and
+// archive-first: non-destructive inspection is always safe to surface, and
+// `ArchiveRiskLevel::High` forces a backup-first recommendation ahead of
+// any mutating repair (wires into bead .1.3).
+//
+// All enum values serialize as snake_case, matching the existing readiness
+// vocabulary and the `fallback_mode` / `recommended_action` robot fields.
+
+/// Result of opening the canonical SQLite database — the source of truth
+/// from which every derived asset is projected. Distinguishes "no DB yet"
+/// (fresh install, safe to build) from "DB present but unusable" (needs
+/// inspection, never blind rebuild) from "host unreachable" (nothing local
+/// to do), all of which collapse into a generic "unhealthy" today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CanonicalDbAvailability {
+    /// The canonical DB opened and passed a basic integrity/schema probe.
+    Available,
+    /// No canonical DB file exists yet — a fresh install. Building the
+    /// initial index is the safe first step (no data to lose).
+    Missing,
+    /// The file exists but could not be opened (lock contention, EACCES,
+    /// truncated header). Distinct from `Corrupt`: the bytes may be fine,
+    /// the process just could not acquire/read them.
+    OpenFailed,
+    /// The DB opened but failed integrity/schema validation. Inspection is
+    /// required before any repair; never blind-rebuild over it.
+    Corrupt,
+    /// The host or source backing the DB is unreachable (a fleet probe
+    /// timed out / refused). No remaining fields are trustworthy.
+    Unreachable,
+}
+
+impl CanonicalDbAvailability {
+    /// Whether derived assets can be projected from the DB at all.
+    pub(crate) fn is_projectable(self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
+/// Coverage of the configured source paths relative to what the canonical
+/// DB has ingested. Separates "no sources configured" (operator setup gap)
+/// from "configured but unreachable" (transient/host problem) from
+/// "partial" (index reflects only the reachable subset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceCoverageState {
+    /// Every configured source path is present and reachable.
+    Complete,
+    /// Some configured paths are missing/unreachable; the index reflects
+    /// only the reachable subset.
+    Partial,
+    /// Configured paths exist but none are currently reachable.
+    Unavailable,
+    /// No source paths are configured at all.
+    Unconfigured,
+    /// Coverage could not be evaluated (e.g. unreachable host).
+    Unknown,
+}
+
+/// What maintenance, if any, is actively mutating derived assets. Callers
+/// use this to attach/wait instead of starting a duplicate job (the
+/// single-flight contract from `asset_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MaintenanceActivity {
+    /// No maintenance running.
+    Idle,
+    /// A lexical index rebuild is in flight.
+    LexicalRebuild,
+    /// Semantic model acquisition / embedding backfill is in flight.
+    SemanticBackfill,
+    /// A storage-integrity repair is in flight.
+    StorageRepair,
+    /// Activity could not be evaluated.
+    Unknown,
+}
+
+/// Risk that a repair/rebuild touching the canonical archive could lose
+/// data. `High` means the archive is effectively the only copy (or a
+/// destructive path would touch source data); it forces backup-first
+/// behavior before any mutating repair (bead .1.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ArchiveRiskLevel {
+    /// Derived assets are fully reproducible from a safely-backed source.
+    None,
+    /// Reproducible, but with some manual effort / cost.
+    Low,
+    /// Loss would be expensive to recover; prefer backup-first.
+    Elevated,
+    /// The archive is the only copy or repair would touch source data;
+    /// backup-first is mandatory before any mutating repair.
+    High,
+    /// Risk could not be evaluated.
+    Unknown,
+}
+
+/// Compatibility of the running binary with the on-disk derived assets and
+/// the fleet baseline. Version skew across the fleet manifests here: an
+/// `Outdated` binary should be upgraded before its derived assets are
+/// trusted or rebuilt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BinaryCompatibility {
+    /// Running binary matches the expected asset schema / fleet baseline.
+    Current,
+    /// Running binary is older than the fleet baseline; upgrade before
+    /// relying on or rebuilding derived assets.
+    Outdated,
+    /// Running binary is newer than the on-disk assets, which therefore
+    /// need a rebuild to match the current schema.
+    Ahead,
+    /// Compatibility could not be evaluated.
+    Unknown,
+}
+
+/// Byte-level lexical asset metadata, independent of the freshness *state*
+/// (which lives in `ReadinessSnapshot::lexical`). Carries the presence,
+/// schema hash, storage fingerprint, and build timestamp that downstream
+/// surfaces compare to detect drift.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) struct LexicalMetadata {
+    /// Whether a lexical index directory + metadata sidecar exist on disk.
+    pub present: bool,
+    /// Schema hash baked into the index (matches `tantivy::SCHEMA_HASH`
+    /// when current). `None` when absent or unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_hash: Option<String>,
+    /// Storage fingerprint tying the index to the canonical DB generation
+    /// it was built from. `None` when absent or unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_fingerprint: Option<String>,
+    /// Wall-clock ms when the index was last published. `None` when
+    /// unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_at_ms: Option<i64>,
+}
+
+/// Summary of assets excluded from search because they were quarantined.
+/// Advisory: quarantine never makes search incorrect, it only excludes
+/// the failing artifact. Causes are stable snake_case codes grouped for
+/// status surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) struct QuarantineSummary {
+    /// Number of quarantined artifacts currently excluded.
+    pub quarantined_count: usize,
+    /// Total on-disk bytes held by quarantined artifacts.
+    pub total_quarantined_bytes: u64,
+    /// Distinct quarantine causes (snake_case codes), e.g.
+    /// `schema_drift`, `validation_failed`, `ingest_oom`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub causes: Vec<String>,
+}
+
+impl QuarantineSummary {
+    /// Whether any artifact is currently quarantined.
+    pub(crate) fn has_exclusions(&self) -> bool {
+        self.quarantined_count > 0
+    }
+}
+
+/// Stable, kebab-free identifier for the single safe next action. Kept as
+/// an enum (snake_case wire form) so every consumer pattern-matches the
+/// same vocabulary instead of string-sniffing prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SafeNextAction {
+    /// All derived assets converged; nothing to do.
+    None,
+    /// Fresh install with no canonical DB; build the initial index.
+    IndexFull,
+    /// Archive risk is high; back up before any mutating repair.
+    BackupThenRepair,
+    /// Canonical DB is unusable; inspect (read-only) before repair.
+    InspectCanonicalDb,
+    /// Lexical index is missing/quarantined; rebuild from the DB.
+    RepairLexical,
+    /// Lexical index is stale; refresh to pick up recent ingests.
+    RefreshLexical,
+    /// A rebuild/repair is already running; attach or wait.
+    WaitForMaintenance,
+    /// Semantic backfill is running; hybrid refinement will catch up.
+    WaitForSemantic,
+    /// No sources configured; run setup.
+    ConfigureSources,
+    /// Configured sources unreachable; reconnect before sync.
+    ReconnectSource,
+    /// Quarantined artifacts present; inspect (advisory).
+    InspectQuarantine,
+    /// Semantic tier absent; install the model for hybrid refinement.
+    InstallSemanticModel,
+    /// Binary is older than the fleet baseline; upgrade first.
+    UpgradeBinary,
+    /// Binary is newer than derived assets; rebuild assets for this schema.
+    RebuildForCurrentBinary,
+    /// Host unreachable; nothing local to do.
+    HostUnreachable,
+}
+
+impl SafeNextAction {
+    /// Whether following this action would *mutate* derived assets or the
+    /// archive. Inspection / wait / setup actions are non-mutating and are
+    /// always safe to surface even under high archive risk.
+    pub(crate) fn is_mutating(self) -> bool {
+        matches!(
+            self,
+            Self::IndexFull
+                | Self::RepairLexical
+                | Self::RefreshLexical
+                | Self::RebuildForCurrentBinary
+        )
+    }
+}
+
+/// The single safe next command derived from a `DerivedAssetTruthTable`.
+/// Pairs the machine-matchable `action` with a copy-pasteable `command`
+/// (absent for pure wait/none) and a one-line human rationale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SafeNextCommand {
+    pub action: SafeNextAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    pub reason: String,
+}
+
+impl SafeNextCommand {
+    fn new(action: SafeNextAction, command: Option<&str>, reason: &str) -> Self {
+        Self {
+            action,
+            command: command.map(str::to_string),
+            reason: reason.to_string(),
+        }
+    }
+}
+
+/// The archive-risk safety envelope every readiness surface (status,
+/// triage, doctor, index preflight) projects so that high archive risk
+/// forces backup-first guidance and marks coverage-reducing commands
+/// *unsafe until a backup or fingerprinted plan exists*, rather than
+/// emitting casual rebuild/repair advice (bead
+/// cass-fleet-resilience-20260608-uojcg.1.3).
+///
+/// This is the single shared derivation; the four surfaces serialize it
+/// into their JSON verbatim instead of each re-deciding when a rebuild is
+/// safe. It is intentionally conservative: only a *mutating* action (one
+/// that could reduce archive coverage) is ever gated, so a stale
+/// low-risk index still gets normal `RefreshLexical` guidance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ArchiveSafetyEnvelope {
+    /// The archive-loss risk level driving the envelope.
+    pub archive_risk: ArchiveRiskLevel,
+    /// Whether a backup (or explicit fingerprinted plan) is recommended
+    /// before any mutating repair. True for `Elevated` and `High`.
+    pub backup_recommended: bool,
+    /// Actions that are unsafe to run until a backup / fingerprinted plan
+    /// exists. Non-empty only under `High` risk; the hard gate that keeps
+    /// archive-only nodes from being blindly rebuilt. Sorted + de-duped
+    /// for deterministic JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsafe_until_backup: Vec<SafeNextAction>,
+    /// The canonical data dir whose archive is at risk, when known. `None`
+    /// for unreachable hosts (nothing local is trustworthy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
+    /// One-line human-facing rationale.
+    pub reason: String,
+}
+
+impl ArchiveSafetyEnvelope {
+    /// Whether `action` is currently gated as unsafe-until-backup.
+    pub(crate) fn is_gated(&self, action: SafeNextAction) -> bool {
+        self.unsafe_until_backup.contains(&action)
+    }
+}
+
+/// The canonical per-node derived-asset truth table. Every readiness
+/// surface (health, status, doctor, fleet doctor, search `--robot-meta`)
+/// projects this one shape so the stale-but-searchable, missing,
+/// unreachable, and high-archive-risk states never collapse into a single
+/// "unhealthy" bit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DerivedAssetTruthTable {
+    /// Canonical DB open result — the root of every derived asset.
+    pub db: CanonicalDbAvailability,
+    /// Coverage of configured source paths.
+    pub source_coverage: SourceCoverageState,
+    /// High-water timestamp (ms) up to which sources have been scanned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_watermark_ms: Option<i64>,
+    /// Wall-clock ms of the last completed projection of derived assets
+    /// from the canonical DB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_projection_ms: Option<i64>,
+    /// Byte-level lexical asset metadata.
+    pub lexical_metadata: LexicalMetadata,
+    /// Lexical + semantic readiness states and last search refinement.
+    pub readiness: ReadinessSnapshot,
+    /// Quarantine exclusions (advisory).
+    pub quarantine: QuarantineSummary,
+    /// Active rebuild/repair state.
+    pub maintenance: MaintenanceActivity,
+    /// Archive-loss risk for any mutating repair.
+    pub archive_risk: ArchiveRiskLevel,
+    /// Running-binary compatibility with assets / fleet baseline.
+    pub binary: BinaryCompatibility,
+}
+
+impl DerivedAssetTruthTable {
+    /// Whether ordinary search queries can run against this node, honoring
+    /// both the DB availability and the lexical readiness axis.
+    pub(crate) fn is_searchable(&self) -> bool {
+        self.db.is_projectable() && self.readiness.is_searchable()
+    }
+
+    /// Derive the single safe next command. Priority is archive-first and
+    /// conservative: unreachable hosts and unusable DBs are surfaced with
+    /// non-destructive guidance; `ArchiveRiskLevel::High` forces a
+    /// backup-first recommendation ahead of any mutating repair; active
+    /// maintenance is waited on rather than duplicated; the lexical axis
+    /// dominates the semantic axis; quarantine is advisory-only.
+    pub(crate) fn safe_next_command(&self) -> SafeNextCommand {
+        use SafeNextAction as A;
+
+        // 0. Unreachable host — nothing local is trustworthy.
+        if self.db == CanonicalDbAvailability::Unreachable {
+            return SafeNextCommand::new(
+                A::HostUnreachable,
+                None,
+                "host unreachable; retry from a reachable fleet node before acting",
+            );
+        }
+
+        // 1. Unusable-but-present DB — inspect (read-only) before any
+        //    repair, even under high archive risk (inspection is safe).
+        match self.db {
+            CanonicalDbAvailability::Corrupt => {
+                return SafeNextCommand::new(
+                    A::InspectCanonicalDb,
+                    Some("cass diag --json --quarantine"),
+                    "canonical database failed integrity validation; inspect before any repair",
+                );
+            }
+            CanonicalDbAvailability::OpenFailed => {
+                return SafeNextCommand::new(
+                    A::InspectCanonicalDb,
+                    Some("cass health --json"),
+                    "canonical database could not be opened (lock/permission); inspect before repair",
+                );
+            }
+            _ => {}
+        }
+
+        // 2. High archive risk dominates every *mutating* repair below.
+        if self.archive_risk == ArchiveRiskLevel::High {
+            return SafeNextCommand::new(
+                A::BackupThenRepair,
+                Some("cass doctor --json   # review the backup-first plan before --fix"),
+                "high archive risk: back up the canonical archive before any repair",
+            );
+        }
+
+        // 3. Fresh install — no DB yet, safe to build.
+        if self.db == CanonicalDbAvailability::Missing {
+            return SafeNextCommand::new(
+                A::IndexFull,
+                Some("cass index --full"),
+                "no canonical database yet; build the initial index",
+            );
+        }
+
+        // 4. Active maintenance — attach/wait, never start a duplicate.
+        match self.maintenance {
+            MaintenanceActivity::LexicalRebuild | MaintenanceActivity::StorageRepair => {
+                return SafeNextCommand::new(
+                    A::WaitForMaintenance,
+                    None,
+                    "a rebuild/repair is already running; wait or attach instead of starting another",
+                );
+            }
+            // SemanticBackfill does not block lexical guidance; handled at
+            // the semantic axis below.
+            _ => {}
+        }
+
+        // 5. Source coverage gaps.
+        match self.source_coverage {
+            SourceCoverageState::Unconfigured => {
+                return SafeNextCommand::new(
+                    A::ConfigureSources,
+                    Some("cass sources setup"),
+                    "no sources configured; configure sources before indexing",
+                );
+            }
+            SourceCoverageState::Unavailable => {
+                return SafeNextCommand::new(
+                    A::ReconnectSource,
+                    Some("cass sources list --json"),
+                    "configured sources are unreachable; reconnect before syncing",
+                );
+            }
+            _ => {}
+        }
+
+        // 6. Binary skew — upgrade before trusting/rebuilding assets.
+        if self.binary == BinaryCompatibility::Outdated {
+            return SafeNextCommand::new(
+                A::UpgradeBinary,
+                Some("cass self-update"),
+                "binary is older than the fleet baseline; upgrade before relying on derived assets",
+            );
+        }
+        if self.binary == BinaryCompatibility::Ahead {
+            return SafeNextCommand::new(
+                A::RebuildForCurrentBinary,
+                Some("cass index --full"),
+                "binary is newer than the on-disk assets; rebuild derived assets for the current schema",
+            );
+        }
+
+        // 7. Lexical axis (mutating repairs gated by archive risk above).
+        match self.readiness.lexical {
+            LexicalReadinessState::Missing | LexicalReadinessState::CorruptQuarantined => {
+                return SafeNextCommand::new(
+                    A::RepairLexical,
+                    Some("cass index --full"),
+                    "lexical index unavailable; rebuild it from the canonical database",
+                );
+            }
+            LexicalReadinessState::Repairing => {
+                return SafeNextCommand::new(
+                    A::WaitForMaintenance,
+                    None,
+                    "lexical repair already in progress; wait or attach",
+                );
+            }
+            LexicalReadinessState::StaleButSearchable => {
+                return SafeNextCommand::new(
+                    A::RefreshLexical,
+                    Some("cass index"),
+                    "lexical index is stale; refresh to pick up recent ingests (search still works)",
+                );
+            }
+            LexicalReadinessState::Ready => {}
+        }
+
+        // 8. Semantic axis — opportunistic, never blocks lexical search.
+        match self.readiness.semantic {
+            SemanticReadinessState::Absent => {
+                return SafeNextCommand::new(
+                    A::InstallSemanticModel,
+                    Some("cass models install"),
+                    "semantic tier absent; install the model for hybrid refinement (lexical works now)",
+                );
+            }
+            SemanticReadinessState::Backfilling => {
+                return SafeNextCommand::new(
+                    A::WaitForSemantic,
+                    None,
+                    "semantic backfill in progress; hybrid refinement will catch up on its own",
+                );
+            }
+            SemanticReadinessState::FastTierReady
+            | SemanticReadinessState::HybridReady
+            | SemanticReadinessState::PolicyDisabled => {}
+        }
+
+        // 9. Quarantine is advisory — surfaced only when otherwise healthy.
+        if self.quarantine.has_exclusions() {
+            return SafeNextCommand::new(
+                A::InspectQuarantine,
+                Some("cass diag --json --quarantine"),
+                "quarantined artifacts present (advisory; search results are unaffected)",
+            );
+        }
+
+        // 10. Fully converged.
+        SafeNextCommand::new(
+            A::None,
+            None,
+            "all derived assets converged; no action required",
+        )
+    }
+
+    /// Derive the archive-risk safety envelope for this node. `data_dir` is
+    /// the canonical data directory whose archive is at risk (surfaced so
+    /// operators know exactly what to back up); pass `None` when it is not
+    /// known (e.g. an unreachable host).
+    ///
+    /// Gating rules (archive-first, conservative):
+    /// - `High` → backup is mandatory; every *mutating* next-action that
+    ///   could reduce archive coverage is marked unsafe-until-backup, so the
+    ///   surface cannot emit a casual rebuild/repair command.
+    /// - `Elevated` → backup recommended, but actions are not hard-gated
+    ///   (advisory): recovery is expensive, not irreplaceable.
+    /// - `None` / `Low` / `Unknown` → no backup gate; normal guidance
+    ///   (e.g. a stale low-risk index still gets `RefreshLexical`).
+    pub(crate) fn archive_safety_envelope(&self, data_dir: Option<&str>) -> ArchiveSafetyEnvelope {
+        // The mutating actions that could reduce archive coverage; gated as
+        // a unit so no single rebuild/repair path slips through under High
+        // risk. Derived from `SafeNextAction::is_mutating` to stay in sync
+        // with the safe-next-command vocabulary.
+        const GATED: &[SafeNextAction] = &[
+            SafeNextAction::IndexFull,
+            SafeNextAction::RepairLexical,
+            SafeNextAction::RefreshLexical,
+            SafeNextAction::RebuildForCurrentBinary,
+        ];
+        debug_assert!(
+            GATED.iter().all(|a| a.is_mutating()),
+            "every gated action must be mutating"
+        );
+
+        // Unreachable hosts: nothing local is trustworthy, so surface the
+        // risk verbatim with no data_dir and no actionable gate.
+        if self.db == CanonicalDbAvailability::Unreachable {
+            return ArchiveSafetyEnvelope {
+                archive_risk: self.archive_risk,
+                backup_recommended: false,
+                unsafe_until_backup: Vec::new(),
+                data_dir: None,
+                reason: "host unreachable; archive risk cannot be assessed locally".to_string(),
+            };
+        }
+
+        let data_dir = data_dir.map(str::to_string);
+        match self.archive_risk {
+            ArchiveRiskLevel::High => ArchiveSafetyEnvelope {
+                archive_risk: ArchiveRiskLevel::High,
+                backup_recommended: true,
+                unsafe_until_backup: GATED.to_vec(),
+                data_dir,
+                reason:
+                    "high archive risk: back up the canonical archive (or produce a fingerprinted \
+                     recovery plan) before any rebuild or repair"
+                        .to_string(),
+            },
+            ArchiveRiskLevel::Elevated => ArchiveSafetyEnvelope {
+                archive_risk: ArchiveRiskLevel::Elevated,
+                backup_recommended: true,
+                unsafe_until_backup: Vec::new(),
+                data_dir,
+                reason: "elevated archive risk: a backup is recommended before any repair"
+                    .to_string(),
+            },
+            ArchiveRiskLevel::None | ArchiveRiskLevel::Low => ArchiveSafetyEnvelope {
+                archive_risk: self.archive_risk,
+                backup_recommended: false,
+                unsafe_until_backup: Vec::new(),
+                data_dir,
+                reason: "archive risk is low; derived assets are reproducible from a backed source"
+                    .to_string(),
+            },
+            ArchiveRiskLevel::Unknown => ArchiveSafetyEnvelope {
+                archive_risk: ArchiveRiskLevel::Unknown,
+                backup_recommended: false,
+                unsafe_until_backup: Vec::new(),
+                data_dir,
+                reason: "archive risk could not be evaluated".to_string(),
+            },
+        }
+    }
+}
+
+/// Bridge the live `state_meta_json` snapshot into the canonical typed
+/// [`DerivedAssetTruthTable`] (bead
+/// `cass-fleet-resilience-20260608-uojcg.envu1`).
+///
+/// Today the typed truth table is only built in fixtures; every live
+/// readiness surface (`run_status` / `run_doctor` / `run_health`) instead
+/// works off a parallel `serde_json::Value` snapshot produced by
+/// `state_meta_json_inner`. This function maps that same snapshot — the one
+/// the surfaces already compute from the canonical data dir — into the typed
+/// table, so the typed projections (`readiness_projection::project`,
+/// [`DerivedAssetTruthTable::next_command_envelope`],
+/// [`DerivedAssetTruthTable::safe_next_command`]) can be reused across
+/// surfaces (recovery support bundle, human readiness summary) instead of
+/// re-deriving the JSON ad hoc.
+///
+/// The lexical/semantic [`ReadinessSnapshot`] is computed by the caller
+/// (`readiness_snapshot_from_state`, which already owns that derivation) and
+/// passed in, so this bridge does not duplicate the search-axis logic.
+///
+/// Fields the local single-node snapshot does not carry are reported
+/// truthfully as `Unknown` / `None` rather than guessed:
+/// - `source_coverage` is `Unknown` (source-path coverage is the
+///   sources-doctor surface's concern, not part of this readiness snapshot).
+/// - `archive_risk` is `Unknown` (archive-loss evaluation is a fleet/source
+///   concern, not derivable from the local readiness probe; reporting Unknown
+///   makes the archive-safety envelope say "could not be evaluated" rather
+///   than gating or green-lighting a mutating repair on a guess).
+/// - `binary` is `Current` unless the on-disk lexical checkpoint reports a
+///   schema mismatch, in which case the running binary is `Ahead` of the
+///   assets (rebuild required to match the current schema). Fleet version
+///   skew (`Outdated`) requires a fleet baseline and is not derived here.
+pub(crate) fn truth_table_from_state(
+    state: &serde_json::Value,
+    readiness: ReadinessSnapshot,
+) -> DerivedAssetTruthTable {
+    use serde_json::Value;
+
+    let as_bool = |ptr: &str| state.pointer(ptr).and_then(Value::as_bool);
+    let as_str = |ptr: &str| {
+        state
+            .pointer(ptr)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+
+    // --- Canonical DB availability ---------------------------------------
+    let db_exists = as_bool("/database/exists").unwrap_or(false);
+    let db_opened = as_bool("/database/opened").unwrap_or(false);
+    let db_open_skipped = as_bool("/database/open_skipped").unwrap_or(false);
+    let db = if !db_exists {
+        // No canonical DB file yet — a fresh install, safe to build.
+        CanonicalDbAvailability::Missing
+    } else if db_opened || db_open_skipped {
+        // Opened for real, or the open was deliberately elided (health's fast
+        // path) on a present file: treat the present DB as available.
+        CanonicalDbAvailability::Available
+    } else {
+        // File present but the (attempted) open failed. The snapshot cannot
+        // distinguish lock/permission from header corruption (open_retryable
+        // conflates them), so report the conservative "could not open" —
+        // inspect before any repair, never blind-rebuild.
+        CanonicalDbAvailability::OpenFailed
+    };
+
+    // --- Lexical asset metadata ------------------------------------------
+    let lexical_metadata = LexicalMetadata {
+        present: as_bool("/index/exists").unwrap_or(false),
+        // The state snapshot exposes fingerprints, not the bare schema hash.
+        schema_hash: None,
+        storage_fingerprint: as_str("/index/fingerprint/checkpoint_fingerprint"),
+        built_at_ms: as_str("/index/last_indexed_at").and_then(|ts| parse_rfc3339_millis(&ts)),
+    };
+    let last_projection_ms = lexical_metadata.built_at_ms;
+
+    // --- Quarantine (advisory) -------------------------------------------
+    let quarantined_count = state
+        .pointer("/ingest_quarantine/quarantined_conversations")
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+        .unwrap_or(0);
+    let quarantine = QuarantineSummary {
+        quarantined_count,
+        // Byte accounting lives in `cass diag --quarantine`, not the
+        // readiness snapshot; report 0 rather than guessing.
+        total_quarantined_bytes: 0,
+        causes: Vec::new(),
+    };
+
+    // --- Active maintenance ----------------------------------------------
+    let maintenance = if as_bool("/rebuild/active").unwrap_or(false) {
+        MaintenanceActivity::LexicalRebuild
+    } else if as_bool("/semantic/checkpoint/active").unwrap_or(false) {
+        MaintenanceActivity::SemanticBackfill
+    } else {
+        MaintenanceActivity::Idle
+    };
+
+    // --- Binary compatibility --------------------------------------------
+    // A present lexical checkpoint whose schema does not match the running
+    // binary means the binary is *ahead* of the on-disk assets (rebuild to
+    // match the current schema). Otherwise the running binary is the
+    // reference for this local node (fleet `Outdated` skew needs a baseline
+    // we do not have here).
+    let binary = if matches!(as_bool("/index/checkpoint/schema_matches"), Some(false)) {
+        BinaryCompatibility::Ahead
+    } else {
+        BinaryCompatibility::Current
+    };
+
+    DerivedAssetTruthTable {
+        db,
+        source_coverage: SourceCoverageState::Unknown,
+        // The snapshot does not expose a separate scan watermark; the last
+        // completed projection is the index's last_indexed_at.
+        scan_watermark_ms: None,
+        last_projection_ms,
+        lexical_metadata,
+        readiness,
+        quarantine,
+        maintenance,
+        archive_risk: ArchiveRiskLevel::Unknown,
+        binary,
+    }
+}
+
+/// Parse an RFC-3339 timestamp (as serialized by the state snapshot) into
+/// wall-clock milliseconds. Returns `None` for absent/malformed values.
+fn parse_rfc3339_millis(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+/// The seven canonical fleet states from the 2026-06-08 analysis, exposed
+/// as fixtures so downstream beads (.1.5 readiness fixture matrix, .12.1
+/// test matrix, fleet doctor goldens) consume one source of truth instead
+/// of hand-rolling node states. Returned as `(name, table)` pairs in a
+/// stable order. Timestamps are fixed literals for determinism.
+pub(crate) fn fleet_fixtures() -> Vec<(&'static str, DerivedAssetTruthTable)> {
+    // A fixed reference clock (ms) so fixtures are byte-deterministic.
+    const NOW_MS: i64 = 1_749_350_000_000; // ~2026-06-08T00:00:00Z
+    const HOUR_MS: i64 = 3_600_000;
+    const DAY_MS: i64 = 86_400_000;
+
+    vec![
+        // local: index is stale but searchable, with quarantined assets.
+        (
+            "local_stale_quarantine",
+            DerivedAssetTruthTable {
+                db: CanonicalDbAvailability::Available,
+                source_coverage: SourceCoverageState::Complete,
+                scan_watermark_ms: Some(NOW_MS - HOUR_MS),
+                last_projection_ms: Some(NOW_MS - 6 * HOUR_MS),
+                lexical_metadata: LexicalMetadata {
+                    present: true,
+                    schema_hash: Some("schema-current".to_string()),
+                    storage_fingerprint: Some("fp-old-gen".to_string()),
+                    built_at_ms: Some(NOW_MS - 6 * HOUR_MS),
+                },
+                readiness: ReadinessSnapshot::new(
+                    LexicalReadinessState::StaleButSearchable,
+                    // Semantic assets exist but the planner fell back to
+                    // lexical-only refinement for the last query (the report's
+                    // "lexical-only semantic fallback").
+                    SemanticReadinessState::HybridReady,
+                )
+                .with_last_search_refinement(SearchRefinementLevel::LexicalOnly),
+                quarantine: QuarantineSummary {
+                    // The report's local 0.6.13 node held 133 ingest-OOM
+                    // quarantines (issue #258 class).
+                    quarantined_count: 133,
+                    total_quarantined_bytes: 139_460_608,
+                    causes: vec!["ingest_oom".to_string()],
+                },
+                maintenance: MaintenanceActivity::Idle,
+                archive_risk: ArchiveRiskLevel::Low,
+                binary: BinaryCompatibility::Current,
+            },
+        ),
+        // ts1: high archive risk — the canonical archive is the only copy.
+        (
+            "ts1_high_archive_risk",
+            DerivedAssetTruthTable {
+                db: CanonicalDbAvailability::Available,
+                source_coverage: SourceCoverageState::Complete,
+                scan_watermark_ms: Some(NOW_MS - 2 * HOUR_MS),
+                last_projection_ms: Some(NOW_MS - 2 * HOUR_MS),
+                lexical_metadata: LexicalMetadata {
+                    present: true,
+                    schema_hash: Some("schema-current".to_string()),
+                    storage_fingerprint: Some("fp-current".to_string()),
+                    built_at_ms: Some(NOW_MS - 2 * HOUR_MS),
+                },
+                readiness: ReadinessSnapshot::new(
+                    LexicalReadinessState::Ready,
+                    SemanticReadinessState::HybridReady,
+                ),
+                quarantine: QuarantineSummary::default(),
+                maintenance: MaintenanceActivity::Idle,
+                archive_risk: ArchiveRiskLevel::High,
+                binary: BinaryCompatibility::Current,
+            },
+        ),
+        // ts2: fast health, slow status — semantic backfill in flight so the
+        // heavier status probe is slow while health stays fast/cached.
+        (
+            "ts2_fast_health_slow_status",
+            DerivedAssetTruthTable {
+                db: CanonicalDbAvailability::Available,
+                source_coverage: SourceCoverageState::Complete,
+                scan_watermark_ms: Some(NOW_MS - 30 * 60_000),
+                last_projection_ms: Some(NOW_MS - HOUR_MS),
+                lexical_metadata: LexicalMetadata {
+                    present: true,
+                    schema_hash: Some("schema-current".to_string()),
+                    storage_fingerprint: Some("fp-current".to_string()),
+                    built_at_ms: Some(NOW_MS - HOUR_MS),
+                },
+                readiness: ReadinessSnapshot::new(
+                    LexicalReadinessState::Ready,
+                    SemanticReadinessState::Backfilling,
+                ),
+                quarantine: QuarantineSummary::default(),
+                maintenance: MaintenanceActivity::SemanticBackfill,
+                archive_risk: ArchiveRiskLevel::Low,
+                binary: BinaryCompatibility::Current,
+            },
+        ),
+        // csd: lexical metadata absent entirely — index never built / lost.
+        (
+            "csd_missing_lexical_metadata",
+            DerivedAssetTruthTable {
+                db: CanonicalDbAvailability::Available,
+                source_coverage: SourceCoverageState::Complete,
+                scan_watermark_ms: Some(NOW_MS - DAY_MS),
+                last_projection_ms: None,
+                lexical_metadata: LexicalMetadata {
+                    present: false,
+                    schema_hash: None,
+                    storage_fingerprint: None,
+                    built_at_ms: None,
+                },
+                readiness: ReadinessSnapshot::new(
+                    LexicalReadinessState::Missing,
+                    SemanticReadinessState::Absent,
+                ),
+                quarantine: QuarantineSummary::default(),
+                maintenance: MaintenanceActivity::Idle,
+                archive_risk: ArchiveRiskLevel::None,
+                binary: BinaryCompatibility::Current,
+            },
+        ),
+        // css: a stale existing index against reachable sources.
+        (
+            "css_stale_existing_index",
+            DerivedAssetTruthTable {
+                db: CanonicalDbAvailability::Available,
+                source_coverage: SourceCoverageState::Complete,
+                scan_watermark_ms: Some(NOW_MS - 12 * HOUR_MS),
+                last_projection_ms: Some(NOW_MS - 5 * DAY_MS),
+                lexical_metadata: LexicalMetadata {
+                    present: true,
+                    schema_hash: Some("schema-current".to_string()),
+                    storage_fingerprint: Some("fp-stale-gen".to_string()),
+                    built_at_ms: Some(NOW_MS - 5 * DAY_MS),
+                },
+                readiness: ReadinessSnapshot::new(
+                    LexicalReadinessState::StaleButSearchable,
+                    SemanticReadinessState::HybridReady,
+                ),
+                quarantine: QuarantineSummary::default(),
+                maintenance: MaintenanceActivity::Idle,
+                archive_risk: ArchiveRiskLevel::Low,
+                binary: BinaryCompatibility::Current,
+            },
+        ),
+        // mac-mini-max: a stale old binary whose assets predate the current
+        // schema; upgrade the binary before trusting/rebuilding assets.
+        (
+            "mac_mini_max_stale_old_binary",
+            DerivedAssetTruthTable {
+                db: CanonicalDbAvailability::Available,
+                source_coverage: SourceCoverageState::Complete,
+                scan_watermark_ms: Some(NOW_MS - 3 * DAY_MS),
+                last_projection_ms: Some(NOW_MS - 3 * DAY_MS),
+                lexical_metadata: LexicalMetadata {
+                    present: true,
+                    schema_hash: Some("schema-legacy".to_string()),
+                    storage_fingerprint: Some("fp-legacy-gen".to_string()),
+                    built_at_ms: Some(NOW_MS - 3 * DAY_MS),
+                },
+                readiness: ReadinessSnapshot::new(
+                    LexicalReadinessState::StaleButSearchable,
+                    SemanticReadinessState::FastTierReady,
+                ),
+                quarantine: QuarantineSummary::default(),
+                maintenance: MaintenanceActivity::Idle,
+                archive_risk: ArchiveRiskLevel::Low,
+                binary: BinaryCompatibility::Outdated,
+            },
+        ),
+        // mac-mini-old: unreachable via the fleet probe entirely.
+        (
+            "mac_mini_old_unreachable",
+            DerivedAssetTruthTable {
+                db: CanonicalDbAvailability::Unreachable,
+                source_coverage: SourceCoverageState::Unknown,
+                scan_watermark_ms: None,
+                last_projection_ms: None,
+                lexical_metadata: LexicalMetadata::default(),
+                readiness: ReadinessSnapshot::new(
+                    LexicalReadinessState::Missing,
+                    SemanticReadinessState::Absent,
+                ),
+                quarantine: QuarantineSummary::default(),
+                maintenance: MaintenanceActivity::Unknown,
+                archive_risk: ArchiveRiskLevel::Unknown,
+                binary: BinaryCompatibility::Unknown,
+            },
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,5 +1365,658 @@ mod tests {
         assert!(snap.last_search_refinement.is_none());
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"last_search_refinement\":null"));
+    }
+
+    // -----------------------------------------------------------------
+    // DerivedAssetTruthTable (.1.1)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn truth_table_enums_serialize_as_snake_case() {
+        let db: &[(CanonicalDbAvailability, &str)] = &[
+            (CanonicalDbAvailability::Available, "available"),
+            (CanonicalDbAvailability::Missing, "missing"),
+            (CanonicalDbAvailability::OpenFailed, "open_failed"),
+            (CanonicalDbAvailability::Corrupt, "corrupt"),
+            (CanonicalDbAvailability::Unreachable, "unreachable"),
+        ];
+        for (v, want) in db {
+            assert_eq!(serde_json::to_string(v).unwrap(), format!("\"{want}\""));
+        }
+        let cov: &[(SourceCoverageState, &str)] = &[
+            (SourceCoverageState::Complete, "complete"),
+            (SourceCoverageState::Partial, "partial"),
+            (SourceCoverageState::Unavailable, "unavailable"),
+            (SourceCoverageState::Unconfigured, "unconfigured"),
+            (SourceCoverageState::Unknown, "unknown"),
+        ];
+        for (v, want) in cov {
+            assert_eq!(serde_json::to_string(v).unwrap(), format!("\"{want}\""));
+        }
+        let maint: &[(MaintenanceActivity, &str)] = &[
+            (MaintenanceActivity::Idle, "idle"),
+            (MaintenanceActivity::LexicalRebuild, "lexical_rebuild"),
+            (MaintenanceActivity::SemanticBackfill, "semantic_backfill"),
+            (MaintenanceActivity::StorageRepair, "storage_repair"),
+            (MaintenanceActivity::Unknown, "unknown"),
+        ];
+        for (v, want) in maint {
+            assert_eq!(serde_json::to_string(v).unwrap(), format!("\"{want}\""));
+        }
+        let risk: &[(ArchiveRiskLevel, &str)] = &[
+            (ArchiveRiskLevel::None, "none"),
+            (ArchiveRiskLevel::Low, "low"),
+            (ArchiveRiskLevel::Elevated, "elevated"),
+            (ArchiveRiskLevel::High, "high"),
+            (ArchiveRiskLevel::Unknown, "unknown"),
+        ];
+        for (v, want) in risk {
+            assert_eq!(serde_json::to_string(v).unwrap(), format!("\"{want}\""));
+        }
+        let bin: &[(BinaryCompatibility, &str)] = &[
+            (BinaryCompatibility::Current, "current"),
+            (BinaryCompatibility::Outdated, "outdated"),
+            (BinaryCompatibility::Ahead, "ahead"),
+            (BinaryCompatibility::Unknown, "unknown"),
+        ];
+        for (v, want) in bin {
+            assert_eq!(serde_json::to_string(v).unwrap(), format!("\"{want}\""));
+        }
+    }
+
+    #[test]
+    fn safe_next_action_serializes_as_snake_case() {
+        let pairs: &[(SafeNextAction, &str)] = &[
+            (SafeNextAction::None, "none"),
+            (SafeNextAction::IndexFull, "index_full"),
+            (SafeNextAction::BackupThenRepair, "backup_then_repair"),
+            (SafeNextAction::InspectCanonicalDb, "inspect_canonical_db"),
+            (SafeNextAction::RepairLexical, "repair_lexical"),
+            (SafeNextAction::RefreshLexical, "refresh_lexical"),
+            (SafeNextAction::WaitForMaintenance, "wait_for_maintenance"),
+            (SafeNextAction::WaitForSemantic, "wait_for_semantic"),
+            (SafeNextAction::ConfigureSources, "configure_sources"),
+            (SafeNextAction::ReconnectSource, "reconnect_source"),
+            (SafeNextAction::InspectQuarantine, "inspect_quarantine"),
+            (
+                SafeNextAction::InstallSemanticModel,
+                "install_semantic_model",
+            ),
+            (SafeNextAction::UpgradeBinary, "upgrade_binary"),
+            (
+                SafeNextAction::RebuildForCurrentBinary,
+                "rebuild_for_current_binary",
+            ),
+            (SafeNextAction::HostUnreachable, "host_unreachable"),
+        ];
+        for (v, want) in pairs {
+            assert_eq!(serde_json::to_string(v).unwrap(), format!("\"{want}\""));
+        }
+    }
+
+    /// Look up a fixture by name; panics with a clear message if missing.
+    fn fixture(name: &str) -> DerivedAssetTruthTable {
+        fleet_fixtures()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("missing fleet fixture {name}"))
+            .1
+    }
+
+    #[test]
+    fn fleet_fixtures_cover_all_seven_named_states_in_stable_order() {
+        let names: Vec<&str> = fleet_fixtures().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "local_stale_quarantine",
+                "ts1_high_archive_risk",
+                "ts2_fast_health_slow_status",
+                "csd_missing_lexical_metadata",
+                "css_stale_existing_index",
+                "mac_mini_max_stale_old_binary",
+                "mac_mini_old_unreachable",
+            ]
+        );
+    }
+
+    #[test]
+    fn fleet_fixtures_round_trip_through_json() {
+        for (name, table) in fleet_fixtures() {
+            let json = serde_json::to_string(&table).unwrap();
+            let parsed: DerivedAssetTruthTable = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, table, "fixture {name} should round-trip");
+        }
+    }
+
+    #[test]
+    fn local_stale_quarantine_recommends_refresh_over_advisory_quarantine() {
+        let t = fixture("local_stale_quarantine");
+        assert!(t.is_searchable());
+        assert!(t.quarantine.has_exclusions());
+        // Stale-refresh dominates the advisory quarantine signal.
+        assert_eq!(t.safe_next_command().action, SafeNextAction::RefreshLexical);
+    }
+
+    #[test]
+    fn ts1_high_archive_risk_is_backup_first() {
+        let t = fixture("ts1_high_archive_risk");
+        let cmd = t.safe_next_command();
+        assert_eq!(cmd.action, SafeNextAction::BackupThenRepair);
+        assert!(!cmd.action.is_mutating());
+    }
+
+    #[test]
+    fn ts2_fast_health_slow_status_waits_for_semantic() {
+        let t = fixture("ts2_fast_health_slow_status");
+        assert!(t.is_searchable());
+        assert_eq!(
+            t.safe_next_command().action,
+            SafeNextAction::WaitForSemantic
+        );
+    }
+
+    #[test]
+    fn csd_missing_lexical_metadata_repairs_lexical() {
+        let t = fixture("csd_missing_lexical_metadata");
+        assert!(!t.is_searchable());
+        assert!(!t.lexical_metadata.present);
+        assert_eq!(t.safe_next_command().action, SafeNextAction::RepairLexical);
+    }
+
+    #[test]
+    fn css_stale_existing_index_refreshes_lexical() {
+        let t = fixture("css_stale_existing_index");
+        assert!(t.is_searchable());
+        assert_eq!(t.safe_next_command().action, SafeNextAction::RefreshLexical);
+    }
+
+    #[test]
+    fn mac_mini_max_stale_old_binary_upgrades_binary_first() {
+        let t = fixture("mac_mini_max_stale_old_binary");
+        // Binary skew is surfaced ahead of the stale-lexical refresh.
+        assert_eq!(t.safe_next_command().action, SafeNextAction::UpgradeBinary);
+    }
+
+    #[test]
+    fn newer_binary_rebuilds_assets_for_current_schema() {
+        let t = DerivedAssetTruthTable {
+            db: CanonicalDbAvailability::Available,
+            source_coverage: SourceCoverageState::Complete,
+            scan_watermark_ms: Some(1),
+            last_projection_ms: Some(1),
+            lexical_metadata: LexicalMetadata {
+                present: true,
+                schema_hash: Some("schema-previous".to_string()),
+                storage_fingerprint: Some("fp-current".to_string()),
+                built_at_ms: Some(1),
+            },
+            readiness: ReadinessSnapshot::new(
+                LexicalReadinessState::Ready,
+                SemanticReadinessState::HybridReady,
+            ),
+            quarantine: QuarantineSummary::default(),
+            maintenance: MaintenanceActivity::Idle,
+            archive_risk: ArchiveRiskLevel::Low,
+            binary: BinaryCompatibility::Ahead,
+        };
+        let cmd = t.safe_next_command();
+        assert_eq!(cmd.action, SafeNextAction::RebuildForCurrentBinary);
+        assert!(cmd.action.is_mutating());
+        assert_eq!(cmd.command.as_deref(), Some("cass index --full"));
+    }
+
+    #[test]
+    fn mac_mini_old_unreachable_yields_host_unreachable() {
+        let t = fixture("mac_mini_old_unreachable");
+        assert!(!t.is_searchable());
+        let cmd = t.safe_next_command();
+        assert_eq!(cmd.action, SafeNextAction::HostUnreachable);
+        assert!(cmd.command.is_none());
+    }
+
+    #[test]
+    fn fresh_install_recommends_index_full() {
+        let t = DerivedAssetTruthTable {
+            db: CanonicalDbAvailability::Missing,
+            source_coverage: SourceCoverageState::Complete,
+            scan_watermark_ms: None,
+            last_projection_ms: None,
+            lexical_metadata: LexicalMetadata::default(),
+            readiness: ReadinessSnapshot::new(
+                LexicalReadinessState::Missing,
+                SemanticReadinessState::Absent,
+            ),
+            quarantine: QuarantineSummary::default(),
+            maintenance: MaintenanceActivity::Idle,
+            archive_risk: ArchiveRiskLevel::None,
+            binary: BinaryCompatibility::Current,
+        };
+        assert_eq!(t.safe_next_command().action, SafeNextAction::IndexFull);
+    }
+
+    #[test]
+    fn corrupt_db_inspects_before_repair_even_under_high_risk() {
+        let t = DerivedAssetTruthTable {
+            db: CanonicalDbAvailability::Corrupt,
+            source_coverage: SourceCoverageState::Complete,
+            scan_watermark_ms: None,
+            last_projection_ms: None,
+            lexical_metadata: LexicalMetadata::default(),
+            readiness: ReadinessSnapshot::new(
+                LexicalReadinessState::CorruptQuarantined,
+                SemanticReadinessState::Absent,
+            ),
+            quarantine: QuarantineSummary::default(),
+            maintenance: MaintenanceActivity::Idle,
+            archive_risk: ArchiveRiskLevel::High,
+            binary: BinaryCompatibility::Current,
+        };
+        let cmd = t.safe_next_command();
+        // Read-only inspection wins even when archive risk is high.
+        assert_eq!(cmd.action, SafeNextAction::InspectCanonicalDb);
+        assert!(!cmd.action.is_mutating());
+    }
+
+    #[test]
+    fn active_lexical_rebuild_waits_instead_of_duplicating() {
+        let t = DerivedAssetTruthTable {
+            db: CanonicalDbAvailability::Available,
+            source_coverage: SourceCoverageState::Complete,
+            scan_watermark_ms: None,
+            last_projection_ms: None,
+            lexical_metadata: LexicalMetadata::default(),
+            readiness: ReadinessSnapshot::new(
+                LexicalReadinessState::Repairing,
+                SemanticReadinessState::Absent,
+            ),
+            quarantine: QuarantineSummary::default(),
+            maintenance: MaintenanceActivity::LexicalRebuild,
+            archive_risk: ArchiveRiskLevel::Low,
+            binary: BinaryCompatibility::Current,
+        };
+        assert_eq!(
+            t.safe_next_command().action,
+            SafeNextAction::WaitForMaintenance
+        );
+    }
+
+    #[test]
+    fn unconfigured_sources_recommend_setup() {
+        let t = DerivedAssetTruthTable {
+            db: CanonicalDbAvailability::Available,
+            source_coverage: SourceCoverageState::Unconfigured,
+            scan_watermark_ms: None,
+            last_projection_ms: None,
+            lexical_metadata: LexicalMetadata::default(),
+            readiness: ReadinessSnapshot::new(
+                LexicalReadinessState::Missing,
+                SemanticReadinessState::Absent,
+            ),
+            quarantine: QuarantineSummary::default(),
+            maintenance: MaintenanceActivity::Idle,
+            archive_risk: ArchiveRiskLevel::None,
+            binary: BinaryCompatibility::Current,
+        };
+        assert_eq!(
+            t.safe_next_command().action,
+            SafeNextAction::ConfigureSources
+        );
+    }
+
+    #[test]
+    fn fully_converged_table_requires_no_action() {
+        let t = DerivedAssetTruthTable {
+            db: CanonicalDbAvailability::Available,
+            source_coverage: SourceCoverageState::Complete,
+            scan_watermark_ms: Some(1),
+            last_projection_ms: Some(1),
+            lexical_metadata: LexicalMetadata {
+                present: true,
+                schema_hash: Some("schema-current".to_string()),
+                storage_fingerprint: Some("fp-current".to_string()),
+                built_at_ms: Some(1),
+            },
+            readiness: ReadinessSnapshot::new(
+                LexicalReadinessState::Ready,
+                SemanticReadinessState::HybridReady,
+            ),
+            quarantine: QuarantineSummary::default(),
+            maintenance: MaintenanceActivity::Idle,
+            archive_risk: ArchiveRiskLevel::None,
+            binary: BinaryCompatibility::Current,
+        };
+        let cmd = t.safe_next_command();
+        assert_eq!(cmd.action, SafeNextAction::None);
+        assert!(cmd.command.is_none());
+        assert!(t.is_searchable());
+    }
+
+    // -----------------------------------------------------------------
+    // ArchiveSafetyEnvelope (.1.3)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn high_archive_risk_envelope_is_backup_first_and_hard_gates_mutating_actions() {
+        let t = fixture("ts1_high_archive_risk");
+        let env = t.archive_safety_envelope(Some("/data/cass"));
+        assert_eq!(env.archive_risk, ArchiveRiskLevel::High);
+        assert!(env.backup_recommended);
+        assert_eq!(env.data_dir.as_deref(), Some("/data/cass"));
+        // Every coverage-reducing rebuild/repair is gated unsafe-until-backup.
+        for gated in [
+            SafeNextAction::IndexFull,
+            SafeNextAction::RepairLexical,
+            SafeNextAction::RefreshLexical,
+            SafeNextAction::RebuildForCurrentBinary,
+        ] {
+            assert!(
+                env.is_gated(gated),
+                "{gated:?} must be gated under high risk"
+            );
+            assert!(gated.is_mutating());
+        }
+        // The node's own safe-next-command stays backup-first, never a
+        // casual rebuild.
+        assert_eq!(
+            t.safe_next_command().action,
+            SafeNextAction::BackupThenRepair
+        );
+        assert!(env.reason.contains("back up"));
+    }
+
+    #[test]
+    fn low_risk_stale_node_is_not_gated_and_keeps_normal_refresh_guidance() {
+        for name in ["local_stale_quarantine", "css_stale_existing_index"] {
+            let t = fixture(name);
+            let env = t.archive_safety_envelope(Some("/data/cass"));
+            assert!(matches!(env.archive_risk, ArchiveRiskLevel::Low));
+            assert!(!env.backup_recommended, "{name} low risk: no backup gate");
+            assert!(env.unsafe_until_backup.is_empty(), "{name} nothing gated");
+            assert!(!env.is_gated(SafeNextAction::RefreshLexical));
+            // Normal refresh guidance is preserved.
+            assert_eq!(t.safe_next_command().action, SafeNextAction::RefreshLexical);
+        }
+    }
+
+    #[test]
+    fn elevated_risk_recommends_backup_without_hard_gating() {
+        let t = DerivedAssetTruthTable {
+            db: CanonicalDbAvailability::Available,
+            source_coverage: SourceCoverageState::Complete,
+            scan_watermark_ms: Some(1),
+            last_projection_ms: Some(1),
+            lexical_metadata: LexicalMetadata::default(),
+            readiness: ReadinessSnapshot::new(
+                LexicalReadinessState::StaleButSearchable,
+                SemanticReadinessState::HybridReady,
+            ),
+            quarantine: QuarantineSummary::default(),
+            maintenance: MaintenanceActivity::Idle,
+            archive_risk: ArchiveRiskLevel::Elevated,
+            binary: BinaryCompatibility::Current,
+        };
+        let env = t.archive_safety_envelope(Some("/data/cass"));
+        assert!(env.backup_recommended);
+        assert!(
+            env.unsafe_until_backup.is_empty(),
+            "elevated risk is advisory, not a hard gate"
+        );
+    }
+
+    #[test]
+    fn unreachable_node_envelope_has_no_data_dir_and_no_gate() {
+        let t = fixture("mac_mini_old_unreachable");
+        let env = t.archive_safety_envelope(Some("/data/cass"));
+        assert!(
+            env.data_dir.is_none(),
+            "unreachable host surfaces no data_dir"
+        );
+        assert!(!env.backup_recommended);
+        assert!(env.unsafe_until_backup.is_empty());
+    }
+
+    #[test]
+    fn archive_safety_envelope_round_trips_through_json_snake_case() {
+        let t = fixture("ts1_high_archive_risk");
+        let env = t.archive_safety_envelope(Some("/data/cass"));
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"archive_risk\":\"high\""));
+        assert!(json.contains("\"backup_recommended\":true"));
+        assert!(json.contains("\"unsafe_until_backup\":[\"index_full\""));
+        assert!(json.contains("\"data_dir\":\"/data/cass\""));
+        let parsed: ArchiveSafetyEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn healthy_node_with_only_quarantine_surfaces_advisory_inspection() {
+        let t = DerivedAssetTruthTable {
+            db: CanonicalDbAvailability::Available,
+            source_coverage: SourceCoverageState::Complete,
+            scan_watermark_ms: Some(1),
+            last_projection_ms: Some(1),
+            lexical_metadata: LexicalMetadata {
+                present: true,
+                schema_hash: Some("schema-current".to_string()),
+                storage_fingerprint: Some("fp-current".to_string()),
+                built_at_ms: Some(1),
+            },
+            readiness: ReadinessSnapshot::new(
+                LexicalReadinessState::Ready,
+                SemanticReadinessState::HybridReady,
+            ),
+            quarantine: QuarantineSummary {
+                quarantined_count: 1,
+                total_quarantined_bytes: 1024,
+                causes: vec!["ingest_oom".to_string()],
+            },
+            maintenance: MaintenanceActivity::Idle,
+            archive_risk: ArchiveRiskLevel::None,
+            binary: BinaryCompatibility::Current,
+        };
+        let cmd = t.safe_next_command();
+        assert_eq!(cmd.action, SafeNextAction::InspectQuarantine);
+        assert!(!cmd.action.is_mutating());
+    }
+
+    // --- truth_table_from_state bridge (bead envu1) ----------------------
+
+    #[test]
+    fn bridge_fresh_install_maps_to_missing_db_and_index_full() {
+        // A fresh data dir: no canonical DB, no lexical index, nothing
+        // rebuilding. The bridge must surface a Missing DB and the safe next
+        // command must be the initial `cass index --full` build.
+        let state = serde_json::json!({
+            "database": { "exists": false, "opened": false, "open_skipped": false },
+            "index": { "exists": false },
+            "rebuild": { "active": false },
+        });
+        let readiness = ReadinessSnapshot::new(
+            LexicalReadinessState::Missing,
+            SemanticReadinessState::Absent,
+        );
+        let table = truth_table_from_state(&state, readiness);
+        assert_eq!(table.db, CanonicalDbAvailability::Missing);
+        assert!(!table.lexical_metadata.present);
+        assert_eq!(table.source_coverage, SourceCoverageState::Unknown);
+        assert_eq!(table.archive_risk, ArchiveRiskLevel::Unknown);
+        assert_eq!(table.maintenance, MaintenanceActivity::Idle);
+        assert!(!table.is_searchable());
+        assert_eq!(table.safe_next_command().action, SafeNextAction::IndexFull);
+    }
+
+    #[test]
+    fn bridge_healthy_node_maps_to_available_and_converged() {
+        // A healthy node: DB opened, lexical index present + fresh, no
+        // rebuild, no quarantine. With a Ready/HybridReady search axis the
+        // bridge must converge to "nothing required".
+        let state = serde_json::json!({
+            "database": { "exists": true, "opened": true, "open_skipped": false },
+            "index": {
+                "exists": true,
+                "fingerprint": { "checkpoint_fingerprint": "10:42:0:0" },
+                "last_indexed_at": "2026-06-08T00:00:00+00:00",
+                "checkpoint": { "schema_matches": true },
+            },
+            "rebuild": { "active": false },
+            "semantic": { "checkpoint": { "active": false } },
+            "ingest_quarantine": { "quarantined_conversations": 0 },
+        });
+        let readiness = ReadinessSnapshot::new(
+            LexicalReadinessState::Ready,
+            SemanticReadinessState::HybridReady,
+        );
+        let table = truth_table_from_state(&state, readiness);
+        assert_eq!(table.db, CanonicalDbAvailability::Available);
+        assert!(table.lexical_metadata.present);
+        assert_eq!(
+            table.lexical_metadata.storage_fingerprint.as_deref(),
+            Some("10:42:0:0")
+        );
+        assert_eq!(
+            table.lexical_metadata.built_at_ms,
+            Some(1_780_876_800_000) // 2026-06-08T00:00:00Z in epoch millis
+        );
+        assert_eq!(table.last_projection_ms, table.lexical_metadata.built_at_ms);
+        assert_eq!(table.binary, BinaryCompatibility::Current);
+        assert!(table.is_searchable());
+        assert_eq!(table.safe_next_command().action, SafeNextAction::None);
+    }
+
+    #[test]
+    fn bridge_present_unopened_db_maps_to_open_failed() {
+        // The file exists but a real open attempt failed (not skipped):
+        // surface OpenFailed → inspect before any repair, never rebuild.
+        let state = serde_json::json!({
+            "database": { "exists": true, "opened": false, "open_skipped": false },
+            "index": { "exists": true },
+            "rebuild": { "active": false },
+        });
+        let table = truth_table_from_state(
+            &state,
+            ReadinessSnapshot::new(LexicalReadinessState::Ready, SemanticReadinessState::Absent),
+        );
+        assert_eq!(table.db, CanonicalDbAvailability::OpenFailed);
+        let cmd = table.safe_next_command();
+        assert_eq!(cmd.action, SafeNextAction::InspectCanonicalDb);
+        assert!(!cmd.action.is_mutating());
+    }
+
+    #[test]
+    fn bridge_skipped_open_on_present_db_is_available() {
+        // Health's fast path elides the DB open (open_skipped=true) on a
+        // present file: the bridge must treat it as Available, not OpenFailed.
+        let state = serde_json::json!({
+            "database": { "exists": true, "opened": false, "open_skipped": true },
+            "index": { "exists": true },
+            "rebuild": { "active": false },
+        });
+        let table = truth_table_from_state(
+            &state,
+            ReadinessSnapshot::new(LexicalReadinessState::Ready, SemanticReadinessState::Absent),
+        );
+        assert_eq!(table.db, CanonicalDbAvailability::Available);
+    }
+
+    #[test]
+    fn bridge_maps_active_rebuild_and_semantic_backfill() {
+        let rebuilding = serde_json::json!({
+            "database": { "exists": true, "opened": true },
+            "index": { "exists": true },
+            "rebuild": { "active": true },
+            "semantic": { "checkpoint": { "active": false } },
+        });
+        assert_eq!(
+            truth_table_from_state(
+                &rebuilding,
+                ReadinessSnapshot::new(
+                    LexicalReadinessState::Repairing,
+                    SemanticReadinessState::Absent,
+                ),
+            )
+            .maintenance,
+            MaintenanceActivity::LexicalRebuild
+        );
+
+        // Lexical rebuild takes precedence; when it is idle and the semantic
+        // checkpoint is active the bridge reports SemanticBackfill.
+        let backfilling = serde_json::json!({
+            "database": { "exists": true, "opened": true },
+            "index": { "exists": true },
+            "rebuild": { "active": false },
+            "semantic": { "checkpoint": { "active": true } },
+        });
+        assert_eq!(
+            truth_table_from_state(
+                &backfilling,
+                ReadinessSnapshot::new(
+                    LexicalReadinessState::Ready,
+                    SemanticReadinessState::Backfilling,
+                ),
+            )
+            .maintenance,
+            MaintenanceActivity::SemanticBackfill
+        );
+    }
+
+    #[test]
+    fn bridge_schema_mismatch_marks_binary_ahead() {
+        let state = serde_json::json!({
+            "database": { "exists": true, "opened": true },
+            "index": { "exists": true, "checkpoint": { "schema_matches": false } },
+            "rebuild": { "active": false },
+        });
+        let table = truth_table_from_state(
+            &state,
+            ReadinessSnapshot::new(
+                LexicalReadinessState::Ready,
+                SemanticReadinessState::HybridReady,
+            ),
+        );
+        assert_eq!(table.binary, BinaryCompatibility::Ahead);
+        // A binary ahead of the on-disk assets must drive a rebuild-for-schema
+        // recommendation ahead of the converged path.
+        assert_eq!(
+            table.safe_next_command().action,
+            SafeNextAction::RebuildForCurrentBinary
+        );
+    }
+
+    #[test]
+    fn bridge_maps_quarantine_count_and_feeds_projections() {
+        // Quarantine is advisory: it never blocks search, but the count must
+        // flow through, and the bridged table must feed both typed
+        // projections (readiness summary + next-command envelope) cleanly.
+        let state = serde_json::json!({
+            "database": { "exists": true, "opened": true },
+            "index": {
+                "exists": true,
+                "checkpoint": { "schema_matches": true },
+            },
+            "rebuild": { "active": false },
+            "semantic": { "checkpoint": { "active": false } },
+            "ingest_quarantine": { "quarantined_conversations": 3 },
+        });
+        let table = truth_table_from_state(
+            &state,
+            ReadinessSnapshot::new(
+                LexicalReadinessState::Ready,
+                SemanticReadinessState::HybridReady,
+            ),
+        );
+        assert_eq!(table.quarantine.quarantined_count, 3);
+        assert!(table.quarantine.has_exclusions());
+
+        // Prove the bridged table is consumable by the typed projection layer
+        // that 6f1lm / v6vuz assemble over.
+        let summary = crate::search::readiness_projection::project(
+            &table,
+            crate::search::readiness_projection::SurfaceKind::Status,
+        );
+        assert!(summary.is_searchable);
+        assert!(summary.quarantine_incomplete);
+        let envelope = table.next_command_envelope(Some("/tmp/cass-data"));
+        assert!(!envelope.recommended_commands.is_empty());
     }
 }

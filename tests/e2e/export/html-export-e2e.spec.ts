@@ -13,7 +13,14 @@
  *   npx playwright test e2e/export/html-export-e2e.spec.ts
  */
 
-import { test, expect, gotoFile, waitForPageReady, countMessages } from '../setup/test-utils';
+import {
+  test,
+  expect,
+  gotoFile,
+  waitForPageReady,
+  countMessages,
+  collectBrowserErrors,
+} from '../setup/test-utils';
 import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import path from 'path';
 
@@ -26,6 +33,7 @@ test.beforeAll(async () => {
 
 test.describe('HTML Export - Plain Mode', () => {
   test('renders basic export with all messages visible', async ({ page, exportPath }, testInfo) => {
+    const browserErrors = collectBrowserErrors(page);
     await test.step('Verify export file exists', async () => {
       expect(existsSync(exportPath), `Export file should exist at ${exportPath}`).toBe(true);
     });
@@ -53,13 +61,11 @@ test.describe('HTML Export - Plain Mode', () => {
     });
 
     await test.step('Verify no JavaScript errors', async () => {
-      const errors: string[] = [];
-      page.on('pageerror', (err) => errors.push(err.message));
-
       // Wait for any deferred scripts
       await page.waitForTimeout(500);
 
-      expect(errors).toEqual([]);
+      expect(browserErrors.pageErrors).toEqual([]);
+      expect(browserErrors.consoleErrors).toEqual([]);
     });
 
     // Capture output HTML as artifact
@@ -103,6 +109,7 @@ test.describe('HTML Export - Plain Mode', () => {
 
   test('code blocks render with syntax highlighting', async ({ page, toolCallsExportPath }, testInfo) => {
     test.skip(!toolCallsExportPath, 'Tool calls export path not configured');
+    const browserErrors = collectBrowserErrors(page);
 
     await gotoFile(page, toolCallsExportPath);
     await waitForPageReady(page);
@@ -115,6 +122,9 @@ test.describe('HTML Export - Plain Mode', () => {
         // Code should have some highlighting classes
         await expect(codeBlocks.first()).toBeVisible();
       }
+      await page.waitForTimeout(500);
+      expect(browserErrors.pageErrors).toEqual([]);
+      expect(browserErrors.consoleErrors).toEqual([]);
     });
   });
 
@@ -140,6 +150,7 @@ test.describe('HTML Export - Plain Mode', () => {
 
   test('export handles large conversations', async ({ page, largeExportPath }, testInfo) => {
     test.skip(!largeExportPath, 'Large export path not configured');
+    const browserErrors = collectBrowserErrors(page);
 
     await test.step('Navigate to large export', async () => {
       await gotoFile(page, largeExportPath);
@@ -161,11 +172,23 @@ test.describe('HTML Export - Plain Mode', () => {
       expect(messageCount).toBeGreaterThan(0);
       // Count operation should be reasonably fast
       expect(loadTime).toBeLessThan(5000);
+      await page.waitForTimeout(500);
+      expect(browserErrors.pageErrors).toEqual([]);
+      expect(browserErrors.consoleErrors).toEqual([]);
     });
   });
 
   test('export handles unicode content', async ({ page, unicodeExportPath }, testInfo) => {
     test.skip(!unicodeExportPath, 'Unicode export path not configured');
+
+    const browserErrors = collectBrowserErrors(page);
+    const dialogs: string[] = [];
+    page.on('dialog', (dialog) => {
+      dialogs.push(dialog.message());
+      dialog.dismiss().catch((error) => {
+        browserErrors.pageErrors.push(`dialog dismissal failed: ${String(error)}`);
+      });
+    });
 
     await gotoFile(page, unicodeExportPath);
     await waitForPageReady(page);
@@ -174,6 +197,12 @@ test.describe('HTML Export - Plain Mode', () => {
       // Should not have any replacement characters
       const content = await page.locator('body').textContent();
       expect(content).not.toContain('\uFFFD');
+      expect(content).toContain('<script>');
+      expect(content).toContain('XSS');
+      await page.waitForTimeout(500);
+      expect(dialogs).toEqual([]);
+      expect(browserErrors.pageErrors).toEqual([]);
+      expect(browserErrors.consoleErrors).toEqual([]);
     });
   });
 });
@@ -200,6 +229,7 @@ test.describe('HTML Export - Encrypted Mode', () => {
 
   test('decrypts content with correct password', async ({ page, encryptedExportPath, password }, testInfo) => {
     test.skip(!encryptedExportPath, 'Encrypted export path not configured');
+    const browserErrors = collectBrowserErrors(page);
 
     await test.step('Navigate to encrypted export', async () => {
       await gotoFile(page, encryptedExportPath);
@@ -222,6 +252,8 @@ test.describe('HTML Export - Encrypted Mode', () => {
       // Content should be visible
       const content = page.locator('.message, .conversation, main');
       await expect(content.first()).toBeVisible();
+      expect(browserErrors.pageErrors).toEqual([]);
+      expect(browserErrors.consoleErrors).toEqual([]);
     });
 
     // Capture decrypted content as artifact

@@ -111,6 +111,9 @@ pub struct BundleConfig {
     pub generate_qr: bool,
     /// Additional generated documentation files to include
     pub generated_docs: Vec<GeneratedDoc>,
+    /// Exact `cass analytics status --json` data projection for the source
+    /// archive. Pages consumes this instead of inventing separate readiness.
+    pub analytics_status: Option<serde_json::Value>,
 }
 
 impl Default for BundleConfig {
@@ -122,6 +125,7 @@ impl Default for BundleConfig {
             recovery_secret: None,
             generate_qr: false,
             generated_docs: Vec::new(),
+            analytics_status: None,
         }
     }
 }
@@ -242,6 +246,16 @@ impl BundleBuilder {
                 let dest_path = site_dir.join(name);
                 fs::write(&dest_path, content)
                     .with_context(|| format!("Failed to write {}", name))?;
+            }
+
+            if let Some(status) = &self.config.analytics_status {
+                let status_json = serde_json::to_vec_pretty(status)
+                    .context("Failed to serialize analytics_status.json")?;
+                crate::pages::write_file_durably(
+                    &site_dir.join("analytics_status.json"),
+                    &status_json,
+                )
+                .context("Failed to write analytics_status.json")?;
             }
 
             // Copy payload into site/payload/
@@ -1316,11 +1330,14 @@ mod tests {
     }
 
     fn encrypted_config_for_files(files: Vec<&str>) -> EncryptionConfig {
+        use base64::prelude::*;
         let chunk_count = files.len();
         EncryptionConfig {
             version: crate::pages::encrypt::SCHEMA_VERSION,
-            export_id: "export-123".to_string(),
-            base_nonce: "nonce".to_string(),
+            // The shared payload-format validation decodes these as base64
+            // and requires exactly 16 / 12 bytes.
+            export_id: BASE64_STANDARD.encode([0u8; 16]),
+            base_nonce: BASE64_STANDARD.encode([0u8; 12]),
             compression: "deflate".to_string(),
             kdf_defaults: crate::pages::encrypt::Argon2Params::default(),
             payload: crate::pages::encrypt::PayloadMeta {

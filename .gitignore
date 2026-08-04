@@ -193,6 +193,7 @@ perf.data.old
 
 # One-off analysis output
 user_requests_output.txt
+COMPREHENSIVE_ISSUES_AND_PROBLEMS_WITH_CASS_BASED_ON_COMPLETE_SESSION_HISTORY_ANALYSIS.md
 # Root-level ad-hoc logs are almost always local run artifacts. JSON config is
 # intentionally not ignored wholesale; important project metadata often uses
 # root-level JSON names and must stay visible to `git status`.
@@ -278,3 +279,12 @@ fuzz/fuzz/
 
 # Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
 /beads_compliance_audit/
+# br doctor per-run artifacts
+.doctor/
+
+# frankensqlite VFS namespace lock sidecars (machine-local, created next to any opened DB)
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+# index-run lock metadata sidecar (machine-local runtime state; the committed
+# fixture ships only the empty index-run.lock)
+tests/fixtures/**/index-run.lock.meta

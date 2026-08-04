@@ -1,4 +1,5 @@
 use coding_agent_search::default_data_dir;
+use coding_agent_search::robot_budget_envelope::BudgetBlock;
 use coding_agent_search::search::canonicalize::{MAX_EMBED_CHARS, canonicalize_for_embedding};
 use coding_agent_search::search::embedder::Embedder;
 use coding_agent_search::search::hash_embedder::HashEmbedder;
@@ -329,6 +330,13 @@ fn pack_bench_render_request(
         normalized_query: "checkout failure answer pack freshness".to_string(),
         generated_at_ms: PACK_BENCH_NOW_MS,
         elapsed_ms: 0,
+        budget: BudgetBlock {
+            elapsed_ms: 0,
+            budget_ms: 8_000,
+            timed_out: false,
+            skipped_sections: Vec::new(),
+            recommended_next_probe: None,
+        },
         request_id: Some("bench-answer-pack".to_string()),
         format,
         limits,

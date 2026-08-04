@@ -25,9 +25,9 @@ Non-negotiables in this repo/workflow:
 - `.env` is loaded via `dotenvy`; `.env` must never be overwritten.
 - No script-based repo-wide code transformations.
 - After substantive changes, run:
-  - `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-optimization-gates-target cargo check --all-targets`
-  - `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-optimization-gates-target cargo clippy --all-targets -- -D warnings`
-  - `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-optimization-gates-target cargo fmt --check`
+  - `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-optimization-gates-target cargo check --all-targets`
+  - `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-optimization-gates-target cargo clippy --all-targets -- -D warnings`
+  - `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-optimization-gates-target cargo fmt --check`
 
 ---
 
@@ -252,10 +252,10 @@ Why these matter:
 
 Run commands:
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-runtime-target cargo bench --bench runtime_perf -- --noplot
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-search-target cargo bench --bench search_perf -- --noplot
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-cache-target cargo bench --bench cache_micro -- --noplot
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-index-target cargo bench --bench index_perf -- --noplot
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-runtime-target cargo bench --bench runtime_perf -- --noplot
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-search-target cargo bench --bench search_perf -- --noplot
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-cache-target cargo bench --bench cache_micro -- --noplot
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-bench-index-target cargo bench --bench index_perf -- --noplot
 ```
 
 Selected “p50/median” results (from `PLAN_FOR_ADVANCED_OPTIMIZATIONS_ROUND_1__OPUS.md`; re-run to refresh on your machine):
@@ -675,7 +675,7 @@ Implementation notes (to avoid self-inflicted regressions):
 - Bench uses `VectorIndex::build(..., Quantization::F16, ...)` (in-memory `Vec<f16>`). Production commonly uses `VectorStorage::Mmap` (bounds checks + pointer math). Measure both paths before assuming identical speedups.
 - Before writing any explicit SIMD, check whether LLVM already auto-vectorizes the existing scalar dot product loop for your target:
   ```bash
-  rch exec -- env CARGO_TARGET_DIR=/tmp/cass-asm-target RUSTFLAGS=\"--emit=asm\" cargo build --release
+  rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-asm-target RUSTFLAGS=\"--emit=asm\" cargo build --release
   # inspect dot_product/dot_product_f16 for vector instructions (and confirm it doesn't reorder sums)
   ```
 
@@ -770,15 +770,15 @@ Proposed guardrails for next round:
 
 Always run:
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-optimization-gates-target cargo fmt --check
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-optimization-gates-target cargo check --all-targets
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-optimization-gates-target cargo clippy --all-targets -- -D warnings
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-optimization-gates-target cargo test
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-optimization-gates-target cargo fmt --check
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-optimization-gates-target cargo check --all-targets
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-optimization-gates-target cargo clippy --all-targets -- -D warnings
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-optimization-gates-target cargo test
 ```
 
 For profiling builds:
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-profiling-target RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-profiling-target RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
 ```
 
 ---

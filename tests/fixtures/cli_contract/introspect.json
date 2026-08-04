@@ -649,7 +649,7 @@
         },
         {
           "name": "daemon",
-          "description": "Use daemon for warm model inference (faster repeated queries). If daemon is unavailable, falls back to direct inference",
+          "description": "Auto-spawn the warm-model daemon when one is not already running. Search discovers and uses an existing daemon by default; if daemon inference is unavailable, it lazily falls back to direct inference",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -671,7 +671,7 @@
         },
         {
           "name": "two-tier",
-          "description": "Enable two-tier progressive search: fast results immediately, refined via daemon. Returns initial results from fast embedder (~1ms), then refines with quality embedder via daemon (~130ms). Best of both worlds for interactive search",
+          "description": "Request the quality-refined tier of the two-tier search pipeline. The one-shot CLI emits the final quality result set; the interactive TUI is the surface that displays fast results first and refines them in place",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -693,7 +693,7 @@
         },
         {
           "name": "quality-only",
-          "description": "Quality-only search: wait for full transformer model results. Higher latency (~130ms) but most accurate semantic matching. Requires daemon to be available; falls back to fast if unavailable",
+          "description": "Quality-only search: wait for full transformer model results. Uses an existing daemon when available and lazily falls back to the installed local model; higher latency than --fast-only, but more accurate",
           "arg_type": "flag",
           "required": false,
           "default": "false",

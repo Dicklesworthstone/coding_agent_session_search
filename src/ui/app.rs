@@ -13595,7 +13595,7 @@ impl CassApp {
         push_metric(
             &mut spans,
             "cov",
-            format!("{:.0}%", data.coverage_pct),
+            crate::ui::analytics_charts::format_metric_percent(data.coverage_metric, 0),
             meta_style,
         );
         let filter_count = self.analytics_filter_count();
@@ -15591,6 +15591,7 @@ impl SearchService for TantivySearchService {
                         cache_stats: crate::search::query::CacheStats::default(),
                         suggestions: Vec::new(),
                         ann_stats,
+                        ann_unavailable_reason: None,
                         total_count: None,
                     })
                 }
@@ -23306,21 +23307,12 @@ pub fn run_tui_ftui(
                 model.semantic_availability = setup.availability.clone();
 
                 if let Some(context) = setup.context {
-                    let ann_path = Some(
-                        data_dir
-                            .join(crate::search::vector_index::VECTOR_INDEX_DIR)
-                            .join(format!("hnsw-{}.chsw", context.embedder.id())),
-                    );
-                    let mut indexes =
-                        Vec::with_capacity(context.additional_indexes.len().saturating_add(1));
-                    indexes.push(context.index);
-                    indexes.extend(context.additional_indexes);
-                    if let Err(err) = client.set_semantic_indexes_context(
+                    if let Err(err) = client.set_semantic_artifacts_context(
                         context.embedder,
-                        indexes,
+                        context.artifacts,
+                        context.quality_artifact,
                         context.filter_maps,
                         context.roles,
-                        ann_path,
                     ) {
                         tracing::debug!(error = %err, "tui semantic context unavailable");
                         let _ = client.clear_semantic_context();
@@ -40813,8 +40805,11 @@ not jsonl",
         data.total_content_tokens = 800_000;
         data.total_plan_messages = 200;
         data.coverage_pct = 85.0;
+        data.coverage_metric = crate::metric_integrity::MetricOutcome::Value(85.0);
         data.plan_message_pct = 4.0;
+        data.plan_message_metric = crate::metric_integrity::MetricOutcome::Value(4.0);
         data.plan_api_token_share = 6.5;
+        data.plan_api_token_metric = crate::metric_integrity::MetricOutcome::Value(6.5);
         data.agent_tokens = vec![
             ("claude_code".into(), 600_000.0),
             ("codex".into(), 300_000.0),

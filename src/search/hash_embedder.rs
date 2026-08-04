@@ -17,9 +17,11 @@
 //!
 //! # When to Use
 //!
-//! - When ML model is not installed
 //! - When user explicitly opts for hash mode (`CASS_SEMANTIC_EMBEDDER=hash`)
-//! - As a fallback when ML inference fails
+//! - For the explicit fast tier (`--fast-only` / `--embedder hash`)
+//!
+//! A missing or failed ML model does not silently select this separate vector
+//! space; hybrid search fails open to lexical results instead.
 //!
 //! # Example
 //!

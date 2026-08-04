@@ -1,0 +1,19 @@
+# Guided operations integrated gate
+
+| Scenario | Robot command | Frozen assertion |
+|---|---|---|
+| Clean first run | `cass onboarding --json` | discovery is recommended without mutation |
+| Workflow macros | `cass swarm macros --json --fixture <fixture>` | blocked facts remain advisory |
+| Blocked privacy risk | `cass swarm privacy-preview --json --fixture <fixture>` | opt-in is required and samples are redacted |
+| Stale search trust | `cass swarm dashboard --json --fixture <fixture>` | stale trust is metadata-only |
+| Failed command repro | `cass swarm repro-capsule --json --fixture <fixture>` | rerun uses a real share-safe fixture template |
+| Release channel drift | `cass release-verify --json --from <fixture>` | stale channels block readiness |
+| Dependency pin risk | `cass swarm dependency-drift --json --fixture <fixture>` | incomplete pins block release readiness |
+| Low-resource host | `cass swarm resource-plan --json --fixture <fixture>` | unsafe work is deferred |
+| Dashboard empty state | `cass swarm dashboard --json --fixture <fixture>` | empty state recommends selecting a workflow |
+
+Runtime artifacts: one stdout, stderr, and parsed JSON file per scenario; `redaction_report.json`; `fixture_manifest.json`; `timing_summary.json`; `assertion_summary.json`.
+
+All commands run against an isolated HOME and data directory. The before/after tree snapshot must be byte-identical. Private fixture markers must be absent from stdout, stderr, parsed JSON, and audit summaries. Recommended commands must pass the independent robot-safe allowlist.
+
+Dependency graph evidence: `bv --robot-insights --force-full-analysis --format json` at 2026-07-22T05:58:01Z reported `cycle_break.status=available`, `cycle_count=0`, and `No cycles detected - dependency graph is a proper DAG.`

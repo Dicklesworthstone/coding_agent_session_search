@@ -456,6 +456,7 @@ impl ThemePalette {
             "codex" => (colors::AGENT_CODEX_BG, colors::STATUS_SUCCESS),                   // Green
             "cline" => (colors::AGENT_CLINE_BG, colors::ACCENT_TERTIARY),                  // Cyan
             "gemini" | "gemini_cli" => (colors::AGENT_GEMINI_BG, colors::ACCENT_SECONDARY), // Purple
+            "antigravity" | "agy" => (PackedRgba::rgb(28, 22, 52), PackedRgba::rgb(150, 120, 255)), // Deep violet (agy)
             "amp" => (colors::AGENT_AMP_BG, colors::STATUS_ERROR), // Orange/Red
             "aider" => (colors::AGENT_AIDER_BG, PackedRgba::rgb(64, 224, 208)), // Turquoise accent
             "cursor" => (colors::AGENT_CURSOR_BG, PackedRgba::rgb(236, 72, 153)), // Pink accent
@@ -491,6 +492,7 @@ impl ThemePalette {
             "codex" => "◆",
             "claude_code" | "claude" => "●",
             "gemini" | "gemini_cli" => "◇",
+            "antigravity" | "agy" => "★",
             "cline" => "■",
             "amp" => "▲",
             "aider" => "▼",

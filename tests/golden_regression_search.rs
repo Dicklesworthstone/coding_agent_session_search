@@ -3,7 +3,7 @@
 //! These snapshots intentionally build a fresh temp HOME, run `cass index`
 //! into a real tempdir database, then snapshot `cass search --json` output.
 //! Regenerate with:
-//!   UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_regression_search
+//!   UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_regression_search
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -62,7 +62,7 @@ fn assert_golden(name: &str, actual: &str) {
     let expected = fs::read_to_string(&golden_path).unwrap_or_else(|err| {
         panic!(
             "Golden file missing: {}\n{err}\n\n\
-             Run: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_regression_search",
+             Run: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_regression_search",
             golden_path.display()
         )
     });

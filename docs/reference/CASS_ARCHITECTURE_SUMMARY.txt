@@ -55,8 +55,8 @@ SEARCH ARCHITECTURE LAYERS
                                    ▼
         ┌──────────────────────────────────────────────────────────┐
         │           SEMANTIC SEARCH (Optional)                      │
-        │  • FastEmbed embedder (MiniLM or hash-based fallback)    │
-        │  • Vector index (CVVI format)                             │
+        │  • Pure-Rust native MiniLM; lexical fail-open if absent │
+        │  • Vector index (frankensearch FSVI format)               │
         │  • F32 or F16 quantization                                │
         │  Speed: 100-1000ms (embedding inference)                  │
         └──────────────────────────┬───────────────────────────────┘
@@ -115,11 +115,11 @@ KEY OPTIMIZATION TECHNIQUES
 └─────────────────────────────────────────────────────────────────────────┘
 
 ┌─ LAYER 2: WARM WORKER ──────────────────────────────────────────────────┐
-│  • Background tokio task for index reload                               │
+│  • Dedicated cass-warm-worker thread for index reload                    │
 │  • Debounced to 300ms interval (prevent thrashing)                      │
 │  • Executes mini search (limit:1) to page in OS cache                   │
 │  • Non-blocking: doesn't impact user input                              │
-│  • Graceful fallback if no Tokio runtime (tests)                        │
+│  • Optional worker creation; search remains available without it         │
 └─────────────────────────────────────────────────────────────────────────┘
 
 ┌─ LAYER 3: SEGMENT MERGING ──────────────────────────────────────────────┐
@@ -160,7 +160,7 @@ Wildcard prefix (*foo)     100-500ms       Index       RegexQuery scan
 Boolean complex            50-500ms        Query       BooleanQuery nest
 Time range filter          10-100ms        Index       RangeQuery
 Full scan (empty query)    10-50ms         Index       AllQuery
-Semantic search            100-1000ms      Vector      FastEmbed inference
+Semantic search            100-1000ms      Vector      Native MiniLM inference
 Hybrid (RRF)               100-1500ms      Both        Dual execution
 
 
@@ -172,8 +172,8 @@ Primary:     Tantivy (Rust full-text search engine)
              - Boolean query support
              - Field-specific indexing
 
-Secondary:   Vector Index (Custom CVVI format)
-             - FastEmbed for embeddings
+Secondary:   Vector Index (frankensearch FSVI format)
+             - Pure-Rust native MiniLM embeddings
              - F16 quantization support
              - Memory-mapped file access
 
@@ -182,7 +182,7 @@ Caching:     LRU cache + Bloom filters
              - Token presence gates
              - Schema-aware key versioning
 
-Async:       Tokio runtime
+Async:       Asupersync runtime
              - Multi-threaded task spawning
              - Warm worker background task
              - Debounced reload channel
@@ -251,7 +251,7 @@ ARCHITECTURAL STRENGTHS
 ✓ Deterministic:      Same query → same results (no randomness)
 ✓ Offline-first:      Lexical search works without external service
 ✓ Composable:         Lexical + semantic via RRF fusion
-✓ Progressive:        Graceful degradation (hash embedder fallback)
+✓ Progressive:        Hybrid fails open to lexical; hash mode is explicit
 ✓ Auditable:          Provenance fields track result sources
 ✓ Responsive:         Multi-layer caching for interactive use
 ✓ Maintainable:       Clear separation (Tantivy/Vector/SQLite)
@@ -262,11 +262,11 @@ ARCHITECTURAL STRENGTHS
 UNIQUE DESIGN DECISIONS
 ───────────────────────────────────────────────────────────────────────────────
 
-1. CUSTOM CVVI FORMAT
-   - Bespoke memory-mapped binary format vs external vector DB
-   - Row-oriented (70 bytes/entry) for cache locality
-   - Content-addressed dedup (SHA256)
-   - Zero external dependencies for vector storage
+1. FRANKENSEARCH FSVI FORMAT
+   - Memory-mapped in-process vector index vs external vector service
+   - F16/F32 quantization
+   - Embedder ID, revision, and dimension compatibility gates
+   - Stable cass metadata encoded in document IDs
 
 2. PREFIX CACHE STRATEGY
    - Caches partial results instead of full result sets
@@ -278,7 +278,7 @@ UNIQUE DESIGN DECISIONS
    - Doesn't block user input (async background task)
    - Debounced to prevent OS cache thrashing
    - Runs tiny search to page in data before user sees latency
-   - Graceful fallback when no Tokio runtime available
+   - Optional dedicated thread; failure does not disable search
 
 4. SOURCE BOUNDARY DEDUPLICATION
    - Same content from different sources → separate results
@@ -319,13 +319,13 @@ src/search/
   │   • Edge n-gram generation
   │
   ├── vector_index.rs
-  │   • VectorIndex       - CVVI format reader
-  │   • CvviHeader        - Binary format spec
+  │   • VectorIndex       - frankensearch FSVI reader
+  │   • vector_index_path - Canonical .fsvi artifact path
   │   • Semantic filtering - Vector similarity
   │
   ├── embedder.rs        - Embedder trait + implementations
-  ├── fastembed_embedder.rs - ML embedder (MiniLM)
-  ├── hash_embedder.rs   - Hash-based fallback
+  ├── fastembed_embedder.rs - Native MiniLM embedder
+  ├── hash_embedder.rs   - Explicit hash-vector tier
   ├── model_manager.rs   - Model detection/wiring
   └── canonicalize.rs    - Text preprocessing
 
@@ -345,4 +345,3 @@ CASS achieves sub-10ms interactive search through:
 The architecture balances performance, memory usage, maintainability, and
 feature richness - providing a responsive search experience for coding agent
 conversation history.
-

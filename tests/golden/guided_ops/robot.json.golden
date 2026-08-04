@@ -1,0 +1,1005 @@
+{
+  "artifact_contract": {
+    "per_scenario": [
+      "stdout",
+      "stderr",
+      "parsed_json"
+    ],
+    "summaries": [
+      "redaction_report.json",
+      "fixture_manifest.json",
+      "timing_summary.json",
+      "assertion_summary.json"
+    ]
+  },
+  "assertion_summary": {
+    "assertions": {
+      "cross_surface_contracts": "pass",
+      "default_non_mutation": "pass",
+      "golden_docs": "reviewed",
+      "golden_robot_json": "reviewed",
+      "private_session_leak_count": 0,
+      "robot_safe_recommended_commands": 11,
+      "timing_budgets": "pass"
+    },
+    "dependency_graph": {
+      "advisory": "No cycles detected - dependency graph is a proper DAG.",
+      "captured_at": "2026-07-22T05:58:01Z",
+      "command": "bv --robot-insights --force-full-analysis --format json",
+      "cycle_break_status": "available",
+      "cycle_count": 0
+    },
+    "scenario_count": 9,
+    "schema_version": "cass.guided_ops.assertion_summary.v1",
+    "status": "pass"
+  },
+  "fixture_manifest": {
+    "fixtures": [
+      {
+        "blake3": "ffcf5613152db2420a4082fa709be3238444d39c6d30d33e5bd5a4934126b603",
+        "bytes": 172,
+        "name": "empty.inputs.json"
+      },
+      {
+        "blake3": "e941f916879a14464df767b71e7f1d01cf045471d3419185016f1ac0ded0d617",
+        "bytes": 6362,
+        "name": "integrated.inputs.json"
+      },
+      {
+        "blake3": "54070db5029bf1cf61505eeb718f2c1ab64bca71d5d7444d566911603af129f9",
+        "bytes": 818,
+        "name": "release-drift.request.json"
+      }
+    ],
+    "schema_version": "cass.guided_ops.fixture_manifest.v1",
+    "synthetic_private_input": true
+  },
+  "recommended_commands": [
+    "cass guide fix-ci-regression --json",
+    "cass sources discover --json",
+    "cass swarm evidence --json",
+    "cass swarm macros --json",
+    "cass swarm privacy-preview --json",
+    "cass swarm repro-capsule --json",
+    "cass swarm repro-capsule --json --fixture repro-capsule.fixture.json",
+    "cass swarm resource-plan --json",
+    "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo check --all-targets",
+    "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-resource-plan-target",
+    "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation"
+  ],
+  "redaction_report": {
+    "dashboard": {
+      "contains_raw_paths": false,
+      "contains_raw_secrets": false,
+      "contains_session_content": false,
+      "redaction_applied": true
+    },
+    "leak_count": 0,
+    "privacy_preview": {
+      "contains_raw_paths": false,
+      "contains_raw_secrets": false,
+      "contains_session_content": false,
+      "redaction_applied": true,
+      "redaction_policy": "ingestion-secret + strict-swarm-evidence",
+      "sampling_is_opt_in": true
+    },
+    "private_markers_checked": 3,
+    "repro_capsule": {
+      "fields_scrubbed": 6,
+      "policy": "strict-swarm-evidence + drop-private-session-text",
+      "private_session_text_dropped": true,
+      "raw_session_content_included": false,
+      "strings_seen": 9
+    },
+    "schema_version": "cass.guided_ops.redaction_report.v1"
+  },
+  "scenario_commands": {
+    "blocked-privacy-risk": "cass swarm privacy-preview --json --fixture <fixture>",
+    "clean-first-run": "cass onboarding --json",
+    "dashboard-empty-state": "cass swarm dashboard --json --fixture <fixture>",
+    "dependency-pin-risk": "cass swarm dependency-drift --json --fixture <fixture>",
+    "failed-command-repro": "cass swarm repro-capsule --json --fixture <fixture>",
+    "low-resource-host": "cass swarm resource-plan --json --fixture <fixture>",
+    "release-channel-drift": "cass release-verify --json --from <fixture>",
+    "stale-trust-dashboard": "cass swarm dashboard --json --fixture <fixture>",
+    "workflow-macros": "cass swarm macros --json --fixture <fixture>"
+  },
+  "scenarios": {
+    "blocked-privacy-risk": {
+      "_meta": {
+        "contract": "read-only privacy exposure preview",
+        "fixture_id": "guided-ops-integrated",
+        "generated_at": "<generated-at>",
+        "source": "fixture"
+      },
+      "exclusions": {
+        "excluded_agents": [
+          "private-agent"
+        ],
+        "policy": "excluded agents are never read, indexed, exported, or captured"
+      },
+      "exports": {
+        "chatgpt_encrypted_present": true,
+        "html_export_privacy_tier": "redacted",
+        "policy": "export and capsule outputs are redaction-first; decryption and raw capture require opt-in",
+        "repro_capsule_requested": true,
+        "source_mirror_capture_requested": false,
+        "support_capsule_requested": true
+      },
+      "guided_workflow": {
+        "apply_mode_available": false,
+        "bead_id": "coding_agent_session_search-guided-ops-repro-trust-5u82n.5",
+        "next_step": "confirm-required-opt-ins",
+        "surface": "cass swarm privacy-preview --json"
+      },
+      "live_enumeration": {
+        "note": "live preview is policy-only by default; pass --fixture <file> for a populated preview or opt in to a scan",
+        "performed": false
+      },
+      "mutation_contract": {
+        "apply_mode": false,
+        "mutates_db": false,
+        "mutates_files": false,
+        "read_only": true,
+        "reads_file_contents": false,
+        "runs_builds": false,
+        "schedules_work": false,
+        "touches_network": false
+      },
+      "privacy": {
+        "contains_raw_paths": false,
+        "contains_raw_secrets": false,
+        "contains_session_content": false,
+        "redaction_applied": true,
+        "redaction_policy": "ingestion-secret + strict-swarm-evidence",
+        "sampling_is_opt_in": true
+      },
+      "providers": [
+        {
+          "enabled": true,
+          "file_count": 7,
+          "flags": [
+            "secrets-detected",
+            "unreadable-paths"
+          ],
+          "name": "codex",
+          "redacted_samples": [
+            {
+              "kind": "email",
+              "original_len": 28,
+              "redacted": "[EMAIL_REDACTED]"
+            }
+          ],
+          "roots_redacted": [
+            "[REDACTED_PATH]"
+          ],
+          "secret_sample_count": 1,
+          "size_range_bytes": {
+            "max_file": null,
+            "min_file": null,
+            "total": 4096
+          },
+          "source_class": "local-session-history",
+          "symlink_count": 0,
+          "unreadable_count": 1
+        }
+      ],
+      "raw_mirror": {
+        "enabled": false,
+        "manifest_count": 0,
+        "policy": "raw-mirror stores verbatim source copies; treat as sensitive at rest",
+        "stored_bytes": 0
+      },
+      "required_opt_ins": [
+        {
+          "currently_requested": false,
+          "default_state": "off",
+          "flag": "--scan-secrets",
+          "mode": "live-secret-scan",
+          "reason": "Scanning live files for secret-like strings reads raw file contents.",
+          "severity": "review"
+        },
+        {
+          "currently_requested": true,
+          "default_state": "off",
+          "flag": "--allow-decrypt-export",
+          "mode": "decrypt-export",
+          "reason": "Decrypting ChatGPT exports exposes plaintext conversation content.",
+          "severity": "high"
+        },
+        {
+          "currently_requested": true,
+          "default_state": "off",
+          "flag": "--allow-support-capsule",
+          "mode": "support-capsule",
+          "reason": "Support capsules bundle redacted diagnostics intended for sharing.",
+          "severity": "review"
+        },
+        {
+          "currently_requested": true,
+          "default_state": "off",
+          "flag": "--allow-repro-capsule",
+          "mode": "repro-capsule",
+          "reason": "Repro capsules embed redacted session excerpts for failure reproduction.",
+          "severity": "review"
+        },
+        {
+          "currently_requested": false,
+          "default_state": "off",
+          "flag": "--allow-source-mirror",
+          "mode": "source-mirror-capture",
+          "reason": "Source-mirror capture stores raw copies of source files on disk.",
+          "severity": "high"
+        }
+      ],
+      "risk_categories": [
+        {
+          "blocking": false,
+          "category": "secrets-detected",
+          "count": 1,
+          "mitigation": "redaction-applied-automatically",
+          "severity": "high"
+        },
+        {
+          "blocking": false,
+          "category": "unreadable-paths",
+          "count": 1,
+          "mitigation": "skipped-during-read",
+          "severity": "review"
+        },
+        {
+          "blocking": false,
+          "category": "encrypted-export-present",
+          "count": 1,
+          "mitigation": "decryption-requires-opt-in",
+          "severity": "opt-in"
+        }
+      ],
+      "schema_version": "cass.swarm.privacy_exposure.v1",
+      "status": "warning",
+      "summary": {
+        "enabled_provider_count": 1,
+        "excluded_agent_count": 1,
+        "high_risk_count": 1,
+        "opt_in_pending_count": 3,
+        "provider_count": 1,
+        "readiness": "opt-in-required",
+        "recommended_action": "confirm-required-opt-ins",
+        "review_count": 1,
+        "secret_sample_count": 1,
+        "status": "warning"
+      }
+    },
+    "clean-first-run": {
+      "data_dir": "<isolated-data-dir>",
+      "estimated_index_sessions": 0,
+      "excluded_providers": [],
+      "indexed_conversation_count": 0,
+      "mutation_free": true,
+      "providers": [],
+      "recommended_action": "discover_sources",
+      "recommended_command": "cass sources discover --json",
+      "remote_hint": "no remote sources configured; run cass sources add <ssh-host> to include other machines (additive)",
+      "rollback_note": "read-only discovery; nothing is written until you run an explicit add/index",
+      "schema_version": 1,
+      "semantic_ready": false
+    },
+    "dashboard-empty-state": {
+      "_meta": {
+        "contract": "local read-only projection of robot JSON",
+        "fixture_id": "guided-ops-empty",
+        "source": "fixture"
+      },
+      "cards": {
+        "blocked_prerequisites": [],
+        "next_proof": {
+          "command": "cass swarm evidence --json",
+          "proof_gate": null,
+          "reason": "conservative read-only evidence check"
+        },
+        "privacy": null,
+        "recent_repro_capsules": [],
+        "resources": null,
+        "trust_warnings": [],
+        "workflows": []
+      },
+      "mutation_contract": {
+        "apply_mode": false,
+        "mutates_db": false,
+        "mutates_files": false,
+        "read_only": true,
+        "runs_builds": false,
+        "schedules_work": false,
+        "touches_network": false
+      },
+      "privacy": {
+        "contains_raw_paths": false,
+        "contains_raw_secrets": false,
+        "contains_session_content": false,
+        "redaction_applied": true
+      },
+      "schema_version": "cass.swarm.operations_dashboard.v1",
+      "status": "empty",
+      "summary": {
+        "available_section_count": 0,
+        "blocked_prerequisite_count": 0,
+        "blocked_workflow_count": 0,
+        "current_goal": null,
+        "empty": true,
+        "recommended_action": "select-a-guided-workflow",
+        "repro_capsule_count": 0,
+        "trust_warning_count": 0,
+        "workflow_count": 0
+      },
+      "underlying_json_surfaces": [
+        "cass guide <intent> --json",
+        "cass swarm macros --json",
+        "cass swarm resource-plan --json",
+        "cass swarm privacy-preview --json",
+        "cass swarm repro-capsule --json",
+        "cass search <query> --robot --robot-meta",
+        "cass swarm evidence --json"
+      ]
+    },
+    "dependency-pin-risk": {
+      "_meta": {
+        "contract": "read-only sibling dependency drift sentinel",
+        "fixture_id": "guided-ops-integrated",
+        "generated_at": "<generated-at>",
+        "source": "fixture"
+      },
+      "dependencies": [
+        {
+          "manifest": {
+            "key": "frankensearch",
+            "status": "missing-rev",
+            "table": "dependencies"
+          },
+          "name": "frankensearch",
+          "package": "frankensearch",
+          "required_downstream_tests": [
+            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation",
+            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo check --all-targets"
+          ],
+          "risk": {
+            "kind": "manifest-pin-missing",
+            "level": "warning",
+            "release_readiness": "blocked",
+            "summary": "frankensearch does not have a complete manifest pin in [dependencies].frankensearch"
+          },
+          "sibling": {
+            "dirty": false,
+            "local_head": "1111111111111111111111111111111111111111",
+            "path": "../frankensearch",
+            "revision_matches_pin": null,
+            "status": "clean"
+          },
+          "source": {
+            "git": "https://example.invalid/frankensearch.git",
+            "kind": "git",
+            "rev": null,
+            "version": null
+          },
+          "upstream": {
+            "status": "not_checked"
+          }
+        }
+      ],
+      "mutation_contract": {
+        "mutates_files": false,
+        "mutates_git": false,
+        "network_policy": "remote upstreams are not queried by default",
+        "read_only": true,
+        "runs_builds": false,
+        "touches_network": false
+      },
+      "privacy": {
+        "contains_secrets": false,
+        "contains_session_content": false,
+        "redaction_applied": false
+      },
+      "recommendations": [
+        {
+          "commands": [
+            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation"
+          ],
+          "kind": "strict-path-dep-validation",
+          "requires_human_confirmation": false,
+          "requires_network": false,
+          "summary": "Run the strict dependency contract check before enabling local sibling overrides or updating pins."
+        },
+        {
+          "commands": [
+            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-strict-target cargo check --features strict-path-dep-validation",
+            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-check-target cargo check --all-targets"
+          ],
+          "kind": "review-drift-before-release",
+          "requires_human_confirmation": false,
+          "requires_network": false,
+          "summary": "Do not treat local sibling behavior as release proof until Cargo.toml pins, build.rs contracts, and downstream checks agree."
+        }
+      ],
+      "schema_version": "cass.swarm.dependency_drift.v1",
+      "status": "warning",
+      "summary": {
+        "clean_count": 0,
+        "dependency_count": 1,
+        "dirty_count": 0,
+        "fixture_problem": null,
+        "local_rev_mismatch_count": 0,
+        "missing_manifest_count": 1,
+        "missing_sibling_count": 0,
+        "network_status": "not_checked",
+        "partial_count": 0,
+        "recommended_action": "restore-manifest-pin",
+        "release_readiness": "blocked",
+        "status": "warning",
+        "warning_count": 1
+      }
+    },
+    "failed-command-repro": {
+      "_meta": {
+        "contract": "redacted reproduction capsule",
+        "fixture_id": "guided-ops-integrated",
+        "generated_at": "<generated-at>",
+        "source": "fixture"
+      },
+      "capsule": {
+        "actual": "failed command observed",
+        "command": "search [REDACTED_PATH]",
+        "env_summary": {
+          "email": "[EMAIL_REDACTED]",
+          "home": "[REDACTED_PATH]",
+          "os": "linux"
+        },
+        "evidence_refs": [
+          "[REDACTED_PATH]"
+        ],
+        "expected": "shared fixture reproduction succeeds",
+        "health_excerpt": {
+          "index_present": false,
+          "path": "[REDACTED_PATH]"
+        },
+        "incident_kind": "ci-failure",
+        "session_text": "[OMITTED_PRIVATE_SESSION_TEXT]",
+        "transcript": "failed command referenced private session content at [REDACTED_PATH]"
+      },
+      "description": "Self-contained redacted input for cass swarm repro-capsule",
+      "fixture_id": "guided-ops-integrated",
+      "guided_workflow": {
+        "apply_mode_available": false,
+        "bead_id": "coding_agent_session_search-guided-ops-repro-trust-5u82n.2",
+        "next_step": "review-capsule",
+        "surface": "cass swarm repro-capsule --json"
+      },
+      "manifest": {
+        "capsule_id": "capsule-blake3:2b10a8075a81cd681e448e7fe9780ec92256288e3776a7046457d3f705b25be8",
+        "cass_version": "0.6.22",
+        "evidence_ref_count": 1,
+        "incident_kind": "ci-failure",
+        "privacy_tier": "redacted",
+        "schema_version": "cass.swarm.repro_capsule.v2"
+      },
+      "mutation_contract": {
+        "mutates_db": false,
+        "mutates_files": false,
+        "read_only": true,
+        "schedules_work": false,
+        "touches_network": false
+      },
+      "privacy": {
+        "contains_raw_secrets": false,
+        "contains_raw_session_text": false,
+        "redaction_applied": true,
+        "session_text_opt_in": false
+      },
+      "redaction_report": {
+        "fields_scrubbed": 6,
+        "policy": "strict-swarm-evidence + drop-private-session-text",
+        "private_session_text_dropped": true,
+        "raw_session_content_included": false,
+        "strings_seen": 9
+      },
+      "rerun": {
+        "capsule_id": "capsule-blake3:2b10a8075a81cd681e448e7fe9780ec92256288e3776a7046457d3f705b25be8",
+        "command_template": "cass swarm repro-capsule --json --fixture repro-capsule.fixture.json",
+        "no_live_data_guard": true,
+        "note": "Save this capsule as repro-capsule.fixture.json, then run the command from that directory; the operator's original path is intentionally omitted.",
+        "targets_live_data": false
+      },
+      "schema_version": "cass.swarm.repro_capsule.v2",
+      "sources": {
+        "repro_capsule": {
+          "actual": "failed command observed",
+          "cass_version": "0.6.22",
+          "command": "search [REDACTED_PATH]",
+          "env": {
+            "email": "[EMAIL_REDACTED]",
+            "home": "[REDACTED_PATH]",
+            "os": "linux"
+          },
+          "evidence_refs": [
+            "[REDACTED_PATH]"
+          ],
+          "expected": "shared fixture reproduction succeeds",
+          "health_excerpt": {
+            "index_present": false,
+            "path": "[REDACTED_PATH]"
+          },
+          "incident_kind": "ci-failure",
+          "privacy_tier": "redacted",
+          "private_session_text": "[OMITTED_PRIVATE_SESSION_TEXT]",
+          "transcript": "failed command referenced private session content at [REDACTED_PATH]"
+        }
+      },
+      "status": "ok",
+      "summary": {
+        "evidence_ref_count": 1,
+        "fields_scrubbed": 6,
+        "incident_kind_known": true,
+        "private_session_text_dropped": true,
+        "recommended_action": "review-capsule",
+        "status": "ok"
+      }
+    },
+    "low-resource-host": {
+      "_meta": {
+        "contract": "read-only resource what-if planner",
+        "fixture_id": "guided-ops-integrated",
+        "generated_at": "<generated-at>",
+        "source": "fixture"
+      },
+      "concurrency_caps": {
+        "max_index_threads": 1,
+        "max_semantic_batches": 0,
+        "max_writer_threads": 1,
+        "policy": "advisory caps only; cass does not schedule background work from this command"
+      },
+      "guided_workflow": {
+        "apply_mode_available": false,
+        "bead_id": "coding_agent_session_search-guided-ops-repro-trust-5u82n.11",
+        "next_step": "free-disk-before-action",
+        "surface": "cass swarm resource-plan --json"
+      },
+      "inputs": {
+        "build_pressure": {
+          "level": "high"
+        },
+        "cass": {
+          "active_rebuild": true,
+          "db_size_mb": 5000,
+          "message_count": 2000000,
+          "semantic_model_installed": false
+        },
+        "fixture_problem": null,
+        "host": {
+          "cpu_count": 2,
+          "disk_available_mb": 200,
+          "memory_available_mb": 256,
+          "memory_total_mb": 1024,
+          "profile": "laptop"
+        }
+      },
+      "mutation_contract": {
+        "apply_mode": false,
+        "mutates_db": false,
+        "mutates_files": false,
+        "read_only": true,
+        "runs_builds": false,
+        "schedules_work": false,
+        "touches_network": false
+      },
+      "offload": {
+        "command_prefix": "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-resource-plan-target",
+        "reason": "use a dedicated target dir per agent and keep expensive work off the interactive pane",
+        "recommended": true,
+        "target_dir": "/data/tmp/cass-resource-plan-target"
+      },
+      "plans": [
+        {
+          "action": "full-index",
+          "action_status": "blocked",
+          "disk_write_mb": 2500,
+          "estimated_duration": {
+            "confidence": "low",
+            "p50_seconds": 7875,
+            "p95_seconds": 15780
+          },
+          "estimated_work_units": 2625,
+          "interactive_latency_risk": "high",
+          "peak_memory_mb": 1858,
+          "recommended_action": "free-disk-before-action",
+          "safer_time_window": "after-disk-recovery",
+          "warnings": [
+            "low-disk-headroom",
+            "active-rebuild-in-progress",
+            "high-build-pressure"
+          ]
+        },
+        {
+          "action": "semantic-backfill",
+          "action_status": "blocked",
+          "disk_write_mb": 4625,
+          "estimated_duration": {
+            "confidence": "low",
+            "p50_seconds": 12936,
+            "p95_seconds": 25902
+          },
+          "estimated_work_units": 4312,
+          "interactive_latency_risk": "high",
+          "peak_memory_mb": 1920,
+          "recommended_action": "free-disk-before-action",
+          "safer_time_window": "after-disk-recovery",
+          "warnings": [
+            "low-disk-headroom",
+            "active-rebuild-in-progress",
+            "high-build-pressure",
+            "semantic-model-absent"
+          ]
+        },
+        {
+          "action": "model-install",
+          "action_status": "blocked",
+          "disk_write_mb": 120,
+          "estimated_duration": {
+            "confidence": "low",
+            "p50_seconds": 75,
+            "p95_seconds": 180
+          },
+          "estimated_work_units": 25,
+          "interactive_latency_risk": "high",
+          "peak_memory_mb": 768,
+          "recommended_action": "free-disk-before-action",
+          "safer_time_window": "after-disk-recovery",
+          "warnings": [
+            "low-disk-headroom",
+            "active-rebuild-in-progress",
+            "high-build-pressure",
+            "operator-opt-in-network-step"
+          ]
+        },
+        {
+          "action": "html-export",
+          "action_status": "blocked",
+          "disk_write_mb": 2000,
+          "estimated_duration": {
+            "confidence": "low",
+            "p50_seconds": 834,
+            "p95_seconds": 1698
+          },
+          "estimated_work_units": 278,
+          "interactive_latency_risk": "high",
+          "peak_memory_mb": 1009,
+          "recommended_action": "free-disk-before-action",
+          "safer_time_window": "after-disk-recovery",
+          "warnings": [
+            "low-disk-headroom",
+            "active-rebuild-in-progress",
+            "high-build-pressure"
+          ]
+        },
+        {
+          "action": "support-capsule",
+          "action_status": "blocked",
+          "disk_write_mb": 250,
+          "estimated_duration": {
+            "confidence": "low",
+            "p50_seconds": 417,
+            "p95_seconds": 864
+          },
+          "estimated_work_units": 139,
+          "interactive_latency_risk": "high",
+          "peak_memory_mb": 824,
+          "recommended_action": "free-disk-before-action",
+          "safer_time_window": "after-disk-recovery",
+          "warnings": [
+            "low-disk-headroom",
+            "active-rebuild-in-progress",
+            "high-build-pressure"
+          ]
+        },
+        {
+          "action": "release-verification",
+          "action_status": "blocked",
+          "disk_write_mb": 256,
+          "estimated_duration": {
+            "confidence": "low",
+            "p50_seconds": 4650,
+            "p95_seconds": 9330
+          },
+          "estimated_work_units": 1550,
+          "interactive_latency_risk": "high",
+          "peak_memory_mb": 2176,
+          "recommended_action": "free-disk-before-action",
+          "safer_time_window": "after-disk-recovery",
+          "warnings": [
+            "low-disk-headroom",
+            "active-rebuild-in-progress",
+            "high-build-pressure"
+          ]
+        }
+      ],
+      "privacy": {
+        "contains_secrets": false,
+        "contains_session_content": false,
+        "redaction_applied": false
+      },
+      "schema_version": "cass.swarm.resource_plan.v1",
+      "status": "warning",
+      "summary": {
+        "blocked_count": 6,
+        "high_risk_count": 6,
+        "host_profile": "laptop",
+        "partial_input_count": 0,
+        "plan_count": 6,
+        "readiness": "blocked",
+        "recommended_action": "free-disk-before-action",
+        "status": "warning",
+        "warning_count": 20
+      }
+    },
+    "release-channel-drift": {
+      "channels": [
+        {
+          "channel": "github_release",
+          "checksum_ok": true,
+          "detail": "github_release serves 0.6.22",
+          "expected_version": "0.6.22",
+          "observed_version": "0.6.22",
+          "state": "up_to_date"
+        },
+        {
+          "channel": "homebrew",
+          "detail": "homebrew serves 0.6.21, behind expected 0.6.22",
+          "expected_version": "0.6.22",
+          "manual_next_action": "manually dispatch the homebrew update workflow for version 0.6.22",
+          "observed_version": "0.6.21",
+          "state": "stale"
+        },
+        {
+          "channel": "scoop",
+          "detail": "scoop serves 0.6.22",
+          "expected_version": "0.6.22",
+          "observed_version": "0.6.22",
+          "state": "up_to_date"
+        },
+        {
+          "channel": "crates_io",
+          "detail": "crates_io serves 0.6.21, behind expected 0.6.22",
+          "expected_version": "0.6.22",
+          "manual_next_action": "re-publish crates_io for version 0.6.22",
+          "observed_version": "0.6.21",
+          "state": "stale"
+        },
+        {
+          "channel": "installer_script",
+          "detail": "installer_script serves 0.6.22",
+          "expected_version": "0.6.22",
+          "observed_version": "0.6.22",
+          "state": "up_to_date"
+        }
+      ],
+      "expected_version": "0.6.22",
+      "overall_ready": false,
+      "schema_version": 1,
+      "summary": {
+        "checksum_mismatch": 0,
+        "installer_failed": 0,
+        "missing": 0,
+        "network_unavailable": 0,
+        "ready": 3,
+        "stale": 2,
+        "total": 5
+      }
+    },
+    "stale-trust-dashboard": {
+      "_meta": {
+        "contract": "local read-only projection of robot JSON",
+        "fixture_id": "guided-ops-integrated",
+        "source": "fixture"
+      },
+      "cards": {
+        "blocked_prerequisites": [
+          {
+            "fact": "privacy_review_complete",
+            "status": "unmet",
+            "workflow": "fix-ci-regression"
+          }
+        ],
+        "next_proof": {
+          "command": "cass swarm evidence --json",
+          "proof_gate": "guided-ops-golden",
+          "reason": "fixture-selected robot proof surface"
+        },
+        "privacy": {
+          "inspect_command": "cass swarm privacy-preview --json",
+          "readiness": "opt-in-required",
+          "recommended_action": "confirm-required-opt-ins",
+          "risk_categories": [
+            {
+              "blocking": true,
+              "category": "private session text at [REDACTED_PATH]",
+              "count": 1,
+              "severity": "high"
+            }
+          ],
+          "status": "warning"
+        },
+        "recent_repro_capsules": [
+          {
+            "capsule_id": "capsule-blake3:guidedopsfixture",
+            "incident_kind": "ci-failure",
+            "local_ref": "artifacts/repro-capsule.json",
+            "rerun_command": "cass swarm repro-capsule --json --fixture repro-capsule.fixture.json",
+            "status": "ok",
+            "targets_live_data": false
+          }
+        ],
+        "resources": {
+          "blocked_count": 4,
+          "high_risk_count": 6,
+          "inspect_command": "cass swarm resource-plan --json",
+          "readiness": "blocked",
+          "recommended_action": "free-disk-before-action",
+          "status": "warning",
+          "warning_count": 6
+        },
+        "trust_warnings": [
+          {
+            "confidence": "medium",
+            "provenance_refs": [
+              "commit:abcdef123456"
+            ],
+            "reason": "aged_out",
+            "recommended_followup": "inspect [EMAIL_REDACTED]",
+            "trust_tier": "stale"
+          }
+        ],
+        "workflows": [
+          {
+            "id": "fix-ci-regression",
+            "inspect_command": "cass guide fix-ci-regression --json",
+            "missing_prerequisites": [
+              "privacy_review_complete"
+            ],
+            "privacy_tier": "redacted",
+            "readiness": "blocked",
+            "title": "Diagnose CI safely"
+          }
+        ]
+      },
+      "mutation_contract": {
+        "apply_mode": false,
+        "mutates_db": false,
+        "mutates_files": false,
+        "read_only": true,
+        "runs_builds": false,
+        "schedules_work": false,
+        "touches_network": false
+      },
+      "privacy": {
+        "contains_raw_paths": false,
+        "contains_raw_secrets": false,
+        "contains_session_content": false,
+        "redaction_applied": true
+      },
+      "schema_version": "cass.swarm.operations_dashboard.v1",
+      "status": "warning",
+      "summary": {
+        "available_section_count": 6,
+        "blocked_prerequisite_count": 1,
+        "blocked_workflow_count": 1,
+        "current_goal": "investigate [REDACTED_PATH]",
+        "empty": false,
+        "recommended_action": "satisfy-prerequisites-then-follow-plan",
+        "repro_capsule_count": 1,
+        "trust_warning_count": 1,
+        "workflow_count": 1
+      },
+      "underlying_json_surfaces": [
+        "cass guide <intent> --json",
+        "cass swarm macros --json",
+        "cass swarm resource-plan --json",
+        "cass swarm privacy-preview --json",
+        "cass swarm repro-capsule --json",
+        "cass search <query> --robot --robot-meta",
+        "cass swarm evidence --json"
+      ]
+    },
+    "workflow-macros": {
+      "_meta": {
+        "contract": "advisory workflow macro registry",
+        "fixture_id": "guided-ops-integrated",
+        "generated_at": "<generated-at>",
+        "source": "fixture"
+      },
+      "guided_workflow": {
+        "apply_mode_available": false,
+        "bead_id": "coding_agent_session_search-guided-ops-repro-trust-5u82n.10",
+        "surface": "cass swarm macros --json"
+      },
+      "invalid_macros": [],
+      "macros": [
+        {
+          "id": "fix-ci-regression",
+          "intent_aliases": [
+            "ci failing",
+            "fix broken build",
+            "regression triage"
+          ],
+          "missing_facts": [
+            "git_clean_or_known"
+          ],
+          "optional_mutations": [
+            "apply-source-fix"
+          ],
+          "privacy_tier": "low",
+          "proof_gates": [
+            "first-failure-found",
+            "repro-confirmed",
+            "gate-green"
+          ],
+          "rch_rules": "Run --all-targets gates via rch with a per-agent target dir.",
+          "readiness": "blocked",
+          "required_preflight_facts": [
+            "git_clean_or_known",
+            "ci_logs_available"
+          ],
+          "rollback_notes": "Source edits are tracked in git; revert with a follow-up commit, never a hard reset.",
+          "steps": [
+            {
+              "command": "diag.ci-first-failure",
+              "intent": "identify the first failing gate",
+              "mutates": false,
+              "proof_gate": "first-failure-found",
+              "rch_rule": "none"
+            },
+            {
+              "command": "verify.reproduce-gate",
+              "intent": "reproduce the failing gate locally",
+              "mutates": false,
+              "proof_gate": "repro-confirmed",
+              "rch_rule": "offload-build"
+            },
+            {
+              "command": "verify.rerun-gate",
+              "intent": "apply the minimal fix and re-run the gate",
+              "mutates": true,
+              "proof_gate": "gate-green",
+              "rch_rule": "offload-build"
+            }
+          ],
+          "stop_conditions": [
+            "gate is green",
+            "regression is upstream/not in this repo"
+          ],
+          "title": "Diagnose and fix a CI regression"
+        }
+      ],
+      "mutation_contract": {
+        "apply_mode": false,
+        "mutates_db": false,
+        "mutates_files": false,
+        "read_only": true,
+        "schedules_work": false,
+        "touches_network": false
+      },
+      "schema_version": "cass.swarm.workflow_macros.v1",
+      "status": "warning",
+      "summary": {
+        "blocked_count": 1,
+        "invalid_count": 0,
+        "macro_count": 1,
+        "ready_count": 0,
+        "recommended_action": "satisfy-preflight-facts",
+        "registry_size": 7,
+        "status": "warning"
+      }
+    }
+  },
+  "schema_version": "cass.guided_ops.gate.v1",
+  "timing_contract": {
+    "all_within_budget": true,
+    "budget_ms_per_scenario": 60000
+  }
+}

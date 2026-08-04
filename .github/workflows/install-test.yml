@@ -56,8 +56,12 @@ jobs:
         run: |
           mkdir -p test-artifacts
           cp target/release/cass test-artifacts/
+          # Match the real v0.6.15+ release tarball layout (binary + bundled
+          # docs) so install.sh's archive-member guard is exercised against the
+          # siblings that broke installs in cass#299.
+          cp README.md LICENSE test-artifacts/
           cd test-artifacts
-          tar -czvf cass-vtest-linux-x86_64.tar.gz cass
+          tar -czvf cass-vtest-linux-x86_64.tar.gz cass README.md LICENSE
           sha256sum cass-vtest-linux-x86_64.tar.gz > cass-vtest-linux-x86_64.tar.gz.sha256
           echo "=== Test artifact created ==="
           ls -la
@@ -145,8 +149,8 @@ jobs:
           echo "" | tee -a install-test.log
           echo "  cargo build --release" | tee -a install-test.log
           echo "  mkdir -p /tmp/test-artifacts" | tee -a install-test.log
-          echo "  cp target/release/cass /tmp/test-artifacts/" | tee -a install-test.log
-          echo "  cd /tmp/test-artifacts && tar -czvf cass-vtest-linux-x86_64.tar.gz cass" | tee -a install-test.log
+          echo "  cp target/release/cass README.md LICENSE /tmp/test-artifacts/" | tee -a install-test.log
+          echo "  cd /tmp/test-artifacts && tar -czvf cass-vtest-linux-x86_64.tar.gz cass README.md LICENSE" | tee -a install-test.log
           echo "  sha256sum cass-vtest-linux-x86_64.tar.gz > cass-vtest-linux-x86_64.tar.gz.sha256" | tee -a install-test.log
           echo "  ARTIFACT_URL=file:///tmp/test-artifacts/cass-vtest-linux-x86_64.tar.gz \\" | tee -a install-test.log
           echo "  CHECKSUM=\$(cat /tmp/test-artifacts/cass-vtest-linux-x86_64.tar.gz.sha256 | cut -d' ' -f1) \\" | tee -a install-test.log
@@ -189,8 +193,12 @@ jobs:
         run: |
           mkdir -p test-artifacts
           cp target/release/cass test-artifacts/
+          # Match the real v0.6.15+ release tarball layout (binary + bundled
+          # docs) so install.sh's archive-member guard is exercised against the
+          # siblings that broke installs in cass#299.
+          cp README.md LICENSE test-artifacts/
           cd test-artifacts
-          tar -czvf cass-vtest-macos-arm64.tar.gz cass
+          tar -czvf cass-vtest-macos-arm64.tar.gz cass README.md LICENSE
           shasum -a 256 cass-vtest-macos-arm64.tar.gz > cass-vtest-macos-arm64.tar.gz.sha256
           echo "=== Test artifact created ==="
           ls -la
@@ -269,8 +277,8 @@ jobs:
           echo "" | tee -a install-test.log
           echo "  cargo build --release" | tee -a install-test.log
           echo "  mkdir -p /tmp/test-artifacts" | tee -a install-test.log
-          echo "  cp target/release/cass /tmp/test-artifacts/" | tee -a install-test.log
-          echo "  cd /tmp/test-artifacts && tar -czvf cass-vtest-macos-arm64.tar.gz cass" | tee -a install-test.log
+          echo "  cp target/release/cass README.md LICENSE /tmp/test-artifacts/" | tee -a install-test.log
+          echo "  cd /tmp/test-artifacts && tar -czvf cass-vtest-macos-arm64.tar.gz cass README.md LICENSE" | tee -a install-test.log
           echo "  shasum -a 256 cass-vtest-macos-arm64.tar.gz > cass-vtest-macos-arm64.tar.gz.sha256" | tee -a install-test.log
           echo "  ARTIFACT_URL=file:///tmp/test-artifacts/cass-vtest-macos-arm64.tar.gz \\" | tee -a install-test.log
           echo "  CHECKSUM=\$(cat /tmp/test-artifacts/cass-vtest-macos-arm64.tar.gz.sha256 | cut -d' ' -f1) \\" | tee -a install-test.log

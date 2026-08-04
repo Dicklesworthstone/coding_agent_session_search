@@ -1,0 +1,3 @@
+repo_path=.
+timestamp=20260722T044535Z
+issue_id=coding_agent_session_search-guided-ops-repro-trust-5u82n.16

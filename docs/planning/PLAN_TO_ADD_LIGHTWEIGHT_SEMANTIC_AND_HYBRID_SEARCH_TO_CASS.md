@@ -1,13 +1,14 @@
 # Plan: Lightweight Semantic & Hybrid Search for CASS
 
-> **Status: historical design, superseded for model acquisition.** This plan
-> predates the current shipped model-management contract. Treat any
-> "auto-download", TUI-triggered download, `CASS_SEMANTIC_AUTODOWNLOAD`, or
-> `cass index --semantic --download-model` wording below as historical design
-> context unless a section explicitly says it is current. Current cass behavior
-> is: semantic model acquisition is opt-in only via `cass models install` or
-> `cass models install --from-file <dir>`; cass never auto-downloads models, and
-> missing models degrade to lexical-only behavior with truthful robot metadata.
+> **Status: historical design, superseded for acquisition and inference.** This
+> plan predates the shipped model-management contract and the cass#308 removal
+> of FastEmbed/ONNX Runtime. Treat references below to auto-downloads,
+> `CASS_SEMANTIC_AUTODOWNLOAD`, `model.onnx`, FastEmbed/ORT, or a `semantic`
+> Cargo feature as historical design context. Current cass explicitly installs
+> native MiniLM safetensors via `cass models install` (or `--from-file`), never
+> auto-downloads, and always compiles the pure-Rust runtime-dispatched backend.
+> Missing model/vector assets make hybrid search fail open to lexical; there is
+> no AVX2-only or separate `-baseline` binary.
 
 ## Executive Summary
 
@@ -1759,7 +1760,7 @@ semantic = ["fastembed", "half", "memmap2"]
 
 This allows building without semantic search for minimal binary size:
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-semantic-minimal-target cargo build --release --no-default-features
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-semantic-minimal-target cargo build --release --no-default-features
 ```
 
 ### Binary Size Impact

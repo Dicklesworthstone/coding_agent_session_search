@@ -2,7 +2,8 @@
  * cass Archive Stats Dashboard Module
  *
  * Renders an instant analytics dashboard using precomputed JSON files
- * (statistics.json, timeline.json, agent_summary.json, workspace_summary.json, top_terms.json)
+ * (statistics.json, timeline.json, agent_summary.json, workspace_summary.json,
+ * top_terms.json, analytics_status.json)
  * generated during export. Falls back to database queries if JSON not available.
  *
  * Routes:
@@ -113,12 +114,38 @@ async function loadPrecomputedAnalytics() {
         }
     }
 
+    // zqre2: this file is generated from the same Rust query/projection used by
+    // `cass analytics status --json`. Older exports do not have it, so keep
+    // loading them while reporting an explicit unavailable state rather than
+    // manufacturing a healthy status from archive counters.
+    const analyticsStatus = await loadOptionalAnalyticsStatus();
+
     return {
         statistics: results.statistics,
         timeline: results.timeline,
         agentSummary: results.agent_summary,
         workspaceSummary: results.workspace_summary,
-        topTerms: results.top_terms
+        topTerms: results.top_terms,
+        analyticsStatus
+    };
+}
+
+async function loadOptionalAnalyticsStatus() {
+    for (const path of ['./data/analytics_status.json', './analytics_status.json']) {
+        try {
+            const response = await fetchWithTimeout(path);
+            if (response.ok) {
+                return await response.json();
+            }
+        } catch {
+            // Try the alternate export layout below.
+        }
+    }
+
+    return {
+        coverage: {},
+        recommended_action: 'regenerate the Pages export to include analytics readiness',
+        pages_projection_status: 'not-available'
     };
 }
 
@@ -329,7 +356,12 @@ function computeAnalyticsFromDatabase() {
         timeline,
         agentSummary,
         workspaceSummary,
-        topTerms
+        topTerms,
+        analyticsStatus: {
+            coverage: {},
+            recommended_action: 'regenerate the Pages export to include analytics readiness',
+            pages_projection_status: 'not-available'
+        }
     };
 
     return computedAnalytics;
@@ -417,7 +449,7 @@ function renderErrorState(message) {
 function renderDashboard(data) {
     if (!container) return;
 
-    const { statistics = {}, timeline = {}, agentSummary, workspaceSummary, topTerms } = data || {};
+    const { statistics = {}, timeline = {}, agentSummary, workspaceSummary, topTerms, analyticsStatus } = data || {};
     const statisticsAgents = isPlainObject(statistics.agents) ? statistics.agents : {};
     const statisticsRoles = isPlainObject(statistics.roles) ? statistics.roles : {};
     const agents = Array.isArray(agentSummary?.agents) ? agentSummary.agents : [];
@@ -434,6 +466,7 @@ function renderDashboard(data) {
                 ${statistics.computed_at ? `<span class="stats-timestamp">Updated ${formatRelativeTime(statistics.computed_at)}</span>` : ''}
             </header>
             <div class="panel-content">
+                ${renderAnalyticsReadiness(analyticsStatus)}
                 <!-- Overview Cards -->
                 <section class="stats-section" aria-labelledby="overview-heading">
                     <h3 id="overview-heading" class="visually-hidden">Overview</h3>
@@ -576,6 +609,28 @@ function renderDashboard(data) {
 
     // Set up timeline tab handlers
     setupTimelineControls(timeline);
+}
+
+/**
+ * Render the same readiness/next-action state exposed by robot analytics.
+ * A healthy `none` action stays quiet; every non-healthy state is also logged
+ * so the human warning has an inspectable machine-readable equivalent.
+ */
+function renderAnalyticsReadiness(status) {
+    const action = typeof status?.recommended_action === 'string'
+        ? status.recommended_action
+        : 'regenerate the Pages export to include analytics readiness';
+    if (action === 'none') {
+        return '';
+    }
+
+    console.warn('[Stats] Analytics readiness requires action:', action, status);
+    return `
+        <section class="stats-section stats-readiness" aria-labelledby="analytics-readiness-heading">
+            <h3 id="analytics-readiness-heading">Analytics readiness</h3>
+            <p>${escapeHtml(action)}</p>
+        </section>
+    `;
 }
 
 /**

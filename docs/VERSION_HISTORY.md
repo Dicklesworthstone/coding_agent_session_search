@@ -86,10 +86,10 @@ When migration fails:
 
 ```bash
 # Run upgrade tests
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-version-target cargo test --test upgrade
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-version-target cargo test --test upgrade
 
 # Test specific version migration
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-version-target cargo test test_schema_version_5_to_current
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-version-target cargo test test_schema_version_5_to_current
 ```
 
 ## Future Versions

@@ -1273,7 +1273,7 @@ mod tests {
         let data_dir = tmp.path().to_path_buf();
         let model_marker = data_dir.join("models/all-minilm-l6-v2/__incomplete__");
         fs::create_dir_all(model_marker.parent().unwrap()).unwrap();
-        let pre = b"missing model.onnx";
+        let pre = b"missing model.safetensors";
         fs::write(&model_marker, pre).unwrap();
         let run_id = RunId::from_parts("sha-model-missing", 1_700_000_000_000);
         let _ = crate::doctor_runs::create_run_dir(&data_dir, &run_id).unwrap();
@@ -1295,29 +1295,29 @@ mod tests {
         assert_eq!(fs::read(&backup).unwrap(), pre.to_vec());
     }
 
-    /// fm-models-checksum-mismatch: model.onnx has wrong sha256. Same
+    /// fm-models-checksum-mismatch: model.safetensors has wrong sha256. Same
     /// quarantine pattern.
     #[test]
     fn pass6_fixture_fm_models_checksum_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().to_path_buf();
-        let onnx = data_dir.join("models/all-minilm-l6-v2/model.onnx");
-        fs::create_dir_all(onnx.parent().unwrap()).unwrap();
-        let pre = b"\x80\x02ONNX\x00bad-checksum-bytes";
-        fs::write(&onnx, pre).unwrap();
+        let weights = data_dir.join("models/all-minilm-l6-v2/model.safetensors");
+        fs::create_dir_all(weights.parent().unwrap()).unwrap();
+        let pre = b"\x00safetensors\x00bad-checksum-bytes";
+        fs::write(&weights, pre).unwrap();
         let run_id = RunId::from_parts("sha-model-csum", 1_700_000_000_000);
         let _ = crate::doctor_runs::create_run_dir(&data_dir, &run_id).unwrap();
         let _receipt = mutate(MutationRequest {
             run_id,
             data_dir: data_dir.clone(),
             fm_id: "fm-models-checksum-mismatch".into(),
-            path: onnx.clone(),
+            path: weights.clone(),
             op: Op::Quarantine {
                 reason: "model checksum mismatch — pass-6 fixture".into(),
             },
         })
         .expect("quarantine ok");
-        assert!(!onnx.exists());
+        assert!(!weights.exists());
     }
 
     /// fm-connectors-malformed-session-json: a session jsonl is unparseable.

@@ -1,0 +1,19 @@
+{
+  "storage_version": 1,
+  "entries": {
+    "conv-bumped::v1": {
+      "first_attempt_at": "2026-03-01T00:00:00Z",
+      "last_attempt_at": "2026-03-01T00:00:00Z",
+      "attempt_count": 2,
+      "last_reason": "index-ingest-out-of-memory: schema v1 encoding",
+      "cass_version_at_quarantine": "0.6.10"
+    },
+    "conv-bumped::v2": {
+      "first_attempt_at": "2026-06-05T00:00:00Z",
+      "last_attempt_at": "2026-06-05T00:00:00Z",
+      "attempt_count": 1,
+      "last_reason": "index-ingest-out-of-memory: schema v2 encoding",
+      "cass_version_at_quarantine": "0.6.13"
+    }
+  }
+}

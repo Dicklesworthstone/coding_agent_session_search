@@ -10,13 +10,83 @@ use coding_agent_search::search::embedder::{Embedder, EmbedderResult};
 use coding_agent_search::search::reranker::{
     RerankDocument, RerankScore, Reranker, RerankerResult, rerank_texts,
 };
-use frankensearch::ModelCategory;
+use frankensearch::{AssumedDaemonClient, DaemonTrustLevelV1, ModelCategory, SearchError};
 use parking_lot::Mutex;
+
+#[cfg(unix)]
+#[test]
+fn issue_347_uds_client_rejects_same_width_wrong_model() {
+    use coding_agent_search::daemon::protocol::{
+        EmbedResponse, FramedMessage, HealthStatus, PROTOCOL_VERSION, Request, Response,
+        decode_message, encode_message,
+    };
+    use coding_agent_search::daemon::{DaemonClientConfig, UdsDaemonClient};
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let socket = temp.path().join("semantic.sock");
+    let listener = UnixListener::bind(&socket).expect("bind daemon fixture socket");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept client");
+        for _ in 0..2 {
+            let mut len = [0_u8; 4];
+            stream.read_exact(&mut len).expect("read request length");
+            let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
+            stream
+                .read_exact(&mut payload)
+                .expect("read request payload");
+            let request: FramedMessage<Request> = decode_message(&payload).expect("decode request");
+            let response = match request.payload {
+                Request::Health => Response::Health(HealthStatus {
+                    uptime_secs: 1,
+                    version: PROTOCOL_VERSION,
+                    ready: true,
+                    memory_bytes: 0,
+                }),
+                Request::Embed { texts, .. } => Response::Embed(EmbedResponse {
+                    embeddings: vec![vec![0.25; 384]; texts.len()],
+                    model: "hash-384".to_string(),
+                    elapsed_ms: 1,
+                }),
+                _ => Response::Health(HealthStatus {
+                    uptime_secs: 1,
+                    version: PROTOCOL_VERSION,
+                    ready: false,
+                    memory_bytes: 0,
+                }),
+            };
+            stream
+                .write_all(
+                    &encode_message(&FramedMessage::new(request.request_id, response))
+                        .expect("encode response"),
+                )
+                .expect("write response");
+        }
+    });
+
+    let client = UdsDaemonClient::new(DaemonClientConfig {
+        socket_path: socket,
+        auto_spawn: false,
+        expected_embedder_id: Some("minilm-384".to_string()),
+        ..Default::default()
+    });
+    client.connect().expect("connect to fixture daemon");
+    assert!(client.is_available(), "fixture health must be ready");
+    let error = client
+        .embed("daemon contract probe", "issue-347")
+        .expect_err("a hash response must be rejected for the MiniLM index");
+    assert!(matches!(error, DaemonError::InvalidInput(_)));
+    assert!(error.to_string().contains("expected minilm-384"));
+    assert!(error.to_string().contains("received hash-384"));
+    server.join().expect("daemon fixture thread");
+}
 
 #[derive(Clone, Copy)]
 enum DaemonMode {
     Ok,
     Drop,
+    Timeout,
 }
 
 enum DaemonRequest {
@@ -202,6 +272,12 @@ fn respond<T: Send + 'static>(
         DaemonMode::Drop => {
             // Simulate a crash by dropping the response channel.
         }
+        DaemonMode::Timeout => {
+            // Exceed ChannelDaemonClient's 25 ms response budget so the caller
+            // observes the real timeout path before this late response arrives.
+            thread::sleep(Duration::from_millis(50));
+            let _ = resp.send(Ok(ok_value));
+        }
     }
 }
 
@@ -284,24 +360,81 @@ fn daemon_integration_embed_and_rerank() {
         jitter_pct: 0.0,
     };
 
-    let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, cfg.clone());
-    let embed = embedder.embed_sync("hello").unwrap();
-    assert_eq!(embed[0], 2.0);
+    let error = match DaemonFallbackEmbedder::new(daemon.clone(), fallback, cfg.clone()) {
+        Err(error) => error,
+        Ok(_) => unreachable!("legacy raw daemon composition must fail closed"),
+    };
+    assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+    assert_eq!(
+        harness.calls(),
+        0,
+        "constructor rejection must happen before any unverified daemon request"
+    );
 
     let reranker_fallback = Arc::new(StaticReranker { value: 0.5 });
     let reranker = DaemonFallbackReranker::new(daemon, Some(reranker_fallback), cfg);
     let scores = rerank_texts(&reranker, "q", &["a", "b"]).unwrap();
     assert_eq!(scores, vec![1.0, 1.0]);
 
-    assert_eq!(harness.calls(), 2);
+    assert_eq!(harness.calls(), 1);
 }
 
 #[test]
-fn daemon_integration_crash_falls_back() {
+fn raw_daemon_is_available_only_through_explicit_transient_assumed_mode() {
+    let harness = DaemonHarness::new(DaemonMode::Ok);
+    let daemon = harness.client();
+
+    let assumed = AssumedDaemonClient::new(daemon);
+    let batch = assumed
+        .embed_transient("transient exploration only")
+        .expect("raw daemon remains available in explicit assumed mode");
+    assert_eq!(batch.trust_level(), DaemonTrustLevelV1::AssumedRemote);
+    assert_eq!(batch.vectors(), &[vec![2.0; 4]]);
+    assert_eq!(harness.calls(), 1);
+
+    let rendered = format!("{assumed:?} {batch:?}");
+    assert!(rendered.contains("AssumedRemote"));
+    assert!(rendered.contains("<redacted>"));
+    assert!(
+        !rendered.contains("[2.0, 2.0, 2.0, 2.0]"),
+        "transient vectors must stay redacted from diagnostics"
+    );
+}
+
+#[test]
+fn failed_raw_daemon_never_becomes_an_index_compatible_fallback_embedder() {
     let harness = DaemonHarness::new(DaemonMode::Drop);
     let daemon = harness.client();
 
     let fallback = Arc::new(StaticEmbedder { dim: 4, value: 1.0 });
+    let error =
+        match DaemonFallbackEmbedder::new(daemon.clone(), fallback, DaemonRetryConfig::default()) {
+            Err(error) => error,
+            Ok(_) => unreachable!("unattested daemon must not implement indexed embedding"),
+        };
+    assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+    assert_eq!(harness.calls(), 0);
+
+    let assumed = AssumedDaemonClient::new(daemon);
+    assert!(
+        assumed.embed_transient("raw failure").is_err(),
+        "assumed mode must expose daemon failure rather than relabel local vectors"
+    );
+    assert_eq!(harness.calls(), 1);
+    harness.set_available(false);
+    assert!(assumed.embed_transient("unavailable raw failure").is_err());
+    assert_eq!(
+        harness.calls(),
+        1,
+        "known-unavailable raw daemon must fail before a transport request"
+    );
+}
+
+#[test]
+fn daemon_reranker_crash_falls_back_without_losing_results() {
+    let harness = DaemonHarness::new(DaemonMode::Drop);
+    let daemon = harness.client();
+    let fallback = Arc::new(StaticReranker { value: 0.5 });
     let cfg = DaemonRetryConfig {
         max_attempts: 1,
         base_delay: Duration::from_millis(1),
@@ -309,28 +442,27 @@ fn daemon_integration_crash_falls_back() {
         jitter_pct: 0.0,
     };
 
-    let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, cfg.clone());
-    let first = embedder.embed_sync("hello").unwrap();
-    assert_eq!(first[0], 1.0);
+    let reranker = DaemonFallbackReranker::new(daemon, Some(fallback), cfg);
+    let first = rerank_texts(&reranker, "q", &["doc"]).expect("fallback rerank after daemon crash");
+    assert_eq!(first, vec![0.5]);
     assert_eq!(harness.calls(), 1);
 
     harness.set_available(false);
-    let second = embedder.embed_sync("hello again").unwrap();
-    assert_eq!(second[0], 1.0);
-    assert_eq!(harness.calls(), 1);
-
-    let reranker_fallback = Arc::new(StaticReranker { value: 0.5 });
-    let reranker = DaemonFallbackReranker::new(daemon, Some(reranker_fallback), cfg);
-    let scores = rerank_texts(&reranker, "q", &["doc"]).unwrap();
-    assert_eq!(scores, vec![0.5]);
+    let second =
+        rerank_texts(&reranker, "q", &["doc"]).expect("fallback rerank while daemon unavailable");
+    assert_eq!(second, vec![0.5]);
+    assert_eq!(
+        harness.calls(),
+        1,
+        "known-unavailable daemon must not receive another transport request"
+    );
 }
 
 #[test]
-fn daemon_integration_timeout_backoff_with_jitter() {
-    let harness = DaemonHarness::new(DaemonMode::Drop);
+fn daemon_reranker_timeout_backoff_with_jitter_retries_after_window() {
+    let harness = DaemonHarness::new(DaemonMode::Timeout);
     let daemon = harness.client();
-
-    let fallback = Arc::new(StaticEmbedder { dim: 4, value: 1.0 });
+    let fallback = Arc::new(StaticReranker { value: 0.5 });
     let cfg = DaemonRetryConfig {
         max_attempts: 1,
         base_delay: Duration::from_millis(20),
@@ -338,18 +470,32 @@ fn daemon_integration_timeout_backoff_with_jitter() {
         jitter_pct: 0.5,
     };
 
-    let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, cfg.clone());
-    let _ = embedder.embed_sync("first").unwrap();
+    let reranker = DaemonFallbackReranker::new(daemon, Some(fallback), cfg.clone());
+    assert_eq!(
+        rerank_texts(&reranker, "q", &["first"]).expect("first fallback rerank"),
+        vec![0.5]
+    );
     let calls_after_first = harness.calls();
 
-    let _ = embedder.embed_sync("second").unwrap();
+    assert_eq!(
+        rerank_texts(&reranker, "q", &["second"]).expect("backoff fallback rerank"),
+        vec![0.5]
+    );
     let calls_after_second = harness.calls();
-    assert_eq!(calls_after_first, calls_after_second);
+    assert_eq!(
+        calls_after_first, calls_after_second,
+        "backoff window must suppress immediate retries"
+    );
 
     let max_jitter_ms = (cfg.base_delay.as_millis() as f64 * (1.0 + cfg.jitter_pct)).ceil();
     std::thread::sleep(Duration::from_millis(max_jitter_ms as u64 + 10));
 
-    let _ = embedder.embed_sync("third").unwrap();
-    let calls_after_third = harness.calls();
-    assert!(calls_after_third > calls_after_second);
+    assert_eq!(
+        rerank_texts(&reranker, "q", &["third"]).expect("post-backoff fallback rerank"),
+        vec![0.5]
+    );
+    assert!(
+        harness.calls() > calls_after_second,
+        "daemon must be retried after the bounded backoff window"
+    );
 }

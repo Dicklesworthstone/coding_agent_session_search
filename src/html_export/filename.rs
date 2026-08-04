@@ -538,6 +538,7 @@ pub fn agent_slug(agent: &str) -> String {
         "cursor" | "cursorai" => "cursor".to_string(),
         "chatgpt" | "gpt" | "openai" => "chatgpt".to_string(),
         "gemini" | "geminicli" | "google" => "gemini".to_string(),
+        "antigravity" | "antigravitycli" | "agy" => "antigravity".to_string(),
         "codex" | "codexcli" => "codex".to_string(),
         "aider" => "aider".to_string(),
         "piagent" | "pi" => "piagent".to_string(),

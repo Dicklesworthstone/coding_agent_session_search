@@ -4,6 +4,7 @@
 //! `None` (rendered as JSON `null`) rather than NaN / Infinity.
 
 use super::types::{DerivedMetrics, UsageBucket};
+use crate::metric_integrity::{MetricOutcome, safe_ratio};
 
 /// Compute all derived metrics from a [`UsageBucket`].
 pub fn compute_derived(bucket: &UsageBucket) -> DerivedMetrics {
@@ -51,15 +52,17 @@ pub fn compute_derived(bucket: &UsageBucket) -> DerivedMetrics {
     }
 }
 
-/// Percentage safe against zero denominator.  Returns 0.0 when denominator is
-/// zero. Result is rounded to 2 decimal places (matching the original CLI
-/// rounding: `(pct * 100.0).round() / 100.0`).
-pub fn safe_pct(numerator: i64, denominator: i64) -> f64 {
-    if denominator == 0 {
-        0.0
-    } else {
-        let pct = (numerator as f64 / denominator as f64) * 100.0;
-        (pct * 100.0).round() / 100.0
+/// Percentage classified through the shared metric-integrity taxonomy. A zero
+/// denominator is `no-data`, not a manufactured `0`; a genuine zero numerator
+/// over present rows is `true-zero`. Numeric results are rounded to 2 places.
+pub fn safe_pct(numerator: i64, denominator: i64) -> MetricOutcome {
+    let outcome = safe_ratio(numerator as f64, denominator as f64);
+    match outcome {
+        MetricOutcome::Value(value) => {
+            MetricOutcome::finite(((value * 100.0) * 100.0).round() / 100.0)
+        }
+        MetricOutcome::TrueZero => MetricOutcome::TrueZero,
+        other => other,
     }
 }
 
@@ -113,19 +116,19 @@ mod tests {
 
     #[test]
     fn safe_pct_zero_denominator() {
-        assert_eq!(safe_pct(50, 0), 0.0);
+        assert_eq!(safe_pct(50, 0), MetricOutcome::NoData);
     }
 
     #[test]
     fn safe_pct_normal() {
-        let pct = safe_pct(75, 100);
+        let pct = safe_pct(75, 100).as_value().expect("numeric percentage");
         assert!((pct - 75.0).abs() < 0.01);
     }
 
     #[test]
     fn safe_pct_rounding() {
         // 1/3 = 33.333...% → should round to 33.33
-        let pct = safe_pct(1, 3);
+        let pct = safe_pct(1, 3).as_value().expect("numeric percentage");
         assert!((pct - 33.33).abs() < 0.01);
     }
 
@@ -133,7 +136,7 @@ mod tests {
     fn compute_derived_empty_bucket() {
         let bucket = UsageBucket::default();
         let d = compute_derived(&bucket);
-        assert_eq!(d.api_coverage_pct, 0.0);
+        assert_eq!(d.api_coverage_pct, MetricOutcome::NoData);
         assert_eq!(d.api_tokens_per_assistant_msg, None);
         assert_eq!(d.content_tokens_per_user_msg, None);
         assert_eq!(d.tool_calls_per_1k_api_tokens, None);
@@ -160,7 +163,7 @@ mod tests {
             ..Default::default()
         };
         let d = compute_derived(&bucket);
-        assert!((d.api_coverage_pct - 80.0).abs() < 0.01);
+        assert_eq!(d.api_coverage_pct, MetricOutcome::Value(80.0));
         assert_eq!(d.api_tokens_per_assistant_msg, Some(1200.0));
         assert_eq!(d.content_tokens_per_user_msg, Some(1000.0));
         assert!(d.tool_calls_per_1k_api_tokens.is_some());
@@ -180,7 +183,6 @@ mod tests {
             ..Default::default()
         };
         let d = compute_derived(&bucket);
-        assert!(!d.api_coverage_pct.is_nan());
-        assert!(!d.api_coverage_pct.is_infinite());
+        assert_eq!(d.api_coverage_pct, MetricOutcome::NoData);
     }
 }

@@ -1,0 +1,213 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer"
+    },
+    "mode": {
+      "type": "string"
+    },
+    "target_version": {
+      "type": "string"
+    },
+    "probed_remote_hosts": {
+      "type": "boolean"
+    },
+    "rehearsal": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "target_version": {
+          "type": "string"
+        },
+        "rehearsal_mode": {
+          "type": "string"
+        },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "schema_version": {
+                "type": "integer"
+              },
+              "host_alias": {
+                "type": "string"
+              },
+              "disposition": {
+                "type": "string"
+              },
+              "observed_version": {
+                "type": "string"
+              },
+              "target_version": {
+                "type": "string"
+              },
+              "capability_gap": {
+                "type": "string"
+              },
+              "upgrade_before_repair": {
+                "type": "boolean"
+              },
+              "install_method": {
+                "type": "string"
+              },
+              "install_command": {
+                "type": "string"
+              },
+              "channel": {
+                "type": "string"
+              },
+              "preflight": {
+                "type": "object",
+                "properties": {
+                  "archive_risk": {
+                    "type": "string"
+                  },
+                  "coverage_state": {
+                    "type": "string"
+                  },
+                  "source_coverage_ok": {
+                    "type": "boolean"
+                  },
+                  "archive_safe_to_proceed": {
+                    "type": "boolean"
+                  },
+                  "backup_required": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "actions": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "action": {
+                      "type": "string"
+                    },
+                    "applicable": {
+                      "type": "boolean"
+                    },
+                    "mutation_scope": {
+                      "type": "string"
+                    },
+                    "command": {
+                      "type": "string"
+                    },
+                    "opt_in": {
+                      "type": "boolean"
+                    },
+                    "requires_confirmation": {
+                      "type": "boolean"
+                    },
+                    "backup_required": {
+                      "type": "boolean"
+                    },
+                    "blocked": {
+                      "type": "boolean"
+                    },
+                    "why": {
+                      "type": "string"
+                    },
+                    "proof_check": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "will_check_before_mutation": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "not_touched": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "post_checks": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "check": {
+                      "type": "string"
+                    },
+                    "command": {
+                      "type": "string"
+                    },
+                    "timeout_ms": {
+                      "type": "integer"
+                    },
+                    "required": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              },
+              "safe_next_commands": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "rehearsal_mode": {
+                "type": "string"
+              },
+              "live_steps_skipped": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "abort_behavior": {
+                "type": "string"
+              },
+              "redaction_applied": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "hosts_up_to_date": {
+          "type": "integer"
+        },
+        "hosts_needing_upgrade": {
+          "type": "integer"
+        },
+        "hosts_unreachable": {
+          "type": "integer"
+        },
+        "hosts_gated_by_archive": {
+          "type": "integer"
+        },
+        "hosts_installer_unavailable": {
+          "type": "integer"
+        },
+        "recommended_order": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "highest_archive_risk": {
+          "type": "string"
+        },
+        "any_blocked": {
+          "type": "boolean"
+        }
+      }
+    },
+    "mutation_free": {
+      "type": "boolean"
+    },
+    "generated_by": {
+      "type": "string"
+    }
+  }
+}

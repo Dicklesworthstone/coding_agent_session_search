@@ -5,6 +5,12 @@
 > **Methodology:** 10-mode reasoning swarm with triangulated synthesis
 > **Confidence:** 0.85 (composite)
 
+> **Status: historical snapshot.** In particular, the AVX startup-check and
+> ONNX degradation findings below were superseded by cass#308 and bead tg5o9.
+> Current cass uses an always-compiled pure-Rust inference backend with
+> runtime-dispatched SIMD and one release artifact per platform; it has no ONNX
+> static initializer, mandatory AVX/AVX2 gate, or separate `-baseline` binary.
+
 ---
 
 ## 1. Executive Summary

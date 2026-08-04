@@ -31,9 +31,15 @@ pub enum DecryptError {
     /// Archive integrity check failed (tampering detected).
     #[error("The archive appears to be corrupted or tampered with.")]
     IntegrityCheckFailed,
+    /// Encrypted payload bytes cannot be authenticated or decoded.
+    #[error("The encrypted archive payload is corrupted or tampered with.")]
+    CorruptPayload(String),
     /// Archive version not supported.
     #[error("This archive requires a newer version of the software (version {0}).")]
     UnsupportedVersion(u8),
+    /// Archive metadata names a format feature this build cannot consume.
+    #[error("This archive uses unsupported encryption metadata ({0}).")]
+    UnsupportedMetadata(String),
     /// No matching key slot found.
     #[error("No matching key slot found for the provided credentials.")]
     NoMatchingKeySlot,
@@ -56,8 +62,14 @@ impl DecryptError {
             Self::IntegrityCheckFailed => {
                 "The archive appears to be corrupted. Try downloading it again."
             }
+            Self::CorruptPayload(_) => {
+                "The encrypted payload is incomplete or corrupted. Try downloading it again."
+            }
             Self::UnsupportedVersion(_) => {
                 "This archive was created with a newer version. Please update CASS."
+            }
+            Self::UnsupportedMetadata(_) => {
+                "Update CASS or regenerate the archive with a supported export format."
             }
             Self::NoMatchingKeySlot => {
                 "The credentials you provided don't match any key slot in this archive."
@@ -77,7 +89,11 @@ impl DecryptError {
             Self::EmptyPassword => "Empty password provided".to_string(),
             Self::InvalidFormat(detail) => format!("Invalid format: {}", detail),
             Self::IntegrityCheckFailed => "Integrity check failed".to_string(),
+            Self::CorruptPayload(detail) => format!("Corrupt encrypted payload: {detail}"),
             Self::UnsupportedVersion(v) => format!("Unsupported version: {}", v),
+            Self::UnsupportedMetadata(field) => {
+                format!("Unsupported encryption metadata: {field}")
+            }
             Self::NoMatchingKeySlot => "No matching key slot".to_string(),
             Self::CryptoError(e) => format!("Crypto error: {}", e),
         }
@@ -313,6 +329,8 @@ impl ErrorCode for DecryptError {
             Self::UnsupportedVersion(_) => "E1005",
             Self::NoMatchingKeySlot => "E1006",
             Self::CryptoError(_) => "E1007",
+            Self::UnsupportedMetadata(_) => "E1008",
+            Self::CorruptPayload(_) => "E1009",
         }
     }
 }
@@ -377,7 +395,15 @@ mod tests {
                 "not a valid archive",
             ),
             (DecryptError::IntegrityCheckFailed, "corrupted"),
+            (
+                DecryptError::CorruptPayload("chunk authentication failed".into()),
+                "payload is corrupted",
+            ),
             (DecryptError::UnsupportedVersion(99), "newer version"),
+            (
+                DecryptError::UnsupportedMetadata("compression".into()),
+                "unsupported encryption metadata",
+            ),
         ];
 
         for (error, expected_substring) in errors {
@@ -409,8 +435,16 @@ mod tests {
                 "The archive appears to be corrupted or tampered with.",
             ),
             (
+                DecryptError::CorruptPayload("chunk authentication failed".into()),
+                "The encrypted archive payload is corrupted or tampered with.",
+            ),
+            (
                 DecryptError::UnsupportedVersion(99),
                 "This archive requires a newer version of the software (version 99).",
+            ),
+            (
+                DecryptError::UnsupportedMetadata("compression".into()),
+                "This archive uses unsupported encryption metadata (compression).",
             ),
             (
                 DecryptError::NoMatchingKeySlot,
@@ -435,7 +469,9 @@ mod tests {
             DecryptError::EmptyPassword,
             DecryptError::InvalidFormat("header mismatch".into()),
             DecryptError::IntegrityCheckFailed,
+            DecryptError::CorruptPayload("cipher authentication".into()),
             DecryptError::UnsupportedVersion(2),
+            DecryptError::UnsupportedMetadata("compression".into()),
             DecryptError::CryptoError("GCM tag mismatch".into()),
         ];
 
@@ -462,7 +498,9 @@ mod tests {
             DecryptError::EmptyPassword,
             DecryptError::InvalidFormat("test".into()),
             DecryptError::IntegrityCheckFailed,
+            DecryptError::CorruptPayload("chunk authentication failed".into()),
             DecryptError::UnsupportedVersion(2),
+            DecryptError::UnsupportedMetadata("compression".into()),
             DecryptError::NoMatchingKeySlot,
             DecryptError::CryptoError("test".into()),
         ];
@@ -556,7 +594,9 @@ mod tests {
             DecryptError::EmptyPassword,
             DecryptError::InvalidFormat("".into()),
             DecryptError::IntegrityCheckFailed,
+            DecryptError::CorruptPayload("chunk authentication failed".into()),
             DecryptError::UnsupportedVersion(0),
+            DecryptError::UnsupportedMetadata("compression".into()),
             DecryptError::NoMatchingKeySlot,
             DecryptError::CryptoError("".into()),
         ];

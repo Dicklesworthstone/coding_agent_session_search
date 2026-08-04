@@ -130,13 +130,13 @@ Certain code paths are intentionally excluded from coverage requirements. These 
 1. **Before submitting PR**:
    ```bash
    # Run coverage through rch
-   rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --ignore-filename-regex "(tests/|benches/)"
+   rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-coverage-target cargo llvm-cov --lib --ignore-filename-regex "(tests/|benches/)"
    ```
 
 2. **Check coverage delta**:
    ```bash
    # Compare with main branch
-   rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --json > coverage.json
+   rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-coverage-target cargo llvm-cov --lib --json > coverage.json
    jq '.data[0].totals.lines.percent' coverage.json
    ```
 
@@ -155,16 +155,16 @@ Certain code paths are intentionally excluded from coverage requirements. These 
 ### Generate Coverage Report
 ```bash
 # Full HTML report
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --html \
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-coverage-target cargo llvm-cov --lib --html \
   --ignore-filename-regex "(tests/|benches/)"
 
 # JSON summary
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --json \
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-coverage-target cargo llvm-cov --lib --json \
   --ignore-filename-regex "(tests/|benches/)" \
   > coverage.json
 
 # Codecov format
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --codecov \
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-coverage-target cargo llvm-cov --lib --codecov \
   --ignore-filename-regex "(tests/|benches/)" \
   > codecov.json
 ```
@@ -172,7 +172,7 @@ rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib 
 ### Find Uncovered Lines
 ```bash
 # Show uncovered regions
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --show-missing-lines \
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-coverage-target cargo llvm-cov --lib --show-missing-lines \
   --ignore-filename-regex "(tests/|benches/)"
 
 # Uncovered functions
@@ -182,7 +182,7 @@ scripts/coverage-uncovered.sh
 ### Per-Module Coverage
 ```bash
 # Filter to specific module
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --lib --json | \
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-coverage-target cargo llvm-cov --lib --json | \
   jq '.data[0].files[] | select(.filename | contains("connectors"))'
 ```
 

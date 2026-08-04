@@ -1,0 +1,7 @@
+{
+  "fixture_id": "guided-ops-empty",
+  "description": "Empty dashboard fixture for the guided operations golden gate",
+  "sources": {
+    "operations_dashboard": {}
+  }
+}

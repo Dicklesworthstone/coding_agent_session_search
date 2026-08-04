@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::indexer::redact_secrets::redact_text;
+use crate::robot_budget_envelope::BudgetBlock;
 
 use super::query::{MatchType, SearchHit};
 
@@ -457,6 +458,7 @@ pub struct PackRenderRequest {
     pub normalized_query: String,
     pub generated_at_ms: i64,
     pub elapsed_ms: u64,
+    pub budget: BudgetBlock,
     pub request_id: Option<String>,
     pub format: PackRenderFormat,
     pub limits: PackPlannerLimits,
@@ -479,6 +481,13 @@ impl Default for PackRenderRequest {
             normalized_query: String::new(),
             generated_at_ms: 0,
             elapsed_ms: 0,
+            budget: BudgetBlock {
+                elapsed_ms: 0,
+                budget_ms: 8_000,
+                timed_out: false,
+                skipped_sections: Vec::new(),
+                recommended_next_probe: None,
+            },
             request_id: None,
             format: PackRenderFormat::Json,
             limits: PackPlannerLimits::default(),
@@ -508,6 +517,7 @@ struct RenderedAnswerPack {
     query: RenderedQuery,
     #[serde(rename = "_meta")]
     meta: RenderedMeta,
+    budget: BudgetBlock,
     limits: RenderedLimits,
     realized: RenderedRealized,
     health: RenderedHealth,
@@ -641,6 +651,9 @@ struct RenderedEvidence {
     excerpt_truncated: bool,
     estimated_tokens: usize,
     citation: RenderedCitation,
+    /// Metadata-only trust/provenance verdict for this evidence item (bead
+    /// 5u82n.3). Advisory; mirrors the per-hit `trust` block on `cass search`.
+    trust: crate::search::trust_scoring::TrustAssessment,
     selection: RenderedSelection,
     roles: Vec<&'static str>,
     matched_terms: Vec<String>,
@@ -993,6 +1006,7 @@ fn hard_omission_reason(
             .ranges
             .iter()
             .any(|(source_path, start, end)| {
+                // ubs:ignore — compares public citation paths, never secret material.
                 source_path == &candidate.source_path
                     && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
             })
@@ -1229,6 +1243,7 @@ fn duplicate_penalty(candidate: &PackCandidate, selected_state: &SelectedState) 
         .ranges
         .iter()
         .any(|(source_path, start, end)| {
+            // ubs:ignore — compares public citation paths, never secret material.
             source_path == &candidate.source_path
                 && line_ranges_overlap(*start, *end, candidate.line_start, candidate.line_end)
         })
@@ -1395,10 +1410,15 @@ fn rendered_answer_pack(
     plan: &PlannedAnswerPack,
     request: &PackRenderRequest,
 ) -> RenderedAnswerPack {
+    // q4pau: build the commit/bead/release correlation index once per pack render
+    // (fail-open empty index off-repo); its repo root anchors cwd-relative
+    // workspace matching for each evidence item.
+    let correlation = crate::search::trust_correlation::build_for_cwd();
+    let query_workspace = correlation.project_workspace();
     let evidence = plan
         .evidence
         .iter()
-        .map(|item| rendered_evidence(item, request))
+        .map(|item| rendered_evidence(item, request, &correlation, query_workspace.as_deref()))
         .collect::<Vec<_>>();
     let mut envelope_redactions = Vec::new();
     let query_text = redact_pack_output_text(&request.query_text, &mut envelope_redactions);
@@ -1415,6 +1435,7 @@ fn rendered_answer_pack(
     let redacted_count = plan
         .omitted
         .iter()
+        // ubs:ignore — compares a public omission enum, not secret material.
         .filter(|omitted| omitted.reason == PackOmittedReason::RedactedToEmpty)
         .count();
     let (omitted_items, omitted_redactions) = rendered_omitted_items(&plan.omitted);
@@ -1462,10 +1483,11 @@ fn rendered_answer_pack(
             request_id: request.request_id.clone(),
             generated_at_ms: request.generated_at_ms,
             elapsed_ms: request.elapsed_ms,
-            partial: false,
+            partial: request.budget.timed_out || !request.budget.skipped_sections.is_empty(),
             format: request.format.label(),
             warnings: warnings.clone(),
         },
+        budget: request.budget.clone(),
         limits: RenderedLimits {
             max_tokens: request.limits.max_tokens,
             estimated_tokens: plan.estimated_tokens,
@@ -1783,7 +1805,104 @@ fn push_full_redaction(
     });
 }
 
-fn rendered_evidence(item: &PlannedPackEvidence, request: &PackRenderRequest) -> RenderedEvidence {
+/// Map a pack evidence candidate's source story to the trust source-kind. An
+/// unavailable source is archive-only (source-unhealthy) for trust purposes;
+/// otherwise classify by origin (live local file vs reachable remote mirror).
+fn pack_trust_source_kind(
+    readiness: PackSourceReadiness,
+    origin_kind: &str,
+) -> crate::search::trust_scoring::SourceTrustKind {
+    use crate::search::trust_scoring::SourceTrustKind;
+    if matches!(readiness, PackSourceReadiness::Unavailable) {
+        SourceTrustKind::ArchiveOnly
+    } else if origin_kind.eq_ignore_ascii_case(crate::sources::provenance::LOCAL_SOURCE_ID) {
+        SourceTrustKind::LocalPresent
+    } else {
+        SourceTrustKind::RemoteMirror
+    }
+}
+
+/// Map the pack's realized search mode (the requested mode plus any lexical
+/// fallback) to the trust [`RealizedMode`](crate::search::trust_scoring::RealizedMode).
+fn pack_trust_realized_mode(
+    search_mode: &str,
+    fallback_mode: Option<&str>,
+) -> crate::search::trust_scoring::RealizedMode {
+    use crate::search::trust_scoring::RealizedMode;
+    if fallback_mode.is_some_and(|mode| mode.eq_ignore_ascii_case("lexical")) {
+        return RealizedMode::Lexical;
+    }
+    match search_mode.to_ascii_lowercase().as_str() {
+        "lexical" => RealizedMode::Lexical,
+        "semantic" => RealizedMode::Semantic,
+        _ => RealizedMode::Hybrid,
+    }
+}
+
+/// Build the metadata-only trust verdict for one pack evidence item (beads
+/// 5u82n.3 + q4pau). Advisory only; the same scoring core that powers the
+/// per-hit `cass search` verdict. Recency/source/mode always contribute;
+/// `query_workspace` drives a cwd-relative workspace match, and for on-project
+/// evidence `correlation` links the excerpt to a closed bead / commit / proof /
+/// release when it references a known identifier.
+fn pack_trust_assessment(
+    candidate: &PackCandidate,
+    request: &PackRenderRequest,
+    correlation: &crate::search::trust_correlation::CorrelationIndex,
+    query_workspace: Option<&str>,
+) -> crate::search::trust_scoring::TrustAssessment {
+    use crate::search::trust_correlation::{correlate, proof_for, scan_text, workspace_matches};
+    use crate::search::trust_scoring::{HitTrustContext, assess_trust, derive_trust_signals};
+    let workspace = {
+        let ws = candidate.workspace.trim();
+        (!ws.is_empty()).then(|| ws.to_string())
+    };
+    let on_project = match (query_workspace, workspace.as_deref()) {
+        (None, _) => None,
+        (Some(q), Some(w)) => Some(workspace_matches(q, w)),
+        (Some(_), None) => Some(false),
+    };
+    let mut ctx = HitTrustContext {
+        created_at_ms: candidate.created_at_ms,
+        now_ms: request.generated_at_ms,
+        workspace,
+        query_workspace: None,
+        source_kind: pack_trust_source_kind(candidate.source_readiness, &candidate.origin_kind),
+        realized_mode: pack_trust_realized_mode(
+            &request.search_mode,
+            request.fallback_mode.as_deref(),
+        ),
+        ..HitTrustContext::default()
+    };
+    if matches!(on_project, Some(true)) {
+        let scan = scan_text(&[&candidate.excerpt]);
+        let link = correlate(correlation, &scan);
+        if !link.is_empty() {
+            ctx.outcome = link.outcome;
+            ctx.linked_closed_bead = link.linked_closed_bead;
+            ctx.linked_lessons = link.linked_lessons;
+            if let Some(commit) = link.linked_commit {
+                ctx.release_tag = correlation.release_tag_for_commit(&commit);
+                ctx.linked_commit = Some(commit);
+            }
+            ctx.proof = proof_for(
+                ctx.outcome,
+                ctx.linked_commit.is_some(),
+                ctx.release_tag.is_some(),
+            );
+        }
+    }
+    let mut signals = derive_trust_signals(&ctx);
+    signals.workspace_match = on_project.unwrap_or(true);
+    assess_trust(&signals)
+}
+
+fn rendered_evidence(
+    item: &PlannedPackEvidence,
+    request: &PackRenderRequest,
+    correlation: &crate::search::trust_correlation::CorrelationIndex,
+    query_workspace: Option<&str>,
+) -> RenderedEvidence {
     let candidate = &item.candidate;
     let mut redactions = Vec::new();
     let excerpt = redact_pack_output_text(&item.excerpt, &mut redactions);
@@ -1822,6 +1941,7 @@ fn rendered_evidence(item: &PlannedPackEvidence, request: &PackRenderRequest) ->
         match_type: candidate.match_type.clone(),
         verified: candidate.line_start.is_some() && !candidate.source_path.trim().is_empty(),
     };
+    let trust = pack_trust_assessment(candidate, request, correlation, query_workspace);
     RenderedEvidence {
         id: item.id.clone(),
         rank: item.rank,
@@ -1829,6 +1949,7 @@ fn rendered_evidence(item: &PlannedPackEvidence, request: &PackRenderRequest) ->
         excerpt_truncated: item.excerpt_truncated,
         estimated_tokens: item.estimated_tokens,
         citation,
+        trust,
         selection: rendered_selection(item.selection, request.explain_selection),
         roles: rendered_roles(candidate.role),
         matched_terms: candidate
@@ -2099,7 +2220,10 @@ fn render_answer_pack_jsonl(
 ) -> Result<String, PackRenderError> {
     let mut lines = Vec::with_capacity(envelope.evidence.len() + 4);
     lines.push(json_line(
-        serde_json::json!({ "_meta": &envelope.meta }),
+        serde_json::json!({
+            "_meta": &envelope.meta,
+            "budget": &envelope.budget,
+        }),
         request,
     )?);
     lines.push(json_line(
@@ -2171,6 +2295,7 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
             if let Some(line_start) = item.citation.line_start {
                 out.push(':');
                 out.push_str(&line_start.to_string());
+                // ubs:ignore — compares public citation line numbers, not secret material.
                 if item.citation.line_end != item.citation.line_start
                     && let Some(line_end) = item.citation.line_end
                 {
@@ -2339,6 +2464,7 @@ mod tests {
             candidate_id: id.to_string(),
             source_path: source_path.to_string(),
             source_id: source_id.to_string(),
+            // ubs:ignore — compares a public source-kind fixture label, not a secret.
             origin_kind: if source_id == "local" {
                 "local".to_string()
             } else {
@@ -2394,6 +2520,13 @@ mod tests {
             normalized_query: "pack handoff".to_string(),
             generated_at_ms: 1_060_000,
             elapsed_ms: 7,
+            budget: BudgetBlock {
+                elapsed_ms: 7,
+                budget_ms: 8_000,
+                timed_out: false,
+                skipped_sections: Vec::new(),
+                recommended_next_probe: None,
+            },
             request_id: Some("req-1".to_string()),
             format,
             limits: PackPlannerLimits {
@@ -2413,6 +2546,19 @@ mod tests {
             skill_content_included: false,
             explain_selection: false,
             readiness: PackReadinessSnapshot::default(),
+        }
+    }
+
+    fn timed_out_budget() -> BudgetBlock {
+        BudgetBlock {
+            elapsed_ms: 125,
+            budget_ms: 100,
+            timed_out: true,
+            skipped_sections: vec![
+                "semantic_refinement".to_string(),
+                "source_health".to_string(),
+            ],
+            recommended_next_probe: Some("cass health --json".to_string()),
         }
     }
 
@@ -2457,6 +2603,17 @@ mod tests {
         assert_eq!(value, render_answer_pack_value(&plan, &req).unwrap());
         assert_eq!(value["schema_version"], "cass.pack.v1");
         assert_eq!(value["_meta"]["format"], "compact");
+        assert_eq!(value["_meta"]["partial"], false);
+        assert_eq!(
+            value["budget"],
+            serde_json::json!({
+                "elapsed_ms": 7,
+                "budget_ms": 8_000,
+                "timed_out": false,
+                "skipped_sections": [],
+                "recommended_next_probe": null,
+            })
+        );
         assert_eq!(value["query"]["text"], "pack handoff");
         assert_eq!(value["realized"]["fallback_mode"], "lexical");
         assert_eq!(
@@ -2492,7 +2649,93 @@ mod tests {
             meta["_meta"]["warnings"],
             serde_json::json!(["no_evidence_found", "semantic_fallback_lexical"])
         );
+        assert_eq!(meta["_meta"]["partial"], false);
+        assert_eq!(meta["budget"]["budget_ms"], 8_000);
+        assert_eq!(meta["budget"]["skipped_sections"], serde_json::json!([]));
         assert_eq!(omitted["omitted"]["count"], 0);
+    }
+
+    #[test]
+    fn render_budget_timeout_is_partial_across_structured_formats() -> Result<(), String> {
+        let plan = plan_answer_pack(request(vec![candidate(
+            "budget-timeout",
+            "local",
+            "/s/budget-timeout.jsonl",
+            10.0,
+        )]))
+        .map_err(|err| format!("{err:?}"))?;
+        let expected_budget = serde_json::json!({
+            "elapsed_ms": 125,
+            "budget_ms": 100,
+            "timed_out": true,
+            "skipped_sections": ["semantic_refinement", "source_health"],
+            "recommended_next_probe": "cass health --json",
+        });
+
+        for format in [PackRenderFormat::Json, PackRenderFormat::CompactJson] {
+            let mut req = render_request(format);
+            req.budget = timed_out_budget();
+
+            let rendered = render_answer_pack(&plan, &req)
+                .map_err(|err| format!("{} render failed: {}", err.format, err.message))?;
+            let value: serde_json::Value =
+                serde_json::from_str(&rendered).map_err(|err| err.to_string())?;
+
+            assert_eq!(value["_meta"]["partial"], true);
+            assert_eq!(value["budget"], expected_budget);
+            let evidence = value["evidence"]
+                .as_array()
+                .ok_or_else(|| "structured pack evidence must be an array".to_string())?;
+            assert_eq!(evidence.len(), 1);
+        }
+
+        let mut jsonl_req = render_request(PackRenderFormat::Jsonl);
+        jsonl_req.budget = timed_out_budget();
+        let jsonl = render_answer_pack(&plan, &jsonl_req)
+            .map_err(|err| format!("{} render failed: {}", err.format, err.message))?;
+        let header_line = jsonl
+            .lines()
+            .next()
+            .ok_or_else(|| "JSONL pack must include a header line".to_string())?;
+        let header: serde_json::Value =
+            serde_json::from_str(header_line).map_err(|err| err.to_string())?;
+        assert_eq!(header["_meta"]["partial"], true);
+        assert_eq!(header["budget"], expected_budget);
+
+        let mut toon_req = render_request(PackRenderFormat::Toon);
+        toon_req.budget = timed_out_budget();
+        let value = render_answer_pack_value(&plan, &toon_req)
+            .map_err(|err| format!("{} render failed: {}", err.format, err.message))?;
+        let toon = render_answer_pack(&plan, &toon_req)
+            .map_err(|err| format!("{} render failed: {}", err.format, err.message))?;
+        assert_eq!(value["_meta"]["partial"], true);
+        assert_eq!(value["budget"], expected_budget);
+        assert_eq!(toon, toon::encode(value, Some(pack_toon_encode_options())));
+        Ok(())
+    }
+
+    #[test]
+    fn render_budget_skips_are_partial_without_timeout() -> Result<(), String> {
+        let plan = plan_answer_pack(request(Vec::new())).map_err(|err| format!("{err:?}"))?;
+        let mut req = render_request(PackRenderFormat::Json);
+        req.budget = BudgetBlock {
+            elapsed_ms: 75,
+            budget_ms: 100,
+            timed_out: false,
+            skipped_sections: vec!["selection_explanations".to_string()],
+            recommended_next_probe: Some("cass pack --help".to_string()),
+        };
+
+        let value = render_answer_pack_value(&plan, &req)
+            .map_err(|err| format!("{} render failed: {}", err.format, err.message))?;
+
+        assert_eq!(value["_meta"]["partial"], true);
+        assert_eq!(value["budget"]["timed_out"], false);
+        assert_eq!(
+            value["budget"]["skipped_sections"],
+            serde_json::json!(["selection_explanations"])
+        );
+        Ok(())
     }
 
     #[test]
@@ -2566,6 +2809,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
+                // ubs:ignore — compares a public readiness wire label, not a secret.
                 .any(|source| source["readiness"] == "stale_readable")
         );
     }
@@ -2754,6 +2998,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
+                // ubs:ignore — compares a public diagnostic fixture string, not a secret.
                 .any(|warning| warning == "source_sync_gap:[REDACTED_SOURCE]:source_pruned")
         );
         assert_eq!(
@@ -3259,6 +3504,7 @@ mod tests {
         assert!(
             plan.omitted
                 .iter()
+                // ubs:ignore — compares a public omission enum, not secret material.
                 .all(|omitted| omitted.reason == PackOmittedReason::StaleUnderStrictPolicy)
         );
     }

@@ -1,7 +1,8 @@
 //! Connectors for agent histories.
 //!
-//! All connector implementations live in `franken_agent_detection`.
-//! This module provides re-export stubs for backward-compatible import paths.
+//! Most connector implementations live in `franken_agent_detection`.
+//! This module provides re-export stubs plus the CASS-specific Codex enrichment
+//! wrapper used by every connector factory exposed to the indexer.
 
 use std::fs;
 use std::io;
@@ -37,7 +38,6 @@ pub use franken_agent_detection::{
     file_modified_since,
     flatten_content,
     franken_detection_for_connector,
-    get_connector_factories,
     normalize_model,
     parse_timestamp,
     reindex_messages,
@@ -200,6 +200,7 @@ fn is_codex_rollout_file(path: &Path) -> bool {
 // Connector re-export stubs — each module file re-exports from FAD.
 pub mod aider;
 pub mod amp;
+pub mod antigravity;
 pub mod chatgpt;
 pub mod claude_code;
 pub mod clawdbot;
@@ -211,10 +212,119 @@ pub mod crush;
 pub mod cursor;
 pub mod factory;
 pub mod gemini;
+pub mod grok;
 pub mod hermes;
 pub mod kimi;
 pub mod openclaw;
 pub mod opencode;
+pub mod openhands;
 pub mod pi_agent;
 pub mod qwen;
 pub mod vibe;
+
+/// Constructor function used by the runtime connector registry.
+pub type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
+
+fn codex_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(codex::CodexConnector::new())
+}
+
+/// Return connector factories with CASS-specific wrappers applied.
+///
+/// Non-Codex factories remain exactly the upstream FAD factories. Codex must
+/// pass through CASS's enrichment wrapper so modern `function_call` arguments
+/// reach the production indexer instead of remaining placeholder-only content.
+#[must_use]
+pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
+    franken_agent_detection::get_connector_factories()
+        .into_iter()
+        .map(|(name, factory)| {
+            if name == "codex" {
+                (name, codex_connector_factory as ConnectorFactory)
+            } else {
+                (name, factory)
+            }
+        })
+        .collect()
+}
+
+/// gh373 third variant (bead oeu5a): ambient work-liveness sink for
+/// connector-internal parse loops.
+///
+/// The #332 activity tick fires only once per COMPLETED conversation, so a
+/// connector spending minutes inside the line loop of one giant source file
+/// (observed: 60-90MB codex rollouts, ~40k lines) starves the stall
+/// watchdog's counters and draws a spurious exit(70). Connector code has no
+/// `IndexingProgress` handle — `ScanContext` lives in the pinned external
+/// `franken_agent_detection` crate — so the indexer registers a tick closure
+/// here for the duration of a run and deep parse loops call
+/// [`scan_activity::tick`] every N lines.
+///
+/// Multiple concurrent registrations are supported (in-process tests):
+/// `tick` fans out to every live sink — an extra tick can only delay a false
+/// stall report, never corrupt state. Registration is cheap; `tick` takes a
+/// mutex only once per stride (default: caller ticks every ~1024 lines).
+pub mod scan_activity {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    static SINKS: Mutex<Vec<(u64, Box<dyn Fn() + Send + Sync>)>> = Mutex::new(Vec::new());
+
+    /// Unregisters its sink on drop. Hold for the duration of an index run.
+    pub struct ScanActivityGuard {
+        id: u64,
+    }
+
+    pub fn register(tick: Box<dyn Fn() + Send + Sync>) -> ScanActivityGuard {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut sinks) = SINKS.lock() {
+            sinks.push((id, tick));
+        }
+        ScanActivityGuard { id }
+    }
+
+    impl Drop for ScanActivityGuard {
+        fn drop(&mut self) {
+            if let Ok(mut sinks) = SINKS.lock() {
+                sinks.retain(|(id, _)| *id != self.id);
+            }
+        }
+    }
+
+    /// Record connector-internal parse liveness. No-op when no index run has
+    /// registered a sink (e.g. connector unit tests).
+    pub fn tick() {
+        if let Ok(sinks) = SINKS.lock() {
+            for (_, sink) in sinks.iter() {
+                sink();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        #[test]
+        fn tick_reaches_registered_sink_and_stops_after_guard_drop() {
+            let count = Arc::new(AtomicUsize::new(0));
+            let sink_count = Arc::clone(&count);
+            let guard = register(Box::new(move || {
+                sink_count.fetch_add(1, Ordering::Relaxed);
+            }));
+            tick();
+            tick();
+            assert_eq!(count.load(Ordering::Relaxed), 2);
+            drop(guard);
+            tick();
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                2,
+                "a dropped guard's sink must not receive further ticks"
+            );
+        }
+    }
+}

@@ -167,7 +167,7 @@ For shell commands, use `bash` or `sh`:
 
 ````markdown
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-doc-example-target cargo build --release
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-doc-example-target cargo build --release
 ```
 ````
 

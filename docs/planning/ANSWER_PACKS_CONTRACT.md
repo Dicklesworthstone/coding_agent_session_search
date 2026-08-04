@@ -611,17 +611,17 @@ No-mock integration fixture:
 Verification commands for implementation beads:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo fmt --check
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo check --all-targets
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo clippy --all-targets -- -D warnings
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo test pack
-rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo test --test golden_robot_json --test golden_robot_docs
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo fmt --check
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo check --all-targets
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo clippy --all-targets -- -D warnings
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo test pack
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo test --test golden_robot_json --test golden_robot_docs
 ```
 
 If goldens change intentionally, regenerate with:
 
 ```bash
-UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo test --test golden_robot_json --test golden_robot_docs
+UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo test --test golden_robot_json --test golden_robot_docs
 ```
 
 Review `git diff tests/golden/` before committing regenerated files.

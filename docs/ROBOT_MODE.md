@@ -19,6 +19,7 @@ Updated: 2026-05-09
 - Freshness and fallback hints: `--robot-meta` (adds search mode, semantic refinement, lexical fallback reason, index freshness, and warnings)
 - View source: `cass view <path> -n <line> --json`
 - Health: `cass health --json` or `cass state --json`
+- Incident mining: `cass analytics incidents --limit 10 --json`
 
 ## Core commands for agents
 | Need | Command |
@@ -29,6 +30,7 @@ Updated: 2026-05-09
 | Search today | `cass search "auth" --robot --today` |
 | Wildcards | `cass search "http*" --robot` |
 | Aggregations | `cass search "error" --robot --aggregate agent,workspace` |
+| Bounded recurrent CASS incidents | `cass analytics incidents --limit 10 --json` |
 | Pagination | pass `_meta.next_cursor` back via `--cursor` |
 | Limit output fields | `--fields minimal` or comma list (`source_path,line_number,agent,title`) |
 | Truncate content | `--max-content-length 400` or budgeted `--max-tokens 200` |
@@ -60,6 +62,7 @@ Updated: 2026-05-09
 - State/Status: `status, healthy, initialized, recommended_action, recommended_commands[{id,command,safety,run_when,success_signal,parse_fields,retry_after_ms}], index{exists,fresh,last_indexed_at,age_seconds,stale}, database{exists,conversations,messages,path}, pending{sessions,watch_active}, rebuild{active,...}, semantic{status,availability,can_search,fallback_mode,hint}, _meta{timestamp,data_dir,db_path}`
 - Triage: `surface, schema_version, status, healthy, initialized, recommended_action, recommended_commands[], next_command, readiness{index,database,pending,rebuild,rebuild_progress,semantic}, discovery{capabilities_command,schemas_command,docs_command,api_version_command}, starter_workflows[], mistake_recoveries[], _meta`
 - Capabilities: `crate_version, api_version, contract_version, features[], connectors[], workflows[], mistake_recoveries[], limits{max_limit,max_content_length,max_fields,max_agg_buckets}`
+- Analytics incidents: envelope `command="analytics/incidents"`; `data` contains `schema_version, count_scope, scan_units{files,lines,bytes,candidate_order,message_fragment_chars}, discovery{caps,files_considered,files_scanned,lines_scanned,bytes_scanned,elapsed_ms,stop_reason,timed_out,partial,evidence_truncated,evidence}, top_sessions[{conversation_id,session_id,agent,host,source_id,origin_host?,source_path,exists_state,hit_count,category_breadth,dominant_categories,evidence_summaries,redaction_status,suggested_command{kind,argv,display}}], total_sessions, total_hits, top_sessions_truncated, redaction`. When `discovery.partial=true`, every count is scoped to scanned candidates. `count_scope="no_verified_results_hard_timeout"` means the outer wall-clock guard returned before the read-only worker produced a verified result, so all observed counts are deliberately zero. `message-fragment-capped` means one message exceeded the declared per-message inspection bound. Raw prompt/tool content is suppressed; full `source_path` is retained only as the actionable archive pointer.
 
 ## Flags worth knowing
 - `--fields minimal|summary|<list>`: reduce payload size
@@ -80,11 +83,13 @@ Updated: 2026-05-09
 - Use `--fields minimal` during wide scans; fetch details with `cass view` if needed.
 - Respect `_warning`, `index_freshness.stale`, and health/status `recommended_action`; run `cass index --full` for first setup or explicit recommended refresh, not as a blind repair loop.
 - Treat lexical fallback in default hybrid search as expected when semantic assets are not ready. Escalate only when lexical itself is unavailable after the recommended rebuild path.
+- A long semantic backfill is not stalled just because it is quiet. Set `CASS_SEMANTIC_PROGRESS_JSONL=<path>` before the run and tail that file for phase/sub-phase telemetry: one JSON line per event (`schema":"cass.semantic.progress.v1"`, `event`, `phase`, `sub_phase`, `ts_ms`, `elapsed_ms`, `tier`, `embedder_id`, plus `rows_processed`/`bytes`/`error`). Events run `selection_*` → `packet_replay_*` → `embed_batch_*` → `staging_write_*` → `checkpoint_save_*` → `publish_*` → `complete`, with `error`/`cancelled` on failure. The sink is best-effort: a write failure never aborts the backfill, so absence of recent lines means tail the process, not that work stopped.
 - Store `_meta.next_cursor` for long result sets; avoid re-running the base query.
 - Include `--request-id` to correlate retries and logs.
 - Clamp limits to published caps (see `cass capabilities --json`).
 - Prefer `--max-tokens` to keep outputs small in LLM loops.
 - Use `cass pack ... --robot` when another agent or human needs a cited handoff. Do not run bare `cass` in automation.
+- Use `cass analytics incidents --json` for recurrent CASS operational clusters. Candidate discovery uses descending archive-row keyset paging, and `--max-sessions` bounds the newest-row window before filters. `--budget-ms` is enforced by an outer wall-clock guard around the independently row-bounded read-only worker. Respect its caps and `count_scope`; execute `suggested_command.argv` directly instead of reparsing the display string. The argv preserves the effective `--db` plus exact `--conversation-id`.
 - Read pack `health`, `freshness`, `privacy`, and `warnings` before copying evidence into another tool. Treat redaction and stale-evidence warnings as branchable contract fields.
 
 ## Pack handoff workflow

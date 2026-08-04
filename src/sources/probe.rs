@@ -638,6 +638,11 @@ fn infer_agent_type(path: &str) -> String {
         "codex".to_string()
     } else if path.contains(".cursor") || path.contains("Cursor") {
         "cursor".to_string()
+    } else if path.contains("antigravity-cli") || path.contains("antigravity") {
+        // Antigravity (agy) lives under ~/.gemini/antigravity-cli/, which also
+        // contains ".gemini" — so it MUST be matched before the gemini branch
+        // below, or agy roots would be mislabeled as legacy Gemini CLI.
+        "antigravity".to_string()
     } else if path.contains(".gemini") {
         "gemini".to_string()
     } else if path.contains("/.pi/") || path.ends_with("/.pi") {
@@ -908,6 +913,16 @@ mod tests {
         assert_eq!(infer_agent_type("~/.codex/sessions"), "codex");
         assert_eq!(infer_agent_type("~/.cursor"), "cursor");
         assert_eq!(infer_agent_type("~/.gemini/tmp"), "gemini");
+        // Antigravity (agy) shares the ~/.gemini parent but must NOT be
+        // misclassified as the legacy Gemini CLI.
+        assert_eq!(
+            infer_agent_type("~/.gemini/antigravity-cli/conversations"),
+            "antigravity"
+        );
+        assert_eq!(
+            infer_agent_type("~/.gemini/antigravity-cli/brain/abc/.system_generated/logs"),
+            "antigravity"
+        );
         assert_eq!(
             infer_agent_type("~/.config/Code/User/globalStorage/saoudrizwan.claude-dev"),
             "cline"

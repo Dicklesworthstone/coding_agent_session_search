@@ -1,0 +1,53 @@
+{
+  "type": "object",
+  "properties": {
+    "current_version": {
+      "type": "string"
+    },
+    "total_quarantined": {
+      "type": "integer"
+    },
+    "eligible_total": {
+      "type": "integer"
+    },
+    "planned_attempts": {
+      "type": "integer"
+    },
+    "skip_irreducible": {
+      "type": "integer"
+    },
+    "skip_source_missing": {
+      "type": "integer"
+    },
+    "skip_budget_exhausted": {
+      "type": "integer"
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "unknown"
+      }
+    },
+    "resume_recommended": {
+      "type": "boolean"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "next_safe_command": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer"
+    },
+    "applied": {
+      "type": "boolean"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "data_dir": {
+      "type": "string"
+    }
+  }
+}

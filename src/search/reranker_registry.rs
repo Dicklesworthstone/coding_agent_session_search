@@ -11,9 +11,6 @@
 //! | Name | ID | Type | Notes |
 //! |------|-----|------|-------|
 //! | ms-marco | ms-marco-minilm-l6-v2 | Cross-encoder | Baseline for bake-off |
-//! | bge-reranker-v2 | bge-reranker-v2-m3 | Cross-encoder | BGE v2 (eligible) |
-//! | jina-reranker-turbo | jina-reranker-v1-turbo-en | Cross-encoder | Fast (eligible) |
-//! | jina-reranker-v2 | jina-reranker-v2-base-multilingual | Cross-encoder | Multilingual (eligible) |
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,19 +24,14 @@ pub const DEFAULT_RERANKER: &str = "ms-marco";
 /// Eligibility cutoff for bake-off (models must be released on/after this date).
 pub const BAKEOFF_ELIGIBILITY_CUTOFF: &str = "2025-11-01";
 
-/// Files required for any ONNX-based reranker.
-pub const REQUIRED_ONNX_FILES: &[&str] = &[
-    "model.onnx",
-    "tokenizer.json",
-    "config.json",
-    "special_tokens_map.json",
-    "tokenizer_config.json",
-];
+/// Files required for the pure-Rust (frankentorch) reranker: a safetensors
+/// weight file plus the tokenizer. The ONNX backend was removed in cass #308.
+pub const REQUIRED_NATIVE_MODEL_FILES: &[&str] = &["model.safetensors", "tokenizer.json"];
 
 /// Information about a registered reranker.
 #[derive(Debug, Clone)]
 pub struct RegisteredReranker {
-    /// Short name for CLI/config (e.g., "ms-marco", "bge-reranker-v2").
+    /// Short name for CLI/config (currently "ms-marco").
     pub name: &'static str,
     /// Unique reranker ID (e.g., "ms-marco-minilm-l6-v2").
     pub id: &'static str,
@@ -79,12 +71,8 @@ impl RegisteredReranker {
             return None;
         }
 
-        // Map reranker names to their model directory names
         let dir_name = match self.name {
             "ms-marco" => "ms-marco-MiniLM-L-6-v2",
-            "bge-reranker-v2" => "bge-reranker-v2-m3",
-            "jina-reranker-turbo" => "jina-reranker-v1-turbo-en",
-            "jina-reranker-v2" => "jina-reranker-v2-base-multilingual",
             _ => return None,
         };
         Some(data_dir.join("models").join(dir_name))
@@ -95,7 +83,7 @@ impl RegisteredReranker {
         if !self.requires_model_files {
             return &[];
         }
-        REQUIRED_ONNX_FILES
+        REQUIRED_NATIVE_MODEL_FILES
     }
 
     /// Get missing model files for this reranker.
@@ -143,9 +131,9 @@ impl RegisteredReranker {
 
 /// Static registry of all supported rerankers.
 ///
-/// Models marked with `is_baseline: false` and released after 2025-11-01 are
-/// candidates for the reranker bake-off. The baseline (ms-marco) is not eligible
-/// but used for comparison.
+/// The native backend currently implements only the exact ms-marco MiniLM
+/// topology. Other historical manifests are not registered because routing
+/// them through this loader would silently run the wrong architecture.
 pub static RERANKERS: &[RegisteredReranker] = &[
     // === Baseline (not eligible for bake-off) ===
     RegisteredReranker {
@@ -157,37 +145,6 @@ pub static RERANKERS: &[RegisteredReranker] = &[
         huggingface_id: "cross-encoder/ms-marco-MiniLM-L-6-v2",
         size_bytes: 90_000_000,
         is_baseline: true,
-    },
-    // === Bake-off Eligible Models (released >= 2025-11-01) ===
-    RegisteredReranker {
-        name: "bge-reranker-v2",
-        id: "bge-reranker-v2-m3",
-        description: "BGE Reranker v2 M3 - updated BGE model with improved quality",
-        requires_model_files: true,
-        release_date: "2025-11-15",
-        huggingface_id: "BAAI/bge-reranker-v2-m3",
-        size_bytes: 560_000_000,
-        is_baseline: false,
-    },
-    RegisteredReranker {
-        name: "jina-reranker-turbo",
-        id: "jina-reranker-v1-turbo-en",
-        description: "Jina Reranker v1 Turbo - fast, optimized for English",
-        requires_model_files: true,
-        release_date: "2025-11-20",
-        huggingface_id: "jinaai/jina-reranker-v1-turbo-en",
-        size_bytes: 140_000_000,
-        is_baseline: false,
-    },
-    RegisteredReranker {
-        name: "jina-reranker-v2",
-        id: "jina-reranker-v2-base-multilingual",
-        description: "Jina Reranker v2 Base - multilingual support",
-        requires_model_files: true,
-        release_date: "2025-12-01",
-        huggingface_id: "jinaai/jina-reranker-v2-base-multilingual",
-        size_bytes: 280_000_000,
-        is_baseline: false,
     },
 ];
 
@@ -329,8 +286,7 @@ pub fn get_reranker(data_dir: &Path, name: Option<&str>) -> RerankerResult<Arc<d
     };
 
     match reranker_info.name {
-        // All ONNX-based rerankers (baseline and bake-off candidates)
-        "ms-marco" | "bge-reranker-v2" | "jina-reranker-turbo" | "jina-reranker-v2" => {
+        "ms-marco" => {
             let model_dir = RERANKERS
                 .iter()
                 .find(|r| r.name == reranker_info.name)
@@ -372,17 +328,14 @@ mod tests {
     #[test]
     fn test_registry_all() {
         let (_tmp, registry) = registry_fixture();
-        assert!(registry.all().len() >= 4);
+        assert_eq!(registry.all().len(), 1);
     }
 
     #[test]
     fn test_registry_get_by_name() {
         let (_tmp, registry) = registry_fixture();
 
-        let cases = [
-            ("ms-marco", "ms-marco-minilm-l6-v2"),
-            ("bge-reranker-v2", "bge-reranker-v2-m3"),
-        ];
+        let cases = [("ms-marco", "ms-marco-minilm-l6-v2")];
 
         for (name, expected_id) in cases {
             let reranker = registry.get(name);
@@ -394,6 +347,9 @@ mod tests {
 
         let unknown = registry.get("unknown");
         assert!(unknown.is_none());
+        assert!(registry.get("bge-reranker-v2").is_none());
+        assert!(registry.get("jina-reranker-turbo").is_none());
+        assert!(registry.get("jina-reranker-v2").is_none());
     }
 
     #[test]
@@ -409,7 +365,7 @@ mod tests {
     fn test_rerankers_unavailable_without_files() {
         let (_tmp, registry) = registry_fixture();
 
-        // All rerankers should be unavailable without model files
+        // The native ms-marco reranker should be unavailable without model files.
         for r in registry.all() {
             assert!(
                 !registry.is_available(r.name),
@@ -462,7 +418,7 @@ mod tests {
         let msmarco = registry.get("ms-marco").unwrap();
         let missing = msmarco.missing_files(tmp.path());
         assert!(!missing.is_empty());
-        assert!(missing.contains(&"model.onnx".to_string()));
+        assert!(missing.contains(&"model.safetensors".to_string()));
     }
 
     // ==================== Bake-off Tests ====================
@@ -472,12 +428,7 @@ mod tests {
         let (_tmp, registry) = registry_fixture();
 
         let eligible = registry.bakeoff_eligible();
-        // Should have at least 3 eligible models (bge-v2, jina-turbo, jina-v2)
-        assert!(
-            eligible.len() >= 3,
-            "Expected at least 3 eligible rerankers, got {}",
-            eligible.len()
-        );
+        assert!(eligible.is_empty());
 
         // ms-marco should NOT be in the eligible list (it's the baseline)
         assert!(
@@ -509,15 +460,7 @@ mod tests {
             "ms-marco should be released before cutoff"
         );
 
-        // All eligible models should be released after cutoff
-        for r in registry.bakeoff_eligible() {
-            assert!(
-                r.release_date >= BAKEOFF_ELIGIBILITY_CUTOFF,
-                "{} should be released after cutoff (date: {})",
-                r.name,
-                r.release_date
-            );
-        }
+        assert!(registry.bakeoff_eligible().is_empty());
     }
 
     #[test]
@@ -537,19 +480,11 @@ mod tests {
     }
 
     #[test]
-    fn test_eligible_reranker_metadata() {
+    fn test_unverified_reranker_topologies_are_not_registered() {
         let (_tmp, registry) = registry_fixture();
-
-        // Check BGE reranker
-        let bge = registry.get("bge-reranker-v2").unwrap();
-        assert!(bge.is_bakeoff_eligible());
-        let metadata = bge.to_model_metadata();
-        assert!(!metadata.is_baseline);
-        assert!(metadata.is_eligible());
-
-        // Check Jina reranker
-        let jina = registry.get("jina-reranker-turbo").unwrap();
-        assert!(jina.is_bakeoff_eligible());
+        assert!(registry.get("bge-reranker-v2").is_none());
+        assert!(registry.get("jina-reranker-turbo").is_none());
+        assert!(registry.get("jina-reranker-v2").is_none());
     }
 
     #[test]

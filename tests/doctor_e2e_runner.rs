@@ -3344,6 +3344,70 @@ fn doctor_e2e_runner_records_multi_file_source_artifacts() {
                 .any(|command| command.as_str() == Some("cass sources sync --all --json"))),
         "remote source report should include a directly runnable sync command"
     );
+    // Additive/preservation contract on the robot surface: no recommended command,
+    // gap advice, or evidence string may instruct a destructive transfer or
+    // source-log mutation. rsync stays additive (no --delete); provider logs are
+    // never rewritten by a recommended action.
+    {
+        let mut robot_strings: Vec<String> = Vec::new();
+        if let Some(commands) =
+            payload["remote_source_sync"]["recommended_sync_commands"].as_array()
+        {
+            robot_strings.extend(
+                commands
+                    .iter()
+                    .filter_map(|c| c.as_str().map(str::to_string)),
+            );
+        }
+        for gap in sync_gaps {
+            if let Some(action) = gap["recommended_action"].as_str() {
+                robot_strings.push(action.to_string());
+            }
+            if let Some(evidence) = gap["evidence"].as_array() {
+                robot_strings.extend(
+                    evidence
+                        .iter()
+                        .filter_map(|e| e.as_str().map(str::to_string)),
+                );
+            }
+        }
+        const ROBOT_DESTRUCTIVE_FLAGS: &[&str] = &[
+            "--delete",
+            "--delete-after",
+            "--delete-during",
+            "--delete-excluded",
+            "--remove-source-files",
+            "--remove-sent-files",
+        ];
+        const ROBOT_DESTRUCTIVE_TOKENS: &[&str] = &["rm", "rmdir", "shred", "unlink", "wipe"];
+        const ROBOT_DESTRUCTIVE_PHRASES: &[&str] = &[
+            "delete the source",
+            "delete source log",
+            "rsync --delete",
+            "rm -rf",
+        ];
+        for s in &robot_strings {
+            let lower = s.to_ascii_lowercase();
+            for flag in ROBOT_DESTRUCTIVE_FLAGS {
+                assert!(
+                    !lower.contains(flag),
+                    "robot remote_source_sync must not emit destructive flag {flag:?}: {s:?}"
+                );
+            }
+            for phrase in ROBOT_DESTRUCTIVE_PHRASES {
+                assert!(
+                    !lower.contains(phrase),
+                    "robot remote_source_sync must not emit destructive phrase {phrase:?}: {s:?}"
+                );
+            }
+            for token in lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+                assert!(
+                    !ROBOT_DESTRUCTIVE_TOKENS.contains(&token),
+                    "robot remote_source_sync must not invoke destructive command {token:?}: {s:?}"
+                );
+            }
+        }
+    }
     assert!(
         payload["remote_source_sync"]["notes"]
             .as_array()

@@ -1,5 +1,12 @@
 # Semantic Search Implementation: Bead Structure & Elaboration
 
+> **Status: historical implementation plan.** The FastEmbed/ONNX,
+> `model.onnx`, and optional semantic-feature tasks below describe the original
+> design. cass#308 replaced that inference stack with always-compiled pure-Rust
+> native MiniLM using safetensors and runtime-dispatched SIMD; bead tg5o9 retired
+> the separate `-baseline` binary machinery. Preserve the sections below as
+> design history, not current build or operator instructions.
+
 ## Overview
 
 This document elaborates on the semantic search plan and defines the complete bead (task) hierarchy for implementation. It's designed to be self-contained so any developer can pick up the work.

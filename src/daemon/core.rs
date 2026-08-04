@@ -5,8 +5,8 @@
 
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
-use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,7 +17,6 @@ use fs2::FileExt;
 use parking_lot::RwLock;
 use tracing::{debug, error, info, warn};
 
-use super::daemon_run_lock_path;
 use super::models::ModelManager;
 use super::protocol::{
     EmbedResponse, EmbeddingJobDetail, EmbeddingJobInfo, ErrorCode, ErrorResponse, FramedMessage,
@@ -26,6 +25,7 @@ use super::protocol::{
 };
 use super::resource::ResourceMonitor;
 use super::worker::{EmbeddingJobConfig, EmbeddingWorker, EmbeddingWorkerHandle};
+use super::{DaemonRunLockMetadata, daemon_run_lock_path};
 
 struct BoundDaemonSocket {
     listener: UnixListener,
@@ -66,8 +66,12 @@ fn parent_dir_is_owner_only(path: &Path) -> std::io::Result<bool> {
         return Ok(false);
     };
 
-    let metadata = fs::symlink_metadata(parent)?;
-    if !metadata.file_type().is_dir() {
+    // Follow a symlinked parent (notably macOS `/tmp` -> `/private/tmp`) when
+    // classifying the directory. The socket itself is still handled with
+    // `symlink_metadata`, and public parents still route through a freshly
+    // created 0700 private runtime directory below.
+    let metadata = fs::metadata(parent)?;
+    if !metadata.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("socket parent is not a directory: {}", parent.display()),
@@ -171,6 +175,9 @@ pub struct DaemonConfig {
     pub nice_value: i32,
     /// IO priority class (0-3).
     pub ionice_class: u32,
+    /// Lexical generation visible when this daemon started. Advisory runtime
+    /// metadata only, used to diagnose stale searchers after atomic publish.
+    pub served_generation: Option<u64>,
 }
 
 impl Default for DaemonConfig {
@@ -183,6 +190,7 @@ impl Default for DaemonConfig {
             memory_limit: 0,                      // Unlimited
             nice_value: 10,                       // Low priority
             ionice_class: 2,                      // Best-effort
+            served_generation: None,
         }
     }
 }
@@ -326,7 +334,7 @@ impl ModelDaemon {
         // Use a file lock to ensure only one daemon instance runs for this socket path
         let lock_path = daemon_run_lock_path(&self.config.socket_path);
 
-        let lock_file = match std::fs::OpenOptions::new()
+        let mut lock_file = match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
@@ -364,6 +372,9 @@ impl ModelDaemon {
                 "Another daemon is already running",
             ));
         }
+
+        write_daemon_run_lock_metadata(&mut lock_file, self.config.served_generation)?;
+        let mut last_lock_heartbeat = Instant::now();
 
         // Apply resource limits
         if !self.resources.apply_nice(self.config.nice_value) {
@@ -432,6 +443,20 @@ impl ModelDaemon {
                         "Daemon memory limit exceeded, shutting down"
                     );
                     break;
+                }
+
+                // Refresh independently of socket idleness. A busy daemon may
+                // accept continuously, but its heartbeat must still reflect a
+                // live owner rather than looking stale under load.
+                if last_lock_heartbeat.elapsed() >= Duration::from_secs(1) {
+                    if let Err(error) = write_daemon_run_lock_metadata(
+                        &mut lock_file,
+                        self.config.served_generation,
+                    ) {
+                        warn!(error = %error, "Failed to refresh daemon run-lock heartbeat");
+                    } else {
+                        last_lock_heartbeat = Instant::now();
+                    }
                 }
 
                 // Accept new connections
@@ -836,6 +861,33 @@ impl ModelDaemon {
     }
 }
 
+fn write_daemon_run_lock_metadata(
+    lock_file: &mut std::fs::File,
+    generation: Option<u64>,
+) -> std::io::Result<()> {
+    let file_metadata = lock_file.metadata()?;
+    if !file_metadata.file_type().is_file() || file_metadata.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to write daemon metadata through a non-regular or multiply-linked run lock",
+        ));
+    }
+    let heartbeat_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0);
+    let metadata = DaemonRunLockMetadata {
+        pid: std::process::id(),
+        heartbeat_unix_ms,
+        generation,
+    };
+    let encoded = serde_json::to_vec(&metadata).map_err(std::io::Error::other)?;
+    lock_file.seek(SeekFrom::Start(0))?;
+    lock_file.write_all(&encoded)?;
+    lock_file.set_len(encoded.len() as u64)?;
+    lock_file.flush()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,6 +904,67 @@ mod tests {
         assert_eq!(config.max_connections, 16);
         assert_eq!(config.nice_value, 10);
         assert_eq!(config.ionice_class, 2);
+    }
+
+    /// Regression for #346: on macOS `/tmp` is a symlink to `/private/tmp`,
+    /// and the daemon refused to start with "socket parent is not a
+    /// directory: /tmp" because the parent check used symlink (lstat)
+    /// semantics. The classifier must follow a symlinked parent and the full
+    /// bind flow must succeed for a socket whose parent is a symlink to a
+    /// world-writable directory (routing through the private runtime dir).
+    #[test]
+    fn test_bind_follows_symlinked_socket_parent() {
+        let tmp = TempDir::new().expect("tempdir");
+        // real_tmp plays /private/tmp: a real, world-writable directory.
+        let real_tmp = tmp.path().join("private").join("tmp");
+        fs::create_dir_all(&real_tmp).expect("create real tmp");
+        fs::set_permissions(&real_tmp, fs::Permissions::from_mode(0o777)).expect("chmod real tmp");
+        // link_tmp plays /tmp: a symlink to the real directory.
+        let link_tmp = tmp.path().join("tmp");
+        std::os::unix::fs::symlink(&real_tmp, &link_tmp).expect("symlink tmp");
+
+        let socket_path = link_tmp.join("cass-semantic.sock");
+
+        // The parent classifier must follow the symlink instead of erroring
+        // with InvalidInput ("socket parent is not a directory").
+        let owner_only = parent_dir_is_owner_only(&socket_path)
+            .expect("symlinked parent must classify, not error (#346)");
+        // A 0o777 parent is shared, so the daemon must route through the
+        // private runtime directory rather than bind directly.
+        assert!(!owner_only, "world-writable parent must not be owner-only");
+
+        let bound = bind_owner_only_unix_listener(&socket_path)
+            .expect("daemon bind must succeed through a symlinked /tmp (#346)");
+        assert_eq!(bound.public_path, socket_path);
+        assert_ne!(
+            bound.bind_path, socket_path,
+            "shared parent must route to the private runtime dir"
+        );
+        // The public path is a symlink to the private-runtime socket.
+        let public_meta = fs::symlink_metadata(&socket_path).expect("public socket path exists");
+        assert!(public_meta.file_type().is_symlink());
+        cleanup_bound_socket(&bound.public_path, &bound.bind_path);
+    }
+
+    /// Complement to the #346 regression: an owner-only (0o700) symlinked
+    /// parent binds the socket directly at the requested path.
+    #[test]
+    fn test_bind_symlinked_owner_only_parent_binds_directly() {
+        let tmp = TempDir::new().expect("tempdir");
+        let real_dir = tmp.path().join("real-private");
+        fs::create_dir_all(&real_dir).expect("create dir");
+        fs::set_permissions(&real_dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+        let link_dir = tmp.path().join("linked-private");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).expect("symlink");
+
+        let socket_path = link_dir.join("daemon.sock");
+        assert!(
+            parent_dir_is_owner_only(&socket_path).expect("owner-only symlinked parent classifies")
+        );
+        let bound = bind_owner_only_unix_listener(&socket_path)
+            .expect("bind through owner-only symlinked parent");
+        assert_eq!(bound.bind_path, socket_path);
+        cleanup_bound_socket(&bound.public_path, &bound.bind_path);
     }
 
     #[test]
@@ -951,6 +1064,50 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+
+        let accept_thread = std::thread::spawn(move || listener.accept().map(|_| ()));
+        let client = UnixStream::connect(&public_socket).unwrap();
+        drop(client);
+        accept_thread.join().unwrap().unwrap();
+
+        cleanup_bound_socket(&public_path, &bind_path);
+    }
+
+    #[test]
+    fn test_owner_only_bind_accepts_symlinked_public_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        // Keep names short: RCH's worker-side target path is already long and
+        // Unix-domain socket paths have a platform SUN_LEN ceiling.
+        let real_public_dir = temp_dir.path().join("r");
+        fs::create_dir(&real_public_dir).unwrap();
+        fs::set_permissions(&real_public_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let linked_public_dir = temp_dir.path().join("l");
+        std::os::unix::fs::symlink(&real_public_dir, &linked_public_dir).unwrap();
+        let public_socket = linked_public_dir.join("s");
+
+        let BoundDaemonSocket {
+            listener,
+            public_path,
+            bind_path,
+        } = bind_owner_only_unix_listener(&public_socket).unwrap();
+
+        assert_eq!(public_path, public_socket);
+        assert_ne!(bind_path, public_socket);
+        assert!(
+            fs::symlink_metadata(&public_socket)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a socket under a symlinked public temp directory should point at its private runtime socket"
+        );
+        assert_eq!(
+            fs::symlink_metadata(bind_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
         );
 
         let accept_thread = std::thread::spawn(move || listener.accept().map(|_| ()));

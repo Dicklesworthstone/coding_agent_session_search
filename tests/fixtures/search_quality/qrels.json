@@ -1,0 +1,45 @@
+{
+  "_comment": "Checked-in relevance judgments for the search-quality gate (bead coding_agent_session_search-guided-ops-repro-trust-5u82n.7). Each qrel's `query` is a single distinctive token from the corpus; `expected_refs` are the session stems that should appear in the top-k. Single-ref queries use a keyword unique to one doc (deterministic recall=1.0); q-shared-recall expects the two docs that both carry `sharedtopic`. Edit alongside corpus.json; the gate proves observed == expected on a real index.",
+  "qrels": [
+    {
+      "id": "q-code-heavy",
+      "query": "asyncmutexdeadlock",
+      "mode": "hybrid",
+      "expected_refs": ["codeheavy"],
+      "k": 5,
+      "note": "code-heavy session; unique keyword maps to exactly one doc"
+    },
+    {
+      "id": "q-nl-debug",
+      "query": "loginflowdebug",
+      "mode": "hybrid",
+      "expected_refs": ["nldebug"],
+      "k": 5,
+      "note": "natural-language debugging session"
+    },
+    {
+      "id": "q-shared-recall",
+      "query": "sharedtopic",
+      "mode": "hybrid",
+      "expected_refs": ["codeheavy", "nldebug"],
+      "k": 5,
+      "note": "multi-ref recall across the code-heavy and NL-debugging sessions"
+    },
+    {
+      "id": "q-stale-advice",
+      "query": "staletopicunique",
+      "mode": "hybrid",
+      "expected_refs": ["staleadvice"],
+      "k": 5,
+      "note": "stale advice; live trust verdict for this hit must be `stale`"
+    },
+    {
+      "id": "q-privacy",
+      "query": "privacytopicunique",
+      "mode": "hybrid",
+      "expected_refs": ["privacydoc"],
+      "k": 5,
+      "note": "privacy-sensitive fixture; report must not echo the body email"
+    }
+  ]
+}

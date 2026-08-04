@@ -1571,6 +1571,7 @@ pre:hover .copy-code-btn { opacity: 1; }
 .agent-cursor .message-assistant { border-left-color: oklch(0.7 0.2 280); }
 .agent-chatgpt .message-assistant { border-left-color: oklch(0.72 0.19 165); }
 .agent-gemini .message-assistant { border-left-color: oklch(0.7 0.2 250); }
+.agent-antigravity .message-assistant { border-left-color: oklch(0.68 0.21 290); }
 .agent-aider .message-assistant { border-left-color: oklch(0.72 0.16 85); }
 .agent-copilot .message-assistant { border-left-color: oklch(0.7 0.18 200); }
 .agent-cody .message-assistant { border-left-color: oklch(0.68 0.2 340); }

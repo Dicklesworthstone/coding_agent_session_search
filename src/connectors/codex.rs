@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
@@ -65,6 +65,19 @@ impl Connector for CodexConnector {
     }
 }
 
+/// gh373/oeu5a: heartbeat stride for the rollout line loop below. One
+/// [`scan_activity::tick`] per this many lines keeps the stall watchdog fed
+/// while this second pass re-parses a giant rollout (~40k lines, minutes).
+const AUGMENT_HEARTBEAT_LINE_STRIDE: usize = 1024;
+
+// TODO(gh373/oeu5a follow-up): this function is a full second parse of every
+// rollout — `franken_agent_detection`'s scan already read and parsed the same
+// file to produce `conversation`. Merging this enrichment into FAD's primary
+// parse (single-pass) would roughly halve producer CPU/IO on the codex
+// corpus, but the parse lives in the pinned external FAD crate
+// (Cargo.toml rev pin), so the merge must land there first with cass-side
+// plumbing behind a feature/rev bump. Deferred deliberately; do not attempt
+// by duplicating FAD parse internals here.
 fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
     if conversation
         .source_path
@@ -79,20 +92,26 @@ fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
         return;
     };
 
-    let mut seen_messages: HashSet<ModernCodexMessageSignature> = conversation
+    let mut message_indices_by_signature: HashMap<ModernCodexMessageSignature, usize> =
+        conversation
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| (modern_codex_message_signature(message), index))
+            .collect();
+    let mut message_indices_by_call_id: HashMap<String, usize> = conversation
         .messages
         .iter()
-        .map(modern_codex_message_signature)
+        .enumerate()
+        .flat_map(|(index, message)| {
+            modern_codex_message_call_ids(message).map(move |call_id| (call_id, index))
+        })
         .collect();
-    let mut seen_call_ids: HashSet<String> = conversation
+    let mut message_indices_by_raw_entry: HashMap<[u8; 32], usize> = conversation
         .messages
         .iter()
-        .flat_map(modern_codex_message_call_ids)
-        .collect();
-    let mut seen_raw_entries: HashSet<[u8; 32]> = conversation
-        .messages
-        .iter()
-        .map(|message| modern_codex_raw_signature(&message.extra))
+        .enumerate()
+        .map(|(index, message)| (modern_codex_raw_signature(&message.extra), index))
         .collect();
     let mut added = false;
     for (line_no_zero, line) in BufReader::new(file)
@@ -101,6 +120,11 @@ fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
         .enumerate()
     {
         let line_no = line_no_zero + 1;
+        // gh373/oeu5a: connector-internal liveness during the minutes-long
+        // re-parse of one giant rollout (see AUGMENT_HEARTBEAT_LINE_STRIDE).
+        if line_no_zero % AUGMENT_HEARTBEAT_LINE_STRIDE == 0 {
+            super::scan_activity::tick();
+        }
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -122,20 +146,44 @@ fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
             }
         };
         let raw_signature = modern_codex_raw_signature(&raw);
-        if seen_raw_entries.contains(&raw_signature) {
-            continue;
-        }
         let Some(message) = modern_codex_message(&raw) else {
             continue;
         };
-        if message_already_indexed(&seen_messages, &seen_call_ids, &message) {
-            seen_raw_entries.insert(raw_signature);
+        let message_signature = modern_codex_message_signature(&message);
+        let existing_index = message_indices_by_raw_entry
+            .get(&raw_signature)
+            .copied()
+            .or_else(|| {
+                message_indices_by_signature
+                    .get(&message_signature)
+                    .copied()
+            })
+            .or_else(|| {
+                modern_codex_message_call_ids(&message)
+                    .find_map(|call_id| message_indices_by_call_id.get(&call_id).copied())
+            });
+
+        if let Some(existing_index) = existing_index {
+            let existing = &mut conversation.messages[existing_index];
+            if merge_modern_codex_tool_call(existing, &message) {
+                message_indices_by_signature
+                    .insert(modern_codex_message_signature(existing), existing_index);
+                message_indices_by_call_id.extend(
+                    modern_codex_message_call_ids(existing)
+                        .map(|call_id| (call_id, existing_index)),
+                );
+            }
+            message_indices_by_raw_entry.insert(raw_signature, existing_index);
             continue;
         }
-        seen_messages.insert(modern_codex_message_signature(&message));
-        seen_call_ids.extend(modern_codex_message_call_ids(&message));
-        seen_raw_entries.insert(raw_signature);
+
+        let message_index = conversation.messages.len();
         conversation.messages.push(message);
+        let stored = &conversation.messages[message_index];
+        message_indices_by_signature.insert(message_signature, message_index);
+        message_indices_by_call_id
+            .extend(modern_codex_message_call_ids(stored).map(|call_id| (call_id, message_index)));
+        message_indices_by_raw_entry.insert(raw_signature, message_index);
         added = true;
     }
 
@@ -451,17 +499,86 @@ fn modern_codex_message_call_ids(message: &NormalizedMessage) -> impl Iterator<I
         .filter_map(|invocation| invocation.call_id.clone())
 }
 
-fn message_already_indexed(
-    seen_messages: &HashSet<ModernCodexMessageSignature>,
-    seen_call_ids: &HashSet<String>,
+fn merge_modern_codex_tool_call(
+    existing: &mut NormalizedMessage,
     candidate: &NormalizedMessage,
 ) -> bool {
-    seen_messages.contains(&modern_codex_message_signature(candidate))
-        || candidate
-            .invocations
-            .iter()
-            .filter_map(|invocation| invocation.call_id.as_deref())
-            .any(|call_id| seen_call_ids.contains(call_id))
+    let mut changed = false;
+    let mut matched_invocation = false;
+    let mut upgraded_unknown_call_id = None;
+
+    for candidate_invocation in &candidate.invocations {
+        let existing_invocation = existing.invocations.iter_mut().find(|invocation| {
+            match (
+                invocation.call_id.as_deref(),
+                candidate_invocation.call_id.as_deref(),
+            ) {
+                (Some(existing_id), Some(candidate_id)) => existing_id == candidate_id,
+                (None, None) => {
+                    invocation.kind == candidate_invocation.kind
+                        && invocation.name == candidate_invocation.name
+                }
+                _ => false,
+            }
+        });
+
+        if let Some(existing_invocation) = existing_invocation {
+            matched_invocation = true;
+            let matched_call_id = existing_invocation.call_id.is_some()
+                && existing_invocation.call_id == candidate_invocation.call_id;
+            if existing_invocation.arguments.is_none() && candidate_invocation.arguments.is_some() {
+                existing_invocation
+                    .arguments
+                    .clone_from(&candidate_invocation.arguments);
+                changed = true;
+            }
+            if existing_invocation.raw_name.is_none() && candidate_invocation.raw_name.is_some() {
+                existing_invocation
+                    .raw_name
+                    .clone_from(&candidate_invocation.raw_name);
+                changed = true;
+            }
+            if existing_invocation.name == "unknown" && candidate_invocation.name != "unknown" {
+                if matched_call_id {
+                    upgraded_unknown_call_id.clone_from(&existing_invocation.call_id);
+                }
+                existing_invocation
+                    .name
+                    .clone_from(&candidate_invocation.name);
+                changed = true;
+            }
+        } else {
+            existing.invocations.push(candidate_invocation.clone());
+            matched_invocation = true;
+            changed = true;
+        }
+    }
+
+    let resolves_unknown_placeholder = upgraded_unknown_call_id.as_deref().is_some_and(|call_id| {
+        existing.content == "[Tool: unknown]"
+            && candidate.invocations.iter().any(|invocation| {
+                invocation.call_id.as_deref() == Some(call_id)
+                    && invocation.name != "unknown"
+                    && tool_call_content_has_name(&candidate.content, &invocation.name)
+            })
+    });
+    if matched_invocation
+        && candidate.content.len() > existing.content.len()
+        && (candidate.content.starts_with(&existing.content) || resolves_unknown_placeholder)
+    {
+        existing.content.clone_from(&candidate.content);
+        changed = true;
+    }
+
+    changed
+}
+
+fn tool_call_content_has_name(content: &str, tool_name: &str) -> bool {
+    let prefix = format!("[Tool: {tool_name}]");
+    content == prefix
+        || content
+            .strip_prefix(&prefix)
+            .is_some_and(|rest| rest.starts_with('\n'))
 }
 
 #[cfg(test)]
@@ -492,34 +609,76 @@ mod tests {
     }
 
     #[test]
-    fn modern_codex_duplicate_detection_uses_precomputed_sets() {
-        let existing = message("canonical response", Some("call-1"));
-        let mut seen_messages = HashSet::from([modern_codex_message_signature(&existing)]);
-        let mut seen_call_ids: HashSet<String> = modern_codex_message_call_ids(&existing).collect();
+    fn modern_codex_tool_call_merge_enriches_content_without_duplication() {
+        let mut existing = message("[Tool: shell]", Some("call-1"));
+        existing.idx = 7;
+        existing.author = Some("codex".to_string());
+        existing.invocations[0].arguments = Some(serde_json::json!({"cmd": "git status"}));
+        existing.extra = serde_json::json!({"canonical": true});
+        let mut candidate = message("[Tool: shell]\n{\"cmd\":\"git status\"}", Some("call-1"));
+        candidate.invocations[0].arguments = Some(serde_json::json!({"cmd": "git status"}));
+        let stable_identity = (
+            existing.idx,
+            existing.role.clone(),
+            existing.author.clone(),
+            existing.created_at,
+            existing.extra.clone(),
+        );
 
-        assert!(message_already_indexed(
-            &seen_messages,
-            &seen_call_ids,
-            &message("canonical response", None)
-        ));
-        assert!(message_already_indexed(
-            &seen_messages,
-            &seen_call_ids,
-            &message("same tool call, changed wording", Some("call-1"))
-        ));
+        assert!(merge_modern_codex_tool_call(&mut existing, &candidate));
+        assert_eq!(existing.content, "[Tool: shell]\n{\"cmd\":\"git status\"}");
+        assert_eq!(
+            (
+                existing.idx,
+                existing.role.clone(),
+                existing.author.clone(),
+                existing.created_at,
+                existing.extra.clone(),
+            ),
+            stable_identity,
+            "enrichment must not replace the canonical message identity"
+        );
+        assert_eq!(existing.invocations.len(), 1);
+        assert!(!merge_modern_codex_tool_call(&mut existing, &candidate));
 
-        let fresh = message("fresh response", Some("call-2"));
-        assert!(!message_already_indexed(
-            &seen_messages,
-            &seen_call_ids,
-            &fresh
+        let mut missing_invocation = message("[Tool: shell]", None);
+        assert!(merge_modern_codex_tool_call(
+            &mut missing_invocation,
+            &candidate
         ));
-        seen_messages.insert(modern_codex_message_signature(&fresh));
-        seen_call_ids.extend(modern_codex_message_call_ids(&fresh));
-        assert!(message_already_indexed(
-            &seen_messages,
-            &seen_call_ids,
-            &fresh
-        ));
+        assert_eq!(missing_invocation.invocations, candidate.invocations);
+        assert_eq!(missing_invocation.content, candidate.content);
+    }
+
+    #[test]
+    fn modern_codex_tool_call_merge_resolves_same_call_unknown_placeholder() {
+        let mut existing = message("[Tool: unknown]", Some("call-1"));
+        existing.invocations[0].name = "unknown".to_string();
+        let mut candidate = message(
+            "[Tool: exec_command]\n{\"cmd\":\"git status\"}",
+            Some("call-1"),
+        );
+        candidate.invocations[0].name = "exec_command".to_string();
+        candidate.invocations[0].arguments = Some(serde_json::json!({"cmd": "git status"}));
+
+        assert!(merge_modern_codex_tool_call(&mut existing, &candidate));
+        assert_eq!(existing.invocations.len(), 1);
+        assert_eq!(existing.invocations[0].name, "exec_command");
+        assert_eq!(
+            existing.invocations[0].arguments,
+            candidate.invocations[0].arguments
+        );
+        assert_eq!(existing.content, candidate.content);
+        assert!(!merge_modern_codex_tool_call(&mut existing, &candidate));
+    }
+
+    #[test]
+    fn modern_codex_tool_call_merge_rejects_unrelated_content_replacement() {
+        let mut existing = message("canonical response", Some("call-1"));
+        let candidate = message("unrelated replacement", Some("call-1"));
+
+        assert!(!merge_modern_codex_tool_call(&mut existing, &candidate));
+        assert_eq!(existing.content, "canonical response");
+        assert_eq!(existing.invocations.len(), 1);
     }
 }

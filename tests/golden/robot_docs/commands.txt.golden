@@ -3,7 +3,7 @@ commands:
   (global) --verbose/-v  Enable debug logs (overrides auto-quiet)
   Tip: `--robot-docs=<topic>` is normalized to `robot-docs <topic>`; globals can appear before/after subcommands.
   cass search <query> [OPTIONS]
-    --agent A         Filter by agent (codex, claude_code, gemini, vibe, opencode, amp, cline)
+    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, antigravity; run `cass capabilities --json | jq .connectors` for the full 23-connector inventory)
     --workspace W     Filter by workspace path
     --limit N         Max results (default: 0 = no limit)
     --offset N        Pagination offset (default: 0)
@@ -53,7 +53,7 @@ commands:
     Aliases: ready, preflight.
   cass status [--json] [--stale-threshold N] [--data-dir DIR]
   cass diag [--json] [--verbose] [--data-dir DIR]
-  cass sessions [--workspace DIR] [--current] [--limit N] [--json]
+  cass sessions [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]
   cass view <path> [-n LINE] [-C CONTEXT] [--json]
   cass index [--full] [--watch] [--json] [--robot-trace-ingest] [--data-dir DIR]
                     In --json mode, NDJSON events stream on stderr:
@@ -102,7 +102,7 @@ commands:
   cass api-version [--json]        Show crate_version + api_version + contract_version.
   cass state [--json]              Alias of `cass status` (index/db/rebuild/semantic readiness).
   cass models status [--json]      Semantic model acquisition + cache state.
-  cass models install [--from-file DIR] [--model NAME]  Download + install embedder (minilm | snowflake-arctic-s | nomic-embed).
+  cass models install [--from-file DIR] [--model minilm]  Download + install the MiniLM embedder.
   cass models remove [--model NAME]  Remove an installed semantic model from disk.
   cass models verify [--json]      Per-file SHA-256 verification of the installed model.
   cass models check-update [--json]  Compare installed revision against the pinned registry revision.

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot, codex::CodexConnector};
+use serde_json::Value;
 use serial_test::serial;
 
 fn codex_real_fixture_home() -> PathBuf {
@@ -245,11 +246,41 @@ fn codex_connector_indexes_modern_response_items() {
     assert_eq!(convs.len(), 1);
 
     let conv = &convs[0];
+    let tool_calls: Vec<_> = conv
+        .messages
+        .iter()
+        .filter(|message| {
+            message
+                .invocations
+                .iter()
+                .any(|invocation| invocation.call_id.as_deref() == Some("call-modern-1"))
+        })
+        .collect();
+    assert_eq!(
+        tool_calls.len(),
+        1,
+        "function_call should not be duplicated"
+    );
+    let tool_call = tool_calls[0];
+    assert_eq!(
+        tool_call.invocations.len(),
+        1,
+        "function_call should produce exactly one invocation"
+    );
     assert!(
-        conv.messages
-            .iter()
-            .any(|message| message.content.contains("git log --grep='bd-2mb03'")),
+        tool_call.content.contains("git log --grep='bd-2mb03'"),
         "function_call arguments should be searchable"
+    );
+    let invocation = &tool_call.invocations[0];
+    assert_eq!(invocation.name, "exec_command");
+    assert_eq!(invocation.call_id.as_deref(), Some("call-modern-1"));
+    assert_eq!(
+        invocation
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("cmd"))
+            .and_then(Value::as_str),
+        Some("git log --grep='bd-2mb03'")
     );
     assert!(
         conv.messages

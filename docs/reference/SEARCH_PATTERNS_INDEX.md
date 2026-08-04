@@ -79,7 +79,7 @@ Comprehensive technical reference covering:
 | How deduplication works | QUICK_REFERENCE.md "Deduplication Logic" |
 | Warm worker optimization | CASS_ARCHITECTURE_SUMMARY.txt "LAYER 2: WARM WORKER" |
 | Segment merging | QUICK_REFERENCE.md "Segment Merging" |
-| Vector index format | QUICK_REFERENCE.md "Custom CVVI Format" |
+| Vector index format | QUICK_REFERENCE.md "Frankensearch FSVI Format" |
 | Quick wins for my project | QUICK_REFERENCE.md "Quick Wins for Similar Projects" |
 
 ---
@@ -108,12 +108,12 @@ search/
 │
 ├── vector_index.rs          - Semantic search
 │   • VectorIndex struct
-│   • CVVI format spec
+│   • FSVI format facade
 │   • Memory-mapped access
 │
 ├── embedder.rs              - Embedder trait
-├── fastembed_embedder.rs    - ML embeddings (MiniLM)
-├── hash_embedder.rs         - Hash-based fallback
+├── fastembed_embedder.rs    - Native MiniLM embeddings
+├── hash_embedder.rs         - Explicit hash-vector tier
 ├── model_manager.rs         - Model lifecycle
 └── canonicalize.rs          - Text preprocessing
 ```
@@ -233,8 +233,8 @@ Hybrid (RRF):             100-1500ms
 ### 3 Search Engines
 
 1. **Tantivy** (Primary) - Full-text BM25 indexing
-2. **Vector Index** (Secondary) - Custom CVVI format embeddings
-3. **SQLite** (Tertiary) - Metadata fallback
+2. **Vector Index** (Secondary) - frankensearch FSVI embeddings
+3. **SQLite** (Tertiary) - Source-of-truth records and metadata
 
 ### 3 Search Modes
 
@@ -267,7 +267,7 @@ Hybrid (RRF):             100-1500ms
 
 ### Search Engines
 - **tantivy** - Full-text indexing with BM25
-- **fastembed** - ML embeddings (MiniLM)
+- **frankensearch** - BM25, FSVI vectors, and native MiniLM inference
 
 ### Caching & Performance
 - **lru** - LRU cache for prefix reuse
@@ -279,10 +279,10 @@ Hybrid (RRF):             100-1500ms
 - **memmap2** - Memory-mapped vectors
 
 ### Async/Runtime
-- **tokio** - Async runtime for warm worker
+- **asupersync** - Async runtime for warm worker
 
 ### Persistence
-- **rusqlite** - SQLite integration
+- **frankensqlite** - SQLite source-of-truth integration
 
 ---
 
@@ -303,7 +303,7 @@ Key test files in `/data/projects/coding_agent_session_search/tests/`:
 
 ### External Documentation
 - [Tantivy Docs](https://docs.rs/tantivy/)
-- [FastEmbed GitHub](https://github.com/qdrant/fastembed)
+- [frankensearch](https://github.com/Dicklesworthstone/frankensearch)
 - [RRF Paper](https://dl.acm.org/doi/10.1145/312624.312649)
 - [BM25 Wikipedia](https://en.wikipedia.org/wiki/Okapi_BM25)
 
@@ -339,4 +339,3 @@ When CASS code changes, update these sections:
 For questions about these patterns or to suggest improvements:
 - See `/data/projects/coding_agent_session_search/README.md`
 - Review `/data/projects/coding_agent_session_search/TESTING.md` for test patterns
-

@@ -1,0 +1,39 @@
+{
+  "expected_version": "0.6.22",
+  "channels": [
+    {
+      "channel": "github_release",
+      "configured": true,
+      "reachable": true,
+      "observed_version": "0.6.22",
+      "checksum_ok": true
+    },
+    {
+      "channel": "homebrew",
+      "configured": true,
+      "reachable": true,
+      "observed_version": "0.6.21",
+      "dispatch_ran": true
+    },
+    {
+      "channel": "scoop",
+      "configured": true,
+      "reachable": true,
+      "observed_version": "0.6.22",
+      "dispatch_ran": true
+    },
+    {
+      "channel": "crates_io",
+      "configured": true,
+      "reachable": true,
+      "observed_version": "0.6.21"
+    },
+    {
+      "channel": "installer_script",
+      "configured": true,
+      "reachable": true,
+      "observed_version": "0.6.22",
+      "installer_ok": true
+    }
+  ]
+}

@@ -69,6 +69,7 @@
 //! ```
 
 pub mod config;
+pub(crate) mod config_validation;
 pub mod index;
 pub mod install;
 pub mod interactive;

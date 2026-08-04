@@ -287,6 +287,29 @@ export async function collectConsoleErrors(page: Page): Promise<string[]> {
 }
 
 /**
+ * Start collecting browser failures before navigation. Load-time failures are
+ * the most important ones for self-contained exports, so callers must create
+ * this collector before `gotoFile`/`page.goto` and assert both arrays after
+ * deferred scripts have settled.
+ */
+export function collectBrowserErrors(page: Page): {
+  consoleErrors: string[];
+  pageErrors: string[];
+} {
+  const consoleErrors: string[] = [];
+  const pageErrors: string[] = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error') {
+      consoleErrors.push(message.text());
+    }
+  });
+  page.on('pageerror', (error) => {
+    pageErrors.push(error.message);
+  });
+  return { consoleErrors, pageErrors };
+}
+
+/**
  * Utility to wait for page to be fully loaded including lazy resources.
  * For file:// URLs, we use domcontentloaded which is faster and more reliable.
  */

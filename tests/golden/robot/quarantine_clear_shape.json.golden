@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer"
+    },
+    "applied": {
+      "type": "boolean"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "data_dir": {
+      "type": "string"
+    },
+    "filter": {
+      "type": "null"
+    },
+    "matched": {
+      "type": "integer"
+    },
+    "cleared": {
+      "type": "integer"
+    },
+    "persist_error": {
+      "type": "null"
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "unknown"
+      }
+    },
+    "recommended_action": {
+      "type": "string"
+    }
+  }
+}

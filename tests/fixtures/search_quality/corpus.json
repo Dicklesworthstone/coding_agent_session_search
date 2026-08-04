@@ -1,0 +1,29 @@
+{
+  "_comment": "Curated fixture corpus for the search-quality gate (bead coding_agent_session_search-guided-ops-repro-trust-5u82n.7). Each doc is seeded as one Codex rollout session `rollout-<stem>.jsonl` whose user message contains the listed keywords plus extra_text, dated `age_days` in the past. Keywords are unique single tokens so each single-ref qrel maps deterministically to one session; `sharedtopic` spans two docs for the multi-ref recall case. `staleadvice` is aged past the 365-day stale window so its live trust verdict is `stale`. `privacydoc` carries a fake email to prove the report never echoes body text.",
+  "docs": [
+    {
+      "stem": "codeheavy",
+      "keywords": ["asyncmutexdeadlock", "sharedtopic"],
+      "age_days": 5,
+      "extra_text": "rust fn handle_request spawn await mutex lock guard code review"
+    },
+    {
+      "stem": "nldebug",
+      "keywords": ["loginflowdebug", "sharedtopic"],
+      "age_days": 5,
+      "extra_text": "how do I debug the user login flow that keeps failing intermittently"
+    },
+    {
+      "stem": "staleadvice",
+      "keywords": ["staletopicunique"],
+      "age_days": 400,
+      "extra_text": "deprecated approach from long ago that has since been superseded"
+    },
+    {
+      "stem": "privacydoc",
+      "keywords": ["privacytopicunique"],
+      "age_days": 5,
+      "extra_text": "please contact private.user@example.invalid about this and do not leak it"
+    }
+  ]
+}

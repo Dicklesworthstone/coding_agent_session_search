@@ -6,7 +6,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,13 +16,28 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
-use super::daemon_spawn_guard_lock_path;
 use super::protocol::{
     EmbeddingJobInfo, ErrorCode, FramedMessage, HealthStatus, PROTOCOL_VERSION, Request, Response,
     decode_message, default_socket_path, encode_message,
 };
 use super::worker::EmbeddingJobConfig;
+use super::{
+    DaemonRunLockMetadata, daemon_run_lock_path, daemon_spawn_guard_lock_path,
+    published_lexical_generation,
+};
 use crate::search::daemon_client::{DaemonClient, DaemonError};
+
+/// Hard ceiling for the status/doctor daemon probe. The worker owns its socket
+/// and may finish after a timeout, but the diagnostic caller never waits past
+/// this bound and never auto-spawns or mutates daemon state.
+pub const DEFAULT_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Debug)]
+struct RuntimeProbeSocketResult {
+    socket_connectable: bool,
+    responded_to_ping: bool,
+    connect_error: Option<String>,
+}
 
 fn connection_not_established() -> DaemonError {
     DaemonError::Unavailable("connection not established".to_string())
@@ -45,6 +60,13 @@ pub struct DaemonClientConfig {
     pub auto_spawn: bool,
     /// Path to the daemon binary (if auto-spawn is enabled).
     pub daemon_binary: Option<PathBuf>,
+    /// Embedder identity required by the caller's vector index.
+    ///
+    /// The daemon protocol reports the model that produced every embedding.
+    /// When this is set, a response from a different model is rejected instead
+    /// of feeding a same-width but semantically incompatible vector into the
+    /// caller's index (#347).
+    pub expected_embedder_id: Option<String>,
 }
 
 impl Default for DaemonClientConfig {
@@ -55,6 +77,7 @@ impl Default for DaemonClientConfig {
             request_timeout: Duration::from_secs(30),
             auto_spawn: true,
             daemon_binary: None, // Will use current executable with --daemon flag
+            expected_embedder_id: None,
         }
     }
 }
@@ -116,6 +139,17 @@ impl UdsDaemonClient {
     /// Create a client with default configuration.
     pub fn with_defaults() -> Self {
         Self::new(DaemonClientConfig::from_env())
+    }
+
+    fn validate_embedder_id(&self, actual: &str) -> Result<(), DaemonError> {
+        if let Some(expected) = self.config.expected_embedder_id.as_deref()
+            && actual != expected
+        {
+            return Err(DaemonError::InvalidInput(format!(
+                "daemon embedder mismatch: expected {expected}, received {actual}"
+            )));
+        }
+        Ok(())
     }
 
     /// Connect to the daemon, optionally spawning it if not running.
@@ -534,6 +568,7 @@ impl DaemonClient for UdsDaemonClient {
 
         match response {
             Response::Embed(embed) => {
+                self.validate_embedder_id(&embed.model)?;
                 if embed.embeddings.is_empty() {
                     return Err(DaemonError::Failed("no embeddings returned".to_string()));
                 }
@@ -569,6 +604,7 @@ impl DaemonClient for UdsDaemonClient {
 
         match response {
             Response::Embed(embed) => {
+                self.validate_embedder_id(&embed.model)?;
                 if embed.embeddings.len() != texts.len() {
                     return Err(DaemonError::Failed(format!(
                         "embedding count mismatch: expected {}, got {}",
@@ -629,6 +665,159 @@ impl DaemonClient for UdsDaemonClient {
     }
 }
 
+/// Gather a read-only, deadline-bounded daemon observation for status/doctor.
+/// No auto-spawn and no stale-artifact cleanup occurs on this path. A slow
+/// connect or liveness request yields a truthful `unresponsive` diagnostic with
+/// the already-collected lock/socket metadata still present.
+pub fn probe_daemon_runtime(
+    data_dir: &Path,
+    timeout: Duration,
+) -> crate::daemon_runtime_state::DaemonRuntimeDiagnostic {
+    let mut config = DaemonClientConfig::from_env();
+    config.auto_spawn = false;
+    config.connect_timeout = timeout;
+    // The caller's receive deadline is the authoritative hard bound. Keep the
+    // worker's socket timeout longer so the two clocks cannot race and turn a
+    // deadline breach nondeterministically into a ghost-process response.
+    config.request_timeout = timeout.saturating_mul(2);
+    probe_daemon_runtime_with_config(data_dir, config, timeout)
+}
+
+fn probe_daemon_runtime_with_config(
+    data_dir: &Path,
+    config: DaemonClientConfig,
+    timeout: Duration,
+) -> crate::daemon_runtime_state::DaemonRuntimeDiagnostic {
+    use crate::daemon_runtime_state::{DaemonRuntimeDiagnostic, DaemonRuntimeObservation};
+
+    let socket_path = config.socket_path.clone();
+    let run_lock_path = daemon_run_lock_path(&socket_path);
+    let socket_present = std::fs::symlink_metadata(&socket_path).is_ok();
+    let run_lock_present = std::fs::symlink_metadata(&run_lock_path).is_ok();
+    let lock_metadata = read_daemon_run_lock_metadata(&run_lock_path);
+    let run_lock_acquirable = probe_run_lock_acquirable(&run_lock_path);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0);
+    let mut observation = DaemonRuntimeObservation {
+        socket_path: Some(socket_path.display().to_string()),
+        data_dir: Some(data_dir.display().to_string()),
+        run_lock_present,
+        run_lock_acquirable,
+        socket_present,
+        daemon_generation: lock_metadata.and_then(|metadata| metadata.generation),
+        published_generation: published_lexical_generation(data_dir),
+        owner_pid: lock_metadata.map(|metadata| metadata.pid),
+        last_heartbeat_unix_ms: lock_metadata.map(|metadata| metadata.heartbeat_unix_ms),
+        last_heartbeat_age_ms: lock_metadata
+            .map(|metadata| now_ms.saturating_sub(metadata.heartbeat_unix_ms)),
+        ..Default::default()
+    };
+
+    if !socket_present {
+        observation.socket_connectable = Some(false);
+        return DaemonRuntimeDiagnostic::from_observation(observation);
+    }
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let spawn = std::thread::Builder::new()
+        .name("cass-daemon-runtime-probe".to_string())
+        .spawn(move || {
+            let client = UdsDaemonClient::new(config);
+            let result = match client.connect() {
+                Ok(()) => match client.health() {
+                    Ok(_) => RuntimeProbeSocketResult {
+                        socket_connectable: true,
+                        responded_to_ping: true,
+                        connect_error: None,
+                    },
+                    Err(error) => RuntimeProbeSocketResult {
+                        socket_connectable: true,
+                        responded_to_ping: false,
+                        connect_error: Some(error.to_string()),
+                    },
+                },
+                Err(error) => RuntimeProbeSocketResult {
+                    socket_connectable: false,
+                    responded_to_ping: false,
+                    connect_error: Some(error.to_string()),
+                },
+            };
+            let _ = tx.send(result);
+        });
+
+    if let Err(error) = spawn {
+        observation.probe_incomplete = true;
+        observation.connect_error = Some(format!("failed to start bounded daemon probe: {error}"));
+        return DaemonRuntimeDiagnostic::from_observation(observation);
+    }
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => {
+            observation.socket_connectable = Some(result.socket_connectable);
+            observation.responded_to_ping = result
+                .socket_connectable
+                .then_some(result.responded_to_ping);
+            observation.connect_error = result.connect_error;
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            observation.socket_connectable = None;
+            observation.responded_to_ping = None;
+            observation.connect_timed_out = true;
+            observation.connect_error = Some(format!(
+                "daemon liveness probe exceeded {} ms",
+                timeout.as_millis()
+            ));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            observation.probe_incomplete = true;
+            observation.connect_error =
+                Some("daemon liveness probe worker disconnected".to_string());
+        }
+    }
+
+    DaemonRuntimeDiagnostic::from_observation(observation)
+}
+
+fn read_daemon_run_lock_metadata(path: &Path) -> Option<DaemonRunLockMetadata> {
+    const MAX_RUN_LOCK_METADATA_BYTES: u64 = 4 * 1024;
+
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_RUN_LOCK_METADATA_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_RUN_LOCK_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_RUN_LOCK_METADATA_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn probe_run_lock_acquirable(path: &Path) -> Option<bool> {
+    if std::fs::symlink_metadata(path)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new().read(true).open(path).ok()?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = fs2::FileExt::unlock(&file);
+            Some(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Some(false),
+        Err(_) => None,
+    }
+}
+
 fn remove_stale_daemon_socket(socket_path: &std::path::Path) -> Result<(), DaemonError> {
     use std::os::unix::fs::FileTypeExt;
 
@@ -663,6 +852,18 @@ pub fn connect_or_spawn() -> Result<Arc<UdsDaemonClient>, DaemonError> {
     Ok(Arc::new(client))
 }
 
+/// Connect to an existing daemon or spawn one, requiring embeddings from the
+/// model that owns the caller's vector index.
+pub fn connect_or_spawn_for_embedder(
+    expected_embedder_id: &str,
+) -> Result<Arc<UdsDaemonClient>, DaemonError> {
+    let mut config = DaemonClientConfig::from_env();
+    config.expected_embedder_id = Some(expected_embedder_id.to_string());
+    let client = UdsDaemonClient::new(config);
+    client.connect()?;
+    Ok(Arc::new(client))
+}
+
 /// Try to connect to an existing daemon without spawning.
 pub fn try_connect() -> Option<Arc<UdsDaemonClient>> {
     let mut config = DaemonClientConfig::from_env();
@@ -674,9 +875,149 @@ pub fn try_connect() -> Option<Arc<UdsDaemonClient>> {
     }
 }
 
+/// Try an existing daemon without spawning and require embeddings from the
+/// model that owns the caller's vector index.
+pub fn try_connect_for_embedder(expected_embedder_id: &str) -> Option<Arc<UdsDaemonClient>> {
+    let mut config = DaemonClientConfig::from_env();
+    config.auto_spawn = false;
+    config.expected_embedder_id = Some(expected_embedder_id.to_string());
+    let client = UdsDaemonClient::new(config);
+    match client.connect() {
+        Ok(()) => Some(Arc::new(client)),
+        Err(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_test_lock_metadata(path: &Path, generation: Option<u64>) {
+        let metadata = DaemonRunLockMetadata {
+            pid: std::process::id(),
+            heartbeat_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_millis() as u64,
+            generation,
+        };
+        std::fs::write(
+            path,
+            serde_json::to_vec(&metadata).expect("serialize lock metadata"),
+        )
+        .expect("write lock metadata");
+    }
+
+    fn serve_one_health(listener: std::os::unix::net::UnixListener) {
+        let (mut stream, _) = listener.accept().expect("accept probe");
+        let mut len = [0_u8; 4];
+        stream.read_exact(&mut len).expect("read request length");
+        let mut body = vec![0_u8; u32::from_be_bytes(len) as usize];
+        stream.read_exact(&mut body).expect("read request body");
+        let request = decode_message::<Request>(&body).expect("decode request");
+        assert!(matches!(request.payload, Request::Health));
+        let response = FramedMessage::new(
+            request.request_id,
+            Response::Health(HealthStatus {
+                uptime_secs: 1,
+                version: PROTOCOL_VERSION,
+                ready: true,
+                memory_bytes: 0,
+            }),
+        );
+        stream
+            .write_all(&encode_message(&response).expect("encode response"))
+            .expect("write response");
+    }
+
+    #[test]
+    fn b7tb0_runtime_probe_classifies_stale_socket_then_live_restart_without_archive_mutation() {
+        use crate::daemon_runtime_state::DaemonRuntimeState;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("semantic.sock");
+        let lock_path = daemon_run_lock_path(&socket_path);
+        let stale_listener = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("bind stale socket fixture");
+        drop(stale_listener);
+        write_test_lock_metadata(&lock_path, Some(7));
+
+        let config = DaemonClientConfig {
+            socket_path: socket_path.clone(),
+            auto_spawn: false,
+            request_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let stale = probe_daemon_runtime_with_config(
+            dir.path(),
+            config.clone(),
+            Duration::from_millis(100),
+        );
+        assert_eq!(stale.state, DaemonRuntimeState::StaleSocket);
+        assert!(stale.recovery.disposable_runtime_artifact);
+        assert_eq!(stale.observation.owner_pid, Some(std::process::id()));
+        assert!(stale.observation.last_heartbeat_unix_ms.is_some());
+
+        remove_stale_daemon_socket(&socket_path).expect("reclaim stale runtime socket");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("bind restarted daemon fixture");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open daemon run lock");
+        lock.try_lock_exclusive()
+            .expect("hold restarted daemon lock");
+        let server = std::thread::spawn(move || serve_one_health(listener));
+
+        let restarted =
+            probe_daemon_runtime_with_config(dir.path(), config, Duration::from_millis(250));
+        server.join().expect("health responder");
+        assert_eq!(restarted.state, DaemonRuntimeState::Ok);
+        assert_eq!(restarted.observation.responded_to_ping, Some(true));
+        assert!(!restarted.recovery.action_needed);
+    }
+
+    #[test]
+    fn b7tb0_runtime_probe_returns_partial_unresponsive_diagnostic_at_deadline() {
+        use crate::daemon_runtime_state::DaemonRuntimeState;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("slow.sock");
+        let lock_path = daemon_run_lock_path(&socket_path);
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind slow daemon fixture");
+        write_test_lock_metadata(&lock_path, None);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open slow daemon lock");
+        lock.try_lock_exclusive().expect("hold slow daemon lock");
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let accepted = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept slow probe");
+            release_rx.recv().expect("release slow responder");
+        });
+        let timeout = Duration::from_millis(20);
+        let started = Instant::now();
+        let diagnostic = probe_daemon_runtime_with_config(
+            dir.path(),
+            DaemonClientConfig {
+                socket_path,
+                auto_spawn: false,
+                request_timeout: Duration::from_millis(250),
+                ..Default::default()
+            },
+            timeout,
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(diagnostic.state, DaemonRuntimeState::Unresponsive);
+        assert!(diagnostic.observation.connect_timed_out);
+        assert!(diagnostic.observation.owner_pid.is_some());
+        release_tx.send(()).expect("release slow responder");
+        accepted.join().expect("slow responder");
+    }
 
     #[test]
     fn test_config_defaults() {
@@ -689,9 +1030,17 @@ mod tests {
     #[test]
     fn test_default_socket_path() {
         let config = DaemonClientConfig::default();
-        let path_str = config.socket_path.to_string_lossy();
-        assert!(path_str.starts_with("/tmp/semantic-daemon-"));
-        assert!(path_str.ends_with(".sock"));
+        assert_eq!(
+            config.socket_path.parent(),
+            Some(std::env::temp_dir().as_path())
+        );
+        let file_name = config
+            .socket_path
+            .file_name()
+            .expect("default socket path has a filename")
+            .to_string_lossy();
+        assert!(file_name.starts_with("semantic-daemon-"));
+        assert!(file_name.ends_with(".sock"));
     }
 
     #[test]
@@ -704,6 +1053,22 @@ mod tests {
 
         let client = UdsDaemonClient::new(config);
         assert!(!client.is_available());
+    }
+
+    #[test]
+    fn issue_347_embedding_response_model_must_match_the_callers_vector_index() {
+        let client = UdsDaemonClient::new(DaemonClientConfig {
+            expected_embedder_id: Some("minilm-384".to_string()),
+            ..Default::default()
+        });
+
+        assert!(client.validate_embedder_id("minilm-384").is_ok());
+        let error = client
+            .validate_embedder_id("hash-384")
+            .expect_err("a hash vector must never enter the MiniLM index");
+        assert!(matches!(error, DaemonError::InvalidInput(_)));
+        assert!(error.to_string().contains("expected minilm-384"));
+        assert!(error.to_string().contains("received hash-384"));
     }
 
     #[test]

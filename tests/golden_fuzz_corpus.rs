@@ -10,7 +10,7 @@
 //! as an explicit golden diff.
 //!
 //! Regenerate:
-//!   UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_fuzz_corpus
+//!   UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_fuzz_corpus
 
 use arbitrary::{Arbitrary, Unstructured};
 use coding_agent_search::parse_cli;
@@ -315,7 +315,7 @@ fn fuzz_corpus_replay_no_panics() {
         if expected_json["total_seeds"] != snapshot["total_seeds"] {
             panic!(
                 "Fuzz corpus size changed: expected {} seeds, got {}.\n\
-                 Regenerate: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_fuzz_corpus",
+                 Regenerate: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_fuzz_corpus",
                 expected_json["total_seeds"], snapshot["total_seeds"]
             );
         }
@@ -355,7 +355,7 @@ fn fuzz_corpus_seed_count_golden() {
         assert_eq!(
             count, expected_count,
             "Fuzz corpus seed count changed: expected {expected_count}, got {count}.\n\
-             If intentional, run: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_fuzz_corpus"
+             If intentional, run: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-golden-target cargo test --test golden_fuzz_corpus"
         );
     }
 }

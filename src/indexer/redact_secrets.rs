@@ -115,7 +115,16 @@ pub fn redact_text(input: &str) -> Cow<'_, str> {
     if !matches.matched_any() {
         return Cow::Borrowed(input);
     }
+    apply_replacements(input, &matches)
+}
 
+/// Ordered per-pattern replacement passes for an input whose RegexSet
+/// prefilter already reported candidate matches. Shared by the plain
+/// [`redact_text`] path and the memoizing miss path so the candidate
+/// scan runs exactly once per input. Replacement order (ascending
+/// pattern index, sequential `replace_all`) is part of the frozen
+/// behavior contract — see `redact_text_reference` in the tests.
+fn apply_replacements<'a>(input: &'a str, matches: &regex::SetMatches) -> Cow<'a, str> {
     let mut output = Cow::Borrowed(input);
     for idx in matches.iter() {
         let replaced = SECRET_PATTERNS[idx]
@@ -162,10 +171,45 @@ pub fn fuzz_redact_json_with_memoizing_redactor(
     MemoizingRedactor::with_capacity(capacity.clamp(1, 1024)).redact_json(value)
 }
 
-/// Returns true if redaction is enabled (default: true).
+/// Returns true if index-time redaction is enabled (default: true).
 ///
-/// Set `CASS_REDACT_SECRETS=0` or `CASS_REDACT_SECRETS=false` to disable.
+/// Operator control, checked in order:
+///
+/// 1. `CASS_INDEX_REDACTION` — the documented switch.
+///    - `full` (default): secret redaction runs on every persisted
+///      message body, title, snippet, and metadata blob before anything
+///      reaches SQLite or the lexical index.
+///    - `off`: redaction is skipped entirely at index time. **Raw text
+///      is then indexed as-is.** Note the trade honestly: the original
+///      session files AND the cass raw-mirror blobs
+///      (`<data_dir>/raw-mirror/v1/`, captured unredacted with
+///      encryption state "none") already contain the same raw text on
+///      the same disk, so index-time redaction protects the *queryable
+///      surfaces* (DB rows, FTS/lexical index, exports, robot output),
+///      not disk-at-rest secrecy. `off` trades that protection for
+///      ingest speed. Accepted aliases: `off|0|false|no|none|disabled`
+///      and `full|on|1|true|yes`.
+///    - Any other value: warn and default to `full`.
+/// 2. Legacy `CASS_REDACT_SECRETS` — `0|false|off|no` disables. Kept
+///    for backward compatibility; `CASS_INDEX_REDACTION` wins when both
+///    are set.
 pub fn redaction_enabled() -> bool {
+    if let Ok(val) = dotenvy::var("CASS_INDEX_REDACTION") {
+        let normalized = val.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "off" | "0" | "false" | "no" | "none" | "disabled" => return false,
+            "full" | "on" | "1" | "true" | "yes" => return true,
+            // Empty behaves as unset: fall through to the legacy switch.
+            "" => {}
+            other => {
+                tracing::warn!(
+                    value = %other,
+                    "unrecognized CASS_INDEX_REDACTION value; defaulting to full redaction"
+                );
+                return true;
+            }
+        }
+    }
     match dotenvy::var("CASS_REDACT_SECRETS") {
         Ok(val) => !matches!(val.as_str(), "0" | "false" | "off" | "no"),
         Err(_) => true,
@@ -208,6 +252,15 @@ pub fn redaction_algorithm_fingerprint() -> String {
 /// fingerprint so repeated content stops paying the regex cost while a
 /// pattern bump invalidates every prior entry transparently.
 ///
+/// Prefilter-first scope (redaction-perf campaign, xu3jq): the cache is
+/// consulted only for inputs whose RegexSet prefilter reports at least
+/// one candidate pattern match. Clean inputs — the overwhelming
+/// majority of real corpora — bypass hashing, LRU bookkeeping, and
+/// audit records entirely, because profiling showed that bookkeeping
+/// costing ~18x the actual regex scanning on a 21.8MB real codex
+/// corpus. Hit/miss/insert telemetry therefore describes
+/// candidate-bearing content only.
+///
 /// The wrapper preserves the legacy [`redact_text`]/[`redact_json`]
 /// contract byte-for-byte: see
 /// `memoizing_redactor_matches_uncached_for_arbitrary_input` for the
@@ -231,6 +284,19 @@ impl MemoizingRedactor {
     /// eviction kicks in.
     pub(crate) const DEFAULT_CAPACITY: usize = 4096;
 
+    /// Byte ceiling for memoizing a single input (xu3jq round 3).
+    /// Candidate-bearing inputs larger than this are redacted directly
+    /// and never enter the cache: caching them would pin up to
+    /// `capacity x input_size` of message bodies in memory (the
+    /// original giant-rollout incident ran the host into swap), while
+    /// the hit-rate on multi-hundred-KB distinct tool outputs is ~0.
+    /// 64 KiB bounds worst-case cache value memory at
+    /// ~4096 x 64KiB = 256 MiB and still covers every capped codex
+    /// message body (128 KiB content cap applies upstream, but titles,
+    /// metadata blobs, and extra_json strings are typically far
+    /// smaller).
+    pub(crate) const MAX_MEMOIZED_INPUT_BYTES: usize = 64 * 1024;
+
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             text_cache: crate::indexer::memoization::ContentAddressedMemoCache::with_capacity(
@@ -241,7 +307,20 @@ impl MemoizingRedactor {
     }
 
     pub(crate) fn new() -> Self {
-        Self::with_capacity(Self::DEFAULT_CAPACITY)
+        Self::with_capacity(Self::configured_capacity())
+    }
+
+    /// Resolve the memo-cache capacity, honoring the optional
+    /// `CASS_REDACT_MEMO_CAPACITY` override (#291). On a very large,
+    /// subagent-heavy corpus the 4096 default thrashes ~one eviction per
+    /// insert; operators can raise the ceiling to cut that churn. A `0`,
+    /// empty, or unparseable value falls back to the default.
+    pub(crate) fn configured_capacity() -> usize {
+        dotenvy::var("CASS_REDACT_MEMO_CAPACITY")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(Self::DEFAULT_CAPACITY)
     }
 
     pub(crate) fn algorithm_fingerprint(&self) -> &str {
@@ -286,6 +365,33 @@ impl MemoizingRedactor {
         if input.is_empty() {
             return (String::new(), Vec::new());
         }
+        // Prefilter-first fast path (redaction-perf campaign, xu3jq):
+        // run the RegexSet candidate scan BEFORE any cache machinery.
+        // Profiling the previous shape on a real 21.8MB codex corpus
+        // showed the memo bookkeeping (blake3 content hashing, MemoKey
+        // clones, and O(capacity) VecDeque LRU scans in touch/retain)
+        // costing ~18x the actual secret scanning, because the
+        // overwhelming majority of message bodies contain no secret
+        // candidates at all. Clean inputs now pay exactly one RegexSet
+        // scan plus the one unavoidable copy into the owned return
+        // value — no hashing, no LRU traffic, no audit records. Only
+        // candidate-bearing inputs (rare, and the ones whose ordered
+        // replace_all passes are genuinely expensive) consult the
+        // cache. Consequence: cache hit/miss/insert audit telemetry now
+        // describes candidate-bearing content only; clean content is
+        // silent by design.
+        let matches = SECRET_REGEX_SET.matches(input);
+        if !matches.matched_any() {
+            return (input.to_owned(), Vec::new());
+        }
+        // Oversized candidate-bearing inputs: redact directly, never
+        // cache (see MAX_MEMOIZED_INPUT_BYTES for the memory-bound
+        // rationale). Output is identical to the cached path by
+        // construction — both run apply_replacements on the same
+        // matches.
+        if input.len() > Self::MAX_MEMOIZED_INPUT_BYTES {
+            return (apply_replacements(input, &matches).into_owned(), Vec::new());
+        }
         let key = self.key_for(input);
         let (lookup, lookup_audit) = self.text_cache.get_with_audit(&key);
         Self::trace_audit(&lookup_audit);
@@ -302,11 +408,11 @@ impl MemoizingRedactor {
                     algorithm = %self.algorithm_fingerprint,
                     "redaction memo entry is quarantined; falling back to direct regex pass"
                 );
-                let redacted = redact_text(input).into_owned();
+                let redacted = apply_replacements(input, &matches).into_owned();
                 (redacted, vec![lookup_audit])
             }
             crate::indexer::memoization::MemoLookup::Miss => {
-                let redacted = redact_text(input).into_owned();
+                let redacted = apply_replacements(input, &matches).into_owned();
                 let insert_audit = self.text_cache.insert_with_audit(key, redacted.clone());
                 Self::trace_audit(&insert_audit);
                 (redacted, vec![lookup_audit, insert_audit])
@@ -348,9 +454,10 @@ impl MemoizingRedactor {
     fn trace_audit(audit: &crate::indexer::memoization::MemoCacheAuditRecord) {
         // Severity tiers match operator expectations: hits are noise
         // (trace), misses + inserts are routine (debug), evictions
-        // are noteworthy (info), invalidations and quarantines are
-        // alarming enough to warn so they show up in default-level
-        // logs without dredging.
+        // are routine churn on large corpora (debug — #291: at info they
+        // pegged a core with 30k+ lines in minutes), invalidations and
+        // quarantines are alarming enough to warn so they show up in
+        // default-level logs without dredging.
         use crate::indexer::memoization::MemoCacheEvent;
         match audit.event {
             MemoCacheEvent::Hit => tracing::trace!(
@@ -371,7 +478,7 @@ impl MemoizingRedactor {
                 live_entries = audit.stats.live_entries,
                 "redact memo insert"
             ),
-            MemoCacheEvent::Evict { ref reason } => tracing::info!(
+            MemoCacheEvent::Evict { ref reason } => tracing::debug!(
                 target: "cass::redact::memo",
                 evict_reason = ?reason,
                 live_entries = audit.stats.live_entries,
@@ -445,6 +552,35 @@ mod tests {
     use super::*;
     use serde_json::json;
     use serial_test::serial;
+
+    /// FROZEN reference implementation of the redaction algorithm as of
+    /// the 2026-08 redaction-perf campaign baseline. This is a verbatim
+    /// copy of the pre-optimization `redact_text` body (RegexSet
+    /// prefilter + ordered per-pattern `replace_all` passes). Every
+    /// optimization to the production paths (`redact_text`,
+    /// `MemoizingRedactor::redact_text`, `redact_json`) must stay
+    /// byte-identical to THIS function on arbitrary input — enforced by
+    /// `production_redaction_paths_match_frozen_reference` below. Do
+    /// not "modernize" this copy alongside a production change; it is
+    /// the fixed point the equivalence proof hangs on. (A deliberate
+    /// pattern-list change is the one legitimate reason to update it,
+    /// together with the algorithm fingerprint bump.)
+    fn redact_text_reference(input: &str) -> Cow<'_, str> {
+        let matches = SECRET_REGEX_SET.matches(input);
+        if !matches.matched_any() {
+            return Cow::Borrowed(input);
+        }
+        let mut output = Cow::Borrowed(input);
+        for idx in matches.iter() {
+            let replaced = SECRET_PATTERNS[idx]
+                .regex
+                .replace_all(output.as_ref(), REDACTED);
+            if let Cow::Owned(redacted) = replaced {
+                output = Cow::Owned(redacted);
+            }
+        }
+        output
+    }
 
     #[test]
     fn redacts_openai_key() {
@@ -584,6 +720,72 @@ mod tests {
 
         // Restore for other tests
         unsafe { std::env::remove_var("CASS_REDACT_SECRETS") };
+    }
+
+    /// `CASS_INDEX_REDACTION` is the documented operator switch for
+    /// index-time redaction: `full` (default) / `off`, with precedence
+    /// over the legacy `CASS_REDACT_SECRETS` toggle and a warn+default
+    /// path for unrecognized values.
+    #[test]
+    #[serial]
+    fn cass_index_redaction_switch_controls_and_overrides_legacy() {
+        // Safety: serial test context; single-threaded env mutation.
+        unsafe {
+            std::env::remove_var("CASS_INDEX_REDACTION");
+            std::env::remove_var("CASS_REDACT_SECRETS");
+        }
+        assert!(redaction_enabled(), "default must be full redaction");
+
+        unsafe { std::env::set_var("CASS_INDEX_REDACTION", "off") };
+        assert!(!redaction_enabled(), "off must disable redaction");
+        unsafe { std::env::set_var("CASS_INDEX_REDACTION", "OFF") };
+        assert!(!redaction_enabled(), "value must be case-insensitive");
+        unsafe { std::env::set_var("CASS_INDEX_REDACTION", "full") };
+        assert!(redaction_enabled(), "full must enable redaction");
+
+        // Precedence: CASS_INDEX_REDACTION wins over the legacy switch
+        // in BOTH directions.
+        unsafe {
+            std::env::set_var("CASS_INDEX_REDACTION", "full");
+            std::env::set_var("CASS_REDACT_SECRETS", "0");
+        }
+        assert!(
+            redaction_enabled(),
+            "explicit full must override legacy disable"
+        );
+        unsafe {
+            std::env::set_var("CASS_INDEX_REDACTION", "off");
+            std::env::set_var("CASS_REDACT_SECRETS", "1");
+        }
+        assert!(
+            !redaction_enabled(),
+            "explicit off must override legacy enable"
+        );
+
+        // Unrecognized value: fail safe to full redaction.
+        unsafe {
+            std::env::set_var("CASS_INDEX_REDACTION", "lazy");
+            std::env::remove_var("CASS_REDACT_SECRETS");
+        }
+        assert!(
+            redaction_enabled(),
+            "unrecognized value must default to full redaction"
+        );
+
+        // Empty value behaves as unset: legacy switch applies again.
+        unsafe {
+            std::env::set_var("CASS_INDEX_REDACTION", "");
+            std::env::set_var("CASS_REDACT_SECRETS", "0");
+        }
+        assert!(
+            !redaction_enabled(),
+            "empty CASS_INDEX_REDACTION must fall through to legacy switch"
+        );
+
+        unsafe {
+            std::env::remove_var("CASS_INDEX_REDACTION");
+            std::env::remove_var("CASS_REDACT_SECRETS");
+        }
     }
 
     #[test]
@@ -752,10 +954,12 @@ mod tests {
         );
     }
 
-    /// Repeated metadata / extra_json structures are common in salvage
-    /// replays and assistant boilerplate. The memoized JSON walker must
-    /// reuse repeated object keys and repeated scalar values instead of
-    /// re-running the regex set for every copy.
+    /// Repeated secret-bearing values inside metadata / extra_json are
+    /// common in salvage replays. The memoized JSON walker must reuse
+    /// the cached redaction for repeated candidate-bearing scalars
+    /// instead of re-running the replacement passes for every copy —
+    /// while clean keys and clean values bypass the cache entirely
+    /// (prefilter-first, redaction-perf campaign).
     #[test]
     fn memoizing_redactor_redact_json_reuses_repeated_keys_and_values() {
         let repeated_secret =
@@ -785,16 +989,16 @@ mod tests {
 
         let stats = redactor.stats();
         assert_eq!(
-            stats.misses, 6,
-            "first occurrences of root keys, repeated child keys, and scalar values should miss once"
+            stats.misses, 1,
+            "only the first occurrence of the candidate-bearing secret value should miss; clean keys/values bypass the cache"
         );
         assert_eq!(
-            stats.inserts, 6,
-            "each distinct JSON key/value string should be inserted once"
+            stats.inserts, 1,
+            "only the distinct candidate-bearing value should be inserted"
         );
         assert_eq!(
-            stats.hits, 9,
-            "repeated child keys and repeated scalar values should hit the memo cache"
+            stats.hits, 2,
+            "repeated candidate-bearing values should hit the memo cache; clean strings never do"
         );
     }
 
@@ -869,14 +1073,79 @@ mod tests {
         }
     }
 
+    /// Oversized candidate-bearing inputs (> MAX_MEMOIZED_INPUT_BYTES)
+    /// must be redacted correctly WITHOUT entering the cache — the
+    /// memory bound that prevents the memo cache from pinning
+    /// gigabytes of giant tool outputs (xu3jq round 3).
+    #[test]
+    fn memoizing_redactor_oversized_candidate_input_redacts_without_caching() {
+        let mut redactor = MemoizingRedactor::with_capacity(8);
+        let mut giant = "x".repeat(MemoizingRedactor::MAX_MEMOIZED_INPUT_BYTES);
+        giant.push_str(" sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij tail");
+        assert!(giant.len() > MemoizingRedactor::MAX_MEMOIZED_INPUT_BYTES);
+
+        let (output, audit) = redactor.redact_text_with_audit(&giant);
+        assert!(
+            !output.contains("sk-ABCDE"),
+            "oversized input must still be redacted"
+        );
+        assert_eq!(
+            output,
+            redact_text(&giant).into_owned(),
+            "oversized bypass must match the plain redaction path byte-for-byte"
+        );
+        assert!(
+            audit.is_empty(),
+            "oversized input must not produce cache audit records"
+        );
+        let _ = redactor.redact_text(&giant);
+        let stats = redactor.stats();
+        assert_eq!(stats.misses, 0, "oversized input must never miss the cache");
+        assert_eq!(stats.inserts, 0, "oversized input must never be inserted");
+        assert_eq!(stats.hits, 0, "oversized input must never hit the cache");
+
+        // A small candidate-bearing input still uses the cache.
+        let small = "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+        let _ = redactor.redact_text(small);
+        let _ = redactor.redact_text(small);
+        assert_eq!(redactor.stats().misses, 1);
+        assert_eq!(redactor.stats().hits, 1);
+    }
+
+    /// Prefilter-first bypass (redaction-perf campaign): inputs with
+    /// no secret candidates must never touch the memo cache — no miss,
+    /// no insert, no audit records — while still returning the input
+    /// text unchanged. This pins the fast path that removed the ~18x
+    /// memo-bookkeeping overhead on clean corpora.
+    #[test]
+    fn memoizing_redactor_clean_input_bypasses_cache_entirely() {
+        let mut redactor = MemoizingRedactor::with_capacity(8);
+        let clean = "no secret here, just a sentence";
+        let (output, audit) = redactor.redact_text_with_audit(clean);
+        assert_eq!(output, clean, "clean input must pass through unchanged");
+        assert!(
+            audit.is_empty(),
+            "clean input must not produce cache audit records"
+        );
+        let _ = redactor.redact_text(clean);
+        let stats = redactor.stats();
+        assert_eq!(stats.misses, 0, "clean input must not count as miss");
+        assert_eq!(stats.hits, 0, "clean input must not count as hit");
+        assert_eq!(stats.inserts, 0, "clean input must not insert");
+        // Invalidate on never-cached clean content is a no-op.
+        assert!(!redactor.invalidate(clean));
+    }
+
     /// Invalidate must remove the cached entry so the next call is a
     /// miss + re-insert. Pin the changed/no-op semantics so a caller
     /// can rely on the boolean return value to know whether anything
-    /// was actually evicted.
+    /// was actually evicted. (Payload carries a secret candidate:
+    /// since the prefilter-first bypass, only candidate-bearing
+    /// content enters the cache at all.)
     #[test]
     fn memoizing_redactor_invalidate_drops_cached_entry() {
         let mut redactor = MemoizingRedactor::with_capacity(8);
-        let payload = "no secret here, just a sentence";
+        let payload = "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij here";
 
         // Prime the cache.
         let _ = redactor.redact_text(payload);
@@ -913,6 +1182,175 @@ mod tests {
             "post-invalidate call must register as a miss"
         );
         assert_eq!(redactor.stats().hits, 1, "hits counter must not regress");
+    }
+
+    /// Golden corpus for the redaction-perf campaign: literal expected
+    /// outputs for one planted secret per pattern class PLUS
+    /// adversarial near-misses that must pass through untouched. These
+    /// are byte-pinned so any optimization that changes output shape
+    /// fails loudly. Checked against the plain path, a fresh memoizing
+    /// redactor, and a warmed (cache-hit) memoizing redactor.
+    #[test]
+    fn golden_redaction_corpus_is_byte_stable_across_paths() {
+        let ghp = format!("ghp_{}", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij");
+        let sk_live = format!("{}_{}", "sk_live", "AAAABBBBCCCCDDDDEEEEFFFFGGGG");
+        let cases: Vec<(String, String)> = vec![
+            // --- planted secrets, one per pattern class ---
+            (
+                "aws AKIAIOSFODNN7EXAMPLE key".into(),
+                "aws [REDACTED] key".into(),
+            ),
+            (format!("token {ghp} end"), "token [REDACTED] end".into()),
+            (
+                "openai sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij".into(),
+                "openai [REDACTED]".into(),
+            ),
+            (
+                "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij".into(),
+                "[REDACTED]".into(),
+            ),
+            (
+                "Authorization: Bearer abcdefghijklmnopqrstuvwxyz1234".into(),
+                "Authorization: [REDACTED]".into(),
+            ),
+            (
+                "jwt eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl done".into(),
+                "jwt [REDACTED] done".into(),
+            ),
+            (
+                "-----BEGIN RSA PRIVATE KEY-----".into(),
+                "[REDACTED]".into(),
+            ),
+            (
+                "url postgres://user:pass@host:5432/db".into(),
+                "url [REDACTED]".into(),
+            ),
+            ("api_key=abcdefgh12345678".into(), "[REDACTED]".into()),
+            (
+                "slack xoxb-123456789-abcdefghij".into(),
+                "slack [REDACTED]".into(),
+            ),
+            (format!("stripe {sk_live}!"), "stripe [REDACTED]!".into()),
+            // --- multi-secret input: two patterns fire in one string ---
+            (
+                format!("a=sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij b={ghp}"),
+                "a=[REDACTED] b=[REDACTED]".into(),
+            ),
+            // --- adversarial near-misses: MUST pass through unchanged ---
+            ("sk-abc".into(), "sk-abc".into()), // too short
+            ("AKIAIOSFODN7EXAMPL".into(), "AKIAIOSFODN7EXAMPL".into()), // 14 chars, not 16
+            ("akiaiosfodnn7example".into(), "akiaiosfodnn7example".into()), // lowercase AKIA
+            ("ghx_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij".into(),
+             "ghx_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij".into()), // bad PAT prefix
+            ("eyJhbGciOiJSUzI1NiJ9".into(), "eyJhbGciOiJSUzI1NiJ9".into()), // single JWT segment
+            ("Bearer short".into(), "Bearer short".into()), // bearer token too short
+            ("xoxz-123456789-abcdefghij".into(), "xoxz-123456789-abcdefghij".into()), // bad slack prefix
+            (format!("{}_{}", "sk_test", "AAAABBBBCCCCDDDDEEEEFFFFGGGG"),
+             format!("{}_{}", "sk_test", "AAAABBBBCCCCDDDDEEEEFFFFGGGG")), // test-mode stripe key
+            ("api_key=short".into(), "api_key=short".into()), // value below 8 chars
+            ("-----BEGIN CERTIFICATE-----".into(), "-----BEGIN CERTIFICATE-----".into()),
+            ("visit https://example.com/path for docs".into(),
+             "visit https://example.com/path for docs".into()),
+            ("plain prose with no secrets at all".into(),
+             "plain prose with no secrets at all".into()),
+            ("".into(), "".into()),
+            ("🔐 unicode near sk-abc miss 测试".into(), "🔐 unicode near sk-abc miss 测试".into()),
+        ];
+
+        let mut warmed = MemoizingRedactor::with_capacity(128);
+        // Prime the cache so the second pass below exercises the hit path.
+        for (input, _) in &cases {
+            let _ = warmed.redact_text(input);
+        }
+        for (input, expected) in &cases {
+            assert_eq!(
+                &redact_text(input).into_owned(),
+                expected,
+                "plain redact_text golden mismatch for {input:?}"
+            );
+            assert_eq!(
+                &redact_text_reference(input).into_owned(),
+                expected,
+                "frozen reference golden mismatch for {input:?}"
+            );
+            let mut fresh = MemoizingRedactor::with_capacity(128);
+            assert_eq!(
+                &fresh.redact_text(input),
+                expected,
+                "fresh memoizing redactor golden mismatch for {input:?}"
+            );
+            assert_eq!(
+                &warmed.redact_text(input),
+                expected,
+                "warmed (cache-hit) memoizing redactor golden mismatch for {input:?}"
+            );
+        }
+    }
+
+    /// Property-based equivalence gate for the redaction-perf campaign:
+    /// on inputs assembled from adversarial fragments (real secret
+    /// shapes, near-misses, whitespace variants, unicode, JSON-ish
+    /// punctuation), every production path must be byte-identical to
+    /// the FROZEN pre-optimization reference:
+    ///   redact_text == MemoizingRedactor (miss) == MemoizingRedactor
+    ///   (hit) == redact_text_reference.
+    #[test]
+    fn production_redaction_paths_match_frozen_reference() {
+        use proptest::prelude::*;
+
+        let fragment = proptest::sample::select(vec![
+            "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
+            "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
+            "Bearer abcdefghijklmnopqrstuvwxyz1234",
+            "Bearer\tabcdefghijklmnopqrstuvwxyz1234",
+            "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "postgres://user:pass@host:5432/db",
+            "api_key = \"abcdefgh12345678\"",
+            "password:hunter2hunter2",
+            "xoxb-123456789-abcdefghij",
+            // concat! so push-protection does not treat the fixture as a live Stripe key
+            concat!("sk_live_", "AAAABBBBCCCCDDDDEEEEFFFFGGGG"),
+            // near-misses & noise
+            "sk-abc",
+            "AKIA1234",
+            "ghx_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
+            "Bearer x",
+            "api_key=short",
+            "password=",
+            "xoxz-nope",
+            "https://example.com/path?q=1",
+            "plain words",
+            "{\"k\":\"v\"}",
+            "\\\"escaped\\\"",
+            "🔐测试🗝️",
+            " ",
+            "\n",
+            "\t",
+            ":",
+            "=",
+        ]);
+        let input_strategy = proptest::collection::vec(fragment, 0..12)
+            .prop_map(|parts| parts.concat());
+
+        let mut runner = proptest::test_runner::TestRunner::new(
+            proptest::test_runner::Config::with_cases(512),
+        );
+        runner
+            .run(&input_strategy, |input| {
+                let reference = redact_text_reference(&input).into_owned();
+                let plain = redact_text(&input).into_owned();
+                prop_assert_eq!(&plain, &reference, "plain redact_text diverged");
+                let mut memo = MemoizingRedactor::with_capacity(64);
+                let first = memo.redact_text(&input);
+                prop_assert_eq!(&first, &reference, "memoized miss path diverged");
+                let second = memo.redact_text(&input);
+                prop_assert_eq!(&second, &reference, "memoized hit path diverged");
+                Ok(())
+            })
+            .unwrap();
     }
 
     /// Quarantined entries must NEVER serve a cached value. After

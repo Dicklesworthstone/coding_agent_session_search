@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer"
+    },
+    "applied": {
+      "type": "boolean"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "db_path": {
+      "type": "string"
+    },
+    "db_exists": {
+      "type": "boolean"
+    },
+    "conversations_collapsed": {
+      "type": "integer"
+    },
+    "messages_removed": {
+      "type": "integer"
+    },
+    "lexical_rebuilt": {
+      "type": "boolean"
+    },
+    "pairs": {
+      "type": "array",
+      "items": {
+        "type": "unknown"
+      }
+    },
+    "recommended_action": {
+      "type": "string"
+    }
+  }
+}

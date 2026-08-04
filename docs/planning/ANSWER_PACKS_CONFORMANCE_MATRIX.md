@@ -146,10 +146,10 @@ are clear.
 | AP-BOUND-007 | MUST | Non-Goals | Pack never auto-downloads semantic models; missing models must use truthful lexical fallback or semantic errors. | Missing-model fixture that checks no model artifact is created and no acquisition path runs. | Planned |
 | AP-BOUND-008 | MUST | Non-Goals | Pack does not run hidden `doctor --fix`, manual index repair, or quarantine garbage collection. | State-snapshot integration test around pack execution. | Planned |
 | AP-BOUND-009 | MUST | Non-Goals | Pack does not delete or clean up derived assets while preparing output. | State-snapshot integration test covering index, quarantine, and publish-backup directories. | Planned |
-| AP-GATE-001 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo fmt --check` is part of closeout. | Implementation closeout evidence. | Planned |
-| AP-GATE-002 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo check --all-targets` is part of closeout. | Implementation closeout evidence. | Planned |
-| AP-GATE-003 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo clippy --all-targets -- -D warnings` is part of closeout. | Implementation closeout evidence. | Planned |
-| AP-GATE-004 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo test pack` is part of closeout. | Implementation closeout evidence. | Planned |
+| AP-GATE-001 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo fmt --check` is part of closeout. | Implementation closeout evidence. | Planned |
+| AP-GATE-002 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo check --all-targets` is part of closeout. | Implementation closeout evidence. | Planned |
+| AP-GATE-003 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo clippy --all-targets -- -D warnings` is part of closeout. | Implementation closeout evidence. | Planned |
+| AP-GATE-004 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo test pack` is part of closeout. | Implementation closeout evidence. | Planned |
 | AP-GATE-005 | MUST | Verification Commands | Golden robot JSON/docs tests run through `rch exec` and reviewed diffs. | Implementation closeout evidence. | Planned |
 | AP-GATE-006 | MUST | Verification Commands | Intentional golden updates use `UPDATE_GOLDENS=1 rch exec -- ...` and reviewed `tests/golden/` diffs. | Implementation closeout evidence. | Planned |
 

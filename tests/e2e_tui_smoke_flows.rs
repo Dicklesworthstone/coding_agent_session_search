@@ -14,7 +14,6 @@
 //!
 //! Run with: cargo test --test e2e_tui_smoke_flows -- --nocapture
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::fs;
 use std::io::{Read, Write};
@@ -24,8 +23,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod util;
-use util::EnvGuard;
-use util::e2e_log::{E2eError, E2eErrorContext, E2ePerformanceMetrics, PhaseTracker};
+use util::e2e_log::{
+    E2eCommandEnvironment, E2eError, E2eErrorContext, E2ePerformanceMetrics, PhaseTracker,
+};
 
 /// Global lock to prevent parallel test interference
 static TUI_FLOW_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -174,6 +174,7 @@ struct FtuiPtyEnv {
     xdg: PathBuf,
     data_dir: PathBuf,
     codex_home: PathBuf,
+    command_env: E2eCommandEnvironment,
 }
 
 fn cass_bin_path() -> &'static str {
@@ -191,6 +192,12 @@ fn prepare_ftui_pty_env(trace: &str, tracker: &PhaseTracker) -> FtuiPtyEnv {
     let xdg = tmp.path().join("xdg");
     let data_dir = tmp.path().join("cass_data");
     let codex_home = tmp.path().join("codex_home");
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_codex_home(&codex_home)
+        .with_var("XDG_DATA_HOME", &xdg)
+        .with_var("CASS_DATA_DIR", &data_dir);
     fs::create_dir_all(&home).expect("create home");
     fs::create_dir_all(&xdg).expect("create xdg");
     fs::create_dir_all(&data_dir).expect("create cass_data");
@@ -213,7 +220,8 @@ fn prepare_ftui_pty_env(trace: &str, tracker: &PhaseTracker) -> FtuiPtyEnv {
         "pty_index",
         Some("Indexing fixture data for ftui interactive PTY tests"),
     );
-    let output = cargo_bin_cmd!("cass")
+    let output = command_env
+        .cass_assert_command()
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -266,10 +274,12 @@ fn prepare_ftui_pty_env(trace: &str, tracker: &PhaseTracker) -> FtuiPtyEnv {
         xdg,
         data_dir,
         codex_home,
+        command_env,
     }
 }
 
 fn apply_ftui_env(cmd: &mut CommandBuilder, env: &FtuiPtyEnv) {
+    env.command_env.apply_to_pty(cmd);
     cmd.cwd(env.home.to_string_lossy().as_ref());
     cmd.env("HOME", env.home.to_string_lossy().as_ref());
     cmd.env("XDG_DATA_HOME", env.xdg.to_string_lossy().as_ref());
@@ -455,7 +465,6 @@ fn tui_pty_launch_quit_and_terminal_cleanup() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_pty_launch_quit_and_terminal_cleanup");
-    let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
     let pty_system = native_pty_system();
@@ -550,7 +559,6 @@ fn tui_pty_help_overlay_open_close_flow() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_pty_help_overlay_open_close_flow");
-    let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
     let pty_system = native_pty_system();
@@ -656,7 +664,6 @@ fn tui_pty_search_detail_and_quit_flow() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_pty_search_detail_and_quit_flow");
-    let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
     let pty_system = native_pty_system();
@@ -765,7 +772,6 @@ fn tui_pty_enter_selected_hit_opens_detail_modal() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_pty_enter_selected_hit_opens_detail_modal");
-    let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
     let pty_system = native_pty_system();
@@ -894,7 +900,6 @@ fn tui_pty_search_query_with_space_opens_detail_modal() -> Result<(), String> {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_pty_search_query_with_space_opens_detail_modal");
-    let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
     let pty_system = native_pty_system();
@@ -1027,7 +1032,6 @@ fn tui_pty_detail_modal_shows_markdown_content() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_pty_detail_modal_shows_markdown_content");
-    let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
     let pty_system = native_pty_system();
@@ -1142,7 +1146,6 @@ fn tui_pty_performance_guardrails_smoke() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_pty_performance_guardrails_smoke");
-    let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
     let queries = ["hello", "authentication", "session", "timeout", "hello"];
@@ -1150,7 +1153,8 @@ fn tui_pty_performance_guardrails_smoke() {
 
     for (idx, query) in queries.iter().enumerate() {
         let run_start = Instant::now();
-        let output = cargo_bin_cmd!("cass")
+        let mut command = tracker.cass_assert_command();
+        let output = command
             .arg("search")
             .arg(query)
             .arg("--robot")
@@ -1349,29 +1353,26 @@ fn tui_search_flow_with_logging() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_search_flow_with_logging");
-    let _trace_guard = tracker.trace_env_guard();
 
     // Setup phase
     let setup_start = tracker.start("setup", Some("Creating isolated test environment"));
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
 
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
     make_codex_fixture(&data_dir);
     tracker.end("setup", Some("Fixtures created"), setup_start);
 
     // Index phase
     let index_start = tracker.start("index", Some("Building search index"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -1405,7 +1406,8 @@ fn tui_search_flow_with_logging() {
 
     // Search flow: simulate search for "hello"
     let search_start = tracker.start("search_hello", Some("Simulating TUI search: 'hello'"));
-    let search_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let search_output = command
         .arg("search")
         .arg("hello")
         .arg("--robot")
@@ -1439,7 +1441,8 @@ fn tui_search_flow_with_logging() {
         "search_auth",
         Some("Simulating TUI search: 'authentication'"),
     );
-    let search2_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let search2_output = command
         .arg("search")
         .arg("authentication")
         .arg("--robot")
@@ -1466,7 +1469,8 @@ fn tui_search_flow_with_logging() {
         "tui_headless",
         Some("Verifying TUI launches in headless mode"),
     );
-    let tui_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let tui_output = command
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -1532,7 +1536,6 @@ fn tui_filter_flow_with_logging() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_filter_flow_with_logging");
-    let _trace_guard = tracker.trace_env_guard();
 
     // Setup
     let setup_start = tracker.start(
@@ -1542,11 +1545,9 @@ fn tui_filter_flow_with_logging() {
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
 
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     let codex_home = tmp.path().join("codex_home");
@@ -1555,14 +1556,14 @@ fn tui_filter_flow_with_logging() {
     fs::create_dir_all(&codex_home).unwrap();
     fs::create_dir_all(&claude_home).unwrap();
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
     make_codex_fixture(&codex_home);
     make_claude_fixture(&claude_home, "testproject");
     tracker.end("setup", Some("Multi-agent fixtures created"), setup_start);
 
     // Index
     let index_start = tracker.start("index", Some("Building multi-agent index"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -1585,7 +1586,8 @@ fn tui_filter_flow_with_logging() {
 
     // Filter by agent: Codex
     let filter_start = tracker.start("filter_codex", Some("Simulating TUI filter: agent=codex"));
-    let filter_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let filter_output = command
         .arg("search")
         .arg("hello")
         .arg("--agent")
@@ -1611,7 +1613,8 @@ fn tui_filter_flow_with_logging() {
 
     // TUI launch with filter
     let tui_start = tracker.start("tui_headless", Some("Verifying TUI with filter"));
-    let tui_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let tui_output = command
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -1663,29 +1666,26 @@ fn tui_export_flow_with_logging() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_export_flow_with_logging");
-    let _trace_guard = tracker.trace_env_guard();
 
     // Setup
     let setup_start = tracker.start("setup", Some("Creating test environment"));
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
 
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
     let export_session_path = make_codex_fixture(&data_dir);
     tracker.end("setup", Some("Fixtures created"), setup_start);
 
     // Index
     let index_start = tracker.start("index", Some("Building index"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -1705,7 +1705,8 @@ fn tui_export_flow_with_logging() {
         "search_for_export",
         Some("Search to identify exportable content"),
     );
-    let search_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let search_output = command
         .arg("search")
         .arg("hello")
         .arg("--robot")
@@ -1749,7 +1750,8 @@ fn tui_export_flow_with_logging() {
         "export_html",
         Some("Exporting selected session content to HTML"),
     );
-    let export_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let export_output = command
         .arg("export-html")
         .arg(&export_session_path)
         .arg("--output-dir")
@@ -1798,7 +1800,8 @@ fn tui_export_flow_with_logging() {
         "tui_headless",
         Some("Verifying TUI launches for export flow"),
     );
-    let tui_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let tui_output = command
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -1854,18 +1857,15 @@ fn tui_empty_dataset_flow_with_logging() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_empty_dataset_flow_with_logging");
-    let _trace_guard = tracker.trace_env_guard();
 
     // Setup with empty dataset
     let setup_start = tracker.start("setup", Some("Creating empty test environment"));
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
 
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
@@ -1873,13 +1873,13 @@ fn tui_empty_dataset_flow_with_logging() {
     // Point to empty directories (no fixtures)
     let empty_codex = tmp.path().join("empty_codex");
     fs::create_dir_all(&empty_codex).unwrap();
-    let _guard_codex = EnvGuard::set("CODEX_HOME", empty_codex.to_string_lossy());
 
     tracker.end("setup", Some("Empty environment created"), setup_start);
 
     // Index empty dataset
     let index_start = tracker.start("index_empty", Some("Building empty index"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -1895,7 +1895,8 @@ fn tui_empty_dataset_flow_with_logging() {
 
     // Search empty dataset
     let search_start = tracker.start("search_empty", Some("Searching empty dataset"));
-    let search_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let search_output = command
         .arg("search")
         .arg("anything")
         .arg("--robot")
@@ -1919,7 +1920,8 @@ fn tui_empty_dataset_flow_with_logging() {
 
     // TUI with empty dataset
     let tui_start = tracker.start("tui_empty", Some("TUI with empty dataset"));
-    let tui_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let tui_output = command
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -1976,18 +1978,15 @@ fn tui_unicode_flow_with_logging() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_unicode_flow_with_logging");
-    let _trace_guard = tracker.trace_env_guard();
 
     // Setup
     let setup_start = tracker.start("setup", Some("Creating unicode test environment"));
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
 
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
@@ -2003,12 +2002,12 @@ fn tui_unicode_flow_with_logging() {
 "#;
     fs::write(file, sample).unwrap();
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
     tracker.end("setup", Some("Unicode fixtures created"), setup_start);
 
     // Index
     let index_start = tracker.start("index", Some("Building unicode index"));
-    let output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let output = command
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -2025,7 +2024,8 @@ fn tui_unicode_flow_with_logging() {
 
     // Search for unicode content
     let search_start = tracker.start("search_unicode", Some("Searching for unicode content"));
-    let search_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let search_output = command
         .arg("search")
         .arg("日本語")
         .arg("--robot")
@@ -2053,7 +2053,8 @@ fn tui_unicode_flow_with_logging() {
 
     // TUI with unicode
     let tui_start = tracker.start("tui_unicode", Some("TUI with unicode content"));
-    let tui_output = cargo_bin_cmd!("cass")
+    let mut command = tracker.cass_assert_command();
+    let tui_output = command
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -2105,7 +2106,6 @@ fn tui_pty_analytics_navigation_flow() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_pty_analytics_navigation_flow");
-    let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
     let pty_system = native_pty_system();
@@ -2220,7 +2220,6 @@ fn tui_pty_inline_mode_no_altscreen() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_pty_inline_mode_no_altscreen");
-    let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
     let pty_system = native_pty_system();
@@ -2332,7 +2331,6 @@ fn tui_pty_record_macro_creates_file() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_pty_record_macro_creates_file");
-    let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
     let macro_path = env.data_dir.join("test_recording.macro");
@@ -2427,7 +2425,6 @@ fn tui_typing_writes_latency_trace() -> Result<(), String> {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_typing_writes_latency_trace");
-    let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
     let latency_path = env.data_dir.join("latency_trace.json");

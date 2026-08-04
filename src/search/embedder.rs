@@ -65,9 +65,14 @@ mod tests {
             .join("tests/fixtures/models/xenova-paraphrase-minilm-l3-v2-int8")
     }
 
+    // cass #308: the pure-Rust native backend loads f32 `model.safetensors` of the
+    // all-MiniLM-L6-v2 topology; it cannot load the small committed int8 ONNX
+    // fixture. Tests using this helper are `#[ignore]`d by default and run against
+    // a real model supplied via `FRANKENSEARCH_MODEL_DIR` (`cargo test -- --ignored`).
     fn load_fastembed_fixture() -> FastEmbedder {
-        FastEmbedder::load_from_dir(&fastembed_fixture_dir())
-            .expect("fastembed fixture should load")
+        let dir = crate::search::fastembed_embedder::model_dir_override()
+            .unwrap_or_else(fastembed_fixture_dir);
+        FastEmbedder::load_from_dir(&dir).expect("fastembed fixture should load")
     }
 
     #[test]
@@ -80,6 +85,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a real safetensors MiniLM model via FRANKENSEARCH_MODEL_DIR; the int8 ONNX fixture is incompatible with the native backend — cass #308"]
     fn test_embedder_trait_semantic() {
         let embedder = load_fastembed_fixture();
         assert_eq!(embedder.dimension(), 384);
@@ -88,6 +94,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a real safetensors MiniLM model via FRANKENSEARCH_MODEL_DIR; the int8 ONNX fixture is incompatible with the native backend — cass #308"]
     fn test_embedder_batch() {
         let embedder = load_fastembed_fixture();
         let texts = &["hello", "world", "test"];
@@ -100,6 +107,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a real safetensors MiniLM model via FRANKENSEARCH_MODEL_DIR; the int8 ONNX fixture is incompatible with the native backend — cass #308"]
     fn test_embedder_empty_input_error() {
         let embedder = load_fastembed_fixture();
         let result = embedder.embed_sync("");
@@ -107,6 +115,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a real safetensors MiniLM model via FRANKENSEARCH_MODEL_DIR; the int8 ONNX fixture is incompatible with the native backend — cass #308"]
     fn test_embedder_info() {
         let embedder = load_fastembed_fixture();
         let info = EmbedderInfo::from_embedder(&embedder);

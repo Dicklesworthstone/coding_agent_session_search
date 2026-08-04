@@ -5,7 +5,7 @@ description: "Coding Agent Session Search - unified CLI/TUI to index and search 
 
 # CASS - Coding Agent Session Search
 
-Unified, high-performance CLI/TUI to index and search your local coding agent history. Aggregates sessions from **11 agents**: Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, and Factory (Droid).
+Unified, high-performance CLI/TUI to index and search your local coding agent history. Aggregates sessions from **23 agents**, including Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Factory (Droid), OpenHands, Antigravity, and Grok Build.
 
 ## CRITICAL: Robot Mode Required for AI Agents
 
@@ -575,7 +575,7 @@ Final_Score = BM25_Score × Match_Quality + α × Recency_Factor
 
 ---
 
-## Supported Agents (11 Connectors)
+## Supported Agents (23 Connectors)
 
 | Agent | Location | Format |
 |-------|----------|--------|
@@ -590,6 +590,18 @@ Final_Score = BM25_Score × Match_Quality + α × Recency_Factor
 | **Aider** | `~/.aider.chat.history.md` + per-project | Markdown |
 | **Pi-Agent** | `~/.pi/agent/sessions` | JSONL with thinking |
 | **Factory (Droid)** | `~/.factory/sessions` | JSONL by workspace |
+| **GitHub Copilot Chat** | VS Code global storage | JSON / SQLite |
+| **GitHub Copilot CLI** | `~/.copilot/session-state` | JSONL |
+| **OpenClaw** | `~/.openclaw` | JSONL |
+| **ClawdBot** | `~/.clawdbot` | JSONL |
+| **Vibe** | `~/.vibe/logs/session` | JSONL |
+| **Crush** | `~/.crush/crush.db` | SQLite |
+| **Hermes** | `~/.hermes` | JSONL |
+| **Kimi Code** | `~/.kimi/sessions` | JSONL |
+| **Qwen Code** | `~/.qwen/tmp` | JSON / JSONL |
+| **OpenHands** | `~/.openhands/conversations` | JSON event stream |
+| **Antigravity** | `~/.gemini/antigravity-cli` | JSONL / SQLite |
+| **Grok Build** | `$GROK_HOME/sessions` (default `~/.grok/sessions`) | ACP updates JSONL |
 
 **Note:** ChatGPT v2/v3 are AES-256-GCM encrypted (keychain access required). Legacy v1 unencrypted conversations are indexed automatically.
 
