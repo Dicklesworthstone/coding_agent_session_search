@@ -948,11 +948,11 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
     Ok(count)
 }
 
-/// Return the exact next candidate prefix through bounded parent probes when
-/// the first parent page is dense enough. Each normal parent resolves its
-/// single tail row through the canonical `(conversation_id, idx)` key instead
-/// of scanning a conversation history with an incompatible `id > cursor`
-/// predicate. Sparse or legacy archives retain the global cursor fallback.
+/// Return the exact next candidate prefix through one bounded indexed parent
+/// page query. Normal archives resolve each page's tail through the canonical
+/// `(conversation_id, idx)` key in that single query; this avoids retaining
+/// FrankenSQLite state for a separate tail lookup per parent. Sparse or legacy
+/// archives retain the global cursor fallback.
 fn try_fetch_dense_semantic_candidate_conversation_ids(
     storage: &FrankenStorage,
     after_conversation_id: i64,
@@ -961,18 +961,34 @@ fn try_fetch_dense_semantic_candidate_conversation_ids(
 ) -> Result<Option<(Vec<i64>, usize)>> {
     let page_size = max_candidates.saturating_mul(4).clamp(256, 4_096);
     let page_size_i64 = i64::try_from(page_size).unwrap_or(i64::MAX);
-    let page: Vec<(i64, Option<i64>)> = storage
+    let page: Vec<(i64, Option<i64>, Option<i64>)> = storage
         .raw()
         .query_map_collect(
-            "SELECT id, last_message_idx FROM conversations
-             WHERE id > ?1
-             ORDER BY id ASC
-             LIMIT ?2",
+            "SELECT page.id,
+                    COALESCE(page.last_message_idx, tails.last_message_idx),
+                    tail_message.id
+             FROM (
+                 SELECT id, last_message_idx
+                 FROM conversations
+                 WHERE id > ?1
+                 ORDER BY id ASC
+                 LIMIT ?2
+             ) AS page
+             LEFT JOIN conversation_tail_state AS tails
+                    ON tails.conversation_id = page.id
+             LEFT JOIN messages AS tail_message
+                    INDEXED BY sqlite_autoindex_messages_1
+                    ON tail_message.conversation_id = page.id
+                   AND tail_message.idx = COALESCE(
+                       page.last_message_idx,
+                       tails.last_message_idx
+                   )
+             ORDER BY page.id ASC",
             &[
                 ParamValue::from(after_conversation_id),
                 ParamValue::from(page_size_i64),
             ],
-            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
         )
         .with_context(|| {
             format!(
@@ -986,15 +1002,11 @@ fn try_fetch_dense_semantic_candidate_conversation_ids(
     let page_len = page.len();
     let mut selected = Vec::with_capacity(max_candidates);
     let mut rows_scanned = 0usize;
-    for (conversation_id, legacy_last_message_idx) in page {
+    for (conversation_id, tail_idx, tail_message_id) in page {
         rows_scanned = rows_scanned.saturating_add(1);
-        let has_newer_message = match semantic_conversation_tail_message_id(
-            storage,
-            conversation_id,
-            legacy_last_message_idx,
-        )? {
-            Some(tail_message_id) => tail_message_id > after_message_id,
-            None => semantic_conversation_has_message_after(
+        let has_newer_message = match (tail_idx, tail_message_id) {
+            (Some(_), Some(tail_message_id)) => tail_message_id > after_message_id,
+            (None, _) | (_, None) => semantic_conversation_has_message_after(
                 storage,
                 conversation_id,
                 Some(after_message_id),
