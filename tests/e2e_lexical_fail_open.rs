@@ -318,6 +318,149 @@ fn run_hybrid_hash_search(home: &Path, data_dir: &Path, query: &str) -> Value {
     })
 }
 
+#[test]
+fn explicit_semantic_budget_pressure_never_realizes_lexical() {
+    let tmp = TempDir::new().expect("create isolated semantic-budget home");
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).expect("create isolated semantic-budget data dir");
+
+    for idx in 1..=3 {
+        let name = format!("rollout-explicit-semantic-budget-{idx:02}.jsonl");
+        seed_codex_session(
+            &codex_home,
+            &name,
+            &format!("semanticbudgetprobe concept {idx}"),
+        );
+    }
+    run_fresh_index(home, &data_dir);
+    build_hash_semantic_assets(&data_dir, false);
+
+    // A one-millisecond budget is deterministically at least NearLimit even
+    // at elapsed_ms=0 because the integer 80% threshold rounds down to zero.
+    // Hash is an explicit production control vector space here: it makes the
+    // requested semantic path fully usable without a model download, so a
+    // missing-model error cannot accidentally make this regression pass.
+    let mut search = cass_cmd(home);
+    search
+        .args([
+            "search",
+            "semanticbudgetprobe",
+            "--json",
+            "--robot-meta",
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--timeout",
+            "1",
+            "--limit",
+            "5",
+            "--data-dir",
+        ])
+        .arg(&data_dir);
+    let output = search
+        .output()
+        .expect("run explicit semantic search under robot budget pressure");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let emitted_bytes = output.stdout.len().saturating_add(output.stderr.len());
+    let emitted_lines = stdout
+        .lines()
+        .count()
+        .saturating_add(stderr.lines().count());
+    assert!(
+        emitted_bytes < 8 * 1024 * 1024,
+        "bounded semantic-budget probe emitted {emitted_bytes} bytes"
+    );
+    assert!(
+        emitted_lines < 10_000,
+        "bounded semantic-budget probe emitted {emitted_lines} lines"
+    );
+
+    if output.status.success() {
+        let payload: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+            panic!(
+                "successful semantic-budget output must be valid JSON: {err}\n\
+                 stdout: {stdout}\nstderr: {stderr}"
+            )
+        });
+        let meta = payload
+            .get("_meta")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("--robot-meta must emit _meta: {payload}"));
+        assert_eq!(
+            meta.get("requested_search_mode").and_then(Value::as_str),
+            Some("semantic"),
+            "explicit semantic intent must survive budget shedding: {payload}"
+        );
+        assert_eq!(
+            meta.get("search_mode").and_then(Value::as_str),
+            Some("semantic"),
+            "budget pressure must not substitute lexical execution for explicit semantic: {payload}"
+        );
+        assert_ne!(
+            meta.get("fallback_tier").and_then(Value::as_str),
+            Some("lexical"),
+            "explicit semantic must never report lexical fallback: {payload}"
+        );
+    } else {
+        let last_line = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_else(|| {
+                panic!(
+                    "failed semantic-budget search must emit a structured error; \
+                     stdout: {stdout}\nstderr: {stderr}"
+                )
+            });
+        let payload: Value = serde_json::from_str(last_line.trim()).unwrap_or_else(|err| {
+            panic!(
+                "failed semantic-budget output must end in a JSON error: {err}\n\
+                 stdout: {stdout}\nstderr: {stderr}"
+            )
+        });
+        let error = payload
+            .get("error")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| {
+                panic!("failed semantic-budget output must carry an error object: {payload}")
+            });
+        assert_eq!(
+            error.get("kind").and_then(Value::as_str),
+            Some("timeout"),
+            "budget-shed explicit semantic search must fail with the typed timeout kind: {payload}"
+        );
+        assert_eq!(
+            error.get("code").and_then(Value::as_i64),
+            Some(10),
+            "budget-shed explicit semantic search must preserve timeout exit code 10: {payload}"
+        );
+        assert_eq!(
+            error.get("retryable").and_then(Value::as_bool),
+            Some(true),
+            "the same semantic request should be retryable with a larger budget: {payload}"
+        );
+        let hint = error
+            .get("hint")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("semantic timeout must include an actionable hint: {payload}")
+            });
+        assert!(
+            hint.contains("Increase --timeout") && hint.contains("hybrid"),
+            "semantic timeout hint must preserve semantic intent and name opt-in hybrid fail-open: {hint}"
+        );
+        assert!(
+            !stdout.contains("\"search_mode\":\"lexical\"")
+                && !stdout.contains("\"search_mode\": \"lexical\""),
+            "strict semantic failure must not emit a lexical realization: {stdout}"
+        );
+    }
+}
+
 fn run_lexical_search(home: &Path, data_dir: &Path, query: &str) -> Value {
     let mut search = cass_cmd(home);
     search
