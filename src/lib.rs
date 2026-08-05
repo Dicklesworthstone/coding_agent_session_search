@@ -2268,6 +2268,9 @@ pub enum ModelsCommand {
         /// Maximum canonical conversations to process in this batch
         #[arg(long, default_value_t = 64)]
         batch_conversations: usize,
+        /// Maximum checkpoints to process in one bounded process (default: one)
+        #[arg(long, default_value_t = 1)]
+        max_batches: usize,
         /// Apply idle/load scheduler gates before running this batch
         #[arg(long, visible_alias = "background")]
         scheduled: bool,
@@ -103255,6 +103258,7 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             tier,
             embedder,
             batch_conversations,
+            max_batches,
             scheduled,
             data_dir,
             db,
@@ -103265,6 +103269,7 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
                 &tier,
                 embedder.as_deref(),
                 batch_conversations,
+                max_batches,
                 scheduled,
                 data_dir,
                 db.or_else(|| cli.db.clone()),
@@ -104787,6 +104792,7 @@ fn run_models_backfill(
     tier_raw: &str,
     embedder_override: Option<&str>,
     batch_conversations: usize,
+    max_batches: usize,
     scheduled: bool,
     data_dir_override: Option<PathBuf>,
     db_override: Option<PathBuf>,
@@ -104808,6 +104814,16 @@ fn run_models_backfill(
             kind: CliErrorKind::Usage.kind_str(),
             message: "--batch-conversations must be greater than zero".to_string(),
             hint: Some("Use a small positive batch such as --batch-conversations 64".into()),
+            retryable: false,
+        });
+    }
+
+    if max_batches == 0 {
+        return Err(CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: "--max-batches must be greater than zero".to_string(),
+            hint: Some("Use a positive bound such as --max-batches 16".into()),
             retryable: false,
         });
     }
@@ -104852,7 +104868,7 @@ fn run_models_backfill(
         let signals = SemanticBackfillSchedulerSignals::from_env();
         Some(semantic_backfill_scheduler_decision(
             &policy,
-            batch_conversations,
+            max_batches,
             &signals,
         ))
     } else {
@@ -104910,8 +104926,15 @@ fn run_models_backfill(
             decision.scheduled_batch_conversations
         });
 
-    let db_fingerprint =
-        crate::indexer::lexical_storage_fingerprint_for_db(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+        code: 5,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("Failed to open cass database {}: {e}", db_path.display()),
+        hint: Some("Run 'cass health --json' to inspect the archive database".into()),
+        retryable: true,
+    })?;
+    let db_fingerprint = crate::indexer::lexical_storage_fingerprint_from_storage(&storage)
+        .map_err(|e| CliError {
             code: 5,
             kind: CliErrorKind::StorageFingerprint.kind_str(),
             message: format!(
@@ -104924,13 +104947,6 @@ fn run_models_backfill(
             ),
             retryable: true,
         })?;
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::Storage.kind_str(),
-        message: format!("Failed to open cass database {}: {e}", db_path.display()),
-        hint: Some("Run 'cass health --json' to inspect the archive database".into()),
-        retryable: true,
-    })?;
     let mut manifest = SemanticManifest::load_or_default(&data_dir).map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::SemanticManifest.kind_str(),
@@ -104969,28 +104985,36 @@ fn run_models_backfill(
         tier.as_str(),
         indexer.embedder_id(),
     );
-    let outcome = indexer
-        .run_capped_backfill_from_storage_with_sink(
-            &storage,
-            &data_dir,
-            &mut manifest,
-            SemanticBackfillStoragePlan {
-                tier,
-                db_fingerprint,
-                model_revision,
-                max_conversations: effective_batch_conversations,
-            },
-            &progress_sink,
-        )
-        .map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::SemanticBackfill.kind_str(),
-            message: format!("Semantic backfill failed: {e}"),
-            hint: Some(
-                "Retry the command; resumable checkpoints are kept in the semantic manifest".into(),
-            ),
-            retryable: true,
-        })?;
+    let mut batches_run = 0usize;
+    let outcome = loop {
+        let outcome = indexer
+            .run_capped_backfill_from_storage_with_sink(
+                &storage,
+                &data_dir,
+                &mut manifest,
+                SemanticBackfillStoragePlan {
+                    tier,
+                    db_fingerprint: db_fingerprint.clone(),
+                    model_revision: model_revision.clone(),
+                    max_conversations: effective_batch_conversations,
+                },
+                &progress_sink,
+            )
+            .map_err(|e| CliError {
+                code: 5,
+                kind: CliErrorKind::SemanticBackfill.kind_str(),
+                message: format!("Semantic backfill failed: {e}"),
+                hint: Some(
+                    "Retry the command; resumable checkpoints are kept in the semantic manifest"
+                        .into(),
+                ),
+                retryable: true,
+            })?;
+        batches_run = batches_run.saturating_add(1);
+        if outcome.published || !outcome.checkpoint_saved || batches_run >= max_batches {
+            break outcome;
+        }
+    };
 
     let progress_pct = outcome.progress_pct();
     let status = if outcome.published {
@@ -105000,8 +105024,12 @@ fn run_models_backfill(
     } else {
         "idle"
     };
+    let bounded_run_complete =
+        outcome.checkpoint_saved && !outcome.published && batches_run >= max_batches;
     let next_step = if outcome.published {
         "semantic tier is ready"
+    } else if bounded_run_complete {
+        "bounded multi-batch run reached its limit; rerun the same command to continue the resumable backfill"
     } else if outcome.checkpoint_saved {
         "rerun the same command to continue the resumable backfill"
     } else {
@@ -105034,6 +105062,8 @@ fn run_models_backfill(
                 "batch_conversations_limit": effective_batch_conversations,
                 "requested_batch_conversations_limit": batch_conversations,
                 "scheduler": scheduler_decision,
+                "max_batches": max_batches,
+                "batches_run": batches_run,
                 "embedded_docs": outcome.embedded_docs,
                 "conversations_processed": outcome.conversations_processed,
                 "total_conversations": outcome.total_conversations,
