@@ -2724,13 +2724,14 @@ impl SemanticIndexer {
         data_dir: &Path,
     ) -> Result<usize> {
         let index_path = vector_index_path(data_dir, self.embedder_id());
-        self.append_to_index_path(embedded_messages, &index_path)
+        self.append_to_index_path(embedded_messages, &index_path, true)
     }
 
     fn append_to_index_path(
         &self,
         embedded_messages: impl IntoIterator<Item = EmbeddedMessage>,
         index_path: &Path,
+        compact_when_needed: bool,
     ) -> Result<usize> {
         let mut index = FsVectorIndex::open(index_path)
             .map_err(|err| anyhow::anyhow!("open fsvi index for append: {err}"))?;
@@ -2769,7 +2770,7 @@ impl SemanticIndexer {
             .append_batch(&entries)
             .map_err(|err| anyhow::anyhow!("append_batch: {err}"))?;
 
-        if index.needs_compaction() {
+        if compact_when_needed && index.needs_compaction() {
             index
                 .compact()
                 .map_err(|err| anyhow::anyhow!("compaction: {err}"))?;
@@ -3017,7 +3018,11 @@ impl SemanticIndexer {
         resume_existing: bool,
     ) -> Result<FsVectorIndex> {
         if resume_existing && staging_path.exists() {
-            self.append_to_index_path(embedded_messages, staging_path)?;
+            // A resumable backfill deliberately keeps its growing delta in the
+            // staging WAL. Compacting after a small checkpoint rewrites every
+            // prior vector and turns the bounded path into O(corpus-size) work
+            // per checkpoint. The final publish path compacts once, atomically.
+            self.append_to_index_path(embedded_messages, staging_path, false)?;
             FsVectorIndex::open(staging_path)
                 .map_err(|err| anyhow::anyhow!("open staged semantic index failed: {err}"))
         } else {
