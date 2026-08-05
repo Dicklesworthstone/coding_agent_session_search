@@ -840,6 +840,70 @@ fn semantic_conversation_has_message_after(
     Ok(has_message)
 }
 
+/// Return the canonical tail message id for one conversation without scanning
+/// its full message history. Normal archives maintain `last_message_idx` on
+/// the parent row; the compact tail table is the compatible fallback for older
+/// rows. The unique `(conversation_id, idx)` key then resolves exactly one row.
+fn semantic_conversation_tail_message_id(
+    storage: &FrankenStorage,
+    conversation_id: i64,
+    legacy_last_message_idx: Option<i64>,
+) -> Result<Option<i64>> {
+    let tail_idx = match legacy_last_message_idx {
+        Some(last_message_idx) => Some(last_message_idx),
+        None => storage
+            .raw()
+            .query_map_collect(
+                "SELECT last_message_idx
+                 FROM conversation_tail_state
+                 WHERE conversation_id = ?1 AND last_message_idx IS NOT NULL",
+                &[ParamValue::from(conversation_id)],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| {
+                format!("looking up semantic tail metadata for conversation {conversation_id}")
+            })?
+            .into_iter()
+            .next(),
+    };
+    let Some(tail_idx) = tail_idx else {
+        return Ok(None);
+    };
+
+    let params = [
+        ParamValue::from(conversation_id),
+        ParamValue::from(tail_idx),
+    ];
+    let indexed_probe = "SELECT id
+                         FROM messages INDEXED BY sqlite_autoindex_messages_1
+                         WHERE conversation_id = ?1 AND idx = ?2
+                         LIMIT 1";
+    let fallback_probe = "SELECT id
+                          FROM messages
+                          WHERE conversation_id = ?1 AND idx = ?2
+                          LIMIT 1";
+    let tail_ids: Vec<i64> = storage
+        .raw()
+        .query_map_collect(indexed_probe, &params, |row| row.get_typed(0))
+        .or_else(|err| {
+            if !err
+                .to_string()
+                .contains("no such index: sqlite_autoindex_messages_1")
+            {
+                return Err(err);
+            }
+            storage
+                .raw()
+                .query_map_collect(fallback_probe, &params, |row| row.get_typed(0))
+        })
+        .with_context(|| {
+            format!(
+                "probing semantic tail message for conversation {conversation_id} at idx {tail_idx}"
+            )
+        })?;
+    Ok(tail_ids.into_iter().next())
+}
+
 fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
     // `conversation_tail_state.last_message_idx` is the maintained, schema-v18
     // hot cache for every normal non-empty conversation. Merge that compact
@@ -885,8 +949,10 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
 }
 
 /// Return the exact next candidate prefix through bounded parent probes when
-/// the first parent page is dense enough. Sparse archives retain the global
-/// cursor fallback below, avoiding a semantic correctness trade-off.
+/// the first parent page is dense enough. Each normal parent resolves its
+/// single tail row through the canonical `(conversation_id, idx)` key instead
+/// of scanning a conversation history with an incompatible `id > cursor`
+/// predicate. Sparse or legacy archives retain the global cursor fallback.
 fn try_fetch_dense_semantic_candidate_conversation_ids(
     storage: &FrankenStorage,
     after_conversation_id: i64,
@@ -895,10 +961,10 @@ fn try_fetch_dense_semantic_candidate_conversation_ids(
 ) -> Result<Option<(Vec<i64>, usize)>> {
     let page_size = max_candidates.saturating_mul(4).clamp(256, 4_096);
     let page_size_i64 = i64::try_from(page_size).unwrap_or(i64::MAX);
-    let page: Vec<i64> = storage
+    let page: Vec<(i64, Option<i64>)> = storage
         .raw()
         .query_map_collect(
-            "SELECT id FROM conversations
+            "SELECT id, last_message_idx FROM conversations
              WHERE id > ?1
              ORDER BY id ASC
              LIMIT ?2",
@@ -906,10 +972,7 @@ fn try_fetch_dense_semantic_candidate_conversation_ids(
                 ParamValue::from(after_conversation_id),
                 ParamValue::from(page_size_i64),
             ],
-            |row| {
-                let conversation_id: i64 = row.get_typed(0)?;
-                Ok(conversation_id)
-            },
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
         )
         .with_context(|| {
             format!(
@@ -923,13 +986,21 @@ fn try_fetch_dense_semantic_candidate_conversation_ids(
     let page_len = page.len();
     let mut selected = Vec::with_capacity(max_candidates);
     let mut rows_scanned = 0usize;
-    for conversation_id in page {
+    for (conversation_id, legacy_last_message_idx) in page {
         rows_scanned = rows_scanned.saturating_add(1);
-        if semantic_conversation_has_message_after(
+        let has_newer_message = match semantic_conversation_tail_message_id(
             storage,
             conversation_id,
-            Some(after_message_id),
+            legacy_last_message_idx,
         )? {
+            Some(tail_message_id) => tail_message_id > after_message_id,
+            None => semantic_conversation_has_message_after(
+                storage,
+                conversation_id,
+                Some(after_message_id),
+            )?,
+        };
+        if has_newer_message {
             selected.push(conversation_id);
             if selected.len() >= max_candidates {
                 return Ok(Some((selected, rows_scanned)));
