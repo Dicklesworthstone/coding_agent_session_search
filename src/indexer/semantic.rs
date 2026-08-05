@@ -884,6 +884,66 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
     Ok(count)
 }
 
+/// Return the exact next candidate prefix through bounded parent probes when
+/// the first parent page is dense enough. Sparse archives retain the global
+/// cursor fallback below, avoiding a semantic correctness trade-off.
+fn try_fetch_dense_semantic_candidate_conversation_ids(
+    storage: &FrankenStorage,
+    after_conversation_id: i64,
+    after_message_id: i64,
+    max_candidates: usize,
+) -> Result<Option<(Vec<i64>, usize)>> {
+    let page_size = max_candidates.saturating_mul(4).clamp(256, 4_096);
+    let page_size_i64 = i64::try_from(page_size).unwrap_or(i64::MAX);
+    let page: Vec<i64> = storage
+        .raw()
+        .query_map_collect(
+            "SELECT id FROM conversations
+             WHERE id > ?1
+             ORDER BY id ASC
+             LIMIT ?2",
+            &[
+                ParamValue::from(after_conversation_id),
+                ParamValue::from(page_size_i64),
+            ],
+            |row| {
+                let conversation_id: i64 = row.get_typed(0)?;
+                Ok(conversation_id)
+            },
+        )
+        .with_context(|| {
+            format!(
+                "listing dense semantic candidate page after conversation {after_conversation_id}"
+            )
+        })?;
+    if page.is_empty() {
+        return Ok(Some((Vec::new(), 0)));
+    }
+
+    let page_len = page.len();
+    let mut selected = Vec::with_capacity(max_candidates);
+    let mut rows_scanned = 0usize;
+    for conversation_id in page {
+        rows_scanned = rows_scanned.saturating_add(1);
+        if semantic_conversation_has_message_after(
+            storage,
+            conversation_id,
+            Some(after_message_id),
+        )? {
+            selected.push(conversation_id);
+            if selected.len() >= max_candidates {
+                return Ok(Some((selected, rows_scanned)));
+            }
+        }
+    }
+
+    if page_len < page_size {
+        Ok(Some((selected, rows_scanned)))
+    } else {
+        Ok(None)
+    }
+}
+
 fn fetch_bounded_semantic_candidate_conversation_ids(
     storage: &FrankenStorage,
     after_conversation_id: i64,
@@ -892,6 +952,15 @@ fn fetch_bounded_semantic_candidate_conversation_ids(
 ) -> Result<(Vec<i64>, usize)> {
     let max_candidates = max_candidates.max(1);
     if let Some(after_message_id) = after_message_id {
+        if let Some(fast_path) = try_fetch_dense_semantic_candidate_conversation_ids(
+            storage,
+            after_conversation_id,
+            after_message_id,
+            max_candidates,
+        )? {
+            return Ok(fast_path);
+        }
+
         // Resume from the canonical global message cursor, not from the much
         // wider parent-table gap.  The previous implementation paged
         // `conversations` and executed one prepared message probe for every
