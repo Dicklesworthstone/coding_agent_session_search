@@ -126,6 +126,11 @@
       "found": false
     },
     {
+      "name": "goose",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
       "name": "crush",
       "path": "(not detected)",
       "found": false

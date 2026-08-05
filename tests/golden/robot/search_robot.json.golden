@@ -26,7 +26,7 @@
   "hits_clamped": false,
   "budget": {
     "elapsed_ms": "[ELAPSED_MS]",
-    "budget_ms": 8000,
+    "budget_ms": 120000,
     "timed_out": false,
     "skipped_sections": [],
     "recommended_next_probe": null

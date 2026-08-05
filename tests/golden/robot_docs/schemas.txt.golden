@@ -14,6 +14,7 @@ schemas: (auto-generated from contract)
         - files_scanned: integer
         - lines_scanned: integer
         - partial: boolean
+        - schema_version: integer
         - stop_reason: string
         - timed_out: boolean
       - redaction: object
@@ -80,6 +81,12 @@ schemas: (auto-generated from contract)
     - asset_taxonomy: array
     - auto_fix_actions: array
     - auto_fix_applied: boolean
+    - budget: object
+      - budget_ms: integer
+      - elapsed_ms: integer
+      - recommended_next_probe: ?
+      - skipped_sections: array
+      - timed_out: boolean
     - candidate_staging: object
       - blocked_candidate_count: integer
       - candidates: array
@@ -242,6 +249,7 @@ schemas: (auto-generated from contract)
       - visible_current_source_bytes: integer
       - visible_current_source_count: integer
     - daemon_runtime: object
+    - degraded_reason_codes: array
     - derived_semantic_assets: object
       - asset_class: string
       - auto_download_allowed: boolean
@@ -517,6 +525,7 @@ schemas: (auto-generated from contract)
       - status: string
       - total_candidate_count: integer
       - warnings: array
+    - reason_code: ?
     - recommended_action: ?
     - remote_source_sync: object
       - archive_remote_conversation_count: integer
@@ -3250,6 +3259,12 @@ schemas: (auto-generated from contract)
       - data_dir: string
       - db_path: string
       - timestamp: string
+    - budget: object
+      - budget_ms: integer
+      - elapsed_ms: integer
+      - recommended_next_probe: ?
+      - skipped_sections: array
+      - timed_out: boolean
     - coverage_risk: object
       - archive_conversation_count: integer
       - confidence_tier: string
@@ -3263,6 +3278,7 @@ schemas: (auto-generated from contract)
       - schema_version: integer
       - sole_copy_warning_count: integer
       - status: string
+    - daemon_runtime: object
     - data_dir: string
     - database: object
       - conversations: ?
@@ -3470,6 +3486,22 @@ schemas: (auto-generated from contract)
       - status: string
       - sync_gap_count: integer
       - sync_staleness: string
+    - root_cause: object
+      - confidence: string
+      - evidence_refs: array
+      - family: string
+      - locus: string
+      - recommended_next_probe: ?
+      - schema_version: integer
+      - summary: string
+    - search_completeness: object
+      - can_search: boolean
+      - complete: boolean
+      - coverage_suspect: boolean
+      - impact: string
+      - next_command: string
+      - quarantine_status: string
+      - quarantined_conversations: integer
     - semantic: object
       - availability: string
       - available: boolean
@@ -3532,6 +3564,16 @@ schemas: (auto-generated from contract)
       - summary: string
       - vector_index_path: ?
     - status: string
+    - storage_integrity: object
+      - archive_readability: string
+      - attestation_check_depth: string
+      - attestation_source: string
+      - attested_at_ms: integer
+      - attested_db_fingerprint: string
+      - checks_attempted: array
+      - checks_not_attempted: array
+      - source_of_truth_risk: string
+      - storage_state: string
     - topology_budget: object
       - advisory_budgets: object
         - cache_cap_bytes: integer
@@ -3597,6 +3639,12 @@ schemas: (auto-generated from contract)
       - data_dir: string
       - db_path: string
       - timestamp: string
+    - budget: object
+      - budget_ms: integer
+      - elapsed_ms: integer
+      - recommended_next_probe: ?
+      - skipped_sections: array
+      - timed_out: boolean
     - coverage_risk: object
       - archive_conversation_count: integer
       - confidence_tier: string
@@ -3947,6 +3995,12 @@ schemas: (auto-generated from contract)
       - data_dir: string
       - db_path: string
       - timestamp: string
+    - budget: object
+      - budget_ms: integer
+      - elapsed_ms: integer
+      - recommended_next_probe: ?
+      - skipped_sections: array
+      - timed_out: boolean
     - data_dir: string
     - discovery: object
       - api_version_command: string
@@ -4089,6 +4143,7 @@ schemas: (auto-generated from contract)
     - status: string
     - surface: string
   view:
+    - archive_only: boolean
     - budget: object
       - budget_ms: integer
       - elapsed_ms: integer
@@ -4100,6 +4155,7 @@ schemas: (auto-generated from contract)
     - highlight_line: ?
     - lines: array
     - path: string
+    - source_exists: boolean
     - start_line: integer
     - target_line: ?
     - total_lines: integer

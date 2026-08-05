@@ -212,6 +212,7 @@ pub mod crush;
 pub mod cursor;
 pub mod factory;
 pub mod gemini;
+pub mod goose;
 pub mod grok;
 pub mod hermes;
 pub mod kimi;
@@ -246,4 +247,88 @@ pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
             }
         })
         .collect()
+}
+
+/// gh373 third variant (bead oeu5a): ambient work-liveness sink for
+/// connector-internal parse loops.
+///
+/// The #332 activity tick fires only once per COMPLETED conversation, so a
+/// connector spending minutes inside the line loop of one giant source file
+/// (observed: 60-90MB codex rollouts, ~40k lines) starves the stall
+/// watchdog's counters and draws a spurious exit(70). Connector code has no
+/// `IndexingProgress` handle — `ScanContext` lives in the pinned external
+/// `franken_agent_detection` crate — so the indexer registers a tick closure
+/// here for the duration of a run and deep parse loops call
+/// [`scan_activity::tick`] every N lines.
+///
+/// Multiple concurrent registrations are supported (in-process tests):
+/// `tick` fans out to every live sink — an extra tick can only delay a false
+/// stall report, never corrupt state. Registration is cheap; `tick` takes a
+/// mutex only once per stride (default: caller ticks every ~1024 lines).
+pub mod scan_activity {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Registered liveness sinks: `(registration id, tick callback)`.
+    type SinkRegistry = Vec<(u64, Box<dyn Fn() + Send + Sync>)>;
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    static SINKS: Mutex<SinkRegistry> = Mutex::new(Vec::new());
+
+    /// Unregisters its sink on drop. Hold for the duration of an index run.
+    pub struct ScanActivityGuard {
+        id: u64,
+    }
+
+    pub fn register(tick: Box<dyn Fn() + Send + Sync>) -> ScanActivityGuard {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut sinks) = SINKS.lock() {
+            sinks.push((id, tick));
+        }
+        ScanActivityGuard { id }
+    }
+
+    impl Drop for ScanActivityGuard {
+        fn drop(&mut self) {
+            if let Ok(mut sinks) = SINKS.lock() {
+                sinks.retain(|(id, _)| *id != self.id);
+            }
+        }
+    }
+
+    /// Record connector-internal parse liveness. No-op when no index run has
+    /// registered a sink (e.g. connector unit tests).
+    pub fn tick() {
+        if let Ok(sinks) = SINKS.lock() {
+            for (_, sink) in sinks.iter() {
+                sink();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        #[test]
+        fn tick_reaches_registered_sink_and_stops_after_guard_drop() {
+            let count = Arc::new(AtomicUsize::new(0));
+            let sink_count = Arc::clone(&count);
+            let guard = register(Box::new(move || {
+                sink_count.fetch_add(1, Ordering::Relaxed);
+            }));
+            tick();
+            tick();
+            assert_eq!(count.load(Ordering::Relaxed), 2);
+            drop(guard);
+            tick();
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                2,
+                "a dropped guard's sink must not receive further ticks"
+            );
+        }
+    }
 }

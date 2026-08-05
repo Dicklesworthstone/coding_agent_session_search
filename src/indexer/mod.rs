@@ -1033,6 +1033,16 @@ pub struct IndexingProgress {
     /// canonical DB malformed to stock SQLite (#296/#321). Liveness is still
     /// bounded: see `index_finalize_abort_threshold` (#319).
     pub finalizing: AtomicBool,
+    /// gh373 third variant (bead oeu5a): true while the streaming consumer is
+    /// inside `persist::persist_conversations_batched*` for one ingest batch.
+    /// A single giant conversation (observed: 60-90MB codex rollouts, ~40k
+    /// messages) makes that call run for many minutes — allocator-heavy
+    /// redaction in `map_to_internal_with_redactor` before the first WAL
+    /// write — during which `current` cannot move and, before the
+    /// per-message heartbeat existed, `activity` did not either. The stall
+    /// watchdog grants this window the finalize-class abort grace as defense
+    /// in depth (the per-message heartbeat is the primary liveness signal).
+    pub persist_in_progress: AtomicBool,
     /// Number of coding agents discovered so far during scanning
     pub discovered_agents: AtomicUsize,
     /// Names of discovered agents (protected by mutex for concurrent access)
@@ -1259,6 +1269,7 @@ impl IndexingProgress {
         let agents = self.discovered_agents.load(Ordering::Relaxed);
         let is_rebuilding = self.is_rebuilding.load(Ordering::Relaxed);
         let finalizing = self.finalizing.load(Ordering::Relaxed);
+        let persist_in_progress = self.persist_in_progress.load(Ordering::Relaxed);
         let agent_names: Vec<String> = self
             .discovered_agent_names
             .lock()
@@ -1463,6 +1474,11 @@ impl IndexingProgress {
             // current==total snapshot with `finalizing: true` is an active
             // final checkpoint, NOT a #297 wedge.
             "finalizing": finalizing,
+            // gh373/oeu5a: true while one ingest batch is inside batched
+            // persistence (redaction/map + writer transaction). A phase-2
+            // snapshot with frozen counters but `persist_in_progress: true`
+            // is an active giant-batch persist, not a wedge.
+            "persist_in_progress": persist_in_progress,
             "elapsed_ms": elapsed_ms,
             "rate_per_sec": rate_per_sec,
             "eta_seconds": eta_seconds,
@@ -2732,6 +2748,55 @@ fn try_readonly_canonical_force_rebuild(
             observed_messages,
         );
     }
+
+    // Force-rebuild deliberately skips the writable index path (readonly DB →
+    // Tantivy only). Without an explicit watermark write, `last_indexed_at`
+    // stays frozen from the previous incremental run and `cass status` /
+    // `cass health` report stale forever even though the lexical index is
+    // freshly rebuilt. performed_scan=false so last_scan_ts is preserved.
+    let now_ms = FrankenStorage::now_millis();
+    match FrankenStorage::open_writer(&opts.db_path) {
+        Ok(writer) => {
+            let write_result = writer.set_last_indexed_at(now_ms);
+            match writer.close() {
+                Ok(()) => {
+                    if let Err(err) = write_result {
+                        tracing::warn!(
+                            db_path = %opts.db_path.display(),
+                            now_ms,
+                            error = %format!("{err:#}"),
+                            "force rebuild succeeded but failed to update last_indexed_at; \
+                             status/health may report stale until the next index run"
+                        );
+                    } else {
+                        tracing::info!(
+                            now_ms,
+                            "updated last_indexed_at for status display after force rebuild"
+                        );
+                    }
+                }
+                Err(close_err) => {
+                    tracing::warn!(
+                        db_path = %opts.db_path.display(),
+                        now_ms,
+                        write_ok = write_result.is_ok(),
+                        error = %format!("{close_err:#}"),
+                        "force rebuild metadata writer close failed after last_indexed_at update attempt"
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                now_ms,
+                error = %format!("{err:#}"),
+                "force rebuild succeeded but could not open writer to update last_indexed_at; \
+                 status/health may report stale until the next index run"
+            );
+        }
+    }
+
     Ok(true)
 }
 
@@ -9187,14 +9252,20 @@ fn should_run_targeted_watch_once_only(
     has_watch_once_paths: bool,
     watch_enabled: bool,
     full_rebuild: bool,
-    needs_rebuild: bool,
-    canonical_sessions_before_salvage: usize,
+    _needs_rebuild: bool,
+    _canonical_sessions_before_salvage: usize,
 ) -> bool {
-    if !has_watch_once_paths || watch_enabled || full_rebuild {
-        return false;
-    }
-
-    !needs_rebuild || canonical_sessions_before_salvage == 0
+    // GH #350: an explicit targeted `--watch-once <paths>` ALWAYS bounds work to
+    // the supplied paths — the path-scoped run ingests the changed sessions and
+    // applies their inline lexical updates, deferring any broader authoritative
+    // rebuild (exactly as the plain-index path defers it) instead of scanning the
+    // whole archive. Previously `!needs_rebuild || canonical_sessions == 0`
+    // flipped a populated archive whose derived index looked stale into a
+    // full-corpus authoritative rebuild — the reported "scans large archive for
+    // one changed session". `needs_rebuild` is true for essentially any change a
+    // watch-once exists to ingest, so gating the targeted path on it defeated the
+    // feature; the size-based deferral now keeps the run path-bounded.
+    has_watch_once_paths && !watch_enabled && !full_rebuild
 }
 
 fn should_skip_absent_explicit_watch_once_paths(opts: &IndexOptions) -> bool {
@@ -9447,56 +9518,135 @@ fn repair_fallback_fts_after_full_index_run(
         }
     };
 
-    if let Some(archive_fingerprint) = known_archive_fingerprint {
-        match fresh_storage
-            .fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)
-        {
-            Ok(true) => {
-                return Ok(Some(
-                    FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
+    let outcome: FallbackFtsRepairOutcome = 'compute: {
+        if let Some(archive_fingerprint) = known_archive_fingerprint {
+            match fresh_storage
+                .fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)
+            {
+                Ok(true) => {
+                    break 'compute FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
                         archive_fingerprint: archive_fingerprint.to_string(),
-                    },
-                ));
-            }
-            Ok(false) => {}
-            // #329: same policy as the repair itself — a failed probe of the
-            // optional derived asset must not fail the completed run.
-            Err(err) => {
-                return Ok(Some(FallbackFtsRepairOutcome::SkippedRepairFailed {
-                    detail: format!("probing fallback FTS archive-fingerprint health: {err:#}"),
-                }));
+                    };
+                }
+                Ok(false) => {}
+                // #329: same policy as the repair itself — a failed probe of the
+                // optional derived asset must not fail the completed run.
+                Err(err) => {
+                    break 'compute FallbackFtsRepairOutcome::SkippedRepairFailed {
+                        detail: format!("probing fallback FTS archive-fingerprint health: {err:#}"),
+                    };
+                }
             }
         }
-    }
 
-    let repair = match fresh_storage.ensure_search_fallback_fts_consistency() {
-        Ok(repair) => repair,
-        Err(err) => {
-            let detail = format!("{err:#}");
-            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail.clone()) {
-                return Ok(Some(outcome));
+        let repair = match fresh_storage.ensure_search_fallback_fts_consistency() {
+            Ok(repair) => repair,
+            Err(err) => {
+                let detail = format!("{err:#}");
+                if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail.clone()) {
+                    break 'compute outcome;
+                }
+                // #329/#345: internal repair failures (frankensqlite "out of
+                // memory" on huge shadow rebuilds being the reported case) no
+                // longer fail an `index --full` whose canonical + Tantivy work
+                // already completed. Lexical search is served by Tantivy and
+                // doctor treats the shadow state honestly on its next check.
+                break 'compute FallbackFtsRepairOutcome::SkippedRepairFailed { detail };
             }
-            // #329/#345: internal repair failures (frankensqlite "out of
-            // memory" on huge shadow rebuilds being the reported case) no
-            // longer fail an `index --full` whose canonical + Tantivy work
-            // already completed. Lexical search is served by Tantivy and
-            // doctor treats the shadow state honestly on its next check.
-            return Ok(Some(FallbackFtsRepairOutcome::SkippedRepairFailed {
-                detail,
-            }));
+        };
+        if let Some(archive_fingerprint) = known_archive_fingerprint
+            && let Err(err) =
+                fresh_storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)
+        {
+            // The repair itself SUCCEEDED — only the memo that lets the next run
+            // skip re-probing failed to persist, so the worst case is one
+            // redundant probe/repair later. Report the repair honestly instead
+            // of discarding it as SkippedRepairFailed, which logged "repair
+            // failed" for a fully repaired shadow (adversarial-review F5).
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "fallback FTS repair succeeded but recording its archive fingerprint failed; the next run will re-probe"
+            );
         }
+        FallbackFtsRepairOutcome::Repaired(repair)
     };
-    if let Some(archive_fingerprint) = known_archive_fingerprint
-        && let Err(err) =
-            fresh_storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)
+
+    // zn1xn (adversarial-review F5): persist a "canonical FTS shadow may be
+    // half-rebuilt" marker when the repair was skipped/failed, or clear it once
+    // the shadow is repaired/known-healthy, so `cass index --json` / `status`
+    // surface the half-built shadow immediately. Best-effort: a marker write
+    // failure must never fail a run whose canonical + Tantivy work succeeded.
+    if let Err(err) = fresh_storage
+        .record_fallback_fts_repair_pending(fallback_fts_repair_pending_detail(&outcome))
     {
-        return Ok(Some(FallbackFtsRepairOutcome::SkippedRepairFailed {
-            detail: format!(
-                "fallback FTS repair succeeded but recording its archive fingerprint failed: {err:#}"
-            ),
-        }));
+        tracing::debug!(
+            error = %format!("{err:#}"),
+            "recording fallback FTS repair-pending marker failed (non-fatal)"
+        );
     }
-    Ok(Some(FallbackFtsRepairOutcome::Repaired(repair)))
+    Ok(Some(outcome))
+}
+
+/// The failure detail to persist as the "shadow may be half-rebuilt" marker for
+/// an outcome — `Some` for the skipped/failed cases, `None` (clear) when the
+/// shadow is repaired or known-healthy (zn1xn).
+fn fallback_fts_repair_pending_detail(outcome: &FallbackFtsRepairOutcome) -> Option<&str> {
+    match outcome {
+        FallbackFtsRepairOutcome::SkippedRepairFailed { detail }
+        | FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail }
+        | FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail } => {
+            Some(detail.as_str())
+        }
+        FallbackFtsRepairOutcome::Repaired(_)
+        | FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod fallback_fts_repair_pending_tests {
+    use super::{FallbackFtsRepairOutcome, fallback_fts_repair_pending_detail};
+    use crate::storage::sqlite::FtsConsistencyRepair;
+
+    #[test]
+    fn only_broken_outcomes_mark_the_shadow_pending() {
+        assert_eq!(
+            fallback_fts_repair_pending_detail(&FallbackFtsRepairOutcome::SkippedRepairFailed {
+                detail: "boom".to_string()
+            }),
+            Some("boom")
+        );
+        assert_eq!(
+            fallback_fts_repair_pending_detail(
+                &FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex {
+                    detail: "corrupt".to_string()
+                }
+            ),
+            Some("corrupt")
+        );
+        assert_eq!(
+            fallback_fts_repair_pending_detail(
+                &FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload {
+                    detail: "unsupported".to_string()
+                }
+            ),
+            Some("unsupported")
+        );
+        // Repaired / known-healthy outcomes clear the marker (None).
+        assert_eq!(
+            fallback_fts_repair_pending_detail(
+                &FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
+                    archive_fingerprint: "fp".to_string()
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            fallback_fts_repair_pending_detail(&FallbackFtsRepairOutcome::Repaired(
+                FtsConsistencyRepair::AlreadyHealthy { rows: 3 }
+            )),
+            None
+        );
+    }
 }
 
 fn full_rebuild_requires_historical_restart(
@@ -10483,7 +10633,7 @@ fn published_lexical_index_validated_for_current_data(index_path: &Path, db_path
         Ok(current_fingerprint) => current_fingerprint == checkpoint.storage_fingerprint,
         Err(err) => {
             tracing::debug!(
-                error = %err,
+                error = %format!("{err:#}"),
                 "could not compute current storage fingerprint while validating published index"
             );
             false
@@ -11795,6 +11945,21 @@ fn spawn_connector_producer(
         let mut is_discovered = false;
         let mut scan_succeeded = true;
 
+        // #373 Variant A: give the connector a liveness tick so a long internal
+        // scan (e.g. decoding a large opencode.db) advances the watchdog's
+        // `activity` signal BEFORE the first conversation is yielded — otherwise
+        // a multi-minute pre-first-yield scan false-fires as a stall. Wired to
+        // the same per-conversation `tick_activity` the streaming consumer uses.
+        let scan_progress_tick: Option<Arc<dyn Fn() + Send + Sync>> =
+            config.progress.as_ref().map(|progress| {
+                let progress = Arc::clone(progress);
+                Arc::new(move || progress.tick_activity()) as Arc<dyn Fn() + Send + Sync>
+            });
+        let with_scan_tick = |ctx: crate::connectors::ScanContext| match &scan_progress_tick {
+            Some(tick) => ctx.with_progress_tick(Arc::clone(tick)),
+            None => ctx,
+        };
+
         if detect.detected {
             // Update discovered agents count immediately when detected
             if let Some(p) = &config.progress {
@@ -11809,10 +11974,10 @@ fn spawn_connector_producer(
                 .unwrap_or(config.since_ts);
 
             // Scan local sources
-            let ctx = crate::connectors::ScanContext::local_default(
+            let ctx = with_scan_tick(crate::connectors::ScanContext::local_default(
                 config.data_dir.clone(),
                 local_since_ts,
-            );
+            ));
             let local_origin = Origin::local();
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
@@ -11918,11 +12083,11 @@ fn spawn_connector_producer(
                     "configured scan root is using a full root scan so already-mirrored sessions can be promoted to canonical"
                 );
             }
-            let ctx = crate::connectors::ScanContext::with_roots(
+            let ctx = with_scan_tick(crate::connectors::ScanContext::with_roots(
                 root.path.clone(),
                 vec![root.clone()],
                 root_since_ts,
-            );
+            ));
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
             let mut ingest_diagnostics = capture_connector_sources_before_parse(
@@ -13201,6 +13366,17 @@ pub fn run_index(
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
+    // gh373/oeu5a: let connector-internal parse loops (which have no
+    // IndexingProgress handle) tick work-liveness for this run's stall
+    // watchdog. Weak: the sink must never extend the progress lifetime.
+    let _scan_activity_guard = opts.progress.as_ref().map(|progress| {
+        let weak = Arc::downgrade(progress);
+        crate::connectors::scan_activity::register(Box::new(move || {
+            if let Some(progress) = weak.upgrade() {
+                progress.tick_activity();
+            }
+        }))
+    });
     // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
     // flows. Keep routine indexing focused on the canonical conversation store
     // and lexical assets; set CASS_INLINE_ANALYTICS_UPDATES=1 to restore the
@@ -14440,6 +14616,12 @@ pub fn run_index(
 
                 let additional_scan_roots =
                     additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
+                // #372: drop remote mirror roots whose on-disk fingerprint is
+                // unchanged since the last error-free scan (they would otherwise
+                // be fully re-scanned every run), and capture fingerprints to
+                // persist for the roots we still scan.
+                let (additional_scan_roots, mirror_fingerprints_to_store) =
+                    plan_remote_mirror_scan_skips(&storage, &opts, additional_scan_roots);
                 let scan_requires_tantivy =
                     lexical_population_strategy_requires_inline_tantivy(lexical_strategy);
 
@@ -14498,6 +14680,23 @@ pub fn run_index(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
                     scan_had_errors |= scan_outcome.scan_had_errors;
+                }
+                // #372: persist remote mirror fingerprints only after an
+                // error-free scan (the same signal that gates last_scan_ts), so
+                // a scan with errors never memoizes a fingerprint that would
+                // skip re-scanning incompletely-ingested mirror data.
+                if !scan_had_errors {
+                    for (source_id, fingerprint) in &mirror_fingerprints_to_store {
+                        if let Err(error) =
+                            storage.record_mirror_scan_fingerprint(source_id, fingerprint)
+                        {
+                            tracing::warn!(
+                                source_id = %source_id,
+                                error = %error,
+                                "failed to record remote mirror scan fingerprint (#372)"
+                            );
+                        }
+                    }
                 }
                 performed_scan = true;
                 stale_index_ingest_quarantine_retry_attempted =
@@ -14915,6 +15114,26 @@ pub fn run_index(
             scan_start_ts,
             now_ms,
         )?;
+        // zn1xn F4: track the persistent lexical-repair deferral streak so
+        // `status`/`index --json` expose the recurring full-rebuild
+        // amplification (previously only a stderr warn). Increment when this
+        // run deferred inline lexical updates; clear the streak when a scan
+        // completed without deferring. Best-effort observability — a marker
+        // write must never fail a run whose indexing work already succeeded.
+        if scan_lexical_update_deferred {
+            if let Err(err) = storage.record_lexical_repair_deferred(
+                "inline lexical updates deferred during non-watch scan (streaming ingest \
+                 pressure on one or more conversations); full authoritative lexical rebuild \
+                 performed — recurs every run until the offending source is resolved",
+            ) {
+                tracing::debug!(
+                    error = %format!("{err:#}"),
+                    "recording lexical-repair deferral marker failed (non-fatal)"
+                );
+            }
+        } else if performed_scan {
+            let _ = storage.clear_lexical_repair_deferred();
+        }
         if performed_scan_for_connector_watermarks {
             persist_connector_scan_watermarks(
                 &storage,
@@ -14943,6 +15162,30 @@ pub fn run_index(
             "skipping final lexical checkpoint refresh because targeted watch-once startup does not need broad checkpoint maintenance"
         );
     } else if let Some(deferred) = &large_incremental_authoritative_lexical_repair_probe_deferred {
+        // GH #353: a large incremental run defers the *expensive* authoritative
+        // rebuild — but it must NOT preserve a stale lexical checkpoint
+        // fingerprint forever. Otherwise search's fingerprint-mismatch defer
+        // ("storage fingerprint no longer matches") and this run's deferral form
+        // a loop that never repairs (`cass index` no-ops above the size cap and
+        // re-preserves the very fingerprint that keeps triggering the defer).
+        //
+        // Break the loop with the CHEAP, doc-count-gated metadata-only refresh:
+        // `refresh_completed_lexical_rebuild_checkpoint` rewrites the checkpoint
+        // fingerprint ONLY when the live Tantivy index already matches the
+        // canonical message count (i.e. the drift was absorbed inline), and
+        // safely skips otherwise — so it never masks genuine staleness (which
+        // would silently drop the newly-ingested sessions from search). When
+        // Tantivy is really behind, the refresh no-ops and search keeps
+        // deferring; the real escalation there is a full rebuild, named below.
+        if let Err(err) =
+            refresh_completed_lexical_rebuild_checkpoint(&storage, &opts.db_path, &opts.data_dir)
+        {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                error = %format!("{err:#}"),
+                "gh353: bounded lexical checkpoint reconciliation failed; leaving the checkpoint unchanged"
+            );
+        }
         tracing::warn!(
             db_path = %opts.db_path.display(),
             canonical_conversations = deferred.canonical_conversations,
@@ -14952,7 +15195,7 @@ pub fn run_index(
             reason = deferred.reason,
             inserted_conversations = scan_canonical_mutations.inserted_conversations,
             inserted_messages = scan_canonical_mutations.inserted_messages,
-            "skipping final lexical checkpoint refresh because this large incremental run deferred expensive lexical repair probes"
+            "deferred the expensive authoritative lexical repair on this large incremental run and reconciled the lexical checkpoint against the live Tantivy index where equivalent (GH #353). If search still reports the storage fingerprint no longer matches, the derived index is genuinely behind — run 'cass index --full --force-rebuild' to rebuild the lexical index authoritatively"
         );
     } else if should_skip_noop_final_lexical_checkpoint_refresh(
         opts.full,
@@ -16694,15 +16937,22 @@ fn canonical_archive_unhealthy_for_index_error(db_path: &Path, reason: &str) -> 
     anyhow::anyhow!(
         "canonical cass archive at {} is not safe for indexing: {reason}. \
          cass index will not replace or truncate the SQLite source of truth. \
-         Run 'cass doctor check --json' to inspect the archive. If the canonical \
-         rows are readable but a derived/FTS5 structure is corrupt, run \
-         'cass doctor --rebuild-canonical-fts --dry-run --json' and apply its safe \
-         parity repair with '--yes'. If the archive cannot be opened, recover the \
-         source tree from cass's own preserved events with \
-         'cass doctor --recover-from-archive <DIR>' (rebuilds source JSONL from the \
-         extra_json/extra_bin envelopes — no stock-sqlite .recover needed), then \
-         re-ingest with 'cass index --full'. An explicit backup restore via \
-         'cass doctor backups restore <id>' also remains available.",
+         Run 'cass doctor check --json' first — it ranks the recovery authorities \
+         (canonical DB vs a checksum-verified raw mirror vs backups) and names the \
+         exact next command. If the canonical rows are readable but a derived/FTS5 \
+         structure is corrupt, run 'cass doctor --rebuild-canonical-fts --dry-run \
+         --json' and apply its safe parity repair with '--yes' (if the FTS \
+         corruption blocks the open itself so even that repair cannot read the \
+         archive — GH #368 — treat it as unopenable and use reconstruct below). \
+         If the archive \
+         cannot be opened at all, run 'cass doctor reconstruct --json': it rebuilds \
+         the canonical archive from the checksum-verified raw-mirror blobs (reading \
+         the mirror, not the dead DB) and promotes it behind a coverage gate with a \
+         backup of the corrupt bundle. If instead the archive opens read-only but is \
+         malformed, 'cass doctor --recover-from-archive <DIR>' rebuilds the source \
+         JSONL from cass's preserved extra_json/extra_bin envelopes for re-ingest. \
+         An explicit backup restore via 'cass doctor backups restore <id>' also \
+         remains available.",
         db_path.display()
     )
 }
@@ -21383,6 +21633,32 @@ fn ingest_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// gh373/oeu5a RAII guard: marks `IndexingProgress::persist_in_progress` for
+/// the duration of one batched-persist call so the stall watchdog can grant
+/// an active giant-batch persist the finalize-class abort grace instead of
+/// killing it at the ordinary 300s no-progress threshold. Cleared on drop —
+/// including the error path — so a failed persist never leaves the grace
+/// stuck on.
+struct PersistInProgressGuard<'a>(Option<&'a IndexingProgress>);
+
+impl<'a> PersistInProgressGuard<'a> {
+    fn engage(progress: Option<&'a IndexingProgress>) -> Self {
+        if let Some(p) = progress {
+            p.persist_in_progress.store(true, Ordering::Relaxed);
+        }
+        Self(progress)
+    }
+}
+
+impl Drop for PersistInProgressGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = self.0 {
+            p.persist_in_progress.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ingest_batch_detailed(
     storage: &FrankenStorage,
     t_index: Option<&mut TantivyIndex>,
@@ -21398,14 +21674,23 @@ fn ingest_batch_detailed(
     // Persistence now uses short-lived writer connections internally so the
     // long-lived watch/session handle does not accumulate retained MVCC state
     // on older frankensqlite builds that ignore autocommit_retain.
-    let batch_result = persist::persist_conversations_batched_with_raw_mirror_links(
-        storage,
-        t_index,
-        data_dir,
-        convs,
-        lexical_strategy,
-        defer_checkpoints,
-    );
+    //
+    // gh373/oeu5a: thread the work-liveness heartbeat into the persist call
+    // (per-message ticks during redaction/map, per-chunk ticks during write)
+    // and flag `persist_in_progress` for the watchdog's defense-in-depth
+    // grace — one giant conversation legitimately persists for minutes.
+    let batch_result = {
+        let _persist_in_progress = PersistInProgressGuard::engage(progress.as_deref());
+        persist::persist_conversations_batched_with_raw_mirror_links(
+            storage,
+            t_index,
+            data_dir,
+            convs,
+            lexical_strategy,
+            defer_checkpoints,
+            persist::PersistHeartbeat::new(progress.as_deref(), progress_bump),
+        )
+    };
     let batch_outcome = match batch_result {
         Ok(batch_outcome) => batch_outcome,
         Err(error) => {
@@ -21674,7 +21959,15 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         });
     }
 
-    record_index_poison_conversation(data_dir, conv, &error)?;
+    record_index_poison_conversation(
+        data_dir,
+        conv,
+        &error,
+        Some(PoisonMemoryAttribution {
+            real_memory_pressure: real_pressure,
+            indexed_text_bytes,
+        }),
+    )?;
     if let Some(progress) = progress {
         progress.current.fetch_add(1, Ordering::Relaxed);
     }
@@ -21714,6 +22007,11 @@ fn ingest_batch_with_semantic_delta(
         lexical_strategy,
         defer_checkpoints,
     );
+    // gh373/oeu5a: same heartbeat + persist_in_progress treatment as
+    // `ingest_batch_detailed` — watch-session batches can also carry one
+    // giant conversation. No index-run lock bump handle exists on this path.
+    let heartbeat = persist::PersistHeartbeat::new(progress.as_deref(), None);
+    let _persist_in_progress = PersistInProgressGuard::engage(progress.as_deref());
     let batch_result = if semantic_delta.is_some() {
         persist::persist_conversations_batched_with_semantic_delta_and_raw_mirror_links(
             storage,
@@ -21722,6 +22020,7 @@ fn ingest_batch_with_semantic_delta(
             convs,
             lexical_strategy,
             defer_checkpoints,
+            heartbeat,
         )
     } else {
         persist::persist_conversations_batched_with_raw_mirror_links(
@@ -21731,8 +22030,10 @@ fn ingest_batch_with_semantic_delta(
             convs,
             lexical_strategy,
             defer_checkpoints,
+            heartbeat,
         )
     };
+    drop(_persist_in_progress);
     let batch_outcome = match batch_result {
         Ok(batch_outcome) => batch_outcome,
         Err(error) => {
@@ -22039,7 +22340,15 @@ fn quarantine_single_watch_conversation(
     indexed_text_bytes: usize,
     real_memory_pressure: Option<bool>,
 ) -> Result<WatchIngestBatchOutcome> {
-    record_watch_poison_conversation(data_dir, conv, error)?;
+    record_watch_poison_conversation(
+        data_dir,
+        conv,
+        error,
+        Some(PoisonMemoryAttribution {
+            real_memory_pressure,
+            indexed_text_bytes,
+        }),
+    )?;
     if let Some(progress) = progress {
         progress.current.fetch_add(1, Ordering::Relaxed);
     }
@@ -22200,10 +22509,47 @@ fn format_error_chain(error: &anyhow::Error) -> String {
     parts.join(" | ")
 }
 
+/// Why a single-conversation OOM became a *quarantine* rather than a defer
+/// (#364). Recorded in the poison record so post-mortem triage (and
+/// `cass diag --quarantine`) can distinguish a genuine host-memory-pressure
+/// OOM from a precautionary quarantine of a large conversation taken when host
+/// pressure could not be determined — the exact confusion behind the "false
+/// OOM quarantine" report.
+#[derive(Debug, Clone, Copy)]
+struct PoisonMemoryAttribution {
+    /// `watch_oom_under_real_memory_pressure()` at quarantine time: `Some(true)`
+    /// = genuine host pressure, `Some(false)` = a bounded-allocation guard with
+    /// no host pressure, `None` = pressure could not be sampled.
+    real_memory_pressure: Option<bool>,
+    /// Indexed text size of the conversation that OOMed.
+    indexed_text_bytes: usize,
+}
+
+impl PoisonMemoryAttribution {
+    fn memory_pressure_label(self) -> &'static str {
+        match self.real_memory_pressure {
+            Some(true) => "real",
+            Some(false) => "none",
+            None => "unknown",
+        }
+    }
+
+    /// The trigger that turned this OOM into a quarantine (mirrors the
+    /// `should_quarantine` decision in the ingest paths).
+    fn quarantine_trigger(self) -> &'static str {
+        match self.real_memory_pressure {
+            Some(true) => "real_host_memory_pressure",
+            Some(false) => "bounded_allocation_guard_no_pressure",
+            None => "unknown_pressure_large_conversation_precaution",
+        }
+    }
+}
+
 fn record_watch_poison_conversation(
     data_dir: &Path,
     conv: &NormalizedConversation,
     error: &anyhow::Error,
+    attribution: Option<PoisonMemoryAttribution>,
 ) -> Result<()> {
     record_poison_conversation(
         data_dir,
@@ -22211,6 +22557,7 @@ fn record_watch_poison_conversation(
         "watch-ingest-out-of-memory",
         conv,
         error,
+        attribution,
     )
 }
 
@@ -22218,6 +22565,7 @@ fn record_index_poison_conversation(
     data_dir: &Path,
     conv: &NormalizedConversation,
     error: &anyhow::Error,
+    attribution: Option<PoisonMemoryAttribution>,
 ) -> Result<()> {
     record_poison_conversation(
         data_dir,
@@ -22225,6 +22573,7 @@ fn record_index_poison_conversation(
         "index-ingest-out-of-memory",
         conv,
         error,
+        attribution,
     )
 }
 
@@ -22240,6 +22589,7 @@ fn record_poison_conversation(
     reason: &str,
     conv: &NormalizedConversation,
     error: &anyhow::Error,
+    attribution: Option<PoisonMemoryAttribution>,
 ) -> Result<()> {
     let quarantine_dir = data_dir.join("quarantine");
     fs::create_dir_all(&quarantine_dir).with_context(|| {
@@ -22296,7 +22646,7 @@ fn record_poison_conversation(
     // `FrankenError::OutOfMemory` is just the bare string "out of memory" and
     // tells us nothing about which subsystem failed.
     let full_error_chain = format_error_chain(error);
-    let record = serde_json::json!({
+    let mut record = serde_json::json!({
         "schema_version": POISON_CONVERSATION_QUARANTINE_SCHEMA_VERSION,
         "conversation_id": conversation_id,
         "schema_version_at_quarantine": schema_version_at_quarantine,
@@ -22316,6 +22666,25 @@ fn record_poison_conversation(
         "ended_at": conv.ended_at,
         "message_count": conv.messages.len(),
     });
+    // #364: record WHY this OOM became a quarantine (genuine host pressure vs a
+    // precautionary large-conversation quarantine), additively so pre-#364
+    // records without attribution stay shape-compatible.
+    if let Some(attribution) = attribution
+        && let Some(object) = record.as_object_mut()
+    {
+        object.insert(
+            "memory_pressure".to_string(),
+            serde_json::json!(attribution.memory_pressure_label()),
+        );
+        object.insert(
+            "quarantine_trigger".to_string(),
+            serde_json::json!(attribution.quarantine_trigger()),
+        );
+        object.insert(
+            "indexed_text_bytes".to_string(),
+            serde_json::json!(attribution.indexed_text_bytes),
+        );
+    }
     records.insert(key, record);
 
     let mut file = OpenOptions::new()
@@ -24259,6 +24628,330 @@ fn explicit_watch_once_root_unchanged_after_last_index(
     Ok(!matches.is_empty())
 }
 
+/// #372: fingerprint the current on-disk state of a remote mirror directory as
+/// `(relative_path, size, mtime)` over every regular file / symlink under
+/// `root_path`, hashed in a stable order.
+///
+/// This is compared against the fingerprint recorded at the last error-free
+/// scan to decide whether an unchanged mirror can skip its (deliberately
+/// full — see [`explicit_scan_root_since_ts`]) re-scan. It is intentionally
+/// self-referential: it compares the mirror to a prior snapshot of *itself*,
+/// never to a wall clock, so rsync's preservation of the *remote* mtime cannot
+/// cause a clock-skew false match. It also mirrors rsync's own size+mtime
+/// change-detection, so "rsync did not transfer" ⇒ "fingerprint unchanged".
+///
+/// Returns `None` on any doubt (missing path, walk/stat error, unreadable
+/// mtime) so the caller falls through to a full scan — never a false skip.
+fn remote_mirror_scan_fingerprint(root_path: &Path) -> Option<String> {
+    if !root_path.exists() {
+        return None;
+    }
+    let mut entries: Vec<(String, u64, i64)> = Vec::new();
+    for entry in walkdir::WalkDir::new(root_path)
+        .min_depth(1)
+        .follow_links(false)
+    {
+        let entry = entry.ok()?;
+        let file_type = entry.file_type();
+        if !(file_type.is_file() || file_type.is_symlink()) {
+            continue;
+        }
+        let metadata = entry.metadata().ok()?;
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_epoch_millis)?;
+        let relative = entry.path().strip_prefix(root_path).ok()?;
+        entries.push((
+            relative.to_string_lossy().into_owned(),
+            metadata.len(),
+            modified_ms,
+        ));
+    }
+    // Directory-walk order is not guaranteed stable across runs/platforms.
+    entries.sort();
+    let mut hasher = blake3::Hasher::new();
+    for (relative, size, modified_ms) in &entries {
+        hasher.update(relative.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&size.to_le_bytes());
+        hasher.update(&modified_ms.to_le_bytes());
+        hasher.update(b"\n");
+    }
+    // Include the file count so a missing dir, an empty dir, and a populated
+    // dir never collide on the empty-hash.
+    Some(format!(
+        "mirrorfp-v1:{}:{}",
+        entries.len(),
+        hasher.finalize().to_hex()
+    ))
+}
+
+/// #372: has this mirror source already produced at least one canonical
+/// conversation row? Guards the skip so a never-indexed mirror is always
+/// scanned even if a stale fingerprint somehow matched.
+fn remote_mirror_source_already_indexed(storage: &FrankenStorage, source_id: &str) -> Result<bool> {
+    let matches: Vec<i64> = storage
+        .raw()
+        .query_map_collect(
+            "SELECT id FROM conversations WHERE source_id = ?1 LIMIT 1",
+            &[ParamValue::from(source_id)],
+            |row| row.get_typed(0),
+        )
+        .with_context(|| format!("checking indexed rows for mirror source {source_id}"))?;
+    Ok(!matches.is_empty())
+}
+
+/// #372: partition additional scan roots into the ones to actually scan and the
+/// remote-mirror fingerprints to persist on a clean scan.
+///
+/// A remote (ssh) mirror root gets `since_ts = None` (a full re-scan every run)
+/// so freshly-synced old-content sessions still promote to canonical. When the
+/// mirror is byte-identical to the last clean scan, that full re-scan is pure
+/// waste (issue #372: 2.9 h for a 2.67 GB `opencode.db`). Such a root is
+/// dropped from the returned scan set; the returned fingerprint list is stored
+/// by the caller *only after an error-free scan*.
+///
+/// Fail-safe: local roots are never touched (they already honor the incremental
+/// cutoff); `--full` / `--force-rebuild` never skip; and any fingerprint doubt
+/// falls through to a full scan.
+fn plan_remote_mirror_scan_skips(
+    storage: &FrankenStorage,
+    opts: &IndexOptions,
+    roots: Vec<ScanRoot>,
+) -> (Vec<ScanRoot>, Vec<(String, String)>) {
+    let skip_enabled = !opts.full && !opts.force_rebuild;
+    let mut scanned = Vec::with_capacity(roots.len());
+    let mut fingerprints_to_store: Vec<(String, String)> = Vec::new();
+    let mut skipped = 0usize;
+    for root in roots {
+        if root.origin.kind != SourceKind::Ssh {
+            scanned.push(root);
+            continue;
+        }
+        let fingerprint_now = remote_mirror_scan_fingerprint(&root.path);
+        let stored = storage
+            .read_mirror_scan_fingerprint(&root.origin.source_id)
+            .ok()
+            .flatten();
+        let unchanged = skip_enabled
+            && fingerprint_now.is_some()
+            && stored.is_some()
+            && stored.as_deref() == fingerprint_now.as_deref()
+            && remote_mirror_source_already_indexed(storage, &root.origin.source_id)
+                .unwrap_or(false);
+        if unchanged {
+            skipped += 1;
+            tracing::info!(
+                source_id = %root.origin.source_id,
+                root = %root.path.display(),
+                "skipping unchanged remote mirror scan; fingerprint matches last clean scan (#372)"
+            );
+            continue;
+        }
+        if let Some(fingerprint) = fingerprint_now {
+            fingerprints_to_store.push((root.origin.source_id.clone(), fingerprint));
+        }
+        scanned.push(root);
+    }
+    if skipped > 0 {
+        tracing::info!(
+            skipped_mirror_roots = skipped,
+            "#372: skipped unchanged remote mirror roots to avoid a redundant full re-scan"
+        );
+    }
+    (scanned, fingerprints_to_store)
+}
+
+#[cfg(test)]
+mod mirror_scan_skip_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn base_opts(db_path: &Path, data_dir: &Path) -> IndexOptions {
+        IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: None,
+            db_path: db_path.to_path_buf(),
+            data_dir: data_dir.to_path_buf(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        }
+    }
+
+    fn ssh_root(mirror: &Path, source_id: &str) -> ScanRoot {
+        ScanRoot::remote(
+            mirror.to_path_buf(),
+            Origin {
+                source_id: source_id.to_string(),
+                kind: SourceKind::Ssh,
+                host: Some(source_id.to_string()),
+            },
+            None,
+        )
+    }
+
+    fn insert_conv_with_source(storage: &FrankenStorage, source_id: &str, source_path: &Path) {
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conv = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "tester".into(),
+            workspace: None,
+            external_id: Some(format!("ext-{source_id}")),
+            title: Some("t".into()),
+            source_path: source_path.to_path_buf(),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![crate::model::types::Message {
+                id: None,
+                idx: 0,
+                role: crate::model::types::MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "hi".into(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: source_id.to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conv)
+            .unwrap();
+    }
+
+    #[test]
+    fn remote_mirror_fingerprint_detects_changes() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("mirror");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("opencode.db"), b"hello").unwrap();
+
+        let fp1 = remote_mirror_scan_fingerprint(&dir).expect("fingerprint");
+        // Stable across repeated calls on an unchanged directory.
+        assert_eq!(
+            remote_mirror_scan_fingerprint(&dir).as_deref(),
+            Some(fp1.as_str())
+        );
+        // Content growth (size changes) -> different fingerprint.
+        std::fs::write(dir.join("opencode.db"), b"hello world").unwrap();
+        let fp2 = remote_mirror_scan_fingerprint(&dir).expect("fingerprint");
+        assert_ne!(fp1, fp2);
+        // A new file -> different fingerprint.
+        std::fs::write(dir.join("opencode.db-wal"), b"x").unwrap();
+        let fp3 = remote_mirror_scan_fingerprint(&dir).expect("fingerprint");
+        assert_ne!(fp2, fp3);
+        // Missing directory -> None (never skip).
+        assert_eq!(
+            remote_mirror_scan_fingerprint(&tmp.path().join("absent")),
+            None
+        );
+    }
+
+    #[test]
+    fn mirror_scan_fingerprint_meta_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&tmp.path().join("db.sqlite")).unwrap();
+        assert_eq!(storage.read_mirror_scan_fingerprint("css").unwrap(), None);
+        storage
+            .record_mirror_scan_fingerprint("css", "fp-abc")
+            .unwrap();
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("css").unwrap(),
+            Some("fp-abc".to_string())
+        );
+        storage
+            .record_mirror_scan_fingerprint("css", "fp-def")
+            .unwrap();
+        assert_eq!(
+            storage.read_mirror_scan_fingerprint("css").unwrap(),
+            Some("fp-def".to_string())
+        );
+        // Distinct source ids do not collide.
+        assert_eq!(storage.read_mirror_scan_fingerprint("csd").unwrap(), None);
+    }
+
+    #[test]
+    fn plan_skips_only_unchanged_indexed_remote_mirrors() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        let mirror = tmp.path().join("remotes/css/mirror");
+        std::fs::create_dir_all(&mirror).unwrap();
+        let mirror_db = mirror.join("opencode.db");
+        std::fs::write(&mirror_db, b"data").unwrap();
+
+        let remote = ssh_root(&mirror, "css");
+        let local = ScanRoot::local(tmp.path().join("localdir"));
+        let opts = base_opts(&db_path, tmp.path());
+
+        // 1. No stored fingerprint yet -> remote scanned + fp captured; local
+        //    root is never a skip candidate.
+        let (scanned, fps) =
+            plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone(), local.clone()]);
+        assert_eq!(
+            scanned.len(),
+            2,
+            "nothing skipped without a stored fingerprint"
+        );
+        assert_eq!(fps.len(), 1, "one remote fingerprint captured for storing");
+        assert_eq!(fps[0].0, "css");
+        storage
+            .record_mirror_scan_fingerprint(&fps[0].0, &fps[0].1)
+            .unwrap();
+
+        // 2. Fingerprint matches but the source was never indexed -> still scan.
+        let (scanned2, _) = plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone()]);
+        assert_eq!(
+            scanned2.len(),
+            1,
+            "a never-indexed mirror must scan even with a matching fingerprint"
+        );
+
+        insert_conv_with_source(&storage, "css", &mirror_db);
+
+        // 3. Fingerprint matches AND the source is indexed -> skip.
+        let (scanned3, fps3) = plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone()]);
+        assert!(
+            scanned3.is_empty(),
+            "unchanged indexed mirror should be skipped"
+        );
+        assert!(
+            fps3.is_empty(),
+            "a skipped mirror stores no new fingerprint"
+        );
+
+        // 3b. --full never skips, even when unchanged + indexed.
+        let mut full_opts = base_opts(&db_path, tmp.path());
+        full_opts.full = true;
+        let (scanned_full, _) =
+            plan_remote_mirror_scan_skips(&storage, &full_opts, vec![remote.clone()]);
+        assert_eq!(scanned_full.len(), 1, "--full must never skip a mirror");
+
+        // 4. Mirror content changes -> re-scanned and a fresh fingerprint captured.
+        std::fs::write(&mirror_db, b"data plus more").unwrap();
+        let (scanned4, fps4) = plan_remote_mirror_scan_skips(&storage, &opts, vec![remote.clone()]);
+        assert_eq!(scanned4.len(), 1, "a changed mirror must re-scan");
+        assert_eq!(fps4.len(), 1, "changed mirror captures a new fingerprint");
+        assert_ne!(fps4[0].1, fps[0].1, "fingerprint changed with content");
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ConnectorKind {
     #[serde(rename = "cx", alias = "Codex")]
@@ -25630,6 +26323,8 @@ pub mod persist {
     use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicI64;
     use std::time::Duration;
     #[cfg(test)]
     use std::time::Instant;
@@ -26571,6 +27266,7 @@ pub mod persist {
         defer_checkpoints: bool,
         capture_semantic_delta: bool,
         raw_mirror_data_dir: Option<&Path>,
+        heartbeat: PersistHeartbeat<'_>,
     ) -> Result<PersistBatchOutcome> {
         if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
             && t_index.is_none()
@@ -26590,13 +27286,7 @@ pub mod persist {
         // allocator work out of every writer's retry window — so conflict
         // retries re-run only SQLite I/O, not the allocation cost. See the
         // matching hoist in the serial persist_conversations_batched path.
-        let internal_convs: Vec<Conversation> = convs
-            .par_iter()
-            .map_init(
-                super::redact_secrets::MemoizingRedactor::new,
-                |redactor, conv| map_to_internal_with_redactor(conv, Some(redactor)),
-            )
-            .collect();
+        let internal_convs: Vec<Conversation> = map_batch_to_internal(convs, heartbeat);
 
         let indexed_chunks: Vec<Result<ChunkPersistResult>> = convs
             .par_chunks(chunk_size)
@@ -26649,6 +27339,10 @@ pub mod persist {
                         if let Some(g) = shadow_guard {
                             g.finish_ok();
                         }
+                        // gh373/oeu5a: each persisted chunk is live work even
+                        // while the batch-level `current` bump waits for the
+                        // whole persist call to return.
+                        heartbeat.tick();
                         Ok(outcomes)
                     }
                     Err(err) => {
@@ -26830,9 +27524,94 @@ pub mod persist {
         map_to_internal_with_redactor(conv, None)
     }
 
+    /// gh373 third variant (bead oeu5a): one activity tick per this many
+    /// mapped messages. A single giant conversation (observed: 60-90MB codex
+    /// rollouts, ~40k messages) spends minutes inside
+    /// `map_to_internal_with_redactor` — allocator-heavy secret redaction on
+    /// one thread, zero WAL writes — which froze all three watchdog atomics
+    /// and drew a spurious exit(70) at the 300s abort threshold. The stride
+    /// keeps ticks cheap (one relaxed atomic add per 256 messages) while
+    /// bounding the silent window to well under any sane threshold.
+    const MAP_HEARTBEAT_MESSAGE_STRIDE: usize = 256;
+
+    /// Work-liveness heartbeat threaded through batched persistence
+    /// (gh373/oeu5a). Mirrors the #282/#332/#366 pattern: real work ticks
+    /// `IndexingProgress::activity` for the run-side stall watchdog and bumps
+    /// the index-run lock's `last_progress_at_ms` for the status-side stall
+    /// detector. `NONE` keeps legacy call sites (tests, paths without a
+    /// progress handle) unchanged.
+    #[derive(Clone, Copy)]
+    pub(crate) struct PersistHeartbeat<'a> {
+        progress: Option<&'a super::IndexingProgress>,
+        progress_bump: Option<&'a Arc<AtomicI64>>,
+    }
+
+    impl<'a> PersistHeartbeat<'a> {
+        pub(crate) const NONE: PersistHeartbeat<'static> = PersistHeartbeat {
+            progress: None,
+            progress_bump: None,
+        };
+
+        pub(crate) fn new(
+            progress: Option<&'a super::IndexingProgress>,
+            progress_bump: Option<&'a Arc<AtomicI64>>,
+        ) -> Self {
+            Self {
+                progress,
+                progress_bump,
+            }
+        }
+
+        pub(crate) fn tick(&self) {
+            if let Some(progress) = self.progress {
+                progress.tick_activity();
+            }
+            super::bump_index_run_lock_progress_if_present(self.progress_bump);
+        }
+    }
+
     pub(crate) fn map_to_internal_with_redactor(
         conv: &NormalizedConversation,
+        redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
+    ) -> Conversation {
+        map_to_internal_with_redactor_and_heartbeat(conv, redactor, PersistHeartbeat::NONE)
+    }
+
+    /// Map a batch of normalized conversations to internal (redacted)
+    /// form on the rayon pool with one `MemoizingRedactor` per worker.
+    ///
+    /// This is the single shared implementation for BOTH batched persist
+    /// paths (begin-concurrent and serial) — and for the
+    /// `redaction_perf` bench harness via
+    /// [`bench_map_batch_to_internal`] — so benchmark numbers measure
+    /// the exact production transform by construction.
+    pub(crate) fn map_batch_to_internal(
+        convs: &[NormalizedConversation],
+        heartbeat: PersistHeartbeat<'_>,
+    ) -> Vec<Conversation> {
+        convs
+            .par_iter()
+            .map_init(
+                super::redact_secrets::MemoizingRedactor::new,
+                |redactor, conv| {
+                    map_to_internal_with_redactor_and_heartbeat(conv, Some(redactor), heartbeat)
+                },
+            )
+            .collect()
+    }
+
+    /// Bench-only public entry point for the production batch mapping
+    /// path (memoized redaction on the rayon pool). Hidden from docs;
+    /// see `benches/redaction_perf.rs`.
+    #[doc(hidden)]
+    pub fn bench_map_batch_to_internal(convs: &[NormalizedConversation]) -> Vec<Conversation> {
+        map_batch_to_internal(convs, PersistHeartbeat::NONE)
+    }
+
+    pub(crate) fn map_to_internal_with_redactor_and_heartbeat(
+        conv: &NormalizedConversation,
         mut redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
+        heartbeat: PersistHeartbeat<'_>,
     ) -> Conversation {
         // Extract provenance from metadata (P2.2)
         let (source_id, origin_host) = extract_provenance(&conv.metadata);
@@ -26872,7 +27651,14 @@ pub mod persist {
             messages: conv
                 .messages
                 .iter()
-                .map(|m| {
+                .enumerate()
+                .map(|(mapped_message_index, m)| {
+                    // gh373/oeu5a: heartbeat during the long single-thread
+                    // redaction of one giant conversation, so the stall
+                    // watchdog sees live work between batch publications.
+                    if mapped_message_index % MAP_HEARTBEAT_MESSAGE_STRIDE == 0 {
+                        heartbeat.tick();
+                    }
                     let content = if should_redact {
                         if let Some(r) = redactor.as_mut() {
                             r.redact_text(&m.content)
@@ -27064,9 +27850,16 @@ pub mod persist {
             defer_checkpoints,
             false,
             None,
+            PersistHeartbeat::NONE,
         )
     }
 
+    /// gh373/oeu5a: carries the work-liveness heartbeat for the streaming
+    /// ingest chokepoints, so a minutes-long giant-batch persist keeps
+    /// ticking the stall watchdog and the index-run lock instead of reading
+    /// as a wedge. Callers without a progress handle pass
+    /// `PersistHeartbeat::NONE`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn persist_conversations_batched_with_raw_mirror_links(
         storage: &FrankenStorage,
         t_index: Option<&mut TantivyIndex>,
@@ -27074,6 +27867,7 @@ pub mod persist {
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
+        heartbeat: PersistHeartbeat<'_>,
     ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
@@ -27083,9 +27877,13 @@ pub mod persist {
             defer_checkpoints,
             false,
             Some(data_dir),
+            heartbeat,
         )
     }
 
+    /// gh373/oeu5a: heartbeat-carrying (see
+    /// `persist_conversations_batched_with_raw_mirror_links`).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn persist_conversations_batched_with_semantic_delta_and_raw_mirror_links(
         storage: &FrankenStorage,
         t_index: Option<&mut TantivyIndex>,
@@ -27093,6 +27891,7 @@ pub mod persist {
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
+        heartbeat: PersistHeartbeat<'_>,
     ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
@@ -27102,9 +27901,11 @@ pub mod persist {
             defer_checkpoints,
             true,
             Some(data_dir),
+            heartbeat,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn persist_conversations_batched_inner(
         storage: &FrankenStorage,
         mut t_index: Option<&mut TantivyIndex>,
@@ -27113,6 +27914,7 @@ pub mod persist {
         defer_checkpoints: bool,
         capture_semantic_delta: bool,
         raw_mirror_data_dir: Option<&Path>,
+        heartbeat: PersistHeartbeat<'_>,
     ) -> Result<PersistBatchOutcome> {
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
@@ -27147,6 +27949,7 @@ pub mod persist {
                 defer_checkpoints,
                 capture_semantic_delta,
                 raw_mirror_data_dir,
+                heartbeat,
             );
         }
 
@@ -27164,14 +27967,7 @@ pub mod persist {
         // lock while we burn CPU on it. Running it in parallel via rayon
         // shortens the serial writer-hold window and exploits headroom on
         // many-core hosts. This is the hot path for ingest batches.
-        use rayon::prelude::*;
-        let internal_convs: Vec<Conversation> = convs
-            .par_iter()
-            .map_init(
-                super::redact_secrets::MemoizingRedactor::new,
-                |redactor, conv| map_to_internal_with_redactor(conv, Some(redactor)),
-            )
-            .collect();
+        let internal_convs: Vec<Conversation> = map_batch_to_internal(convs, heartbeat);
 
         let outcomes = with_ephemeral_writer(
             storage,
@@ -27234,6 +28030,10 @@ pub mod persist {
                     let end = (start + chunk_size).min(prepared.len());
                     let chunk_refs = &prepared[start..end];
                     outcomes.extend(writer.insert_conversations_batched(chunk_refs)?);
+                    // gh373/oeu5a: each written chunk is live work even while
+                    // the batch-level `current` bump waits for the whole
+                    // persist call to return.
+                    heartbeat.tick();
                 }
 
                 Ok(outcomes)
@@ -27251,6 +28051,10 @@ pub mod persist {
             let mut skip_inline_lexical_updates = false;
             for (internal_conv, outcome) in internal_convs.iter().zip(outcomes.iter()) {
                 batch_outcome.record_insert_outcome(outcome);
+                // gh373/oeu5a: per-conversation liveness through the inline
+                // lexical sink (packet build + Tantivy add can be slow for a
+                // giant conversation).
+                heartbeat.tick();
                 if skip_inline_lexical_updates {
                     continue;
                 }
@@ -27406,6 +28210,56 @@ pub mod persist {
         fn begin_concurrent_chunk_size_parsing() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "7");
             assert_eq!(begin_concurrent_chunk_size(), 7);
+        }
+
+        /// gh373/oeu5a: mapping one giant conversation must tick the
+        /// work-liveness heartbeat per MAP_HEARTBEAT_MESSAGE_STRIDE messages
+        /// so the stall watchdog sees live work during the minutes-long
+        /// redaction window (previously zero ticks until the whole batch
+        /// persisted — the proven exit(70) trigger).
+        #[test]
+        fn map_to_internal_heartbeat_ticks_per_message_stride() {
+            use crate::connectors::NormalizedConversation;
+            use std::sync::atomic::Ordering;
+
+            let message_count = MAP_HEARTBEAT_MESSAGE_STRIDE * 3 + 5;
+            let conv = NormalizedConversation {
+                agent_slug: "codex".to_string(),
+                external_id: Some("giant".to_string()),
+                title: Some("giant conversation".to_string()),
+                workspace: None,
+                source_path: std::path::PathBuf::from("/log/giant.jsonl"),
+                started_at: Some(1000),
+                ended_at: Some(2000),
+                metadata: serde_json::json!({}),
+                messages: (0..message_count)
+                    .map(|j| crate::connectors::NormalizedMessage {
+                        idx: j as i64,
+                        role: "user".to_string(),
+                        author: None,
+                        created_at: Some(1000 + j as i64),
+                        content: format!("msg {j}"),
+                        extra: serde_json::json!({}),
+                        snippets: vec![],
+                        invocations: Vec::new(),
+                    })
+                    .collect(),
+            };
+
+            let progress = super::super::IndexingProgress::default();
+            let heartbeat = PersistHeartbeat::new(Some(&progress), None);
+            let mapped = map_to_internal_with_redactor_and_heartbeat(&conv, None, heartbeat);
+            assert_eq!(mapped.messages.len(), message_count);
+            let ticks = progress.activity.load(Ordering::Relaxed);
+            // Ticks fire at message indices 0, STRIDE, 2*STRIDE, 3*STRIDE.
+            assert_eq!(
+                ticks, 4,
+                "expected one tick per started stride (got {ticks} for {message_count} messages)"
+            );
+
+            // The heartbeat-free path stays a no-op (no progress handle).
+            let unmapped = map_to_internal_with_redactor(&conv, None);
+            assert_eq!(unmapped.messages.len(), message_count);
         }
 
         #[test]
@@ -27813,6 +28667,7 @@ pub mod persist {
                 false,
                 false,
                 None,
+                PersistHeartbeat::NONE,
             )
             .expect("begin-concurrent persist should succeed");
 
@@ -27917,6 +28772,7 @@ pub mod persist {
                 false,
                 false,
                 None,
+                PersistHeartbeat::NONE,
             )
             .expect("single conversation begin-concurrent persist should succeed");
 
@@ -28068,6 +28924,7 @@ pub mod persist {
                 false,
                 false,
                 None,
+                PersistHeartbeat::NONE,
             )
             .expect("begin-concurrent deferred persist should succeed");
 
@@ -31397,6 +32254,7 @@ mod tests {
             "watch-ingest-out-of-memory",
             &conv,
             &error,
+            None,
         )
         .expect("record poison");
 
@@ -31426,6 +32284,110 @@ mod tests {
         assert!(
             last_error.contains(" | "),
             "last_error must be ` | `-joined chain: {last_error}"
+        );
+    }
+
+    /// #364: the poison record carries the memory-pressure attribution so
+    /// post-mortem triage can tell a genuine host-pressure OOM from a
+    /// precautionary large-conversation quarantine — and omits it entirely
+    /// (pre-#364 shape) when no attribution is supplied.
+    #[test]
+    fn poison_record_carries_memory_pressure_attribution() {
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: Some("attrib-conv".into()),
+            title: None,
+            workspace: None,
+            source_path: std::path::PathBuf::from("/log/attrib.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_010),
+            metadata: serde_json::json!({}),
+            messages: vec![],
+        };
+        let error: anyhow::Error = frankensqlite::FrankenError::OutOfMemory.into();
+        let read_record = |data_dir: &std::path::Path| -> serde_json::Value {
+            let path = data_dir.join("quarantine").join(INDEX_INGEST_POISON_FILE);
+            let contents = std::fs::read_to_string(&path).expect("read quarantine file");
+            let line = contents
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .expect("at least one record");
+            serde_json::from_str(line).expect("parse record")
+        };
+
+        // Genuine host memory pressure.
+        let real = tempfile::tempdir().expect("tempdir");
+        super::record_poison_conversation(
+            real.path(),
+            INDEX_INGEST_POISON_FILE,
+            "index-ingest-out-of-memory",
+            &conv,
+            &error,
+            Some(super::PoisonMemoryAttribution {
+                real_memory_pressure: Some(true),
+                indexed_text_bytes: 12_345,
+            }),
+        )
+        .expect("record poison");
+        let rec = read_record(real.path());
+        assert_eq!(
+            rec.get("memory_pressure")
+                .and_then(serde_json::Value::as_str),
+            Some("real")
+        );
+        assert_eq!(
+            rec.get("quarantine_trigger")
+                .and_then(serde_json::Value::as_str),
+            Some("real_host_memory_pressure")
+        );
+        assert_eq!(
+            rec.get("indexed_text_bytes")
+                .and_then(serde_json::Value::as_u64),
+            Some(12_345)
+        );
+
+        // Pressure could not be sampled -> precautionary large-conversation
+        // quarantine trigger.
+        let unknown = tempfile::tempdir().expect("tempdir");
+        super::record_poison_conversation(
+            unknown.path(),
+            INDEX_INGEST_POISON_FILE,
+            "index-ingest-out-of-memory",
+            &conv,
+            &error,
+            Some(super::PoisonMemoryAttribution {
+                real_memory_pressure: None,
+                indexed_text_bytes: 999,
+            }),
+        )
+        .expect("record poison");
+        let rec = read_record(unknown.path());
+        assert_eq!(
+            rec.get("memory_pressure")
+                .and_then(serde_json::Value::as_str),
+            Some("unknown")
+        );
+        assert_eq!(
+            rec.get("quarantine_trigger")
+                .and_then(serde_json::Value::as_str),
+            Some("unknown_pressure_large_conversation_precaution")
+        );
+
+        // No attribution -> fields omitted (pre-#364 record shape).
+        let none = tempfile::tempdir().expect("tempdir");
+        super::record_poison_conversation(
+            none.path(),
+            INDEX_INGEST_POISON_FILE,
+            "index-ingest-out-of-memory",
+            &conv,
+            &error,
+            None,
+        )
+        .expect("record poison");
+        let rec = read_record(none.path());
+        assert!(
+            rec.get("memory_pressure").is_none() && rec.get("quarantine_trigger").is_none(),
+            "attribution fields must be omitted when no attribution is supplied"
         );
     }
 
@@ -42316,17 +43278,18 @@ mod tests {
             "fresh explicit watch-once imports should not broaden into every detected connector"
         );
         assert!(
-            !should_run_targeted_watch_once_only(true, false, false, true, 43_678),
-            "populated archives with a missing or invalid index still need authoritative repair"
+            should_run_targeted_watch_once_only(true, false, false, true, 43_678),
+            "GH #350: a populated archive whose derived index looks stale must STILL bound a \
+             targeted watch-once to the requested paths (ingesting the changed sessions inline \
+             and deferring any broader rebuild), never silently broadened into a full-corpus scan"
         );
+        // Watch mode, full rebuild, and absent explicit paths are never a
+        // targeted path-bounded run (regardless of index health).
         assert!(!should_run_targeted_watch_once_only(
             true, true, false, false, 43_678
         ));
         assert!(!should_run_targeted_watch_once_only(
             true, false, true, false, 43_678
-        ));
-        assert!(!should_run_targeted_watch_once_only(
-            true, false, false, true, 43_678
         ));
         assert!(!should_run_targeted_watch_once_only(
             false, false, false, false, 43_678
@@ -44108,6 +45071,35 @@ mod tests {
             "shared-writer completion should retain the final committed meta fingerprint"
         );
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
+    }
+
+    /// cass#368: the storage-fingerprint failure chain must keep its root
+    /// cause. Every render site formats with `{err:#}`; if the chain itself
+    /// were collapsed (e.g. a `map_err` swapping in a fresh error), users
+    /// would again see only "opening readonly storage ..." while the real
+    /// frankensqlite failure (a corrupt FTS5 structure record, a bad header)
+    /// stays invisible.
+    #[test]
+    fn storage_fingerprint_error_keeps_root_cause_in_alternate_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("corrupt.db");
+        std::fs::write(&db_path, b"definitely not a sqlite database").unwrap();
+
+        let err = lexical_rebuild_storage_fingerprint(&db_path).unwrap_err();
+        assert!(
+            err.chain().count() > 1,
+            "fingerprint failure must carry the inner storage-open cause, got: {err:#}"
+        );
+        let root_cause = err.chain().last().unwrap().to_string();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("opening readonly storage to compute lexical fingerprint"),
+            "outer context missing: {rendered}"
+        );
+        assert!(
+            rendered.contains(root_cause.trim()),
+            "root cause {root_cause:?} must survive alternate display: {rendered}"
+        );
     }
 
     #[test]
@@ -48039,6 +49031,12 @@ mod tests {
     /// a quarantine here is a same-version-irreducible coverage hole for a
     /// healthy, replayable source (the reported case: a 36 MB Codex session
     /// under ~89 GiB MemAvailable).
+    ///
+    /// Linux/macOS only: the reserve=0 pin yields `Some(false)` real
+    /// pressure only where `available_memory_bytes()` reports a value; on
+    /// other platforms the probe returns `None`, the (pinned) size gate
+    /// fires, and the disposition legitimately quarantines.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[serial]
     fn watch_reindex_defers_large_conversation_with_ample_memory() {
@@ -51401,6 +52399,77 @@ mod tests {
         assert_eq!(
             checkpoint.storage_fingerprint,
             lexical_rebuild_storage_fingerprint(&db_path).unwrap()
+        );
+    }
+
+    /// GH #353: a deferred large-incremental run must break the forever-defer
+    /// loop by refreshing a STALE lexical checkpoint fingerprint to the live DB
+    /// fingerprint WHEN the live Tantivy index already matches the canonical
+    /// message count (the drift was absorbed inline). This is the exact call the
+    /// deferred branch now makes; the doc-count gate keeps it safe when Tantivy
+    /// is genuinely behind (verified separately by the gate's own tests).
+    #[test]
+    #[serial]
+    fn gh353_refresh_advances_stale_fingerprint_when_tantivy_is_equivalent() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = index_dir(&data_dir).unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+
+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let convs = vec![norm_conv(
+            Some("c1"),
+            vec![
+                norm_msg(0, 1_700_000_000_000),
+                norm_msg(1, 1_700_000_000_100),
+            ],
+        )];
+        ingest_batch(
+            &storage,
+            Some(&mut index),
+            &data_dir,
+            &convs,
+            &None,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+        )
+        .unwrap();
+        index.commit().unwrap();
+        drop(index);
+
+        let live_fingerprint = lexical_rebuild_storage_fingerprint(&db_path).unwrap();
+
+        // Persist a completed checkpoint carrying a STALE fingerprint — the #353
+        // loop state where search keeps deferring on the mismatch and a large
+        // incremental run keeps re-preserving it.
+        let mut state = LexicalRebuildState::new(
+            lexical_rebuild_db_state(&storage, &db_path).unwrap(),
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.db.storage_fingerprint = "content-v1:0:0:0".to_string();
+        state.mark_completed(index_meta_fingerprint(&index_path).unwrap());
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+        assert_ne!(
+            load_lexical_rebuild_checkpoint(&index_path)
+                .unwrap()
+                .unwrap()
+                .storage_fingerprint,
+            live_fingerprint,
+            "precondition: the checkpoint starts stale"
+        );
+
+        refresh_completed_lexical_rebuild_checkpoint(&storage, &db_path, &data_dir).unwrap();
+
+        assert_eq!(
+            load_lexical_rebuild_checkpoint(&index_path)
+                .unwrap()
+                .unwrap()
+                .storage_fingerprint,
+            live_fingerprint,
+            "GH #353: a stale checkpoint must be refreshed to the live fingerprint when Tantivy is equivalent, breaking the forever-defer loop"
         );
     }
 

@@ -157,6 +157,9 @@ pub mod colors {
     /// Hermes Agent - dim gold tint
     pub const AGENT_HERMES_BG: Color = Color::rgb(40, 34, 18); // #282212 - gold
 
+    /// Goose - dark umber/bronze tint
+    pub const AGENT_GOOSE_BG: Color = Color::rgb(38, 30, 20); // #261e14 - umber
+
     // ═══════════════════════════════════════════════════════════════════════════
     // ROLE-AWARE BACKGROUND TINTS - Subtle backgrounds per message type
     // ═══════════════════════════════════════════════════════════════════════════
@@ -471,6 +474,7 @@ impl ThemePalette {
             "copilot_cli" => (colors::AGENT_COPILOT_CLI_BG, PackedRgba::rgb(80, 170, 230)), // Navy
             "crush" => (colors::AGENT_CRUSH_BG, PackedRgba::rgb(255, 120, 80)),        // Coral
             "hermes" => (colors::AGENT_HERMES_BG, PackedRgba::rgb(240, 200, 100)),     // Gold
+            "goose" => (colors::AGENT_GOOSE_BG, PackedRgba::rgb(210, 170, 110)),       // Tan/bronze
             "kimi" => (colors::AGENT_KIMI_BG, PackedRgba::rgb(190, 220, 80)), // Yellow-green
             "qwen" => (colors::AGENT_QWEN_BG, PackedRgba::rgb(80, 210, 180)), // Mint
             _ => (colors::BG_DEEP, colors::ACCENT_PRIMARY),
@@ -508,6 +512,7 @@ impl ThemePalette {
             "copilot_cli" => "◑",
             "crush" => "✚",
             "hermes" => "▽",
+            "goose" => "◍",
             "kimi" => "✧",
             "qwen" => "◒",
             _ => "•",
@@ -1651,6 +1656,7 @@ mod tests {
         "copilot",
         "copilot_cli",
         "crush",
+        "goose",
         "hermes",
         "kimi",
         "qwen",

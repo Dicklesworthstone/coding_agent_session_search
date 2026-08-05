@@ -52,7 +52,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // that API and its no-create/bounded-open tests; a version-only pin is
         // ambiguous because both sources declare 0.1.19.
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "62a58ee388775ffdf133c069372a6d01e3a589b4",
+        expected_rev: "2351c6c52b9e5fdba6a413865415db0452e660ef",
         expected_version: "0.1.19",
         expected_features: &["fts5"],
         expected_default_features: None,
@@ -70,7 +70,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: Some("fsqlite-types"),
         // Keep shared types on the identical immutable source as the facade.
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "62a58ee388775ffdf133c069372a6d01e3a589b4",
+        expected_rev: "2351c6c52b9e5fdba6a413865415db0452e660ef",
         expected_version: "0.1.19",
         expected_features: &[],
         expected_default_features: None,
@@ -88,7 +88,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: Some("fsqlite-types"),
         // Keep shared types on the identical immutable source as the facade.
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "62a58ee388775ffdf133c069372a6d01e3a589b4",
+        expected_rev: "2351c6c52b9e5fdba6a413865415db0452e660ef",
         expected_version: "0.1.19",
         expected_features: &[],
         expected_default_features: None,
@@ -105,13 +105,14 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "1557300b1df8a26abde191dc30b8ef4b6154d7bc",
+        expected_rev: "dd2c694096d959ba87e0f6a44e87450b34144d3f",
         expected_version: "0.1.10",
         expected_features: &[
             "chatgpt",
             "connectors",
             "crush",
             "cursor",
+            "goose",
             "hermes",
             "opencode",
         ],
@@ -329,7 +330,7 @@ fn validate_fsqlite_registry_source_override(manifest: &Value, packaged_manifest
     }
 
     const EXPECTED_GIT: &str = "https://github.com/Dicklesworthstone/frankensqlite";
-    const EXPECTED_REV: &str = "62a58ee388775ffdf133c069372a6d01e3a589b4";
+    const EXPECTED_REV: &str = "2351c6c52b9e5fdba6a413865415db0452e660ef";
 
     let patch_tables = table(manifest, "patch", "manifest root");
     let crates_io = table_value(Some(patch_tables), "crates-io", "[patch]")

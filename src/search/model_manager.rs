@@ -529,7 +529,7 @@ fn load_complete_shard_artifacts_for_current_db(
         Ok(fingerprint) => fingerprint,
         Err(err) => {
             tracing::debug!(
-                error = %err,
+                error = %format!("{err:#}"),
                 embedder = embedder_id,
                 context = context_label,
                 "semantic shard context unavailable: failed to fingerprint current DB"

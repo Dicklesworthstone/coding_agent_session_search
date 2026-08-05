@@ -1117,6 +1117,24 @@ pub const FTS5_REGISTER_SQL: &str = "\
 
 const FTS_FRANKEN_REBUILD_META_KEY: &str = "fts_frankensqlite_rebuild_generation";
 const FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY: &str = "fts_frankensqlite_archive_fingerprint";
+/// zn1xn (adversarial-review F5): set to the failure detail when a full index
+/// run's optional derived fallback-FTS repair was skipped/failed and the
+/// canonical SQLite `fts_messages` shadow may be half-rebuilt; deleted when a
+/// later run repairs it. Surfaced additively in `state_meta_json` so `cass
+/// index --json` / `status` expose the half-built shadow immediately, rather
+/// than only when doctor's next PartialParity/ShadowCorrupt check catches it.
+const FTS_FALLBACK_REPAIR_PENDING_META_KEY: &str = "fts_fallback_repair_pending";
+/// Bound on the persisted failure detail so a pathological error chain cannot
+/// bloat the `meta` row.
+const FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES: usize = 400;
+/// zn1xn F4: consecutive count of non-watch index runs that deferred inline
+/// lexical updates (an OOM under ample memory reroutes EVERY plain run through
+/// the full authoritative lexical rebuild — a multi-minute/hour amplification
+/// that was previously only a stderr warn). Surfaced in `status`/`index --json`
+/// so operators/agents can see the persistently-deferred degradation and its
+/// streak length, and reset once a run completes without deferring.
+const LEXICAL_REPAIR_DEFERRED_COUNT_META_KEY: &str = "lexical_repair_deferred_consecutive_runs";
+const LEXICAL_REPAIR_DEFERRED_REASON_META_KEY: &str = "lexical_repair_deferred_reason";
 const FTS_FRANKEN_REBUILD_GENERATION: i64 = 1;
 /// Exact canonical cardinality driven by the compact parent-rowid domain.
 /// FrankenSQLite 0.1.19 lowers this shape to `CountIndexEqRun`: each real
@@ -4135,6 +4153,31 @@ impl FrankenStorage {
                 path.display()
             )
         })?;
+        let storage = Self::new(conn, path.to_path_buf());
+        storage.apply_open_stage_busy_timeout();
+        storage.apply_config()?;
+        Ok(storage)
+    }
+
+    /// #368 defect 3: open an archive for FTS repair with FTS5 shadow
+    /// validation/hydration DEFERRED, so a database whose FTS5 `%_data` is
+    /// structurally corrupt (which fails an ordinary open during the schema
+    /// reload) can still be opened to drop+recreate the corrupt shadow. FTS5
+    /// queries on this connection see an empty index until the shadow is
+    /// rebuilt — it is for repair only (see `rebuild_fts_shadow_via_drop_recreate`).
+    pub(crate) fn open_deferred_fts5_for_repair(path: &Path) -> Result<Self> {
+        let path_str = path.to_string_lossy().to_string();
+        let _doctor_guard =
+            acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
+        let conn =
+            FrankenConnection::open_existing_schema_only_deferred_fts5(&path_str).with_context(
+                || {
+                    format!(
+                        "opening frankensqlite db with deferred FTS5 validation for corrupt-shadow repair at {}",
+                        path.display()
+                    )
+                },
+            )?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_open_stage_busy_timeout();
         storage.apply_config()?;
@@ -7428,6 +7471,34 @@ impl FrankenStorage {
         Ok(())
     }
 
+    fn mirror_scan_fingerprint_meta_key(source_id: &str) -> String {
+        format!("mirror_scan_fp:{}", source_id.trim())
+    }
+
+    /// #372: read the file fingerprint recorded at the last error-free scan of a
+    /// remote mirror source, used to skip re-scanning an unchanged mirror. A
+    /// missing key returns `None` (never seen / never cleanly scanned).
+    pub fn read_mirror_scan_fingerprint(&self, source_id: &str) -> Result<Option<String>> {
+        let key = Self::mirror_scan_fingerprint_meta_key(source_id);
+        let result: Result<String, _> = self.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![key.as_str()],
+            |row| row.get_typed(0),
+        );
+        Ok(result.optional()?)
+    }
+
+    /// #372: record the current file fingerprint of a remote mirror after an
+    /// error-free scan, so the next incremental run can skip it if unchanged.
+    pub fn record_mirror_scan_fingerprint(&self, source_id: &str, fingerprint: &str) -> Result<()> {
+        let key = Self::mirror_scan_fingerprint_meta_key(source_id);
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![key.as_str(), fingerprint],
+        )?;
+        Ok(())
+    }
+
     /// Load per-connector scan watermarks and archived-row presence in one
     /// explicit transaction.
     ///
@@ -8104,7 +8175,13 @@ impl FrankenStorage {
                 &missing_tail_positions,
             )?;
         }
-        if !every_footprint_was_missing_tail {
+        // When every conversation already has last_message_idx / tail-state
+        // coverage, skip the full `messages GROUP BY conversation_id` raise.
+        // That exact-count pass was observed to thrash for 10–20+ minutes on
+        // multi-GB archives during plan_lexical_shards (cass 0.6.23 prepare
+        // wedge). Tail estimates are sufficient for shard sizing; exact
+        // message counts are still available later from the rebuild sink.
+        if !missing_tail_positions.is_empty() && !every_footprint_was_missing_tail {
             self.raise_lexical_rebuild_footprints_to_exact_message_counts(&mut footprints)?;
         }
 
@@ -10714,6 +10791,128 @@ impl FrankenStorage {
         Ok(())
     }
 
+    /// Record (or, with `None`, clear) the "the canonical FTS shadow may be
+    /// half-rebuilt" marker after a full index run (zn1xn). Best-effort:
+    /// callers ignore errors because this is observability, not correctness —
+    /// a failed marker write must never fail a run whose canonical + Tantivy
+    /// work already succeeded.
+    pub(crate) fn record_fallback_fts_repair_pending(&self, detail: Option<&str>) -> Result<()> {
+        match detail {
+            Some(detail) => {
+                let bounded: String = detail
+                    .chars()
+                    .take(FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES)
+                    .collect();
+                self.conn
+                    .execute_compat(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                        fparams![FTS_FALLBACK_REPAIR_PENDING_META_KEY, bounded],
+                    )
+                    .with_context(|| "recording fallback FTS repair-pending marker")?;
+            }
+            None => {
+                self.conn
+                    .execute_compat(
+                        "DELETE FROM meta WHERE key = ?1",
+                        fparams![FTS_FALLBACK_REPAIR_PENDING_META_KEY],
+                    )
+                    .with_context(|| "clearing fallback FTS repair-pending marker")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The persisted fallback-FTS repair-pending detail, if the last full index
+    /// run left the canonical `fts_messages` shadow unrepaired (zn1xn).
+    #[cfg(test)]
+    #[cfg(test)]
+    pub(crate) fn read_fallback_fts_repair_pending(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![FTS_FALLBACK_REPAIR_PENDING_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?
+            .filter(|detail: &String| !detail.is_empty()))
+    }
+
+    fn read_lexical_repair_deferred_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![LEXICAL_REPAIR_DEFERRED_COUNT_META_KEY],
+                |row| row.get_typed::<String>(0),
+            )
+            .optional()?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// Increment the consecutive-deferral streak and record the reason after a
+    /// non-watch run deferred inline lexical updates (zn1xn F4). Returns the new
+    /// streak length. Best-effort observability — callers ignore errors.
+    pub(crate) fn record_lexical_repair_deferred(&self, reason: &str) -> Result<i64> {
+        let next = self.read_lexical_repair_deferred_count()?.saturating_add(1);
+        self.conn
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![LEXICAL_REPAIR_DEFERRED_COUNT_META_KEY, next.to_string()],
+            )
+            .with_context(|| "recording lexical-repair deferral streak")?;
+        let bounded: String = reason
+            .chars()
+            .take(FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES)
+            .collect();
+        self.conn
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![LEXICAL_REPAIR_DEFERRED_REASON_META_KEY, bounded],
+            )
+            .with_context(|| "recording lexical-repair deferral reason")?;
+        Ok(next)
+    }
+
+    /// Clear the consecutive-deferral streak after a non-watch run completed
+    /// without deferring inline lexical updates (zn1xn F4).
+    pub(crate) fn clear_lexical_repair_deferred(&self) -> Result<()> {
+        self.conn
+            .execute_compat(
+                "DELETE FROM meta WHERE key = ?1",
+                fparams![LEXICAL_REPAIR_DEFERRED_COUNT_META_KEY],
+            )
+            .with_context(|| "clearing lexical-repair deferral streak")?;
+        self.conn
+            .execute_compat(
+                "DELETE FROM meta WHERE key = ?1",
+                fparams![LEXICAL_REPAIR_DEFERRED_REASON_META_KEY],
+            )
+            .with_context(|| "clearing lexical-repair deferral reason")?;
+        Ok(())
+    }
+
+    /// The consecutive-deferral streak length and last reason, if a non-watch
+    /// run has persistently deferred inline lexical updates (zn1xn F4).
+    #[cfg(test)]
+    pub(crate) fn read_lexical_repair_deferred(&self) -> Result<Option<(i64, String)>> {
+        let count = self.read_lexical_repair_deferred_count()?;
+        if count <= 0 {
+            return Ok(None);
+        }
+        let reason = self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![LEXICAL_REPAIR_DEFERRED_REASON_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        Ok(Some((count, reason)))
+    }
+
     pub(crate) fn daily_stats_is_known_healthy_for_archive_fingerprint(
         &self,
         archive_fingerprint: &str,
@@ -11178,6 +11377,70 @@ impl FrankenStorage {
                 before.indexed_messages.unwrap_or_default(),
                 before.indexable_messages
             ),
+        }
+    }
+
+    /// #368 defect 3: rebuild the canonical FTS5 shadow by DROPPING the
+    /// (possibly structurally corrupt) shadow and recreating it fresh from
+    /// canonical rows, rather than the DELETE-based clear in
+    /// [`Self::rebuild_fts_via_frankensqlite`], which routes through the FTS5
+    /// vtab update path and hydrates the corrupt `%_data`.
+    ///
+    /// Must be called on a connection opened via
+    /// [`Self::open_deferred_fts5_for_repair`], so the corrupt shadow was never
+    /// read at open. The FTS5 vtab's destructor is a no-op that never reads
+    /// `%_data`, and its backing shadow tables are plain, so `DROP TABLE`
+    /// removes the corrupt structure without decoding it. Canonical rows are
+    /// never modified. NOT fully failure-atomic: the drop+recreate runs in
+    /// autocommit (frankensqlite cannot recreate a virtual table in the same
+    /// transaction as its DROP), so only the repopulate is transactional — a
+    /// failed repopulate leaves an EMPTY (not corrupt) shadow, and re-running
+    /// the repair is safe because the shadow is fully derived from canonical.
+    pub(crate) fn rebuild_fts_shadow_via_drop_recreate(&self) -> Result<usize> {
+        self.invalidate_fts_messages_present_cache();
+
+        // Drop + recreate the shadow in autocommit: frankensqlite does not
+        // support recreating a virtual table in the SAME transaction as its
+        // DROP. The corrupt shadow is replaced by a fresh empty one here; the
+        // repopulate below is transactional. Full failure-atomicity (preserving
+        // the ORIGINAL) has no value in this path because the original shadow is
+        // corrupt — if the repopulate fails, the shadow is empty (not corrupt)
+        // and re-running the repair is safe, since it is fully derived from
+        // canonical rows.
+        self.conn
+            .execute("DROP TABLE IF EXISTS fts_messages")
+            .with_context(|| "dropping the corrupt FTS5 shadow before recreate")?;
+        self.conn
+            .execute_compat(FTS5_REGISTER_SQL, fparams![])
+            .with_context(|| "recreating a fresh FTS5 shadow after dropping the corrupt one")?;
+        self.set_fts_messages_present_cache(true);
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE TRANSACTION;")
+            .with_context(|| "starting the corrupt-FTS shadow repopulate transaction")?;
+        let repopulate = (|| -> Result<usize> {
+            let inserted_rows = self.stream_fts_rows_via_frankensqlite(false)?;
+            self.require_healthy_fts_parity("corrupt-FTS drop+recreate rebuild")?;
+            self.record_fts_franken_rebuild_generation()?;
+            self.conn
+                .execute_batch("COMMIT;")
+                .with_context(|| "publishing the corrupt-FTS shadow repopulate")?;
+            Ok(inserted_rows)
+        })();
+
+        match repopulate {
+            Ok(inserted_rows) => {
+                self.set_fts_messages_present_cache(true);
+                Ok(inserted_rows)
+            }
+            Err(err) => {
+                self.invalidate_fts_messages_present_cache();
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(err.context(
+                    "corrupt-FTS shadow repopulate rolled back after the shadow was dropped and \
+                     recreated empty; re-run 'cass doctor --rebuild-canonical-fts --yes' to retry",
+                ))
+            }
         }
     }
 
@@ -26419,6 +26682,100 @@ mod tests {
             )
             .unwrap();
         assert_eq!(auth_rows, 1);
+    }
+
+    #[test]
+    fn drop_recreate_repairs_corrupt_fts_shadow_structure() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("corrupt-fts.db");
+
+        // Canonical data + a valid FTS shadow.
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            let conversation = Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("corrupt-fts".into()),
+                title: Some("corrupt fts".into()),
+                source_path: PathBuf::from("/tmp/corrupt-fts.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_100),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_050),
+                    content: "authentication needle".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &conversation)
+                .unwrap();
+            storage.rebuild_fts_via_frankensqlite().unwrap();
+        }
+
+        // Corrupt the %_data structure record (rowid 10) via a fresh connection
+        // (the FTS is still valid here, so the open succeeds).
+        {
+            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            let garbage = [0xFFu8; 12];
+            conn.execute_compat(
+                "UPDATE fts_messages_data SET block = ?1 WHERE id = ?2",
+                fparams![garbage.as_slice(), 10_i64],
+            )
+            .unwrap();
+        }
+
+        // #368 defect 3: an ordinary open now fails on the corrupt structure.
+        assert!(
+            SqliteStorage::open(&db_path).is_err(),
+            "ordinary open must fail on a corrupt FTS5 %_data structure record"
+        );
+
+        // The deferred-open repair drops+recreates the shadow and rebuilds it
+        // from canonical.
+        let inserted = {
+            let storage = SqliteStorage::open_deferred_fts5_for_repair(&db_path).unwrap();
+            storage
+                .rebuild_fts_shadow_via_drop_recreate()
+                .unwrap_or_else(|e| panic!("drop+recreate rebuild failed: {e:#}"))
+        };
+        assert!(
+            inserted >= 1,
+            "repair must rebuild the canonical message into the FTS shadow"
+        );
+
+        // The archive now opens normally and the rebuilt shadow is queryable.
+        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let matches: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'needle'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            matches, 1,
+            "rebuilt FTS shadow must be queryable for 'needle'"
+        );
     }
 
     #[test]

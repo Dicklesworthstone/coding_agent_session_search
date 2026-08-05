@@ -68,6 +68,71 @@ fn storage_error(message: impl Into<String>, hint: Option<&str>) -> CliError {
     }
 }
 
+/// True when an FTS-repair failure is the frankensqlite FTS5 segment-writer
+/// leaf-offset ceiling rather than corruption of the operator's data (GH #369).
+///
+/// frankensqlite writes exactly one segment leaf per flush and stores each
+/// term's byte offset inside that leaf in a `u16`. When a single insert batch's
+/// combined terms + doclists encode past 65,535 bytes, `Fts5SegmentLeaf::encode`
+/// hard-fails with `segment leaf term offset exceeds u16` (surfaced as
+/// `fts5: corrupt %_data record: …`) and the failure-atomic rebuild rolls back
+/// without publishing a partial shadow. This is a *content-dependent, sticky*
+/// engine limitation — not archive corruption — so it deserves a distinct,
+/// reassuring operator diagnostic instead of the generic storage-error wall.
+/// Note the `gh362` overlong-*term* tokenizer cap (`FTS5_MAX_TERM_BYTES`) does
+/// not address this: the overflow is cumulative across many in-cap terms, not a
+/// single oversized token.
+fn is_fts5_oversized_leaf_error(err: &anyhow::Error) -> bool {
+    // Match the full rendered chain so it is robust to however the fsqlite
+    // error was wrapped on the way up (context strings, `{e:#}`, etc.).
+    let rendered = format!("{err:#}");
+    rendered.contains("segment leaf term offset exceeds u16")
+        || rendered.contains("segment leaf rowid offset exceeds u16")
+        || rendered.contains("segment leaf footer offset exceeds u16")
+        || rendered.contains("segment footer offset exceeds u16")
+        || (rendered.contains("corrupt %_data record") && rendered.contains("segment leaf"))
+}
+
+/// #368 defect 3: does this error indicate the FTS5 `%_data` shadow structure
+/// is corrupt enough to fail an ordinary open during the schema reload (e.g.
+/// "structure segment count exceeds FTS5 maximum")? Such an archive can't be
+/// opened normally to repair it, but CAN be opened with FTS5 hydration deferred
+/// and then rebuilt by dropping + recreating the shadow from canonical. The
+/// oversized-*leaf* (gh#369) shape is excluded — that is a content-dependent
+/// write-time engine limitation with its own reassuring diagnostic, not a
+/// persisted open-blocking corruption.
+fn is_fts5_shadow_open_corruption_error(err: &anyhow::Error) -> bool {
+    let rendered = format!("{err:#}");
+    rendered.contains("corrupt %_data record") && !is_fts5_oversized_leaf_error(err)
+}
+
+/// The distinct, non-alarming diagnostic for the GH #369 oversized-leaf case:
+/// canonical rows and the Tantivy index are intact and fully serve search; only
+/// the optional SQLite-side FTS5 shadow cannot be materialized for this corpus.
+fn fts5_oversized_leaf_shadow_error(db_path: &Path) -> CliError {
+    CliError {
+        code: 13,
+        kind: "fts5-oversized-leaf-shadow-unbuildable",
+        message: format!(
+            "the canonical SQLite FTS5 shadow cannot be built for {} because a single insert \
+             batch in this corpus encodes past the frankensqlite FTS5 segment-leaf u16 offset \
+             ceiling (one-leaf-per-segment limitation, GH #369) — this is an engine limitation, \
+             not corruption of your archive, and the failed rebuild was rolled back without \
+             publishing a partial shadow",
+            db_path.display()
+        ),
+        hint: Some(
+            "No action is needed and no data was lost: the canonical SQLite tables and the \
+             Tantivy lexical index are intact and fully serve search — only the optional \
+             SQLite-side `fts_messages` shadow is affected, and `cass doctor check` stays \
+             healthy. This is tracked upstream for a multi-leaf FTS5 segment writer; re-run \
+             `--rebuild-canonical-fts --yes` once the pinned frankensqlite build ships that fix."
+                .to_string(),
+        ),
+        retryable: false,
+    }
+}
+
 fn print_json(envelope: &serde_json::Value) -> CliResult<()> {
     let rendered = serde_json::to_string_pretty(envelope).map_err(|e| CliError {
         code: 9,
@@ -420,23 +485,86 @@ pub fn run_doctor_rebuild_canonical_fts(
         ));
     }
 
-    let storage = if dry_run {
+    let storage_open = if dry_run {
         FrankenStorage::open_readonly(&db_path)
     } else {
         FrankenStorage::open_existing_schema_only_for_fts_repair(&db_path)
-    }
-    .map_err(|e| {
-        storage_error(
-            format!(
-                "could not open canonical archive {} for FTS5 inspection: {e:#}",
-                db_path.display()
-            ),
-            Some(
-                "If the archive cannot be opened at all, the canonical rows are unreadable — use \
-                 'cass doctor --recover-from-archive <DIR>' to rebuild the source tree instead.",
-            ),
-        )
-    })?;
+    };
+    let storage = match storage_open {
+        Ok(storage) => storage,
+        // #368 defect 3: the FTS5 shadow structure is corrupt enough that the
+        // archive cannot be opened normally (the schema reload decodes the
+        // corrupt %_data). Open with FTS5 hydration DEFERRED and rebuild the
+        // shadow by dropping + recreating it from canonical rows — the shadow is
+        // fully derived and canonical rows are never touched.
+        Err(open_err) if is_fts5_shadow_open_corruption_error(&open_err) => {
+            if dry_run {
+                // A dry-run must stay read-only and non-locking: report the
+                // planned repair straight from the open error, WITHOUT opening
+                // the archive writable or taking the doctor mutation lock that
+                // `open_deferred_fts5_for_repair` acquires.
+                let envelope = serde_json::json!({
+                    "surface": "doctor_rebuild_canonical_fts_dry_run",
+                    "status": "shadow_structure_corrupt",
+                    "planned_action": "drop_recreate_rebuild_from_canonical",
+                    "detail": format!("{open_err:#}"),
+                });
+                if structured_format.is_some() {
+                    print_json(&envelope)?;
+                } else {
+                    println!(
+                        "Canonical FTS5 dry-run: status=shadow_structure_corrupt, planned_action=drop_recreate_rebuild_from_canonical; re-run with --yes to drop, recreate, and rebuild the corrupt shadow from canonical"
+                    );
+                }
+                return Ok(());
+            }
+            let deferred = FrankenStorage::open_deferred_fts5_for_repair(&db_path).map_err(|e| {
+                storage_error(
+                    format!(
+                        "opening canonical archive {} with deferred FTS5 validation for corrupt-shadow repair: {e:#}",
+                        db_path.display()
+                    ),
+                    Some("Preserve the archive bundle and run 'cass doctor check --json'."),
+                )
+            })?;
+            let inserted = deferred
+                .rebuild_fts_shadow_via_drop_recreate()
+                .map_err(|e| {
+                    storage_error(
+                        format!(
+                            "rebuilding corrupt canonical FTS5 shadow via drop+recreate: {e:#}"
+                        ),
+                        Some("Preserve the archive bundle and run 'cass doctor check --json'."),
+                    )
+                })?;
+            let envelope = serde_json::json!({
+                "surface": "doctor_rebuild_canonical_fts",
+                "status": "rebuilt_from_corrupt_shadow",
+                "method": "drop_recreate_rebuild_from_canonical",
+                "inserted_messages": inserted,
+            });
+            if structured_format.is_some() {
+                print_json(&envelope)?;
+            } else {
+                println!(
+                    "Canonical FTS5 shadow was structurally corrupt; dropped, recreated, and rebuilt {inserted} message(s) from canonical rows."
+                );
+            }
+            return Ok(());
+        }
+        Err(open_err) => {
+            return Err(storage_error(
+                format!(
+                    "could not open canonical archive {} for FTS5 inspection: {open_err:#}",
+                    db_path.display()
+                ),
+                Some(
+                    "If the archive cannot be opened at all, the canonical rows are unreadable — use \
+                     'cass doctor --recover-from-archive <DIR>' to rebuild the source tree instead.",
+                ),
+            ));
+        }
+    };
     let before = storage.inspect_search_fallback_fts_parity().map_err(|e| {
         storage_error(
             format!("inspecting canonical/FTS5 row parity: {e:#}"),
@@ -466,12 +594,20 @@ pub fn run_doctor_rebuild_canonical_fts(
     let repair = storage
         .ensure_search_fallback_fts_consistency()
         .map_err(|e| {
-            storage_error(
-                format!("safely repairing canonical FTS5 shadow tables: {e:#}"),
-                Some(
-                    "Preserve the complete database bundle. Re-run the dry-run to inspect exact current parity before any retry.",
-                ),
-            )
+            if is_fts5_oversized_leaf_error(&e) {
+                // GH #369: a known, content-dependent engine limitation — not
+                // archive corruption. Surface a distinct, reassuring diagnostic
+                // instead of the generic storage wall so operators do not treat
+                // a working (Tantivy-served) search as broken.
+                fts5_oversized_leaf_shadow_error(&db_path)
+            } else {
+                storage_error(
+                    format!("safely repairing canonical FTS5 shadow tables: {e:#}"),
+                    Some(
+                        "Preserve the complete database bundle. Re-run the dry-run to inspect exact current parity before any retry.",
+                    ),
+                )
+            }
         })?;
     let after = storage.inspect_search_fallback_fts_parity().map_err(|e| {
         storage_error(
@@ -1026,9 +1162,11 @@ mod tests {
     /// leaf-offset space (91,548 bytes observed in a real Codex rollout) used
     /// to fail every canonical FTS repair path with "fts5: corrupt %_data
     /// record: segment leaf term offset exceeds u16" — including this exact
-    /// `--rebuild-canonical-fts` recovery. With frankensqlite ≥ 95ec7126 the
-    /// overlong term is skipped at the tokenizer, the rebuild completes, and
-    /// neighboring terms in the same message stay indexed.
+    /// `--rebuild-canonical-fts` recovery. With the pinned frankensqlite
+    /// hotfix family (branch `fts5-overlong-hotfix-cass362`, which carries
+    /// the overlong-term skip cap) the overlong term is skipped at the
+    /// tokenizer, the rebuild completes, and neighboring terms in the same
+    /// message stay indexed.
     #[test]
     fn rebuild_canonical_fts_survives_overlong_term_in_corpus() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1079,5 +1217,195 @@ mod tests {
         assert_eq!(parity.status, FtsShadowParityStatus::Healthy);
         assert_eq!(parity.canonical_messages, 2);
         assert_eq!(parity.indexed_messages, Some(2));
+    }
+
+    /// GH #368 (defect 3): when the FTS5 `%_data` *structure* record is corrupt
+    /// enough that the archive cannot be opened normally (the schema reload
+    /// eagerly decodes it), `--rebuild-canonical-fts --yes` must still repair it
+    /// by reopening with FTS5 hydration DEFERRED and dropping + recreating +
+    /// repopulating the shadow from canonical rows. This drives the full doctor
+    /// CLI fallback end-to-end (`is_fts5_shadow_open_corruption_error` detection
+    /// plus the corrupt-shadow branch of `run_doctor_rebuild_canonical_fts`,
+    /// including the read-only dry-run report) — coverage the storage-level test
+    /// `drop_recreate_repairs_corrupt_fts_shadow_structure` does not reach.
+    #[test]
+    fn rebuild_canonical_fts_repairs_structurally_corrupt_shadow_that_blocks_open() {
+        use frankensqlite::Connection as FrankenConnection;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+
+        // Canonical data + a VALID FTS shadow (which we then corrupt).
+        {
+            let storage = FrankenStorage::open(&db_path).expect("open db");
+            let agent_id = seed_agent(&storage);
+            let conversation_id =
+                seed_conversation(&storage, agent_id, "corrupt-shadow", "/orig/corrupt.jsonl");
+            // The FTS rebuild streams `messages.content`, so the matchable token
+            // must land there (the `write_message` helper stores a placeholder
+            // content and would never be queryable for 'needle').
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) \
+                     VALUES(?1, 0, 'user', NULL, 1000, ?2, NULL, NULL)",
+                    &[
+                        ParamValue::from(conversation_id),
+                        ParamValue::from("authentication needle".to_string()),
+                    ] as &[ParamValue],
+                )
+                .expect("insert canonical message");
+            storage
+                .rebuild_fts_via_frankensqlite()
+                .expect("build a valid FTS shadow");
+        }
+
+        // Corrupt the %_data structure record (rowid 10) through a fresh
+        // connection (the FTS is still valid here, so the open succeeds).
+        {
+            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())
+                .expect("open raw franken connection");
+            let garbage = [0xFFu8; 12];
+            conn.execute_compat(
+                "UPDATE fts_messages_data SET block = ?1 WHERE id = ?2",
+                &[
+                    ParamValue::from(garbage.as_slice()),
+                    ParamValue::from(10_i64),
+                ] as &[ParamValue],
+            )
+            .expect("corrupt the FTS5 structure record");
+        }
+
+        // Both the read-only open (dry-run path) and the schema-only repair open
+        // (apply path) must now fail on the corrupt structure, so the doctor
+        // command is forced through the deferred-open corrupt-shadow fallback
+        // rather than the ordinary parity path.
+        assert!(
+            FrankenStorage::open_readonly(&db_path).is_err(),
+            "read-only open must fail on a corrupt FTS5 %_data structure record"
+        );
+        assert!(
+            FrankenStorage::open_existing_schema_only_for_fts_repair(&db_path).is_err(),
+            "schema-only repair open must fail on a corrupt FTS5 %_data structure record"
+        );
+
+        // Dry-run (even with --yes) must report the planned repair while staying
+        // strictly read-only: it must NOT open the archive writable, take the
+        // doctor mutation lock, or repair anything.
+        let bytes_before_dry_run = std::fs::read(&db_path).expect("snapshot db before dry-run");
+        run_doctor_rebuild_canonical_fts(
+            Some(tmp.path().to_path_buf()),
+            Some(db_path.clone()),
+            true,
+            true,
+            Some(RobotFormat::Json),
+        )
+        .expect("dry-run on a corrupt shadow must succeed read-only");
+        let bytes_after_dry_run = std::fs::read(&db_path).expect("snapshot db after dry-run");
+        assert_eq!(
+            bytes_after_dry_run, bytes_before_dry_run,
+            "corrupt-shadow dry-run must not alter any database bytes"
+        );
+        assert!(
+            FrankenStorage::open_existing_schema_only_for_fts_repair(&db_path).is_err(),
+            "dry-run must not have repaired the corrupt shadow"
+        );
+
+        // Apply: the fallback drops + recreates + rebuilds the shadow from
+        // canonical rows.
+        run_doctor_rebuild_canonical_fts(
+            Some(tmp.path().to_path_buf()),
+            Some(db_path.clone()),
+            false,
+            true,
+            Some(RobotFormat::Json),
+        )
+        .expect(
+            "rebuild-canonical-fts must repair a structurally-corrupt shadow (GH #368 defect 3)",
+        );
+
+        // The archive now opens normally and the rebuilt shadow reaches exact
+        // parity and is queryable for a token from canonical content.
+        let readonly = FrankenStorage::open_readonly(&db_path).expect("reopen read-only");
+        let parity = readonly
+            .inspect_search_fallback_fts_parity()
+            .expect("inspect rebuilt FTS");
+        assert_eq!(parity.status, FtsShadowParityStatus::Healthy);
+        assert_eq!(parity.canonical_messages, 1);
+        assert_eq!(parity.indexed_messages, Some(1));
+        let matches: i64 = readonly
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'needle'",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .expect("MATCH on rebuilt shadow");
+        assert_eq!(
+            matches, 1,
+            "rebuilt FTS shadow must be queryable for 'needle'"
+        );
+    }
+
+    /// GH #369: the cumulative oversized-leaf failure (many in-cap terms in one
+    /// batch, not a single overlong token) must be recognized so the operator
+    /// gets a reassuring "search still works via Tantivy" diagnostic rather than
+    /// the generic storage wall. This mirrors the exact wrapped chain the
+    /// failure-atomic rebuild produces (`sqlite.rs` `.context(...)`), with the
+    /// fsqlite root string preserved.
+    #[test]
+    fn oversized_leaf_error_is_classified_and_gets_reassuring_diagnostic() {
+        let wrapped = anyhow::anyhow!(
+            "inserting 4000 rows into fts_messages during streaming FTS maintenance: \
+             fts5: corrupt %_data record: segment leaf term offset exceeds u16"
+        )
+        .context("failure-atomic FTS rebuild rolled back without publishing a partial shadow");
+        assert!(
+            is_fts5_oversized_leaf_error(&wrapped),
+            "the real wrapped chain must be recognized as the GH #369 oversized-leaf case"
+        );
+
+        // Each sibling leaf/footer overflow signature is also covered.
+        for signature in [
+            "segment leaf rowid offset exceeds u16",
+            "segment leaf footer offset exceeds u16",
+            "segment footer offset exceeds u16",
+        ] {
+            assert!(
+                is_fts5_oversized_leaf_error(&anyhow::anyhow!(signature.to_string())),
+                "signature must be recognized: {signature}"
+            );
+        }
+
+        // Unrelated storage failures must NOT be misclassified — they still get
+        // the generic storage wall + bundle-preservation hint.
+        for unrelated in [
+            "database is locked",
+            "no such table: fts_messages",
+            "disk I/O error while reading page 42",
+            "segment terms must be strictly increasing",
+        ] {
+            assert!(
+                !is_fts5_oversized_leaf_error(&anyhow::anyhow!(unrelated.to_string())),
+                "unrelated error must not be misclassified: {unrelated}"
+            );
+        }
+
+        let diagnostic = fts5_oversized_leaf_shadow_error(Path::new("/tmp/agent_search.db"));
+        assert_eq!(diagnostic.kind, "fts5-oversized-leaf-shadow-unbuildable");
+        assert!(!diagnostic.retryable);
+        assert!(
+            diagnostic
+                .message
+                .contains("not corruption of your archive"),
+            "message must reassure the operator their data is intact"
+        );
+        let hint = diagnostic
+            .hint
+            .expect("oversized-leaf diagnostic carries a hint");
+        assert!(
+            hint.contains("Tantivy") && hint.contains("No action is needed"),
+            "hint must state search still works and no action is needed"
+        );
     }
 }

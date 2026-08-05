@@ -371,7 +371,7 @@
       "last_indexed_at": null,
       "age_seconds": "[AGE_SECONDS]",
       "stale": false,
-      "stale_threshold_seconds": 300,
+      "stale_threshold_seconds": 1800,
       "rebuilding": false,
       "stalled": false,
       "activity_at": null,

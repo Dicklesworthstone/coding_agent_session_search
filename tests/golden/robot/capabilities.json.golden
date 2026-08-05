@@ -57,6 +57,7 @@
     "copilot_cli",
     "qwen",
     "grok",
+    "goose",
     "crush",
     "hermes"
   ],
@@ -1389,11 +1390,11 @@
         },
         {
           "name": "stale-threshold",
-          "description": "Staleness threshold in seconds (default: 300)",
+          "description": "Staleness threshold in seconds (default: 1800 = 30 minutes)",
           "arg_type": "option",
           "value_type": "integer",
           "required": false,
-          "default": "300"
+          "default": "1800"
         },
         {
           "name": "robot-format",
@@ -1435,11 +1436,11 @@
         },
         {
           "name": "stale-threshold",
-          "description": "Staleness threshold in seconds (default: 300)",
+          "description": "Staleness threshold in seconds (default: 1800 = 30 minutes)",
           "arg_type": "option",
           "value_type": "integer",
           "required": false,
-          "default": "300"
+          "default": "1800"
         },
         {
           "name": "include-full-paths",
@@ -1702,11 +1703,11 @@
         },
         {
           "name": "stale-threshold",
-          "description": "Staleness threshold in seconds (default: 300)",
+          "description": "Staleness threshold in seconds (default: 1800 = 30 minutes). Matches `cass status` / `DEFAULT_STALE_THRESHOLD_SECS` so bare `cass health` does not flip unhealthy five minutes after a rebuild on large archives that are not in continuous watch mode",
           "arg_type": "option",
           "value_type": "integer",
           "required": false,
-          "default": "300"
+          "default": "1800"
         },
         {
           "name": "robot-format",

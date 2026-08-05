@@ -32,7 +32,7 @@
 //! - Evictions are driven only by a bounded entry budget. Callers pick
 //!   the budget; no hidden global cache exists.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -173,12 +173,25 @@ pub(crate) struct MemoQuarantineSummary {
 /// driven by LRU eviction when `max_entries` is reached. Quarantined
 /// entries stay resident (so an operator can inspect them) but never
 /// serve a hit.
+///
+/// Recency bookkeeping (redaction-perf campaign, xu3jq round 2): a
+/// monotonic clock assigns each entry a recency sequence; `lru_order`
+/// maps sequence -> key (min = least-recently-used victim) and
+/// `lru_seq` maps key -> its current sequence. Touch/insert/invalidate
+/// are O(log n) instead of the previous VecDeque scheme's O(capacity)
+/// linear scans (`iter().position()` / `retain()`), which profiling
+/// showed as the dominant cost on every hit and insert (MemoKey memcmp
+/// storms). Eviction order is semantically identical to the old
+/// push-back/pop-front VecDeque: least-recently-touched entry evicts
+/// first.
 #[derive(Debug)]
 pub(crate) struct ContentAddressedMemoCache<V: Clone> {
     max_entries: usize,
     entries: HashMap<MemoKey, V>,
     quarantined: HashMap<MemoKey, String>,
-    lru: VecDeque<MemoKey>,
+    lru_order: BTreeMap<u64, MemoKey>,
+    lru_seq: HashMap<MemoKey, u64>,
+    lru_clock: u64,
     stats: MemoCacheStats,
 }
 
@@ -189,7 +202,9 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
             max_entries: cap,
             entries: HashMap::with_capacity(cap),
             quarantined: HashMap::new(),
-            lru: VecDeque::with_capacity(cap),
+            lru_order: BTreeMap::new(),
+            lru_seq: HashMap::with_capacity(cap),
+            lru_clock: 0,
             stats: MemoCacheStats::default(),
         }
     }
@@ -265,17 +280,19 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
             );
         }
         let mut evicted = false;
-        if !self.entries.contains_key(&key)
-            && self.entries.len() >= self.max_entries
-            && let Some(victim) = self.lru.pop_front()
-        {
-            self.entries.remove(&victim);
-            evicted = true;
+        if !self.entries.contains_key(&key) && self.entries.len() >= self.max_entries {
+            // Victim = smallest recency sequence (least recently used).
+            if let Some((&victim_seq, _)) = self.lru_order.iter().next()
+                && let Some(victim) = self.lru_order.remove(&victim_seq)
+            {
+                self.entries.remove(&victim);
+                self.lru_seq.remove(&victim);
+                evicted = true;
+            }
         }
-        // Re-insert OR fresh-insert both retain position at tail.
+        // Re-insert OR fresh-insert both take the newest recency slot.
         let audit_key = key.clone();
-        self.lru.retain(|existing| existing != &key);
-        self.lru.push_back(key.clone());
+        self.touch_or_track(&key);
         self.entries.insert(key, value);
         self.stats.inserts = self.stats.inserts.saturating_add(1);
         self.stats.live_entries = self.entries.len() as u64;
@@ -296,7 +313,7 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
 
     pub(crate) fn invalidate_with_audit(&mut self, key: &MemoKey) -> MemoCacheAuditRecord {
         let removed = self.entries.remove(key).is_some();
-        self.lru.retain(|existing| existing != key);
+        self.untrack(key);
         if removed {
             self.stats.invalidations = self.stats.invalidations.saturating_add(1);
             self.stats.live_entries = self.entries.len() as u64;
@@ -322,7 +339,7 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
         let previous_reason = self.quarantined.get(&key).cloned();
         let had_entry = self.entries.contains_key(&key);
         self.entries.remove(&key);
-        self.lru.retain(|existing| existing != &key);
+        self.untrack(&key);
         let newly_quarantined = !self.quarantined.contains_key(&key);
         self.quarantined.insert(key.clone(), reason.clone());
         if newly_quarantined {
@@ -453,10 +470,30 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
         preview
     }
 
+    /// Move an already-tracked key to the newest recency slot. No-op
+    /// for untracked keys (matches the old VecDeque `touch` semantics).
     fn touch(&mut self, key: &MemoKey) {
-        if let Some(pos) = self.lru.iter().position(|existing| existing == key) {
-            self.lru.remove(pos);
-            self.lru.push_back(key.clone());
+        if self.lru_seq.contains_key(key) {
+            self.touch_or_track(key);
+        }
+    }
+
+    /// Assign the key the newest recency sequence, tracking it if
+    /// necessary. O(log n).
+    fn touch_or_track(&mut self, key: &MemoKey) {
+        if let Some(old_seq) = self.lru_seq.get(key).copied() {
+            self.lru_order.remove(&old_seq);
+        }
+        self.lru_clock += 1;
+        let seq = self.lru_clock;
+        self.lru_order.insert(seq, key.clone());
+        self.lru_seq.insert(key.clone(), seq);
+    }
+
+    /// Drop a key from recency tracking entirely. O(log n).
+    fn untrack(&mut self, key: &MemoKey) {
+        if let Some(seq) = self.lru_seq.remove(key) {
+            self.lru_order.remove(&seq);
         }
     }
 

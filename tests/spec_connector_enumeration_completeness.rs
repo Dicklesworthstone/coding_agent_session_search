@@ -79,6 +79,7 @@ const DOCUMENTED_CONNECTOR_NAMES: &[&str] = &[
     "cursor",
     "factory",
     "gemini",
+    "goose",
     "grok",
     "hermes",
     "kimi",
