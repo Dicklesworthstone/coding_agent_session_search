@@ -190,7 +190,7 @@ impl SemanticIndexArtifact {
         let fsvi_path = freeze(fsvi_path.into());
         let ann_path = ann_path.map(freeze);
         reject_final_component_symlink("FSVI", &fsvi_path)?;
-        let index = VectorIndex::open(&fsvi_path)
+        let index = VectorIndex::open_read_only(&fsvi_path)
             .with_context(|| format!("open semantic FSVI {}", fsvi_path.display()))?;
         let ann_unavailable_reason =
             ann_path
@@ -216,10 +216,11 @@ impl SemanticIndexArtifact {
             fsvi_path,
             ann_path,
             ann_unavailable_reason,
-            // `VectorIndex::open` retains the exact FSVI owner used by CASS
-            // exact search, but FrankenSearch's current two-tier constructors
-            // still reopen a pathname. Keep those lanes fail-closed until an
-            // owner-accepting constructor can set this capability true.
+            // `VectorIndex::open_read_only` retains the exact FSVI owner used
+            // by CASS exact search, but FrankenSearch's current two-tier
+            // constructors still reopen a pathname. Keep those lanes
+            // fail-closed until an owner-accepting constructor can set this
+            // capability true.
             owner_backed_progressive_reader: false,
         })
     }

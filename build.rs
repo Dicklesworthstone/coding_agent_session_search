@@ -135,7 +135,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // `validate_manifest_dependency_spec` to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.9",
+        expected_version: "0.3.10",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -156,7 +156,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // surface. The latter keeps CASS schema-v8 access independent from
         // FrankenSearch's swappable generic lexical backend (cass #308,
         // bd-8nqz.5).
-        expected_rev: "ad8e29eaa03c9f29abc472d895a0ea9bcbe04ff1",
+        expected_rev: "fbde80225914f02389e04af5970647034a8291d7",
         expected_version: "0.3.2",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
