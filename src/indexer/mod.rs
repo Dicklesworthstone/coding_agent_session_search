@@ -53146,8 +53146,22 @@ mod tests {
     fn cass_connector_registry_only_replaces_codex_factory() {
         let upstream = franken_agent_detection::get_connector_factories();
         let configured = get_connector_factories();
-        assert_eq!(configured.len(), upstream.len());
 
+        // CASS mirrors the upstream FAD registry (replacing only the codex
+        // factory) and then appends the CASS-local Kiro connector, which FAD
+        // does not provide -- so the configured registry is exactly one longer.
+        assert_eq!(configured.len(), upstream.len() + 1);
+
+        let (kiro_name, _) = *configured.last().expect("registry is non-empty");
+        assert_eq!(kiro_name, "kiro", "the Kiro connector is appended last");
+        assert!(
+            upstream.iter().all(|(name, _)| *name != "kiro"),
+            "upstream FAD must not already provide a kiro connector"
+        );
+
+        // Every upstream-mirrored entry keeps its name; only codex is rewrapped.
+        // `zip` stops at the shorter iterator, so the appended kiro entry (which
+        // has no upstream counterpart) is intentionally not compared here.
         for ((configured_name, configured_factory), (upstream_name, upstream_factory)) in
             configured.into_iter().zip(upstream)
         {

@@ -11,7 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, and Grok Build into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, Grok Build, and Kiro into a single, searchable timeline.
 
 <div align="center">
 
@@ -360,7 +360,7 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from 23 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
+Ingests history from 24 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
 - **Codex**: `~/.codex/sessions` (Rollout JSONL)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
@@ -386,6 +386,7 @@ Ingests history from 23 local agents, normalizing them into a unified `Conversat
 - **Antigravity (agy)**: `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl` (clean JSONL transcript), with the durable per-conversation `conversations/<uuid>.db` (SQLite) mirrored alongside. Resume with `cass resume <transcript> --agent agy` (`agy --conversation <uuid>`).
 - **OpenHands (OpenDevin)**: `~/.openhands/conversations/<id>/` — `base_state.json` metadata plus an `events/event-NNNNN-<uuid>.json` event stream (JSON)
 - **Grok Build (xAI `grok`)**: `~/.grok/sessions/<percent-encoded-cwd>/<session-uuid>/` — `updates.jsonl` (authoritative ACP session-update stream) with `summary.json` metadata and `chat_history.jsonl` fallback (override the base dir with `GROK_HOME`). Resume with `grok --resume <session-id>`.
+- **Kiro**: `~/.kiro/sessions/cli/<session-uuid>.jsonl` — append-only `{version, kind, data}` event log (kinds `Prompt`/`AssistantMessage`/`ToolResults`) with a sibling `<session-uuid>.json` snapshot for metadata (`session_id`, `cwd`, `title`, `created_at`/`updated_at`, `model_info`). The Kiro IDE/desktop store under `~/.kiro/sessions/<workspaceHash>/sess_<uuid>/` (`session.json` + `messages.jsonl`) uses a distinct camelCase schema; the CLI store is the primary indexed surface.
 
 Claude Code Desktop sidecars preserve title, workspace, model, and session IDs,
 but not necessarily the full conversation body. If Claude Code has culled an old
@@ -404,6 +405,13 @@ that the conversation body is unavailable.
 - **Location**: `.opencode/` directories (scans recursively from home)
 - **Format**: SQLite database with sessions table
 - **Detection**: Finds directories named `.opencode` containing database files
+
+**Kiro** parses the Kiro CLI (`kiro-cli chat`) session store:
+- **Location**: `~/.kiro/sessions/cli/` — each session is a `<uuid>.jsonl` message log paired with a `<uuid>.json` state/metadata snapshot (`.lock` and `sess_*.history` files are ignored)
+- **Format**: Append-only JSONL of `{version, kind, data}` records — `Prompt` (user), `AssistantMessage` (assistant), and `ToolResults` (tool); content blocks are `text`, `thinking`, `toolUse`, and `toolResult`, with `toolUse`/`toolResult` normalized into tool invocations. `thinking` blocks are excluded from indexed conversation text
+- **Features**: Metadata (title, `cwd`, created/updated timestamps, model) is read from the sibling `.json`; `Prompt` timestamps are epoch seconds while `AssistantMessage`/`ToolResults` carry none, so timestamps are carried forward to stay monotonic. Empty (0-byte) session logs are skipped
+- **Detection**: Scans for non-empty `<uuid>.jsonl` files under `~/.kiro/sessions/cli/`
+- **Note**: The Kiro IDE/desktop store (`~/.kiro/sessions/<workspaceHash>/sess_<uuid>/` with `session.json` + `messages.jsonl`) uses a separate camelCase schema and is not the primary indexed surface; the CLI store is
 
 ### 🌐 Remote Sources (Multi-Machine Search)
 
@@ -2180,7 +2188,7 @@ classDiagram
 `cass` uses frankensqlite as the durable source of truth and frankensearch as a derived speed layer, powered by a suite of integrated "franken" libraries.
 
 ### The Pipeline
-1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 23 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi, Qwen, Factory, OpenHands, Antigravity, Grok Build).
+1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 24 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi, Qwen, Factory, OpenHands, Antigravity, Grok Build, Kiro).
 2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation with `BEGIN CONCURRENT` support for MVCC multi-writer transactions.
 3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.

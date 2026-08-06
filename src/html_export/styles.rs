@@ -1580,6 +1580,7 @@ pre:hover .copy-code-btn { opacity: 1; }
 .agent-grok .message-assistant { border-left-color: oklch(0.7 0.22 350); }
 .agent-hermes .message-assistant { border-left-color: oklch(0.78 0.16 95); }
 .agent-goose .message-assistant { border-left-color: oklch(0.74 0.1 75); }
+.agent-kiro .message-assistant { border-left-color: oklch(0.72 0.19 315); }
 
 /* Print styles */
 @media print {
