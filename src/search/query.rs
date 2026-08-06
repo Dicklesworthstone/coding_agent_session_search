@@ -19,10 +19,10 @@ use frankensearch::{
     InMemoryVectorIndex as FsInMemoryVectorIndex, QueryClass as FsQueryClass,
     RrfConfig as FsRrfConfig, ScoreSource as FsScoreSource, ScoredResult as FsScoredResult,
     SearchError as FsSearchError, SearchFuture as FsSearchFuture, SearchPhase as FsSearchPhase,
-    SyncEmbedderAdapter as FsSyncEmbedderAdapter, SyncTwoTierSearcher as FsSyncTwoTierSearcher,
-    TwoTierConfig as FsTwoTierConfig, TwoTierIndex as FsTwoTierIndex,
-    TwoTierIndexPaths as FsTwoTierIndexPaths, TwoTierSearcher as FsTwoTierSearcher,
-    VectorHit as FsVectorHit, candidate_count as fs_candidate_count,
+    SyncEmbedderAdapter as FsSyncEmbedderAdapter, TwoTierConfig as FsTwoTierConfig,
+    TwoTierIndex as FsTwoTierIndex, TwoTierIndexPaths as FsTwoTierIndexPaths,
+    TwoTierSearcher as FsTwoTierSearcher, VectorHit as FsVectorHit,
+    candidate_count as fs_candidate_count,
     core::{LexicalRead as FsLexicalRead, filter::SearchFilter as FsSearchFilter},
     index::{
         HNSW_DEFAULT_EF_SEARCH as FS_HNSW_DEFAULT_EF_SEARCH, HnswIndex as FsHnswIndex,
@@ -403,9 +403,11 @@ impl SearchMode {
 /// Execution strategy for semantic search.
 ///
 /// `Single` preserves existing exact vector behavior.
-/// Other modes attempt to use frankensearch's sync two-tier searcher when a
-/// compatible in-memory two-tier index is available; otherwise they fall back
-/// to `Single`.
+/// The other modes request two-tier semantics, but this synchronous candidate
+/// path currently carries only one CASS query embedding. It therefore falls
+/// back to exact single-tier search until it can supply independently
+/// identity-bound fast and quality embeddings; the owner-backed progressive
+/// API remains the safe two-tier execution path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticTierMode {
@@ -419,21 +421,6 @@ pub enum SemanticTierMode {
 impl SemanticTierMode {
     const fn wants_two_tier(self) -> bool {
         !matches!(self, Self::Single)
-    }
-
-    fn to_frankensearch_config(self) -> FsTwoTierConfig {
-        let mut config = frankensearch_two_tier_config();
-        match self {
-            Self::Single | Self::Progressive => {}
-            Self::FastOnly => {
-                config.fast_only = true;
-            }
-            Self::QualityOnly => {
-                config.fast_only = false;
-                config.quality_weight = 1.0;
-            }
-        }
-        config
     }
 }
 
@@ -4649,59 +4636,10 @@ impl SearchClient {
         }
 
         if request.tier_mode.wants_two_tier() && !request.approximate {
-            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-            if let Some(two_tier_index) = request.in_memory_two_tier_index {
-                let config = request.tier_mode.to_frankensearch_config();
-                let searcher = FsSyncTwoTierSearcher::new(Arc::clone(two_tier_index), config);
-                let (tier_hits, metrics) = searcher
-                    .search_collect_with_filter(embedding, request.fetch_limit, fs_filter)
-                    .map_err(|err| {
-                        anyhow!("frankensearch two-tier semantic search failed: {err}")
-                    })?;
-
-                tracing::debug!(
-                    tier_mode = ?request.tier_mode,
-                    phase1_ms = metrics.phase1_total_ms,
-                    phase2_ms = metrics.phase2_total_ms,
-                    skip_reason = ?metrics.skip_reason,
-                    returned = tier_hits.len(),
-                    "semantic two-tier search executed"
-                );
-
-                let mut best_by_message: HashMap<u64, VectorSearchResult> =
-                    HashMap::with_capacity(tier_hits.len());
-                for hit in tier_hits.iter() {
-                    let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                        continue;
-                    };
-                    best_by_message
-                        .entry(parsed.message_id)
-                        .and_modify(|entry| {
-                            if hit.score > entry.score {
-                                entry.score = hit.score;
-                                entry.chunk_idx = parsed.chunk_idx;
-                            }
-                        })
-                        .or_insert(VectorSearchResult {
-                            message_id: parsed.message_id,
-                            chunk_idx: parsed.chunk_idx,
-                            score: hit.score,
-                        });
-                }
-
-                return Ok((
-                    Self::collapse_semantic_results(best_by_message, request.fetch_limit),
-                    SemanticCandidateRetryState {
-                        has_more_candidates: tier_hits.len() >= request.fetch_limit,
-                        exact_window_may_omit_competitor: false,
-                    },
-                    None,
-                ));
-            }
-
             tracing::debug!(
                 tier_mode = ?request.tier_mode,
-                "two-tier semantic unavailable; falling back to exact single-tier search"
+                owner_backed_index_available = request.in_memory_two_tier_index.is_some(),
+                "per-tier bound query embeddings unavailable; falling back to exact single-tier search"
             );
 
             let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
