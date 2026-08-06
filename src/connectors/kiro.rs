@@ -244,7 +244,10 @@ impl KiroConnector {
         };
 
         let mut messages: Vec<NormalizedMessage> = Vec::new();
-        let mut last_ts = base_ts;
+        // Timestamp of the previously emitted message, if any. Kept separate
+        // from `base_ts` so a Prompt's own `meta.timestamp` is honored verbatim
+        // rather than being clamped up to the session's `created_at`/file mtime.
+        let mut last_ts: Option<i64> = None;
         for line in BufReader::new(file_handle).lines().map_while(Result::ok) {
             let line = line.trim();
             if line.is_empty() {
@@ -279,8 +282,15 @@ impl KiroConnector {
             } else {
                 None
             };
-            let effective_ts = raw_ts.map_or(last_ts, |ts| ts.max(last_ts));
-            last_ts = effective_ts;
+            // A message with its own timestamp uses it directly (only raised to
+            // stay >= the prior message). A message with none carries the prior
+            // timestamp forward, or falls back to `base_ts` when it is the first
+            // record so the value is still present.
+            let effective_ts = match raw_ts {
+                Some(ts) => last_ts.map_or(ts, |prev| ts.max(prev)),
+                None => last_ts.unwrap_or(base_ts),
+            };
+            last_ts = Some(effective_ts);
 
             messages.push(NormalizedMessage {
                 idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
