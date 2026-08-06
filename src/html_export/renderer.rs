@@ -513,6 +513,7 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "crush" => "agent-amp",
         "hermes" => "agent-hermes",
         "goose" => "agent-goose",
+        "kiro" => "agent-kiro",
         "openhands" | "open_hands" => "agent-aider",
         _ => "agent-default",
     }
@@ -546,6 +547,7 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "crush" => "Crush",
         "hermes" => "Hermes",
         "goose" => "Goose",
+        "kiro" => "Kiro",
         "kimi" => "Kimi",
         "qwen" => "Qwen",
         "openhands" | "open_hands" => "OpenHands",
