@@ -38,6 +38,9 @@ tempfile = "3.27.0"
 wait-timeout = "0.2.1"
 rmp-serde = "1.3.1"  # MessagePack for binary metadata serialization (Opt 3.1)
 toml = "1.1.2"
+# Bounded semantic candidate selection is read-only C-SQLite; canonical replay
+# and every write remain on FrankenSQLite.
+rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 directories = "6.0.0"
 which = "8.0.2"
 shell-words = "1.1.1"
@@ -186,9 +189,6 @@ arbitrary = { version = "1", features = ["derive"] }
 serde_yaml = "0.9.34"
 rand = "0.10"
 rand_chacha = "0.10"
-# rusqlite is retained only for C-SQLite interop fixtures in tests; production
-# storage and historical salvage paths use frankensqlite.
-rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
 fsqlite-types = { version = "0.1.19", package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2351c6c52b9e5fdba6a413865415db0452e660ef" }
