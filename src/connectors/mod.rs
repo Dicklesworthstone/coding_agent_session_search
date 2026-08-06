@@ -216,6 +216,7 @@ pub mod goose;
 pub mod grok;
 pub mod hermes;
 pub mod kimi;
+pub mod kiro;
 pub mod openclaw;
 pub mod opencode;
 pub mod openhands;
@@ -230,23 +231,36 @@ fn codex_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(codex::CodexConnector::new())
 }
 
+/// Construct the CASS-local Kiro connector.
+///
+/// Kiro has no `franken_agent_detection` implementation, so this factory is
+/// appended CASS-side (mirroring how Codex is swapped in above) rather than
+/// coming from FAD's registry.
+fn kiro_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(kiro::KiroConnector::new())
+}
+
 /// Return connector factories with CASS-specific wrappers applied.
 ///
 /// Non-Codex factories remain exactly the upstream FAD factories. Codex must
 /// pass through CASS's enrichment wrapper so modern `function_call` arguments
 /// reach the production indexer instead of remaining placeholder-only content.
+/// The CASS-local Kiro connector is appended because FAD has no Kiro parser.
 #[must_use]
 pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
-    franken_agent_detection::get_connector_factories()
-        .into_iter()
-        .map(|(name, factory)| {
-            if name == "codex" {
-                (name, codex_connector_factory as ConnectorFactory)
-            } else {
-                (name, factory)
-            }
-        })
-        .collect()
+    let mut factories: Vec<(&'static str, ConnectorFactory)> =
+        franken_agent_detection::get_connector_factories()
+            .into_iter()
+            .map(|(name, factory)| {
+                if name == "codex" {
+                    (name, codex_connector_factory as ConnectorFactory)
+                } else {
+                    (name, factory)
+                }
+            })
+            .collect();
+    factories.push(("kiro", kiro_connector_factory as ConnectorFactory));
+    factories
 }
 
 /// gh373 third variant (bead oeu5a): ambient work-liveness sink for
