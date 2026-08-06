@@ -16,7 +16,7 @@
 //! carry no timestamp and inherit the previous value forward so the sequence
 //! stays monotonically nondecreasing.
 //!
-//! See `kiro-assumptions.md` for the full observed contract these tests pin.
+//! See the README's Kiro connector section for the observed contract these tests pin.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -226,10 +226,7 @@ fn kiro_connector_title_falls_back_to_first_user_message() {
         .unwrap();
 
     assert_eq!(convs.len(), 1);
-    assert_eq!(
-        convs[0].title.as_deref(),
-        Some("This is the real question")
-    );
+    assert_eq!(convs[0].title.as_deref(), Some("This is the real question"));
 }
 
 #[test]
@@ -335,15 +332,17 @@ fn kiro_connector_discovers_log_and_sidecar() {
     assert_eq!(discovered.len(), 2);
     assert!(discovered.iter().all(|d| d.provider_slug == "kiro"));
     assert!(
-        discovered.iter().any(|d| d.role
-            == DiscoveredSourceRole::PrimarySessionLog
-            && d.required_for_reconstruction),
+        discovered
+            .iter()
+            .any(|d| d.role == DiscoveredSourceRole::PrimarySessionLog
+                && d.required_for_reconstruction),
         "the .jsonl log must be the primary, required source"
     );
     assert!(
-        discovered.iter().any(|d| d.role
-            == DiscoveredSourceRole::MetadataSidecar
-            && !d.required_for_reconstruction),
+        discovered
+            .iter()
+            .any(|d| d.role == DiscoveredSourceRole::MetadataSidecar
+                && !d.required_for_reconstruction),
         "the .json sidecar must be an optional metadata source"
     );
 
@@ -354,6 +353,75 @@ fn kiro_connector_discovers_log_and_sidecar() {
             "every scanned conversation path must be discoverable"
         );
     }
+}
+
+#[test]
+fn kiro_connector_does_not_treat_substring_only_path_as_storage() {
+    let tmp = TempDir::new().unwrap();
+    let misleading = tmp.path().join("kiroshi-data");
+    fs::create_dir_all(&misleading).unwrap();
+    write(
+        &misleading.join("unrelated.jsonl"),
+        r#"{"version":"v1","kind":"Prompt","data":{"content":[{"kind":"text","data":"must not scan"}],"meta":{"timestamp":1785939877}}}"#,
+    );
+
+    let connector = KiroConnector::new();
+    let ctx = ScanContext {
+        data_dir: tmp.path().join("cass-data"),
+        scan_roots: vec![coding_agent_search::connectors::ScanRoot::local(misleading)],
+        since_ts: None,
+        progress_tick: None,
+    };
+    assert!(connector.scan(&ctx).unwrap().is_empty());
+}
+
+#[test]
+fn kiro_connector_parent_root_does_not_duplicate_nested_store() {
+    let tmp = TempDir::new().unwrap();
+    let cli = kiro_cli_dir(&tmp);
+    write(
+        &cli.join("one.jsonl"),
+        r#"{"version":"v1","kind":"Prompt","data":{"content":[{"kind":"text","data":"once"}],"meta":{"timestamp":1785939877}}}"#,
+    );
+
+    let connector = KiroConnector::new();
+    let ctx = ScanContext {
+        data_dir: tmp.path().join("cass-data"),
+        scan_roots: vec![coding_agent_search::connectors::ScanRoot::local(
+            tmp.path().to_path_buf(),
+        )],
+        since_ts: None,
+        progress_tick: None,
+    };
+    assert_eq!(connector.scan(&ctx).unwrap().len(), 1);
+}
+
+#[test]
+fn kiro_connector_explicit_file_root_scans_only_that_file() {
+    let tmp = TempDir::new().unwrap();
+    let cli = kiro_cli_dir(&tmp);
+    for name in ["selected", "sibling"] {
+        write(
+            &cli.join(format!("{name}.jsonl")),
+            &format!(
+                r#"{{"version":"v1","kind":"Prompt","data":{{"content":[{{"kind":"text","data":"{name}"}}],"meta":{{"timestamp":1785939877}}}}}}"#
+            ),
+        );
+    }
+
+    let selected = cli.join("selected.jsonl");
+    let connector = KiroConnector::new();
+    let ctx = ScanContext {
+        data_dir: tmp.path().join("cass-data"),
+        scan_roots: vec![coding_agent_search::connectors::ScanRoot::local(
+            selected.clone(),
+        )],
+        since_ts: None,
+        progress_tick: None,
+    };
+    let conversations = connector.scan(&ctx).unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].source_path, selected);
 }
 
 #[test]
@@ -424,7 +492,9 @@ fn kiro_connector_parses_committed_fixture() {
     assert_eq!(conv.messages[0].role, "user");
     assert_eq!(conv.messages[1].role, "assistant");
     assert!(
-        !conv.messages[1].content.contains("private chain of thought"),
+        !conv.messages[1]
+            .content
+            .contains("private chain of thought"),
         "thinking blocks must never be indexed"
     );
     assert!(conv.messages[2].content.contains("[Tool: execute_bash]"));

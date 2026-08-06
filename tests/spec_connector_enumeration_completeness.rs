@@ -59,7 +59,7 @@ fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
     }
 }
 
-/// The canonical set of 23 documented provider connectors. Sourced from the
+/// The canonical set of 25 runtime provider connectors. Sourced from the
 /// runtime registry `franken_agent_detection::get_connector_factories()` (as
 /// surfaced by `cass capabilities --json` / `cass diag --json`) under the
 /// franken-agent-detection features cass enables in Cargo.toml. A peer adding a
@@ -83,6 +83,7 @@ const DOCUMENTED_CONNECTOR_NAMES: &[&str] = &[
     "grok",
     "hermes",
     "kimi",
+    "kiro",
     "openclaw",
     "opencode",
     "openhands",

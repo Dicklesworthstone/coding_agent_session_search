@@ -53,6 +53,10 @@ fn probe_slugs() -> HashSet<String> {
 /// no parser implementation (no entry in `get_connector_factories()`).
 const DETECTION_ONLY: &[&str] = &["continue", "windsurf"];
 
+/// CASS-local connectors: have parser factories but are intentionally absent
+/// from FAD's probe-path and detection-report APIs.
+const CASS_LOCAL: &[&str] = &["kiro"];
+
 /// Extract a function body from source code, including the braces.
 fn extract_function_body(source: &str, fn_prefix: &str) -> String {
     let start = source
@@ -146,15 +150,16 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 24, "Expected 24 connector factories");
+    assert_eq!(slugs.len(), 25, "Expected 25 connector factories");
 }
 
 // ---------------------------------------------------------------------------
 // Test 2: Probe path coverage
 // ---------------------------------------------------------------------------
 
-/// Every factory connector must have a corresponding probe path entry.
-/// Detection-only connectors have probe paths but no factory.
+/// Every FAD-backed factory connector must have a corresponding probe path.
+/// Detection-only connectors have probe paths but no factory; CASS-local
+/// connectors have factories but intentionally no FAD probe entry.
 #[test]
 fn probe_paths_cover_all_factory_connectors() {
     let factory = factory_fad_slugs();
@@ -164,6 +169,7 @@ fn probe_paths_cover_all_factory_connectors() {
     // Note: "copilot" factory slug maps to "github-copilot" in KNOWN_CONNECTORS.
     let factory_mapped: HashSet<String> = factory
         .iter()
+        .filter(|slug| !CASS_LOCAL.contains(&slug.as_str()))
         .map(|s| match s.as_str() {
             "copilot" => "github-copilot".to_string(),
             other => other.to_string(),
@@ -281,8 +287,9 @@ fn detect_installed_agents_report_structure() {
 // Test 4: Agent count consistency
 // ---------------------------------------------------------------------------
 
-/// Detection and probe APIs should enumerate the same set of connectors.
-/// Factory connectors are a subset (they exclude detection-only connectors).
+/// Detection and probe APIs should enumerate the same set of FAD connectors.
+/// FAD-backed factories are a subset; detection-only connectors have no
+/// factory, while CASS-local connectors intentionally have no FAD entry.
 #[test]
 fn agent_counts_consistent_across_apis() {
     let factory = factory_fad_slugs();
@@ -312,6 +319,7 @@ fn agent_counts_consistent_across_apis() {
     // Factory must be a strict subset of detection (after slug mapping)
     let factory_mapped: HashSet<String> = factory
         .iter()
+        .filter(|slug| !CASS_LOCAL.contains(&slug.as_str()))
         .map(|s| match s.as_str() {
             "copilot" => "github-copilot".to_string(),
             other => other.to_string(),

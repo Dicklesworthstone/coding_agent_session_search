@@ -59,7 +59,8 @@
     "grok",
     "goose",
     "crush",
-    "hermes"
+    "hermes",
+    "kiro"
   ],
   "global_flags": [
     {

@@ -32,8 +32,8 @@
 //! - `toolResult` → `[Tool output: <id>]\n<text>`.
 //!
 //! Unknown record kinds and malformed lines are tolerated (skip-and-continue)
-//! rather than failing the whole session. See `kiro-assumptions.md` for the
-//! full observed contract and the assumptions this parser encodes.
+//! rather than failing the whole session. See the README's Kiro connector
+//! section for the observed contract and assumptions this parser encodes.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -72,9 +72,14 @@ impl KiroConnector {
 
     /// Heuristic: does this path look like a Kiro session store? Kiro's default
     /// store lives under `~/.kiro/...` and test fixtures live under a `kiro`
-    /// directory, so a `kiro` path segment is the stable signal.
+    /// directory, so an exact `kiro` or `.kiro` path component is the stable
+    /// signal. Substring matching would misclassify paths such as `/Users/kiroshi`.
     fn looks_like_kiro_storage(path: &Path) -> bool {
-        path.to_string_lossy().to_lowercase().contains("kiro")
+        path.components().any(|component| {
+            component.as_os_str().to_str().is_some_and(|value| {
+                value.eq_ignore_ascii_case("kiro") || value.eq_ignore_ascii_case(".kiro")
+            })
+        })
     }
 
     /// Resolve the concrete scan roots for this context, honoring explicit
@@ -84,18 +89,17 @@ impl KiroConnector {
         if ctx.use_default_detection() {
             if Self::looks_like_kiro_storage(&ctx.data_dir) && ctx.data_dir.exists() {
                 roots.push(ScanRoot::local(ctx.data_dir.clone()));
-            } else if let Some(default_root) = Self::default_sessions_root() {
-                if default_root.exists() {
-                    roots.push(ScanRoot::local(default_root));
-                }
+            } else if let Some(default_root) = Self::default_sessions_root()
+                && default_root.exists()
+            {
+                roots.push(ScanRoot::local(default_root));
             }
         } else {
             for root in &ctx.scan_roots {
                 let candidate = root.path.join(".kiro").join("sessions").join("cli");
                 if candidate.exists() {
                     roots.push(root.with_path(candidate));
-                }
-                if Self::looks_like_kiro_storage(&root.path) && root.path.exists() {
+                } else if Self::looks_like_kiro_storage(&root.path) && root.path.exists() {
                     roots.push(root.with_path(root.path.clone()));
                 }
             }
@@ -111,6 +115,19 @@ impl KiroConnector {
     pub(crate) fn session_files(root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         if !root.exists() {
+            return out;
+        }
+        if root.is_file() {
+            if root
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+                && fs::metadata(root)
+                    .map(|meta| meta.len() > 0)
+                    .unwrap_or(false)
+            {
+                out.push(root.to_path_buf());
+            }
             return out;
         }
 
@@ -135,7 +152,9 @@ impl KiroConnector {
                         .extension()
                         .and_then(|ext| ext.to_str())
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
-                    && fs::metadata(&path).map(|meta| meta.len() > 0).unwrap_or(false)
+                    && fs::metadata(&path)
+                        .map(|meta| meta.len() > 0)
+                        .unwrap_or(false)
                 {
                     out.push(path);
                 }
@@ -146,19 +165,6 @@ impl KiroConnector {
         out.sort();
         out.dedup();
         out
-    }
-
-    /// Normalize a scan root so that a file root is treated as its parent dir.
-    fn as_dir_root(mut root: ScanRoot) -> ScanRoot {
-        if root.path.is_file() {
-            let parent = root
-                .path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| root.path.clone());
-            root = root.with_path(parent);
-        }
-        root
     }
 
     /// Parse a single Kiro CLI `<uuid>.jsonl` log (paired with its optional
@@ -231,9 +237,10 @@ impl KiroConnector {
             .map(std::string::ToString::to_string);
         let workspace = cwd.as_ref().map(PathBuf::from);
 
-        // Base timestamp so every message can carry a present, nondecreasing
-        // value: prefer the session's created_at, else the file mtime, else 0.
-        let base_ts = conv_created_ms.or_else(|| file_mtime_ms(file)).unwrap_or(0);
+        // Best-effort timestamp for records without their own value. Keep it
+        // absent when neither sidecar metadata nor file mtime is available rather
+        // than fabricating the Unix epoch and mis-ranking the conversation.
+        let base_ts = conv_created_ms.or_else(|| file_mtime_ms(file));
 
         let file_handle = match fs::File::open(file) {
             Ok(handle) => handle,
@@ -284,19 +291,20 @@ impl KiroConnector {
             };
             // A message with its own timestamp uses it directly (only raised to
             // stay >= the prior message). A message with none carries the prior
-            // timestamp forward, or falls back to `base_ts` when it is the first
-            // record so the value is still present.
+            // timestamp forward, or falls back to `base_ts` when available.
             let effective_ts = match raw_ts {
-                Some(ts) => last_ts.map_or(ts, |prev| ts.max(prev)),
-                None => last_ts.unwrap_or(base_ts),
+                Some(ts) => Some(last_ts.map_or(ts, |prev| ts.max(prev))),
+                None => last_ts.or(base_ts),
             };
-            last_ts = Some(effective_ts);
+            if let Some(ts) = effective_ts {
+                last_ts = Some(ts);
+            }
 
             messages.push(NormalizedMessage {
                 idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
                 role: role.to_string(),
                 author: None,
-                created_at: Some(effective_ts),
+                created_at: effective_ts,
                 content,
                 extra: record,
                 invocations,
@@ -350,15 +358,15 @@ impl Connector for KiroConnector {
     fn detect(&self) -> DetectionResult {
         let mut evidence = Vec::new();
         let mut root_paths = Vec::new();
-        if let Some(root) = Self::default_sessions_root() {
-            if root.exists() {
-                let count = Self::session_files(&root).len();
-                evidence.push(format!(
-                    "Kiro CLI session store present at {} ({count} session log(s))",
-                    root.display()
-                ));
-                root_paths.push(root);
-            }
+        if let Some(root) = Self::default_sessions_root()
+            && root.exists()
+        {
+            let count = Self::session_files(&root).len();
+            evidence.push(format!(
+                "Kiro CLI session store present at {} ({count} session log(s))",
+                root.display()
+            ));
+            root_paths.push(root);
         }
         DetectionResult {
             detected: !root_paths.is_empty(),
@@ -386,7 +394,6 @@ impl Connector for KiroConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         for root in Self::source_roots(ctx) {
-            let root = Self::as_dir_root(root);
             for file in Self::session_files(&root.path) {
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
@@ -402,7 +409,6 @@ impl Connector for KiroConnector {
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
         let mut out = Vec::new();
         for root in Self::source_roots(ctx) {
-            let root = Self::as_dir_root(root);
             for file in Self::session_files(&root.path) {
                 if !file_modified_since(&file, ctx.since_ts) {
                     continue;
@@ -543,15 +549,13 @@ fn flatten_kiro_content(content: &Value) -> (String, Vec<NormalizedInvocation>) 
                     .map(std::string::ToString::to_string);
                 let input = data.and_then(|d| d.get("input")).cloned();
                 let mut rendered = format!("[Tool: {name}]");
-                if let Some(input) = &input {
-                    if !input.is_null() {
-                        if let Ok(json) = serde_json::to_string(input) {
-                            if !json.is_empty() {
-                                rendered.push('\n');
-                                rendered.push_str(&json);
-                            }
-                        }
-                    }
+                if let Some(input) = &input
+                    && !input.is_null()
+                    && let Ok(json) = serde_json::to_string(input)
+                    && !json.is_empty()
+                {
+                    rendered.push('\n');
+                    rendered.push_str(&json);
                 }
                 texts.push(rendered);
                 invocations.push(NormalizedInvocation {
@@ -563,9 +567,14 @@ fn flatten_kiro_content(content: &Value) -> (String, Vec<NormalizedInvocation>) 
                 });
             }
             "toolResult" => {
-                let call_id = data.and_then(|d| d.get("toolUseId")).and_then(Value::as_str);
+                let call_id = data
+                    .and_then(|d| d.get("toolUseId"))
+                    .and_then(Value::as_str);
                 let mut parts: Vec<String> = Vec::new();
-                if let Some(inner) = data.and_then(|d| d.get("content")).and_then(Value::as_array) {
+                if let Some(inner) = data
+                    .and_then(|d| d.get("content"))
+                    .and_then(Value::as_array)
+                {
                     for item in inner {
                         if let Some(text) = item.get("data").and_then(Value::as_str) {
                             push_text(&mut parts, text);
@@ -659,7 +668,10 @@ mod tests {
         assert!(conv.messages[1].content.contains("here is the plan"));
         assert!(!conv.messages[1].content.contains("internal reasoning"));
 
-        assert_eq!(conv.metadata.get("model_id").and_then(Value::as_str), Some("claude-opus-4.8"));
+        assert_eq!(
+            conv.metadata.get("model_id").and_then(Value::as_str),
+            Some("claude-opus-4.8")
+        );
     }
 
     #[test]
