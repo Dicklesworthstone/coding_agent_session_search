@@ -1,0 +1,4 @@
+{"version":"v1","kind":"Prompt","data":{"message_id":"m1","content":[{"kind":"text","data":"Add a Kiro connector to coding_agent_session_search"}],"meta":{"timestamp":1785939877}}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"m2","content":[{"kind":"thinking","data":{"text":"private chain of thought that must never be indexed","signature":"sig"}},{"kind":"text","data":"Sure -- I'll mirror the Codex connector pattern."}]}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"m3","content":[{"kind":"toolUse","data":{"toolUseId":"tool-42","name":"execute_bash","input":{"command":"cargo test connector_kiro"}}}]}}
+{"version":"v1","kind":"ToolResults","data":{"message_id":"m4","content":[{"kind":"toolResult","data":{"toolUseId":"tool-42","content":[{"kind":"text","data":"test result: ok. 12 passed; 0 failed"}]}}]}}
