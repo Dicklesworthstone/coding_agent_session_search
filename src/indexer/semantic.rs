@@ -17,6 +17,7 @@ use frankensqlite::{
 };
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
+use rusqlite::{Connection as NativeSqliteConnection, OpenFlags};
 
 use crate::indexer::memoization::{
     ContentAddressedMemoCache, MemoCacheAuditRecord, MemoContentHash, MemoKey, MemoLookup,
@@ -840,68 +841,22 @@ fn semantic_conversation_has_message_after(
     Ok(has_message)
 }
 
-/// Return the canonical tail message id for one conversation without scanning
-/// its full message history. Normal archives maintain `last_message_idx` on
-/// the parent row; the compact tail table is the compatible fallback for older
-/// rows. The unique `(conversation_id, idx)` key then resolves exactly one row.
-fn semantic_conversation_tail_message_id(
+/// Selection is a bounded, read-only operation. Run it through native SQLite
+/// so a hostile FrankenSQLite query plan cannot retain archive-sized state;
+/// canonical replay and all writes remain on FrankenStorage.
+fn native_semantic_selection_connection(
     storage: &FrankenStorage,
-    conversation_id: i64,
-    legacy_last_message_idx: Option<i64>,
-) -> Result<Option<i64>> {
-    let tail_idx = match legacy_last_message_idx {
-        Some(last_message_idx) => Some(last_message_idx),
-        None => storage
-            .raw()
-            .query_map_collect(
-                "SELECT last_message_idx
-                 FROM conversation_tail_state
-                 WHERE conversation_id = ?1 AND last_message_idx IS NOT NULL",
-                &[ParamValue::from(conversation_id)],
-                |row| row.get_typed(0),
-            )
-            .with_context(|| {
-                format!("looking up semantic tail metadata for conversation {conversation_id}")
-            })?
-            .into_iter()
-            .next(),
-    };
-    let Some(tail_idx) = tail_idx else {
-        return Ok(None);
-    };
-
-    let params = [
-        ParamValue::from(conversation_id),
-        ParamValue::from(tail_idx),
-    ];
-    let indexed_probe = "SELECT id
-                         FROM messages INDEXED BY sqlite_autoindex_messages_1
-                         WHERE conversation_id = ?1 AND idx = ?2
-                         LIMIT 1";
-    let fallback_probe = "SELECT id
-                          FROM messages
-                          WHERE conversation_id = ?1 AND idx = ?2
-                          LIMIT 1";
-    let tail_ids: Vec<i64> = storage
-        .raw()
-        .query_map_collect(indexed_probe, &params, |row| row.get_typed(0))
-        .or_else(|err| {
-            if !err
-                .to_string()
-                .contains("no such index: sqlite_autoindex_messages_1")
-            {
-                return Err(err);
-            }
-            storage
-                .raw()
-                .query_map_collect(fallback_probe, &params, |row| row.get_typed(0))
-        })
+) -> Result<NativeSqliteConnection> {
+    let db_path = storage
+        .database_path()
+        .with_context(|| "resolving canonical database path for native semantic selection")?;
+    NativeSqliteConnection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| {
             format!(
-                "probing semantic tail message for conversation {conversation_id} at idx {tail_idx}"
+                "opening native read-only semantic selector at {}",
+                db_path.display()
             )
-        })?;
-    Ok(tail_ids.into_iter().next())
+        })
 }
 
 fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
@@ -948,11 +903,10 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
     Ok(count)
 }
 
-/// Return the exact next candidate prefix through one bounded indexed parent
-/// page query. Normal archives resolve each page's tail through the canonical
-/// `(conversation_id, idx)` key in that single query; this avoids retaining
-/// FrankenSQLite state for a separate tail lookup per parent. Sparse or legacy
-/// archives retain the global cursor fallback.
+/// Return the exact next candidate prefix through a bounded native-SQLite
+/// parent-page query. Canonical replay and all writes remain on
+/// FrankenStorage; only this read-only selector crosses the compatibility
+/// boundary. Sparse or legacy archives retain the global cursor fallback.
 fn try_fetch_dense_semantic_candidate_conversation_ids(
     storage: &FrankenStorage,
     after_conversation_id: i64,
@@ -961,9 +915,9 @@ fn try_fetch_dense_semantic_candidate_conversation_ids(
 ) -> Result<Option<(Vec<i64>, usize)>> {
     let page_size = max_candidates.saturating_mul(4).clamp(256, 4_096);
     let page_size_i64 = i64::try_from(page_size).unwrap_or(i64::MAX);
-    let page: Vec<(i64, Option<i64>, Option<i64>)> = storage
-        .raw()
-        .query_map_collect(
+    let native = native_semantic_selection_connection(storage)?;
+    let mut statement = native
+        .prepare(
             "SELECT page.id,
                     COALESCE(page.last_message_idx, tails.last_message_idx),
                     tail_message.id
@@ -984,15 +938,21 @@ fn try_fetch_dense_semantic_candidate_conversation_ids(
                        tails.last_message_idx
                    )
              ORDER BY page.id ASC",
-            &[
-                ParamValue::from(after_conversation_id),
-                ParamValue::from(page_size_i64),
-            ],
-            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
         )
         .with_context(|| {
             format!(
                 "listing dense semantic candidate page after conversation {after_conversation_id}"
+            )
+        })?;
+    let page: Vec<(i64, Option<i64>, Option<i64>)> = statement
+        .query_map(
+            rusqlite::params![after_conversation_id, page_size_i64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?
+        .collect::<std::result::Result<_, _>>()
+        .with_context(|| {
+            format!(
+                "materializing bounded native semantic candidate page after conversation {after_conversation_id}"
             )
         })?;
     if page.is_empty() {
@@ -1006,11 +966,17 @@ fn try_fetch_dense_semantic_candidate_conversation_ids(
         rows_scanned = rows_scanned.saturating_add(1);
         let has_newer_message = match (tail_idx, tail_message_id) {
             (Some(_), Some(tail_message_id)) => tail_message_id > after_message_id,
-            (None, _) | (_, None) => semantic_conversation_has_message_after(
-                storage,
-                conversation_id,
-                Some(after_message_id),
-            )?,
+            (None, _) | (_, None) => {
+                native.query_row(
+                    "SELECT EXISTS(
+                     SELECT 1
+                     FROM messages INDEXED BY sqlite_autoindex_messages_1
+                     WHERE conversation_id = ?1 AND id > ?2
+                 )",
+                    rusqlite::params![conversation_id, after_message_id],
+                    |row| row.get::<_, i64>(0),
+                )? != 0
+            }
         };
         if has_newer_message {
             selected.push(conversation_id);
@@ -1045,59 +1011,53 @@ fn fetch_bounded_semantic_candidate_conversation_ids(
         }
 
         // Resume from the canonical global message cursor, not from the much
-        // wider parent-table gap.  The previous implementation paged
-        // `conversations` and executed one prepared message probe for every
-        // parent.  A legitimate sparse checkpoint in #348 crossed 6,668
-        // ineligible parents and retained more than 2 GiB before finding two
-        // candidates.
-        //
-        // `messages.id` is the canonical INTEGER PRIMARY KEY cursor.  Force a
-        // table/rowid traversal so FrankenSQLite can stream every eligible
-        // post-cursor message through one statement.  A bounded BTreeSet keeps
-        // only the smallest `max_candidates` conversation IDs.  This final
-        // reconciliation is essential: messages may be appended to older
-        // conversations, so global message-id order is not necessarily
-        // conversation-id order, while the durable conversation checkpoint
-        // must advance in ascending order without skipping an older candidate.
+        // wider parent-table gap. This sparse compatibility path remains
+        // native and read-only for the same reason as the dense prefix: it
+        // must stream rows without retaining archive-sized FrankenSQLite state.
+        // A bounded BTreeSet keeps only the smallest `max_candidates`
+        // conversation IDs while canonical replay and all writes stay on
+        // FrankenStorage.
         let mut selected = BTreeSet::new();
         let mut rows_scanned = 0_usize;
-        storage
-            .raw()
-            .query_with_params_for_each(
+        let native = native_semantic_selection_connection(storage)?;
+        let mut statement = native
+            .prepare(
                 "SELECT conversation_id
-                 FROM messages NOT INDEXED
+                 FROM messages
                  WHERE id > ?1 AND conversation_id > ?2",
-                &[
-                    SqliteValue::from(after_message_id),
-                    SqliteValue::from(after_conversation_id),
-                ],
-                |row| {
-                    let conversation_id: i64 = row.get_typed(0)?;
-                    rows_scanned = rows_scanned.saturating_add(1);
-                    if selected.contains(&conversation_id) {
-                        return Ok(());
-                    }
-                    if selected.len() < max_candidates {
-                        selected.insert(conversation_id);
-                        return Ok(());
-                    }
-                    if selected
-                        .last()
-                        .is_some_and(|largest| conversation_id < *largest)
-                    {
-                        selected.insert(conversation_id);
-                        if let Some(largest) = selected.last().copied() {
-                            selected.remove(&largest);
-                        }
-                    }
-                    Ok(())
-                },
             )
             .with_context(|| {
                 format!(
-                    "streaming semantic candidates after conversation {after_conversation_id} and message {after_message_id}"
+                    "preparing native sparse semantic selector after conversation {after_conversation_id} and message {after_message_id}"
                 )
             })?;
+        let mut rows = statement
+            .query(rusqlite::params![after_message_id, after_conversation_id])
+            .with_context(|| {
+                format!(
+                    "streaming native semantic candidates after conversation {after_conversation_id} and message {after_message_id}"
+                )
+            })?;
+        while let Some(row) = rows.next()? {
+            let conversation_id: i64 = row.get(0)?;
+            rows_scanned = rows_scanned.saturating_add(1);
+            if selected.contains(&conversation_id) {
+                continue;
+            }
+            if selected.len() < max_candidates {
+                selected.insert(conversation_id);
+                continue;
+            }
+            if selected
+                .last()
+                .is_some_and(|largest| conversation_id < *largest)
+            {
+                selected.insert(conversation_id);
+                if let Some(largest) = selected.last().copied() {
+                    selected.remove(&largest);
+                }
+            }
+        }
         return Ok((selected.into_iter().collect(), rows_scanned));
     }
 
