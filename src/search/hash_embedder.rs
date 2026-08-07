@@ -123,7 +123,7 @@ impl Embedder for HashEmbedder {
 
         let tokens = Self::tokenize(text);
 
-        // Preserve cass legacy behavior for low-signal inputs.
+        // Preserve cass legacy behavior for tokenless low-signal inputs.
         if tokens.is_empty() {
             return Ok(self.uniform_fallback());
         }
@@ -141,6 +141,12 @@ impl Embedder for HashEmbedder {
                     embedding.len()
                 ))),
             });
+        }
+        // Feature hashing can exactly cancel two or more token contributions
+        // in a dimension. Frankensearch correctly refuses zero-norm vectors,
+        // so use the same deterministic nonzero fallback as tokenless input.
+        if embedding.iter().all(|value| *value == 0.0) {
+            return Ok(self.uniform_fallback());
         }
         Ok(embedding)
     }
@@ -252,6 +258,31 @@ mod tests {
             (norm - 1.0).abs() < 1e-5,
             "L2 norm should be ~1.0, got {norm}"
         );
+    }
+
+    #[test]
+    fn test_hash_embedder_cancellation_uses_nonzero_fallback() {
+        let embedder = HashEmbedder::new(1);
+        let mut positive = None;
+        let mut negative = None;
+        for index in 0..1024 {
+            let token = format!("token{index}");
+            let raw = embedder.delegate.embed_sync(&token);
+            if raw[0] > 0.0 {
+                positive = Some(token);
+            } else if raw[0] < 0.0 {
+                negative = Some(token);
+            }
+            if positive.is_some() && negative.is_some() {
+                break;
+            }
+        }
+        let positive = positive.expect("fixture should find a positive hash feature");
+        let negative = negative.expect("fixture should find a negative hash feature");
+        let text = format!("{positive} {negative}");
+        let embedding = embedder.embed_sync(&text).unwrap();
+
+        assert_eq!(embedding, vec![1.0]);
     }
 
     #[test]

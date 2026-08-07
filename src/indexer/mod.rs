@@ -10601,6 +10601,16 @@ pub(crate) fn load_active_lexical_rebuild_pipeline_runtime(
     Ok(Some(state.runtime))
 }
 
+/// Compute the canonical content fingerprint from an already-open storage handle.
+///
+/// Resumable semantic backfill owns such a handle for its complete bounded run.
+/// Reusing it prevents a second FrankenSQLite open and archive scan solely for
+/// fingerprinting before every checkpoint.
+pub(crate) fn lexical_storage_fingerprint_from_storage(storage: &FrankenStorage) -> Result<String> {
+    let total_conversations = count_total_conversations_exact(storage)?;
+    lexical_rebuild_content_fingerprint(storage, total_conversations)
+}
+
 pub(crate) fn lexical_storage_fingerprint_for_db(db_path: &Path) -> Result<String> {
     lexical_rebuild_storage_fingerprint(db_path)
 }

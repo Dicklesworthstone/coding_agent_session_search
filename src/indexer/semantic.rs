@@ -17,6 +17,7 @@ use frankensqlite::{
 };
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
+use rusqlite::{Connection as NativeSqliteConnection, OpenFlags};
 
 use crate::indexer::memoization::{
     ContentAddressedMemoCache, MemoCacheAuditRecord, MemoContentHash, MemoKey, MemoLookup,
@@ -840,6 +841,24 @@ fn semantic_conversation_has_message_after(
     Ok(has_message)
 }
 
+/// Selection is a bounded, read-only operation. Run it through native SQLite
+/// so a hostile FrankenSQLite query plan cannot retain archive-sized state;
+/// canonical replay and all writes remain on FrankenStorage.
+fn native_semantic_selection_connection(
+    storage: &FrankenStorage,
+) -> Result<NativeSqliteConnection> {
+    let db_path = storage
+        .database_path()
+        .with_context(|| "resolving canonical database path for native semantic selection")?;
+    NativeSqliteConnection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| {
+            format!(
+                "opening native read-only semantic selector at {}",
+                db_path.display()
+            )
+        })
+}
+
 fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
     // `conversation_tail_state.last_message_idx` is the maintained, schema-v18
     // hot cache for every normal non-empty conversation. Merge that compact
@@ -884,6 +903,96 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
     Ok(count)
 }
 
+/// Return the exact next candidate prefix through a bounded native-SQLite
+/// parent-page query. Canonical replay and all writes remain on
+/// FrankenStorage; only this read-only selector crosses the compatibility
+/// boundary. Sparse or legacy archives retain the global cursor fallback.
+fn try_fetch_dense_semantic_candidate_conversation_ids(
+    storage: &FrankenStorage,
+    after_conversation_id: i64,
+    after_message_id: i64,
+    max_candidates: usize,
+) -> Result<Option<(Vec<i64>, usize)>> {
+    let page_size = max_candidates.saturating_mul(4).clamp(256, 4_096);
+    let page_size_i64 = i64::try_from(page_size).unwrap_or(i64::MAX);
+    let native = native_semantic_selection_connection(storage)?;
+    let mut statement = native
+        .prepare(
+            "SELECT page.id,
+                    COALESCE(page.last_message_idx, tails.last_message_idx),
+                    tail_message.id
+             FROM (
+                 SELECT id, last_message_idx
+                 FROM conversations
+                 WHERE id > ?1
+                 ORDER BY id ASC
+                 LIMIT ?2
+             ) AS page
+             LEFT JOIN conversation_tail_state AS tails
+                    ON tails.conversation_id = page.id
+             LEFT JOIN messages AS tail_message
+                    INDEXED BY sqlite_autoindex_messages_1
+                    ON tail_message.conversation_id = page.id
+                   AND tail_message.idx = COALESCE(
+                       page.last_message_idx,
+                       tails.last_message_idx
+                   )
+             ORDER BY page.id ASC",
+        )
+        .with_context(|| {
+            format!(
+                "listing dense semantic candidate page after conversation {after_conversation_id}"
+            )
+        })?;
+    let page: Vec<(i64, Option<i64>, Option<i64>)> = statement
+        .query_map(
+            rusqlite::params![after_conversation_id, page_size_i64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?
+        .collect::<std::result::Result<_, _>>()
+        .with_context(|| {
+            format!(
+                "materializing bounded native semantic candidate page after conversation {after_conversation_id}"
+            )
+        })?;
+    if page.is_empty() {
+        return Ok(Some((Vec::new(), 0)));
+    }
+
+    let page_len = page.len();
+    let mut selected = Vec::with_capacity(max_candidates);
+    let mut rows_scanned = 0usize;
+    for (conversation_id, tail_idx, tail_message_id) in page {
+        rows_scanned = rows_scanned.saturating_add(1);
+        let has_newer_message = match (tail_idx, tail_message_id) {
+            (Some(_), Some(tail_message_id)) => tail_message_id > after_message_id,
+            (None, _) | (_, None) => {
+                native.query_row(
+                    "SELECT EXISTS(
+                     SELECT 1
+                     FROM messages INDEXED BY sqlite_autoindex_messages_1
+                     WHERE conversation_id = ?1 AND id > ?2
+                 )",
+                    rusqlite::params![conversation_id, after_message_id],
+                    |row| row.get::<_, i64>(0),
+                )? != 0
+            }
+        };
+        if has_newer_message {
+            selected.push(conversation_id);
+            if selected.len() >= max_candidates {
+                return Ok(Some((selected, rows_scanned)));
+            }
+        }
+    }
+
+    if page_len < page_size {
+        Ok(Some((selected, rows_scanned)))
+    } else {
+        Ok(None)
+    }
+}
+
 fn fetch_bounded_semantic_candidate_conversation_ids(
     storage: &FrankenStorage,
     after_conversation_id: i64,
@@ -892,60 +1001,63 @@ fn fetch_bounded_semantic_candidate_conversation_ids(
 ) -> Result<(Vec<i64>, usize)> {
     let max_candidates = max_candidates.max(1);
     if let Some(after_message_id) = after_message_id {
+        if let Some(fast_path) = try_fetch_dense_semantic_candidate_conversation_ids(
+            storage,
+            after_conversation_id,
+            after_message_id,
+            max_candidates,
+        )? {
+            return Ok(fast_path);
+        }
+
         // Resume from the canonical global message cursor, not from the much
-        // wider parent-table gap.  The previous implementation paged
-        // `conversations` and executed one prepared message probe for every
-        // parent.  A legitimate sparse checkpoint in #348 crossed 6,668
-        // ineligible parents and retained more than 2 GiB before finding two
-        // candidates.
-        //
-        // `messages.id` is the canonical INTEGER PRIMARY KEY cursor.  Force a
-        // table/rowid traversal so FrankenSQLite can stream every eligible
-        // post-cursor message through one statement.  A bounded BTreeSet keeps
-        // only the smallest `max_candidates` conversation IDs.  This final
-        // reconciliation is essential: messages may be appended to older
-        // conversations, so global message-id order is not necessarily
-        // conversation-id order, while the durable conversation checkpoint
-        // must advance in ascending order without skipping an older candidate.
+        // wider parent-table gap. This sparse compatibility path remains
+        // native and read-only for the same reason as the dense prefix: it
+        // must stream rows without retaining archive-sized FrankenSQLite state.
+        // A bounded BTreeSet keeps only the smallest `max_candidates`
+        // conversation IDs while canonical replay and all writes stay on
+        // FrankenStorage.
         let mut selected = BTreeSet::new();
         let mut rows_scanned = 0_usize;
-        storage
-            .raw()
-            .query_with_params_for_each(
+        let native = native_semantic_selection_connection(storage)?;
+        let mut statement = native
+            .prepare(
                 "SELECT conversation_id
-                 FROM messages NOT INDEXED
+                 FROM messages
                  WHERE id > ?1 AND conversation_id > ?2",
-                &[
-                    SqliteValue::from(after_message_id),
-                    SqliteValue::from(after_conversation_id),
-                ],
-                |row| {
-                    let conversation_id: i64 = row.get_typed(0)?;
-                    rows_scanned = rows_scanned.saturating_add(1);
-                    if selected.contains(&conversation_id) {
-                        return Ok(());
-                    }
-                    if selected.len() < max_candidates {
-                        selected.insert(conversation_id);
-                        return Ok(());
-                    }
-                    if selected
-                        .last()
-                        .is_some_and(|largest| conversation_id < *largest)
-                    {
-                        selected.insert(conversation_id);
-                        if let Some(largest) = selected.last().copied() {
-                            selected.remove(&largest);
-                        }
-                    }
-                    Ok(())
-                },
             )
             .with_context(|| {
                 format!(
-                    "streaming semantic candidates after conversation {after_conversation_id} and message {after_message_id}"
+                    "preparing native sparse semantic selector after conversation {after_conversation_id} and message {after_message_id}"
                 )
             })?;
+        let mut rows = statement
+            .query(rusqlite::params![after_message_id, after_conversation_id])
+            .with_context(|| {
+                format!(
+                    "streaming native semantic candidates after conversation {after_conversation_id} and message {after_message_id}"
+                )
+            })?;
+        while let Some(row) = rows.next()? {
+            let conversation_id: i64 = row.get(0)?;
+            rows_scanned = rows_scanned.saturating_add(1);
+            if selected.contains(&conversation_id) {
+                continue;
+            }
+            if selected.len() < max_candidates {
+                selected.insert(conversation_id);
+                continue;
+            }
+            if selected
+                .last()
+                .is_some_and(|largest| conversation_id < *largest)
+            {
+                selected.insert(conversation_id);
+                if let Some(largest) = selected.last().copied() {
+                    selected.remove(&largest);
+                }
+            }
+        }
         return Ok((selected.into_iter().collect(), rows_scanned));
     }
 
@@ -2584,13 +2696,14 @@ impl SemanticIndexer {
         data_dir: &Path,
     ) -> Result<usize> {
         let index_path = vector_index_path(data_dir, self.embedder_id());
-        self.append_to_index_path(embedded_messages, &index_path)
+        self.append_to_index_path(embedded_messages, &index_path, true)
     }
 
     fn append_to_index_path(
         &self,
         embedded_messages: impl IntoIterator<Item = EmbeddedMessage>,
         index_path: &Path,
+        compact_when_needed: bool,
     ) -> Result<usize> {
         let mut index = FsVectorIndex::open(index_path)
             .map_err(|err| anyhow::anyhow!("open fsvi index for append: {err}"))?;
@@ -2629,7 +2742,7 @@ impl SemanticIndexer {
             .append_batch(&entries)
             .map_err(|err| anyhow::anyhow!("append_batch: {err}"))?;
 
-        if index.needs_compaction() {
+        if compact_when_needed && index.needs_compaction() {
             index
                 .compact()
                 .map_err(|err| anyhow::anyhow!("compaction: {err}"))?;
@@ -2877,7 +2990,11 @@ impl SemanticIndexer {
         resume_existing: bool,
     ) -> Result<FsVectorIndex> {
         if resume_existing && staging_path.exists() {
-            self.append_to_index_path(embedded_messages, staging_path)?;
+            // A resumable backfill deliberately keeps its growing delta in the
+            // staging WAL. Compacting after a small checkpoint rewrites every
+            // prior vector and turns the bounded path into O(corpus-size) work
+            // per checkpoint. The final publish path compacts once, atomically.
+            self.append_to_index_path(embedded_messages, staging_path, false)?;
             FsVectorIndex::open(staging_path)
                 .map_err(|err| anyhow::anyhow!("open staged semantic index failed: {err}"))
         } else {
