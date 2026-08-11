@@ -9,9 +9,9 @@
 //! Output is a structured [`ValidationReport`] that serialises to JSON
 //! for `cass analytics validate --json`.
 
-use frankensqlite::Connection;
-use frankensqlite::Row;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use crate::franken_sync::Connection;
+use crate::franken_sync::Row;
+use crate::franken_sync::compat::{ConnectionExt, RowExt};
 use serde::Serialize;
 use std::collections::BTreeMap;
 

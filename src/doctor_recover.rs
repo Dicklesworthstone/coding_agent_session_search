@@ -800,7 +800,7 @@ pub fn run_doctor_cleanup_interrupted_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+    use crate::franken_sync::compat::{ConnectionExt as _, ParamValue, RowExt as _};
 
     fn write_message(storage: &FrankenStorage, conversation_id: i64, idx: i64, raw_line: &str) {
         // Store the verbatim line via the historical-raw-json sentinel wrapper
@@ -1230,7 +1230,7 @@ mod tests {
     /// `drop_recreate_repairs_corrupt_fts_shadow_structure` does not reach.
     #[test]
     fn rebuild_canonical_fts_repairs_structurally_corrupt_shadow_that_blocks_open() {
-        use frankensqlite::Connection as FrankenConnection;
+        use crate::franken_sync::Connection as FrankenConnection;
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("agent_search.db");

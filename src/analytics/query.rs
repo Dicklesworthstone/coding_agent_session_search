@@ -1,13 +1,13 @@
 //! SQL query builders for analytics.
 //!
-//! All functions accept a `&frankensqlite::Connection` and an [`AnalyticsFilter`],
+//! All functions accept a `&crate::franken_sync::Connection` and an [`AnalyticsFilter`],
 //! keeping the SQL and bucketing logic in one place for both CLI and ftui.
 
 use std::collections::BTreeMap;
 
-use frankensqlite::Connection;
-use frankensqlite::Row;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use crate::franken_sync::Connection;
+use crate::franken_sync::Row;
+use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 
 use super::bucketing;
 use super::types::*;
@@ -3853,7 +3853,7 @@ mod tests {
                     api_cache_read_tokens_total, api_cache_creation_tokens_total,
                     api_thinking_tokens_total)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-                frankensqlite::params![
+                crate::franken_sync::params![
                     r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10, r.11, r.12, r.13, r.14,
                     r.15, r.16, r.17, r.18
                 ],
@@ -3953,7 +3953,7 @@ mod tests {
                  1200, 500, 700,
                  1400, 700, 550, 100, 25, 25,
                  ?2)",
-            frankensqlite::params![1000_i64, 1_i64],
+            crate::franken_sync::params![1000_i64, 1_i64],
         )
         .unwrap();
 
@@ -3976,7 +3976,7 @@ mod tests {
                  2200, 900, 1300,
                  2600, 1300, 1000, 200, 50, 50,
                  ?2)",
-            frankensqlite::params![1001_i64, 2_i64],
+            crate::franken_sync::params![1001_i64, 2_i64],
         )
         .unwrap();
         conn
@@ -4147,15 +4147,15 @@ mod tests {
             .as_secs() as i64;
         conn.execute_compat(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            frankensqlite::params![20250, "claude_code", "local", "opus", 80, 40, 40, 5, 30000, 25000, 3000, 1500, 500, 60000, 160000, 20, 1.50, 3, now],
+            crate::franken_sync::params![20250, "claude_code", "local", "opus", 80, 40, 40, 5, 30000, 25000, 3000, 1500, 500, 60000, 160000, 20, 1.50, 3, now],
         ).unwrap();
         conn.execute_compat(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            frankensqlite::params![20250, "claude_code", "local", "sonnet", 40, 20, 20, 2, 10000, 8000, 1000, 500, 200, 19700, 80000, 8, 0.40, 2, now],
+            crate::franken_sync::params![20250, "claude_code", "local", "sonnet", 40, 20, 20, 2, 10000, 8000, 1000, 500, 200, 19700, 80000, 8, 0.40, 2, now],
         ).unwrap();
         conn.execute_compat(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            frankensqlite::params![20250, "codex", "local", "gpt-4o", 50, 25, 25, 3, 15000, 12000, 2000, 800, 0, 29800, 100000, 10, 0.80, 1, now],
+            crate::franken_sync::params![20250, "codex", "local", "gpt-4o", 50, 25, 25, 3, 15000, 12000, 2000, 800, 0, 29800, 100000, 10, 0.80, 1, now],
         ).unwrap();
 
         conn
@@ -4180,12 +4180,12 @@ mod tests {
 
         conn.execute_compat(
             "INSERT INTO usage_hourly (hour_id, last_updated) VALUES (?1, ?2)",
-            frankensqlite::params![123_i64, hourly_last_updated],
+            crate::franken_sync::params![123_i64, hourly_last_updated],
         )
         .unwrap();
         conn.execute_compat(
             "INSERT INTO token_daily_stats (day_id, last_updated) VALUES (?1, ?2)",
-            frankensqlite::params![456_i64, track_b_last_updated],
+            crate::franken_sync::params![456_i64, track_b_last_updated],
         )
         .unwrap();
 
@@ -5448,7 +5448,7 @@ mod tests {
                 api_cache_read_tokens_total, api_cache_creation_tokens_total,
                 api_thinking_tokens_total)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            frankensqlite::params![
+            crate::franken_sync::params![
                 20252,
                 "cursor",
                 3,
@@ -5499,7 +5499,7 @@ mod tests {
             .as_secs() as i64;
         conn.execute_compat(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            frankensqlite::params![20251, "cursor", "  LOCAL  ", "sonnet", 10, 5, 5, 1, 1500, 1200, 0, 0, 0, 2700, 9000, 1, 0.25, 1, now],
+            crate::franken_sync::params![20251, "cursor", "  LOCAL  ", "sonnet", 10, 5, 5, 1, 1500, 1200, 0, 0, 0, 2700, 9000, 1, 0.25, 1, now],
         )
         .unwrap();
 
@@ -5526,7 +5526,7 @@ mod tests {
             .as_secs() as i64;
         conn.execute_compat(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            frankensqlite::params![20250, "claude_code", "remote-ci", "sonnet", 5, 2, 3, 1, 1200, 900, 0, 0, 0, 2100, 6000, 1, 0.6, 1, now],
+            crate::franken_sync::params![20250, "claude_code", "remote-ci", "sonnet", 5, 2, 3, 1, 1200, 900, 0, 0, 0, 2100, 6000, 1, 0.6, 1, now],
         )
         .unwrap();
 

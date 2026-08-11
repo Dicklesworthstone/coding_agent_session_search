@@ -19,7 +19,7 @@
 //! This module is the classification contract:
 //! - [`ContentionClass`] separates busy/locked, busy-recovery, snapshot
 //!   conflict, stale WAL/SHM sidecar, stale searcher/cache, and host-pressure.
-//! - [`classify_franken_error`] maps a real `frankensqlite::FrankenError` to
+//! - [`classify_franken_error`] maps a real `crate::franken_sync::FrankenError` to
 //!   its contention class (or `None` when the error is not contention — e.g.
 //!   corruption, which is a `.14.1` integrity state, not a transient).
 //! - [`Retryability`] + [`BoundedWaitGuidance`] give retry/backoff advice that
@@ -188,13 +188,13 @@ impl ContentionClass {
     }
 }
 
-/// Map a real `frankensqlite::FrankenError` to its contention class, or `None`
+/// Map a real `crate::franken_sync::FrankenError` to its contention class, or `None`
 /// when the error is not a transient/contention class (e.g. corruption, which
 /// is a `.14.1` integrity state). The struct variants are matched with `{ .. }`
 /// so this stays robust to field-shape changes, with a catch-all for any
 /// future non-contention variant.
-pub(crate) fn classify_franken_error(err: &frankensqlite::FrankenError) -> Option<ContentionClass> {
-    use frankensqlite::FrankenError as E;
+pub(crate) fn classify_franken_error(err: &crate::franken_sync::FrankenError) -> Option<ContentionClass> {
+    use crate::franken_sync::FrankenError as E;
     match err {
         E::Busy | E::DatabaseLocked { .. } | E::LockFailed { .. } => {
             Some(ContentionClass::BusyLocked)
@@ -209,11 +209,11 @@ pub(crate) fn classify_franken_error(err: &frankensqlite::FrankenError) -> Optio
     }
 }
 
-/// Whether a `frankensqlite::FrankenError` is a retryable contention error
+/// Whether a `crate::franken_sync::FrankenError` is a retryable contention error
 /// (busy/recovery/snapshot conflict). Mirrors the retry predicate used by the
 /// connection-manager backoff loop, but driven by the shared classifier so the
 /// two never disagree.
-pub(crate) fn is_retryable_contention(err: &frankensqlite::FrankenError) -> bool {
+pub(crate) fn is_retryable_contention(err: &crate::franken_sync::FrankenError) -> bool {
     classify_franken_error(err)
         .is_some_and(|c| matches!(c.retryability(), Retryability::RetryAfterBackoff))
 }
@@ -384,9 +384,9 @@ impl ContentionReport {
         }
     }
 
-    /// Build the verdict directly from a `frankensqlite::FrankenError`, or
+    /// Build the verdict directly from a `crate::franken_sync::FrankenError`, or
     /// `None` when the error is not a contention class (e.g. corruption).
-    pub(crate) fn from_franken_error(err: &frankensqlite::FrankenError) -> Option<Self> {
+    pub(crate) fn from_franken_error(err: &crate::franken_sync::FrankenError) -> Option<Self> {
         classify_franken_error(err).map(|class| Self::classify(class, None))
     }
 }
@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn classify_franken_error_maps_busy_variants_and_skips_corruption() {
-        use frankensqlite::FrankenError as E;
+        use crate::franken_sync::FrankenError as E;
         // Busy / recovery are concrete unit variants — safe to construct.
         assert_eq!(
             classify_franken_error(&E::Busy),
@@ -629,8 +629,8 @@ mod tests {
 mod contention_integration_tests {
     use super::{ContentionClass, classify_franken_error};
     use crate::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager, WriterGuard};
-    use frankensqlite::compat::{RowExt, TransactionExt};
-    use frankensqlite::params as fparams;
+    use crate::franken_sync::compat::{RowExt, TransactionExt};
+    use crate::franken_sync::params as fparams;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -704,10 +704,10 @@ mod contention_integration_tests {
                                 }
                                 Err(err) => {
                                     let franken = err
-                                        .downcast_ref::<frankensqlite::FrankenError>()
+                                        .downcast_ref::<crate::franken_sync::FrankenError>()
                                         .or_else(|| {
                                             err.root_cause()
-                                                .downcast_ref::<frankensqlite::FrankenError>()
+                                                .downcast_ref::<crate::franken_sync::FrankenError>()
                                         });
                                     let class = franken.and_then(classify_franken_error);
                                     match class {

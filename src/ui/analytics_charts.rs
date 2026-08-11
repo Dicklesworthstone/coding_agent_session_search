@@ -525,10 +525,10 @@ pub(crate) fn format_metric_percent(
 }
 
 fn resolve_workspace_filter_ids(
-    conn: &frankensqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     workspaces: &std::collections::HashSet<String>,
 ) -> Vec<i64> {
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 
     if workspaces.is_empty() {
         return Vec::new();
@@ -546,7 +546,7 @@ fn resolve_workspace_filter_ids(
         if let Ok(id) = conn.query_row_map(
             "SELECT id FROM workspaces WHERE path = ?1",
             &[ParamValue::from(workspace.as_str())],
-            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+            |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         ) && !ids.contains(&id)
         {
             ids.push(id);
@@ -3288,12 +3288,12 @@ fn format_number(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::compat::ConnectionExt;
-    use frankensqlite::params;
+    use crate::franken_sync::compat::ConnectionExt;
+    use crate::franken_sync::params;
 
     #[test]
     fn resolve_workspace_filter_ids_supports_paths_and_numeric_ids() {
-        let conn = frankensqlite::Connection::open(":memory:").unwrap();
+        let conn = crate::franken_sync::Connection::open(":memory:").unwrap();
         conn.execute_batch(
             "CREATE TABLE workspaces (
                 id INTEGER PRIMARY KEY,

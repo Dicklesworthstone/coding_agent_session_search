@@ -27,8 +27,8 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use frankensqlite::compat::{ConnectionExt, RowExt};
-use frankensqlite::{Connection, Row};
+use crate::franken_sync::compat::{ConnectionExt, RowExt};
+use crate::franken_sync::{Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -1020,7 +1020,7 @@ mod tests {
                 conn.execute_compat(
                     "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    frankensqlite::params![
+                    crate::franken_sync::params![
                         conv_id as i64,
                         idx as i64,
                         role,
@@ -1099,7 +1099,7 @@ mod tests {
                      FROM messages
                      WHERE conversation_id = ?1
                      ORDER BY idx ASC",
-                    &[frankensqlite::compat::ParamValue::from(conv_id)],
+                    &[crate::franken_sync::compat::ParamValue::from(conv_id)],
                     |row: &Row| {
                         Ok((
                             row.get_typed::<i64>(0)?,
@@ -1293,7 +1293,7 @@ mod tests {
             conn.execute_compat(
                 "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                  VALUES (?1, ?2, 'assistant', 'message', ?3)",
-                frankensqlite::params![conv_id, idx, created_at],
+                crate::franken_sync::params![conv_id, idx, created_at],
             )
             .unwrap();
         }
@@ -1349,7 +1349,7 @@ mod tests {
             conn.execute_compat(
                 "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
                  VALUES (?1, 'codex', '/tmp/project', ?2, ?3, 1704067200000, 0)",
-                frankensqlite::params![id, title, source_path.as_str()],
+                crate::franken_sync::params![id, title, source_path.as_str()],
             )
             .unwrap();
         }
@@ -1439,7 +1439,7 @@ mod tests {
             conn.execute_compat(
                 "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
                  VALUES (?1, 'claude-code', ?2, ?3, ?4, ?5, 1)",
-                frankensqlite::params![
+                crate::franken_sync::params![
                     conv_id,
                     workspace.as_str(),
                     title.as_str(),
@@ -1452,7 +1452,7 @@ mod tests {
             conn.execute_compat(
                 "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                  VALUES (?1, 0, 'assistant', ?2, ?3)",
-                frankensqlite::params![conv_id, content.as_str(), started_at],
+                crate::franken_sync::params![conv_id, content.as_str(), started_at],
             )
             .unwrap();
             conv_id += 1;
@@ -1466,7 +1466,7 @@ mod tests {
             conn.execute_compat(
                 "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
                  VALUES (?1, 'codex', '/home/user/codex-ws', ?2, ?3, ?4, 1)",
-                frankensqlite::params![
+                crate::franken_sync::params![
                     conv_id,
                     title.as_str(),
                     source.as_str(),
@@ -1478,7 +1478,7 @@ mod tests {
             conn.execute_compat(
                 "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                  VALUES (?1, 0, 'assistant', ?2, ?3)",
-                frankensqlite::params![conv_id, content.as_str(), started_at],
+                crate::franken_sync::params![conv_id, content.as_str(), started_at],
             )
             .unwrap();
             conv_id += 1;

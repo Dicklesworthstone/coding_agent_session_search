@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use crate::franken_sync::Connection as FrankenConnection;
+use crate::franken_sync::compat::{ConnectionExt, RowExt};
 use half::f16;
 
 pub use frankensearch::index::{Quantization, SearchParams, VectorIndex, VectorIndexWriter};
@@ -497,7 +497,7 @@ impl SemanticFilterMaps {
         let agent_rows = conn.query_map_collect(
             "SELECT id, slug FROM agents",
             &[],
-            |row: &frankensqlite::Row| {
+            |row: &crate::franken_sync::Row| {
                 let id: i64 = row.get_typed(0)?;
                 let slug: String = row.get_typed(1)?;
                 Ok((id, slug))
@@ -512,7 +512,7 @@ impl SemanticFilterMaps {
         let workspace_rows = conn.query_map_collect(
             "SELECT id, path FROM workspaces",
             &[],
-            |row: &frankensqlite::Row| {
+            |row: &crate::franken_sync::Row| {
                 let id: i64 = row.get_typed(0)?;
                 let path: String = row.get_typed(1)?;
                 Ok((id, path))
@@ -528,7 +528,7 @@ impl SemanticFilterMaps {
         let source_rows = conn.query_map_collect(
             "SELECT id, kind FROM sources",
             &[],
-            |row: &frankensqlite::Row| {
+            |row: &crate::franken_sync::Row| {
                 let id: String = row.get_typed(0)?;
                 let kind: String = row.get_typed(1)?;
                 Ok((id, kind))

@@ -640,7 +640,7 @@ fn inspect_schema_state_from_isolated_snapshot(
     db_path: &std::path::Path,
     timeout: std::time::Duration,
 ) -> SchemaSnapshotProbe {
-    use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
+    use crate::franken_sync::compat::{ConnectionExt as _, RowExt as _};
 
     let snapshot_dir = match tempfile::Builder::new()
         .prefix("cass-storage-schema-probe-")
@@ -691,12 +691,12 @@ fn inspect_schema_state_from_isolated_snapshot(
     let table_count = conn.query_row_map(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
         &[],
-        |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+        |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
     );
     let meta_count = conn.query_row_map(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
         &[],
-        |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+        |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
     );
 
     let outcome = match (table_count, meta_count) {
@@ -709,7 +709,7 @@ fn inspect_schema_state_from_isolated_snapshot(
         (Ok(_), Ok(_)) => match conn.query_row_map(
             "SELECT value FROM meta WHERE key = 'schema_version'",
             &[],
-            |row: &frankensqlite::Row| row.get_typed::<String>(0),
+            |row: &crate::franken_sync::Row| row.get_typed::<String>(0),
         ) {
             Ok(raw_version) => match raw_version.trim().parse::<i64>() {
                 Ok(version)
@@ -841,7 +841,7 @@ fn probe_writer_lock_state(
 
 #[cfg(unix)]
 fn inspect_native_writer_lock(db_path: &std::path::Path) -> LockAdmissionProbe {
-    use frankensqlite::fsqlite_vfs::{UnixVfs, Vfs as _, VfsFile as _};
+    use crate::franken_sync::fsqlite_vfs::{UnixVfs, Vfs as _, VfsFile as _};
     use fsqlite_types::cx::Cx;
     use fsqlite_types::flags::VfsOpenFlags;
 
@@ -873,7 +873,7 @@ fn inspect_native_writer_lock(_db_path: &std::path::Path) -> LockAdmissionProbe 
 }
 
 #[cfg(unix)]
-fn lock_admission_outcome_from_error(err: &frankensqlite::FrankenError) -> LockAdmissionProbe {
+fn lock_admission_outcome_from_error(err: &crate::franken_sync::FrankenError) -> LockAdmissionProbe {
     use crate::search::contention_diagnostics::{ContentionClass, classify_franken_error};
 
     if classify_franken_error(err).is_some_and(|class| {
@@ -896,13 +896,13 @@ fn elapsed_millis(started: std::time::Instant) -> i64 {
 
 fn observe_anyhow_contention(err: &anyhow::Error, probe: &mut DedicatedStorageProbe) {
     for cause in err.chain() {
-        if let Some(franken) = cause.downcast_ref::<frankensqlite::FrankenError>() {
+        if let Some(franken) = cause.downcast_ref::<crate::franken_sync::FrankenError>() {
             observe_typed_contention(franken, probe);
         }
     }
 }
 
-fn observe_typed_contention(err: &frankensqlite::FrankenError, probe: &mut DedicatedStorageProbe) {
+fn observe_typed_contention(err: &crate::franken_sync::FrankenError, probe: &mut DedicatedStorageProbe) {
     use crate::search::contention_diagnostics::{ContentionClass, classify_franken_error};
 
     probe.busy_or_locked |= classify_franken_error(err).is_some_and(|class| {
@@ -1923,7 +1923,7 @@ mod tests {
     }
 
     fn seed_schema_version(path: &std::path::Path, version: i64) -> anyhow::Result<()> {
-        use frankensqlite::compat::{ConnectionExt as _, ParamValue};
+        use crate::franken_sync::compat::{ConnectionExt as _, ParamValue};
 
         let storage = crate::storage::sqlite::FrankenStorage::open(path)?;
         storage.raw().execute_compat(

@@ -11,7 +11,7 @@ use frankensearch::index::{
     Quantization as FsQuantization, VectorIndex as FsVectorIndex,
     VectorIndexWriter as FsVectorIndexWriter, wal_path_for as fsvi_wal_path_for,
 };
-use frankensqlite::{
+use crate::franken_sync::{
     SqliteValue,
     compat::{ConnectionExt, ParamValue, RowExt},
 };

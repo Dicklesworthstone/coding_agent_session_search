@@ -25,9 +25,9 @@ use crate::pages::encrypt::{KeySlot, SlotType};
 use crate::pages::secret_scan::{SecretScanReport, SecretScanSummary};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use frankensqlite::Connection;
-use frankensqlite::Row;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use crate::franken_sync::Connection;
+use crate::franken_sync::Row;
+use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1444,8 +1444,8 @@ mod tests {
     }
 
     fn insert_test_data(conn: &Connection) {
-        use frankensqlite::compat::ConnectionExt;
-        use frankensqlite::params;
+        use crate::franken_sync::compat::ConnectionExt;
+        use crate::franken_sync::params;
 
         conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude-code');")
             .unwrap();

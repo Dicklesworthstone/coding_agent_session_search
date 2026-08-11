@@ -21,8 +21,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
-use frankensqlite::{Connection, Row};
+use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
+use crate::franken_sync::{Connection, Row};
 use serde::{Deserialize, Serialize};
 
 use crate::analytics::{AnalyticsFilter, SourceFilter};
@@ -1136,7 +1136,7 @@ mod tests {
                      id, agent_id, workspace_id, source_id, external_id,
                      source_path, started_at, origin_host
                  ) VALUES (?1, 1, 10, 'local', 'bulk', '/bulk.jsonl', 1, NULL)",
-                frankensqlite::params![id],
+                crate::franken_sync::params![id],
             )
             .unwrap();
         }
@@ -1217,7 +1217,7 @@ mod tests {
         let oversized = format!("cass recommended_action unhealthy {}", "x".repeat(5_000));
         conn.execute_compat(
             "UPDATE messages SET content = ?1 WHERE id = 1",
-            frankensqlite::params![oversized],
+            crate::franken_sync::params![oversized],
         )
         .unwrap();
 

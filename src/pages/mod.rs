@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
-use frankensqlite::Connection;
-use frankensqlite::compat::OpenFlags;
+use crate::franken_sync::Connection;
+use crate::franken_sync::compat::OpenFlags;
 use std::fs::Metadata;
 #[cfg(not(windows))]
 use std::fs::OpenOptions;
@@ -86,7 +86,7 @@ pub(crate) fn open_existing_sqlite_db(path: &Path) -> Result<Connection> {
 
     // Open read-only to prevent accidental writes to the source database
     // during export/scan operations.
-    frankensqlite::compat::open_with_flags(
+    crate::franken_sync::compat::open_with_flags(
         path.to_string_lossy().as_ref(),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )

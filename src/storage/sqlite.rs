@@ -3,7 +3,7 @@
 use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow, bail};
-use frankensqlite::{
+use crate::franken_sync::{
     Connection as FrankenConnection, Row as FrankenRow, SqliteValue,
     compat::{
         ConnectionExt as FrankenConnectionExt, OpenFlags as FrankenOpenFlags,
@@ -57,7 +57,7 @@ pub enum LazyDbError {
     #[error("Failed to open FrankenSQLite database at {path}: {source}")]
     FrankenOpenFailed {
         path: PathBuf,
-        source: frankensqlite::FrankenError,
+        source: crate::franken_sync::FrankenError,
     },
 }
 
@@ -171,7 +171,7 @@ impl LazyFrankenDb {
             )
             .map_err(|err| LazyDbError::FrankenOpenFailed {
                 path: self.path.clone(),
-                source: frankensqlite::FrankenError::Internal(err.to_string()),
+                source: crate::franken_sync::FrankenError::Internal(err.to_string()),
             })?;
             let conn =
                 FrankenConnection::open(self.path.to_string_lossy().into_owned()).map_err(|e| {
@@ -217,7 +217,7 @@ impl LazyFrankenDb {
                         Ok(guard) => guard,
                         Err(err) => {
                             let _ = tx
-                                .send(Err(frankensqlite::FrankenError::Internal(err.to_string())));
+                                .send(Err(crate::franken_sync::FrankenError::Internal(err.to_string())));
                             return;
                         }
                     };
@@ -228,7 +228,7 @@ impl LazyFrankenDb {
                 .recv_timeout(timeout)
                 .map_err(|_| LazyDbError::FrankenOpenFailed {
                     path: self.path.clone(),
-                    source: frankensqlite::FrankenError::Internal(format!(
+                    source: crate::franken_sync::FrankenError::Internal(format!(
                         "database open timed out after {}s (possible corruption or lock contention)",
                         timeout.as_secs()
                     )),
@@ -703,16 +703,16 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
     }
 }
 
-pub(crate) fn retryable_franken_error(err: &frankensqlite::FrankenError) -> bool {
+pub(crate) fn retryable_franken_error(err: &crate::franken_sync::FrankenError) -> bool {
     matches!(
         err,
-        frankensqlite::FrankenError::Busy
-            | frankensqlite::FrankenError::BusyRecovery
-            | frankensqlite::FrankenError::BusySnapshot { .. }
-            | frankensqlite::FrankenError::DatabaseLocked { .. }
-            | frankensqlite::FrankenError::LockFailed { .. }
-            | frankensqlite::FrankenError::WriteConflict { .. }
-            | frankensqlite::FrankenError::SerializationFailure { .. }
+        crate::franken_sync::FrankenError::Busy
+            | crate::franken_sync::FrankenError::BusyRecovery
+            | crate::franken_sync::FrankenError::BusySnapshot { .. }
+            | crate::franken_sync::FrankenError::DatabaseLocked { .. }
+            | crate::franken_sync::FrankenError::LockFailed { .. }
+            | crate::franken_sync::FrankenError::WriteConflict { .. }
+            | crate::franken_sync::FrankenError::SerializationFailure { .. }
     ) || retryable_storage_error_message(&err.to_string())
 }
 
@@ -729,7 +729,7 @@ pub(crate) fn retryable_storage_error_message(message: &str) -> bool {
 pub(crate) fn retryable_franken_anyhow(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
-            .downcast_ref::<frankensqlite::FrankenError>()
+            .downcast_ref::<crate::franken_sync::FrankenError>()
             .is_some_and(retryable_franken_error)
             || retryable_storage_error_message(&cause.to_string())
     })
@@ -1070,7 +1070,7 @@ pub enum MigrationError {
 
     /// A database error occurred during migration.
     #[error("Database error: {0}")]
-    Database(#[from] frankensqlite::FrankenError),
+    Database(#[from] crate::franken_sync::FrankenError),
 
     /// An I/O error occurred during backup.
     #[error("I/O error: {0}")]
@@ -1454,7 +1454,7 @@ pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, Migra
 fn vacuum_into_backup_stage(
     db_path: &Path,
     stage_path: &Path,
-) -> std::result::Result<(), frankensqlite::FrankenError> {
+) -> std::result::Result<(), crate::franken_sync::FrankenError> {
     let mut conn = open_franken_with_flags(
         &db_path.to_string_lossy(),
         FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1476,7 +1476,7 @@ fn vacuum_into_backup_stage(
     result
 }
 
-fn backup_vacuum_error_requires_consistent_retry(err: &frankensqlite::FrankenError) -> bool {
+fn backup_vacuum_error_requires_consistent_retry(err: &crate::franken_sync::FrankenError) -> bool {
     retryable_franken_error(err)
 }
 
@@ -3115,16 +3115,16 @@ pub enum SchemaCheck {
     NeedsRebuild(String),
 }
 
-fn schema_check_error_requires_rebuild(err: &frankensqlite::FrankenError) -> bool {
+fn schema_check_error_requires_rebuild(err: &crate::franken_sync::FrankenError) -> bool {
     // Only on-disk corruption classes justify destructive rebuild.
     // Locking, open, and generic I/O failures are often transient and must
     // surface as errors rather than deleting the database under the caller.
     matches!(
         err,
-        frankensqlite::FrankenError::DatabaseCorrupt { .. }
-            | frankensqlite::FrankenError::WalCorrupt { .. }
-            | frankensqlite::FrankenError::NotADatabase { .. }
-            | frankensqlite::FrankenError::ShortRead { .. }
+        crate::franken_sync::FrankenError::DatabaseCorrupt { .. }
+            | crate::franken_sync::FrankenError::WalCorrupt { .. }
+            | crate::franken_sync::FrankenError::NotADatabase { .. }
+            | crate::franken_sync::FrankenError::ShortRead { .. }
     )
 }
 
@@ -3159,7 +3159,7 @@ fn vacuum_stage_backup_path(backup_path: &Path) -> PathBuf {
 /// Opens the database read-only and checks the schema version.
 fn check_schema_compatibility(
     path: &Path,
-) -> std::result::Result<SchemaCheck, frankensqlite::FrankenError> {
+) -> std::result::Result<SchemaCheck, crate::franken_sync::FrankenError> {
     let mut conn = open_franken_with_flags(
         &path.to_string_lossy(),
         FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -3922,8 +3922,8 @@ pub type SqliteStorage = FrankenStorage;
 /// Primary frankensqlite-backed storage backend.
 /// Busy-class engine errors that a connection close can hit transiently while
 /// a sibling connection briefly holds the WAL write or checkpoint lock.
-fn franken_close_error_is_transiently_busy(err: &frankensqlite::FrankenError) -> bool {
-    use frankensqlite::FrankenError;
+fn franken_close_error_is_transiently_busy(err: &crate::franken_sync::FrankenError) -> bool {
+    use crate::franken_sync::FrankenError;
     matches!(
         err,
         FrankenError::Busy
@@ -3953,7 +3953,7 @@ fn franken_close_error_is_transiently_busy(err: &frankensqlite::FrankenError) ->
 fn close_franken_in_place_with_busy_retry(
     conn: &mut FrankenConnection,
     checkpoint_on_close: bool,
-) -> std::result::Result<(), frankensqlite::FrankenError> {
+) -> std::result::Result<(), crate::franken_sync::FrankenError> {
     const MAX_ATTEMPTS: usize = 12;
     const BACKOFF_START: Duration = Duration::from_millis(5);
     const BACKOFF_CAP: Duration = Duration::from_millis(250);
@@ -12271,7 +12271,7 @@ impl FrankenStorage {
                 fparams![db_path, model_id, total_docs],
             );
             if let Err(err) = insert_result {
-                if !matches!(err, frankensqlite::FrankenError::UniqueViolation { .. }) {
+                if !matches!(err, crate::franken_sync::FrankenError::UniqueViolation { .. }) {
                     return Err(err.into());
                 }
                 self.conn.execute_compat(
@@ -13896,7 +13896,7 @@ fn franken_insert_conversation(
             }
             Ok(Some(conv_id))
         }
-        Err(frankensqlite::FrankenError::UniqueViolation { .. }) => {
+        Err(crate::franken_sync::FrankenError::UniqueViolation { .. }) => {
             tracing::debug!(
                 source_id = %conv.source_id,
                 agent_id,
@@ -17251,8 +17251,8 @@ impl OutOfMemoryProbe for anyhow::Error {
     fn is_out_of_memory(&self) -> bool {
         self.chain().any(|cause| {
             if cause
-                .downcast_ref::<frankensqlite::FrankenError>()
-                .is_some_and(|err| matches!(err, frankensqlite::FrankenError::OutOfMemory))
+                .downcast_ref::<crate::franken_sync::FrankenError>()
+                .is_some_and(|err| matches!(err, crate::franken_sync::FrankenError::OutOfMemory))
             {
                 return true;
             }
@@ -17261,9 +17261,9 @@ impl OutOfMemoryProbe for anyhow::Error {
     }
 }
 
-impl OutOfMemoryProbe for frankensqlite::FrankenError {
+impl OutOfMemoryProbe for crate::franken_sync::FrankenError {
     fn is_out_of_memory(&self) -> bool {
-        matches!(self, frankensqlite::FrankenError::OutOfMemory)
+        matches!(self, crate::franken_sync::FrankenError::OutOfMemory)
     }
 }
 
@@ -19759,42 +19759,42 @@ mod tests {
     #[test]
     fn schema_check_rebuild_classification_ignores_transient_errors() {
         assert!(!schema_check_error_requires_rebuild(
-            &frankensqlite::FrankenError::Busy
+            &crate::franken_sync::FrankenError::Busy
         ));
         assert!(!schema_check_error_requires_rebuild(
-            &frankensqlite::FrankenError::DatabaseLocked {
+            &crate::franken_sync::FrankenError::DatabaseLocked {
                 path: PathBuf::from("/tmp/test.db"),
             }
         ));
         assert!(!schema_check_error_requires_rebuild(
-            &frankensqlite::FrankenError::CannotOpen {
+            &crate::franken_sync::FrankenError::CannotOpen {
                 path: PathBuf::from("/tmp/test.db"),
             }
         ));
         assert!(!schema_check_error_requires_rebuild(
-            &frankensqlite::FrankenError::Io(std::io::Error::other("disk hiccup"))
+            &crate::franken_sync::FrankenError::Io(std::io::Error::other("disk hiccup"))
         ));
     }
 
     #[test]
     fn schema_check_rebuild_classification_keeps_corruption_errors() {
         assert!(schema_check_error_requires_rebuild(
-            &frankensqlite::FrankenError::DatabaseCorrupt {
+            &crate::franken_sync::FrankenError::DatabaseCorrupt {
                 detail: "bad header".to_string(),
             }
         ));
         assert!(schema_check_error_requires_rebuild(
-            &frankensqlite::FrankenError::WalCorrupt {
+            &crate::franken_sync::FrankenError::WalCorrupt {
                 detail: "bad wal".to_string(),
             }
         ));
         assert!(schema_check_error_requires_rebuild(
-            &frankensqlite::FrankenError::NotADatabase {
+            &crate::franken_sync::FrankenError::NotADatabase {
                 path: PathBuf::from("/tmp/test.db"),
             }
         ));
         assert!(schema_check_error_requires_rebuild(
-            &frankensqlite::FrankenError::ShortRead {
+            &crate::franken_sync::FrankenError::ShortRead {
                 expected: 4096,
                 actual: 64,
             }
@@ -19804,20 +19804,20 @@ mod tests {
     #[test]
     fn create_backup_refuses_raw_copy_after_retryable_vacuum_errors() {
         let retryable_errors = [
-            frankensqlite::FrankenError::Busy,
-            frankensqlite::FrankenError::BusyRecovery,
-            frankensqlite::FrankenError::BusySnapshot {
+            crate::franken_sync::FrankenError::Busy,
+            crate::franken_sync::FrankenError::BusyRecovery,
+            crate::franken_sync::FrankenError::BusySnapshot {
                 conflicting_pages: "1,2".to_string(),
             },
-            frankensqlite::FrankenError::DatabaseLocked {
+            crate::franken_sync::FrankenError::DatabaseLocked {
                 path: PathBuf::from("/tmp/test.db"),
             },
-            frankensqlite::FrankenError::LockFailed {
+            crate::franken_sync::FrankenError::LockFailed {
                 detail: "fcntl lock still held".to_string(),
             },
-            frankensqlite::FrankenError::WriteConflict { page: 7, holder: 9 },
-            frankensqlite::FrankenError::SerializationFailure { page: 11 },
-            frankensqlite::FrankenError::Internal("database is locked".to_string()),
+            crate::franken_sync::FrankenError::WriteConflict { page: 7, holder: 9 },
+            crate::franken_sync::FrankenError::SerializationFailure { page: 11 },
+            crate::franken_sync::FrankenError::Internal("database is locked".to_string()),
         ];
 
         for err in retryable_errors {
@@ -19828,12 +19828,12 @@ mod tests {
         }
 
         assert!(!backup_vacuum_error_requires_consistent_retry(
-            &frankensqlite::FrankenError::NotADatabase {
+            &crate::franken_sync::FrankenError::NotADatabase {
                 path: PathBuf::from("/tmp/test.db")
             }
         ));
         assert!(!backup_vacuum_error_requires_consistent_retry(
-            &frankensqlite::FrankenError::DatabaseCorrupt {
+            &crate::franken_sync::FrankenError::DatabaseCorrupt {
                 detail: "bad header".to_string()
             }
         ));
@@ -23147,24 +23147,24 @@ mod tests {
         use crate::connectors::{NormalizedConversation, NormalizedMessage};
         use crate::indexer::persist::map_to_internal;
         use crate::model::types::{Agent, AgentKind};
-        use frankensqlite::compat::{ConnectionExt, RowExt};
+        use crate::franken_sync::compat::{ConnectionExt, RowExt};
         use rand::RngExt;
         use rayon::prelude::*;
 
         fn retryable_franken_error(err: &anyhow::Error) -> bool {
-            err.downcast_ref::<frankensqlite::FrankenError>()
+            err.downcast_ref::<crate::franken_sync::FrankenError>()
                 .or_else(|| {
                     err.root_cause()
-                        .downcast_ref::<frankensqlite::FrankenError>()
+                        .downcast_ref::<crate::franken_sync::FrankenError>()
                 })
                 .is_some_and(|inner| {
                     matches!(
                         inner,
-                        frankensqlite::FrankenError::Busy
-                            | frankensqlite::FrankenError::BusyRecovery
-                            | frankensqlite::FrankenError::BusySnapshot { .. }
-                            | frankensqlite::FrankenError::WriteConflict { .. }
-                            | frankensqlite::FrankenError::SerializationFailure { .. }
+                        crate::franken_sync::FrankenError::Busy
+                            | crate::franken_sync::FrankenError::BusyRecovery
+                            | crate::franken_sync::FrankenError::BusySnapshot { .. }
+                            | crate::franken_sync::FrankenError::WriteConflict { .. }
+                            | crate::franken_sync::FrankenError::SerializationFailure { .. }
                     )
                 })
         }
@@ -29247,7 +29247,7 @@ mod tests {
         let column_names: HashSet<String> = columns
             .iter()
             .map(|row| row.get_typed(1))
-            .collect::<std::result::Result<_, frankensqlite::FrankenError>>()
+            .collect::<std::result::Result<_, crate::franken_sync::FrankenError>>()
             .unwrap();
         assert!(column_names.contains("last_message_idx"));
         assert!(column_names.contains("last_message_created_at"));
@@ -29919,7 +29919,7 @@ mod tests {
     #[test]
     fn franken_insert_conversations_batched_populates_analytics_rollups() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use frankensqlite::compat::{ConnectionExt, RowExt};
+        use crate::franken_sync::compat::{ConnectionExt, RowExt};
         use std::path::PathBuf;
 
         let dir = TempDir::new().unwrap();
@@ -30111,7 +30111,7 @@ mod tests {
 
     #[test]
     fn connection_manager_writer_reads_and_writes() {
-        use frankensqlite::compat::RowExt;
+        use crate::franken_sync::compat::RowExt;
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("cm.db");
@@ -30171,7 +30171,7 @@ mod tests {
 
     #[test]
     fn connection_manager_concurrent_writer_works() {
-        use frankensqlite::compat::RowExt;
+        use crate::franken_sync::compat::RowExt;
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("cm.db");

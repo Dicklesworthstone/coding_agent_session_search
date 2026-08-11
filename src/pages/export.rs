@@ -2,8 +2,8 @@ use crate::ui::time_parser::parse_time_input;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt, TransactionExt};
-use frankensqlite::{Connection, Row as FrankenRow, params};
+use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, TransactionExt};
+use crate::franken_sync::{Connection, Row as FrankenRow, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -327,7 +327,7 @@ impl ExportEngine {
                     // Fetch messages for this conversation
                     let msg_rows: Vec<MessageExportRow> = src.query_map_collect(
                         &msg_query,
-                        frankensqlite::params![*id],
+                        crate::franken_sync::params![*id],
                         |row: &FrankenRow| {
                             Ok((
                                 row.get_typed::<i64>(0)?,

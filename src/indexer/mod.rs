@@ -36,9 +36,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
 use frankensearch::index::VectorIndex as FsVectorIndex;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 #[cfg(test)]
-use frankensqlite::compat::{
+use crate::franken_sync::compat::{
     Transaction as FrankenTransaction, TransactionExt as FrankenTransactionExt,
 };
 use fs2::FileExt;
@@ -9083,7 +9083,7 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
         .query_map_collect(
             "SELECT id FROM conversations",
             &[] as &[ParamValue],
-            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+            |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         )
         .context("listing conversations for the noise-adjusted lexical doc expectation")?;
     let mut expected_docs = 0usize;
@@ -15806,7 +15806,7 @@ fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalChe
     // retained autocommit writes during close, and TRUNCATE avoids leaving the
     // completed bulk-ingest WAL for the next opener to replay.
     let checkpoint_db_path = db_path.to_string_lossy().into_owned();
-    let conn = frankensqlite::Connection::open(checkpoint_db_path).with_context(|| {
+    let conn = crate::franken_sync::Connection::open(checkpoint_db_path).with_context(|| {
         format!(
             "opening canonical db for final WAL checkpoint after {context}: {}",
             db_path.display()
@@ -15826,7 +15826,7 @@ fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalChe
 }
 
 fn query_final_wal_checkpoint(
-    conn: &frankensqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     db_path: &Path,
     context: &str,
 ) -> Result<FinalWalCheckpointOutcome> {
@@ -21816,7 +21816,7 @@ fn ingest_non_watch_batch_once(
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
         // exercises the downcast path that real frankensqlite OOMs hit, instead
         // of relying on the plain-string fallback.
-        return Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory));
+        return Err(anyhow::Error::new(crate::franken_sync::FrankenError::OutOfMemory));
     }
 
     let outcome = ingest_batch_detailed(
@@ -22152,7 +22152,7 @@ fn ingest_watch_batch_with_oom_split_inner(
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
         // exercises the downcast path that real frankensqlite OOMs hit, instead
         // of relying on the plain-string fallback.
-        Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
+        Err(anyhow::Error::new(crate::franken_sync::FrankenError::OutOfMemory))
     } else {
         let mut semantic_delta = WatchSemanticDelta::default();
         ingest_batch_with_semantic_delta(
@@ -22237,7 +22237,7 @@ fn ingest_watch_batch_with_oom_split_inner(
             // conversation (solo ingest also OOMs) set
             // `CASS_TEST_WATCH_SOLO_RETRY_OOM=1`.
             let solo_retry = if should_force_watch_solo_retry_oom() {
-                Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
+                Err(anyhow::Error::new(crate::franken_sync::FrankenError::OutOfMemory))
             } else {
                 ingest_watch_batch_with_oom_split_inner(
                     storage,
@@ -22416,8 +22416,8 @@ fn save_watch_state_watermark(
 fn error_is_out_of_memory(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         if cause
-            .downcast_ref::<frankensqlite::FrankenError>()
-            .is_some_and(|err| matches!(err, frankensqlite::FrankenError::OutOfMemory))
+            .downcast_ref::<crate::franken_sync::FrankenError>()
+            .is_some_and(|err| matches!(err, crate::franken_sync::FrankenError::OutOfMemory))
         {
             return true;
         }
@@ -26330,8 +26330,8 @@ pub mod persist {
     use std::time::Instant;
 
     use anyhow::{Context, Result, anyhow};
-    use frankensqlite::FrankenError;
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+    use crate::franken_sync::FrankenError;
+    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
     use rand::RngExt;
     use rayon::prelude::*;
 
@@ -28623,7 +28623,7 @@ pub mod persist {
         fn begin_concurrent_persist_writes_all_conversations() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("test.db");
@@ -28740,7 +28740,7 @@ pub mod persist {
         fn begin_concurrent_single_conversation_works() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("test.db");
@@ -28805,7 +28805,7 @@ pub mod persist {
         fn persist_conversations_batched_can_defer_inline_lexical_updates() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
 
@@ -28878,7 +28878,7 @@ pub mod persist {
         fn begin_concurrent_persist_can_defer_inline_lexical_updates() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
@@ -29637,7 +29637,7 @@ pub mod persist {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
             use crate::sources::provenance::{Source, SourceKind};
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
@@ -29762,7 +29762,7 @@ pub mod persist {
             // persisted content, message ordering, or redaction behaviour.
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
             // Force redaction on so we exercise the heavier allocation path
@@ -30008,7 +30008,7 @@ pub mod persist {
             // old per-chunk map_to_internal loop produced.
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             // Use chunk_size 8 so the 32-conv batch splits across multiple
@@ -30098,7 +30098,7 @@ pub mod persist {
             // (external_id, started_at) tuples.
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             fn run_once(parallel_wal: Option<&str>) -> Vec<(String, i64)> {
                 let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
@@ -30241,7 +30241,7 @@ pub mod persist {
         fn persist_conversations_batched_registers_missing_remote_source_in_serial_path() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
 
@@ -30312,7 +30312,7 @@ pub mod persist {
         {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
@@ -30386,7 +30386,7 @@ pub mod persist {
         fn persist_conversations_batched_reuses_auto_registered_remote_source_across_serial_runs() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
 
@@ -30514,7 +30514,7 @@ pub mod persist {
          {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
@@ -30641,7 +30641,7 @@ pub mod persist {
         fn persist_conversation_registers_missing_remote_source() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("single-remote-source.db");
@@ -30705,7 +30705,7 @@ pub mod persist {
         fn persist_conversation_host_only_remote_source_infers_source_id_from_host() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("single-host-only-remote.db");
@@ -31046,7 +31046,7 @@ mod tests {
     };
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::sources::provenance::SourceKind;
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
     use fsqlite_types::value::SqliteValue;
     use serial_test::serial;
     use tempfile::TempDir;
@@ -32208,7 +32208,7 @@ mod tests {
 
     #[test]
     fn out_of_memory_classifier_rejects_contextual_substrings() {
-        let typed: anyhow::Error = frankensqlite::FrankenError::OutOfMemory.into();
+        let typed: anyhow::Error = crate::franken_sync::FrankenError::OutOfMemory.into();
         assert!(error_is_out_of_memory(&typed));
 
         let exact = anyhow::anyhow!("out of memory");
@@ -32252,7 +32252,7 @@ mod tests {
         // Build a realistic wrapped chain: low-level FrankenError::OutOfMemory
         // bubbling up through two layers of context (mirrors how it actually
         // arrives at the quarantine path inside the watch ingest flow).
-        let typed: anyhow::Error = frankensqlite::FrankenError::OutOfMemory.into();
+        let typed: anyhow::Error = crate::franken_sync::FrankenError::OutOfMemory.into();
         let with_inner_ctx = typed.context("vdbe register allocation");
         let error: anyhow::Error = with_inner_ctx.context("ingest_batch_with_semantic_delta");
 
@@ -32312,7 +32312,7 @@ mod tests {
             metadata: serde_json::json!({}),
             messages: vec![],
         };
-        let error: anyhow::Error = frankensqlite::FrankenError::OutOfMemory.into();
+        let error: anyhow::Error = crate::franken_sync::FrankenError::OutOfMemory.into();
         let read_record = |data_dir: &std::path::Path| -> serde_json::Value {
             let path = data_dir.join("quarantine").join(INDEX_INGEST_POISON_FILE);
             let contents = std::fs::read_to_string(&path).expect("read quarantine file");
@@ -36717,7 +36717,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("legacy-canonical.db");
         let db_path_str = db_path.to_string_lossy().into_owned();
-        let conn = frankensqlite::Connection::open(db_path_str).unwrap();
+        let conn = crate::franken_sync::Connection::open(db_path_str).unwrap();
         conn.execute_compat(
             "CREATE TABLE conversations (id INTEGER PRIMARY KEY, source_path TEXT NOT NULL)",
             &[] as &[ParamValue],
@@ -36821,7 +36821,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("sparse-tail-canonical.db");
         let db_path_str = db_path.to_string_lossy().into_owned();
-        let conn = frankensqlite::Connection::open(db_path_str).unwrap();
+        let conn = crate::franken_sync::Connection::open(db_path_str).unwrap();
         conn.execute_compat(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
@@ -40554,7 +40554,7 @@ mod tests {
             "DB file should still exist after checkpoint"
         );
         // A fresh connection can open and query it.
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned())?;
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())?;
         let _ = conn.query("PRAGMA quick_check;");
         conn.close().ok();
         Ok(())
@@ -41349,7 +41349,7 @@ mod tests {
 
         close_storage_after_index(storage, &db_path, "test index run").unwrap();
 
-        let conn = frankensqlite::Connection::open(db_path_str).unwrap();
+        let conn = crate::franken_sync::Connection::open(db_path_str).unwrap();
         let rows = conn.query("PRAGMA wal_checkpoint(FULL);").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -41446,7 +41446,7 @@ mod tests {
         // Ordering: external_ids must appear in the DB in the order they
         // were sent on the channel. The combine path concatenates, so
         // this is only true if the drain preserves FIFO semantics.
-        use frankensqlite::compat::{ConnectionExt, RowExt};
+        use crate::franken_sync::compat::{ConnectionExt, RowExt};
         let external_ids: Vec<String> = storage
             .raw()
             .query_map_collect(
@@ -41536,7 +41536,7 @@ mod tests {
             )
             .unwrap();
 
-            use frankensqlite::compat::{ConnectionExt, RowExt};
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
             let conv_count: i64 = storage
                 .raw()
                 .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
@@ -43754,7 +43754,7 @@ mod tests {
         // feature dependency. Opens a FrankenConnection directly against
         // the file written by SqliteStorage above.
         let canonical_db_path = canonical_db.to_string_lossy().to_string();
-        let conn = frankensqlite::Connection::open(canonical_db_path).unwrap();
+        let conn = crate::franken_sync::Connection::open(canonical_db_path).unwrap();
         conn.execute_compat(
             "INSERT INTO meta(key, value) VALUES(?1, ?2)",
             &[

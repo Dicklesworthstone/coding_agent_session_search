@@ -43,16 +43,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use frankensqlite::Connection;
+use crate::franken_sync::Connection;
 #[cfg(test)]
-use frankensqlite::compat::OptionalExtension;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt};
+use crate::franken_sync::compat::OptionalExtension;
+use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt};
 #[cfg(test)]
-use frankensqlite::params;
+use crate::franken_sync::params;
 
-/// Wrapper around `frankensqlite::Connection` that implements `Send`.
+/// Wrapper around `crate::franken_sync::Connection` that implements `Send`.
 ///
-/// `frankensqlite::Connection` is `!Send` because it uses `Rc` internally.
+/// `crate::franken_sync::Connection` is `!Send` because it uses `Rc` internally.
 /// However, the `Rc` values are entirely self-contained within the Connection
 /// and are not shared with any external references.  When wrapped in a `Mutex`
 /// (as in `SearchClient`), exclusive access is guaranteed, making cross-thread
@@ -162,9 +162,9 @@ fn franken_query_map_collect_retry<T, F>(
     sql: &str,
     params: &[ParamValue],
     map: F,
-) -> Result<Vec<T>, frankensqlite::FrankenError>
+) -> Result<Vec<T>, crate::franken_sync::FrankenError>
 where
-    F: Copy + Fn(&frankensqlite::Row) -> Result<T, frankensqlite::FrankenError>,
+    F: Copy + Fn(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
 {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut backoff = Duration::from_millis(4);
@@ -5081,7 +5081,7 @@ impl SearchClient {
             }
 
             let chunk_rows: Vec<ResolvedSemanticLookupRow> =
-                conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                conn.query_map_collect(&sql, &params, |row: &crate::franken_sync::Row| {
                     let conversation_id: i64 = row.get_typed(0)?;
                     let source_id: String = row.get_typed(1)?;
                     let source_path: String = row.get_typed(2)?;
@@ -5166,7 +5166,7 @@ impl SearchClient {
             }
 
             let chunk_rows: Vec<ResolvedSemanticLookupRow> =
-                conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                conn.query_map_collect(&sql, &params, |row: &crate::franken_sync::Row| {
                     let source_id: String = row.get_typed(0)?;
                     let source_path: String = row.get_typed(1)?;
                     let idx: i64 = row.get_typed(2)?;
@@ -5238,7 +5238,7 @@ impl SearchClient {
         let rows: Vec<String> = conn.query_map_collect(
             "SELECT content FROM messages WHERE id = ?",
             &[ParamValue::from(i64::try_from(message_id)?)],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &crate::franken_sync::Row| row.get_typed(0),
         )?;
         Ok(rows.into_iter().next())
     }
@@ -5342,7 +5342,7 @@ impl SearchClient {
         let message_rows: Vec<MessageHydrationRow> = transaction.query_map_collect(
             &message_sql,
             &message_params,
-            |row: &frankensqlite::Row| {
+            |row: &crate::franken_sync::Row| {
                 let message_id: i64 = row.get_typed(0)?;
                 Ok(MessageHydrationRow {
                     message_id: semantic_message_id_from_db(message_id)?,
@@ -5397,7 +5397,7 @@ impl SearchClient {
         );
 
         let conversation_rows: Vec<(i64, ConversationHydrationRow)> = transaction
-            .query_map_collect(&sql, &conversation_params, |row: &frankensqlite::Row| {
+            .query_map_collect(&sql, &conversation_params, |row: &crate::franken_sync::Row| {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let title: Option<String> = if field_mask.wants_title() {
                     row.get_typed(1)?
@@ -6620,7 +6620,7 @@ impl SearchClient {
                  ORDER BY MAX(c.id) DESC
                  LIMIT 3",
                 &[],
-                |row: &frankensqlite::Row| row.get_typed::<String>(0),
+                |row: &crate::franken_sync::Row| row.get_typed::<String>(0),
             )
         {
             for row in rows {
@@ -7280,7 +7280,7 @@ impl SearchClient {
              ORDER BY rowid DESC
              LIMIT 1",
             &params,
-            |row: &frankensqlite::Row| row.get_typed::<String>(0),
+            |row: &crate::franken_sync::Row| row.get_typed::<String>(0),
         )?;
         Ok(ddl_rows
             .first()
@@ -7294,7 +7294,7 @@ impl SearchClient {
             conn,
             "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?",
             &params,
-            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+            |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         ) {
             Ok(_) => Ok(SqliteFtsMatchMode::Table),
             Err(err)
@@ -7314,7 +7314,7 @@ impl SearchClient {
             conn,
             "SELECT rowid FROM fts_messages LIMIT 1",
             &params,
-            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+            |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         )
         .is_ok()
     }
@@ -8332,7 +8332,7 @@ impl SearchClient {
         params.push(ParamValue::from(offset as i64));
 
         let rows: Vec<SearchHit> =
-            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+            conn.query_map_collect(&sql, &params, |row: &crate::franken_sync::Row| {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let title: String = if field_mask.wants_title() {
                     row.get_typed::<Option<String>>(1)?.unwrap_or_default()
@@ -9381,8 +9381,8 @@ mod tests {
     use crate::search::tantivy::TantivyIndex;
     use crate::search::vector_index::VectorIndex;
     use crate::storage::sqlite::FrankenStorage;
-    use frankensqlite::Connection as FrankenConnection;
-    use frankensqlite::compat::ParamValue;
+    use crate::franken_sync::Connection as FrankenConnection;
+    use crate::franken_sync::compat::ParamValue;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -10476,7 +10476,7 @@ mod tests {
              JOIN conversations c ON m.conversation_id = c.id
              ORDER BY c.id",
             &[],
-            |row: &frankensqlite::Row| {
+            |row: &crate::franken_sync::Row| {
                 let message_id: i64 = row.get_typed(0)?;
                 let created_at: i64 = row.get_typed(1)?;
                 Ok((u64::try_from(message_id).unwrap_or(u64::MAX), created_at))

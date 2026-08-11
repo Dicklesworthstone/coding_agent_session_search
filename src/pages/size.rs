@@ -4,8 +4,8 @@
 //! exporting/encrypting data that would exceed GitHub Pages limits.
 
 use anyhow::{Context, Result, bail};
-use frankensqlite::Row;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use crate::franken_sync::Row;
+use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -413,7 +413,7 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::Connection;
+    use crate::franken_sync::Connection;
 
     #[test]
     fn test_size_estimate_from_plaintext() {

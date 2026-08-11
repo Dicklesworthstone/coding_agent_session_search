@@ -30748,7 +30748,7 @@ mod tests {
         let conn = storage.raw();
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
@@ -30805,7 +30805,7 @@ mod tests {
         let conn = storage.raw();
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
@@ -30859,7 +30859,7 @@ not jsonl",
         let conn = storage.raw();
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'aider', 'Aider', 'local', 0, 0)").unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
@@ -31093,7 +31093,7 @@ not jsonl",
         let conn = storage.raw();
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
@@ -31155,7 +31155,7 @@ not jsonl",
         let conn = storage.raw();
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
@@ -31219,7 +31219,7 @@ not jsonl",
         let conn = storage.raw();
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'aider', 'Aider', 'local', 0, 0)").unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),

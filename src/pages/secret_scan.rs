@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt, params_from_iter};
-use frankensqlite::params;
+use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, params_from_iter};
+use crate::franken_sync::params;
 use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -485,7 +485,7 @@ pub fn scan_database<P: AsRef<Path>>(
     })
 }
 
-fn table_exists(conn: &frankensqlite::Connection, table_name: &str) -> bool {
+fn table_exists(conn: &crate::franken_sync::Connection, table_name: &str) -> bool {
     if !table_name
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')

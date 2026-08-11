@@ -3,8 +3,8 @@ use crate::search::query::SearchHit;
 use crate::storage::sqlite::FrankenStorage;
 use crate::ui::components::theme::ThemePalette;
 use anyhow::Result;
-use frankensqlite::compat::{ConnectionExt, RowExt};
-use frankensqlite::{FrankenError, Row};
+use crate::franken_sync::compat::{ConnectionExt, RowExt};
+use crate::franken_sync::{FrankenError, Row};
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -355,7 +355,7 @@ pub(crate) fn load_conversation_by_id_uncached(
          LEFT JOIN workspaces w ON c.workspace_id = w.id
          WHERE c.id = ?1
          LIMIT 1",
-        frankensqlite::params![conversation_id],
+        crate::franken_sync::params![conversation_id],
         ui_conversation_row_parts,
     )?;
     if let Some((convo_id, convo, workspace)) = rows.into_iter().next() {
@@ -395,7 +395,7 @@ pub(crate) fn load_conversation_uncached(
                  WHERE c.source_path = ?1 AND {normalized_source_sql} = ?2
                  ORDER BY c.started_at DESC LIMIT 1"
             ),
-            frankensqlite::params![source_path, normalize_ui_source_id_value(Some(source_id))],
+            crate::franken_sync::params![source_path, normalize_ui_source_id_value(Some(source_id))],
         )
     } else {
         (
@@ -411,7 +411,7 @@ pub(crate) fn load_conversation_uncached(
                  LIMIT 1",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             ),
-            frankensqlite::params![source_path],
+            crate::franken_sync::params![source_path],
         )
     };
     let rows = storage
@@ -457,7 +457,7 @@ fn cached_conversation_matches_lookup_head(
             format!(
                 "SELECT id, {normalized_source_sql} FROM conversations WHERE source_path = ?1 AND {normalized_source_sql} = ?2 ORDER BY started_at DESC LIMIT 1"
             ),
-            frankensqlite::params![source_path, normalize_ui_source_id_value(Some(source_id))],
+            crate::franken_sync::params![source_path, normalize_ui_source_id_value(Some(source_id))],
         )
     } else {
         (
@@ -465,7 +465,7 @@ fn cached_conversation_matches_lookup_head(
                 "SELECT id, {normalized_source_sql} FROM conversations WHERE source_path = ?1 ORDER BY CASE WHEN {normalized_source_sql} = '{local}' THEN 0 ELSE 1 END, started_at DESC LIMIT 1",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             ),
-            frankensqlite::params![source_path],
+            crate::franken_sync::params![source_path],
         )
     };
 
@@ -717,7 +717,7 @@ pub fn load_conversation_for_hit(
     );
     let rows = storage.raw().query_map_collect(
         &sql,
-        frankensqlite::params![
+        crate::franken_sync::params![
             fallback_hit.source_path.as_str(),
             normalize_ui_hit_source_id(&fallback_hit)
         ],
@@ -1397,7 +1397,7 @@ mod tests {
         }
 
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn_a.execute_with_params(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'db-a', 'DB A Session', ?1, 'local', 100)",
@@ -1452,7 +1452,7 @@ mod tests {
         )
         .expect("insert blank-id remote source");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn.execute_with_params(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, origin_host, started_at) VALUES (1, 1, 'remote-ext', 'Remote Session', ?1, '   ', 'user@laptop', 200)",
@@ -1496,7 +1496,7 @@ mod tests {
         )
         .expect("insert source");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn.execute_with_params(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Local Session', ?1, '  local  ', 200)",
@@ -1549,7 +1549,7 @@ mod tests {
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
             .expect("insert agent");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn.execute_with_params(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'old-ext', 'Old Session', ?1, 'local', 100)",
@@ -1569,7 +1569,7 @@ mod tests {
         assert_eq!(first.messages[0].content, "old body");
 
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn.execute_with_params(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'new-ext', 'New Session', ?1, 'local', 200)",
@@ -1613,7 +1613,7 @@ mod tests {
         )
         .expect("insert source");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn.execute_with_params(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Local Session', ?1, '  local  ', 100)",
@@ -1660,7 +1660,7 @@ mod tests {
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
             .expect("insert agent");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn.execute_with_params(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Cached Session', ?1, 'local', 100)",
@@ -1920,7 +1920,7 @@ mod tests {
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
             .expect("insert agent");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn.execute_with_params(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Cached Session', ?1, 'local', 100)",
@@ -1973,7 +1973,7 @@ mod tests {
         )
         .expect("insert source");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn.execute_with_params(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'remote-ext', 'Remote Session', ?1, 'work-laptop', 200)",
@@ -1993,7 +1993,7 @@ mod tests {
         assert_eq!(first.messages[0].content, "remote body");
 
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn.execute_with_params(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'local-ext', 'Local Session', ?1, 'local', 100)",

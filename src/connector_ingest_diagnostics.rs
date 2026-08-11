@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
-use frankensqlite::compat::{ConnectionExt, OpenFlags, open_with_flags};
+use crate::franken_sync::compat::{ConnectionExt, OpenFlags, open_with_flags};
 use serde::{Deserialize, Serialize};
 
 use crate::connectors::{DiscoveredSourceFile, NormalizedConversation, ScanContext};

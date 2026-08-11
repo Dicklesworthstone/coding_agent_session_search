@@ -4,9 +4,9 @@
 //! and tags. Uses a separate `SQLite` database file to avoid schema conflicts.
 
 use anyhow::{Context, Result};
-use frankensqlite::Connection;
-use frankensqlite::compat::{ConnectionExt, OptionalExtension, RowExt, TransactionExt};
-use frankensqlite::params;
+use crate::franken_sync::Connection;
+use crate::franken_sync::compat::{ConnectionExt, OptionalExtension, RowExt, TransactionExt};
+use crate::franken_sync::params;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -260,7 +260,7 @@ impl BookmarkStore {
         let count: i64 = self.conn.query_row_map(
             "SELECT COUNT(*) FROM bookmarks",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &crate::franken_sync::Row| row.get_typed(0),
         )?;
         usize::try_from(count).context("bookmark count is out of range")
     }
@@ -271,7 +271,7 @@ impl BookmarkStore {
         let exists: i64 = self.conn.query_row_map(
             "SELECT EXISTS(SELECT 1 FROM bookmarks WHERE source_path = ?1 AND line_number IS ?2)",
             params![source_path, line_number],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &crate::franken_sync::Row| row.get_typed(0),
         )?;
         Ok(exists != 0)
     }
@@ -295,7 +295,7 @@ impl BookmarkStore {
 
             // Check for duplicates
             let check_params = params![bookmark.source_path.as_str(), line_number];
-            let check_values = frankensqlite::compat::param_slice_to_values(check_params);
+            let check_values = crate::franken_sync::compat::param_slice_to_values(check_params);
             let exists_row = tx.query_with_params(
                 "SELECT EXISTS(SELECT 1 FROM bookmarks WHERE source_path = ?1 AND line_number IS ?2)",
                 &check_values,
@@ -303,13 +303,13 @@ impl BookmarkStore {
             let exists: i64 = exists_row
                 .first()
                 .ok_or_else(|| {
-                    frankensqlite::FrankenError::Internal(
+                    crate::franken_sync::FrankenError::Internal(
                         "bookmark schema-incompatible: duplicate probe returned no row".to_string(),
                     )
                 })?
                 .get_typed(0)
                 .map_err(|error| {
-                    frankensqlite::FrankenError::Internal(format!(
+                    crate::franken_sync::FrankenError::Internal(format!(
                         "bookmark schema-incompatible: duplicate probe decode failed: {error}"
                     ))
                 })?;
@@ -343,7 +343,7 @@ impl BookmarkStore {
 }
 
 /// Convert a database row to a Bookmark
-fn row_to_bookmark(row: &frankensqlite::Row) -> Result<Bookmark, frankensqlite::FrankenError> {
+fn row_to_bookmark(row: &crate::franken_sync::Row) -> Result<Bookmark, crate::franken_sync::FrankenError> {
     Ok(Bookmark {
         id: row.get_typed(0)?,
         title: row.get_typed(1)?,
@@ -393,11 +393,11 @@ fn line_number_to_db(line_number: Option<usize>) -> Result<Option<i64>> {
 
 fn line_number_from_db(
     line_number: Option<i64>,
-) -> Result<Option<usize>, frankensqlite::FrankenError> {
+) -> Result<Option<usize>, crate::franken_sync::FrankenError> {
     line_number
         .map(|number| {
             usize::try_from(number).map_err(|_| {
-                frankensqlite::FrankenError::Internal(format!(
+                crate::franken_sync::FrankenError::Internal(format!(
                     "bookmark schema-incompatible: line_number {number} is outside the supported non-negative range"
                 ))
             })

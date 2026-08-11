@@ -27,7 +27,7 @@ use crate::pages::summary::{
     ExclusionSet, PrePublishSummary, SummaryFilters, SummaryGenerator, format_size,
 };
 use crate::storage::sqlite::FrankenStorage;
-use frankensqlite::Connection;
+use crate::franken_sync::Connection;
 
 /// Deployment target for the export
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

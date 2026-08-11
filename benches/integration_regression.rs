@@ -25,7 +25,7 @@ use coding_agent_search::storage::sqlite::{
     ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankensqlite::FrankenError;
+use coding_agent_search::franken_sync::FrankenError;
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -584,7 +584,7 @@ where
 // =============================================================================
 
 fn bench_concurrent_writes(c: &mut Criterion) {
-    use frankensqlite::compat::TransactionExt;
+    use coding_agent_search::franken_sync::compat::TransactionExt;
 
     let mut group = c.benchmark_group("concurrent_writes");
     group.sample_size(10);
