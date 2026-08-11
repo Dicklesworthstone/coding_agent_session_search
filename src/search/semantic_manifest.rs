@@ -2421,7 +2421,7 @@ impl SemanticGenerationManifestV1 {
                     }
                 })?;
             let joined = generation_dir.join(relative);
-            reject_existing_path_links(&joined).map_err(|error| {
+            reject_existing_path_links(&generation_dir, &joined).map_err(|error| {
                 SemanticGenerationError::ArtifactIo {
                     role: artifact.role,
                     source: error.to_string(),
@@ -2690,7 +2690,7 @@ impl SemanticCurrentPointerV1 {
         let root = semantic_vector_root(data_dir);
         prepare_semantic_vector_root(data_dir, &root)?;
         let lock_path = root.join(SEMANTIC_CURRENT_POINTER_LOCK_FILENAME);
-        let lock_file = open_semantic_publish_lock(&lock_path)?;
+        let lock_file = open_semantic_publish_lock(&root, &lock_path)?;
         lock_file
             .lock_exclusive()
             .map_err(|error| SemanticGenerationError::PublishLockIo {
@@ -3279,9 +3279,14 @@ impl Drop for SemanticPublishLock {
     }
 }
 
-fn open_semantic_publish_lock(path: &Path) -> Result<fs::File, SemanticGenerationError> {
-    reject_existing_path_links(path).map_err(|error| SemanticGenerationError::PublishLockIo {
-        source: error.to_string(),
+fn open_semantic_publish_lock(
+    vector_root: &Path,
+    path: &Path,
+) -> Result<fs::File, SemanticGenerationError> {
+    reject_existing_path_links(vector_root, path).map_err(|error| {
+        SemanticGenerationError::PublishLockIo {
+            source: error.to_string(),
+        }
     })?;
     let file = OpenOptions::new()
         .read(true)
@@ -4055,12 +4060,12 @@ fn prepare_semantic_vector_root(
     data_dir: &Path,
     vector_root: &Path,
 ) -> Result<(), SemanticGenerationError> {
-    ensure_directory_chain_without_links(data_dir).map_err(|error| {
+    ensure_directory_chain_without_links(data_dir, data_dir).map_err(|error| {
         SemanticGenerationError::PointerIo {
             source: error.to_string(),
         }
     })?;
-    ensure_directory_chain_without_links(vector_root).map_err(|error| {
+    ensure_directory_chain_without_links(data_dir, vector_root).map_err(|error| {
         SemanticGenerationError::PointerIo {
             source: error.to_string(),
         }
@@ -4097,13 +4102,13 @@ fn prepare_generation_directory(
         .and_then(|name| name.to_str())
         .unwrap_or("[invalid]")
         .to_owned();
-    ensure_directory_chain_without_links(&generations_root).map_err(|error| {
+    ensure_directory_chain_without_links(data_dir, &generations_root).map_err(|error| {
         SemanticGenerationError::ManifestIo {
             generation_id: generation_id.clone(),
             source: error.to_string(),
         }
     })?;
-    ensure_directory_chain_without_links(generation_dir).map_err(|error| {
+    ensure_directory_chain_without_links(data_dir, generation_dir).map_err(|error| {
         SemanticGenerationError::ManifestIo {
             generation_id,
             source: error.to_string(),
@@ -4121,7 +4126,7 @@ fn validate_existing_generation_directory(
         .and_then(|name| name.to_str())
         .unwrap_or("[invalid]")
         .to_owned();
-    reject_existing_path_links(generation_dir).map_err(|error| {
+    reject_existing_path_links(data_dir, generation_dir).map_err(|error| {
         SemanticGenerationError::ManifestIo {
             generation_id: generation_id.clone(),
             source: error.to_string(),
@@ -4183,45 +4188,95 @@ fn reject_symlink_entry(path: &Path, label: &str) -> Result<(), SemanticGenerati
     }
 }
 
-fn ensure_directory_chain_without_links(path: &Path) -> std::io::Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                if metadata_is_link_or_reparse(&metadata) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "directory chain contains a symlink or reparse point",
-                    ));
-                }
-                if !metadata.is_dir() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotADirectory,
-                        "directory chain contains a non-directory component",
-                    ));
-                }
+/// Splits `path` into the trusted `base` prefix plus the (possibly empty)
+/// relative remainder of plain `Normal` components below it.
+///
+/// The link checks in this module anchor at `base` instead of walking from
+/// the filesystem root: components ABOVE the controlled root are not ours to
+/// police and cannot legally be link-free everywhere (macOS keeps every
+/// standard temp and data path under `/var` and `/tmp`, both of which are
+/// symlinks into `/private`). The controlled region — `base` itself and
+/// everything below it — is still fully link-checked.
+fn relative_below_base<'p>(base: &Path, path: &'p Path) -> std::io::Result<&'p Path> {
+    path.strip_prefix(base).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path escapes its trusted base directory",
+        )
+    })
+}
+
+fn verify_or_create_dir_component(current: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(current) {
+        Ok(metadata) => {
+            if metadata_is_link_or_reparse(&metadata) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "directory chain contains a symlink or reparse point",
+                ));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current)?;
-                let metadata = fs::symlink_metadata(&current)?;
-                if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "new directory component was replaced by an unsafe path entry",
-                    ));
-                }
+            if !metadata.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "directory chain contains a non-directory component",
+                ));
             }
-            Err(error) => return Err(error),
+            Ok(())
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(current)?;
+            let metadata = fs::symlink_metadata(current)?;
+            if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "new directory component was replaced by an unsafe path entry",
+                ));
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_directory_chain_without_links(base: &Path, path: &Path) -> std::io::Result<()> {
+    let relative = relative_below_base(base, path)?;
+    let mut current = base.to_path_buf();
+    verify_or_create_dir_component(&current)?;
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "directory chain contains a non-normal path component",
+            ));
+        };
+        current.push(part);
+        verify_or_create_dir_component(&current)?;
     }
     Ok(())
 }
 
-fn reject_existing_path_links(path: &Path) -> std::io::Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
+fn reject_existing_path_links(base: &Path, path: &Path) -> std::io::Result<()> {
+    let relative = relative_below_base(base, path)?;
+    let mut current = base.to_path_buf();
+    match fs::symlink_metadata(&current) {
+        Ok(metadata) if metadata_is_link_or_reparse(&metadata) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains a symlink or reparse point",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains a non-normal path component",
+            ));
+        };
+        current.push(part);
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata_is_link_or_reparse(&metadata) => {
                 return Err(std::io::Error::new(
