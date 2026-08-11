@@ -17,6 +17,41 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## [Unreleased]
 
+(nothing yet)
+
+## [v0.6.24] -- 2026-08-10
+
+**Everything in the 98 commits since v0.6.23: the post-v0.6.23 GitHub-issue
+triage wave documented below, plus the frankensqlite dependency re-pin that
+turns two of those entries from "pending" into shipped, doctor's
+corrupt-FTS5-shadow repair wiring, wall-clock budgets across index/search,
+and status/health truthfulness under repair. Field-validated the day of
+release on a production incident: a 9.3 GB corpus whose v0.6.23 binary
+busy-spun indefinitely on open now gets a bounded 30 s open refusal, an
+honest 27 ms `cass health` state report during rebuild, and a working
+set-aside + full-reindex recovery (sub-second search afterward).**
+
+### Changed (dependency re-pin and repair wiring, post-triage)
+
+- **frankensqlite is now pinned to git rev `2351c6c5`** (`12129e25`,
+  budgets/pin wave `f6cd6376`): the shipped binary now actually contains the
+  multi-leaf FTS5 segment writer for #369 and the deferred-FTS5-validation
+  open mode for #368 defect 3 -- both previously noted below as "pending a
+  dependency re-pin" -- plus the 2026-07-21 namespace-lifecycle durability
+  wave (`ReadOnlyExisting`).
+- **doctor can rebuild a structurally-corrupt FTS5 shadow that blocks its own
+  open** (#368 defect 3, `0ae97aaa`, e2e-covered `8cc94f78`), riding the
+  deferred-validation open above.
+- **Wall-clock budgets for index/search plus storage hardening**
+  (`f6cd6376`); **large-archive rebuild, search budget, and status freshness
+  fixes** (`fd78c5af`); **FSVI opened read-only with fail-closed two-tier
+  sync** (`ee8b585d`).
+- **Long connector scans tick activity via ScanContext progress-tick**
+  (#373 Variant A, `3523bf20`).
+- **Redaction memo-cache performance rounds** (`f5f4d7ba`, `e4a15698`,
+  `ec20b699`): prefilter-first bypass, O(log n) LRU, and a 64 KiB memo input
+  cap bounding cache memory.
+
 Post-v0.6.23 GitHub-issue triage: the second half of the
 [#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368)
 FTS5 corruption-opacity defects, three fresh v0.6.x reports, and the genuine
@@ -1795,7 +1830,8 @@ Initial development. Project scaffolding, architecture design, and first impleme
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.24...HEAD
+[v0.6.24]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.23...v0.6.24
 [v0.2.2]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.1...v0.2.2
 [v0.2.1]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.1.64...v0.2.0
