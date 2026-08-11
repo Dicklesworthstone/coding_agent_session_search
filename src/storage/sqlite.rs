@@ -8354,7 +8354,6 @@ impl FrankenStorage {
             .query_with_params_for_each(sql, &[] as &[SqliteValue], |row| {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let last_message_idx: Option<i64> = row.get_typed(1)?;
-                eprintln!("DBG raise row: conv={conversation_id} max_idx={last_message_idx:?}");
                 let Some(position) = positions_by_conversation.get(&conversation_id) else {
                     return Ok(());
                 };
@@ -8530,7 +8529,6 @@ impl FrankenStorage {
             .query_with_params_for_each(sql, &[] as &[SqliteValue], |row| {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let last_message_idx: Option<i64> = row.get_typed(1)?;
-                eprintln!("DBG raise row: conv={conversation_id} max_idx={last_message_idx:?}");
                 let Some(position) = missing_tail_positions.get(&conversation_id) else {
                     return Ok(());
                 };
