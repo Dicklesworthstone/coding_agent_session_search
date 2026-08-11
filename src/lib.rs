@@ -29,6 +29,7 @@ pub mod fleet_platform_compat;
 pub mod fleet_probe;
 pub mod fleet_upgrade_rehearsal;
 pub mod fleet_version_skew;
+pub mod franken_sync;
 pub mod ftui_harness;
 pub mod guide_planner;
 pub mod guide_runner;
@@ -77,7 +78,7 @@ use anyhow::Result;
 use base64::prelude::*;
 use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
-use frankensqlite::compat::{
+use crate::franken_sync::compat::{
     ConnectionExt, OpenFlags as FrankenOpenFlags, RowExt,
     open_with_flags as open_franken_with_flags,
 };
@@ -188,11 +189,11 @@ fn with_frankensqlite_connection<T, F>(
     db_path: &Path,
     context: &str,
     op: F,
-) -> std::result::Result<T, frankensqlite::FrankenError>
+) -> std::result::Result<T, crate::franken_sync::FrankenError>
 where
-    F: FnOnce(&frankensqlite::Connection) -> std::result::Result<T, frankensqlite::FrankenError>,
+    F: FnOnce(&crate::franken_sync::Connection) -> std::result::Result<T, crate::franken_sync::FrankenError>,
 {
-    let mut conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+    let mut conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
     let result = op(&conn);
     let close_result = conn.close_in_place();
     match (result, close_result) {
@@ -16628,10 +16629,10 @@ fn analytics_build_filters(common: &AnalyticsCommon) -> Vec<String> {
 }
 
 fn resolve_analytics_workspace_ids(
-    conn: &frankensqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     workspace_paths: &[String],
 ) -> CliResult<Vec<i64>> {
-    use frankensqlite::compat::{ParamValue, RowExt};
+    use crate::franken_sync::compat::{ParamValue, RowExt};
 
     let requested_paths: Vec<String> = workspace_paths
         .iter()
@@ -16654,7 +16655,7 @@ fn resolve_analytics_workspace_ids(
             .query_map_collect(
                 "SELECT id FROM workspaces WHERE path = ?1",
                 &[ParamValue::from(workspace.as_str())],
-                |row: &frankensqlite::Row| row.get_typed(0),
+                |row: &crate::franken_sync::Row| row.get_typed(0),
             )
             .map_err(|e| CliError {
                 code: 9,
@@ -16674,7 +16675,7 @@ fn resolve_analytics_workspace_ids(
 }
 
 fn analytics_query_filter(
-    conn: &frankensqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     common: &AnalyticsCommon,
 ) -> CliResult<analytics::AnalyticsFilter> {
     let mut filter = analytics::AnalyticsFilter::from(common);
@@ -16686,7 +16687,7 @@ fn analytics_query_filter(
 fn open_franken_analytics_db(
     data_dir: &Option<PathBuf>,
     db_path_override: Option<&PathBuf>,
-) -> CliResult<frankensqlite::Connection> {
+) -> CliResult<crate::franken_sync::Connection> {
     open_franken_cli_read_db(
         analytics_db_path(data_dir, db_path_override),
         "analytics",
@@ -16705,7 +16706,7 @@ fn open_franken_cli_read_db(
     path: PathBuf,
     reason: &str,
     busy_timeout: Duration,
-) -> CliResult<frankensqlite::Connection> {
+) -> CliResult<crate::franken_sync::Connection> {
     if !path.exists() {
         return Err(CliError {
             code: 3,
@@ -16766,7 +16767,7 @@ fn open_franken_cli_read_db_with_hard_timeout(
     path: PathBuf,
     reason: &str,
     timeout: Duration,
-) -> CliResult<frankensqlite::Connection> {
+) -> CliResult<crate::franken_sync::Connection> {
     let display_path = path.display().to_string();
     let reason = reason.to_string();
     if let Some(err) = sqlite_header_preflight_error(&path, &display_path, &reason) {
@@ -16833,7 +16834,7 @@ fn receive_franken_cli_read_db_open_result_with_hard_timeout(
     display_path: String,
     reason: String,
     timeout: Duration,
-) -> CliResult<frankensqlite::Connection> {
+) -> CliResult<crate::franken_sync::Connection> {
     match rx.recv_timeout(timeout) {
         Ok(Ok(conn)) => Ok(conn.into_parts().0),
         Ok(Err(err)) => Err(err),
@@ -16860,7 +16861,7 @@ fn receive_franken_cli_read_db_open_result_with_hard_timeout(
 }
 
 fn close_franken_cli_read_db(
-    mut conn: frankensqlite::Connection,
+    mut conn: crate::franken_sync::Connection,
     path: &Path,
     reason: &str,
 ) -> CliResult<()> {
@@ -16887,7 +16888,7 @@ fn fts_messages_integrity_cli_error(surface: &str, err: anyhow::Error) -> CliErr
 }
 
 fn validate_fts_messages_integrity_for_cli(
-    conn: &frankensqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     surface: &str,
 ) -> CliResult<()> {
     crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
@@ -16895,13 +16896,13 @@ fn validate_fts_messages_integrity_for_cli(
 }
 
 fn franken_query_row_map_retry<T, F>(
-    conn: &frankensqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     sql: &str,
-    params: &[frankensqlite::compat::ParamValue],
+    params: &[crate::franken_sync::compat::ParamValue],
     map: F,
-) -> Result<T, frankensqlite::FrankenError>
+) -> Result<T, crate::franken_sync::FrankenError>
 where
-    F: Copy + Fn(&frankensqlite::Row) -> Result<T, frankensqlite::FrankenError>,
+    F: Copy + Fn(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
 {
     let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
     let mut backoff = Duration::from_millis(4);
@@ -16926,13 +16927,13 @@ where
 }
 
 fn franken_query_map_collect_retry<T, F>(
-    conn: &frankensqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     sql: &str,
-    params: &[frankensqlite::compat::ParamValue],
+    params: &[crate::franken_sync::compat::ParamValue],
     map: F,
-) -> Result<Vec<T>, frankensqlite::FrankenError>
+) -> Result<Vec<T>, crate::franken_sync::FrankenError>
 where
-    F: Copy + Fn(&frankensqlite::Row) -> Result<T, frankensqlite::FrankenError>,
+    F: Copy + Fn(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
 {
     let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
     let mut backoff = Duration::from_millis(4);
@@ -16961,7 +16962,7 @@ fn fresh_franken_count_retry(
     reason: &str,
     busy_timeout: Duration,
     sql: &str,
-    params: &[frankensqlite::compat::ParamValue],
+    params: &[crate::franken_sync::compat::ParamValue],
 ) -> Option<i64> {
     let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
     let mut backoff = Duration::from_millis(4);
@@ -17874,8 +17875,8 @@ fn probe_state_db_modes(
         }
     };
 
-    use frankensqlite::compat::RowExt;
-    use frankensqlite::params;
+    use crate::franken_sync::compat::RowExt;
+    use crate::franken_sync::params;
 
     snapshot.opened = true;
     snapshot.last_indexed_at = franken_query_row_map_retry(
@@ -20149,7 +20150,7 @@ fn prepare_headless_once_tui_artifacts(
     let db_path = data_dir.join("agent_search.db");
     {
         let _conn =
-            frankensqlite::Connection::open(db_path.to_string_lossy().as_ref()).map_err(|e| {
+            crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref()).map_err(|e| {
                 anyhow::anyhow!(
                     "initialize SQLite database for headless --once at {}: {e}",
                     db_path.display()
@@ -29523,7 +29524,7 @@ fn stats_workspace_count_sql(source_where: &str) -> String {
 
 fn append_source_filter_condition(
     sql: &mut String,
-    params: &mut Vec<frankensqlite::compat::ParamValue>,
+    params: &mut Vec<crate::franken_sync::compat::ParamValue>,
     source_filter: &crate::sources::provenance::SourceFilter,
 ) {
     append_source_filter_condition_with_columns(
@@ -29537,7 +29538,7 @@ fn append_source_filter_condition(
 
 fn append_source_filter_condition_with_columns(
     sql: &mut String,
-    params: &mut Vec<frankensqlite::compat::ParamValue>,
+    params: &mut Vec<crate::franken_sync::compat::ParamValue>,
     source_filter: &crate::sources::provenance::SourceFilter,
     source_id_sql: &str,
     origin_host_sql: &str,
@@ -29580,7 +29581,7 @@ fn run_stats(
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
 
-    use frankensqlite::compat::{ParamValue, RowExt};
+    use crate::franken_sync::compat::{ParamValue, RowExt};
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -30342,8 +30343,8 @@ fn run_diag(
     quarantine: bool,
     verbose: bool,
 ) -> CliResult<()> {
-    use frankensqlite::compat::RowExt;
-    use frankensqlite::params;
+    use crate::franken_sync::compat::RowExt;
+    use crate::franken_sync::params;
     use std::fs;
 
     let version = env!("CARGO_PKG_VERSION");
@@ -31208,14 +31209,14 @@ fn doctor_anomaly_taxonomy_report() -> Vec<DoctorAnomalyTaxonomyEntry> {
 }
 
 fn doctor_database_integrity_probe(
-    conn: &frankensqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     set_phase: impl Fn(&'static str),
 ) -> Result<DoctorDatabaseIntegrityProbe, String> {
-    use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
+    use crate::franken_sync::compat::{ConnectionExt as _, RowExt as _};
 
     set_phase("quick_check");
     let quick_check_status: String = conn
-        .query_row_map("PRAGMA quick_check(1)", &[], |row: &frankensqlite::Row| {
+        .query_row_map("PRAGMA quick_check(1)", &[], |row: &crate::franken_sync::Row| {
             row.get_typed(0)
         })
         .map_err(|err| format!("running PRAGMA quick_check(1): {err}"))?;
@@ -38286,14 +38287,14 @@ fn doctor_source_inventory_stable_id(
     )
 }
 
-fn doctor_table_columns(conn: &frankensqlite::Connection, table: &str) -> HashSet<String> {
+fn doctor_table_columns(conn: &crate::franken_sync::Connection, table: &str) -> HashSet<String> {
     if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return HashSet::new();
     }
     conn.query_map_collect(
         &format!("PRAGMA table_info({table})"),
         &[],
-        |row: &frankensqlite::Row| row.get_typed::<String>(1),
+        |row: &crate::franken_sync::Row| row.get_typed::<String>(1),
     )
     .unwrap_or_default()
     .into_iter()
@@ -38301,9 +38302,9 @@ fn doctor_table_columns(conn: &frankensqlite::Connection, table: &str) -> HashSe
 }
 
 fn query_doctor_source_inventory_db_rows(
-    conn: &frankensqlite::Connection,
-) -> std::result::Result<Vec<DoctorSourceInventoryDbRow>, frankensqlite::FrankenError> {
-    use frankensqlite::compat::ConnectionExt as _;
+    conn: &crate::franken_sync::Connection,
+) -> std::result::Result<Vec<DoctorSourceInventoryDbRow>, crate::franken_sync::FrankenError> {
+    use crate::franken_sync::compat::ConnectionExt as _;
 
     let conversation_columns = doctor_table_columns(conn, "conversations");
     if conversation_columns.is_empty() {
@@ -38363,7 +38364,7 @@ fn query_doctor_source_inventory_db_rows(
          FROM conversations c{agent_join}{source_join}"
     );
 
-    conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
+    conn.query_map_collect(&sql, &[], |row: &crate::franken_sync::Row| {
         let count: i64 = row.get_typed(5)?;
         Ok(DoctorSourceInventoryDbRow {
             provider: row.get_typed(0)?,
@@ -41793,9 +41794,9 @@ pub(crate) fn run_doctor_archive_normalize_impl(
 }
 
 fn query_doctor_raw_mirror_backfill_candidates(
-    conn: &frankensqlite::Connection,
-) -> std::result::Result<Vec<DoctorRawMirrorBackfillCandidate>, frankensqlite::FrankenError> {
-    use frankensqlite::compat::ConnectionExt as _;
+    conn: &crate::franken_sync::Connection,
+) -> std::result::Result<Vec<DoctorRawMirrorBackfillCandidate>, crate::franken_sync::FrankenError> {
+    use crate::franken_sync::compat::ConnectionExt as _;
 
     let conversation_columns = doctor_table_columns(conn, "conversations");
     if !conversation_columns.contains("id") {
@@ -41867,7 +41868,7 @@ fn query_doctor_raw_mirror_backfill_candidates(
          ORDER BY c.id"
     );
 
-    let mut candidates = conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
+    let mut candidates = conn.query_map_collect(&sql, &[], |row: &crate::franken_sync::Row| {
         let message_count: i64 = row.get_typed(7)?;
         Ok(DoctorRawMirrorBackfillCandidate {
             conversation_id: row.get_typed(0)?,
@@ -41891,7 +41892,7 @@ fn query_doctor_raw_mirror_backfill_candidates(
             .query_map_collect(
                 "PRAGMA index_list(messages)",
                 &[],
-                |row: &frankensqlite::Row| row.get_typed::<String>(1),
+                |row: &crate::franken_sync::Row| row.get_typed::<String>(1),
             )
             .unwrap_or_default()
             .into_iter()
@@ -41910,7 +41911,7 @@ fn query_doctor_raw_mirror_backfill_candidates(
         };
         conn.query_with_params_for_each(
             message_scan_sql,
-            &[] as &[frankensqlite::SqliteValue],
+            &[] as &[crate::franken_sync::SqliteValue],
             |row| {
                 let conversation_id: i64 = row.get_typed(0)?;
                 if let Some(position) = candidate_positions.get(&conversation_id) {
@@ -44047,7 +44048,7 @@ fn doctor_candidate_copy_to_staging(
     })
 }
 
-fn doctor_candidate_table_count(conn: &frankensqlite::Connection, table: &str) -> Option<usize> {
+fn doctor_candidate_table_count(conn: &crate::franken_sync::Connection, table: &str) -> Option<usize> {
     let table = match table {
         "conversations" | "messages" => table,
         _ => return None,
@@ -44056,7 +44057,7 @@ fn doctor_candidate_table_count(conn: &frankensqlite::Connection, table: &str) -
         conn.query_row_map(
             &format!("SELECT COUNT(*) FROM {table}"),
             &[],
-            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+            |row: &crate::franken_sync::Row| row.get_typed::<i64>(0),
         )
         .ok()
         .map(|count| count.max(0) as usize)
@@ -44069,7 +44070,7 @@ fn doctor_candidate_probe_frankensqlite(
     candidate_db_path: &Path,
     candidate_id: &str,
 ) -> Result<(Option<usize>, Option<usize>), String> {
-    let conn = frankensqlite::Connection::open(candidate_db_path.to_string_lossy().as_ref())
+    let conn = crate::franken_sync::Connection::open(candidate_db_path.to_string_lossy().as_ref())
         .map_err(|err| {
             format!(
                 "failed to open candidate archive DB with frankensqlite at {}: {err}",
@@ -44105,7 +44106,7 @@ fn doctor_candidate_probe_frankensqlite(
         "INSERT OR REPLACE INTO cass_doctor_candidate_metadata
          (candidate_id, created_at_ms, schema_version)
          VALUES (?1, ?2, ?3)",
-        frankensqlite::params![
+        crate::franken_sync::params![
             candidate_id,
             doctor_now_ms(),
             DOCTOR_CANDIDATE_SCHEMA_VERSION as i64
@@ -44172,16 +44173,16 @@ fn doctor_candidate_live_archive_copy_probe(
             db_path.display()
         )
     })?;
-    let result: std::result::Result<(Option<usize>, Option<usize>), frankensqlite::FrankenError> =
+    let result: std::result::Result<(Option<usize>, Option<usize>), crate::franken_sync::FrankenError> =
         (|| {
             let conversations =
                 doctor_candidate_table_count(&conn, "conversations").ok_or_else(|| {
-                    frankensqlite::FrankenError::Internal(
+                    crate::franken_sync::FrankenError::Internal(
                         "live archive DB has no readable conversations table".to_string(),
                     )
                 })?;
             let messages = doctor_candidate_table_count(&conn, "messages").ok_or_else(|| {
-                frankensqlite::FrankenError::Internal(
+                crate::franken_sync::FrankenError::Internal(
                     "live archive DB has no readable messages table".to_string(),
                 )
             })?;
@@ -56128,7 +56129,7 @@ fn run_doctor_archive_db_post_repair_probe(
     data_dir: &Path,
     db_path: &Path,
 ) -> DoctorPostRepairProbeReport {
-    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
     let probe_id = "archive-db-rollback-write-read";
     let target = DoctorPostRepairProbeTarget {
@@ -56260,7 +56261,7 @@ fn run_doctor_archive_db_post_repair_probe(
     let insert_sql = format!("INSERT INTO {table_name} (probe_id, value) VALUES (?1, ?2)");
     if let Err(err) = conn.execute_compat(
         &insert_sql,
-        frankensqlite::params![probe_id, sentinel_value.as_str()],
+        crate::franken_sync::params![probe_id, sentinel_value.as_str()],
     ) {
         let _ = conn.execute("ROLLBACK;");
         return doctor_post_repair_probe_report(
@@ -56283,8 +56284,8 @@ fn run_doctor_archive_db_post_repair_probe(
     let select_sql = format!("SELECT value FROM {table_name} WHERE probe_id = ?1");
     let mut read_back = match conn.query_row_map(
         &select_sql,
-        frankensqlite::params![probe_id],
-        |row: &frankensqlite::Row| row.get_typed::<String>(0),
+        crate::franken_sync::params![probe_id],
+        |row: &crate::franken_sync::Row| row.get_typed::<String>(0),
     ) {
         Ok(value) => {
             steps.push("read_probe_sentinel".to_string());
@@ -56390,8 +56391,8 @@ fn run_doctor_archive_db_post_repair_probe(
     let durable_table_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            frankensqlite::params![table_name.as_str()],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            crate::franken_sync::params![table_name.as_str()],
+            |row: &crate::franken_sync::Row| row.get_typed(0),
         )
         .unwrap_or(1);
     let _ = close_franken_cli_read_db(conn, db_path, "doctor post-repair probe");
@@ -61711,8 +61712,8 @@ mod doctor_asset_taxonomy_tests {
         let durable_probe_tables: i64 = conn
             .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'cass_doctor_probe_%'",
-                frankensqlite::params![],
-                |row: &frankensqlite::Row| row.get_typed(0),
+                crate::franken_sync::params![],
+                |row: &crate::franken_sync::Row| row.get_typed(0),
             )
             .expect("count probe tables");
         let _ = close_franken_cli_read_db(conn, &db_path, "post-repair probe test");
@@ -65835,7 +65836,7 @@ mod doctor_asset_taxonomy_tests {
     }
 
     fn seed_candidate_source_db(db_path: &Path) {
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())
             .expect("open source db");
         conn.execute("PRAGMA journal_mode = WAL;")
             .expect("set wal mode");
@@ -67913,13 +67914,13 @@ paths = ["~/.claude/projects"]
 
     #[test]
     fn doctor_inventory_queries_stream_metadata_and_count_messages_in_one_narrow_pass() {
-        use frankensqlite::compat::ConnectionExt as _;
+        use crate::franken_sync::compat::ConnectionExt as _;
 
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("doctor-inventory-streaming.db");
         let source_path = temp.path().join("session.jsonl");
         std::fs::write(&source_path, b"{}\n").expect("write source fixture");
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())
             .expect("open fixture database");
         conn.execute_batch(&format!(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -67992,7 +67993,7 @@ paths = ["~/.claude/projects"]
                  LEFT JOIN agents a ON c.agent_id = a.id
                  LEFT JOIN sources s ON c.source_id = s.id",
                 &[],
-                |row: &frankensqlite::Row| row.get_typed(3),
+                |row: &crate::franken_sync::Row| row.get_typed(3),
             )
             .expect("explain source inventory metadata scan");
         assert!(
@@ -68007,7 +68008,7 @@ paths = ["~/.claude/projects"]
                  SELECT conversation_id
                  FROM messages INDEXED BY sqlite_autoindex_messages_1",
                 &[],
-                |row: &frankensqlite::Row| row.get_typed(3),
+                |row: &crate::franken_sync::Row| row.get_typed(3),
             )
             .expect("explain narrow message scan");
         // FrankenSQLite currently renders a full covering-index walk as the
@@ -68032,7 +68033,7 @@ paths = ["~/.claude/projects"]
     fn doctor_raw_mirror_message_count_falls_back_to_one_streaming_legacy_table_scan() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db_path = temp.path().join("doctor-inventory-legacy.db");
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())
             .expect("open legacy fixture database");
         conn.execute_batch(
             "CREATE TABLE conversations (
@@ -75214,7 +75215,7 @@ enum DoctorFtsTableState {
     },
 }
 
-fn probe_doctor_fts_table(conn: &frankensqlite::Connection) -> DoctorFtsTableState {
+fn probe_doctor_fts_table(conn: &crate::franken_sync::Connection) -> DoctorFtsTableState {
     if let Err(frankensqlite_error) = conn.query("SELECT rowid FROM fts_messages LIMIT 1;") {
         return DoctorFtsTableState::Missing {
             frankensqlite_error: frankensqlite_error.to_string(),
@@ -75227,7 +75228,7 @@ fn probe_doctor_fts_table(conn: &frankensqlite::Connection) -> DoctorFtsTableSta
     // the repair path. A docsize count failure is itself a corruption signal.
     let indexed_messages = match conn.query_row_map(
         "SELECT COUNT(*) FROM fts_messages_docsize",
-        &[] as &[frankensqlite::compat::ParamValue],
+        &[] as &[crate::franken_sync::compat::ParamValue],
         |row| row.get_typed::<i64>(0),
     ) {
         Ok(count) => count,
@@ -75239,7 +75240,7 @@ fn probe_doctor_fts_table(conn: &frankensqlite::Connection) -> DoctorFtsTableSta
     };
     let Ok(indexable_messages) = conn.query_row_map(
         crate::storage::sqlite::FTS_INDEXABLE_MESSAGE_COUNT_SQL,
-        &[] as &[frankensqlite::compat::ParamValue],
+        &[] as &[crate::franken_sync::compat::ParamValue],
         |row| row.get_typed::<i64>(0),
     ) else {
         return DoctorFtsTableState::QueryableViaFrankensqlite;
@@ -75258,8 +75259,8 @@ mod doctor_fts_tests {
     use super::*;
 
     fn create_search_schema(
-        conn: &frankensqlite::Connection,
-    ) -> Result<(), frankensqlite::FrankenError> {
+        conn: &crate::franken_sync::Connection,
+    ) -> Result<(), crate::franken_sync::FrankenError> {
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
              CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
@@ -75288,7 +75289,7 @@ mod doctor_fts_tests {
         let temp_dir = tempfile::TempDir::new()?;
         let db_path = temp_dir.path().join("legacy-fts.db");
 
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
         create_search_schema(&conn)?;
         conn.execute_batch(
             "CREATE VIRTUAL TABLE fts_messages USING fts5(
@@ -75324,7 +75325,7 @@ mod doctor_fts_tests {
         let temp_dir = tempfile::TempDir::new()?;
         let db_path = temp_dir.path().join("missing-fts.db");
 
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
         create_search_schema(&conn)?;
         let state = probe_doctor_fts_table(&conn);
         assert!(
@@ -75344,7 +75345,7 @@ mod doctor_fts_tests {
         let temp_dir = tempfile::TempDir::new()?;
         let db_path = temp_dir.path().join("partial-fts.db");
 
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
         conn.execute_batch(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
@@ -75407,7 +75408,7 @@ mod doctor_fts_tests {
         let temp_dir = tempfile::TempDir::new()?;
         let db_path = temp_dir.path().join("corrupt-shadow-fts.db");
 
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
         // A plain table satisfies the queryability probe while having no
         // docsize shadow behind it — the same observable shape as a shadow
         // whose structure record is corrupt.
@@ -77881,7 +77882,7 @@ fn doctor_deferred_integrity_never_implies_corruption_or_destructive_rebuild() {
 /// worker until process exit; process isolation or an upstream FrankenSQLite
 /// cancellation handle is required to remove that residual limitation.
 fn run_bounded_doctor_archive_db_probe(
-    conn: frankensqlite::Connection,
+    conn: crate::franken_sync::Connection,
     db_path: &Path,
     timeout: Duration,
 ) -> DoctorBoundedArchiveDbProbeOutcome {
@@ -77892,7 +77893,7 @@ fn run_bounded_doctor_archive_db_probe(
     let deep_integrity_skip_reason = doctor_franken_deep_integrity_skip_reason(db_path);
     let conn = crate::storage::sqlite::SendFrankenConnection::new(conn);
     let _probe_worker = std::thread::spawn(move || {
-        use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
+        use crate::franken_sync::compat::{ConnectionExt as _, RowExt as _};
 
         let set_phase = |value: &'static str| {
             if let Ok(mut current) = worker_phase.lock() {
@@ -77904,7 +77905,7 @@ fn run_bounded_doctor_archive_db_probe(
             .query_row_map(
                 "SELECT COUNT(*) FROM conversations",
                 &[],
-                |r: &frankensqlite::Row| r.get_typed(0),
+                |r: &crate::franken_sync::Row| r.get_typed(0),
             )
             .ok();
         set_phase("row_count_messages");
@@ -77912,7 +77913,7 @@ fn run_bounded_doctor_archive_db_probe(
             .query_row_map(
                 "SELECT COUNT(*) FROM messages",
                 &[],
-                |r: &frankensqlite::Row| r.get_typed(0),
+                |r: &crate::franken_sync::Row| r.get_typed(0),
             )
             .ok();
         let mut integrity = None;
@@ -79889,27 +79890,27 @@ pub(crate) fn run_doctor_impl(
                         Duration::from_secs(30),
                     ) {
                         Ok(conn) => {
-                            use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
+                            use crate::franken_sync::compat::{ConnectionExt as _, RowExt as _};
 
                             let conv_count: Option<i64> = conn
                                 .query_row_map(
                                     "SELECT COUNT(*) FROM conversations",
                                     &[],
-                                    |r: &frankensqlite::Row| r.get_typed(0),
+                                    |r: &crate::franken_sync::Row| r.get_typed(0),
                                 )
                                 .ok();
                             let msg_count: Option<i64> = conn
                                 .query_row_map(
                                     "SELECT COUNT(*) FROM messages",
                                     &[],
-                                    |r: &frankensqlite::Row| r.get_typed(0),
+                                    |r: &crate::franken_sync::Row| r.get_typed(0),
                                 )
                                 .ok();
                             let quick_check_status: Option<String> = conn
                                 .query_row_map(
                                     "PRAGMA quick_check(1)",
                                     &[],
-                                    |r: &frankensqlite::Row| r.get_typed(0),
+                                    |r: &crate::franken_sync::Row| r.get_typed(0),
                                 )
                                 .ok();
 
@@ -81280,7 +81281,7 @@ fn run_sessions(
     db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
     let target_workspace = match (workspace, current) {
@@ -81366,7 +81367,7 @@ fn run_sessions(
         Option<i64>,
         Option<i64>,
     )> = conn
-        .query_map_collect(&sessions_sql, params, |row: &frankensqlite::Row| {
+        .query_map_collect(&sessions_sql, params, |row: &crate::franken_sync::Row| {
             Ok((
                 row.get_typed(0)?,
                 row.get_typed(1)?,
@@ -81491,13 +81492,13 @@ fn run_sessions(
     // range scan on messages(conversation_id, idx) and the roles are
     // tallied in Rust — cost scales with the returned page, not the corpus.
     let count_session_messages =
-        |conversation_id: i64| -> Result<(i64, i64), frankensqlite::FrankenError> {
+        |conversation_id: i64| -> Result<(i64, i64), crate::franken_sync::FrankenError> {
             let roles: Vec<String> = conn.query_map_collect(
                 "SELECT role
                  FROM messages INDEXED BY sqlite_autoindex_messages_1
                  WHERE conversation_id = ?1",
                 &[ParamValue::from(conversation_id)],
-                |row: &frankensqlite::Row| row.get_typed::<String>(0),
+                |row: &crate::franken_sync::Row| row.get_typed::<String>(0),
             )?;
             let message_count = roles.len() as i64;
             let human_turns = roles.iter().filter(|role| role.as_str() == "user").count() as i64;
@@ -81596,7 +81597,7 @@ fn run_sessions(
 /// "same agent" should skip that filter when agent_id is None.
 #[allow(clippy::type_complexity)]
 fn find_context_source_conversation(
-    conn: &frankensqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     path_str: &str,
     source_id: Option<&str>,
 ) -> Option<(
@@ -81608,7 +81609,7 @@ fn find_context_source_conversation(
     String,
     String,
 )> {
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 
     let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
     let source_id = canonical_followup_source_id(source_id);
@@ -81628,7 +81629,7 @@ fn find_context_source_conversation(
             .query_row_map(
                 &query,
                 &[ParamValue::from(path_str), ParamValue::from(source_id)],
-                |r: &frankensqlite::Row| {
+                |r: &crate::franken_sync::Row| {
                     Ok((
                         r.get_typed(0)?,
                         r.get_typed(1)?,
@@ -81655,7 +81656,7 @@ fn find_context_source_conversation(
     conn.query_row_map(
         &query,
         &[ParamValue::from(path_str)],
-        |r: &frankensqlite::Row| {
+        |r: &crate::franken_sync::Row| {
             Ok((
                 r.get_typed(0)?,
                 r.get_typed(1)?,
@@ -81678,7 +81679,7 @@ fn run_context(
     output_format: Option<RobotFormat>,
     limit: usize,
 ) -> CliResult<()> {
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
 
@@ -81713,7 +81714,7 @@ fn run_context(
         conn.query_row_map(
             "SELECT path FROM workspaces WHERE id = ?",
             &[ParamValue::from(ws_id)],
-            |r: &frankensqlite::Row| r.get_typed(0),
+            |r: &crate::franken_sync::Row| r.get_typed(0),
         )
         .ok()
     });
@@ -81739,7 +81740,7 @@ fn run_context(
                 ParamValue::from(conv_id),
                 ParamValue::from(limit as i64),
             ],
-            |r: &frankensqlite::Row| {
+            |r: &crate::franken_sync::Row| {
                 Ok((
                     r.get_typed(0)?,
                     r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
@@ -81775,7 +81776,7 @@ fn run_context(
                 ParamValue::from(conv_id),
                 ParamValue::from(limit as i64),
             ],
-            |r: &frankensqlite::Row| {
+            |r: &crate::franken_sync::Row| {
                 Ok((
                     r.get_typed(0)?,
                     r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
@@ -81808,7 +81809,7 @@ fn run_context(
                 ParamValue::from(conv_id),
                 ParamValue::from(limit as i64),
             ],
-            |r: &frankensqlite::Row| {
+            |r: &crate::franken_sync::Row| {
                 Ok((
                     r.get_typed(0)?,
                     r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
@@ -92229,7 +92230,7 @@ fn run_index_with_data(
     no_progress_events: bool,
     robot_trace_ingest: bool,
 ) -> CliResult<()> {
-    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use crate::franken_sync::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
@@ -92282,7 +92283,7 @@ fn run_index_with_data(
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 if let Err(e) = conn.execute_compat(
                     "DELETE FROM idempotency_keys WHERE expires_at < ?1",
-                    frankensqlite::params![now_ms],
+                    crate::franken_sync::params![now_ms],
                 ) {
                     tracing::warn!("Failed to clean expired idempotency keys: {e}");
                 }
@@ -92290,8 +92291,8 @@ fn run_index_with_data(
                 let cached: Option<(String, String)> = conn
                     .query_row_map(
                         "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
-                        frankensqlite::params![key.as_str(), now_ms],
-                        |r: &frankensqlite::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
+                        crate::franken_sync::params![key.as_str(), now_ms],
+                        |r: &crate::franken_sync::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
                     )
                     .ok();
                 Ok(cached)
@@ -92980,7 +92981,7 @@ fn run_index_with_data(
                     let hash_str = params_hash.to_string();
                     conn.execute_compat(
                         "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        frankensqlite::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
+                        crate::franken_sync::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
                     )?;
                     Ok(())
                 },
@@ -96780,7 +96781,7 @@ mod export_timestamp_tests {
 mod legacy_source_filter_tests {
     use super::*;
     use crate::sources::provenance::SourceFilter;
-    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use crate::franken_sync::compat::{ConnectionExt, RowExt};
     use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -96867,8 +96868,8 @@ mod legacy_source_filter_tests {
         (tmp, db_path, shared_path)
     }
 
-    fn open_legacy_local_db_for_update(db_path: &Path) -> frankensqlite::Connection {
-        frankensqlite::Connection::open(db_path.to_string_lossy().to_string())
+    fn open_legacy_local_db_for_update(db_path: &Path) -> crate::franken_sync::Connection {
+        crate::franken_sync::Connection::open(db_path.to_string_lossy().to_string())
             .expect("open writable legacy source test db")
     }
 
@@ -96948,7 +96949,7 @@ mod legacy_source_filter_tests {
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let params_vec = vec![param.expect("source id param").into()];
         let count: i64 = conn
-            .query_row_map(&sql, &params_vec, |r: &frankensqlite::Row| r.get_typed(0))
+            .query_row_map(&sql, &params_vec, |r: &crate::franken_sync::Row| r.get_typed(0))
             .expect("count blank remote source rows");
         assert_eq!(count, 1);
 
@@ -96956,7 +96957,7 @@ mod legacy_source_filter_tests {
         assert!(param.is_none());
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let count: i64 = conn
-            .query_row_map(&sql, &[], |r: &frankensqlite::Row| r.get_typed(0))
+            .query_row_map(&sql, &[], |r: &crate::franken_sync::Row| r.get_typed(0))
             .expect("count remote source rows");
         assert_eq!(count, 1);
 
@@ -96975,7 +96976,7 @@ mod legacy_source_filter_tests {
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let params_vec = vec![param.expect("source id param").into()];
         let count: i64 = conn
-            .query_row_map(&sql, &params_vec, |r: &frankensqlite::Row| r.get_typed(0))
+            .query_row_map(&sql, &params_vec, |r: &crate::franken_sync::Row| r.get_typed(0))
             .expect("count trimmed local source rows");
         assert_eq!(count, 1);
 
@@ -96983,7 +96984,7 @@ mod legacy_source_filter_tests {
         assert!(param.is_none());
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let count: i64 = conn
-            .query_row_map(&sql, &[], |r: &frankensqlite::Row| r.get_typed(0))
+            .query_row_map(&sql, &[], |r: &crate::franken_sync::Row| r.get_typed(0))
             .expect("count local source rows");
         assert_eq!(count, 1);
 
@@ -97081,7 +97082,7 @@ mod legacy_source_filter_tests {
              ORDER BY source_id"
         );
         let source_rows: Vec<(String, i64)> = conn
-            .query_map_collect(&source_sql, &[], |r: &frankensqlite::Row| {
+            .query_map_collect(&source_sql, &[], |r: &crate::franken_sync::Row| {
                 Ok((r.get_typed(0)?, r.get_typed(1)?))
             })
             .expect("query source rows");
@@ -97106,7 +97107,7 @@ mod legacy_source_filter_tests {
                  GROUP BY c.id
                  ORDER BY c.started_at DESC",
                 &[1_699_999_999_000_i64.into(), 1_700_000_200_000_i64.into()],
-                |r: &frankensqlite::Row| r.get_typed(0),
+                |r: &crate::franken_sync::Row| r.get_typed(0),
             )
             .expect("query timeline rows");
         assert!(timeline_rows.iter().any(|source_id| source_id == "local"));
@@ -97130,7 +97131,7 @@ mod legacy_source_filter_tests {
              ORDER BY source_id"
         );
         let source_rows: Vec<(String, i64)> = conn
-            .query_map_collect(&source_sql, &[], |r: &frankensqlite::Row| {
+            .query_map_collect(&source_sql, &[], |r: &crate::franken_sync::Row| {
                 Ok((r.get_typed(0)?, r.get_typed(1)?))
             })
             .expect("query normalized source rows");
@@ -97160,7 +97161,7 @@ mod legacy_source_filter_tests {
              ORDER BY source_id"
         );
         let source_rows: Vec<(String, i64)> = conn
-            .query_map_collect(&source_sql, &[], |r: &frankensqlite::Row| {
+            .query_map_collect(&source_sql, &[], |r: &crate::franken_sync::Row| {
                 Ok((r.get_typed(0)?, r.get_typed(1)?))
             })
             .expect("query normalized source rows");
@@ -100018,7 +100019,7 @@ fn run_timeline(
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
     use chrono::{Local, TimeZone, Utc};
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
     use std::collections::HashMap;
 
     // Parse source filter (P3.2)
@@ -100100,7 +100101,7 @@ fn run_timeline(
     sql.push_str(" GROUP BY c.id ORDER BY c.started_at DESC");
 
     let rows = conn
-        .query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+        .query_map_collect(&sql, &params, |row: &crate::franken_sync::Row| {
             Ok((
                 row.get_typed::<i64>(0)?,            // id
                 row.get_typed::<String>(1)?,         // agent

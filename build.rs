@@ -47,19 +47,22 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // The published 0.1.19 archive predates the existing-only schema-open
-        // API that CASS calls. Pin the immutable source that actually contains
-        // that API and its no-create/bounded-open tests; a version-only pin is
-        // ambiguous because both sources declare 0.1.19.
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "2351c6c52b9e5fdba6a413865415db0452e660ef",
-        expected_version: "0.1.19",
+        // crates.io-only exact pin since the fsqlite 0.2.1 migration (bead
+        // bo000): the published 0.2.1 archive contains the complete formerly
+        // git-pinned line (existing-only schema opens, deferred-FTS5
+        // validation, ns-lifecycle wave) plus GH#294 mutation-free opens.
+        // Empty `expected_git` signals `validate_manifest_dependency_spec`
+        // to require a bare `=0.2.1` registry pin. Whole-family registry
+        // convergence is enforced by `validate_fsqlite_registry_pin`.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.2.1",
         expected_features: &["fts5"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
         manifest_rel: "crates/fsqlite/Cargo.toml",
-        patch_url: Some("https://github.com/Dicklesworthstone/frankensqlite"),
-        patch_key: Some("fsqlite"),
+        patch_url: None,
+        patch_key: None,
         mode: ValidationMode::StrictOptIn,
     },
     DependencyContract {
@@ -68,16 +71,16 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // Keep shared types on the identical immutable source as the facade.
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "2351c6c52b9e5fdba6a413865415db0452e660ef",
-        expected_version: "0.1.19",
+        // Keep shared types on the identical registry release as the facade.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.2.1",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
         manifest_rel: "crates/fsqlite-types/Cargo.toml",
-        patch_url: Some("https://github.com/Dicklesworthstone/frankensqlite"),
-        patch_key: Some("fsqlite-types"),
+        patch_url: None,
+        patch_key: None,
         mode: ValidationMode::StrictOptIn,
     },
     DependencyContract {
@@ -86,16 +89,16 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // Keep shared types on the identical immutable source as the facade.
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "2351c6c52b9e5fdba6a413865415db0452e660ef",
-        expected_version: "0.1.19",
+        // Keep shared types on the identical registry release as the facade.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.2.1",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
         manifest_rel: "crates/fsqlite-types/Cargo.toml",
-        patch_url: Some("https://github.com/Dicklesworthstone/frankensqlite"),
-        patch_key: Some("fsqlite-types"),
+        patch_url: None,
+        patch_key: None,
         mode: ValidationMode::StrictOptIn,
     },
     DependencyContract {
@@ -105,7 +108,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "dd2c694096d959ba87e0f6a44e87450b34144d3f",
+        expected_rev: "88fc6783805d80677c4ed18dcc79985fcbb2a694",
         expected_version: "0.1.10",
         expected_features: &[
             "chatgpt",
@@ -307,7 +310,7 @@ fn validate_path_dependency_contracts(
     packaged_manifest: bool,
 ) {
     let strict_enabled = strict_path_dep_validation_enabled();
-    validate_fsqlite_registry_source_override(manifest, packaged_manifest);
+    validate_fsqlite_registry_pin(manifest_dir, manifest, packaged_manifest);
 
     for contract in CONTRACTS {
         validate_manifest_dependency_spec(manifest, contract, packaged_manifest);
@@ -322,39 +325,96 @@ fn validate_path_dependency_contracts(
     }
 }
 
-fn validate_fsqlite_registry_source_override(manifest: &Value, packaged_manifest: bool) {
-    // Cargo omits root patch directives from its normalized publish manifest.
-    // The source-tree contract remains enforced during every ordinary build.
-    if packaged_manifest {
-        return;
+fn validate_fsqlite_registry_pin(manifest_dir: &Path, manifest: &Value, packaged_manifest: bool) {
+    // The fsqlite engine family must resolve exclusively from crates.io at the
+    // pinned release. This replaces the pre-0.2.1 [patch.crates-io] git-rev
+    // override contract while keeping its purpose: no silent engine drift.
+    const EXPECTED_VERSION: &str = "0.2.1";
+    const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+    // 1. The former git source override must not quietly come back: no
+    //    [patch.crates-io] entry may target the fsqlite family.
+    if let Some(patch_tables) = manifest.get("patch").and_then(Value::as_table)
+        && let Some(crates_io) = patch_tables.get("crates-io").and_then(Value::as_table)
+    {
+        for dependency in crates_io.keys() {
+            if dependency == "fsqlite" || dependency.starts_with("fsqlite-") {
+                fatal(format!(
+                    "dependency source contract violation for {dependency}: the fsqlite \
+                     family is a crates.io {EXPECTED_VERSION} registry pin; remove the \
+                     [patch.crates-io].{dependency} override (or update this contract \
+                     in build.rs with the new expected identity)"
+                ));
+            }
+        }
     }
 
-    const EXPECTED_GIT: &str = "https://github.com/Dicklesworthstone/frankensqlite";
-    const EXPECTED_REV: &str = "2351c6c52b9e5fdba6a413865415db0452e660ef";
-
-    let patch_tables = table(manifest, "patch", "manifest root");
-    let crates_io = table_value(Some(patch_tables), "crates-io", "[patch]")
-        .as_table()
+    // 2. Lockfile convergence: every resolved fsqlite-family package must be
+    //    the pinned registry release, with exactly one version per crate.
+    //    Cargo resolves the lockfile before running build scripts, so the
+    //    lockfile is authoritative here. Packaged manifests (`cargo package`
+    //    verification builds) re-resolve into a fresh lockfile that inherits
+    //    these same requirements from the manifest pin.
+    let lock_path = manifest_dir.join("Cargo.lock");
+    println!("cargo:rerun-if-changed={}", lock_path.display());
+    let lock_text = match fs::read_to_string(&lock_path) {
+        Ok(text) => text,
+        Err(err) => {
+            if packaged_manifest {
+                return;
+            }
+            fatal(format!(
+                "dependency source contract: failed to read {}: {err}",
+                lock_path.display()
+            ))
+        }
+    };
+    let lock: Value = match toml::from_str(&lock_text) {
+        Ok(value) => value,
+        Err(err) => fatal(format!(
+            "dependency source contract: failed to parse {}: {err}",
+            lock_path.display()
+        )),
+    };
+    let packages = lock
+        .get("package")
+        .and_then(Value::as_array)
         .unwrap_or_else(|| {
-            fatal("dependency source contract violation: [patch.crates-io] must be a table")
+            fatal("dependency source contract: Cargo.lock has no [[package]] entries")
         });
-    for dependency in ["fsqlite", "fsqlite-types"] {
-        let spec = inline_table(crates_io, dependency, "[patch.crates-io]");
-        let git = string_value(spec, "git", dependency);
-        let revision = string_value(spec, "rev", dependency);
-        if git != EXPECTED_GIT || revision != EXPECTED_REV {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for package in packages {
+        let name = package.get("name").and_then(Value::as_str).unwrap_or("");
+        if !(name == "fsqlite" || name.starts_with("fsqlite-")) {
+            continue;
+        }
+        if !seen.insert(name) {
             fatal(format!(
-                "dependency source contract violation for {dependency}: \
-                 [patch.crates-io].{dependency} must pin git = {EXPECTED_GIT:?}, \
-                 rev = {EXPECTED_REV:?}; found git = {git:?}, rev = {revision:?}"
+                "dependency source contract violation: Cargo.lock resolves more than one \
+                 version of `{name}`; the fsqlite family must converge on a single \
+                 registry release"
             ));
         }
-        if spec.contains_key("path") || spec.contains_key("branch") || spec.contains_key("tag") {
+        let version = package.get("version").and_then(Value::as_str).unwrap_or("");
+        if version != EXPECTED_VERSION {
             fatal(format!(
-                "dependency source contract violation for {dependency}: \
-                 the committed crates.io override must use only immutable git + rev identity"
+                "dependency source contract violation: Cargo.lock resolves `{name}` at \
+                 version `{version}`, expected `{EXPECTED_VERSION}`"
             ));
         }
+        let source = package.get("source").and_then(Value::as_str).unwrap_or("");
+        if source != REGISTRY_SOURCE {
+            fatal(format!(
+                "dependency source contract violation: Cargo.lock resolves `{name}` from \
+                 `{source}`, expected the crates.io registry (`{REGISTRY_SOURCE}`)"
+            ));
+        }
+    }
+    if !seen.contains("fsqlite") {
+        fatal(
+            "dependency source contract violation: Cargo.lock does not resolve `fsqlite`; \
+             the engine dependency is missing",
+        );
     }
 }
 
