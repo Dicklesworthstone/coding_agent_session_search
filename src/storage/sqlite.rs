@@ -2819,6 +2819,31 @@ fn promote_staged_historical_seed(
         return Err(err);
     }
 
+    // Re-bind the pathname namespace to the promoted file identity. The
+    // bundle move deliberately carries only db/-wal/-shm: the
+    // `-fsqlite-ns-use`/`-fsqlite-ns-gate` sidecars are identity records
+    // for the REPLACED file, so after promotion the first read-only open
+    // would fail closed under `ReadOnlyExisting` semantics ("missing or
+    // malformed records fail closed"). One writable open takes the
+    // quiescent namespace exclusively and republishes the identity record
+    // for the promoted bytes; on failure the pre-seed canonical is
+    // restored exactly like a failed move.
+    if let Err(err) = FrankenConnection::open(canonical_db_path.to_string_lossy().into_owned())
+        .map(drop)
+        .with_context(|| {
+            format!(
+                "re-binding database namespace after promoting staged historical seed into {}",
+                canonical_db_path.display()
+            )
+        })
+    {
+        let _ = move_database_bundle(canonical_db_path, &staged_seed.db_path);
+        if had_canonical {
+            let _ = move_database_bundle(&canonical_backup, canonical_db_path);
+        }
+        return Err(err);
+    }
+
     Ok(())
 }
 
@@ -8175,17 +8200,121 @@ impl FrankenStorage {
                 &missing_tail_positions,
             )?;
         }
-        // When every conversation already has last_message_idx / tail-state
-        // coverage, skip the full `messages GROUP BY conversation_id` raise.
-        // That exact-count pass was observed to thrash for 10–20+ minutes on
-        // multi-GB archives during plan_lexical_shards (cass 0.6.23 prepare
-        // wedge). Tail estimates are sufficient for shard sizing; exact
-        // message counts are still available later from the rebuild sink.
+        // Tail metadata can UNDERSTATE reality: both `conversations.
+        // last_message_idx` and `conversation_tail_state` are caches, and a
+        // stale-low entry silently under-plans the lexical shards, tripping
+        // the doc>plan invariant during rebuild. Trusting complete tail
+        // coverage without checking is therefore not safe.
+        //
+        // This raise reads MAX(idx) straight from the covering index
+        // `idx_messages_conv_idx(conversation_id, idx)` — a per-conversation
+        // seek, and the same query `fill_missing_lexical_rebuild_footprint_
+        // tails` already runs in production. It is deliberately NOT the
+        // exact-count pass below: that one is an unindexed
+        // `COUNT(*) ... GROUP BY conversation_id`, which is what thrashed for
+        // 10-20+ minutes on multi-GB archives during plan_lexical_shards (the
+        // 0.6.23 prepare wedge).
+        //
+        // MAX(idx)+1 over-estimates when idx values are sparse. That is the
+        // safe direction: over-planning costs shards, under-planning corrupts
+        // the rebuild.
+        self.raise_lexical_rebuild_footprints_from_tail_max_idx(&mut footprints)?;
+
+        // The exact-count pass stays restricted to the mixed-coverage case it
+        // was narrowed to; MAX(idx) already covers the common understatement.
         if !missing_tail_positions.is_empty() && !every_footprint_was_missing_tail {
             self.raise_lexical_rebuild_footprints_to_exact_message_counts(&mut footprints)?;
         }
 
         Ok(footprints)
+    }
+
+    /// Raise footprints whose cached tail understates the real message tail.
+    ///
+    /// Uses the covering index so this stays a per-conversation seek rather
+    /// than a full scan of `messages`. Falls back to an unhinted query when
+    /// the index is absent, mirroring
+    /// `fill_missing_lexical_rebuild_footprint_tails`.
+    fn raise_lexical_rebuild_footprints_from_tail_max_idx(
+        &self,
+        footprints: &mut [LexicalRebuildConversationFootprintRow],
+    ) -> Result<()> {
+        if footprints.is_empty() {
+            return Ok(());
+        }
+
+        let positions_by_conversation: HashMap<i64, usize> = footprints
+            .iter()
+            .enumerate()
+            .map(|(position, footprint)| (footprint.conversation_id, position))
+            .collect();
+
+        self.raise_lexical_rebuild_footprints_from_grouped_max_idx(
+            footprints,
+            &positions_by_conversation,
+            "SELECT conversation_id, MAX(idx) AS last_message_idx
+             FROM messages INDEXED BY idx_messages_conv_idx
+             GROUP BY conversation_id
+             ORDER BY conversation_id ASC",
+        )
+        .or_else(|err| {
+            if err
+                .to_string()
+                .contains("no such index: idx_messages_conv_idx")
+            {
+                return self.raise_lexical_rebuild_footprints_from_grouped_max_idx(
+                    footprints,
+                    &positions_by_conversation,
+                    "SELECT conversation_id, MAX(idx) AS last_message_idx
+                     FROM messages
+                     GROUP BY conversation_id
+                     ORDER BY conversation_id ASC",
+                );
+            }
+            Err(err)
+        })
+        .or_else(|err| {
+            // A missing `messages` table means there is nothing to raise
+            // against; the tail estimates already in hand stand.
+            if error_indicates_missing_table(&err) {
+                return Ok(());
+            }
+            Err(err)
+        })
+        .with_context(|| "raising lexical rebuild footprints from grouped message tails")?;
+        Ok(())
+    }
+
+    fn raise_lexical_rebuild_footprints_from_grouped_max_idx(
+        &self,
+        footprints: &mut [LexicalRebuildConversationFootprintRow],
+        positions_by_conversation: &HashMap<i64, usize>,
+        sql: &str,
+    ) -> Result<()> {
+        self.conn
+            .query_with_params_for_each(sql, &[] as &[SqliteValue], |row| {
+                let conversation_id: i64 = row.get_typed(0)?;
+                let last_message_idx: Option<i64> = row.get_typed(1)?;
+                let Some(position) = positions_by_conversation.get(&conversation_id) else {
+                    return Ok(());
+                };
+                let Some(message_count) =
+                    lexical_rebuild_message_count_from_tail_idx(last_message_idx)
+                else {
+                    return Ok(());
+                };
+                let footprint = &mut footprints[*position];
+                if message_count > footprint.message_count {
+                    let raised = lexical_rebuild_conversation_footprint_from_count(
+                        conversation_id,
+                        message_count,
+                    );
+                    footprint.message_count = raised.message_count;
+                    footprint.message_bytes = footprint.message_bytes.max(raised.message_bytes);
+                }
+                Ok(())
+            })
+            .with_context(|| "grouping lexical rebuild tail maxima")
     }
 
     pub fn lexical_rebuild_has_tail_footprint_metadata(&self) -> Result<bool> {
