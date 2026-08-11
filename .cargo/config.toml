@@ -2,6 +2,7 @@
 # https://doc.rust-lang.org/cargo/reference/config.html
 
 [build]
+rustflags = ["-Z", "threads=4"]
 # Use all available CPU cores for parallel compilation
 jobs = -1
 
@@ -12,7 +13,7 @@ CARGO_LLVM_COV_EXCLUDE = "tests/*,**/test*.rs,benches/*"
 
 [target.x86_64-unknown-linux-gnu]
 # Linux x86_64: Use LLD for faster linking (available in CI)
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+rustflags = ["-Z", "threads=4", "-C", "link-arg=-fuse-ld=lld"]
 
 # Note: Linux ARM64 (aarch64-unknown-linux-gnu) uses default linker
 # The ubuntu-24.04-arm GitHub runner does not have LLD installed
