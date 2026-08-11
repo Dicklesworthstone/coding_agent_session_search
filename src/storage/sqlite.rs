@@ -3920,6 +3920,68 @@ fn truncate_lexical_rebuild_conversation_content(
 pub type SqliteStorage = FrankenStorage;
 
 /// Primary frankensqlite-backed storage backend.
+/// Busy-class engine errors that a connection close can hit transiently while
+/// a sibling connection briefly holds the WAL write or checkpoint lock.
+fn franken_close_error_is_transiently_busy(err: &frankensqlite::FrankenError) -> bool {
+    use frankensqlite::FrankenError;
+    matches!(
+        err,
+        FrankenError::Busy
+            | FrankenError::BusyRecovery
+            | FrankenError::BusySnapshot { .. }
+            | FrankenError::WriteConflict { .. }
+            | FrankenError::SerializationFailure { .. }
+    )
+}
+
+/// Close a frankensqlite connection with a bounded retry on Busy-class errors.
+///
+/// The engine's close path commits any cached/retained write transaction and
+/// (for `checkpoint_on_close`) runs a passive WAL checkpoint. Neither step
+/// waits out the connection's busy timeout, so a sibling writer or reader that
+/// momentarily holds the WAL write or checkpoint lock surfaces as a hard
+/// `FrankenError::Busy` from an otherwise healthy close. That window is
+/// timing-sensitive and much wider on macOS, where commits pay F_FULLFSYNC
+/// (observed as darwin-only "closing frankensqlite connection: database is
+/// busy" failures in the begin-concurrent persist paths; bead
+/// coding_agent_session_search-t8gor, darwin section).
+///
+/// `Connection::close_in_place` explicitly retains the handle on error so
+/// callers can retry; every attempt after a failed one re-runs the same
+/// commit/rollback/teardown steps, and a successful close is terminal, so a
+/// bounded backoff loop is safe. Non-busy errors are returned immediately.
+fn close_franken_in_place_with_busy_retry(
+    conn: &mut FrankenConnection,
+    checkpoint_on_close: bool,
+) -> std::result::Result<(), frankensqlite::FrankenError> {
+    const MAX_ATTEMPTS: usize = 12;
+    const BACKOFF_START: Duration = Duration::from_millis(5);
+    const BACKOFF_CAP: Duration = Duration::from_millis(250);
+
+    let mut backoff = BACKOFF_START;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let result = if checkpoint_on_close {
+            conn.close_in_place()
+        } else {
+            conn.close_without_checkpoint_in_place()
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < MAX_ATTEMPTS && franken_close_error_is_transiently_busy(&err) => {
+                tracing::debug!(
+                    error = %err,
+                    attempt,
+                    "frankensqlite close hit a transient busy state; retrying"
+                );
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(BACKOFF_CAP);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("close retry loop returns on the final attempt")
+}
+
 pub struct FrankenStorage {
     conn: FrankenConnection,
     db_path: PathBuf,
@@ -4434,10 +4496,10 @@ impl FrankenStorage {
     fn close_cached_ephemeral_writer_without_checkpoint_in_place(&mut self) -> Result<()> {
         let cached = self.cached_ephemeral_writer.get_mut();
         match std::mem::replace(cached, CachedEphemeralWriter::Uninitialized) {
-            CachedEphemeralWriter::Cached(mut conn) => conn
-                .0
-                .close_without_checkpoint_in_place()
-                .with_context(|| "closing cached frankensqlite writer without final checkpoint"),
+            CachedEphemeralWriter::Cached(mut conn) => {
+                close_franken_in_place_with_busy_retry(&mut conn.0, false)
+                    .with_context(|| "closing cached frankensqlite writer without final checkpoint")
+            }
             CachedEphemeralWriter::Uninitialized | CachedEphemeralWriter::InUse => Ok(()),
         }
     }
@@ -4464,16 +4526,14 @@ impl FrankenStorage {
     pub fn close(self) -> Result<()> {
         let mut this = self;
         this.close_cached_ephemeral_writer_best_effort_in_place();
-        this.conn
-            .close()
+        close_franken_in_place_with_busy_retry(&mut this.conn, true)
             .with_context(|| "closing frankensqlite connection")
     }
 
     pub fn close_without_checkpoint(self) -> Result<()> {
         let mut this = self;
         this.close_cached_ephemeral_writer_without_checkpoint_in_place()?;
-        this.conn
-            .close_without_checkpoint()
+        close_franken_in_place_with_busy_retry(&mut this.conn, false)
             .with_context(|| "closing frankensqlite connection without final checkpoint")
     }
 
@@ -4484,8 +4544,7 @@ impl FrankenStorage {
 
     pub fn close_without_checkpoint_in_place(&mut self) -> Result<()> {
         self.close_cached_ephemeral_writer_without_checkpoint_in_place()?;
-        self.conn
-            .close_without_checkpoint_in_place()
+        close_franken_in_place_with_busy_retry(&mut self.conn, false)
             .with_context(|| "closing frankensqlite connection without final checkpoint")
     }
 
@@ -8295,6 +8354,7 @@ impl FrankenStorage {
             .query_with_params_for_each(sql, &[] as &[SqliteValue], |row| {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let last_message_idx: Option<i64> = row.get_typed(1)?;
+                eprintln!("DBG raise row: conv={conversation_id} max_idx={last_message_idx:?}");
                 let Some(position) = positions_by_conversation.get(&conversation_id) else {
                     return Ok(());
                 };
@@ -8470,6 +8530,7 @@ impl FrankenStorage {
             .query_with_params_for_each(sql, &[] as &[SqliteValue], |row| {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let last_message_idx: Option<i64> = row.get_typed(1)?;
+                eprintln!("DBG raise row: conv={conversation_id} max_idx={last_message_idx:?}");
                 let Some(position) = missing_tail_positions.get(&conversation_id) else {
                     return Ok(());
                 };
