@@ -11607,8 +11607,7 @@ impl FrankenStorage {
                         .to_ascii_lowercase()
                         .split_whitespace()
                         .collect();
-                    if !(normalized.contains("content=''") || normalized.contains("content=\"\""))
-                    {
+                    if !(normalized.contains("content=''") || normalized.contains("content=\"\"")) {
                         all_contentless = false;
                     }
                     Ok(())
