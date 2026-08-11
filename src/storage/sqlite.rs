@@ -11515,9 +11515,14 @@ impl FrankenStorage {
     /// [`Self::rebuild_fts_via_frankensqlite`], which routes through the FTS5
     /// vtab update path and hydrates the corrupt `%_data`.
     ///
-    /// Must be called on a connection opened via
-    /// [`Self::open_deferred_fts5_for_repair`], so the corrupt shadow was never
-    /// read at open. The FTS5 vtab's destructor is a no-op that never reads
+    /// For the corrupt-`%_data` case this must be called on a connection
+    /// opened via [`Self::open_deferred_fts5_for_repair`], so the corrupt
+    /// shadow was never read at open. [`Self::rebuild_fts_via_frankensqlite`]
+    /// also routes here from ordinarily opened connections when the surviving
+    /// `fts_messages` CREATE is not cass's canonical contentless registration
+    /// (legacy or stale-duplicate catalog rows): the open already succeeded
+    /// there, and DROP TABLE removes every same-named catalog row, which the
+    /// in-place DELETE path cannot. The FTS5 vtab's destructor is a no-op that never reads
     /// `%_data`, and its backing shadow tables are plain, so `DROP TABLE`
     /// removes the corrupt structure without decoding it. Canonical rows are
     /// never modified. NOT fully failure-atomic: the drop+recreate runs in
@@ -11573,11 +11578,76 @@ impl FrankenStorage {
         }
     }
 
+    /// True when every `sqlite_master` row named `fts_messages` declares the
+    /// canonical cass registration's external-empty content option
+    /// (`content=''`), i.e. the contentless family cass itself creates.
+    ///
+    /// A `false` here means the catalog carries a CREATE cass never wrote:
+    /// either a pre-contentless legacy schema (internal or external content)
+    /// or a stale duplicate row left behind by an interrupted legacy
+    /// migration. FrankenSQLite 0.1.19 keeps such a duplicate visible when
+    /// the canonical `fts_messages_content` shadow table exists on disk, and
+    /// its schema reload resolves the surviving DDL last-row-wins — so a
+    /// non-contentless row can shadow canonically persisted contentless
+    /// state, and rows written through one connection's view are invisible
+    /// to the next open (content lands in `%_data`/`%_docsize` while the
+    /// reader hydrates from the empty `%_content`).
+    fn fts_messages_schema_is_canonical_contentless(&self) -> Result<bool> {
+        let mut saw_row = false;
+        let mut all_contentless = true;
+        self.conn
+            .query_with_params_for_each(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
+                &[] as &[SqliteValue],
+                |row| {
+                    saw_row = true;
+                    let sql: Option<String> = row.get_typed(0)?;
+                    let normalized: String = sql
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                        .split_whitespace()
+                        .collect();
+                    if !(normalized.contains("content=''") || normalized.contains("content=\"\""))
+                    {
+                        all_contentless = false;
+                    }
+                    Ok(())
+                },
+            )
+            .with_context(|| "reading the fts_messages CREATE sql for rebuild routing")?;
+        Ok(saw_row && all_contentless)
+    }
+
     pub(crate) fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
         self.invalidate_fts_messages_present_cache();
         let before = self
             .inspect_search_fallback_fts_parity()
             .with_context(|| "inspecting the published FTS shadow before atomic rebuild")?;
+        // Route queryable shadows whose surviving CREATE is NOT cass's
+        // canonical contentless registration through DROP+recreate instead of
+        // DELETE_ALL. cass only ever creates `content='', contentless_delete=1`
+        // shadows, so a non-contentless CREATE is a legacy or stale-duplicate
+        // catalog row (see `fts_messages_schema_is_canonical_contentless`);
+        // rebuilding "in place" through that row splits writes and reads
+        // across different shadow tables and silently loses the rebuilt
+        // content on the next open. DROP TABLE removes every catalog row of
+        // that name plus the module shadow-table cascade, leaving one clean
+        // canonical schema, and the repopulate is fully derived from
+        // canonical messages so nothing user-authored is at stake. The
+        // `content=''`-without-`contentless_delete` legacy family still takes
+        // the DELETE_ALL arm below, where the engine's rejection of the
+        // DELETE preserves its published contents via rollback; Unqueryable
+        // still bails in the match below.
+        if matches!(
+            before.status,
+            FtsShadowParityStatus::Healthy
+                | FtsShadowParityStatus::Partial
+                | FtsShadowParityStatus::Excess
+                | FtsShadowParityStatus::Divergent
+        ) && !self.fts_messages_schema_is_canonical_contentless()?
+        {
+            return self.rebuild_fts_shadow_via_drop_recreate();
+        }
         self.conn
             .execute_batch("BEGIN IMMEDIATE TRANSACTION;")
             .with_context(|| "starting failure-atomic FTS rebuild transaction")?;
