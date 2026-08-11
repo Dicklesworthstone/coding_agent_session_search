@@ -31,6 +31,40 @@ busy-spun indefinitely on open now gets a bounded 30 s open refusal, an
 honest 27 ms `cass health` state report during rebuild, and a working
 set-aside + full-reindex recovery (sub-second search afterward).**
 
+### Fixed (release-gate wave, 2026-08-11 -- bead t8gor)
+
+The v0.6.24 release gate itself caught three cross-platform defects in the
+storage repair/recovery paths plus a darwin-only failure family; all are
+fixed in this release:
+
+- **Lexical-rebuild planner no longer under-plans on a stale-low tail
+  cache** (`70713db0`): footprints are raised from `MAX(idx)+1` via the
+  covering index, so a stale-low `conversation_tail_state` cannot trip the
+  doc>plan invariant (the 0.6.23 anti-wedge restriction is preserved for
+  the mixed-coverage path).
+- **Legacy duplicate `fts_messages` schema rows no longer lose FTS content
+  on rebuild** (`66c3add6`): when the surviving DDL is not cass's canonical
+  `content=''` registration, the rebuild routes to drop/recreate (which
+  collapses every same-named catalog row) instead of delete-all -- closing
+  the contentless-write/content-hydrated-read split at the engine's
+  rootpage-zero dedup exception.
+- **`seed_canonical` restore works under the engine's fail-closed
+  namespace semantics** (`70713db0`): after promoting a staged bundle, one
+  writable open republishes the namespace identity for the promoted bytes
+  (the bundle move deliberately does not carry `-fsqlite-ns-*` sidecars).
+- **darwin: semantic-manifest publishing works under symlinked temp roots**
+  (`f823aa11`): path link-checks anchor at the trusted data root instead of
+  walking from the filesystem root (macOS `/var` symlinks to `private/var`
+  and broke every publish); in-tree symlink rejection is unchanged.
+- **darwin: transient Busy on connection close no longer fails persists**
+  (`b4d9ce05`, `466faf05`): frankensqlite close retries Busy-class errors
+  with backoff (close-time commit/checkpoint does not honor the busy
+  timeout at the pinned rev), and the test env-lock recovers from poison.
+
+Post-release note: fsqlite 0.2.1 (crates.io, 2026-08-11) now contains this
+release's pinned engine line plus the GH#294 mutation-free opens; migrating
+off the git pin to the registry is the next release's first unit.
+
 ### Changed (dependency re-pin and repair wiring, post-triage)
 
 - **frankensqlite is now pinned to git rev `2351c6c5`** (`12129e25`,
