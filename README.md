@@ -11,7 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, and Grok Build into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, and Grok Build into a single, searchable timeline.
 
 <div align="center">
 
@@ -360,7 +360,7 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from 23 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
+Ingests history from 24 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
 - **Codex**: `~/.codex/sessions` (Rollout JSONL)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
@@ -378,6 +378,7 @@ Ingests history from 23 local agents, normalizing them into a unified `Conversat
 - **GitHub Copilot Chat**: VS Code global storage under `github.copilot-chat` (JSON)
 - **Copilot CLI**: `~/.copilot/session-state`, legacy `~/.copilot/history-session-state`, and `gh copilot` config paths (JSONL/JSON)
 - **OpenClaw**: `~/.openclaw/agents/*/sessions` (Session JSONL)
+- **Goose**: `~/.local/share/goose/sessions/sessions.db` (SQLite, v1.20+), plus the earlier per-session `*.jsonl` layout under `~/.goose/sessions`
 - **Crush**: `~/.crush/crush.db` and per-project `.crush/crush.db` (SQLite)
 - **Hermes**: `~/.hermes/state.db` and project-local `.hermes/state.db` (SQLite)
 - **Kimi Code**: `$KIMI_CODE_HOME/sessions/*/*/agents/*/wire.jsonl` (default `~/.kimi-code`; sub-agents index as `<sessionId>:<agentId>`), plus the legacy `~/.kimi/sessions/*/*/wire.jsonl` layout (Session JSONL)

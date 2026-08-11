@@ -65,18 +65,19 @@ re-pin).
 - **A stale-low tail cache no longer under-plans the lexical shards.** The
   0.6.24 wedge fix stopped running the exact-count pass whenever every
   conversation already had tail coverage. That pass was also the only thing
-  catching a tail cache that *understates* reality: `conversations.
-  last_message_idx` and `conversation_tail_state` are both caches, and when
-  both go stale-low the planner sized shards from the stale number and tripped
-  the `doc>plan` invariant mid-rebuild. Footprints are now raised from
-  `MAX(idx)` read through the covering index
-  `idx_messages_conv_idx(conversation_id, idx)` — a per-conversation seek, and
-  the same query the missing-tail path already ran, so the multi-GB prepare
-  wedge stays fixed. The expensive unindexed `COUNT(*) ... GROUP BY` that
-  caused the wedge stays restricted to the mixed-coverage case. `MAX(idx)+1`
-  over-estimates when idx values are sparse, which is the safe direction:
-  over-planning costs shards, under-planning corrupts the rebuild. Caught by
-  the release test gate, which found it as a regression against v0.6.23.
+  catching a tail cache that *understates* reality. Both
+  `conversations.last_message_idx` and `conversation_tail_state` are caches,
+  and when both go stale-low the planner sized shards from the stale number
+  and tripped the `doc>plan` invariant mid-rebuild. Footprints are now raised
+  from `MAX(idx)` read through the covering index
+  `idx_messages_conv_idx(conversation_id, idx)`. That is a per-conversation
+  seek, and the same query the missing-tail path already ran, so the multi-GB
+  prepare wedge stays fixed; the expensive unindexed `COUNT(*) ... GROUP BY`
+  that caused the wedge stays restricted to the mixed-coverage case.
+  `MAX(idx)+1` over-estimates when idx values are sparse, which is the safe
+  direction, since over-planning costs shards while under-planning corrupts
+  the rebuild. The release test gate caught this as a regression against
+  v0.6.23.
 
 - **[#368](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/368)
   defect 2 -- readiness no longer reports "search usable" while search hard-fails
@@ -116,6 +117,16 @@ re-pin).
   and the genuine engine fix (a multi-leaf FTS5 segment writer that partitions an
   oversized flush across leaves) implemented + tested in frankensqlite (branch
   `fts5-multileaf-cass369`, commit `30d31d51`), pending a dependency re-pin.
+
+### Added (connectors)
+
+- **Goose sessions are now indexed**
+  ([`1967c7aa`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/1967c7aa)).
+  Block's Goose agent writes to `~/.local/share/goose/sessions/sessions.db`
+  (SQLite) from v1.20 onward, and to per-session `*.jsonl` files under
+  `~/.goose/sessions` before that. Both layouts are read through
+  `franken_agent_detection`. This brings the connector count to 24;
+  `cass capabilities --json | jq .connectors` remains the canonical inventory.
 
 ### Added (observability)
 
