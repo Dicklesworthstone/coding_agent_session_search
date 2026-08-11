@@ -1,7 +1,7 @@
 use coding_agent_search::connectors::cursor::CursorConnector;
 use coding_agent_search::connectors::{Connector, NormalizedConversation, ScanContext};
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::ConnectionExt;
+use coding_agent_search::franken_sync::Connection as FrankenConnection;
+use coding_agent_search::franken_sync::compat::ConnectionExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
@@ -25,7 +25,7 @@ fn create_test_db(path: &Path) -> FrankenConnection {
 fn insert_kv(conn: &FrankenConnection, key: &str, value: &str) {
     conn.execute_compat(
         "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
-        frankensqlite::params![key, value],
+        coding_agent_search::franken_sync::params![key, value],
     )
     .unwrap();
 }
@@ -33,7 +33,7 @@ fn insert_kv(conn: &FrankenConnection, key: &str, value: &str) {
 fn insert_item(conn: &FrankenConnection, key: &str, value: &str) {
     conn.execute_compat(
         "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
-        frankensqlite::params![key, value],
+        coding_agent_search::franken_sync::params![key, value],
     )
     .unwrap();
 }

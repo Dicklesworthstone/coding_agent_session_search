@@ -23,7 +23,7 @@ use coding_agent_search::indexer::semantic::{
 };
 use coding_agent_search::search::semantic_manifest::{SemanticShardManifest, TierKind};
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use coding_agent_search::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;

@@ -26,9 +26,9 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::expected_index_dir;
 use coding_agent_search::subsystem_coverage_matrix::matrix_report;
-use frankensqlite::Connection;
-use frankensqlite::compat::ConnectionExt;
-use frankensqlite::params;
+use coding_agent_search::franken_sync::Connection;
+use coding_agent_search::franken_sync::compat::ConnectionExt;
+use coding_agent_search::franken_sync::params;
 use serde_json::{Value, json};
 use std::error::Error;
 use std::fs;

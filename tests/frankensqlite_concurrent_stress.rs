@@ -8,9 +8,9 @@
 use coding_agent_search::storage::sqlite::{
     ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage,
 };
-use frankensqlite::compat::{ConnectionExt, RowExt, TransactionExt};
-use frankensqlite::params as fparams;
-use frankensqlite::{Connection, FrankenError};
+use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt, TransactionExt};
+use coding_agent_search::franken_sync::params as fparams;
+use coding_agent_search::franken_sync::{Connection, FrankenError};
 use rand::RngExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

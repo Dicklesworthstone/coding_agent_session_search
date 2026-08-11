@@ -5,7 +5,7 @@ use coding_agent_search::model::types::{Agent, AgentKind, Conversation};
 use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig, SyncSchedule};
 use coding_agent_search::sources::sync::{SourceSyncInfo, SyncResult, SyncStatus};
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::Connection as FrankenConnection;
+use coding_agent_search::franken_sync::Connection as FrankenConnection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};

@@ -127,15 +127,15 @@ fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
 }
 
 fn isolated_search_demo_data_for_current_workspace() -> Result<TempDir, Box<dyn Error>> {
-    use frankensqlite::compat::ConnectionExt;
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
 
     let tmp = isolated_search_demo_data()?;
     let current_workspace = std::env::current_dir()?.to_string_lossy().into_owned();
     let db_path = tmp.path().join("agent_search.db");
-    let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned())?;
+    let conn = coding_agent_search::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())?;
     conn.execute_compat(
         "UPDATE workspaces SET path = ?1 WHERE id = 1",
-        frankensqlite::params![current_workspace],
+        coding_agent_search::franken_sync::params![current_workspace],
     )?;
     Ok(tmp)
 }

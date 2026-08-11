@@ -5,8 +5,8 @@ use super::doctor_fixture::{
     DoctorFixtureFactory, DoctorFixtureScenario, default_expected_artifact_keys,
 };
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::ConnectionExt;
+use coding_agent_search::franken_sync::Connection as FrankenConnection;
+use coding_agent_search::franken_sync::compat::ConnectionExt;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -3146,12 +3146,12 @@ fn write_doctor_e2e_sqlite_marker_db(path: &Path, marker: &str) -> Result<(), St
         .map_err(|err| format!("create doctor backup fixture sqlite db: {err}"))?;
     conn.execute_compat(
         "CREATE TABLE IF NOT EXISTS restore_probe(marker TEXT NOT NULL)",
-        frankensqlite::params![],
+        coding_agent_search::franken_sync::params![],
     )
     .map_err(|err| format!("create doctor backup fixture marker table: {err}"))?;
     conn.execute_compat(
         "INSERT INTO restore_probe(marker) VALUES (?1)",
-        frankensqlite::params![marker],
+        coding_agent_search::franken_sync::params![marker],
     )
     .map_err(|err| format!("write doctor backup fixture sqlite marker: {err}"))?;
     let _ = conn.query("PRAGMA wal_checkpoint(TRUNCATE);");

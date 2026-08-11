@@ -10,7 +10,7 @@ use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message,
 use coding_agent_search::search::tantivy::TantivyIndex;
 use coding_agent_search::sources::provenance::Source;
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 use serde_json::json;
 use tempfile::TempDir;
 

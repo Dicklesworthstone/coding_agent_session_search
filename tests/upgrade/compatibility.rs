@@ -8,7 +8,7 @@
 
 use coding_agent_search::pages::encrypt::{EncryptionConfig, KdfAlgorithm, SlotType};
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, MigrationError, SqliteStorage};
-use frankensqlite::Connection as FrankenConnection;
+use coding_agent_search::franken_sync::Connection as FrankenConnection;
 use serde_json::json;
 use std::path::Path;
 use tempfile::TempDir;
@@ -509,19 +509,19 @@ fn test_search_without_fts() {
 /// expected symbols compile against the currently resolved dependency graph.
 #[test]
 fn test_path_dependency_compile_contracts() {
-    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 
-    let conn = frankensqlite::Connection::open(":memory:").expect("open frankensqlite memory db");
+    let conn = coding_agent_search::franken_sync::Connection::open(":memory:").expect("open frankensqlite memory db");
     conn.execute("CREATE TABLE contract_check (value INTEGER)")
         .expect("create contract table");
-    let _params_contract = frankensqlite::params![7_i64];
+    let _params_contract = coding_agent_search::franken_sync::params![7_i64];
     conn.execute("INSERT INTO contract_check(value) VALUES (7)")
         .expect("insert contract row");
     let value: i64 = conn
         .query_row_map(
             "SELECT value FROM contract_check",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
         )
         .expect("query contract row");
     assert_eq!(value, 7);

@@ -12,8 +12,8 @@ mod tests {
         Fts5SearchMode, detect_search_mode, escape_fts5_query, format_fts5_query,
         validate_fts5_query,
     };
-    use frankensqlite::compat::{ConnectionExt, RowExt};
-    use frankensqlite::{Connection as FrankenConnection, params as fparams};
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::franken_sync::{Connection as FrankenConnection, params as fparams};
     use std::path::Path;
     use tempfile::TempDir;
 

@@ -4,9 +4,9 @@ mod tests {
     use coding_agent_search::pages::secret_scan::{
         SecretScanConfig, SecretScanFilters, SecretScanReport, SecretSeverity, scan_database,
     };
-    use frankensqlite::Connection as FrankenConnection;
-    use frankensqlite::compat::ConnectionExt;
-    use frankensqlite::params as fparams;
+    use coding_agent_search::franken_sync::Connection as FrankenConnection;
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
+    use coding_agent_search::franken_sync::params as fparams;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 

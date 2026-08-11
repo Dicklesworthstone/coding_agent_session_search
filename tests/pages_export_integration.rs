@@ -5,8 +5,8 @@
 
 use chrono::{TimeZone, Utc};
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
-use frankensqlite::compat::{ConnectionExt, RowExt};
-use frankensqlite::{Connection, Row as FrankenRow, params as fparams};
+use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+use coding_agent_search::franken_sync::{Connection, Row as FrankenRow, params as fparams};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

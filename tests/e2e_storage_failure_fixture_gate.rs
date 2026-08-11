@@ -2037,15 +2037,15 @@ fn dedicated_probe_fixtures() -> [DedicatedProbeFixture; 4] {
 }
 
 fn set_probe_fixture_schema_version(db: &Path, legacy: bool) -> Result<(), String> {
-    use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+    use coding_agent_search::franken_sync::compat::{ConnectionExt as _, ParamValue, RowExt as _};
 
-    let mut conn = frankensqlite::Connection::open(db.display().to_string())
+    let mut conn = coding_agent_search::franken_sync::Connection::open(db.display().to_string())
         .map_err(|err| format!("open probe fixture DB: {err}"))?;
     let raw_current = conn
         .query_row_map(
             "SELECT value FROM meta WHERE key = 'schema_version'",
             &[],
-            |row: &frankensqlite::Row| row.get_typed::<String>(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed::<String>(0),
         )
         .map_err(|err| format!("read fixture schema version: {err}"))?;
     let current = raw_current
@@ -2076,10 +2076,10 @@ fn park_fixture_wal_and_create_orphan_shm(data_dir: &Path) -> Result<(), String>
         .map_err(|err| format!("write orphan SHM fixture: {err}"))
 }
 
-fn hold_probe_fixture_exclusive_writer(db: &Path) -> Result<frankensqlite::Connection, String> {
-    use frankensqlite::compat::{ConnectionExt as _, ParamValue};
+fn hold_probe_fixture_exclusive_writer(db: &Path) -> Result<coding_agent_search::franken_sync::Connection, String> {
+    use coding_agent_search::franken_sync::compat::{ConnectionExt as _, ParamValue};
 
-    let conn = frankensqlite::Connection::open(db.display().to_string())
+    let conn = coding_agent_search::franken_sync::Connection::open(db.display().to_string())
         .map_err(|err| format!("open exclusive-writer fixture DB: {err}"))?;
     conn.execute("PRAGMA journal_mode = DELETE;")
         .map_err(|err| format!("select rollback-journal mode for busy fixture: {err}"))?;

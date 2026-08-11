@@ -22,7 +22,7 @@ use coding_agent_search::pages::encrypt::{DecryptionEngine, EncryptionEngine, lo
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
 use coding_agent_search::pages::verify::verify_bundle;
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use frankensqlite::Connection;
+use coding_agent_search::franken_sync::Connection;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::Value;
 use std::fs;
@@ -907,19 +907,19 @@ fn test_cli_pages_full_workflow_end_to_end() {
         .expect("decrypt CLI-generated bundle");
     let conn =
         Connection::open(decrypted_path.to_string_lossy().as_ref()).expect("open decrypted db");
-    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
     let conversation_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM conversations",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
         )
         .expect("count decrypted conversations");
     let message_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM messages",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
         )
         .expect("count decrypted messages");
     assert_eq!(
@@ -1156,19 +1156,19 @@ fn test_pages_wizard_pty_respects_db_override_and_writes_bundle_root() {
         .expect("decrypt wizard-generated bundle");
     let conn = Connection::open(decrypted_path.to_string_lossy().as_ref())
         .expect("open wizard decrypted db");
-    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
     let conversation_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM conversations",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
         )
         .expect("count wizard decrypted conversations");
     let message_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM messages",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
         )
         .expect("count wizard decrypted messages");
     assert_eq!(
@@ -1223,14 +1223,14 @@ fn test_search_in_decrypted_archive() {
     let conn =
         Connection::open(decrypted_path.to_string_lossy().as_ref()).expect("open decrypted db");
 
-    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 
     // Verify conversations table exists and has data
     let conv_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM conversations",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
         )
         .expect("count conversations");
     assert_eq!(conv_count, 5, "Should have 5 conversations");
@@ -1240,7 +1240,7 @@ fn test_search_in_decrypted_archive() {
         .query_row_map(
             "SELECT COUNT(*) FROM messages",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
         )
         .expect("count messages");
     assert!(msg_count > 0, "Should have messages");
@@ -1250,7 +1250,7 @@ fn test_search_in_decrypted_archive() {
         .query_row_map(
             "SELECT value FROM export_meta WHERE key = 'schema_version'",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
         )
         .expect("get schema version");
     assert_eq!(schema_version, "1", "Export schema version should be 1");

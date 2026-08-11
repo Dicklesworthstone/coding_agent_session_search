@@ -357,8 +357,8 @@ fn test_wizard_state_final_site_dir_tracking() {
 
 use coding_agent_search::pages::config_input::PagesConfig;
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use coding_agent_search::franken_sync::Connection as FrankenConnection;
+use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 
 fn open_franken_connection(path: &Path) -> FrankenConnection {
     FrankenConnection::open(path.to_string_lossy().into_owned())

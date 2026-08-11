@@ -22,7 +22,7 @@
 #[test]
 #[ignore = "manual diagnostic for bead mot85; run with --ignored"]
 fn probe_mot85_fsqlite_writable_schema_writes() {
-    use frankensqlite::Connection as FrankenConnection;
+    use coding_agent_search::franken_sync::Connection as FrankenConnection;
     let tmpdir = tempfile::tempdir().unwrap();
     let db_path = tmpdir.path().join("probe.db");
     let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();

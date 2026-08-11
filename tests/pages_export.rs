@@ -4,8 +4,8 @@ mod tests {
     use coding_agent_search::pages::export::{
         ExportEngine, ExportFilter, PathMode, run_pages_export,
     };
-    use frankensqlite::compat::{ConnectionExt, RowExt};
-    use frankensqlite::{Connection, Row as FrankenRow, params as fparams};
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::franken_sync::{Connection, Row as FrankenRow, params as fparams};
     use std::path::Path;
     use tempfile::TempDir;
 

@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::expected_index_dir;
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use coding_agent_search::franken_sync::Connection as FrankenConnection;
+use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 use fs2::FileExt;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -237,12 +237,12 @@ fn write_test_sqlite_db(path: &Path, marker: &str) {
         .expect("open frankensqlite fixture db");
     conn.execute_compat(
         "CREATE TABLE restore_probe(marker TEXT NOT NULL)",
-        frankensqlite::params![],
+        coding_agent_search::franken_sync::params![],
     )
     .expect("create restore probe table");
     conn.execute_compat(
         "INSERT INTO restore_probe(marker) VALUES (?1)",
-        frankensqlite::params![marker],
+        coding_agent_search::franken_sync::params![marker],
     )
     .expect("insert restore probe marker");
     let _ = conn.query("PRAGMA wal_checkpoint(TRUNCATE);");
@@ -474,7 +474,7 @@ fn ensure_codex_agent(conn: &FrankenConnection) -> i64 {
     conn.query_row_map(
         "SELECT id FROM agents WHERE slug = 'codex' LIMIT 1",
         &[],
-        |row: &frankensqlite::Row| row.get_typed(0),
+        |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
     )
     .or_else(|_| {
         let next_id: i64 =
@@ -484,9 +484,9 @@ fn ensure_codex_agent(conn: &FrankenConnection) -> i64 {
         conn.execute_compat(
             "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
              VALUES (?1, 'codex', 'Codex', 'test', 'agent', 0, 0)",
-            frankensqlite::params![next_id],
+            coding_agent_search::franken_sync::params![next_id],
         )?;
-        Ok::<i64, frankensqlite::FrankenError>(next_id)
+        Ok::<i64, coding_agent_search::franken_sync::FrankenError>(next_id)
     })
     .expect("codex agent id")
 }
@@ -496,24 +496,24 @@ fn corrupt_unused_secondary_index_entry(db_path: &Path) {
         .expect("open db for corruption fixture");
     conn.execute_compat(
         "CREATE TABLE doctor_integrity_probe(id INTEGER PRIMARY KEY, payload TEXT)",
-        frankensqlite::params![],
+        coding_agent_search::franken_sync::params![],
     )
     .expect("create integrity probe table");
     conn.execute_compat(
         "CREATE INDEX idx_doctor_integrity_probe_payload ON doctor_integrity_probe(payload)",
-        frankensqlite::params![],
+        coding_agent_search::franken_sync::params![],
     )
     .expect("create integrity probe index");
     for id in 1_i64..=16 {
         let payload = format!("integrity probe payload {id:02}");
         conn.execute_compat(
             "INSERT INTO doctor_integrity_probe(id, payload) VALUES (?1, ?2)",
-            frankensqlite::params![id, payload.as_str()],
+            coding_agent_search::franken_sync::params![id, payload.as_str()],
         )
         .expect("insert integrity probe row");
     }
     let quick_before: String = conn
-        .query_row_map("PRAGMA quick_check(1);", &[], |row: &frankensqlite::Row| {
+        .query_row_map("PRAGMA quick_check(1);", &[], |row: &coding_agent_search::franken_sync::Row| {
             row.get_typed(0)
         })
         .expect("quick_check before corruption");
@@ -522,11 +522,11 @@ fn corrupt_unused_secondary_index_entry(db_path: &Path) {
         .query_row_map(
             "SELECT rootpage FROM sqlite_master WHERE type = 'index' AND name = 'idx_doctor_integrity_probe_payload'",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
         )
         .expect("integrity probe index root page");
     let page_size: i64 = conn
-        .query_row_map("PRAGMA page_size;", &[], |row: &frankensqlite::Row| {
+        .query_row_map("PRAGMA page_size;", &[], |row: &coding_agent_search::franken_sync::Row| {
             row.get_typed(0)
         })
         .unwrap_or(4096);
@@ -565,7 +565,7 @@ fn corrupt_unused_secondary_index_entry(db_path: &Path) {
     let verify_conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())
         .expect("reopen corrupted fixture");
     let quick_after: String = verify_conn
-        .query_row_map("PRAGMA quick_check(1);", &[], |row: &frankensqlite::Row| {
+        .query_row_map("PRAGMA quick_check(1);", &[], |row: &coding_agent_search::franken_sync::Row| {
             row.get_typed(0)
         })
         .expect("quick_check after index corruption");
@@ -577,7 +577,7 @@ fn corrupt_unused_secondary_index_entry(db_path: &Path) {
         .query_row_map(
             "PRAGMA integrity_check;",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
         )
         .expect("integrity_check after index corruption");
     assert_ne!(
@@ -774,13 +774,13 @@ fn doctor_fix_auto_runs_derived_lexical_rebuild_from_readable_archive() {
     conn.execute_compat(
         "INSERT INTO conversations (id, agent_id, source_id, external_id, title, source_path, started_at)
          VALUES (501, ?1, 'local', 'derived-only', 'derived only', ?2, 1700000000000)",
-        frankensqlite::params![agent_id, source_path_text.as_str()],
+        coding_agent_search::franken_sync::params![agent_id, source_path_text.as_str()],
     )
     .expect("insert conversation");
     conn.execute_compat(
         "INSERT INTO messages (conversation_id, idx, role, content)
          VALUES (501, 0, 'user', 'derived rebuild fixture')",
-        frankensqlite::params![],
+        coding_agent_search::franken_sync::params![],
     )
     .expect("insert message");
     drop(conn);
@@ -4255,7 +4255,7 @@ fn doctor_json_reports_missing_upstream_source_as_coverage_risk_not_data_loss() 
     let agent_id: i64 = match conn.query_row_map(
         "SELECT id FROM agents WHERE slug = 'codex' LIMIT 1",
         &[],
-        |row: &frankensqlite::Row| row.get_typed(0),
+        |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
     ) {
         Ok(id) => id,
         Err(_) => {
@@ -4267,7 +4267,7 @@ fn doctor_json_reports_missing_upstream_source_as_coverage_risk_not_data_loss() 
             conn.execute_compat(
                 "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
                  VALUES (?1, 'codex', 'Codex', 'test', 'agent', 0, 0)",
-                frankensqlite::params![next_id],
+                coding_agent_search::franken_sync::params![next_id],
             )
             .expect("insert codex agent");
             next_id
@@ -4277,7 +4277,7 @@ fn doctor_json_reports_missing_upstream_source_as_coverage_risk_not_data_loss() 
     conn.execute_compat(
         "INSERT INTO conversations (agent_id, source_id, external_id, title, source_path, started_at)
          VALUES (?1, 'local', 'missing-codex-session', 'missing upstream fixture', ?2, 1700000000000)",
-        frankensqlite::params![agent_id, missing_source_str.as_str()],
+        coding_agent_search::franken_sync::params![agent_id, missing_source_str.as_str()],
     )
     .expect("insert conversation");
     drop(conn);
@@ -4614,13 +4614,13 @@ fn doctor_fix_backfills_legacy_raw_mirror_metadata_without_touching_provider_fil
     conn.execute_compat(
         "INSERT INTO conversations (id, agent_id, source_id, external_id, title, source_path, started_at)
          VALUES (101, ?1, 'local', 'live-backfill', 'live backfill', ?2, 1700000000000)",
-        frankensqlite::params![agent_id, live_source_str.as_str()],
+        coding_agent_search::franken_sync::params![agent_id, live_source_str.as_str()],
     )
     .expect("insert live conversation");
     conn.execute_compat(
         "INSERT INTO conversations (id, agent_id, source_id, external_id, title, source_path, started_at)
          VALUES (102, ?1, 'local', 'changed-backfill', 'changed backfill', ?2, 1700000001000)",
-        frankensqlite::params![agent_id, changed_source_str.as_str()],
+        coding_agent_search::franken_sync::params![agent_id, changed_source_str.as_str()],
     )
     .expect("insert changed conversation");
     for (conversation_id, content) in [
@@ -4630,7 +4630,7 @@ fn doctor_fix_backfills_legacy_raw_mirror_metadata_without_touching_provider_fil
         conn.execute_compat(
             "INSERT INTO messages (conversation_id, idx, role, content)
              VALUES (?1, 0, 'user', ?2)",
-            frankensqlite::params![conversation_id, content],
+            coding_agent_search::franken_sync::params![conversation_id, content],
         )
         .expect("insert message");
     }
@@ -4942,13 +4942,13 @@ fn doctor_fix_refuses_lower_coverage_candidate_with_gate_details() {
     conn.execute_compat(
         "INSERT INTO conversations (id, agent_id, source_id, external_id, title, source_path, started_at)
          VALUES (201, ?1, 'local', 'coverage-gate-live', 'coverage gate live', ?2, 1700000000000)",
-        frankensqlite::params![agent_id, live_source_str.as_str()],
+        coding_agent_search::franken_sync::params![agent_id, live_source_str.as_str()],
     )
     .expect("insert live conversation");
     conn.execute_compat(
         "INSERT INTO messages (conversation_id, idx, role, content)
          VALUES (201, 0, 'user', 'coverage gate archived message')",
-        frankensqlite::params![],
+        coding_agent_search::franken_sync::params![],
     )
     .expect("insert message");
     drop(conn);
@@ -5042,7 +5042,7 @@ fn doctor_json_verifies_raw_mirror_after_upstream_source_is_pruned() {
         .query_row_map(
             "SELECT id FROM agents WHERE slug = 'codex' LIMIT 1",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
         )
         .or_else(|_| {
             let next_id: i64 =
@@ -5052,16 +5052,16 @@ fn doctor_json_verifies_raw_mirror_after_upstream_source_is_pruned() {
             conn.execute_compat(
                 "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
                  VALUES (?1, 'codex', 'Codex', 'test', 'agent', 0, 0)",
-                frankensqlite::params![next_id],
+                coding_agent_search::franken_sync::params![next_id],
             )?;
-            Ok::<i64, frankensqlite::FrankenError>(next_id)
+            Ok::<i64, coding_agent_search::franken_sync::FrankenError>(next_id)
         })
         .expect("codex agent id");
     let missing_source_str = missing_source.to_string_lossy().into_owned();
     conn.execute_compat(
         "INSERT INTO conversations (agent_id, source_id, external_id, title, source_path, started_at)
          VALUES (?1, 'local', 'raw-mirrored-missing-source', 'raw mirrored fixture', ?2, 1700000000000)",
-        frankensqlite::params![agent_id, missing_source_str.as_str()],
+        coding_agent_search::franken_sync::params![agent_id, missing_source_str.as_str()],
     )
     .expect("insert conversation");
     drop(conn);

@@ -7,8 +7,8 @@
 //! - Backup is created before destructive operations
 
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, MigrationError, SqliteStorage};
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use coding_agent_search::franken_sync::Connection as FrankenConnection;
+use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -583,7 +583,7 @@ fn test_failed_migration_preserves_original() {
         .query_row_map(
             "SELECT value FROM meta WHERE key = 'test_data'",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
         )
         .unwrap();
     assert_eq!(test_data, "important");

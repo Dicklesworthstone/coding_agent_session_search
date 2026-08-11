@@ -26,7 +26,7 @@
 //! gate rather than the routine all-targets check.
 
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 use serial_test::serial;
 use std::fs;
 use std::path::Path;

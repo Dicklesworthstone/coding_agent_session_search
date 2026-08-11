@@ -2,9 +2,9 @@
 
 use coding_agent_search::connectors::crush::CrushConnector;
 use coding_agent_search::connectors::{Connector, ScanContext};
-use frankensqlite::Connection;
-use frankensqlite::compat::ConnectionExt;
-use frankensqlite::params;
+use coding_agent_search::franken_sync::Connection;
+use coding_agent_search::franken_sync::compat::ConnectionExt;
+use coding_agent_search::franken_sync::params;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 use tempfile::TempDir;

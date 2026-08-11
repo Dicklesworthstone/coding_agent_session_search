@@ -35,7 +35,7 @@ use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot};
 use coding_agent_search::indexer::quarantine::{QuarantineRecord, QuarantineState};
 use coding_agent_search::indexer::quarantine_retry::{AttemptResult, RetryConfig, execute_retry};
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, FrankenStorage};
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 use tempfile::tempdir;
 use util::timeout::spawn_with_timeout_or_diag;
 

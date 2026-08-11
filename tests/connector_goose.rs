@@ -19,9 +19,9 @@
 
 use coding_agent_search::connectors::goose::GooseConnector;
 use coding_agent_search::connectors::{Connector, NormalizedConversation, ScanContext, ScanRoot};
-use frankensqlite::Connection;
-use frankensqlite::compat::ConnectionExt;
-use frankensqlite::params;
+use coding_agent_search::franken_sync::Connection;
+use coding_agent_search::franken_sync::compat::ConnectionExt;
+use coding_agent_search::franken_sync::params;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;

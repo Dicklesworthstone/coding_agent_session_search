@@ -1,6 +1,6 @@
 use assert_cmd::cargo::cargo_bin_cmd;
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::ConnectionExt;
+use coding_agent_search::franken_sync::Connection as FrankenConnection;
+use coding_agent_search::franken_sync::compat::ConnectionExt;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -40,7 +40,7 @@ fn stats_source_filter_preserves_date_range() {
     conn.execute_compat(
         "INSERT INTO conversations (id, agent_id, workspace_id, source_id, started_at)
          VALUES (1, 1, 1, 'local', ?1)",
-        frankensqlite::params![ts],
+        coding_agent_search::franken_sync::params![ts],
     )
     .expect("insert conversation");
     conn.execute("INSERT INTO messages (id, conversation_id) VALUES (1, 1)")

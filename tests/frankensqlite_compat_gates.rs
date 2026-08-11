@@ -7,9 +7,9 @@
 //! Gate 1: FTS5 full-text search (CREATE VIRTUAL TABLE, MATCH, highlight, etc.)
 //! Gate 2: Existing C SQLite database file compatibility (read rusqlite-created DBs)
 
-use frankensqlite::Connection;
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::RowExt;
+use coding_agent_search::franken_sync::Connection;
+use coding_agent_search::franken_sync::Connection as FrankenConnection;
+use coding_agent_search::franken_sync::compat::RowExt;
 use fsqlite_types::value::SqliteValue;
 use std::fmt::Write as _;
 
