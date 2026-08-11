@@ -690,6 +690,7 @@ pub fn dot_product_f16_simd_bench(stored: &[f16], query: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensearch::SearchError;
 
     #[test]
     fn semantic_source_filters_respect_registered_kind_before_local_id_fallback() {
@@ -811,6 +812,64 @@ mod tests {
         assert_eq!(
             entries_after, entries_before,
             "opening an artifact must not create conventional aliases or ANN sidecars"
+        );
+    }
+
+    #[test]
+    fn exact_artifact_concurrent_query_handles_share_generation_and_refuse_writer_admission() {
+        let dir = tempfile::tempdir().expect("artifact fixture");
+        let fsvi_path = dir.path().join("published-generation.fsvi");
+        let doc_id = SemanticDocId {
+            message_id: 41,
+            chunk_idx: 0,
+            agent_id: 7,
+            workspace_id: 11,
+            source_id: 13,
+            role: ROLE_ASSISTANT,
+            created_at_ms: 1_700_000_000_000,
+            content_hash: None,
+        }
+        .to_doc_id_string();
+        let mut writer = VectorIndex::create_with_revision(
+            &fsvi_path,
+            "fnv1a-2",
+            "published-generation-revision",
+            2,
+            Quantization::F16,
+        )
+        .expect("create published FSVI");
+        writer
+            .write_record(&doc_id, &[1.0, 0.0])
+            .expect("write published FSVI record");
+        writer.finish().expect("finish published FSVI");
+
+        let first = SemanticIndexArtifact::open(&fsvi_path, None)
+            .expect("open first same-inode query handle");
+        let second = SemanticIndexArtifact::open(&fsvi_path, None)
+            .expect("open second same-inode query handle");
+
+        for reader in [&first, &second] {
+            assert_eq!(reader.fsvi_path(), fsvi_path);
+            assert_eq!(
+                reader.index().embedder_revision(),
+                "published-generation-revision"
+            );
+            let hits = reader
+                .index()
+                .search_top_k(&[1.0, 0.0], 1, None)
+                .expect("search published FSVI generation");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, doc_id);
+        }
+
+        let writer_error = VectorIndex::open_writer(&fsvi_path)
+            .expect_err("read-only query handles must refuse competing writer admission");
+        assert!(
+            matches!(
+                &writer_error,
+                SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+            ),
+            "writer admission must fail through the typed FSVI lock contract: {writer_error}"
         );
     }
 
