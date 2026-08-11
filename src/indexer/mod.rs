@@ -28179,7 +28179,15 @@ pub mod persist {
             ENV_LOCK_DEPTH.with(|depth| {
                 let current = depth.get();
                 if current == 0 {
-                    guard = Some(ENV_LOCK.lock().expect("env mutation lock"));
+                    // Recover from poisoning: the lock only serializes env
+                    // mutation and `EnvGuard::drop` restores the variables even
+                    // while unwinding, so a panic in one test must not cascade
+                    // PoisonError failures through every later test.
+                    guard = Some(
+                        ENV_LOCK
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    );
                 }
                 depth.set(current + 1);
             });
