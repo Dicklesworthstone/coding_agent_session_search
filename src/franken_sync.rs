@@ -58,6 +58,69 @@ fn drive<T>(future: impl Future<Output = T>) -> T {
     output
 }
 
+/// True when `err` can mean the connection's schema image predates another
+/// connection's DDL commit.
+///
+/// fsqlite 0.2.1 upstream regression (verified by standalone probe on both
+/// macOS and Linux, absent at the 0.1.19 git pin): a connection opened before
+/// another connection CREATEs a table does not see that table through the
+/// plain `query`/`execute` paths — but `prepare()` refreshes the shared
+/// schema publication before resolving, after which the same SQL succeeds.
+/// The facade therefore treats these errors as possibly-stale-schema, drives
+/// a `prepare()` of the same SQL to force the refresh, and retries once.
+/// Plan-time resolution failures have no side effects, so the retry is safe.
+fn schema_stale(err: &FrankenError) -> bool {
+    matches!(
+        err,
+        FrankenError::NoSuchTable { .. }
+            | FrankenError::NoSuchColumn { .. }
+            | FrankenError::NoSuchIndex { .. }
+    )
+}
+
+/// Bounded retry for `FrankenError::BusyRecovery`.
+///
+/// fsqlite 0.2's ns-lifecycle opens can put a database into a short
+/// "recovery in progress" window; statements admitted during that window
+/// fail with `BusyRecovery` immediately instead of waiting out the
+/// connection's busy timeout. C SQLite's busy handler covers
+/// `SQLITE_BUSY_RECOVERY`, and the 0.1.x line had no recovery windows at
+/// all, so a bounded caller-side retry restores the pre-0.2 observable
+/// behavior. Plain `Busy` is deliberately NOT retried here: cass classifies
+/// ordinary lock contention itself and the engine owns that timeout.
+fn retry_busy_recovery<T>(
+    mut attempt: impl FnMut() -> Result<T, FrankenError>,
+) -> Result<T, FrankenError> {
+    const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(250);
+    let start = std::time::Instant::now();
+    let mut backoff = std::time::Duration::from_millis(5);
+    loop {
+        match attempt() {
+            Err(FrankenError::BusyRecovery) if start.elapsed() < RETRY_BUDGET => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(BACKOFF_CAP);
+            }
+            other => return other,
+        }
+    }
+}
+
+macro_rules! with_engine_retries {
+    ($conn:expr, $sql:expr, $attempt:expr) => {{
+        let first = retry_busy_recovery(|| $attempt);
+        match first {
+            Err(ref err) if schema_stale(err) => {
+                // `prepare` refreshes the schema image from the shared
+                // publication plane even when it ultimately fails to resolve.
+                let _ = drive($conn.prepare($sql));
+                retry_busy_recovery(|| $attempt)
+            }
+            other => other,
+        }
+    }};
+}
+
 // ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
@@ -111,7 +174,7 @@ impl Connection {
 
     /// Execute a single SQL statement, returning the affected row count.
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
-        drive(self.inner.execute(sql))
+        with_engine_retries!(self.inner, sql, drive(self.inner.execute(sql)))
     }
 
     /// Execute a single SQL statement with positional parameters.
@@ -120,7 +183,11 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
-        drive(self.inner.execute_with_params(sql, params))
+        with_engine_retries!(
+            self.inner,
+            sql,
+            drive(self.inner.execute_with_params(sql, params))
+        )
     }
 
     /// Execute a string of semicolon-separated SQL statements.
@@ -130,7 +197,7 @@ impl Connection {
 
     /// Query, returning all rows.
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
-        drive(self.inner.query(sql))
+        with_engine_retries!(self.inner, sql, drive(self.inner.query(sql)))
     }
 
     /// Query with positional parameters, returning all rows.
@@ -139,7 +206,11 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Vec<Row>, FrankenError> {
-        drive(self.inner.query_with_params(sql, params))
+        with_engine_retries!(
+            self.inner,
+            sql,
+            drive(self.inner.query_with_params(sql, params))
+        )
     }
 
     /// Query with positional parameters, streaming rows into `f`.
@@ -147,17 +218,21 @@ impl Connection {
         &self,
         sql: &str,
         params: &[SqliteValue],
-        f: F,
+        mut f: F,
     ) -> Result<(), FrankenError>
     where
         F: FnMut(&Row) -> Result<(), FrankenError>,
     {
-        drive(self.inner.query_with_params_for_each(sql, params, f))
+        with_engine_retries!(
+            self.inner,
+            sql,
+            drive(self.inner.query_with_params_for_each(sql, params, &mut f))
+        )
     }
 
     /// Query, returning exactly one row.
     pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
-        drive(self.inner.query_row(sql))
+        with_engine_retries!(self.inner, sql, drive(self.inner.query_row(sql)))
     }
 
     /// Query with positional parameters, returning exactly one row.
@@ -166,13 +241,17 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Row, FrankenError> {
-        drive(self.inner.query_row_with_params(sql, params))
+        with_engine_retries!(
+            self.inner,
+            sql,
+            drive(self.inner.query_row_with_params(sql, params))
+        )
     }
 
     /// Prepare a statement for repeated execution.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>, FrankenError> {
         Ok(PreparedStatement {
-            inner: drive(self.inner.prepare(sql))?,
+            inner: retry_busy_recovery(|| drive(self.inner.prepare(sql)))?,
         })
     }
 
@@ -282,7 +361,6 @@ impl PreparedStatement<'_> {
 
 pub mod compat {
     use super::{Connection, FrankenError, Row, SqliteValue, drive};
-    use frankensqlite::compat::ConnectionExt as AsyncConnectionExt;
     use frankensqlite::compat::TransactionExt as AsyncTransactionExt;
 
     pub use frankensqlite::compat::{
@@ -324,6 +402,10 @@ pub mod compat {
         fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError>;
     }
 
+    // Implemented over the facade's own retrying primitives (not the async
+    // `compat::ConnectionExt`) so these paths inherit the stale-schema
+    // prepare-refresh retry. Mirrors upstream compat semantics: `ParamValue`
+    // unwrap + rusqlite-style row mapping.
     impl ConnectionExt for Connection {
         fn query_row_map<T, F>(
             &self,
@@ -334,23 +416,32 @@ pub mod compat {
         where
             F: FnOnce(&Row) -> Result<T, FrankenError>,
         {
-            drive(AsyncConnectionExt::query_row_map(self.as_async(), sql, params, f))
+            let values = param_slice_to_values(params);
+            let row = self.query_row_with_params(sql, &values)?;
+            f(&row)
         }
 
         fn query_map_collect<T, F>(
             &self,
             sql: &str,
             params: &[ParamValue],
-            f: F,
+            mut f: F,
         ) -> Result<Vec<T>, FrankenError>
         where
             F: FnMut(&Row) -> Result<T, FrankenError>,
         {
-            drive(AsyncConnectionExt::query_map_collect(self.as_async(), sql, params, f))
+            let values = param_slice_to_values(params);
+            let rows = self.query_with_params(sql, &values)?;
+            let mut mapped = Vec::with_capacity(rows.len());
+            for row in &rows {
+                mapped.push(f(row)?);
+            }
+            Ok(mapped)
         }
 
         fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError> {
-            drive(AsyncConnectionExt::execute_compat(self.as_async(), sql, params))
+            let values = param_slice_to_values(params);
+            self.execute_with_params(sql, &values)
         }
     }
 
@@ -367,7 +458,7 @@ pub mod compat {
     impl Transaction<'_> {
         /// Commit the transaction.
         pub fn commit(&mut self) -> Result<(), FrankenError> {
-            drive(self.inner.commit())
+            super::retry_busy_recovery(|| drive(self.inner.commit()))
         }
 
         /// Roll back the transaction explicitly.
@@ -494,7 +585,9 @@ pub mod compat {
     impl TransactionExt for Connection {
         fn transaction(&self) -> Result<Transaction<'_>, FrankenError> {
             Ok(Transaction {
-                inner: drive(AsyncTransactionExt::transaction(self.as_async()))?,
+                inner: super::retry_busy_recovery(|| {
+                    drive(AsyncTransactionExt::transaction(self.as_async()))
+                })?,
             })
         }
     }

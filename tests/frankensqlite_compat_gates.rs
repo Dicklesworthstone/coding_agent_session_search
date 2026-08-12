@@ -40,19 +40,17 @@ fn rusqlite_is_dev_dependency_only() {
     );
 }
 
-/// The registry archive and the required Git source both declare version
-/// 0.1.19, but only the immutable Git revision contains CASS's
-/// existing-schema-only open contract. Freeze the complete source identity
-/// across the manifest, lockfile, build-time validator, and user-facing
-/// dependency contract so a version-only update cannot silently regress it.
+/// The fsqlite engine family is a crates.io registry pin since 0.2.1 (the
+/// first published release carrying the complete formerly git-pinned line:
+/// existing-only schema opens, deferred-FTS5 validation, ns-lifecycle,
+/// GH#294 mutation-free opens). Freeze the complete source identity across
+/// the manifest, lockfile, build-time validator, and user-facing dependency
+/// contract so a partial bump cannot silently bifurcate the engine family.
 #[test]
-fn frankensqlite_existing_only_source_identity_is_exact_and_coherent() {
-    // 62a58ee3 = branch `fts5-overlong-hotfix-cass362`: the f9cc3294 family
-    // plus only the FTS5 overlong-term skip cap (cass#362). Upstream main has
-    // moved to an async-first API, so the full-forward bump is a separate
-    // validated porting pass.
-    const REVISION: &str = "62a58ee388775ffdf133c069372a6d01e3a589b4";
-    const REPOSITORY: &str = "https://github.com/Dicklesworthstone/frankensqlite";
+fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
+    const VERSION: &str = "0.2.1";
+    const EXACT_REQUIREMENT: &str = "=0.2.1";
+    const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
     let manifest: toml::Table =
         toml::from_str(include_str!("../Cargo.toml")).expect("parse Cargo.toml");
@@ -74,46 +72,34 @@ fn frankensqlite_existing_only_source_identity_is_exact_and_coherent() {
         );
         assert_eq!(
             dependency.get("version").and_then(toml::Value::as_str),
-            Some("0.1.19"),
+            Some(EXACT_REQUIREMENT),
             "{dependency_name} declared version drifted in [{table_name}]"
         );
-        assert_eq!(
-            dependency.get("git").and_then(toml::Value::as_str),
-            Some(REPOSITORY),
-            "{dependency_name} Git source drifted in [{table_name}]"
-        );
-        assert_eq!(
-            dependency.get("rev").and_then(toml::Value::as_str),
-            Some(REVISION),
-            "{dependency_name} revision drifted in [{table_name}]"
+        assert!(
+            dependency.get("git").is_none()
+                && dependency.get("rev").is_none()
+                && dependency.get("path").is_none()
+                && dependency.get("branch").is_none()
+                && dependency.get("tag").is_none(),
+            "{dependency_name} in [{table_name}] must be a pure crates.io registry pin"
         );
     }
 
-    let crates_io_patch = manifest
+    // The pre-0.2.1 [patch.crates-io] git override must not quietly return:
+    // a patch entry would bifurcate the engine family against the registry
+    // requirement of every transitive consumer.
+    if let Some(crates_io_patch) = manifest
         .get("patch")
         .and_then(toml::Value::as_table)
         .and_then(|patches| patches.get("crates-io"))
         .and_then(toml::Value::as_table)
-        .expect("[patch.crates-io] source override");
-    for dependency_name in ["fsqlite", "fsqlite-types"] {
-        let dependency = crates_io_patch
-            .get(dependency_name)
-            .and_then(toml::Value::as_table)
-            .expect("missing crates.io source override");
-        assert_eq!(
-            dependency.get("git").and_then(toml::Value::as_str),
-            Some(REPOSITORY)
-        );
-        assert_eq!(
-            dependency.get("rev").and_then(toml::Value::as_str),
-            Some(REVISION)
-        );
-        assert!(
-            dependency.get("path").is_none()
-                && dependency.get("branch").is_none()
-                && dependency.get("tag").is_none(),
-            "{dependency_name} override must be immutable and clean-clone-safe"
-        );
+    {
+        for dependency_name in crates_io_patch.keys() {
+            assert!(
+                dependency_name != "fsqlite" && !dependency_name.starts_with("fsqlite-"),
+                "[patch.crates-io].{dependency_name} reintroduces an fsqlite source override"
+            );
+        }
     }
 
     let lockfile: toml::Value =
@@ -122,7 +108,6 @@ fn frankensqlite_existing_only_source_identity_is_exact_and_coherent() {
         .get("package")
         .and_then(toml::Value::as_array)
         .expect("Cargo.lock package array");
-    let expected_source = format!("git+{REPOSITORY}?rev={REVISION}#{REVISION}");
     let resolved_fsqlite: Vec<_> = packages
         .iter()
         .filter(|package| {
@@ -136,32 +121,42 @@ fn frankensqlite_existing_only_source_identity_is_exact_and_coherent() {
         !resolved_fsqlite.is_empty(),
         "Cargo.lock must contain the FrankenSQLite package family"
     );
+    let mut seen_names = std::collections::BTreeSet::new();
     for package in resolved_fsqlite {
         let name = package["name"].as_str().expect("locked package name");
+        assert!(
+            seen_names.insert(name.to_string()),
+            "Cargo.lock resolves more than one version of {name}"
+        );
+        assert_eq!(
+            package.get("version").and_then(toml::Value::as_str),
+            Some(VERSION),
+            "{name} resolved at a different version than the pinned registry release"
+        );
         assert_eq!(
             package.get("source").and_then(toml::Value::as_str),
-            Some(expected_source.as_str()),
-            "{name} resolved from a different source despite sharing version 0.1.19"
+            Some(REGISTRY_SOURCE),
+            "{name} resolved from a non-registry source"
         );
         assert!(
-            package.get("checksum").is_none(),
-            "Git-resolved package {name} must not retain a registry checksum"
+            package.get("checksum").is_some(),
+            "registry-resolved package {name} must carry a registry checksum"
         );
     }
 
     let build_contract = include_str!("../build.rs");
     assert!(
-        build_contract.contains(&format!("expected_rev: \"{REVISION}\""))
-            && build_contract.contains(&format!("expected_git: \"{REPOSITORY}\"")),
-        "build.rs must validate the exact FrankenSQLite source identity"
+        build_contract.contains("expected_version: \"0.2.1\"")
+            && build_contract.contains("fn validate_fsqlite_registry_pin"),
+        "build.rs must validate the exact FrankenSQLite registry identity"
     );
     let readme = include_str!("../README.md");
     assert!(
-        readme.contains(&REVISION[..8])
+        readme.contains("=0.2.1")
             && readme.contains("existing-only schema-open contract")
             && readme.contains("registry archive lacks")
             && readme.contains("[patch.crates-io]"),
-        "README must explain why equal version numbers are not interchangeable"
+        "README must document the registry pin and why the old 0.1.19 archive was unusable"
     );
 }
 

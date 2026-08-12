@@ -1530,6 +1530,19 @@ pub(crate) fn move_database_bundle(
         moved.shm = true;
     }
 
+    // fsqlite 0.2.x WAL certification sidecars travel with the WAL they
+    // certify. They are advisory at open, but leaving one behind (or pairing
+    // a destination's stale cert with a freshly moved WAL) is incoherent.
+    for cert_suffix in ["-wal-cert", "-wal-cert-head"] {
+        let cert_source = database_sidecar_path(source_root, cert_suffix);
+        if bundle_path_exists(&cert_source)? {
+            fs::rename(
+                &cert_source,
+                database_sidecar_path(destination_root, cert_suffix),
+            )?;
+        }
+    }
+
     if moved.moved_any() {
         if let Some(parent) = source_root.parent() {
             sync_parent_directory(parent)?;
@@ -1612,7 +1625,7 @@ fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<(
 
 fn copyable_bundle_sidecar_sources(source_root: &Path) -> Result<Vec<(PathBuf, &'static str)>> {
     let mut sidecars = Vec::new();
-    for suffix in ["-wal", "-shm"] {
+    for suffix in ["-wal", "-wal-cert", "-wal-cert-head", "-shm"] {
         let source_sidecar = database_sidecar_path(source_root, suffix);
         if copyable_bundle_file_exists(&source_sidecar)? {
             sidecars.push((source_sidecar, suffix));
@@ -3096,6 +3109,12 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
         // bundle candidate and can even be seeded into the canonical path.
         "-fsqlite-ns-gate",
         "-fsqlite-ns-use",
+        // fsqlite 0.2.x WAL certification sidecars. Created next to any
+        // database with WAL content; advisory at open (a copied bundle
+        // without them recovers normally, probe-verified), but they are
+        // runtime artifacts, never independent archives.
+        "-wal-cert",
+        "-wal-cert-head",
     ];
     SIDECAR_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
@@ -12066,58 +12085,32 @@ impl FrankenStorage {
 
         // A rowid range is not bounded by `rows.len()`: imported archives can
         // have sparse message IDs, so MIN..MAX could materialize millions of
-        // unrelated docsize rows for a 5,000-row repair page. A plain IN-list
-        // is not suitable on the pinned frankensqlite either: its current VDBE
-        // plan rewinds the table and evaluates the list as a residual filter.
-        // Compound UNION ALL probes are also unsafe on that version because
-        // its prepared SELECT path compiles only the first compound arm.
-        //
-        // Materialize only this page's IDs in a connection-local TEMP table,
-        // then drive a join from that bounded table into the docsize shadow.
-        // FrankenSQLite's multi-join lookup path rewinds the small driver and
-        // emits one SeekRowid into the large table for each requested ID. That
-        // keeps work and memory O(page size) without 5,000 query dispatches;
-        // the ignored two-million-row regression below measures the complete
-        // page and the plan tests pin the driver/seek cursor assignments.
-        self.conn
-            .execute(
-                "CREATE TEMP TABLE IF NOT EXISTS cass_fts_repair_probe_ids(
-                     id INTEGER PRIMARY KEY
-                 )",
-            )
-            .with_context(|| "creating connection-local FTS rowid probe table")?;
-        self.conn
-            .execute("DELETE FROM cass_fts_repair_probe_ids")
-            .with_context(|| "clearing connection-local FTS rowid probe table")?;
-        for chunk in rows.chunks(FTS_EXACT_ROWID_PROBE_INSERT_CHUNK_SIZE) {
-            let sql = fts_exact_rowid_probe_insert_sql(chunk.len());
-            let params: Vec<SqliteValue> = chunk
-                .iter()
-                .map(|row| SqliteValue::from(row.message_id))
-                .collect();
-            self.conn
-                .execute_with_params(&sql, &params)
-                .with_context(|| "loading bounded FTS rowid probe page")?;
-        }
-
+        // unrelated docsize rows for a 5,000-row repair page. On fsqlite
+        // 0.2.1 the correct bounded shape is a chunked *bound IN-list*: the
+        // planner compiles one `SeekRowid` into the shadow per element with
+        // no rewind/residual scan (the plan tests pin this). The pre-0.2
+        // TEMP-driver join is no longer usable: at 0.2.1, join point-seeks
+        // into fts5 shadow tables silently drop sparse high rowids
+        // (probe-verified against a standalone fsqlite 0.2.1 binary), while
+        // IN-list point-seeks return them correctly. Work and memory stay
+        // O(page size) at one dispatch per `FTS_EXACT_ROWID_PROBE_CHUNK_SIZE`
+        // IDs; the ignored two-million-row regression below measures the
+        // complete page.
         let mut existing = HashSet::with_capacity(rows.len());
-        let statement = self
-            .conn
-            .prepare(
-                "SELECT f.id
-                 FROM cass_fts_repair_probe_ids requested
-                 INNER JOIN fts_messages_docsize f ON f.id = requested.id",
-            )
-            .with_context(|| "preparing bounded exact FTS docsize rowid join")?;
-        let matched = statement
-            .query_with_params(&[])
-            .with_context(|| "probing bounded exact FTS docsize rowids")?;
-        for matched_row in matched {
-            existing.insert(
-                matched_row
-                    .get_typed::<i64>(0)
-                    .with_context(|| "decoding exact FTS docsize rowid probe result")?,
-            );
+        for chunk in rows.chunks(FTS_EXACT_ROWID_PROBE_CHUNK_SIZE) {
+            let ids: Vec<i64> = chunk.iter().map(|row| row.message_id).collect();
+            let sql = fts_exact_rowid_probe_select_sql(&ids);
+            let matched = self
+                .conn
+                .query(&sql)
+                .with_context(|| "probing bounded exact FTS docsize rowids")?;
+            for matched_row in matched {
+                existing.insert(
+                    matched_row
+                        .get_typed::<i64>(0)
+                        .with_context(|| "decoding exact FTS docsize rowid probe result")?,
+                );
+            }
         }
         Ok(existing)
     }
@@ -17478,7 +17471,7 @@ const FTS_REBUILD_BATCH_SIZE_DEFAULT: usize = 5_000;
 
 /// Bound parameter count and SQL text while loading the TEMP driver used for
 /// exact docsize membership probes. The page itself remains capped at 5,000.
-const FTS_EXACT_ROWID_PROBE_INSERT_CHUNK_SIZE: usize = 512;
+const FTS_EXACT_ROWID_PROBE_CHUNK_SIZE: usize = 512;
 
 /// Choose the largest ordered prefix whose message bodies fit `max_body_bytes`.
 ///
@@ -17508,17 +17501,20 @@ fn plan_fts_rebuild_message_page(
     })
 }
 
-fn fts_exact_rowid_probe_insert_sql(count: usize) -> String {
-    debug_assert!(count > 0 && count <= FTS_EXACT_ROWID_PROBE_INSERT_CHUNK_SIZE);
-    let mut sql = String::from("INSERT INTO cass_fts_repair_probe_ids(id) VALUES");
-    for index in 0..count {
+/// Literal (not bound) rowid IN-list: on fsqlite 0.2.1 a literal IN-list
+/// compiles to one `SeekRowid` per element, while a bound-parameter IN-list
+/// still compiles to a full rewind + residual-filter scan of the shadow.
+/// Message rowids are `i64`, so inlining them is injection-safe.
+fn fts_exact_rowid_probe_select_sql(ids: &[i64]) -> String {
+    debug_assert!(!ids.is_empty() && ids.len() <= FTS_EXACT_ROWID_PROBE_CHUNK_SIZE);
+    let mut sql = String::from("SELECT id FROM fts_messages_docsize WHERE id IN (");
+    for (index, id) in ids.iter().enumerate() {
         if index > 0 {
             sql.push(',');
         }
-        sql.push_str("(?");
-        sql.push_str(&(index + 1).to_string());
-        sql.push(')');
+        sql.push_str(&id.to_string());
     }
+    sql.push(')');
     sql
 }
 
@@ -18487,29 +18483,25 @@ mod tests {
         let found = storage
             .load_fts_message_rowid_set_for_batch(&rows)
             .expect("load exact sparse FTS rowids");
+        let lookup_sql = format!(
+            "EXPLAIN {}",
+            fts_exact_rowid_probe_select_sql(&[sparse_requested_id, first_id])
+        );
         let lookup_opcodes: Vec<(String, i64)> = storage
             .raw()
-            .query_map_collect(
-                "EXPLAIN
-                 SELECT f.id
-                 FROM cass_fts_repair_probe_ids requested
-                 INNER JOIN fts_messages_docsize f ON f.id = requested.id",
-                fparams![],
-                |row| Ok((row.get_typed(1)?, row.get_typed(2)?)),
-            )
-            .expect("explain the actual bounded-driver FTS rowid join");
+            .query_map_collect(&lookup_sql, fparams![], |row| {
+                Ok((row.get_typed(1)?, row.get_typed(2)?))
+            })
+            .expect("explain the actual bounded IN-list FTS rowid probe");
         assert!(
             lookup_opcodes
                 .iter()
-                .any(|(opcode, cursor)| opcode == "Rewind" && *cursor == 0)
-                && lookup_opcodes
-                    .iter()
-                    .any(|(opcode, cursor)| opcode == "SeekRowid" && *cursor == 1)
+                .any(|(opcode, cursor)| opcode == "SeekRowid" && *cursor == 0)
                 && !lookup_opcodes.iter().any(|(opcode, cursor)| matches!(
                     opcode.as_str(),
                     "Rewind" | "Next"
-                ) && *cursor == 1),
-            "the bounded TEMP driver may scan itself but must point-seek the large shadow: {lookup_opcodes:?}"
+                ) && *cursor == 0),
+            "the bounded IN-list probe must point-seek the large shadow, never scan it: {lookup_opcodes:?}"
         );
 
         assert_eq!(
@@ -18534,7 +18526,7 @@ mod tests {
                 |row| row.get_typed(0),
             )
             .unwrap();
-        let rows: Vec<FtsRebuildMessageRow> = (0..=FTS_EXACT_ROWID_PROBE_INSERT_CHUNK_SIZE)
+        let rows: Vec<FtsRebuildMessageRow> = (0..=FTS_EXACT_ROWID_PROBE_CHUNK_SIZE)
             .map(|offset| FtsRebuildMessageRow {
                 message_id: first_id + i64::try_from(offset).unwrap(),
                 conversation_id: 1,
@@ -18544,31 +18536,33 @@ mod tests {
             .collect();
         let found = storage
             .load_fts_message_rowid_set_for_batch(&rows)
-            .expect("probe more IDs than one TEMP insert chunk");
+            .expect("probe more IDs than one IN-list chunk");
         assert_eq!(found, HashSet::from([first_id]));
 
+        let full_chunk_ids: Vec<i64> = (0..FTS_EXACT_ROWID_PROBE_CHUNK_SIZE)
+            .map(|offset| first_id + i64::try_from(offset).unwrap())
+            .collect();
+        let explain_sql = format!(
+            "EXPLAIN {}",
+            fts_exact_rowid_probe_select_sql(&full_chunk_ids)
+        );
         let opcodes: Vec<(String, i64)> = storage
             .raw()
-            .query_map_collect(
-                "EXPLAIN
-                 SELECT f.id
-                 FROM cass_fts_repair_probe_ids requested
-                 INNER JOIN fts_messages_docsize f ON f.id = requested.id",
-                fparams![],
-                |row| Ok((row.get_typed(1)?, row.get_typed(2)?)),
-            )
-            .expect("explain bounded TEMP-driver exact-rowid join");
+            .query_map_collect(&explain_sql, fparams![], |row| {
+                Ok((row.get_typed(1)?, row.get_typed(2)?))
+            })
+            .expect("explain full-chunk bounded IN-list exact-rowid probe");
         assert_eq!(
             opcodes
                 .iter()
-                .filter(|(opcode, cursor)| opcode == "SeekRowid" && *cursor == 1)
+                .filter(|(opcode, cursor)| opcode == "SeekRowid" && *cursor == 0)
                 .count(),
-            1,
-            "the join loop must use one direct shadow seek opcode: {opcodes:?}"
+            FTS_EXACT_ROWID_PROBE_CHUNK_SIZE,
+            "a full chunk must compile to one direct shadow seek per requested ID: {opcodes:?}"
         );
         assert!(
             !opcodes.iter().any(
-                |(opcode, cursor)| matches!(opcode.as_str(), "Rewind" | "Next") && *cursor == 1
+                |(opcode, cursor)| matches!(opcode.as_str(), "Rewind" | "Next") && *cursor == 0
             ),
             "bounded exact-rowid probes must not scan the shadow cursor: {opcodes:?}"
         );
