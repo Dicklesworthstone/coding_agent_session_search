@@ -210,6 +210,7 @@ COMPREHENSIVE_ISSUES_AND_PROBLEMS_WITH_CASS_BASED_ON_COMPLETE_SESSION_HISTORY_AN
 .beads/*.lock
 .beads/.migration-hint-ts
 .beads/*.bak_*
+.beads/last-touched
 
 # Test log output
 test-logs/
