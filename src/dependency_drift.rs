@@ -64,11 +64,12 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "fsqlite",
         manifest_table: "dependencies",
         manifest_key: "frankensqlite",
-        // Git-pinned since the same-version registry archive lacks the
-        // existing-only schema-open contract cass depends on (cass#345);
+        // Registry-pinned since fsqlite 0.2.1: the published archive now
+        // carries the complete formerly git-pinned line (existing-only
+        // schema opens, deferred-FTS5 validation, ns-lifecycle, GH#294);
         // the compat gates in tests/frankensqlite_compat_gates.rs own the
-        // exact revision.
-        source_kind: "git",
+        // exact version.
+        source_kind: "registry",
         repo_rel: "../frankensqlite",
         required_tests: &[
             STRICT_CHECK_COMMAND,
@@ -81,7 +82,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "fsqlite-types",
         manifest_table: "dev-dependencies",
         manifest_key: "fsqlite-types",
-        source_kind: "git",
+        source_kind: "registry",
         repo_rel: "../frankensqlite",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
@@ -927,9 +928,9 @@ mod tests {
         let frankensqlite_spec = dependency_spec("frankensqlite")?;
         let frankensqlite = manifest_pin(&manifest, frankensqlite_spec);
         ensure(
-            frankensqlite.status == "pinned",
+            frankensqlite.status == "version-pinned",
             format!(
-                "expected frankensqlite git-pinned, got {}",
+                "expected frankensqlite registry version-pinned, got {}",
                 frankensqlite.status
             ),
         )?;
@@ -937,15 +938,15 @@ mod tests {
             frankensqlite.package.as_deref() == Some(frankensqlite_spec.package),
             "frankensqlite package should match the dependency spec",
         )?;
-        // The exact revision is owned by tests/frankensqlite_compat_gates.rs;
-        // here we only require a well-formed immutable pin so routine pin
+        // The exact version is owned by tests/frankensqlite_compat_gates.rs;
+        // here we only require an exact (`=`) registry pin so routine pin
         // bumps do not have to touch this test.
         ensure(
             frankensqlite
-                .rev
+                .version
                 .as_deref()
-                .is_some_and(|rev| rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit())),
-            "frankensqlite git pin should carry a full 40-hex revision",
+                .is_some_and(|version| version.starts_with('=')),
+            "frankensqlite registry pin should be an exact `=` version pin",
         )?;
 
         let asupersync = manifest_pin(&manifest, dependency_spec("asupersync")?);
