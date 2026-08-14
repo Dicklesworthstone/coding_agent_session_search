@@ -33,14 +33,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
-use frankensearch::index::VectorIndex as FsVectorIndex;
 use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 #[cfg(test)]
 use crate::franken_sync::compat::{
     Transaction as FrankenTransaction, TransactionExt as FrankenTransactionExt,
 };
+use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
+use frankensearch::index::VectorIndex as FsVectorIndex;
 use fs2::FileExt;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
@@ -14863,13 +14863,31 @@ pub fn run_index(
                         .any(|e| e.path().extension().is_some_and(|ext| ext == "fsvi"))
                 })
                 .unwrap_or(false);
-        let has_watermark = storage.get_last_embedded_message_id()?.is_some();
+        let last_embedded = storage.get_last_embedded_message_id()?;
+        let has_watermark = last_embedded.is_some();
+        // #394: a one-shot `index --semantic` used to ignore the watermark
+        // entirely and re-embed the whole corpus every run. When the existing
+        // index + watermark already cover the newest message, there is nothing
+        // to embed — skip the bulk pass on one-shot runs too.
+        let watermark_covers_corpus = has_existing_index
+            && match (last_embedded, storage.max_message_id()?) {
+                (Some(watermark), Some(max_id)) => watermark >= max_id,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
 
         if opts.watch && has_existing_index && has_watermark {
             tracing::info!(
                 dir = %vi_dir.display(),
                 "skipping bulk semantic re-embed (existing index + watermark found); \
                  incremental watch callback will handle new messages"
+            );
+        } else if watermark_covers_corpus {
+            tracing::info!(
+                dir = %vi_dir.display(),
+                watermark = last_embedded.unwrap_or(0),
+                "skipping bulk semantic re-embed: watermark already covers the \
+                 newest message and a vector index exists (issue #394)"
             );
         } else {
             // The lexical pass may leave the shared progress atomics in phase
@@ -21816,7 +21834,9 @@ fn ingest_non_watch_batch_once(
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
         // exercises the downcast path that real frankensqlite OOMs hit, instead
         // of relying on the plain-string fallback.
-        return Err(anyhow::Error::new(crate::franken_sync::FrankenError::OutOfMemory));
+        return Err(anyhow::Error::new(
+            crate::franken_sync::FrankenError::OutOfMemory,
+        ));
     }
 
     let outcome = ingest_batch_detailed(
@@ -22152,7 +22172,9 @@ fn ingest_watch_batch_with_oom_split_inner(
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
         // exercises the downcast path that real frankensqlite OOMs hit, instead
         // of relying on the plain-string fallback.
-        Err(anyhow::Error::new(crate::franken_sync::FrankenError::OutOfMemory))
+        Err(anyhow::Error::new(
+            crate::franken_sync::FrankenError::OutOfMemory,
+        ))
     } else {
         let mut semantic_delta = WatchSemanticDelta::default();
         ingest_batch_with_semantic_delta(
@@ -22237,7 +22259,9 @@ fn ingest_watch_batch_with_oom_split_inner(
             // conversation (solo ingest also OOMs) set
             // `CASS_TEST_WATCH_SOLO_RETRY_OOM=1`.
             let solo_retry = if should_force_watch_solo_retry_oom() {
-                Err(anyhow::Error::new(crate::franken_sync::FrankenError::OutOfMemory))
+                Err(anyhow::Error::new(
+                    crate::franken_sync::FrankenError::OutOfMemory,
+                ))
             } else {
                 ingest_watch_batch_with_oom_split_inner(
                     storage,
@@ -26329,9 +26353,9 @@ pub mod persist {
     #[cfg(test)]
     use std::time::Instant;
 
-    use anyhow::{Context, Result, anyhow};
     use crate::franken_sync::FrankenError;
     use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
+    use anyhow::{Context, Result, anyhow};
     use rand::RngExt;
     use rayon::prelude::*;
 
@@ -28622,8 +28646,8 @@ pub mod persist {
         #[test]
         fn begin_concurrent_persist_writes_all_conversations() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("test.db");
@@ -28739,8 +28763,8 @@ pub mod persist {
         #[test]
         fn begin_concurrent_single_conversation_works() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("test.db");
@@ -28804,8 +28828,8 @@ pub mod persist {
         #[serial]
         fn persist_conversations_batched_can_defer_inline_lexical_updates() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
 
@@ -28877,8 +28901,8 @@ pub mod persist {
         #[serial]
         fn begin_concurrent_persist_can_defer_inline_lexical_updates() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
@@ -29635,9 +29659,9 @@ pub mod persist {
         #[serial]
         fn persist_conversations_batched_falls_back_for_duplicate_keys() {
             use crate::connectors::NormalizedConversation;
+            use crate::franken_sync::compat::{ConnectionExt, RowExt};
             use crate::search::tantivy::TantivyIndex;
             use crate::sources::provenance::{Source, SourceKind};
-            use crate::franken_sync::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
@@ -29761,8 +29785,8 @@ pub mod persist {
             // asserts that the parallel pre-compute does NOT change the
             // persisted content, message ordering, or redaction behaviour.
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
             // Force redaction on so we exercise the heavier allocation path
@@ -30007,8 +30031,8 @@ pub mod persist {
             // begin-concurrent writers the *same* redacted, ordered data the
             // old per-chunk map_to_internal loop produced.
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             // Use chunk_size 8 so the 32-conv batch splits across multiple
@@ -30097,8 +30121,8 @@ pub mod persist {
             // and with =shadow, diff the resulting DB state by
             // (external_id, started_at) tuples.
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             fn run_once(parallel_wal: Option<&str>) -> Vec<(String, i64)> {
                 let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
@@ -30240,8 +30264,8 @@ pub mod persist {
         #[serial]
         fn persist_conversations_batched_registers_missing_remote_source_in_serial_path() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
 
@@ -30311,8 +30335,8 @@ pub mod persist {
         fn persist_conversations_batched_registers_missing_remote_source_in_begin_concurrent_path()
         {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
@@ -30385,8 +30409,8 @@ pub mod persist {
         #[serial]
         fn persist_conversations_batched_reuses_auto_registered_remote_source_across_serial_runs() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
 
@@ -30513,8 +30537,8 @@ pub mod persist {
         fn persist_conversations_batched_reuses_auto_registered_remote_source_across_begin_concurrent_runs()
          {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
@@ -30640,8 +30664,8 @@ pub mod persist {
         #[test]
         fn persist_conversation_registers_missing_remote_source() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("single-remote-source.db");
@@ -30704,8 +30728,8 @@ pub mod persist {
         #[test]
         fn persist_conversation_host_only_remote_source_infers_source_id_from_host() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::franken_sync::compat::{ConnectionExt, RowExt};
+            use crate::search::tantivy::TantivyIndex;
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("single-host-only-remote.db");
@@ -31044,9 +31068,9 @@ mod tests {
     use crate::connectors::{
         Connector, DetectionResult, NormalizedConversation, NormalizedMessage, ScanContext,
     };
+    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::sources::provenance::SourceKind;
-    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
     use fsqlite_types::value::SqliteValue;
     use serial_test::serial;
     use tempfile::TempDir;

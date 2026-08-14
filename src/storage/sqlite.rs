@@ -1,8 +1,5 @@
 //! `SQLite` backend: schema, pragmas, and migrations.
 
-use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
-use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
-use anyhow::{Context, Result, anyhow, bail};
 use crate::franken_sync::{
     Connection as FrankenConnection, Row as FrankenRow, SqliteValue,
     compat::{
@@ -13,6 +10,9 @@ use crate::franken_sync::{
     },
     migrate::MigrationRunner,
 };
+use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
+use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -216,8 +216,9 @@ impl LazyFrankenDb {
                     match acquire_doctor_mutation_db_open_guard(&path_for_guard, timeout) {
                         Ok(guard) => guard,
                         Err(err) => {
-                            let _ = tx
-                                .send(Err(crate::franken_sync::FrankenError::Internal(err.to_string())));
+                            let _ = tx.send(Err(crate::franken_sync::FrankenError::Internal(
+                                err.to_string(),
+                            )));
                             return;
                         }
                     };
@@ -12211,6 +12212,22 @@ impl FrankenStorage {
         }
     }
 
+    /// Highest message rowid currently in the canonical archive, or `None`
+    /// when the messages table is empty. Compared against the
+    /// `last_embedded_message_id` watermark to decide whether a one-shot
+    /// `index --semantic` run has anything left to embed (issue #394).
+    pub fn max_message_id(&self) -> Result<Option<i64>> {
+        let max: i64 = self
+            .conn
+            .query_row_map(
+                "SELECT COALESCE(MAX(id), 0) FROM messages",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| "reading max message id for semantic watermark comparison")?;
+        Ok((max > 0).then_some(max))
+    }
+
     /// Set the watermark for incremental semantic embedding.
     pub fn set_last_embedded_message_id(&self, id: i64) -> Result<()> {
         self.conn.execute_compat(
@@ -12264,7 +12281,10 @@ impl FrankenStorage {
                 fparams![db_path, model_id, total_docs],
             );
             if let Err(err) = insert_result {
-                if !matches!(err, crate::franken_sync::FrankenError::UniqueViolation { .. }) {
+                if !matches!(
+                    err,
+                    crate::franken_sync::FrankenError::UniqueViolation { .. }
+                ) {
                     return Err(err.into());
                 }
                 self.conn.execute_compat(
@@ -17887,6 +17907,36 @@ mod tests {
     }
 
     #[test]
+    fn max_message_id_tracks_messages_table() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("max-message-id.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(
+            storage.max_message_id().unwrap(),
+            None,
+            "an empty archive must report no max message id"
+        );
+
+        seed_atomic_fts_rebuild_fixture(&storage);
+        let max = storage
+            .max_message_id()
+            .unwrap()
+            .expect("seeded archive must report a max message id");
+        let expected: i64 = storage
+            .raw()
+            .query_row_map("SELECT MAX(id) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(max, expected);
+
+        // The one-shot semantic skip (issue #394) compares this against the
+        // embedding watermark; a watermark at max must read back intact.
+        storage.set_last_embedded_message_id(max).unwrap();
+        assert_eq!(storage.get_last_embedded_message_id().unwrap(), Some(max));
+    }
+
+    #[test]
     fn fts_indexable_count_and_intersection_plans_are_bounded_and_exact() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts-indexable-count-plan.db");
@@ -23139,9 +23189,9 @@ mod tests {
     #[test]
     fn parallel_insert_conversation_tree_keeps_unique_external_ids_distinct() {
         use crate::connectors::{NormalizedConversation, NormalizedMessage};
+        use crate::franken_sync::compat::{ConnectionExt, RowExt};
         use crate::indexer::persist::map_to_internal;
         use crate::model::types::{Agent, AgentKind};
-        use crate::franken_sync::compat::{ConnectionExt, RowExt};
         use rand::RngExt;
         use rayon::prelude::*;
 
@@ -29912,8 +29962,8 @@ mod tests {
 
     #[test]
     fn franken_insert_conversations_batched_populates_analytics_rollups() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use crate::franken_sync::compat::{ConnectionExt, RowExt};
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
         let dir = TempDir::new().unwrap();
