@@ -836,9 +836,7 @@ fn semantic_tail_state_has_message_after(
             },
         )
         .with_context(|| {
-            format!(
-                "reading tail message id for conversation {conversation_id} at idx {tail_idx}"
-            )
+            format!("reading tail message id for conversation {conversation_id} at idx {tail_idx}")
         })?;
     Ok(tail_message_id.map(|tail_id| tail_id > after_message_id))
 }
@@ -5482,7 +5480,10 @@ mod tests {
             "missing tail message must fall back to the exhaustive probe"
         );
         // No tail row at all (id 99): decline as well.
-        assert_eq!(semantic_tail_state_has_message_after(&storage, 99, 0)?, None);
+        assert_eq!(
+            semantic_tail_state_has_message_after(&storage, 99, 0)?,
+            None
+        );
 
         // The public probe agrees with the fast path and with the fallback.
         assert!(semantic_conversation_has_message_after(
