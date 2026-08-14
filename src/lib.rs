@@ -74,14 +74,14 @@ pub mod update_check;
 pub mod workflow_analytics;
 pub mod workflow_macros;
 
-use anyhow::Result;
-use base64::prelude::*;
-use chrono::Utc;
-use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use crate::franken_sync::compat::{
     ConnectionExt, OpenFlags as FrankenOpenFlags, RowExt,
     open_with_flags as open_franken_with_flags,
 };
+use anyhow::Result;
+use base64::prelude::*;
+use chrono::Utc;
+use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use indexer::IndexOptions;
 use model::cli_error_kind::ErrorKind as CliErrorKind;
 use serde::{Deserialize, Serialize};
@@ -116,18 +116,55 @@ fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
     None
 }
 
+/// #377: watch-once trigger classification (`classify_paths`) matches paths
+/// lexically against connector scan roots, so a relative or symlinked supplied
+/// path silently produces zero triggers and the run is skipped. Absolutize
+/// against the current directory and resolve symlinks at resolve time; a path
+/// that cannot be canonicalized (e.g. already deleted) keeps its absolutized
+/// form and is warned about loudly instead of vanishing without a trace.
+fn canonicalize_watch_once_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let absolute = if path.is_absolute() {
+                path
+            } else {
+                match std::env::current_dir() {
+                    Ok(cwd) => cwd.join(&path),
+                    Err(_) => path,
+                }
+            };
+            match std::fs::canonicalize(&absolute) {
+                Ok(canonical) => canonical,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %absolute.display(),
+                        error = %err,
+                        "watch-once path could not be canonicalized; it may not \
+                         match any connector scan root and its run may be \
+                         skipped (issue #377)"
+                    );
+                    absolute
+                }
+            }
+        })
+        .collect()
+}
+
 fn resolve_watch_once_paths_from_sources(
     watch: bool,
     watch_once: Option<Vec<PathBuf>>,
     env_watch_once_paths: Option<Vec<PathBuf>>,
 ) -> Option<Vec<PathBuf>> {
     let explicit = watch_once.filter(|paths| !paths.is_empty());
-    if explicit.is_some() {
-        return explicit;
+    if let Some(paths) = explicit {
+        return Some(canonicalize_watch_once_paths(paths));
     }
 
     if watch {
-        return env_watch_once_paths.filter(|paths| !paths.is_empty());
+        return env_watch_once_paths
+            .filter(|paths| !paths.is_empty())
+            .map(canonicalize_watch_once_paths);
     }
 
     None
@@ -191,7 +228,9 @@ fn with_frankensqlite_connection<T, F>(
     op: F,
 ) -> std::result::Result<T, crate::franken_sync::FrankenError>
 where
-    F: FnOnce(&crate::franken_sync::Connection) -> std::result::Result<T, crate::franken_sync::FrankenError>,
+    F: FnOnce(
+        &crate::franken_sync::Connection,
+    ) -> std::result::Result<T, crate::franken_sync::FrankenError>,
 {
     let mut conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
     let result = op(&conn);
@@ -20149,8 +20188,8 @@ fn prepare_headless_once_tui_artifacts(
 
     let db_path = data_dir.join("agent_search.db");
     {
-        let _conn =
-            crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref()).map_err(|e| {
+        let _conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())
+            .map_err(|e| {
                 anyhow::anyhow!(
                     "initialize SQLite database for headless --once at {}: {e}",
                     db_path.display()
@@ -20310,6 +20349,42 @@ mod watch_once_resolution_tests {
         let env_paths = Some(vec![PathBuf::from("/tmp/leaked-watch-path.jsonl")]);
         let resolved = resolve_watch_once_paths_from_sources(false, explicit.clone(), env_paths);
         assert_eq!(resolved, explicit);
+    }
+
+    /// #377: relative supplied paths must be absolutized so lexical scan-root
+    /// matching in classify_paths can succeed.
+    #[test]
+    fn relative_watch_once_paths_are_absolutized() {
+        let resolved = resolve_watch_once_paths_from_sources(
+            false,
+            Some(vec![PathBuf::from("some/relative/session.jsonl")]),
+            None,
+        )
+        .expect("explicit paths resolve");
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            resolved[0].is_absolute(),
+            "relative watch-once path must be absolutized, got {}",
+            resolved[0].display()
+        );
+        assert!(resolved[0].ends_with("some/relative/session.jsonl"));
+    }
+
+    /// #377: symlinked supplied paths must resolve to their canonical target
+    /// so they match the connector scan roots discovered from real paths.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_watch_once_paths_resolve_to_canonical_target() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let real = dir.path().join("real-session.jsonl");
+        std::fs::write(&real, "{}\n").expect("write real file");
+        let link = dir.path().join("link-session.jsonl");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+
+        let resolved = resolve_watch_once_paths_from_sources(false, Some(vec![link]), None)
+            .expect("explicit paths resolve");
+        let canonical_real = std::fs::canonicalize(&real).expect("canonicalize real path");
+        assert_eq!(resolved, vec![canonical_real]);
     }
 }
 
@@ -31216,9 +31291,11 @@ fn doctor_database_integrity_probe(
 
     set_phase("quick_check");
     let quick_check_status: String = conn
-        .query_row_map("PRAGMA quick_check(1)", &[], |row: &crate::franken_sync::Row| {
-            row.get_typed(0)
-        })
+        .query_row_map(
+            "PRAGMA quick_check(1)",
+            &[],
+            |row: &crate::franken_sync::Row| row.get_typed(0),
+        )
         .map_err(|err| format!("running PRAGMA quick_check(1): {err}"))?;
 
     let quick_check_ok = quick_check_status.trim().eq_ignore_ascii_case("ok");
@@ -44048,7 +44125,10 @@ fn doctor_candidate_copy_to_staging(
     })
 }
 
-fn doctor_candidate_table_count(conn: &crate::franken_sync::Connection, table: &str) -> Option<usize> {
+fn doctor_candidate_table_count(
+    conn: &crate::franken_sync::Connection,
+    table: &str,
+) -> Option<usize> {
     let table = match table {
         "conversations" | "messages" => table,
         _ => return None,
@@ -44173,21 +44253,23 @@ fn doctor_candidate_live_archive_copy_probe(
             db_path.display()
         )
     })?;
-    let result: std::result::Result<(Option<usize>, Option<usize>), crate::franken_sync::FrankenError> =
-        (|| {
-            let conversations =
-                doctor_candidate_table_count(&conn, "conversations").ok_or_else(|| {
-                    crate::franken_sync::FrankenError::Internal(
-                        "live archive DB has no readable conversations table".to_string(),
-                    )
-                })?;
-            let messages = doctor_candidate_table_count(&conn, "messages").ok_or_else(|| {
+    let result: std::result::Result<
+        (Option<usize>, Option<usize>),
+        crate::franken_sync::FrankenError,
+    > = (|| {
+        let conversations =
+            doctor_candidate_table_count(&conn, "conversations").ok_or_else(|| {
                 crate::franken_sync::FrankenError::Internal(
-                    "live archive DB has no readable messages table".to_string(),
+                    "live archive DB has no readable conversations table".to_string(),
                 )
             })?;
-            Ok((Some(conversations), Some(messages)))
-        })();
+        let messages = doctor_candidate_table_count(&conn, "messages").ok_or_else(|| {
+            crate::franken_sync::FrankenError::Internal(
+                "live archive DB has no readable messages table".to_string(),
+            )
+        })?;
+        Ok((Some(conversations), Some(messages)))
+    })();
     if let Err(close_err) = conn.close_without_checkpoint_in_place() {
         tracing::warn!(
             error = %close_err,
@@ -96780,8 +96862,8 @@ mod export_timestamp_tests {
 #[cfg(test)]
 mod legacy_source_filter_tests {
     use super::*;
-    use crate::sources::provenance::SourceFilter;
     use crate::franken_sync::compat::{ConnectionExt, RowExt};
+    use crate::sources::provenance::SourceFilter;
     use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -96949,7 +97031,9 @@ mod legacy_source_filter_tests {
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let params_vec = vec![param.expect("source id param").into()];
         let count: i64 = conn
-            .query_row_map(&sql, &params_vec, |r: &crate::franken_sync::Row| r.get_typed(0))
+            .query_row_map(&sql, &params_vec, |r: &crate::franken_sync::Row| {
+                r.get_typed(0)
+            })
             .expect("count blank remote source rows");
         assert_eq!(count, 1);
 
@@ -96976,7 +97060,9 @@ mod legacy_source_filter_tests {
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let params_vec = vec![param.expect("source id param").into()];
         let count: i64 = conn
-            .query_row_map(&sql, &params_vec, |r: &crate::franken_sync::Row| r.get_typed(0))
+            .query_row_map(&sql, &params_vec, |r: &crate::franken_sync::Row| {
+                r.get_typed(0)
+            })
             .expect("count trimmed local source rows");
         assert_eq!(count, 1);
 
@@ -100017,9 +100103,9 @@ fn run_timeline(
     group_by: TimelineGrouping,
     source: Option<String>,
 ) -> CliResult<()> {
+    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
     use crate::sources::provenance::SourceFilter;
     use chrono::{Local, TimeZone, Utc};
-    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
     use std::collections::HashMap;
 
     // Parse source filter (P3.2)
@@ -102548,6 +102634,12 @@ fn run_sources_sync(
     let mut all_reports = Vec::new();
     let mut total_files = 0u64;
     let mut total_bytes = 0u64;
+    // #392: `sources sync` used to report status "complete" and exit 0 even
+    // when every path of every source failed. Track per-source outcomes so the
+    // top-level status and the process exit code tell the truth.
+    let mut attempted_sources = 0usize;
+    let mut sources_with_failures = 0usize;
+    let mut sources_fully_failed = 0usize;
 
     for source in &sources_to_sync {
         let sync_decision = status.decision_for_source_at(source, now_ms, true);
@@ -102621,9 +102713,20 @@ fn run_sources_sync(
         }
 
         // Perform actual sync
+        attempted_sources += 1;
         let report = match engine.sync_source(source) {
-            Ok(r) => r,
+            Ok(r) => {
+                if !r.all_succeeded {
+                    sources_with_failures += 1;
+                    if !r.path_results.is_empty() && r.path_results.iter().all(|p| !p.success) {
+                        sources_fully_failed += 1;
+                    }
+                }
+                r
+            }
             Err(e) => {
+                sources_with_failures += 1;
+                sources_fully_failed += 1;
                 let failed_report = SyncReport::failed(source.name.clone(), e);
                 status.update(&source.name, &failed_report);
 
@@ -102771,18 +102874,43 @@ fn run_sources_sync(
         }
     });
 
+    // #392: the top-level status must reflect per-source outcomes instead of
+    // asserting "complete" unconditionally.
+    let overall_status = if attempted_sources > 0 && sources_fully_failed == attempted_sources {
+        "failed"
+    } else if sources_with_failures > 0 {
+        "partial"
+    } else {
+        "complete"
+    };
+
     if let Some(_fmt) = structured_format {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "status": "complete",
+                "status": overall_status,
                 "dry_run": dry_run,
                 "sources": all_reports,
+                "sources_attempted": attempted_sources,
+                "sources_with_failures": sources_with_failures,
+                "sources_fully_failed": sources_fully_failed,
                 "total_files": total_files,
                 "total_bytes": total_bytes,
                 "will_reindex": !no_index && !dry_run,
             }))
             .unwrap_or_default()
+        );
+    } else if sources_with_failures > 0 {
+        println!(
+            "{} {} of {} synced source(s) had failures{}",
+            "Warning:".yellow().bold(),
+            sources_with_failures,
+            attempted_sources,
+            if overall_status == "failed" {
+                " (all paths failed)"
+            } else {
+                ""
+            }
         );
     }
 
@@ -102823,6 +102951,43 @@ fn run_sources_sync(
             false, // no_progress_events
             false, // robot_trace_ingest
         )?;
+    }
+
+    // #392: exit nonzero when the sync did not fully succeed. The summary JSON
+    // above is the data surface (stdout); this error envelope is the
+    // diagnostic surface (stderr + exit code). Runs where every attempted
+    // source failed exit 12 (source/SSH problem); partial failures exit 8
+    // (partial result). Both are retryable.
+    if attempted_sources > 0 && sources_fully_failed == attempted_sources {
+        return Err(CliError {
+            code: 12,
+            kind: CliErrorKind::Source.kind_str(),
+            message: format!(
+                "sources sync failed: all {attempted_sources} attempted source(s) failed every path"
+            ),
+            hint: Some(
+                "Inspect per-path errors in the JSON output; check SSH connectivity and \
+                 remote paths, then retry with 'cass sources sync'"
+                    .into(),
+            ),
+            retryable: true,
+        });
+    }
+    if sources_with_failures > 0 {
+        return Err(CliError {
+            code: 8,
+            kind: CliErrorKind::Source.kind_str(),
+            message: format!(
+                "sources sync partially failed: {sources_with_failures} of {attempted_sources} \
+                 attempted source(s) had path failures"
+            ),
+            hint: Some(
+                "Successful paths were synced and indexed; inspect per-path errors in the \
+                 JSON output and retry the failed sources"
+                    .into(),
+            ),
+            retryable: true,
+        });
     }
 
     Ok(())
