@@ -6,9 +6,9 @@
 //! - Failed migrations are handled gracefully
 //! - Backup is created before destructive operations
 
-use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, MigrationError, SqliteStorage};
 use coding_agent_search::franken_sync::Connection as FrankenConnection;
 use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, MigrationError, SqliteStorage};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;

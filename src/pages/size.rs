@@ -3,9 +3,9 @@
 //! Provides pre-export size estimation to warn users before they spend time
 //! exporting/encrypting data that would exceed GitHub Pages limits.
 
-use anyhow::{Context, Result, bail};
 use crate::franken_sync::Row;
 use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

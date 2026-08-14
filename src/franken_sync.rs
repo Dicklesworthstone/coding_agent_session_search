@@ -29,9 +29,7 @@ use std::future::Future;
 
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 
-pub use frankensqlite::{
-    FileIdentity, FrankenError, Row, SqliteValue, fsqlite_vfs, params,
-};
+pub use frankensqlite::{FileIdentity, FrankenError, Row, SqliteValue, fsqlite_vfs, params};
 
 // ---------------------------------------------------------------------------
 // Bridge driver
@@ -43,11 +41,13 @@ thread_local! {
 
 /// Drive a `!Send` fsqlite future to completion on the calling thread.
 fn drive<T>(future: impl Future<Output = T>) -> T {
-    let runtime = DRIVER.with(|slot| slot.borrow_mut().take()).unwrap_or_else(|| {
-        RuntimeBuilder::current_thread()
-            .build()
-            .expect("failed to build FrankenSQLite sync-bridge runtime")
-    });
+    let runtime = DRIVER
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_else(|| {
+            RuntimeBuilder::current_thread()
+                .build()
+                .expect("failed to build FrankenSQLite sync-bridge runtime")
+        });
     let output = runtime.block_on(future);
     DRIVER.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -160,9 +160,7 @@ impl Connection {
         path: impl Into<String>,
     ) -> Result<Self, FrankenError> {
         Ok(Self {
-            inner: drive(
-                frankensqlite::Connection::open_existing_schema_only_deferred_fts5(path),
-            )?,
+            inner: drive(frankensqlite::Connection::open_existing_schema_only_deferred_fts5(path))?,
         })
     }
 

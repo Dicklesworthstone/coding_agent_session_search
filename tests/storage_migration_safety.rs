@@ -1,5 +1,5 @@
-use coding_agent_search::storage::sqlite::{MigrationError, SqliteStorage};
 use coding_agent_search::franken_sync::Connection;
+use coding_agent_search::storage::sqlite::{MigrationError, SqliteStorage};
 use std::path::Path;
 use tempfile::TempDir;
 

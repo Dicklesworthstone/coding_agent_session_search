@@ -8,8 +8,8 @@
 //!
 //! Bead: coding_agent_session_search-1p9xd
 
-use coding_agent_search::storage::sqlite::SqliteStorage;
 use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;

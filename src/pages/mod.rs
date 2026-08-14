@@ -1,6 +1,6 @@
-use anyhow::{Context, Result, bail};
 use crate::franken_sync::Connection;
 use crate::franken_sync::compat::OpenFlags;
+use anyhow::{Context, Result, bail};
 use std::fs::Metadata;
 #[cfg(not(windows))]
 use std::fs::OpenOptions;

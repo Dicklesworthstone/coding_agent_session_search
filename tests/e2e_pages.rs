@@ -16,13 +16,13 @@
 //! cargo test --test e2e_pages test_full_export_pipeline_password_only
 //! ```
 
+use coding_agent_search::franken_sync::Connection;
 use coding_agent_search::model::types::{Agent, AgentKind};
 use coding_agent_search::pages::bundle::{BundleBuilder, BundleResult};
 use coding_agent_search::pages::encrypt::{DecryptionEngine, EncryptionEngine, load_config};
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
 use coding_agent_search::pages::verify::verify_bundle;
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use coding_agent_search::franken_sync::Connection;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::Value;
 use std::fs;

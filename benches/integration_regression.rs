@@ -18,6 +18,7 @@ mod bench_utils;
 
 use bench_utils::configure_criterion;
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
+use coding_agent_search::franken_sync::FrankenError;
 use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
@@ -25,7 +26,6 @@ use coding_agent_search::storage::sqlite::{
     ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use coding_agent_search::franken_sync::FrankenError;
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Duration;

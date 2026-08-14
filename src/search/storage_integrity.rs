@@ -873,7 +873,9 @@ fn inspect_native_writer_lock(_db_path: &std::path::Path) -> LockAdmissionProbe 
 }
 
 #[cfg(unix)]
-fn lock_admission_outcome_from_error(err: &crate::franken_sync::FrankenError) -> LockAdmissionProbe {
+fn lock_admission_outcome_from_error(
+    err: &crate::franken_sync::FrankenError,
+) -> LockAdmissionProbe {
     use crate::search::contention_diagnostics::{ContentionClass, classify_franken_error};
 
     if classify_franken_error(err).is_some_and(|class| {
@@ -902,7 +904,10 @@ fn observe_anyhow_contention(err: &anyhow::Error, probe: &mut DedicatedStoragePr
     }
 }
 
-fn observe_typed_contention(err: &crate::franken_sync::FrankenError, probe: &mut DedicatedStorageProbe) {
+fn observe_typed_contention(
+    err: &crate::franken_sync::FrankenError,
+    probe: &mut DedicatedStorageProbe,
+) {
     use crate::search::contention_diagnostics::{ContentionClass, classify_franken_error};
 
     probe.busy_or_locked |= classify_franken_error(err).is_some_and(|class| {

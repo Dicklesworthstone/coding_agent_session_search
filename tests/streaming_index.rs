@@ -9,9 +9,9 @@
 //! Part of bead: coding_agent_session_search-decq (Opt 8.3)
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 use coding_agent_search::indexer::streaming_index_enabled;
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;

@@ -4,9 +4,9 @@ use super::cass_bin;
 use super::doctor_fixture::{
     DoctorFixtureFactory, DoctorFixtureScenario, default_expected_artifact_keys,
 };
-use coding_agent_search::storage::sqlite::SqliteStorage;
 use coding_agent_search::franken_sync::Connection as FrankenConnection;
 use coding_agent_search::franken_sync::compat::ConnectionExt;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

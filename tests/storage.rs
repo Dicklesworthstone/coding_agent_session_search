@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
+use coding_agent_search::franken_sync::Connection as FrankenConnection;
+use coding_agent_search::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use coding_agent_search::storage::sqlite::{MigrationError, SqliteStorage};
-use coding_agent_search::franken_sync::Connection as FrankenConnection;
-use coding_agent_search::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 
 fn open_fixture_db(path: impl AsRef<Path>) -> FrankenConnection {
     let path = path.as_ref().to_string_lossy();

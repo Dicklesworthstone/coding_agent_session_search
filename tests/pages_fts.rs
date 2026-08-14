@@ -7,13 +7,13 @@
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::franken_sync::{Connection as FrankenConnection, params as fparams};
     use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
     use coding_agent_search::pages::fts::{
         Fts5SearchMode, detect_search_mode, escape_fts5_query, format_fts5_query,
         validate_fts5_query,
     };
-    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
-    use coding_agent_search::franken_sync::{Connection as FrankenConnection, params as fparams};
     use std::path::Path;
     use tempfile::TempDir;
 

@@ -4,16 +4,16 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::franken_sync::{
+    SqliteValue,
+    compat::{ConnectionExt, ParamValue, RowExt},
+};
 use anyhow::{Context, Result, bail};
 use frankensearch::index::{
     HNSW_DEFAULT_EF_CONSTRUCTION as FS_HNSW_DEFAULT_EF_CONSTRUCTION,
     HNSW_DEFAULT_M as FS_HNSW_DEFAULT_M, HnswConfig as FsHnswConfig, HnswIndex as FsHnswIndex,
     Quantization as FsQuantization, VectorIndex as FsVectorIndex,
     VectorIndexWriter as FsVectorIndexWriter, wal_path_for as fsvi_wal_path_for,
-};
-use crate::franken_sync::{
-    SqliteValue,
-    compat::{ConnectionExt, ParamValue, RowExt},
 };
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;

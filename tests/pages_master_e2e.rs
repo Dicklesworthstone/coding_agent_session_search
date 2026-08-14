@@ -25,6 +25,9 @@
 //! ```
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use coding_agent_search::franken_sync::Connection as FrankenConnection;
+use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+use coding_agent_search::franken_sync::params;
 use coding_agent_search::model::types::{Agent, AgentKind};
 use coding_agent_search::pages::bundle::{BundleBuilder, BundleResult};
 use coding_agent_search::pages::encrypt::{DecryptionEngine, EncryptionEngine, load_config};
@@ -32,9 +35,6 @@ use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
 use coding_agent_search::pages::key_management::{key_add_password, key_list, key_revoke};
 use coding_agent_search::pages::verify::verify_bundle;
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use coding_agent_search::franken_sync::Connection as FrankenConnection;
-use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
-use coding_agent_search::franken_sync::params;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};

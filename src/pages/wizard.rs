@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use crate::franken_sync::Connection;
 use crate::pages::bundle::{BundleBuilder, BundleConfig};
 use crate::pages::confirmation::{
     ConfirmationConfig, ConfirmationFlow, ConfirmationStep, PasswordStrengthAction, StepValidation,
@@ -27,7 +28,6 @@ use crate::pages::summary::{
     ExclusionSet, PrePublishSummary, SummaryFilters, SummaryGenerator, format_size,
 };
 use crate::storage::sqlite::FrankenStorage;
-use crate::franken_sync::Connection;
 
 /// Deployment target for the export
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

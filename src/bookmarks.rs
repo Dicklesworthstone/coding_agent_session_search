@@ -3,10 +3,10 @@
 //! Provides persistent storage for bookmarked search results with user notes
 //! and tags. Uses a separate `SQLite` database file to avoid schema conflicts.
 
-use anyhow::{Context, Result};
 use crate::franken_sync::Connection;
 use crate::franken_sync::compat::{ConnectionExt, OptionalExtension, RowExt, TransactionExt};
 use crate::franken_sync::params;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -343,7 +343,9 @@ impl BookmarkStore {
 }
 
 /// Convert a database row to a Bookmark
-fn row_to_bookmark(row: &crate::franken_sync::Row) -> Result<Bookmark, crate::franken_sync::FrankenError> {
+fn row_to_bookmark(
+    row: &crate::franken_sync::Row,
+) -> Result<Bookmark, crate::franken_sync::FrankenError> {
     Ok(Bookmark {
         id: row.get_typed(0)?,
         title: row.get_typed(1)?,

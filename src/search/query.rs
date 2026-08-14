@@ -5397,27 +5397,31 @@ impl SearchClient {
         );
 
         let conversation_rows: Vec<(i64, ConversationHydrationRow)> = transaction
-            .query_map_collect(&sql, &conversation_params, |row: &crate::franken_sync::Row| {
-                let conversation_id: i64 = row.get_typed(0)?;
-                let title: Option<String> = if field_mask.wants_title() {
-                    row.get_typed(1)?
-                } else {
-                    None
-                };
-                Ok((
-                    conversation_id,
-                    ConversationHydrationRow {
-                        title,
-                        source_path: row.get_typed(2)?,
-                        source_id: row.get_typed(3)?,
-                        origin_host: row.get_typed(4)?,
-                        agent: row.get_typed(5)?,
-                        workspace: row.get_typed(6)?,
-                        origin_kind: row.get_typed(7)?,
-                        started_at: row.get_typed(8)?,
-                    },
-                ))
-            })?;
+            .query_map_collect(
+                &sql,
+                &conversation_params,
+                |row: &crate::franken_sync::Row| {
+                    let conversation_id: i64 = row.get_typed(0)?;
+                    let title: Option<String> = if field_mask.wants_title() {
+                        row.get_typed(1)?
+                    } else {
+                        None
+                    };
+                    Ok((
+                        conversation_id,
+                        ConversationHydrationRow {
+                            title,
+                            source_path: row.get_typed(2)?,
+                            source_id: row.get_typed(3)?,
+                            origin_host: row.get_typed(4)?,
+                            agent: row.get_typed(5)?,
+                            workspace: row.get_typed(6)?,
+                            origin_kind: row.get_typed(7)?,
+                            started_at: row.get_typed(8)?,
+                        },
+                    ))
+                },
+            )?;
 
         let conversations_by_id: HashMap<i64, ConversationHydrationRow> =
             conversation_rows.into_iter().collect();
@@ -9377,12 +9381,12 @@ impl SearchClient {
 mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
+    use crate::franken_sync::Connection as FrankenConnection;
+    use crate::franken_sync::compat::ParamValue;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::tantivy::TantivyIndex;
     use crate::search::vector_index::VectorIndex;
     use crate::storage::sqlite::FrankenStorage;
-    use crate::franken_sync::Connection as FrankenConnection;
-    use crate::franken_sync::compat::ParamValue;
     use serde_json::json;
     use tempfile::TempDir;
 

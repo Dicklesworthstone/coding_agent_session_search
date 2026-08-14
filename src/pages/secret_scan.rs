@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, bail};
-use console::{Term, style};
 use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, params_from_iter};
 use crate::franken_sync::params;
+use anyhow::{Context, Result, bail};
+use console::{Term, style};
 use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;

@@ -355,10 +355,10 @@ fn test_wizard_state_final_site_dir_tracking() {
 // than a frozen golden snapshot. The tests should validate that it is
 // non-empty and exportable without hard-coding a specific agent roster.
 
-use coding_agent_search::pages::config_input::PagesConfig;
-use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
 use coding_agent_search::franken_sync::Connection as FrankenConnection;
 use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+use coding_agent_search::pages::config_input::PagesConfig;
+use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
 
 fn open_franken_connection(path: &Path) -> FrankenConnection {
     FrankenConnection::open(path.to_string_lossy().into_owned())

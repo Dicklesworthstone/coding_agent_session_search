@@ -1,10 +1,10 @@
+use crate::franken_sync::compat::{ConnectionExt, RowExt};
+use crate::franken_sync::{FrankenError, Row};
 use crate::model::types::{Conversation, Message, MessageRole, Workspace};
 use crate::search::query::SearchHit;
 use crate::storage::sqlite::FrankenStorage;
 use crate::ui::components::theme::ThemePalette;
 use anyhow::Result;
-use crate::franken_sync::compat::{ConnectionExt, RowExt};
-use crate::franken_sync::{FrankenError, Row};
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -457,7 +457,10 @@ fn cached_conversation_matches_lookup_head(
             format!(
                 "SELECT id, {normalized_source_sql} FROM conversations WHERE source_path = ?1 AND {normalized_source_sql} = ?2 ORDER BY started_at DESC LIMIT 1"
             ),
-            crate::franken_sync::params![source_path, normalize_ui_source_id_value(Some(source_id))],
+            crate::franken_sync::params![
+                source_path,
+                normalize_ui_source_id_value(Some(source_id))
+            ],
         )
     } else {
         (

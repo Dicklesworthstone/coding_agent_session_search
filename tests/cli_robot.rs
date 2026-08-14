@@ -132,7 +132,9 @@ fn isolated_search_demo_data_for_current_workspace() -> Result<TempDir, Box<dyn 
     let tmp = isolated_search_demo_data()?;
     let current_workspace = std::env::current_dir()?.to_string_lossy().into_owned();
     let db_path = tmp.path().join("agent_search.db");
-    let conn = coding_agent_search::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())?;
+    let conn = coding_agent_search::franken_sync::Connection::open(
+        db_path.to_string_lossy().into_owned(),
+    )?;
     conn.execute_compat(
         "UPDATE workspaces SET path = ?1 WHERE id = 1",
         coding_agent_search::franken_sync::params![current_workspace],

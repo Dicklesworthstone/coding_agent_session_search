@@ -9,9 +9,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
 use crate::franken_sync::Connection as FrankenConnection;
 use crate::franken_sync::compat::{ConnectionExt, RowExt};
+use anyhow::{Context, Result, anyhow};
 use half::f16;
 
 pub use frankensearch::index::{Quantization, SearchParams, VectorIndex, VectorIndexWriter};

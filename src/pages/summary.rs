@@ -21,13 +21,13 @@
 //! println!("{}", summary.render_overview());
 //! ```
 
+use crate::franken_sync::Connection;
+use crate::franken_sync::Row;
+use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 use crate::pages::encrypt::{KeySlot, SlotType};
 use crate::pages::secret_scan::{SecretScanReport, SecretScanSummary};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use crate::franken_sync::Connection;
-use crate::franken_sync::Row;
-use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};

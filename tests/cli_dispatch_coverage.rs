@@ -11,9 +11,9 @@ use assert_cmd::Command;
 use coding_agent_search::evidence_bundle::{
     EvidenceBundleChunk, EvidenceBundleChunkRole, EvidenceBundleKind, EvidenceBundleManifest,
 };
-use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 use coding_agent_search::franken_sync::{Connection as FrankenConnection, params as fparams};
+use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use predicates::prelude::*;
 use predicates::str::contains;
 use serde_json::{Value, json};
@@ -246,7 +246,9 @@ fn seed_analytics_models_workspace_fixture(temp_home: &TempDir) -> PathBuf {
         .query_map_collect(
             "SELECT path, id FROM workspaces",
             &[],
-            |row: &coding_agent_search::franken_sync::Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+            |row: &coding_agent_search::franken_sync::Row| {
+                Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?))
+            },
         )
         .unwrap();
     let workspace_a_id = workspace_rows
@@ -469,7 +471,9 @@ fn seed_analytics_remote_source_tokens_fixture(temp_home: &TempDir) {
         .query_map_collect(
             "SELECT path, id FROM workspaces",
             &[],
-            |row: &coding_agent_search::franken_sync::Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+            |row: &coding_agent_search::franken_sync::Row| {
+                Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?))
+            },
         )
         .unwrap();
     let workspace_b_id = workspace_rows
@@ -513,7 +517,9 @@ fn seed_analytics_remote_source_tools_fixture(temp_home: &TempDir) {
         .query_map_collect(
             "SELECT path, id FROM workspaces",
             &[],
-            |row: &coding_agent_search::franken_sync::Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+            |row: &coding_agent_search::franken_sync::Row| {
+                Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?))
+            },
         )
         .unwrap();
     let workspace_b_id = workspace_rows
@@ -1131,7 +1137,9 @@ fn timeline_json_normalizes_remote_provenance_without_source_row() {
             "user@work-laptop",
         ))
         .unwrap();
-    let conn = coding_agent_search::franken_sync::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    let conn =
+        coding_agent_search::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+            .unwrap();
     conn.execute("UPDATE sources SET kind = '' WHERE id = 'work-laptop'")
         .unwrap();
 
@@ -1212,7 +1220,9 @@ fn timeline_json_derives_remote_source_id_from_origin_host_when_source_id_blank(
     let workspace_id = storage
         .ensure_workspace(&workspace, Some("workspace"))
         .unwrap();
-    let conn = coding_agent_search::franken_sync::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    let conn =
+        coding_agent_search::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+            .unwrap();
     conn.execute(
         "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES ('   ', 'remote', 'user@work-laptop', 0, 0)",
     )
@@ -2471,7 +2481,9 @@ fn sessions_json_derives_remote_source_id_from_origin_host_when_source_id_blank(
     let workspace_id = storage
         .ensure_workspace(&workspace, Some("workspace"))
         .unwrap();
-    let conn = coding_agent_search::franken_sync::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    let conn =
+        coding_agent_search::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+            .unwrap();
     conn.execute(
         "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES ('   ', 'remote', 'user@work-laptop', 0, 0)",
     )
@@ -2540,7 +2552,9 @@ fn sessions_json_keeps_local_file_metadata_for_blank_source_id() {
     let workspace_id = storage
         .ensure_workspace(&workspace, Some("workspace"))
         .unwrap();
-    let conn = coding_agent_search::franken_sync::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    let conn =
+        coding_agent_search::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+            .unwrap();
     conn.execute(
         "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES ('   ', 'local', NULL, 0, 0)",
     )

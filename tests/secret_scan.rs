@@ -1,12 +1,12 @@
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use coding_agent_search::pages::secret_scan::{
-        SecretScanConfig, SecretScanFilters, SecretScanReport, SecretSeverity, scan_database,
-    };
     use coding_agent_search::franken_sync::Connection as FrankenConnection;
     use coding_agent_search::franken_sync::compat::ConnectionExt;
     use coding_agent_search::franken_sync::params as fparams;
+    use coding_agent_search::pages::secret_scan::{
+        SecretScanConfig, SecretScanFilters, SecretScanReport, SecretSeverity, scan_database,
+    };
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 

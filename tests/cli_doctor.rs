@@ -1,7 +1,7 @@
 use assert_cmd::Command;
-use coding_agent_search::search::tantivy::expected_index_dir;
 use coding_agent_search::franken_sync::Connection as FrankenConnection;
 use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+use coding_agent_search::search::tantivy::expected_index_dir;
 use fs2::FileExt;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -513,9 +513,11 @@ fn corrupt_unused_secondary_index_entry(db_path: &Path) {
         .expect("insert integrity probe row");
     }
     let quick_before: String = conn
-        .query_row_map("PRAGMA quick_check(1);", &[], |row: &coding_agent_search::franken_sync::Row| {
-            row.get_typed(0)
-        })
+        .query_row_map(
+            "PRAGMA quick_check(1);",
+            &[],
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
+        )
         .expect("quick_check before corruption");
     assert_eq!(quick_before, "ok");
     let index_root_page: i64 = conn
@@ -526,9 +528,11 @@ fn corrupt_unused_secondary_index_entry(db_path: &Path) {
         )
         .expect("integrity probe index root page");
     let page_size: i64 = conn
-        .query_row_map("PRAGMA page_size;", &[], |row: &coding_agent_search::franken_sync::Row| {
-            row.get_typed(0)
-        })
+        .query_row_map(
+            "PRAGMA page_size;",
+            &[],
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
+        )
         .unwrap_or(4096);
     conn.query("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("checkpoint fixture db before raw page mutation");
@@ -565,9 +569,11 @@ fn corrupt_unused_secondary_index_entry(db_path: &Path) {
     let verify_conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())
         .expect("reopen corrupted fixture");
     let quick_after: String = verify_conn
-        .query_row_map("PRAGMA quick_check(1);", &[], |row: &coding_agent_search::franken_sync::Row| {
-            row.get_typed(0)
-        })
+        .query_row_map(
+            "PRAGMA quick_check(1);",
+            &[],
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
+        )
         .expect("quick_check after index corruption");
     assert_eq!(
         quick_after, "ok",

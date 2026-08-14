@@ -637,7 +637,9 @@ fn load_keep_tag_conversation_ids(
             .collect::<Vec<_>>();
         params.extend(id_chunk.iter().copied().map(ParamValue::from));
         let rows: Vec<i64> = conn
-            .query_map_collect(&sql, &params, |row: &crate::franken_sync::Row| row.get_typed(0))
+            .query_map_collect(&sql, &params, |row: &crate::franken_sync::Row| {
+                row.get_typed(0)
+            })
             .with_context(|| "query raw-mirror prune keep-tag conversation pins")?;
         pinned.extend(rows);
     }

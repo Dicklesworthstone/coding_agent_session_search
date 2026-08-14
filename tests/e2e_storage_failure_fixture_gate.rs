@@ -2076,7 +2076,9 @@ fn park_fixture_wal_and_create_orphan_shm(data_dir: &Path) -> Result<(), String>
         .map_err(|err| format!("write orphan SHM fixture: {err}"))
 }
 
-fn hold_probe_fixture_exclusive_writer(db: &Path) -> Result<coding_agent_search::franken_sync::Connection, String> {
+fn hold_probe_fixture_exclusive_writer(
+    db: &Path,
+) -> Result<coding_agent_search::franken_sync::Connection, String> {
     use coding_agent_search::franken_sync::compat::{ConnectionExt as _, ParamValue};
 
     let conn = coding_agent_search::franken_sync::Connection::open(db.display().to_string())

@@ -1,8 +1,8 @@
 use assert_cmd::Command;
-use coding_agent_search::search::tantivy::{SCHEMA_HASH, expected_index_dir};
-use coding_agent_search::storage::sqlite::FrankenStorage;
 use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 use coding_agent_search::franken_sync::params as fparams;
+use coding_agent_search::search::tantivy::{SCHEMA_HASH, expected_index_dir};
+use coding_agent_search::storage::sqlite::FrankenStorage;
 use fs2::FileExt;
 use fsqlite_types::value::SqliteValue;
 use serde_json::{Value, json};

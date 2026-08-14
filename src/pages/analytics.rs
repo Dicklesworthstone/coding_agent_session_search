@@ -25,10 +25,10 @@
 //! bundle.write_to_dir(&output_dir)?;
 //! ```
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use crate::franken_sync::compat::{ConnectionExt, RowExt};
 use crate::franken_sync::{Connection, Row};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;

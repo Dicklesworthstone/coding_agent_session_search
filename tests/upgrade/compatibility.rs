@@ -6,9 +6,9 @@
 //! - Unknown fields are gracefully ignored
 //! - Missing optional fields have sensible defaults
 
+use coding_agent_search::franken_sync::Connection as FrankenConnection;
 use coding_agent_search::pages::encrypt::{EncryptionConfig, KdfAlgorithm, SlotType};
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, MigrationError, SqliteStorage};
-use coding_agent_search::franken_sync::Connection as FrankenConnection;
 use serde_json::json;
 use std::path::Path;
 use tempfile::TempDir;
@@ -511,7 +511,8 @@ fn test_search_without_fts() {
 fn test_path_dependency_compile_contracts() {
     use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 
-    let conn = coding_agent_search::franken_sync::Connection::open(":memory:").expect("open frankensqlite memory db");
+    let conn = coding_agent_search::franken_sync::Connection::open(":memory:")
+        .expect("open frankensqlite memory db");
     conn.execute("CREATE TABLE contract_check (value INTEGER)")
         .expect("create contract table");
     let _params_contract = coding_agent_search::franken_sync::params![7_i64];

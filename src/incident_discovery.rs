@@ -20,9 +20,9 @@
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow};
 use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 use crate::franken_sync::{Connection, Row};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::analytics::{AnalyticsFilter, SourceFilter};

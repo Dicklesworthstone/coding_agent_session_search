@@ -18,12 +18,12 @@
 //!     pick up the operator's real `~/.config/cass/sources.toml`.
 
 use assert_cmd::Command;
+use coding_agent_search::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 use coding_agent_search::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, SemanticShardBuildPlan,
 };
 use coding_agent_search::search::semantic_manifest::{SemanticShardManifest, TierKind};
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use coding_agent_search::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;

@@ -193,7 +193,9 @@ impl ContentionClass {
 /// is a `.14.1` integrity state). The struct variants are matched with `{ .. }`
 /// so this stays robust to field-shape changes, with a catch-all for any
 /// future non-contention variant.
-pub(crate) fn classify_franken_error(err: &crate::franken_sync::FrankenError) -> Option<ContentionClass> {
+pub(crate) fn classify_franken_error(
+    err: &crate::franken_sync::FrankenError,
+) -> Option<ContentionClass> {
     use crate::franken_sync::FrankenError as E;
     match err {
         E::Busy | E::DatabaseLocked { .. } | E::LockFailed { .. } => {
@@ -628,9 +630,9 @@ mod tests {
 #[cfg(test)]
 mod contention_integration_tests {
     use super::{ContentionClass, classify_franken_error};
-    use crate::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager, WriterGuard};
     use crate::franken_sync::compat::{RowExt, TransactionExt};
     use crate::franken_sync::params as fparams;
+    use crate::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager, WriterGuard};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
