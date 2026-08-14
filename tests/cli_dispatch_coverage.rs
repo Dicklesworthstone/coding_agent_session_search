@@ -4294,10 +4294,41 @@ fn analytics_rebuild_parses_force_and_json_flags() {
     );
 
     match cli.command {
-        Some(Commands::Analytics(AnalyticsCommand::Rebuild { common, force })) => {
+        Some(Commands::Analytics(AnalyticsCommand::Rebuild {
+            common,
+            force,
+            track,
+        })) => {
             assert!(force, "--force should be true");
             assert!(common.json, "--json should be true");
+            assert_eq!(
+                track,
+                coding_agent_search::AnalyticsTrack::A,
+                "--track should default to Track A"
+            );
         }
         other => panic!("expected analytics rebuild, got {other:?}"),
+    }
+}
+
+/// #397: `analytics validate` recommends `--track all`; the flag must parse
+/// for every documented value.
+#[test]
+fn analytics_rebuild_parses_track_flag() {
+    for (value, expected) in [
+        ("a", coding_agent_search::AnalyticsTrack::A),
+        ("b", coding_agent_search::AnalyticsTrack::B),
+        ("all", coding_agent_search::AnalyticsTrack::All),
+    ] {
+        let cli = parse_cli_ok(
+            ["cass", "analytics", "rebuild", "--track", value, "--json"],
+            "parse analytics rebuild with --track",
+        );
+        match cli.command {
+            Some(Commands::Analytics(AnalyticsCommand::Rebuild { track, .. })) => {
+                assert_eq!(track, expected, "--track {value} should parse");
+            }
+            other => panic!("expected analytics rebuild, got {other:?}"),
+        }
     }
 }

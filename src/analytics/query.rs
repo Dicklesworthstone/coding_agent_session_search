@@ -1119,7 +1119,15 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
     let stale_threshold_ms: i64 = 86_400_000;
 
     let track_a_fresh = is_recently_updated(uh.last_updated, now_ms, stale_threshold_ms);
-    let track_b_fresh = is_recently_updated(tds.last_updated, now_ms, stale_threshold_ms);
+    // #397: an empty token_usage ledger gives Track B nothing to aggregate, so
+    // token_daily_stats can never earn a last_updated stamp. Without this
+    // vacuous-fresh case, corpora with no API token metadata report Track B as
+    // permanently stale, `recommended_action: "rebuild_track_b"` never clears,
+    // and the TUI re-triggers a full multi-minute auto-rebuild on every
+    // launch. Empty source + empty rollup is a terminal, healthy state.
+    let track_b_vacuously_fresh = tu.row_count == 0 && tds.row_count == 0;
+    let track_b_fresh = track_b_vacuously_fresh
+        || is_recently_updated(tds.last_updated, now_ms, stale_threshold_ms);
 
     if track_a_fresh && !track_b_fresh && has_token_daily_stats {
         drift_signals.push(DriftSignal {

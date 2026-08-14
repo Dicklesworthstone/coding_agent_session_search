@@ -2546,6 +2546,19 @@ impl std::fmt::Display for AnalyticsBucketing {
     }
 }
 
+/// Which analytics track(s) `cass analytics rebuild` regenerates (#397 —
+/// `analytics validate` has recommended `--track all` since the two-track
+/// split; this makes that flag real).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AnalyticsTrack {
+    /// Track A: message-level rollups (message_metrics, usage_hourly/daily)
+    A,
+    /// Track B: token-level rollups (token_daily_stats from the token_usage ledger)
+    B,
+    /// Both tracks
+    All,
+}
+
 /// Subcommands for analytics (token/tool/model breakdowns and bounded incident mining).
 ///
 /// All subcommands share time-range, dimensional-filter, and output flags
@@ -2612,6 +2625,10 @@ pub enum AnalyticsCommand {
         /// Force full rebuild even if rollups appear fresh
         #[arg(long)]
         force: bool,
+        /// Which analytics track to rebuild: message-level rollups (a),
+        /// token-level rollups (b), or both (all)
+        #[arg(long, value_enum, default_value_t = AnalyticsTrack::A)]
+        track: AnalyticsTrack,
     },
     /// Check rollup invariants and detect drift between raw data and aggregates
     Validate {
@@ -16556,9 +16573,11 @@ fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>, cli: &Cli) -> 
         AnalyticsCommand::Tokens { common, group_by } => {
             run_analytics_tokens(common, *group_by, db_path.as_ref())?
         }
-        AnalyticsCommand::Rebuild { common, force } => {
-            run_analytics_rebuild(common, *force, db_path.as_ref())?
-        }
+        AnalyticsCommand::Rebuild {
+            common,
+            force,
+            track,
+        } => run_analytics_rebuild(common, *force, *track, db_path.as_ref())?,
         AnalyticsCommand::Tools {
             common,
             group_by,
@@ -17188,6 +17207,7 @@ fn run_analytics_tokens(
 fn run_analytics_rebuild(
     common: &AnalyticsCommon,
     _force: bool,
+    track: AnalyticsTrack,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
     use crate::storage::sqlite::FrankenStorage;
@@ -17210,9 +17230,6 @@ fn run_analytics_rebuild(
         });
     }
 
-    // Progress diagnostics go to stderr.
-    eprintln!("Rebuilding analytics (Track A)...");
-
     let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
         code: 9,
         kind: CliErrorKind::DbError.kind_str(),
@@ -17221,36 +17238,87 @@ fn run_analytics_rebuild(
         retryable: false,
     })?;
 
-    let result = storage.rebuild_analytics().map_err(|e| CliError {
-        code: 9,
-        kind: CliErrorKind::RebuildError.kind_str(),
-        message: format!("Analytics rebuild failed: {e}"),
-        hint: Some("Check database integrity with 'cass health --json'.".into()),
-        retryable: true,
-    })?;
+    let rebuild_a = matches!(track, AnalyticsTrack::A | AnalyticsTrack::All);
+    let rebuild_b = matches!(track, AnalyticsTrack::B | AnalyticsTrack::All);
+    let overall_start = std::time::Instant::now();
+    let mut tracks_rebuilt: Vec<&str> = Vec::new();
+    let mut payload = serde_json::Map::new();
 
-    eprintln!(
-        "Rebuild complete: {} message_metrics, {} hourly, {} daily rows in {}ms ({:.0} msg/sec)",
-        result.message_metrics_rows,
-        result.usage_hourly_rows,
-        result.usage_daily_rows,
-        result.elapsed_ms,
-        result.messages_per_sec
+    if rebuild_a {
+        // Progress diagnostics go to stderr.
+        eprintln!("Rebuilding analytics (Track A)...");
+        let result = storage.rebuild_analytics().map_err(|e| CliError {
+            code: 9,
+            kind: CliErrorKind::RebuildError.kind_str(),
+            message: format!("Analytics rebuild failed: {e}"),
+            hint: Some("Check database integrity with 'cass health --json'.".into()),
+            retryable: true,
+        })?;
+        eprintln!(
+            "Track A complete: {} message_metrics, {} hourly, {} daily rows in {}ms ({:.0} msg/sec)",
+            result.message_metrics_rows,
+            result.usage_hourly_rows,
+            result.usage_daily_rows,
+            result.elapsed_ms,
+            result.messages_per_sec
+        );
+        tracks_rebuilt.push("a");
+        payload.insert(
+            "track_a".into(),
+            serde_json::json!({
+                "message_metrics_rows": result.message_metrics_rows,
+                "usage_hourly_rows": result.usage_hourly_rows,
+                "usage_daily_rows": result.usage_daily_rows,
+                "usage_models_daily_rows": result.usage_models_daily_rows,
+                "elapsed_ms": result.elapsed_ms,
+                "rows_per_sec": result.messages_per_sec,
+            }),
+        );
+    }
+
+    if rebuild_b {
+        // #397: `analytics validate` has recommended `--track all` for Track B
+        // drift since the two-track split; this is the path that actually
+        // rebuilds token_daily_stats from the token_usage ledger.
+        eprintln!("Rebuilding analytics (Track B: token_daily_stats)...");
+        let track_b_start = std::time::Instant::now();
+        let rows_created = storage.rebuild_token_daily_stats().map_err(|e| CliError {
+            code: 9,
+            kind: CliErrorKind::ArchiveTokenDailyStatsRebuild.kind_str(),
+            message: format!("Track B (token_daily_stats) rebuild failed: {e}"),
+            hint: Some(
+                "The token_usage ledger may be corrupt — run 'cass doctor check --json'.".into(),
+            ),
+            retryable: true,
+        })?;
+        let track_b_elapsed_ms = track_b_start.elapsed().as_millis() as u64;
+        eprintln!(
+            "Track B complete: {rows_created} token_daily_stats rows in {track_b_elapsed_ms}ms"
+        );
+        tracks_rebuilt.push("b");
+        payload.insert(
+            "track_b".into(),
+            serde_json::json!({
+                "token_daily_stats_rows": rows_created,
+                "elapsed_ms": track_b_elapsed_ms,
+            }),
+        );
+    }
+
+    payload.insert(
+        "track".into(),
+        serde_json::json!(match track {
+            AnalyticsTrack::A => "a",
+            AnalyticsTrack::B => "b",
+            AnalyticsTrack::All => "all",
+        }),
     );
-
-    Ok(serde_json::json!({
-        "track": "a",
-        "tracks_rebuilt": ["a"],
-        "track_a": {
-            "message_metrics_rows": result.message_metrics_rows,
-            "usage_hourly_rows": result.usage_hourly_rows,
-            "usage_daily_rows": result.usage_daily_rows,
-            "usage_models_daily_rows": result.usage_models_daily_rows,
-            "elapsed_ms": result.elapsed_ms,
-            "rows_per_sec": result.messages_per_sec,
-        },
-        "overall_elapsed_ms": result.elapsed_ms,
-    }))
+    payload.insert("tracks_rebuilt".into(), serde_json::json!(tracks_rebuilt));
+    payload.insert(
+        "overall_elapsed_ms".into(),
+        serde_json::json!(overall_start.elapsed().as_millis() as u64),
+    );
+    Ok(serde_json::Value::Object(payload))
 }
 
 // ---------------------------------------------------------------------------
