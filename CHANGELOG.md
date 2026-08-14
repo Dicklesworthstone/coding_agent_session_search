@@ -19,6 +19,57 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 (nothing yet)
 
+## [v0.6.25] -- 2026-08-14
+
+**The FrankenSQLite 0.3.1 engine wave plus the post-v0.6.24 GitHub-issue
+triage fixes. The whole franken dependency family moves in lockstep: fsqlite
+`=0.3.1` (crates.io), asupersync `=0.4.3`, frankensearch remote head
+`14d1480a` (tantivy 0.27), and franken-agent-detection `57d2789e`.**
+
+### Changed
+
+- **FrankenSQLite `=0.2.1` → `=0.3.1`.** Carries the asupersync-0.4.3 runtime
+  migration, the 0.3.0 fix wave (GH#333 concurrent-open BusyRecovery retries;
+  GH#334 `FileIdentity` re-derivation after file replacement — including the
+  cass#393 macOS post-reboot `st_dev` namespace-sidecar repair; the 8-writer
+  rollback cascade; cross-connection visibility), and the 0.3.1 correctness
+  wave (allocator post-savepoint page-aliasing quarantine, committed-freelist
+  resurrection refusal, shared concurrent-writer EOF high-water, sidecar-less
+  read-only first-contact opens [fsqlite GH#140], Darwin OFD locking).
+- **asupersync `=0.3.10` → `=0.4.3`** (required by fsqlite 0.3.x; the 0.3.x
+  and 0.4.x asupersync type universes are non-interchangeable).
+- **frankensearch pinned to remote head `14d1480a`** (491 commits past the
+  previous `fbde8022` pin; brings tantivy 0.27). cass's segment-assembly path
+  was ported off the removed `SegmentMeta::list_files()` API and the
+  progressive-lexical adapter's `doc_count` now returns `Result`.
+- **franken-agent-detection `88fc6783` → `57d2789e`** (fsqlite 0.3.x +
+  asupersync 0.4.3 lockstep bump; 1004 tests green on the new stack).
+
+### Fixed
+
+- **#394**: one-shot `cass index --semantic` no longer re-embeds the entire
+  corpus when the embedding watermark already covers the newest message and a
+  vector index exists (the skip was previously gated on watch mode only).
+- **#392**: `cass sources sync` now tells the truth when transfers fail:
+  top-level `status` is `complete`/`partial`/`failed` (with
+  `sources_attempted`/`sources_with_failures`/`sources_fully_failed` counts),
+  exit 12 when every attempted source failed all paths, exit 8 on partial
+  failure.
+- **#377**: watch-once paths are absolutized and symlink-resolved at resolve
+  time, so relative or symlinked inputs match connector scan roots instead of
+  silently producing a skipped run; uncanonicalizable paths warn loudly.
+- **#383** (partial): the semantic-resume "has message after cursor" probe now
+  answers from `conversation_tail_state` plus one exact `(conversation_id,
+  idx)` point lookup instead of walking conversation histories, with fallback
+  to the exhaustive probe when tail state is absent.
+- **#397**: the TUI no longer triggers a full analytics auto-rebuild on every
+  launch for corpora with no API token metadata — an empty `token_usage`
+  ledger with an empty `token_daily_stats` rollup is now a terminal fresh
+  state for Track B. And `cass analytics rebuild --track a|b|all` now exists,
+  so the `--track all` action that `analytics validate` has been recommending
+  is finally runnable (Track B rebuilds route through
+  `rebuild_token_daily_stats`).
+
 ## [v0.6.24] -- 2026-08-11
 
 **Everything in the 98 commits since v0.6.23: the post-v0.6.23 GitHub-issue
