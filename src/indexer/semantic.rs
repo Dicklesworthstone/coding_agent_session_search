@@ -786,11 +786,74 @@ fn semantic_hot_tail_ids(storage: &FrankenStorage) -> Result<HashSet<i64>> {
         .map(|ids: Vec<i64>| ids.into_iter().collect())
 }
 
+/// #383 fast path: answer "does this conversation have a message past the
+/// global cursor" from the conversation's tail instead of walking its history.
+///
+/// The range probe `conversation_id = ? AND id > ?` degrades to a full
+/// per-conversation history walk under the `(conversation_id, idx)` autoindex,
+/// which on multi-thousand-message conversations costs minutes per resume
+/// checkpoint. The tail message is sufficient: `conversation_tail_state` is
+/// written in the same transaction as the message rows it describes, and both
+/// the append and rewrite ingest paths assign fresh, ascending rowids, so the
+/// message at `last_message_idx` carries the conversation's maximum message
+/// id. If the tail row or its message is missing (legacy/empty conversation,
+/// interrupted migration), return `None` so the caller falls back to the
+/// exhaustive probe.
+fn semantic_tail_state_has_message_after(
+    storage: &FrankenStorage,
+    conversation_id: i64,
+    after_message_id: i64,
+) -> Result<Option<bool>> {
+    let mut tail_idx: Option<i64> = None;
+    storage
+        .raw()
+        .query_with_params_for_each(
+            "SELECT last_message_idx FROM conversation_tail_state WHERE conversation_id = ?1",
+            &[SqliteValue::from(conversation_id)],
+            |row| {
+                tail_idx = row.get_typed(0)?;
+                Ok(())
+            },
+        )
+        .with_context(|| {
+            format!("reading conversation_tail_state for conversation {conversation_id}")
+        })?;
+    let Some(tail_idx) = tail_idx else {
+        return Ok(None);
+    };
+    let mut tail_message_id: Option<i64> = None;
+    storage
+        .raw()
+        .query_with_params_for_each(
+            "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = ?2",
+            &[
+                SqliteValue::from(conversation_id),
+                SqliteValue::from(tail_idx),
+            ],
+            |row| {
+                tail_message_id = Some(row.get_typed(0)?);
+                Ok(())
+            },
+        )
+        .with_context(|| {
+            format!(
+                "reading tail message id for conversation {conversation_id} at idx {tail_idx}"
+            )
+        })?;
+    Ok(tail_message_id.map(|tail_id| tail_id > after_message_id))
+}
+
 fn semantic_conversation_has_message_after(
     storage: &FrankenStorage,
     conversation_id: i64,
     after_message_id: Option<i64>,
 ) -> Result<bool> {
+    if let Some(cursor) = after_message_id
+        && let Some(verdict) =
+            semantic_tail_state_has_message_after(storage, conversation_id, cursor)?
+    {
+        return Ok(verdict);
+    }
     let mut params = vec![SqliteValue::from(conversation_id)];
     let message_cursor_predicate = if let Some(after_message_id) = after_message_id {
         params.push(SqliteValue::from(after_message_id));
@@ -5367,6 +5430,76 @@ mod tests {
                 after.saturating_sub(before)
             );
         }
+        Ok(())
+    }
+
+    /// #383: the tail-state fast path must answer the has-message-after-cursor
+    /// question from `conversation_tail_state` + one exact `(conversation_id,
+    /// idx)` point lookup, and must decline (None) when the tail row or its
+    /// message is absent so the caller can fall back to the exhaustive probe.
+    #[test]
+    fn tail_state_fast_path_answers_message_after_cursor() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.raw().execute_batch(&format!(
+            "BEGIN;
+             INSERT INTO conversations(id, agent_id, source_id, external_id, source_path)
+             VALUES (1,{agent_id},'local','cass-383-a','/tmp/cass-383/a.jsonl'),
+                    (2,{agent_id},'local','cass-383-b','/tmp/cass-383/b.jsonl'),
+                    (3,{agent_id},'local','cass-383-c','/tmp/cass-383/c.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, role, content)
+             VALUES (10,1,0,'user','a0'),(11,1,1,'assistant','a1'),
+                    (20,2,0,'user','b0'),(21,2,1,'assistant','b1');
+             INSERT INTO conversation_tail_state(conversation_id, last_message_idx)
+             VALUES (1,1),(2,1),(3,7);
+             COMMIT;"
+        ))?;
+
+        // Tail message id 11 vs cursors on both sides.
+        assert_eq!(
+            semantic_tail_state_has_message_after(&storage, 1, 10)?,
+            Some(true),
+            "tail id 11 > cursor 10 must report a pending message"
+        );
+        assert_eq!(
+            semantic_tail_state_has_message_after(&storage, 1, 11)?,
+            Some(false),
+            "tail id 11 <= cursor 11 must report the conversation as covered"
+        );
+        // Conversation 3 has a tail row pointing at a missing message: the
+        // fast path must decline rather than guess.
+        assert_eq!(
+            semantic_tail_state_has_message_after(&storage, 3, 0)?,
+            None,
+            "missing tail message must fall back to the exhaustive probe"
+        );
+        // No tail row at all (id 99): decline as well.
+        assert_eq!(semantic_tail_state_has_message_after(&storage, 99, 0)?, None);
+
+        // The public probe agrees with the fast path and with the fallback.
+        assert!(semantic_conversation_has_message_after(
+            &storage,
+            2,
+            Some(20)
+        )?);
+        assert!(!semantic_conversation_has_message_after(
+            &storage,
+            2,
+            Some(21)
+        )?);
+        assert!(!semantic_conversation_has_message_after(
+            &storage,
+            3,
+            Some(0)
+        )?);
         Ok(())
     }
 
