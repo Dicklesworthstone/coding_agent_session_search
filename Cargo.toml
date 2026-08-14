@@ -43,18 +43,21 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-# fsqlite 0.3.0 (crates.io): the 0.2.1 line plus the asupersync-0.4.3 runtime
-# migration and the verified bug-fix wave (GH#333 concurrent-open BusyRecovery
-# retries, GH#334 FileIdentity re-derivation after file replacement — the
-# cass#393 st_dev/namespace-sidecar repair d29339c — 8-writer rollback cascade,
-# cross-connection visibility, PRAGMA-under-concurrent-open retries). The
-# engine API is async (!Send futures); CASS's synchronous call shape is
-# preserved by src/franken_sync.rs, which drives every engine future on a
-# private current-thread asupersync runtime.
-frankensqlite = { version = "=0.3.0", package = "fsqlite", features = ["fts5"] }
+# fsqlite 0.3.1 (crates.io): the 0.3.0 asupersync-0.4.3 runtime migration and
+# bug-fix wave (GH#333 concurrent-open BusyRecovery retries, GH#334
+# FileIdentity re-derivation after file replacement — the cass#393
+# st_dev/namespace-sidecar repair d29339c — 8-writer rollback cascade,
+# cross-connection visibility) plus the 0.3.1 correctness wave: allocator
+# post-savepoint page-aliasing quarantine, committed-freelist resurrection
+# refusal, shared concurrent-writer EOF high-water, sidecar-less read-only
+# first-contact opens (GH#140), Darwin OFD locking. The engine API is async
+# (!Send futures); CASS's synchronous call shape is preserved by
+# src/franken_sync.rs, which drives every engine future on a private
+# current-thread asupersync runtime.
+frankensqlite = { version = "=0.3.1", package = "fsqlite", features = ["fts5"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.3.0", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.1", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -199,11 +202,11 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.3.0", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.1", package = "fsqlite-types" }
 
-# The fsqlite family now resolves from crates.io (0.3.0) for every direct and
+# The fsqlite family now resolves from crates.io (0.3.1) for every direct and
 # transitive consumer, so the former [patch.crates-io] git override is gone.
-# build.rs enforces the registry identity (single 0.3.0 fsqlite family in the
+# build.rs enforces the registry identity (single 0.3.1 fsqlite family in the
 # lockfile, no patch reintroduction) as the dependency source contract.
 
 [[bin]]

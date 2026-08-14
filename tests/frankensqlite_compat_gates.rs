@@ -48,8 +48,8 @@ fn rusqlite_is_dev_dependency_only() {
 /// contract so a partial bump cannot silently bifurcate the engine family.
 #[test]
 fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
-    const VERSION: &str = "0.3.0";
-    const EXACT_REQUIREMENT: &str = "=0.3.0";
+    const VERSION: &str = "0.3.1";
+    const EXACT_REQUIREMENT: &str = "=0.3.1";
     const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
     let manifest: toml::Table =
@@ -146,13 +146,13 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
 
     let build_contract = include_str!("../build.rs");
     assert!(
-        build_contract.contains("expected_version: \"0.3.0\"")
+        build_contract.contains("expected_version: \"0.3.1\"")
             && build_contract.contains("fn validate_fsqlite_registry_pin"),
         "build.rs must validate the exact FrankenSQLite registry identity"
     );
     let readme = include_str!("../README.md");
     assert!(
-        readme.contains("=0.3.0")
+        readme.contains("=0.3.1")
             && readme.contains("existing-only schema-open contract")
             && readme.contains("registry archive lacks")
             && readme.contains("[patch.crates-io]"),
