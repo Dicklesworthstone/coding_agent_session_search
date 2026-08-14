@@ -887,7 +887,7 @@ checksum = "3f88a43d011fc4a6876cb7344703e297c71dda42494fee094d5f7c76bf13f746"
 
 [[package]]
 name = "coding-agent-search"
-version = "0.6.24"
+version = "0.6.25"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",
@@ -896,7 +896,7 @@ dependencies = [
  "arrayvec",
  "assert_cmd",
  "asupersync",
- "base64 0.23.1",
+ "base64 0.22.1",
  "blake3",
  "bloomfilter",
  "bytemuck",
