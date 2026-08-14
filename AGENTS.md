@@ -137,10 +137,10 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `62a58ee3` (git branch `fts5-overlong-hotfix-cass362`; `f9cc3294` family + FTS5 overlong-term skip cap [cass#362]) |
-| `franken-agent-detection` | `1557300b` |
-| `asupersync` | `=0.3.10` |
-| `frankensearch` | `fbde8022` (accepted post-flip candidate with explicit `cass-compat` → `lexical-tantivy`; pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308, bd-8nqz.5) |
+| `frankensqlite` / `fsqlite-types` | crates.io `=0.3.0` (0.2.1 line + asupersync-0.4.3 runtime migration + GH#333/GH#334 fix wave incl. cass#393 st_dev namespace-sidecar repair; carries the FTS5 overlong-term skip cap [cass#362]) |
+| `franken-agent-detection` | `57d2789e` (fsqlite 0.3.0 + asupersync 0.4.3 lockstep bump) |
+| `asupersync` | `=0.4.3` (required by fsqlite 0.3.0; 0.3.x and 0.4.x are non-interchangeable) |
+| `frankensearch` | `14d1480a` (remote head 2026-08-13, aligned with fsqlite 0.3.0 + asupersync 0.4.3; explicit `cass-compat` → `lexical-tantivy`; pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308, bd-8nqz.5) |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 

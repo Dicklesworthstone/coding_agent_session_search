@@ -47,16 +47,16 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // crates.io-only exact pin since the fsqlite 0.2.1 migration (bead
-        // bo000): the published 0.2.1 archive contains the complete formerly
-        // git-pinned line (existing-only schema opens, deferred-FTS5
-        // validation, ns-lifecycle wave) plus GH#294 mutation-free opens.
+        // crates.io-only exact pin (established with the fsqlite 0.2.1
+        // migration, bead bo000; now at 0.3.0, which carries the asupersync
+        // 0.4.3 runtime migration plus the GH#333/GH#334 bug-fix wave and the
+        // cass#393 namespace-sidecar st_dev repair).
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
-        // to require a bare `=0.2.1` registry pin. Whole-family registry
+        // to require a bare `=0.3.0` registry pin. Whole-family registry
         // convergence is enforced by `validate_fsqlite_registry_pin`.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.2.1",
+        expected_version: "0.3.0",
         expected_features: &["fts5"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -74,7 +74,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Keep shared types on the identical registry release as the facade.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.2.1",
+        expected_version: "0.3.0",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -92,7 +92,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Keep shared types on the identical registry release as the facade.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.2.1",
+        expected_version: "0.3.0",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -108,7 +108,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "88fc6783805d80677c4ed18dcc79985fcbb2a694",
+        expected_rev: "57d2789e8d03f6e4b75b0a1a9a5709fc8b290d19",
         expected_version: "0.1.10",
         expected_features: &[
             "chatgpt",
@@ -132,13 +132,14 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "asupersync",
         crate_package_name: "asupersync",
         manifest_package_field: None,
-        // crates.io-only exact pin after the 0.3.x migration unified every source
-        // (direct dep, frankensqlite transitive, frankensearch transitive)
-        // onto a single published release. Empty `expected_git` signals
+        // crates.io-only exact pin: every source (direct dep, frankensqlite
+        // transitive, frankensearch transitive) resolves to a single published
+        // release. 0.4.3 is required by fsqlite 0.3.0, whose public API names
+        // asupersync 0.4.x types. Empty `expected_git` signals
         // `validate_manifest_dependency_spec` to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.10",
+        expected_version: "0.4.3",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -159,7 +160,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // surface. The latter keeps CASS schema-v8 access independent from
         // FrankenSearch's swappable generic lexical backend (cass #308,
         // bd-8nqz.5).
-        expected_rev: "fbde80225914f02389e04af5970647034a8291d7",
+        expected_rev: "14d1480af8f891ff8f477c080301dee2ba26dd4d",
         expected_version: "0.3.2",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
@@ -329,7 +330,7 @@ fn validate_fsqlite_registry_pin(manifest_dir: &Path, manifest: &Value, packaged
     // The fsqlite engine family must resolve exclusively from crates.io at the
     // pinned release. This replaces the pre-0.2.1 [patch.crates-io] git-rev
     // override contract while keeping its purpose: no silent engine drift.
-    const EXPECTED_VERSION: &str = "0.2.1";
+    const EXPECTED_VERSION: &str = "0.3.0";
     const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
     // 1. The former git source override must not quietly come back: no

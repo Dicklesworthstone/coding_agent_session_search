@@ -64,9 +64,8 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "fsqlite",
         manifest_table: "dependencies",
         manifest_key: "frankensqlite",
-        // Registry-pinned since fsqlite 0.2.1: the published archive now
-        // carries the complete formerly git-pinned line (existing-only
-        // schema opens, deferred-FTS5 validation, ns-lifecycle, GH#294);
+        // Registry-pinned since fsqlite 0.2.1 (now 0.3.0, carrying the
+        // asupersync-0.4.3 runtime migration and the GH#333/GH#334 fix wave);
         // the compat gates in tests/frankensqlite_compat_gates.rs own the
         // exact version.
         source_kind: "registry",
@@ -958,7 +957,7 @@ mod tests {
             ),
         )?;
         ensure(
-            asupersync.version.as_deref() == Some("=0.3.10"),
+            asupersync.version.as_deref() == Some("=0.4.3"),
             "asupersync version pin should match Cargo.toml",
         )
     }
