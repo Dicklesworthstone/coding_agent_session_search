@@ -139,7 +139,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | crates.io `=0.3.1` (0.3.0 asupersync-0.4.3 migration + GH#333/GH#334 fix wave incl. cass#393 st_dev namespace-sidecar repair, + 0.3.1 allocator/freelist/concurrent-writer correctness wave; carries the FTS5 overlong-term skip cap [cass#362]) |
 | `franken-agent-detection` | `57d2789e` (fsqlite 0.3.0 + asupersync 0.4.3 lockstep bump) |
-| `asupersync` | `=0.4.3` (required by fsqlite 0.3.0; 0.3.x and 0.4.x are non-interchangeable) |
+| `asupersync` | `=0.4.4` (fsqlite 0.3.x requires the 0.4.x line; asupersync 0.3.x and 0.4.x are non-interchangeable) |
 | `frankensearch` | `14d1480a` (remote head 2026-08-13, aligned with fsqlite 0.3.0 + asupersync 0.4.3; explicit `cass-compat` → `lexical-tantivy`; pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308, bd-8nqz.5) |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |

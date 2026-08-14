@@ -23,7 +23,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 **The FrankenSQLite 0.3.1 engine wave plus the post-v0.6.24 GitHub-issue
 triage fixes. The whole franken dependency family moves in lockstep: fsqlite
-`=0.3.1` (crates.io), asupersync `=0.4.3`, frankensearch remote head
+`=0.3.1` (crates.io), asupersync `=0.4.4`, frankensearch remote head
 `14d1480a` (tantivy 0.27), and franken-agent-detection `57d2789e`.**
 
 ### Changed
@@ -36,8 +36,10 @@ triage fixes. The whole franken dependency family moves in lockstep: fsqlite
   wave (allocator post-savepoint page-aliasing quarantine, committed-freelist
   resurrection refusal, shared concurrent-writer EOF high-water, sidecar-less
   read-only first-contact opens [fsqlite GH#140], Darwin OFD locking).
-- **asupersync `=0.3.10` → `=0.4.3`** (required by fsqlite 0.3.x; the 0.3.x
-  and 0.4.x asupersync type universes are non-interchangeable).
+- **asupersync `=0.3.10` → `=0.4.4`** (fsqlite 0.3.x requires the 0.4.x line;
+  the 0.3.x and 0.4.x asupersync type universes are non-interchangeable.
+  0.4.4 preserves a spawned task's typed result across cancellation
+  acknowledgement instead of letting a concurrent abort erase it).
 - **frankensearch pinned to remote head `14d1480a`** (491 commits past the
   previous `fbde8022` pin; brings tantivy 0.27). cass's segment-assembly path
   was ported off the removed `SegmentMeta::list_files()` API and the
