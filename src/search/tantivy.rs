@@ -1485,10 +1485,19 @@ impl TantivyIndex {
                             "attempted to assemble Tantivy index directories with different index settings"
                         ));
                     }
+                    if metas.persisted_custom_extensions
+                        != combined_meta.persisted_custom_extensions
+                    {
+                        return Err(anyhow::anyhow!(
+                            "attempted to assemble Tantivy index directories with different \
+                             persisted custom plugin extensions"
+                        ));
+                    }
                 }
                 None => {
                     combined_index_meta = Some(tantivy_crate::IndexMeta {
                         index_settings: metas.index_settings.clone(),
+                        persisted_custom_extensions: metas.persisted_custom_extensions.clone(),
                         segments: Vec::new(),
                         schema: metas.schema.clone(),
                         opstamp: 0,
@@ -1499,9 +1508,35 @@ impl TantivyIndex {
 
             max_opstamp = max_opstamp.max(metas.opstamp);
             for segment in metas.segments {
-                for relative_path in segment.list_files() {
+                // tantivy 0.27 removed `SegmentMeta::list_files()` (per-segment
+                // file sets now depend on the persisted plugin extensions).
+                // Every file belonging to a segment is named `<uuid>.<ext>`,
+                // so copy the input directory entries whose file name starts
+                // with this segment's uuid — the same "copy what exists" set
+                // the old enumeration produced.
+                let segment_prefix = segment.id().uuid_string();
+                for entry in std::fs::read_dir(input_path).with_context(|| {
+                    format!(
+                        "listing Tantivy index directory for assembly: {}",
+                        input_path.display()
+                    )
+                })? {
+                    let entry = entry.with_context(|| {
+                        format!(
+                            "reading Tantivy index directory entry for assembly: {}",
+                            input_path.display()
+                        )
+                    })?;
+                    let file_name = entry.file_name();
+                    let Some(name) = file_name.to_str() else {
+                        continue;
+                    };
+                    if !name.starts_with(segment_prefix.as_str()) {
+                        continue;
+                    }
+                    let relative_path = std::path::PathBuf::from(name);
                     let source_path = input_path.join(&relative_path);
-                    if !source_path.exists() {
+                    if !source_path.is_file() {
                         continue;
                     }
                     link_or_copy_searchable_index_file(&source_path, output_path, &relative_path)?;

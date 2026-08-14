@@ -2674,8 +2674,8 @@ impl FsLexicalRead for CassProgressiveLexicalAdapter {
         })
     }
 
-    fn doc_count(&self) -> usize {
-        self.client.total_docs()
+    fn doc_count(&self) -> Result<usize, FsSearchError> {
+        Ok(self.client.total_docs())
     }
 }
 
