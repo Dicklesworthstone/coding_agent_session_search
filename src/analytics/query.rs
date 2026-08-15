@@ -1118,14 +1118,27 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
         .unwrap_or(0);
     let stale_threshold_ms: i64 = 86_400_000;
 
-    let track_a_fresh = is_recently_updated(uh.last_updated, now_ms, stale_threshold_ms);
-    // #397: an empty token_usage ledger gives Track B nothing to aggregate, so
-    // token_daily_stats can never earn a last_updated stamp. Without this
-    // vacuous-fresh case, corpora with no API token metadata report Track B as
-    // permanently stale, `recommended_action: "rebuild_track_b"` never clears,
-    // and the TUI re-triggers a full multi-minute auto-rebuild on every
-    // launch. Empty source + empty rollup is a terminal, healthy state.
-    let track_b_vacuously_fresh = tu.row_count == 0 && tds.row_count == 0;
+    // #397: an empty source with empty rollups gives a track nothing to
+    // aggregate, so its rollup can never earn a last_updated stamp. Without
+    // this vacuous-fresh case, corpora with no API token metadata report
+    // Track B as permanently stale, `recommended_action: "rebuild_track_b"`
+    // never clears, and the TUI re-triggers a full multi-minute auto-rebuild
+    // on every launch. Empty source + empty rollup is a terminal, healthy
+    // state — and it must hold symmetrically for Track A, or a fully empty
+    // (or filtered-to-empty) view reports a spurious "Track B fresh / Track A
+    // stale" mismatch and recommends rebuilding an empty corpus.
+    let track_a_vacuously_fresh = mm.row_count == 0 && uh.row_count == 0 && ud.row_count == 0;
+    let track_a_fresh =
+        track_a_vacuously_fresh || is_recently_updated(uh.last_updated, now_ms, stale_threshold_ms);
+    // Track B's vacuous case additionally requires the ledger to carry the
+    // current schema: a legacy `token_usage` table without `timestamp_ms`
+    // (pre-migration shape) can filter to zero rows while still holding data
+    // that a Track B rebuild would regenerate correctly, so it must keep
+    // recommending `rebuild_track_b` rather than reading as terminally fresh.
+    let token_ledger_schema_current =
+        !has_token_usage || table_has_column(conn, "token_usage", "timestamp_ms");
+    let track_b_vacuously_fresh =
+        token_ledger_schema_current && tu.row_count == 0 && tds.row_count == 0;
     let track_b_fresh = track_b_vacuously_fresh
         || is_recently_updated(tds.last_updated, now_ms, stale_threshold_ms);
 

@@ -216,6 +216,7 @@ pub(crate) fn validate_supported_payload_format(config: &EncryptionConfig) -> Re
     }
 
     let mut slot_ids = std::collections::BTreeSet::new();
+    let mut any_valid_slot = config.key_slots.is_empty();
     for slot in &config.key_slots {
         if !slot_ids.insert(slot.id) {
             return Err(invalid_archive_format(format!(
@@ -223,40 +224,20 @@ pub(crate) fn validate_supported_payload_format(config: &EncryptionConfig) -> Re
                 slot.id
             )));
         }
-        let expected_kdf = match slot.slot_type {
-            SlotType::Password => KdfAlgorithm::Argon2id,
-            SlotType::Recovery => KdfAlgorithm::HkdfSha256,
-        };
-        if slot.kdf != expected_kdf {
-            return Err(DecryptError::UnsupportedMetadata("key_slots.kdf".to_string()).into());
+        // Per-slot metadata damage must not brick the whole archive: the
+        // disaster-recovery contract requires an intact recovery slot to keep
+        // working when the password slot's bytes are corrupted (and vice
+        // versa). Damaged slots are skipped at unlock time instead.
+        if validate_key_slot_metadata(slot, &supported_argon2_params).is_ok() {
+            any_valid_slot = true;
         }
-        match slot.slot_type {
-            SlotType::Password => match &slot.argon2_params {
-                Some(params) if params == &supported_argon2_params => {}
-                Some(_) => {
-                    return Err(DecryptError::UnsupportedMetadata(
-                        "key_slots.argon2_params".to_string(),
-                    )
-                    .into());
-                }
-                None => {
-                    return Err(invalid_archive_format(
-                        "password key slot is missing argon2_params",
-                    ));
-                }
-            },
-            SlotType::Recovery if slot.argon2_params.is_some() => {
-                return Err(invalid_archive_format(
-                    "recovery key slot must not contain argon2_params",
-                ));
-            }
-            SlotType::Recovery => {}
+    }
+    if !any_valid_slot {
+        // Every slot is malformed — report the first slot's defect as the
+        // archive-format error so operators see a concrete reason.
+        if let Some(slot) = config.key_slots.first() {
+            validate_key_slot_metadata(slot, &supported_argon2_params)?;
         }
-        if decode_metadata_field("key_slots.salt", &slot.salt)?.is_empty() {
-            return Err(invalid_archive_format("key slot salt must not be empty"));
-        }
-        require_metadata_len("key_slots.wrapped_dek", &slot.wrapped_dek, 48)?;
-        require_metadata_len("key_slots.nonce", &slot.nonce, 12)?;
     }
 
     for (index, file) in config.payload.files.iter().enumerate() {
@@ -265,6 +246,51 @@ pub(crate) fn validate_supported_payload_format(config: &EncryptionConfig) -> Re
         }
     }
 
+    Ok(())
+}
+
+/// Validate one key slot's metadata shape (kdf pairing, argon2 params, salt,
+/// wrapped_dek, nonce byte lengths). Unlock paths call this per slot and skip
+/// damaged slots so metadata corruption in one slot cannot deny access
+/// through another intact slot.
+pub(crate) fn validate_key_slot_metadata(
+    slot: &KeySlot,
+    supported_argon2_params: &Argon2Params,
+) -> Result<()> {
+    let expected_kdf = match slot.slot_type {
+        SlotType::Password => KdfAlgorithm::Argon2id,
+        SlotType::Recovery => KdfAlgorithm::HkdfSha256,
+    };
+    if slot.kdf != expected_kdf {
+        return Err(DecryptError::UnsupportedMetadata("key_slots.kdf".to_string()).into());
+    }
+    match slot.slot_type {
+        SlotType::Password => match &slot.argon2_params {
+            Some(params) if params == supported_argon2_params => {}
+            Some(_) => {
+                return Err(DecryptError::UnsupportedMetadata(
+                    "key_slots.argon2_params".to_string(),
+                )
+                .into());
+            }
+            None => {
+                return Err(invalid_archive_format(
+                    "password key slot is missing argon2_params",
+                ));
+            }
+        },
+        SlotType::Recovery if slot.argon2_params.is_some() => {
+            return Err(invalid_archive_format(
+                "recovery key slot must not contain argon2_params",
+            ));
+        }
+        SlotType::Recovery => {}
+    }
+    if decode_metadata_field("key_slots.salt", &slot.salt)?.is_empty() {
+        return Err(invalid_archive_format("key slot salt must not be empty"));
+    }
+    require_metadata_len("key_slots.wrapped_dek", &slot.wrapped_dek, 48)?;
+    require_metadata_len("key_slots.nonce", &slot.nonce, 12)?;
     Ok(())
 }
 
@@ -985,8 +1011,14 @@ impl DecryptionEngine {
         }
 
         let mut password_slot_found = false;
+        let supported_argon2_params = Argon2Params::default();
         for slot in &config.key_slots {
             if slot.slot_type != SlotType::Password {
+                continue;
+            }
+            // Skip metadata-damaged slots: corruption in one slot must not
+            // deny unlock through another intact slot.
+            if validate_key_slot_metadata(slot, &supported_argon2_params).is_err() {
                 continue;
             }
             password_slot_found = true;
@@ -1021,8 +1053,15 @@ impl DecryptionEngine {
     pub fn unlock_with_recovery(config: EncryptionConfig, secret: &[u8]) -> Result<Self> {
         validate_supported_payload_format(&config)?;
 
+        let supported_argon2_params = Argon2Params::default();
         for slot in &config.key_slots {
             if slot.slot_type != SlotType::Recovery {
+                continue;
+            }
+            // Skip metadata-damaged slots (see unlock_with_password): the
+            // disaster-recovery contract keeps an intact recovery slot usable
+            // when the password slot's bytes are corrupted.
+            if validate_key_slot_metadata(slot, &supported_argon2_params).is_err() {
                 continue;
             }
 

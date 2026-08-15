@@ -2822,6 +2822,18 @@ mod tests {
         fs::set_permissions(&source_path, fs::Permissions::from_mode(0o000))
             .expect("make source unreadable");
 
+        // root (or CAP_DAC_OVERRIDE) bypasses POSIX permission checks, so the
+        // rejection under test cannot trigger. Probe instead of asserting a
+        // uid so the skip covers capability-granted environments too.
+        if fs::File::open(&source_path).is_ok() {
+            eprintln!(
+                "skipping capture_source_file_rejects_unreadable_sources_without_manifest: \
+                 process bypasses POSIX permission checks (root/CAP_DAC_OVERRIDE)"
+            );
+            let _ = fs::set_permissions(&source_path, fs::Permissions::from_mode(0o600));
+            return;
+        }
+
         let err = capture_source_file(RawMirrorCaptureInput {
             data_dir: &data_dir,
             provider: "codex",

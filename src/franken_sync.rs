@@ -106,6 +106,52 @@ fn retry_busy_recovery<T>(
     }
 }
 
+/// Bounded retry for autocommit-safe transients: `BusyRecovery` always, and
+/// `BusySnapshot` only when `allow_snapshot_retry` (i.e. the statement runs in
+/// autocommit mode, where a failed statement rolled back atomically and can be
+/// re-run). fsqlite 0.3.x surfaces `BusySnapshot` from single autocommit
+/// statements while a peer session's epoch unwinds (dropped-connection
+/// reclamation, tempdir inode reuse), so this keeps the pre-0.3 observable
+/// behavior for the bridge's blocking callers.
+fn retry_transient_statement<T>(
+    allow_snapshot_retry: bool,
+    mut attempt: impl FnMut() -> Result<T, FrankenError>,
+) -> Result<T, FrankenError> {
+    const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(250);
+    let start = std::time::Instant::now();
+    let mut backoff = std::time::Duration::from_millis(5);
+    loop {
+        match attempt() {
+            Err(FrankenError::BusyRecovery) if start.elapsed() < RETRY_BUDGET => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(BACKOFF_CAP);
+            }
+            Err(FrankenError::BusySnapshot { .. })
+                if allow_snapshot_retry && start.elapsed() < RETRY_BUDGET =>
+            {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(BACKOFF_CAP);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Classify the manual-transaction effect of a Connection-level statement.
+fn manual_txn_transition(sql: &str) -> Option<bool> {
+    let head = sql.trim_start().get(..12).unwrap_or(sql.trim_start());
+    let head = head.to_ascii_uppercase();
+    if head.starts_with("BEGIN") {
+        Some(true)
+    } else if head.starts_with("COMMIT") || head.starts_with("ROLLBACK") || head.starts_with("END")
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 macro_rules! with_engine_retries {
     ($conn:expr, $sql:expr, $attempt:expr) => {{
         let first = retry_busy_recovery(|| $attempt);
@@ -129,6 +175,10 @@ macro_rules! with_engine_retries {
 /// blocking method signatures.
 pub struct Connection {
     inner: frankensqlite::Connection,
+    /// True while a caller-managed `BEGIN`-family transaction is open on this
+    /// connection. Tracked so autocommit-only `BusySnapshot` retries never
+    /// re-run a statement whose enclosing explicit transaction was aborted.
+    manual_txn: std::cell::Cell<bool>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -144,6 +194,7 @@ impl Connection {
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
         Ok(Self {
             inner: drive(frankensqlite::Connection::open(path))?,
+            manual_txn: std::cell::Cell::new(false),
         })
     }
 
@@ -151,6 +202,7 @@ impl Connection {
     pub fn open_existing_schema_only(path: impl Into<String>) -> Result<Self, FrankenError> {
         Ok(Self {
             inner: drive(frankensqlite::Connection::open_existing_schema_only(path))?,
+            manual_txn: std::cell::Cell::new(false),
         })
     }
 
@@ -161,6 +213,7 @@ impl Connection {
     ) -> Result<Self, FrankenError> {
         Ok(Self {
             inner: drive(frankensqlite::Connection::open_existing_schema_only_deferred_fts5(path))?,
+            manual_txn: std::cell::Cell::new(false),
         })
     }
 
@@ -172,7 +225,17 @@ impl Connection {
 
     /// Execute a single SQL statement, returning the affected row count.
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
-        with_engine_retries!(self.inner, sql, drive(self.inner.execute(sql)))
+        let transition = manual_txn_transition(sql);
+        let allow_snapshot_retry = !self.manual_txn.get() && transition != Some(true);
+        let result = retry_transient_statement(allow_snapshot_retry, || {
+            with_engine_retries!(self.inner, sql, drive(self.inner.execute(sql)))
+        });
+        if result.is_ok()
+            && let Some(open) = transition
+        {
+            self.manual_txn.set(open);
+        }
+        result
     }
 
     /// Execute a single SQL statement with positional parameters.
@@ -181,11 +244,14 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
-        with_engine_retries!(
-            self.inner,
-            sql,
-            drive(self.inner.execute_with_params(sql, params))
-        )
+        let allow_snapshot_retry = !self.manual_txn.get();
+        retry_transient_statement(allow_snapshot_retry, || {
+            with_engine_retries!(
+                self.inner,
+                sql,
+                drive(self.inner.execute_with_params(sql, params))
+            )
+        })
     }
 
     /// Execute a string of semicolon-separated SQL statements.
@@ -195,7 +261,10 @@ impl Connection {
 
     /// Query, returning all rows.
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
-        with_engine_retries!(self.inner, sql, drive(self.inner.query(sql)))
+        let allow_snapshot_retry = !self.manual_txn.get();
+        retry_transient_statement(allow_snapshot_retry, || {
+            with_engine_retries!(self.inner, sql, drive(self.inner.query(sql)))
+        })
     }
 
     /// Query with positional parameters, returning all rows.
@@ -204,11 +273,14 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Vec<Row>, FrankenError> {
-        with_engine_retries!(
-            self.inner,
-            sql,
-            drive(self.inner.query_with_params(sql, params))
-        )
+        let allow_snapshot_retry = !self.manual_txn.get();
+        retry_transient_statement(allow_snapshot_retry, || {
+            with_engine_retries!(
+                self.inner,
+                sql,
+                drive(self.inner.query_with_params(sql, params))
+            )
+        })
     }
 
     /// Query with positional parameters, streaming rows into `f`.
@@ -371,6 +443,7 @@ pub mod compat {
     pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
         Ok(Connection {
             inner: drive(frankensqlite::compat::open_with_flags(path, flags))?,
+            manual_txn: std::cell::Cell::new(false),
         })
     }
 

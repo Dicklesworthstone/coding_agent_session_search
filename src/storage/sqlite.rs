@@ -736,6 +736,36 @@ pub(crate) fn retryable_franken_anyhow(err: &anyhow::Error) -> bool {
     })
 }
 
+/// fsqlite 0.3.x defers dropped-session reclamation, so the first write
+/// stages of a fresh open (migrations / schema repair) can transiently hit
+/// `BusySnapshot` while a just-closed peer connection's epoch unwinds
+/// (observed in the v0.6.25 release gate on legacy-fixture reopen tests).
+/// Both stages are idempotent — the migration ledger skips already-applied
+/// steps and repair re-checks object presence — so a bounded, backoff-paced
+/// retry is safe and mirrors upstream's own prepare-prologue retry posture.
+pub(crate) fn retry_transient_storage_op<T>(
+    stage: &'static str,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut delay = Duration::from_millis(25);
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(err) if Instant::now() < deadline && retryable_franken_anyhow(&err) => {
+                tracing::debug!(
+                    stage,
+                    error = %err,
+                    "transient contention during open stage; retrying"
+                );
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(400));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 impl Drop for LazyFrankenDb {
     fn drop(&mut self) {
         let Some(mut conn) = self.conn.get_mut().take() else {
@@ -1352,6 +1382,75 @@ pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) 
         probe_error.map(|err| err.to_string()),
     )
     .into())
+}
+
+/// Remove historical duplicate `fts_messages` rows from `sqlite_master`,
+/// keeping the earliest (canonical) row.
+///
+/// fsqlite 0.3.x refuses to open a database whose sqlite_master carries the
+/// pre-fix duplicate `fts_messages` virtual-table row ("conflicting
+/// virtual-table entries"), so this repair must run before the engine open.
+/// writable_schema WRITES are the one documented operation frankensqlite does
+/// not support (AGENTS.md: "PRAGMA writable_schema: Not supported for write
+/// operations"), so the surgery shells to the `sqlite3` CLI — the same
+/// production pattern `scrub_staged_derived_fts_metadata_via_sqlite3` uses
+/// for staged-seed sqlite_master repair.
+pub(crate) fn dedupe_conflicting_fts_schema_rows_via_sqlite3(db_path: &Path) -> Result<()> {
+    let dedupe_sql = "PRAGMA writable_schema = ON;
+         DELETE FROM sqlite_master
+          WHERE type = 'table'
+            AND name = 'fts_messages'
+            AND rowid NOT IN (
+                SELECT MIN(rowid) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'fts_messages'
+            );
+         PRAGMA writable_schema = OFF;";
+
+    let run_dedupe = |disable_defensive: bool| -> Result<std::process::Output> {
+        let mut command = Command::new("sqlite3");
+        command.arg("-batch").arg(db_path);
+        if disable_defensive {
+            command.arg(".dbconfig defensive off");
+        }
+        command.arg(dedupe_sql).output().with_context(|| {
+            format!(
+                "running sqlite3 duplicate fts schema-row repair for {}",
+                db_path.display()
+            )
+        })
+    };
+    let render_output = |output: &std::process::Output| -> String {
+        format!(
+            "status {}; stdout: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    };
+
+    let defensive_off_output = run_dedupe(true)?;
+    if defensive_off_output.status.success() {
+        tracing::info!(
+            db = %db_path.display(),
+            "removed duplicate fts_messages schema rows via sqlite3 bridge"
+        );
+        return Ok(());
+    }
+    let fallback_output = run_dedupe(false)?;
+    if !fallback_output.status.success() {
+        anyhow::bail!(
+            "sqlite3 duplicate fts schema-row repair failed for {}; defensive-off attempt {}; \
+             fallback without .dbconfig {}",
+            db_path.display(),
+            render_output(&defensive_off_output),
+            render_output(&fallback_output)
+        );
+    }
+    tracing::info!(
+        db = %db_path.display(),
+        "removed duplicate fts_messages schema rows via sqlite3 bridge (defensive fallback)"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4225,17 +4324,50 @@ impl FrankenStorage {
             // pager-backed; the compatibility `MemDatabase` is not hydrated
             // eagerly), so ordinary opens stay bounded on multi-gigabyte
             // archives.
-            FrankenConnection::open_existing_schema_only(&path_str).with_context(|| {
-                format!("opening existing frankensqlite db at {}", path.display())
-            })?
+            match FrankenConnection::open_existing_schema_only(&path_str) {
+                Ok(conn) => conn,
+                // fsqlite 0.3.x validates sqlite_master at schema load and
+                // refuses the historical duplicate `fts_messages` row debris
+                // that 0.2.x tolerated (and that cass used to dedupe lazily in
+                // `ensure_search_fallback_fts_consistency`). Repair the
+                // duplicate rows through the rusqlite salvage bridge, then
+                // retry the open once.
+                Err(err)
+                    if err
+                        .to_string()
+                        .contains("conflicting virtual-table entries") =>
+                {
+                    tracing::warn!(
+                        db = %path.display(),
+                        error = %err,
+                        "frankensqlite refused open due to duplicate fts_messages \
+                         schema rows; deduplicating via sqlite3 bridge and retrying"
+                    );
+                    dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
+                    FrankenConnection::open_existing_schema_only(&path_str).with_context(|| {
+                        format!(
+                            "opening existing frankensqlite db at {} after \
+                                 duplicate fts schema-row repair",
+                            path.display()
+                        )
+                    })?
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("opening existing frankensqlite db at {}", path.display())
+                    });
+                }
+            }
         } else {
             FrankenConnection::open(&path_str)
                 .with_context(|| format!("creating frankensqlite db at {}", path.display()))?
         };
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_open_stage_busy_timeout();
-        storage.run_migrations()?;
-        storage.repair_missing_current_schema_objects()?;
+        retry_transient_storage_op("run_migrations", || storage.run_migrations())?;
+        retry_transient_storage_op("repair_missing_current_schema_objects", || {
+            storage.repair_missing_current_schema_objects()
+        })?;
         storage.apply_config()?;
         storage.set_fts_messages_present_cache(true);
         Ok(storage)
@@ -4536,8 +4668,38 @@ impl FrankenStorage {
     pub fn open_readonly_with_doctor_lock_timeout(path: &Path, timeout: Duration) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
-        let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("opening frankensqlite db readonly at {}", path.display()))?;
+        // fsqlite 0.3.x surfaces transient `BusyRecovery` from a readonly open
+        // while a peer connection's WAL-index recovery is in flight (the same
+        // class upstream retries in prepare's prologue since 55d7f2c5). The
+        // lexical-rebuild page-prep workers open readonly right next to the
+        // active writer, so a bounded retry here is load-bearing.
+        let conn = match retry_transient_storage_op("open_readonly", || {
+            open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(anyhow::Error::new)
+        }) {
+            Ok(conn) => conn,
+            // Same duplicate-fts_messages debris handling as the canonical
+            // open: fsqlite 0.3.x refuses the historical duplicate schema row
+            // at load. The dedupe is the one sanctioned mutation from a read
+            // lane — it repairs sqlite_master metadata only (the lexical
+            // self-healing contract), then the readonly open is retried.
+            Err(err) if format!("{err:#}").contains("conflicting virtual-table entries") => {
+                tracing::warn!(
+                    db = %path.display(),
+                    error = %err,
+                    "frankensqlite refused readonly open due to duplicate \
+                     fts_messages schema rows; deduplicating via sqlite3 bridge"
+                );
+                dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
+                open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(anyhow::Error::new)?
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("opening frankensqlite db readonly at {}", path.display())
+                });
+            }
+        };
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_readonly_config()?;
         Ok(storage)
@@ -8116,24 +8278,33 @@ impl FrankenStorage {
         // workspaces (~30 rows) lookup tables and degrade NULL agent_id to
         // the same 'unknown' sentinel that 8a0c547c established for the
         // lexical rebuild path.
+        // Pre-v15 archives reached through no-migration lanes lack
+        // conversation_tail_state; fall back to the parent ended_at there.
+        let ended_at_projection = if self.conversation_tail_state_table_present() {
+            "COALESCE(
+                 (SELECT ts.ended_at
+                  FROM conversation_tail_state ts
+                  WHERE ts.conversation_id = c.id),
+                 c.ended_at
+             )"
+        } else {
+            "c.ended_at"
+        };
         self.conn
             .query_map_collect(
-                r"SELECT c.id,
+                &format!(
+                    "SELECT c.id,
                          COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
                          (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
                          c.external_id, c.title, c.source_path,
                          c.started_at,
-                         COALESCE(
-                             (SELECT ts.ended_at
-                              FROM conversation_tail_state ts
-                              WHERE ts.conversation_id = c.id),
-                             c.ended_at
-                         ),
+                         {ended_at_projection},
                          c.approx_tokens, c.metadata_json,
                          c.source_id, c.origin_host, c.metadata_bin
                 FROM conversations c
                 ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC
-                LIMIT ?1 OFFSET ?2",
+                LIMIT ?1 OFFSET ?2"
+                ),
                 fparams![limit, offset],
                 |row| {
                     let workspace_path: Option<String> = row.get_typed(2)?;
@@ -8577,6 +8748,38 @@ impl FrankenStorage {
     }
     /// Legacy OFFSET-based traversal for one-time checkpoint migration only.
     ///
+    /// Whether the schema-v15 `conversation_tail_state` cache table exists on
+    /// this connection's schema image. Pre-v15 archives reached through the
+    /// no-migration lanes (readonly opens, the schema-only FTS-repair open)
+    /// legitimately lack it — the v0.6.25 gate hit exactly that on the
+    /// schema-13 search fixture.
+    fn conversation_tail_state_table_present(&self) -> bool {
+        match franken_table_column_names(&self.conn, "conversation_tail_state") {
+            // PRAGMA table_info on a missing table yields an EMPTY column
+            // set, not an error — presence means at least one column.
+            Ok(columns) => !columns.is_empty(),
+            Err(err) if error_indicates_missing_table(&err) => false,
+            // Fail open to the richer projection; the listing query will
+            // surface the real error with full context.
+            Err(_) => true,
+        }
+    }
+
+    /// `ended_at` projection for the lexical-rebuild listings: prefer the
+    /// tail-state cache when present, fall back to the parent column.
+    fn lexical_rebuild_ended_at_projection(&self) -> &'static str {
+        if self.conversation_tail_state_table_present() {
+            "COALESCE(
+                 (SELECT ts.ended_at
+                  FROM conversation_tail_state ts
+                  WHERE ts.conversation_id = conversations.id),
+                 ended_at
+             )"
+        } else {
+            "ended_at"
+        }
+    }
+
     /// New code must use `list_conversations_for_lexical_rebuild_after_id`
     /// for keyset pagination.
     pub fn list_conversations_for_lexical_rebuild_by_offset(
@@ -8590,18 +8793,16 @@ impl FrankenStorage {
         // frankensqlite's full-materialization fallback path.
         self.conn
             .query_map_collect(
-                r"SELECT id, agent_id, workspace_id, external_id, title, source_path,
+                &format!(
+                    "SELECT id, agent_id, workspace_id, external_id, title, source_path,
                        started_at,
-                       COALESCE(
-                           (SELECT ts.ended_at
-                            FROM conversation_tail_state ts
-                            WHERE ts.conversation_id = conversations.id),
-                           ended_at
-                       ),
+                       {},
                        source_id, origin_host
                 FROM conversations
                 ORDER BY id ASC
                 LIMIT ?1 OFFSET ?2",
+                    self.lexical_rebuild_ended_at_projection()
+                ),
                 fparams![limit, offset],
                 |row| {
                     let agent_id: Option<i64> = row.get_typed(1)?;
@@ -8646,19 +8847,17 @@ impl FrankenStorage {
     ) -> Result<Vec<LexicalRebuildConversationRow>> {
         self.conn
             .query_map_collect(
-                r"SELECT id, agent_id, workspace_id, external_id, title, source_path,
+                &format!(
+                    "SELECT id, agent_id, workspace_id, external_id, title, source_path,
                        started_at,
-                       COALESCE(
-                           (SELECT ts.ended_at
-                            FROM conversation_tail_state ts
-                            WHERE ts.conversation_id = conversations.id),
-                           ended_at
-                       ),
+                       {},
                        source_id, origin_host
                 FROM conversations
                 WHERE id > ?2
                 ORDER BY id ASC
                 LIMIT ?1",
+                    self.lexical_rebuild_ended_at_projection()
+                ),
                 fparams![limit, after_conversation_id],
                 |row| {
                     let agent_id: Option<i64> = row.get_typed(1)?;
@@ -8712,19 +8911,17 @@ impl FrankenStorage {
         }
         self.conn
             .query_map_collect(
-                r"SELECT id, agent_id, workspace_id, external_id, title, source_path,
+                &format!(
+                    "SELECT id, agent_id, workspace_id, external_id, title, source_path,
                        started_at,
-                       COALESCE(
-                           (SELECT ts.ended_at
-                            FROM conversation_tail_state ts
-                            WHERE ts.conversation_id = conversations.id),
-                           ended_at
-                       ),
+                       {},
                        source_id, origin_host
                 FROM conversations
                 WHERE id > ?2 AND id <= ?3
                 ORDER BY id ASC
                 LIMIT ?1",
+                    self.lexical_rebuild_ended_at_projection()
+                ),
                 fparams![limit, after_conversation_id, through_conversation_id],
                 |row| {
                     let agent_id: Option<i64> = row.get_typed(1)?;
@@ -21989,14 +22186,22 @@ mod tests {
 
             let mut profile = InsertConversationTreePerfProfile::default();
             for external_id in 1..=iterations {
-                storage
-                    .insert_conversation_tree_with_profile(
+                // fsqlite 0.3.x can surface a transient BusySnapshot while a
+                // prior session's epoch unwinds; the production insert path
+                // retries these, so the raw profiled call must too. Restore
+                // the profile snapshot on retry so an aborted attempt's stage
+                // durations don't double-count against the recorded total.
+                let profile_snapshot = profile.clone();
+                retry_transient_storage_op("stage_profile_insert", || {
+                    profile = profile_snapshot.clone();
+                    storage.insert_conversation_tree_with_profile(
                         agent_id,
                         Some(workspace_id),
                         &make_profiled_storage_remote_conversation(external_id as i64, msg_count),
                         &mut profile,
                     )
-                    .unwrap();
+                })
+                .unwrap();
             }
 
             let accounted_duration = profile.source_duration
@@ -22057,8 +22262,14 @@ mod tests {
 
             let mut profile = InsertConversationTreePerfProfile::default();
             for external_id in 0..iterations {
-                storage
-                    .append_existing_conversation_with_profile(
+                // See stage_profile_insert note: transient BusySnapshot under
+                // fsqlite 0.3.x session reclamation must be retried here just
+                // as the production append path does, with the profile
+                // snapshot restored per attempt to keep stage sums <= total.
+                let profile_snapshot = profile.clone();
+                retry_transient_storage_op("stage_profile_append", || {
+                    profile = profile_snapshot.clone();
+                    storage.append_existing_conversation_with_profile(
                         agent_id,
                         Some(workspace_id),
                         &make_profiled_append_remote_merge_conversation(
@@ -22067,7 +22278,8 @@ mod tests {
                         ),
                         &mut profile,
                     )
-                    .unwrap();
+                })
+                .unwrap();
             }
 
             let accounted_duration = profile.source_duration
@@ -29476,8 +29688,13 @@ mod tests {
         let db_path = dir.path().join("test_transition_with_fts.db");
 
         let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        // BEGIN/COMMIT makes the fixture batch atomic so a transient
+        // fsqlite-0.3.x BusySnapshot abort (stale registry state after tempdir
+        // inode reuse) can be retried wholesale without partial-apply debris.
+        retry_transient_storage_op("legacy_v13_fixture_batch", || {
+            conn.execute_batch(
+                "BEGIN;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta(key, value) VALUES('schema_version', '13');
              CREATE TABLE conversations (id INTEGER PRIMARY KEY);
              CREATE VIRTUAL TABLE fts_messages USING fts5(
@@ -29489,8 +29706,11 @@ mod tests {
                  created_at,
                  content='',
                  tokenize='porter unicode61'
-             );",
-        )
+             );
+             COMMIT;",
+            )
+            .map_err(anyhow::Error::new)
+        })
         .unwrap();
         drop(conn);
 
@@ -29510,8 +29730,13 @@ mod tests {
         let db_path = dir.path().join("test_open_legacy_v13_with_fts.db");
 
         let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        // BEGIN/COMMIT makes the fixture batch atomic so a transient
+        // fsqlite-0.3.x BusySnapshot abort (stale registry state after tempdir
+        // inode reuse) can be retried wholesale without partial-apply debris.
+        retry_transient_storage_op("legacy_v13_open_fixture_batch", || {
+            conn.execute_batch(
+                "BEGIN;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta(key, value) VALUES('schema_version', '13');
              CREATE TABLE agents (
                  id INTEGER PRIMARY KEY,
@@ -29589,8 +29814,11 @@ mod tests {
                  message_id,
                  content='',
                  tokenize='porter unicode61'
-             );",
-        )
+             );
+             COMMIT;",
+            )
+            .map_err(anyhow::Error::new)
+        })
         .unwrap();
         drop(conn);
 
