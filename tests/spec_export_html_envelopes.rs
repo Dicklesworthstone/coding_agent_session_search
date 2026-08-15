@@ -198,6 +198,18 @@ fn export_html_unwritable_output_dir_returns_output_not_writable_envelope() -> T
     // environments universally run tests as non-root.
     fs::set_permissions(&out_dir, fs::Permissions::from_mode(0o555))?;
 
+    // Probe rather than assert a uid: root/CAP_DAC_OVERRIDE environments
+    // bypass POSIX permission checks entirely, so the rejection under test
+    // cannot trigger there.
+    if fs::write(out_dir.join(".root-probe"), b"x").is_ok() {
+        eprintln!(
+            "skipping export_html_unwritable_output_dir envelope check: \
+             process bypasses POSIX permission checks (root/CAP_DAC_OVERRIDE)"
+        );
+        let _ = fs::set_permissions(&out_dir, fs::Permissions::from_mode(0o755));
+        return Ok(());
+    }
+
     let session = real_jsonl_session();
     let outcome = run_export_html(&[
         session.to_str().ok_or("non-utf8 path")?,

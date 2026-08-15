@@ -131,8 +131,14 @@ fn indexed_claude_code_positive_search_matches_golden() {
         String::from_utf8_lossy(&search_output.stderr)
     );
 
-    let parsed: Value = serde_json::from_slice(&search_output.stdout).expect("valid search JSON");
+    let mut parsed: Value =
+        serde_json::from_slice(&search_output.stdout).expect("valid search JSON");
     assert_eq!(parsed["count"].as_u64(), Some(2));
+    // The budget object's elapsed_ms is wall-clock and would make the golden
+    // nondeterministic; pin it before comparison.
+    if let Some(elapsed) = parsed.pointer_mut("/budget/elapsed_ms") {
+        *elapsed = Value::from(0);
+    }
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty search JSON");
     let scrubbed = scrub_temp_home(&canonical, &test_home);
     assert_golden("claude_indexed_search_matrix.json", &scrubbed);

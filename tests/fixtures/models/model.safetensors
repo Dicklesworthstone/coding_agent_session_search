@@ -1,0 +1,1 @@
+placeholder safetensors fixture — intentionally wrong bytes so --from-file SHA256 validation fails in tests

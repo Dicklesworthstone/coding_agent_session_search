@@ -6605,10 +6605,12 @@ fn introspect_health_stale_threshold_default() {
         stale["value_type"], "integer",
         "stale-threshold should be integer type"
     );
-    // Health uses a shorter default (5 minutes) for quick checks
+    // Health now matches `cass status` / DEFAULT_STALE_THRESHOLD_SECS so a
+    // bare `cass health` does not flip unhealthy five minutes after a rebuild
+    // on large archives outside continuous watch mode.
     assert_eq!(
-        stale["default"], "300",
-        "health --stale-threshold should default to 300 (5 minutes)"
+        stale["default"], "1800",
+        "health --stale-threshold should default to 1800 (30 minutes), matching status"
     );
 }
 

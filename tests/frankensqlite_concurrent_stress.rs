@@ -537,8 +537,34 @@ fn stress_retry_convergence_conflicting_writes() {
                 for _ in 0..increments_per_thread {
                     let mut attempt = 0;
                     loop {
-                        let mut tx = conn.transaction().unwrap();
-                        let rows = tx.query("SELECT val FROM counter WHERE id = 1").unwrap();
+                        // fsqlite 0.3.x can refuse transaction open or the
+                        // first read with a transient BusySnapshot while a
+                        // peer's publication advances; that is exactly the
+                        // convergence contract this stress test exercises, so
+                        // route those through the same retry path as commit
+                        // conflicts.
+                        let mut tx = match conn.transaction() {
+                            Ok(tx) => tx,
+                            Err(e) => {
+                                attempt += 1;
+                                retries.fetch_add(1, Ordering::Relaxed);
+                                assert!(attempt <= 50, "too many retries on begin: {e}");
+                                std::thread::sleep(Duration::from_millis(1 << attempt.min(6)));
+                                continue;
+                            }
+                        };
+                        let rows = match tx.query("SELECT val FROM counter WHERE id = 1") {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                drop(tx);
+                                let _ = conn.execute("ROLLBACK");
+                                attempt += 1;
+                                retries.fetch_add(1, Ordering::Relaxed);
+                                assert!(attempt <= 50, "too many retries on read: {e}");
+                                std::thread::sleep(Duration::from_millis(1 << attempt.min(6)));
+                                continue;
+                            }
+                        };
                         let current: i64 = rows[0].get_typed(0).unwrap();
                         let new_val = current + 1;
 

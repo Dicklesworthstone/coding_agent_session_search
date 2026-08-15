@@ -387,7 +387,8 @@ fn accepted_embedding_identity() -> frankensearch::core::FrozenEmbeddingIdentity
             schema_version: VECTOR_STORAGE_IDENTITY_SCHEMA_V1,
             format: "fsvi-v1".to_owned(),
             quantization: QuantizationFormat::F16,
-            endianness: "little".to_owned(),
+            // frankensearch validates the canonical spelling since 14d1480a.
+            endianness: "little-endian".to_owned(),
             vector_normalization: "l2-f32-v1".to_owned(),
             dimension: 256,
         },

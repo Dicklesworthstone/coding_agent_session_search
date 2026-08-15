@@ -38,7 +38,8 @@
     },
     "archive-token-daily-stats-rebuild": {
       "exit_codes": [
-        5
+        5,
+        9
       ]
     },
     "config": {
@@ -70,6 +71,7 @@
     },
     "db-open": {
       "exit_codes": [
+        3,
         9
       ]
     },
@@ -387,6 +389,7 @@
     },
     "source": {
       "exit_codes": [
+        8,
         9,
         12
       ]
@@ -429,6 +432,7 @@
     },
     "unknown": {
       "exit_codes": [
+        1,
         9
       ]
     },

@@ -384,7 +384,9 @@ fn test_empty_corpus_error() {
 
     let result = harness.evaluate(&embedder, &corpus, &metadata);
     assert!(result.is_err(), "Empty corpus should return error");
-    assert!(result.unwrap_err().contains("Empty corpus"));
+    // The harness reports machine-readable no-data reasons since the robot
+    // bake-off rework.
+    assert!(result.unwrap_err().contains("no-data: empty-corpus"));
 }
 
 #[test]

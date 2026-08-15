@@ -4075,17 +4075,12 @@ fn status_and_health_stale_threshold_diverge_in_default_only_not_in_computation(
     // ibuuh.19 retention-policy divergence documentation row.
     //
     // `cass health --json` and `cass status --json` BOTH surface
-    // `stale_threshold_seconds` in their index block, but they use
-    // *different defaults by design*:
-    //
-    //   health: --stale-threshold default = 300  (5 min — pre-flight)
-    //   status: --stale-threshold default = 1800 (30 min — operator)
-    //
-    // The tighter health default is intentional: health is the
-    // machine-readable pre-flight check consumed by monitoring and
-    // agent readiness gates, so it should flag stale indexes sooner.
-    // status is operator-facing with a more forgiving default so
-    // human operators are not pestered by mild staleness.
+    // `stale_threshold_seconds` in their index block. Since v0.6.25 they
+    // share ONE default (DEFAULT_STALE_THRESHOLD_SECS = 1800): the old
+    // tighter 300-second health default flipped bare `cass health`
+    // unhealthy five minutes after a rebuild on large archives outside
+    // watch mode, paging monitoring for a non-event. Stricter pre-flight
+    // thresholds are an explicit --stale-threshold opt-in now.
     //
     // The retention-adjacent invariant this row pins: the divergence
     // MUST live purely in the CLI default — the underlying
@@ -4171,14 +4166,16 @@ fn status_and_health_stale_threshold_diverge_in_default_only_not_in_computation(
         &["status", "--json"],
         &["index", "stale_threshold_seconds"],
     );
-    assert_ne!(
+    // v0.6.25 policy change: the defaults deliberately COLLAPSED to
+    // DEFAULT_STALE_THRESHOLD_SECS (1800). The old 300-second health default
+    // made a bare `cass health` flip unhealthy five minutes after a rebuild
+    // on large archives outside continuous watch mode, which paged monitoring
+    // for a non-event. Pre-flight strictness beyond the shared default is now
+    // an explicit `--stale-threshold` opt-in.
+    assert_eq!(
         h_default, s_default,
-        "health and status stale_threshold defaults collapsed to {h_default} — if this is intentional, update this test; otherwise it's a default-policy regression"
-    );
-    // Tighter machine vs looser operator — document the direction.
-    assert!(
-        h_default < s_default,
-        "health default ({h_default}) must remain <= status default ({s_default}) so pre-flight remains at least as strict as operator-facing staleness"
+        "health ({h_default}) and status ({s_default}) stale_threshold defaults must match \
+         DEFAULT_STALE_THRESHOLD_SECS — a re-divergence should be a conscious policy decision"
     );
 
     // Invariant C: both defaults in sane bounds.

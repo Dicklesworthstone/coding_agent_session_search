@@ -1,12 +1,14 @@
 # Plan: Lightweight Semantic & Hybrid Search for CASS
 
-> **Status: historical design, superseded for acquisition and inference.** This
-> plan predates the shipped model-management contract and the cass#308 removal
-> of FastEmbed/ONNX Runtime. Treat references below to auto-downloads,
-> `CASS_SEMANTIC_AUTODOWNLOAD`, `model.onnx`, FastEmbed/ORT, or a `semantic`
-> Cargo feature as historical design context. Current cass explicitly installs
-> native MiniLM safetensors via `cass models install` (or `--from-file`), never
-> auto-downloads, and always compiles the pure-Rust runtime-dispatched backend.
+> **Status: historical design, superseded for model acquisition and
+> inference.** This plan predates the shipped model-management contract and the
+> cass#308 removal of FastEmbed/ONNX Runtime. Treat references below to
+> auto-downloads, `CASS_SEMANTIC_AUTODOWNLOAD`, `model.onnx`, FastEmbed/ORT, or
+> a `semantic` Cargo feature as historical design context.
+> cass never auto-downloads models: current cass explicitly installs native
+> MiniLM safetensors via `cass models install` (air-gapped:
+> `cass models install --from-file <dir>`), and always compiles the pure-Rust
+> runtime-dispatched backend.
 > Missing model/vector assets make hybrid search fail open to lexical; there is
 > no AVX2-only or separate `-baseline` binary.
 

@@ -19,7 +19,8 @@
       "embedder_id": "hash",
       "model_revision": "hash",
       "completed_at": "[TIMESTAMP]",
-      "size_bytes": 4096
+      "size_bytes": 4096,
+      "shard_count": 1
     },
     "quality_tier": {
       "present": false,
@@ -30,7 +31,8 @@
       "embedder_id": null,
       "model_revision": null,
       "completed_at": null,
-      "size_bytes": null
+      "size_bytes": null,
+      "shard_count": null
     },
     "backlog": {
       "total_conversations": 20,

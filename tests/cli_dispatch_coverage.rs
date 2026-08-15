@@ -464,8 +464,14 @@ fn seed_analytics_remote_source_tokens_fixture(temp_home: &TempDir) {
         .path()
         .join(".local/share/coding-agent-search/agent_search.db");
     let conn = FrankenConnection::open(db_path.to_string_lossy().to_string()).unwrap();
-    conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
-        .unwrap();
+    // The modern schema already carries origin_host; fsqlite 0.3.x correctly
+    // rejects the duplicate ALTER that 0.2.x silently accepted.
+    if let Err(err) = conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT") {
+        assert!(
+            err.to_string().contains("duplicate column"),
+            "unexpected origin_host ALTER failure: {err}"
+        );
+    }
 
     let workspace_rows = conn
         .query_map_collect(
@@ -510,8 +516,14 @@ fn seed_analytics_remote_source_tools_fixture(temp_home: &TempDir) {
         .path()
         .join(".local/share/coding-agent-search/agent_search.db");
     let conn = FrankenConnection::open(db_path.to_string_lossy().to_string()).unwrap();
-    conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
-        .unwrap();
+    // The modern schema already carries origin_host; fsqlite 0.3.x correctly
+    // rejects the duplicate ALTER that 0.2.x silently accepted.
+    if let Err(err) = conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT") {
+        assert!(
+            err.to_string().contains("duplicate column"),
+            "unexpected origin_host ALTER failure: {err}"
+        );
+    }
 
     let workspace_rows = conn
         .query_map_collect(
@@ -3994,10 +4006,17 @@ fn analytics_tokens_totals_structure_complete() {
         assert!(content["est_user"].is_number());
         assert!(content["est_assistant"].is_number());
 
-        // Check coverage section
+        // Check coverage section. api_coverage_pct is a metric-integrity
+        // value: a number when computable, else null paired with a
+        // machine-readable status kind explaining why.
         let coverage = &totals["coverage"];
         assert!(coverage["api_coverage_message_count"].is_number());
-        assert!(coverage["api_coverage_pct"].is_number());
+        assert!(
+            coverage["api_coverage_pct"].is_number()
+                || (coverage["api_coverage_pct"].is_null()
+                    && coverage["api_coverage_status"].is_string()),
+            "api_coverage_pct must be numeric or null+status: {coverage}"
+        );
 
         // Check derived section exists
         assert!(

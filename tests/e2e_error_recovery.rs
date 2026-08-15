@@ -21,7 +21,7 @@ use coding_agent_search::pages::encrypt::{DecryptionEngine, EncryptionEngine, lo
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[path = "util/mod.rs"]
@@ -209,6 +209,23 @@ fn test_corrupted_database_fresh_creation() {
     let start = tracker.start("backup_corrupted", Some("Backup corrupted database"));
     let backup_path = db_path.with_extension("db.corrupt");
     fs::rename(&db_path, &backup_path).expect("backup corrupted");
+    // The fsqlite 0.3.x namespace/WAL sidecars carry the corrupt file's
+    // identity; leaving them beside the vacated path makes the fresh create
+    // refuse with "unable to open database file". A real set-aside moves the
+    // whole family, so the fixture must too.
+    for suffix in [
+        "-fsqlite-ns-gate",
+        "-fsqlite-ns-use",
+        "-wal",
+        "-shm",
+        "-wal-cert-head",
+    ] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", db_path.display()));
+        if sidecar.exists() {
+            let sidecar_backup = PathBuf::from(format!("{}{suffix}", backup_path.display()));
+            fs::rename(&sidecar, &sidecar_backup).expect("backup corrupted sidecar");
+        }
+    }
     assert!(backup_path.exists(), "Backup should exist");
     tracker.end("backup_corrupted", Some("Backup corrupted database"), start);
 
@@ -646,6 +663,19 @@ fn test_permission_denied_export_directory() {
         Some("Create source and read-only directory"),
         start,
     );
+
+    // Probe rather than assert a uid: root/CAP_DAC_OVERRIDE environments
+    // bypass POSIX permission checks, so the denial under test cannot fire.
+    if fs::write(readonly_dir.join(".root-probe"), b"x").is_ok() {
+        eprintln!(
+            "skipping test_permission_denied_export_directory: process bypasses \
+             POSIX permission checks (root/CAP_DAC_OVERRIDE)"
+        );
+        let mut restore = fs::metadata(&readonly_dir).expect("meta").permissions();
+        restore.set_mode(0o755);
+        let _ = fs::set_permissions(&readonly_dir, restore);
+        return;
+    }
 
     // Phase 2: Attempt export to read-only directory
     let start = tracker.start(

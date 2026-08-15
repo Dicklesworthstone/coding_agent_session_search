@@ -18,6 +18,29 @@ fn open_fixture_db(path: &Path) -> FrankenConnection {
     FrankenConnection::open(path.as_ref()).expect("open frankensqlite fixture database")
 }
 
+/// Run a fixture batch atomically (BEGIN/COMMIT) with a bounded retry: fsqlite
+/// 0.3.x can abort the whole batch with a transient `BusySnapshot` while a
+/// previously-dropped session's epoch unwinds (tempdir inode reuse), and the
+/// atomic wrapper makes a wholesale re-run safe.
+fn run_fixture_batch(conn: &FrankenConnection, sql: &str) {
+    let wrapped = format!("BEGIN;\n{sql}\nCOMMIT;");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut delay = std::time::Duration::from_millis(10);
+    loop {
+        match conn.execute_batch(&wrapped) {
+            Ok(()) => return,
+            Err(err)
+                if std::time::Instant::now() < deadline
+                    && err.to_string().to_ascii_lowercase().contains("busy") =>
+            {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(200));
+            }
+            Err(err) => panic!("fixture batch failed: {err}"),
+        }
+    }
+}
+
 // =============================================================================
 // Migration Flow Tests
 // =============================================================================
@@ -116,8 +139,10 @@ fn test_migration_preserves_data() {
     // Create database with data
     {
         let conn = open_fixture_db(&db_path);
-        conn.execute_batch(&format!(
-            r#"
+        run_fixture_batch(
+            &conn,
+            &format!(
+                r#"
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
             INSERT INTO meta (key, value) VALUES ('schema_version', '{}');
             CREATE TABLE agents (
@@ -176,9 +201,9 @@ fn test_migration_preserves_data() {
             INSERT INTO messages (conversation_id, idx, role, content)
                 VALUES (1, 1, 'assistant', 'Acknowledged');
             "#,
-            CURRENT_SCHEMA_VERSION
-        ))
-        .unwrap();
+                CURRENT_SCHEMA_VERSION
+            ),
+        );
     }
 
     // Open and verify data
@@ -367,8 +392,10 @@ fn test_fts_rebuild() {
     // Create database with data but no FTS
     {
         let conn = open_fixture_db(&db_path);
-        conn.execute_batch(&format!(
-            r#"
+        run_fixture_batch(
+            &conn,
+            &format!(
+                r#"
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
             INSERT INTO meta (key, value) VALUES ('schema_version', '{}');
 
@@ -442,9 +469,9 @@ fn test_fts_rebuild() {
             INSERT INTO messages (conversation_id, idx, role, content)
                 VALUES (1, 1, 'assistant', 'Greetings user');
             "#,
-            CURRENT_SCHEMA_VERSION
-        ))
-        .unwrap();
+                CURRENT_SCHEMA_VERSION
+            ),
+        );
     }
 
     // Open and rebuild FTS

@@ -312,9 +312,10 @@ fn fixtures() -> Vec<StorageFixture> {
             expected_storage_state: "wal_sidecar_suspect",
             expected_source_of_truth_risk: "medium",
             corruption: Corruption::OrphanWalShm,
-            expected: Expected::FailClosed {
-                error_kinds: STORAGE_ERROR_KINDS,
-            },
+            // fsqlite 0.3.x repairs stale/orphaned sidecars on open (the
+            // GH#334/d29339c quiescent-record repair that also fixed
+            // cass#393), so reads now succeed instead of failing closed.
+            expected: Expected::FailOpenTruthful,
             safe_command: "cass status --json",
             unsafe_command: "cass doctor --repair --yes --plan-fingerprint <fp>",
             human_summary: "storage wal_sidecar_suspect (source-of-truth risk medium) — \
@@ -329,9 +330,10 @@ fn fixtures() -> Vec<StorageFixture> {
             expected_storage_state: "busy_or_locked",
             expected_source_of_truth_risk: "low",
             corruption: Corruption::ActiveWal,
-            expected: Expected::FailClosed {
-                error_kinds: STORAGE_ERROR_KINDS,
-            },
+            // fsqlite 0.3.x retries transient recovery states at autocommit
+            // boundaries (GH#333) and completes the abandoned writer's WAL
+            // recovery, so reads now succeed instead of failing closed.
+            expected: Expected::FailOpenTruthful,
             safe_command: "cass status --json",
             unsafe_command: "cass doctor --repair --yes --plan-fingerprint <fp>",
             human_summary: "storage busy_or_locked (source-of-truth risk low) — \
@@ -1661,17 +1663,27 @@ fn acceptable_doctor_storage_states(fixture_id: &str) -> &'static [&'static str]
         "fm-storage-stale-searcher-cache" | "fm-storage-fts-metadata-mismatch" => {
             &["derived_only_drift"]
         }
-        // These six historical byte fixtures defeat the read-only opener, so
+        // These historical byte fixtures defeat the read-only opener, so
         // generic open/integrity/deferred states correctly dominate. Exact
         // probe-state coverage uses the separate openable fixtures below.
         "fm-storage-pragma-integrity-fail"
         | "fm-storage-frankensqlite-openread-cursor"
         | "fm-storage-schema-version-drift"
-        | "fm-storage-legacy-interop-fail"
-        | "fm-storage-stale-wal-shm"
-        | "fm-storage-busy-lock-active-writer" => {
+        | "fm-storage-legacy-interop-fail" => {
             &["openread_failed", "integrity_failed", "unknown_deferred"]
         }
+        // fsqlite 0.3.x heals stale sidecars and abandoned WALs on open
+        // (GH#333 recovery retries + GH#334/d29339c sidecar repair), so
+        // doctor now reports the exact suspicion class — or full health —
+        // while reads succeed, instead of a generic open failure.
+        "fm-storage-stale-wal-shm" | "fm-storage-busy-lock-active-writer" => &[
+            "openread_failed",
+            "integrity_failed",
+            "unknown_deferred",
+            "wal_sidecar_suspect",
+            "busy_or_locked",
+            "healthy",
+        ],
         // Unknown fixture id: permissive so a newly-added fixture never silently
         // passes a wrong contract — it is simply not pinned here yet.
         _ => VALID_STORAGE_STATES,

@@ -38,7 +38,11 @@ fn malformed_key_slot_nonce_returns_error_without_panic() {
         Ok(_) => panic!("malformed key-slot nonce must reject unlock"),
         Err(err) => assert!(
             err.to_string().contains("Invalid recovery secret")
-                || err.to_string().contains("invalid nonce length"),
+                || err.to_string().contains("invalid nonce length")
+                // Metadata-shape validation now rejects the malformed slot up
+                // front with the privacy-preserving archive-format error; the
+                // dyoj4 property (reject without panicking) is unchanged.
+                || err.to_string().contains("not a valid archive"),
             "unexpected error: {err:#}"
         ),
     }
