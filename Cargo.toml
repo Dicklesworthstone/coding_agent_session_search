@@ -224,6 +224,15 @@ name = "e2e-run-bundle"
 path = "src/bin/e2e-run-bundle.rs"
 test = false
 
+# fsqlite 0.3.x's async engine builds enormous debug-mode futures; at
+# opt-level 0 a single statement poll can overflow even a 16 MiB test-thread
+# stack (analytics::query storage tests SIGABRT'd during the 0.3.1 gate).
+# Upstream frankensqlite develops at `[profile.dev] opt-level = 1` and
+# franken_agent_detection uses this exact dependencies-only form for the same
+# reason. Applies to dependencies only, never this crate's own code/tests.
+[profile.dev.package."*"]
+opt-level = 1
+
 [profile.release]
 lto = true
 codegen-units = 1

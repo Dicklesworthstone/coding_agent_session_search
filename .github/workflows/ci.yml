@@ -23,6 +23,11 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
   RUST_BACKTRACE: 1
   RUST_LOG: debug
+  # fsqlite 0.3.x's async engine builds much deeper debug-mode futures than
+  # 0.2.x; the default 2 MiB test-thread stack overflows in storage-touching
+  # unit tests (first seen: analytics::query breakdown tests after the 0.3.1
+  # bump). 16 MiB matches the long-standing coverage.yml setting.
+  RUST_MIN_STACK: "16777216"
 
 jobs:
   # No-mock policy audit
