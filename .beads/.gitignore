@@ -33,6 +33,12 @@ beads.right.meta.json
 !metadata.json
 !config.json
 
+# Timestamped issues.jsonl copies from filter/import salvage
+issues.jsonl.pre-*
+
+# br fsqlite WAL-cert sidecars — per-machine runtime, like -wal/-shm
+*.db-wal-cert*
+
 # Local history backups
 .br_history/
 

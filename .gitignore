@@ -211,6 +211,13 @@ COMPREHENSIVE_ISSUES_AND_PROBLEMS_WITH_CASS_BASED_ON_COMPLETE_SESSION_HISTORY_AN
 .beads/.migration-hint-ts
 .beads/*.bak_*
 .beads/last-touched
+# br fsqlite WAL-cert sidecars — per-machine runtime, like -wal/-shm.
+.beads/*.db-wal-cert*
+# Timestamped issues.jsonl copies written beside the live export during
+# filter/import salvage. The live file is issues.jsonl.
+.beads/issues.jsonl.pre-*
+# Root-level salvage trees (full copy of .beads/ taken before a repair).
+.beads-recovery-*/
 
 # Test log output
 test-logs/
