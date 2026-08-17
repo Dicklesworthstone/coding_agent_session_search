@@ -7,6 +7,14 @@ rustflags = ["-Z", "threads=4"]
 jobs = -1
 
 [env]
+# fsqlite 0.3.x builds very large debug-mode futures; a single statement poll
+# can overflow the default 2 MiB test-thread stack even with dependencies at
+# opt-level 1 (see the [profile.dev.package."*"] note in Cargo.toml). 128 MiB
+# is a reservation, not a commitment — Linux commits pages lazily — and it
+# applies only to processes cargo launches from this repo, so the shipped
+# binary is unaffected.
+RUST_MIN_STACK = "134217728"
+
 # Coverage exclusion patterns for cargo-llvm-cov
 # These paths are excluded from coverage reports
 CARGO_LLVM_COV_EXCLUDE = "tests/*,**/test*.rs,benches/*"
