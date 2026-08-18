@@ -1357,3 +1357,178 @@ fn health_and_status_agree_on_shared_fields_during_active_rebuild() {
          status={status_idx:?} health={health_idx:?}"
     );
 }
+
+/// GH #398: `cass health --binary-only` must exit 0 on a host whose archive
+/// is not ready (here: cold-start, nothing initialized) while still REPORTING
+/// the unhealthy readiness verdict. Without the flag the same state exits 1
+/// (pinned by `cold_start_health_surface_transitions_from_not_initialized_to_lexical_only`).
+#[test]
+fn health_binary_only_exit_code_ignores_archive_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path();
+    let data_dir = home.join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create empty data dir");
+
+    let out = isolated_cass_cmd(home)
+        .args(["health", "--binary-only", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("run cass health --binary-only");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--binary-only must exit 0 on a merely-unready archive; stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|err| panic!("health JSON parse failed: {err}; stdout: {stdout}"));
+    assert_eq!(
+        json.get("exit_policy").and_then(Value::as_str),
+        Some("binary-only"),
+        "payload must carry the active exit policy; payload: {json}"
+    );
+    assert_eq!(
+        json.get("healthy").and_then(Value::as_bool),
+        Some(false),
+        "--binary-only must NOT change the readiness verdict, only the exit code; payload: {json}"
+    );
+    assert_eq!(
+        json.get("initialized").and_then(Value::as_bool),
+        Some(false),
+        "readiness details must still be reported under --binary-only; payload: {json}"
+    );
+}
+
+/// GH #396: an archive whose canonical DB file exists but cannot be opened
+/// (garbage bytes where a SQLite database should be) must NOT be reported as
+/// `db=available` by the health fast surface. The busy/lock-class elision is
+/// preserved elsewhere; a hard open failure has to surface as an open error
+/// and an unhealthy exit.
+#[test]
+fn health_surfaces_hard_open_failure_instead_of_assuming_db_available() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path();
+    let data_dir = home.join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    // A present-but-unopenable canonical DB: wrong magic, plausible size.
+    let db_path = data_dir.join("agent_search.db");
+    fs::write(&db_path, vec![0xAB_u8; 8192]).expect("write garbage db");
+
+    let out = isolated_cass_cmd(home)
+        .args(["health", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("run cass health on unopenable archive");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "health must exit unhealthy on an unopenable archive; stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|err| panic!("health JSON parse failed: {err}; stdout: {stdout}"));
+    let db = json.get("db").expect("health payload must carry db block");
+    assert_eq!(
+        db.get("exists").and_then(Value::as_bool),
+        Some(true),
+        "the garbage DB file exists; payload: {json}"
+    );
+    assert_eq!(
+        db.get("opened").and_then(Value::as_bool),
+        Some(false),
+        "health must NOT report an assumed-good open for a hard open failure; payload: {json}"
+    );
+    assert_eq!(
+        db.get("open_skipped").and_then(Value::as_bool),
+        Some(false),
+        "a hard open failure is an attempted open, not an elided one; payload: {json}"
+    );
+    assert!(
+        db.get("open_error")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        "health must surface the open error; payload: {json}"
+    );
+    assert_eq!(
+        json.get("healthy").and_then(Value::as_bool),
+        Some(false),
+        "an unopenable archive can never be healthy; payload: {json}"
+    );
+
+    // The same hard failure under --binary-only still reports the degraded
+    // archive but exits 0: the BINARY works, the archive does not (#398).
+    let out2 = isolated_cass_cmd(home)
+        .args(["health", "--binary-only", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("run cass health --binary-only on unopenable archive");
+    assert_eq!(
+        out2.status.code(),
+        Some(0),
+        "--binary-only exits 0 even when the archive is degraded; stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let json2: Value =
+        serde_json::from_str(String::from_utf8_lossy(&out2.stdout).trim()).expect("json2");
+    assert_eq!(
+        json2
+            .get("db")
+            .and_then(|d| d.get("opened"))
+            .and_then(Value::as_bool),
+        Some(false),
+        "--binary-only must not mask the degraded-archive report; payload: {json2}"
+    );
+}
+
+/// GH #403: `--db` pointing outside the default data dir must relocate the
+/// whole derived-asset sandbox (data_dir) to the db file's parent, so a
+/// scratch `--db` never reads or writes the live install's lexical index,
+/// raw-mirror, checkpoints, or locks. An explicit `--data-dir` still wins.
+#[test]
+fn scratch_db_override_isolates_data_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path();
+    let scratch = home.join("scratch");
+    fs::create_dir_all(&scratch).expect("create scratch dir");
+    let db_path = scratch.join("probe.db");
+
+    let out = isolated_cass_cmd(home)
+        .arg("--db")
+        .arg(&db_path)
+        .args(["status", "--json"])
+        .output()
+        .expect("run cass --db status");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|err| panic!("status JSON parse failed: {err}; stdout: {stdout}"));
+    let data_dir = json
+        .get("data_dir")
+        .and_then(Value::as_str)
+        .expect("status payload must carry data_dir");
+    assert_eq!(
+        Path::new(data_dir),
+        scratch.as_path(),
+        "--db outside the default data dir must pull data_dir with it; payload: {json}"
+    );
+
+    // Explicit --data-dir still wins over the --db-derived location.
+    let explicit = home.join("explicit-data-dir");
+    fs::create_dir_all(&explicit).expect("create explicit data dir");
+    let out2 = isolated_cass_cmd(home)
+        .arg("--db")
+        .arg(&db_path)
+        .args(["status", "--json", "--data-dir"])
+        .arg(&explicit)
+        .output()
+        .expect("run cass --db --data-dir status");
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    let json2: Value = serde_json::from_str(stdout2.trim())
+        .unwrap_or_else(|err| panic!("status JSON parse failed: {err}; stdout: {stdout2}"));
+    assert_eq!(
+        json2.get("data_dir").and_then(Value::as_str),
+        Some(explicit.to_str().expect("utf8 path")),
+        "an explicit --data-dir must override the --db-derived data dir; payload: {json2}"
+    );
+}

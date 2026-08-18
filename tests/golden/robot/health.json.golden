@@ -1,6 +1,7 @@
 {
   "status": "not_initialized",
   "healthy": false,
+  "exit_policy": "archive",
   "health_level": "not_initialized",
   "initialized": false,
   "explanation": "No cass database or search index exists in [TEST_HOME]/coding-agent-search yet. This is expected on a fresh install or when using a brand-new --data-dir.",

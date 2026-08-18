@@ -22789,6 +22789,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             // commands` as the authoritative CLI enumeration now see the
             // full advertised surface instead of the ~10-command slice.
             "  cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).".to_string(),
+            "    --binary-only     Report the same readiness verdict but exit 0 unless the executable itself fails (binary promotion gates).".to_string(),
             "  cass doctor [--json] [--fix]     Legacy spelling: --json realizes read-only check; --fix realizes safe-auto-run.".to_string(),
             "                    doctor JSON includes source_inventory; missing upstream provider files are".to_string(),
             "                    source coverage/prune-risk warnings, not proof that archived cass rows are lost.".to_string(),
@@ -82196,11 +82197,12 @@ pub struct CapabilitiesResponse {
     /// Semantic version of the crate
     pub crate_version: String,
     /// Short commit hash the binary was built from (with `-dirty` suffix for
-    /// uncommitted worktrees); `null` when built without git metadata
+    /// uncommitted worktrees); `"unknown"` when built without git metadata
     /// (crates.io / tarball builds). Machine-readable build identity (#399).
-    pub build_commit: Option<String>,
-    /// Commit date (`YYYY-MM-DD`) of `build_commit`, when known.
-    pub build_commit_date: Option<String>,
+    pub build_commit: String,
+    /// Commit date (`YYYY-MM-DD`) of `build_commit`; `"unknown"` when built
+    /// without git metadata.
+    pub build_commit_date: String,
     /// API contract version (bumped on breaking changes)
     pub api_version: u32,
     /// Human-readable contract identifier
@@ -83209,8 +83211,12 @@ fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
     let response = CapabilitiesResponse {
         version: crate_version.clone(),
         crate_version,
-        build_commit: option_env!("CASS_BUILD_COMMIT").map(str::to_string),
-        build_commit_date: option_env!("CASS_BUILD_COMMIT_DATE").map(str::to_string),
+        build_commit: option_env!("CASS_BUILD_COMMIT")
+            .unwrap_or("unknown")
+            .to_string(),
+        build_commit_date: option_env!("CASS_BUILD_COMMIT_DATE")
+            .unwrap_or("unknown")
+            .to_string(),
         api_version: 1,
         contract_version: CONTRACT_VERSION.to_string(),
         features: vec![
@@ -83282,11 +83288,11 @@ fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
         "Version: {} (api v{}, contract v{})",
         response.crate_version, response.api_version, response.contract_version
     );
-    if let Some(commit) = &response.build_commit {
-        match &response.build_commit_date {
-            Some(date) => println!("Build commit: {commit} ({date})"),
-            None => println!("Build commit: {commit}"),
-        }
+    if response.build_commit != "unknown" {
+        println!(
+            "Build commit: {} ({})",
+            response.build_commit, response.build_commit_date
+        );
     }
     println!();
     println!("Features:");
@@ -83700,7 +83706,7 @@ fn run_config_based_export(
 fn run_api_version(output_format: Option<RobotFormat>) -> CliResult<()> {
     let payload = serde_json::json!({
         "crate_version": env!("CARGO_PKG_VERSION"),
-        "build_commit": option_env!("CASS_BUILD_COMMIT"),
+        "build_commit": option_env!("CASS_BUILD_COMMIT").unwrap_or("unknown"),
         "api_version": 1,
         "contract_version": CONTRACT_VERSION,
     });

@@ -2327,7 +2327,8 @@ fn capabilities_matches_golden_contract() {
         output.stderr.is_empty(),
         "capabilities should not log to stderr"
     );
-    let actual: Value = serde_json::from_slice(&output.stdout).expect("valid capabilities json");
+    let mut actual: Value =
+        serde_json::from_slice(&output.stdout).expect("valid capabilities json");
     let expected = read_robot_json_golden("capabilities.json.golden");
 
     // Verify crate_version matches Cargo.toml (dynamic, not from fixture)
@@ -2337,6 +2338,24 @@ fn capabilities_matches_golden_contract() {
         cargo_version,
         "crate_version should match Cargo.toml version"
     );
+
+    // GH #399: build identity varies per build/checkout. Validate its shape,
+    // then normalize to the golden placeholders before the exact compare.
+    let commit = actual["build_commit"]
+        .as_str()
+        .expect("build_commit should be a string");
+    let commit_core = commit.strip_suffix("-dirty").unwrap_or(commit);
+    assert!(
+        commit_core == "unknown"
+            || (commit_core.len() == 12 && commit_core.chars().all(|c| c.is_ascii_hexdigit())),
+        "build_commit should be a 12-hex short sha (optionally -dirty) or 'unknown', got: {commit}"
+    );
+    assert!(
+        actual["build_commit_date"].is_string(),
+        "build_commit_date should be a string"
+    );
+    actual["build_commit"] = Value::String("[BUILD_COMMIT]".to_string());
+    actual["build_commit_date"] = Value::String("[BUILD_COMMIT_DATE]".to_string());
 
     assert_eq!(actual, expected, "capabilities contract drifted");
 }

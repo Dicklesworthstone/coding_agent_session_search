@@ -7,6 +7,9 @@
     "healthy": {
       "type": "boolean"
     },
+    "exit_policy": {
+      "type": "string"
+    },
     "health_level": {
       "type": "string"
     },

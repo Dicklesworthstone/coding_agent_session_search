@@ -2797,6 +2797,7 @@ schemas: (auto-generated from contract)
       - status: string
       - surface: string
     - errors: array
+    - exit_policy: string
     - explanation: ?
     - health_level: string
     - healthy: boolean

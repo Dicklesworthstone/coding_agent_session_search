@@ -752,6 +752,18 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         .replace_all(&out, r#"  "version": "[VERSION]""#)
         .to_string();
 
+    // 1b. Build identity (GH #399): the embedded commit/date vary per build
+    //     (and per checkout state). Keep the fields, scrub the values.
+    let build_commit_re = regex::Regex::new(r#""build_commit"\s*:\s*("[^"]*"|null)"#).unwrap();
+    out = build_commit_re
+        .replace_all(&out, r#""build_commit": "[BUILD_COMMIT]""#)
+        .to_string();
+    let build_commit_date_re =
+        regex::Regex::new(r#""build_commit_date"\s*:\s*("[^"]*"|null)"#).unwrap();
+    out = build_commit_date_re
+        .replace_all(&out, r#""build_commit_date": "[BUILD_COMMIT_DATE]""#)
+        .to_string();
+
     // 2. ISO-8601 timestamps (match with optional fractional seconds / tz).
     let ts_re =
         regex::Regex::new(r#"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?"#)

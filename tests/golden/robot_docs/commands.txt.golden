@@ -67,6 +67,7 @@ commands:
   cass robot-docs <topic>
   cass --robot-help
   cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).
+    --binary-only     Report the same readiness verdict but exit 0 unless the executable itself fails (binary promotion gates).
   cass doctor [--json] [--fix]     Legacy spelling: --json realizes read-only check; --fix realizes safe-auto-run.
                     doctor JSON includes source_inventory; missing upstream provider files are
                     source coverage/prune-risk warnings, not proof that archived cass rows are lost.

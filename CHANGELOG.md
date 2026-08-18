@@ -17,7 +17,45 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## [Unreleased]
 
-(nothing yet)
+### Added
+
+- **Build commit embedded in the binary** ([#399](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/399)).
+  `cass --version` now prints `cass <semver> (<short-sha> <commit-date>)` for
+  builds made from a git checkout (with a `-dirty` suffix for uncommitted
+  worktrees), so a `main` build and the nearest tagged release are no longer
+  indistinguishable at runtime. `capabilities --json` and `api-version --json`
+  gain machine-readable `build_commit` / `build_commit_date` fields
+  (`"unknown"` for builds without git metadata, e.g. crates.io). The commit is
+  resolved at
+  compile time against the crate's own checkout — never at runtime against the
+  process CWD.
+- **`cass health --binary-only`** ([#398](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/398)).
+  Same readiness report, but the exit code reflects only whether the
+  executable itself works — archive conditions (stale index, active rebuild,
+  uninitialized or degraded archive) are still fully reported yet never fail
+  the exit code. Built for binary promotion gates and packaging smoke tests
+  that must validate a candidate binary on a host whose archive happens to be
+  stale. The JSON payload carries the active `exit_policy`
+  (`"archive"`/`"binary-only"`).
+
+### Fixed
+
+- **`--db` now isolates the whole sandbox, not just the SQLite file**
+  ([#403](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/403)).
+  When `--db` points outside the default data dir, derived assets — lexical
+  index, raw-mirror, checkpoints, `index-run.lock` — resolve to the db file's
+  parent directory instead of silently reading and writing the LIVE install's
+  data dir (which previously let a throwaway `--db` rebuild overwrite the live
+  lexical checkpoint fingerprint and contend for live locks). An explicit
+  `--data-dir` still wins; `--db` inside the default data dir keeps today's
+  behavior.
+- **`cass health` no longer reports `db=available` / "Search usable now: yes"
+  on an unopenable archive** ([#396](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/396)).
+  The health fast surface still elides busy/lock-class open failures (a
+  concurrent writer is not a degraded-state signal), but hard failures —
+  CANTOPEN, corrupt header, permissions — now surface as an open error, flip
+  the readiness class to `db=open-failed`, and exit unhealthy, matching what
+  `cass search` actually experiences.
 
 ## [v0.6.25] -- 2026-08-14
 
