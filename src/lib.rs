@@ -263,11 +263,15 @@ where
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "cass",
-    version,
+    version = env!("CASS_VERSION_FULL"),
     about = "Unified TUI search over coding agent histories"
 )]
 pub struct Cli {
-    /// Path to the `SQLite` database (defaults to platform data dir)
+    /// Path to the `SQLite` database (defaults to platform data dir). When it
+    /// points outside the default data dir, derived assets (lexical index,
+    /// raw-mirror, checkpoints, locks) follow it into the db file's parent
+    /// directory, so a scratch `--db` is fully isolated from the live
+    /// install (#403). An explicit `--data-dir` still wins.
     #[arg(long)]
     pub db: Option<PathBuf>,
 
@@ -877,6 +881,14 @@ pub enum Commands {
         /// on large archives that are not in continuous watch mode.
         #[arg(long, default_value_t = 1800)]
         stale_threshold: u64,
+        /// Exit code reflects only whether this executable is functional:
+        /// archive readiness (stale index, active rebuild, uninitialized or
+        /// degraded archive) is still fully REPORTED in the output but never
+        /// fails the exit code. For binary promotion gates and packaging
+        /// smoke tests that must validate a candidate binary on a host whose
+        /// archive happens to be stale (#398).
+        #[arg(long, default_value_t = false)]
+        binary_only: bool,
     },
     /// First-run source onboarding + readiness wizard. Read-only: explains what
     /// CASS found, what it will index, what is missing, and the single safest
@@ -6525,6 +6537,7 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         data_dir,
         robot_meta,
         stale_threshold,
+        binary_only,
         json,
     }) = cli.command.clone()
     else {
@@ -6568,6 +6581,7 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         cli.db.clone(),
         structured_format,
         stale_threshold,
+        binary_only,
         robot_meta,
     );
 
@@ -7778,6 +7792,7 @@ async fn execute_cli(
                     data_dir,
                     robot_meta,
                     stale_threshold,
+                    binary_only,
                     json,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
@@ -7786,6 +7801,7 @@ async fn execute_cli(
                         cli.db.clone(),
                         structured_format,
                         stale_threshold,
+                        binary_only,
                         robot_meta,
                     )?;
                 }
@@ -17212,7 +17228,7 @@ fn run_analytics_rebuild(
 ) -> CliResult<serde_json::Value> {
     use crate::storage::sqlite::FrankenStorage;
 
-    let data_dir = common.data_dir.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(&common.data_dir, db_path_override);
     let db_path = db_path_override
         .cloned()
         .unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -17942,10 +17958,13 @@ fn probe_state_db(
 /// keeps `open_skipped=true` + `counts_skipped=true` + zero counts so
 /// the gi4oy/d0rmo health contract (null counts, assumed-good open
 /// signal) is preserved byte-for-byte — only the watermark fields are
-/// populated. When the open fails, the watermark-only path degrades to
-/// the assumed-good elision (open_skipped=true) rather than surfacing
-/// the open error, matching the prior skip-open semantics on the fast
-/// readiness surface (corrupt-DB detection stays doctor/diag's job).
+/// populated. When the open fails with a RETRYABLE (busy/lock-class)
+/// error, the watermark-only path degrades to the assumed-good elision
+/// (open_skipped=true) rather than surfacing the open error, matching
+/// the prior skip-open semantics on the fast readiness surface. Hard
+/// (non-retryable) open failures surface as open_error even here — see
+/// GH #396: masking them made health report db=available while every
+/// search failed on an unopenable archive.
 fn probe_state_db_modes(
     db_path: &Path,
     reason: &str,
@@ -17966,16 +17985,24 @@ fn probe_state_db_modes(
     let conn = match open_franken_cli_read_db(db_path.to_path_buf(), reason, timeout) {
         Ok(conn) => conn,
         Err(err) => {
-            if watermarks_only {
+            if watermarks_only && err.retryable {
                 // Preserve the pre-#301 skip-open semantics on the fast
-                // readiness surface: an open failure here is not a
-                // degraded-state signal (that is doctor/diag's job).
-                // Report the assumed-good elision so health's contract
-                // (opened=true + open_skipped=true) is unchanged when the
-                // watermark read cannot complete.
+                // readiness surface for RETRYABLE (busy/lock-class) open
+                // failures only: a concurrent writer holding the archive is
+                // not a degraded-state signal, so report the assumed-good
+                // elision (opened=true + open_skipped=true) and keep health
+                // under its latency budget.
+                //
+                // Hard (non-retryable) failures — CANTOPEN, corrupt header,
+                // permission — fall through: GH #396 showed that masking
+                // them made `cass health` print `db=available` / "Search
+                // usable now: yes" while every `cass search` failed on an
+                // unopenable archive. An open we ATTEMPTED and watched fail
+                // hard must surface as OpenFailed, on every surface.
                 snapshot.opened = true;
                 return snapshot;
             }
+            snapshot.open_skipped = false;
             snapshot.open_error = Some(err.message);
             snapshot.open_retryable = err.retryable;
             return snapshot;
@@ -25184,7 +25211,7 @@ fn run_cli_search(
     // Start timing for robot_meta elapsed_ms
     let start_time = Instant::now();
 
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let db_exists = db_path.exists();
@@ -26467,7 +26494,7 @@ fn run_cli_pack(
     };
     limits.validate().map_err(pack_invalid_limit_error)?;
 
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let db_path = db_override
         .clone()
@@ -29741,7 +29768,7 @@ fn run_stats(
 
     use crate::franken_sync::compat::{ParamValue, RowExt};
 
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let conn = open_franken_cli_read_db(db_path.clone(), "stats", Duration::from_secs(30))?;
     validate_fts_messages_integrity_for_cli(&conn, "stats")?;
@@ -30132,7 +30159,7 @@ fn run_storage(
 ) -> CliResult<()> {
     use std::collections::BTreeMap;
 
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override
         .clone()
         .unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -30310,7 +30337,7 @@ fn run_dedup(
     output_format: Option<RobotFormat>,
     apply: bool,
 ) -> CliResult<()> {
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -30506,7 +30533,7 @@ fn run_diag(
     use std::fs;
 
     let version = env!("CARGO_PKG_VERSION");
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     // Use the actual versioned lexical index path without creating it during diagnostics.
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
@@ -41736,7 +41763,7 @@ pub(crate) fn run_doctor_archive_scan_impl(
     use colored::Colorize;
 
     let started = Instant::now();
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let context = build_doctor_archive_scan_context(&data_dir, &db_path);
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -41806,7 +41833,7 @@ pub(crate) fn run_doctor_archive_normalize_impl(
     use colored::Colorize;
 
     let started = Instant::now();
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let apply_requested = execution_mode == doctor::DoctorExecutionMode::ArchiveNormalizeApply;
     let context = build_doctor_archive_scan_context(&data_dir, &db_path);
@@ -46518,7 +46545,7 @@ pub(crate) fn run_doctor_backups_impl(
     requested_plan_fingerprint: Option<String>,
 ) -> CliResult<()> {
     let started = Instant::now();
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -48771,7 +48798,7 @@ fn run_doctor_archive_export_impl(
     wrap: WrapConfig,
 ) -> CliResult<()> {
     let started = Instant::now();
-    let data_dir = request.data_dir_override.unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(&request.data_dir_override, request.db_override.as_ref());
     let db_path = request
         .db_override
         .unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -50031,7 +50058,7 @@ fn run_doctor_support_bundle_impl(
     wrap: WrapConfig,
 ) -> CliResult<()> {
     let started = Instant::now();
-    let data_dir = request.data_dir_override.unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(&request.data_dir_override, request.db_override.as_ref());
     let db_path = request
         .db_override
         .unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -50677,7 +50704,7 @@ fn run_doctor_baseline_impl(
     wrap: WrapConfig,
 ) -> CliResult<()> {
     let started = Instant::now();
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(&data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let baseline_id = doctor_baseline_id_or_default(baseline_id.as_deref(), baseline_path.as_ref());
     let baseline_path = doctor_baseline_resolve_path(
@@ -73090,7 +73117,7 @@ fn run_onboarding(
     db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
 
     let observation = gather_onboarding_observation(&data_dir, &db_path);
@@ -73721,7 +73748,7 @@ fn run_status(
     stale_threshold: u64,
     _robot_meta: bool,
 ) -> CliResult<()> {
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     // Bounded execution budget for the robot surface (uojcg.2.2): when the
     // optional/expensive sections would exceed it, status sheds them and returns
@@ -74273,7 +74300,7 @@ fn run_triage(
     output_format: Option<RobotFormat>,
     stale_threshold: u64,
 ) -> CliResult<()> {
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let triage_budget = crate::robot_budget_envelope::RobotBudget::new(triage_budget_ms());
     let mut state = state_meta_json_for_status(&data_dir, &db_path, stale_threshold);
@@ -74558,7 +74585,7 @@ fn run_support_bundle(
 ) -> CliResult<()> {
     use crate::recovery_support_bundle as rsb;
 
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let data_dir_str = data_dir.display().to_string();
 
@@ -74715,12 +74742,13 @@ fn run_health(
     db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
     stale_threshold: u64,
+    binary_only: bool,
     _robot_meta: bool,
 ) -> CliResult<()> {
     use std::time::Instant;
 
     let start = Instant::now();
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     // [coding_agent_session_search-d0rmo + gi4oy] health is the
     // documented <50ms fast surface; force-skip BOTH the canonical-DB
@@ -74968,6 +74996,11 @@ fn run_health(
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
+            // #398: which state the process exit code reflects. "archive" is
+            // the historical behavior (exit 1 on any readiness gap);
+            // "binary-only" reports the same readiness verdict but exits 0
+            // unless the executable itself malfunctions.
+            "exit_policy": if binary_only { "binary-only" } else { "archive" },
             "health_level": if ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
             "initialized": !not_initialized,
             "explanation": explanation,
@@ -75086,7 +75119,13 @@ fn run_health(
         );
     }
 
-    let final_error = if healthy {
+    let final_error = if binary_only {
+        // #398: the archive-readiness verdict above is fully reported in the
+        // output; under --binary-only it never fails the exit code. Reaching
+        // this point means the executable parsed args, resolved paths, probed
+        // the archive, and rendered its output — the binary works.
+        None
+    } else if healthy {
         None
     } else if rebuild_active {
         Some(CliError {
@@ -78158,7 +78197,7 @@ pub(crate) fn run_doctor_impl(
     use std::time::Instant;
 
     let start = Instant::now();
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let lock_path = data_dir.join(".index.lock");
@@ -82156,6 +82195,12 @@ pub struct CapabilitiesResponse {
     pub version: String,
     /// Semantic version of the crate
     pub crate_version: String,
+    /// Short commit hash the binary was built from (with `-dirty` suffix for
+    /// uncommitted worktrees); `null` when built without git metadata
+    /// (crates.io / tarball builds). Machine-readable build identity (#399).
+    pub build_commit: Option<String>,
+    /// Commit date (`YYYY-MM-DD`) of `build_commit`, when known.
+    pub build_commit_date: Option<String>,
     /// API contract version (bumped on breaking changes)
     pub api_version: u32,
     /// Human-readable contract identifier
@@ -83164,6 +83209,8 @@ fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
     let response = CapabilitiesResponse {
         version: crate_version.clone(),
         crate_version,
+        build_commit: option_env!("CASS_BUILD_COMMIT").map(str::to_string),
+        build_commit_date: option_env!("CASS_BUILD_COMMIT_DATE").map(str::to_string),
         api_version: 1,
         contract_version: CONTRACT_VERSION.to_string(),
         features: vec![
@@ -83235,6 +83282,12 @@ fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
         "Version: {} (api v{}, contract v{})",
         response.crate_version, response.api_version, response.contract_version
     );
+    if let Some(commit) = &response.build_commit {
+        match &response.build_commit_date {
+            Some(date) => println!("Build commit: {commit} ({date})"),
+            None => println!("Build commit: {commit}"),
+        }
+    }
     println!();
     println!("Features:");
     for feature in &response.features {
@@ -83647,6 +83700,7 @@ fn run_config_based_export(
 fn run_api_version(output_format: Option<RobotFormat>) -> CliResult<()> {
     let payload = serde_json::json!({
         "crate_version": env!("CARGO_PKG_VERSION"),
+        "build_commit": option_env!("CASS_BUILD_COMMIT"),
         "api_version": 1,
         "contract_version": CONTRACT_VERSION,
     });
@@ -90711,7 +90765,7 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(&data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let progress = Arc::new(indexer::IndexingProgress::default());
     let opts = indexer::IndexOptions {
@@ -92413,7 +92467,7 @@ fn run_index_with_data(
     use crate::franken_sync::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
 
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let data_dir = resolve_data_dir(&data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let embedder = resolve_semantic_index_embedder(&embedder);
 
@@ -93355,6 +93409,56 @@ pub fn default_db_path() -> PathBuf {
     default_data_dir().join("agent_search.db")
 }
 
+/// Resolve the effective data dir, honoring an explicit `--db` override
+/// (GH #403).
+///
+/// Historically `--db` overrode only the SQLite path while every derived
+/// asset — lexical/Tantivy index, raw-mirror, checkpoints, `index-run.lock` —
+/// still resolved to the live data dir. A command that read as fully
+/// sandboxed (`cass --db /scratch/probe.db index --full`) therefore wrote a
+/// foreign database's lexical fingerprint into the LIVE install's checkpoint
+/// and contended for the live install's locks.
+///
+/// Rules, in order:
+/// 1. An explicit data-dir override (`--data-dir` / per-command flag) always
+///    wins, preserving any deliberate split layout.
+/// 2. Otherwise, when `--db` points OUTSIDE the default data dir, the db
+///    file's parent directory becomes the data dir — the exact inverse of
+///    the `data_dir.join("agent_search.db")` fallback — so a scratch db is
+///    fully isolated.
+/// 3. `--db <default_data_dir>/agent_search.db`, or no `--db` at all, keeps
+///    the default data dir: existing setups are untouched.
+pub fn resolve_data_dir(
+    data_dir_override: &Option<PathBuf>,
+    db_override: Option<&PathBuf>,
+) -> PathBuf {
+    if let Some(dir) = data_dir_override {
+        return dir.clone();
+    }
+    let default_dir = default_data_dir();
+    if let Some(parent) = db_override
+        .and_then(|db| db.parent())
+        .filter(|p| !p.as_os_str().is_empty())
+        && !same_directory(parent, &default_dir)
+    {
+        return parent.to_path_buf();
+    }
+    default_dir
+}
+
+/// Best-effort path identity: canonicalize both sides when possible (resolves
+/// symlinks and relative segments), fall back to the literal paths otherwise
+/// (e.g. the default data dir does not exist yet on a fresh install).
+fn same_directory(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
 pub fn default_data_dir() -> PathBuf {
     if let Ok(dir) = dotenvy::var("CASS_DATA_DIR") {
         let trimmed = dir.trim();
@@ -93372,6 +93476,39 @@ pub fn default_data_dir() -> PathBuf {
         .map(|p| p.data_dir().to_path_buf())
         .or_else(|| dirs::home_dir().map(|h| h.join(".coding-agent-search")))
         .unwrap_or_else(|| PathBuf::from("./data"))
+}
+
+#[cfg(test)]
+mod resolve_data_dir_tests {
+    use super::{default_data_dir, resolve_data_dir};
+    use std::path::PathBuf;
+
+    #[test]
+    fn no_overrides_yields_default() {
+        assert_eq!(resolve_data_dir(&None, None), default_data_dir());
+    }
+
+    #[test]
+    fn explicit_data_dir_override_always_wins() {
+        let dir = PathBuf::from("/explicit/data-dir");
+        let db = PathBuf::from("/scratch/probe.db");
+        assert_eq!(resolve_data_dir(&Some(dir.clone()), Some(&db)), dir);
+    }
+
+    #[test]
+    fn db_inside_default_data_dir_keeps_default() {
+        let db = default_data_dir().join("agent_search.db");
+        assert_eq!(resolve_data_dir(&None, Some(&db)), default_data_dir());
+    }
+
+    #[test]
+    fn scratch_db_isolates_data_dir_to_its_parent() {
+        // GH #403: `--db /scratch/probe.db` must not leave derived assets
+        // (lexical index, raw-mirror, locks) pointing at the live data dir.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("probe.db");
+        assert_eq!(resolve_data_dir(&None, Some(&db)), tmp.path());
+    }
 }
 
 /// Read session paths from a file or stdin (when path is "-").

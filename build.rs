@@ -306,6 +306,73 @@ fn main() {
     let packaged_manifest = manifest_dir.join("Cargo.toml.orig").is_file();
     validate_path_dependency_contracts(&manifest_dir, &manifest, packaged_manifest);
     emit_vergen_metadata();
+    emit_build_commit_metadata(&manifest_dir);
+}
+
+/// Embed the build commit at compile time (GH #399).
+///
+/// A binary built from `main` and the binary from the nearest tag are
+/// otherwise indistinguishable at runtime: bare `version` in clap prints only
+/// `CARGO_PKG_VERSION`. Resolve the commit HERE, against the crate's own
+/// checkout (`CARGO_MANIFEST_DIR`), never at runtime against the process CWD
+/// (ubs#79 is the failure mode to avoid: a runtime `git rev-parse` reports
+/// the *scanned* repository's commit as the build SHA).
+///
+/// Emits:
+/// - `VERGEN_GIT_SHA` — full commit hash (name kept because doctor run
+///   journaling already reads `option_env!("VERGEN_GIT_SHA")`); only when
+///   resolvable.
+/// - `CASS_BUILD_COMMIT` — short (12-char) hash with a `-dirty` suffix when
+///   the worktree has uncommitted tracked changes; only when resolvable.
+/// - `CASS_BUILD_COMMIT_DATE` — commit date (`YYYY-MM-DD`); only when
+///   resolvable.
+/// - `CASS_VERSION_FULL` — ALWAYS emitted: `<semver> (<short-sha> <date>)`
+///   when git metadata is available, plain `<semver>` otherwise (crates.io /
+///   tarball builds have no `.git`).
+fn emit_build_commit_metadata(manifest_dir: &Path) {
+    let crate_version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
+
+    // Rebuild when HEAD moves or the checked-out branch's ref advances, so a
+    // cached build script cannot pin a stale SHA into a fresh binary.
+    let git_dir = manifest_dir.join(".git");
+    if git_dir.exists() {
+        let head = git_dir.join("HEAD");
+        if head.exists() {
+            println!("cargo:rerun-if-changed={}", head.display());
+        }
+        if let Ok(head_contents) = fs::read_to_string(&head)
+            && let Some(reference) = head_contents.trim().strip_prefix("ref: ")
+        {
+            let ref_path = git_dir.join(reference);
+            if ref_path.exists() {
+                println!("cargo:rerun-if-changed={}", ref_path.display());
+            }
+        }
+    }
+
+    let state = git_state(manifest_dir).ok();
+    let commit_date = git_output(manifest_dir, &["show", "-s", "--format=%cs", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .ok();
+
+    let full_version = match &state {
+        Some(state) if state.head.len() >= 12 => {
+            let mut short = state.head[..12].to_string();
+            if state.dirty {
+                short.push_str("-dirty");
+            }
+            println!("cargo:rustc-env=VERGEN_GIT_SHA={}", state.head);
+            println!("cargo:rustc-env=CASS_BUILD_COMMIT={short}");
+            if let Some(date) = &commit_date {
+                println!("cargo:rustc-env=CASS_BUILD_COMMIT_DATE={date}");
+                format!("{crate_version} ({short} {date})")
+            } else {
+                format!("{crate_version} ({short})")
+            }
+        }
+        _ => crate_version.clone(),
+    };
+    println!("cargo:rustc-env=CASS_VERSION_FULL={full_version}");
 }
 
 fn validate_path_dependency_contracts(
