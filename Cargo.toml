@@ -103,7 +103,7 @@ bytemuck = "1.25.0"
 # not run the all-MiniLM LayerNorm export, and its prebuilt AVX/AVX2 vendor
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
-frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "14d1480af8f891ff8f477c080301dee2ba26dd4d", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
+frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "46a3aefce1aa658fa98f27f0b3676f073160e15c", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
 franken-agent-detection = { version = "0.1.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "57d2789e8d03f6e4b75b0a1a9a5709fc8b290d19", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
