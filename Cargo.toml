@@ -23,7 +23,7 @@ anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi", "json"] }
-asupersync = { version = "=0.4.4", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "=0.4.5", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
@@ -54,10 +54,10 @@ notify = "8.2.0"
 # (!Send futures); CASS's synchronous call shape is preserved by
 # src/franken_sync.rs, which drives every engine future on a private
 # current-thread asupersync runtime.
-frankensqlite = { version = "=0.3.1", package = "fsqlite", features = ["fts5"] }
+frankensqlite = { version = "=0.3.4", package = "fsqlite", features = ["fts5"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.3.1", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.4", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -202,7 +202,7 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.3.1", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.4", package = "fsqlite-types" }
 
 # The fsqlite family now resolves from crates.io (0.3.1) for every direct and
 # transitive consumer, so the former [patch.crates-io] git override is gone.
@@ -230,6 +230,15 @@ test = false
 # Upstream frankensqlite develops at `[profile.dev] opt-level = 1` and
 # franken_agent_detection uses this exact dependencies-only form for the same
 # reason. Applies to dependencies only, never this crate's own code/tests.
+#
+# The fsqlite 0.3.4 uptake pushed these futures past what opt-level 1 covers:
+# `cli_read_db_tests::state_meta_json_reports_active_data_dir_lock_without_db_path_metadata`
+# SIGABRT'd on a stack overflow. Verified as a size problem, not a logic
+# regression — the same test passes unchanged under a larger thread stack — so
+# the fix is `RUST_MIN_STACK` in `.cargo/config.toml` rather than opt-level 2
+# here. opt-level 2 also works but forces a full rebuild of every dependency
+# at roughly double the artifact size, which is not worth it for a test-thread
+# stack bound.
 [profile.dev.package."*"]
 opt-level = 1
 

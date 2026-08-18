@@ -57,7 +57,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // convergence is enforced by `validate_fsqlite_registry_pin`.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.1",
+        expected_version: "0.3.4",
         expected_features: &["fts5"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -75,7 +75,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Keep shared types on the identical registry release as the facade.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.1",
+        expected_version: "0.3.4",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -93,7 +93,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Keep shared types on the identical registry release as the facade.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.1",
+        expected_version: "0.3.4",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -142,7 +142,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.4",
+        expected_version: "0.4.5",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -187,7 +187,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankentui",
         expected_rev: "5f78cfa0",
-        expected_version: "0.3.1",
+        expected_version: "0.3.4",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankentui",
@@ -204,7 +204,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankentui",
         expected_rev: "5f78cfa0",
-        expected_version: "0.3.1",
+        expected_version: "0.3.4",
         expected_features: &["crossterm-compat", "native-backend"],
         expected_default_features: None,
         repo_rel: "../frankentui",
@@ -221,7 +221,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankentui",
         expected_rev: "5f78cfa0",
-        expected_version: "0.3.1",
+        expected_version: "0.3.4",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankentui",
@@ -238,7 +238,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankentui",
         expected_rev: "5f78cfa0",
-        expected_version: "0.3.1",
+        expected_version: "0.3.4",
         expected_features: &[
             "canvas",
             "charts",
@@ -400,7 +400,7 @@ fn validate_fsqlite_registry_pin(manifest_dir: &Path, manifest: &Value, packaged
     // The fsqlite engine family must resolve exclusively from crates.io at the
     // pinned release. This replaces the pre-0.2.1 [patch.crates-io] git-rev
     // override contract while keeping its purpose: no silent engine drift.
-    const EXPECTED_VERSION: &str = "0.3.1";
+    const EXPECTED_VERSION: &str = "0.3.4";
     const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
     // 1. The former git source override must not quietly come back: no
