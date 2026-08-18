@@ -5711,9 +5711,24 @@ fn implicit_robot_pack_query_uses_pack_when_pack_only_flags_present() {
 #[test]
 fn timed_out_robot_pack_preserves_evidence_and_names_shed_work() -> Result<(), Box<dyn Error>> {
     let data_dir = isolated_search_demo_data()?;
+    // The scenario needs BOTH margins to hold, or the assertions below cannot
+    // mean what they say:
+    //   budget > cold pre-search + search   -> search completes, so evidence EXISTS
+    //   delay  > budget                     -> the budget trips AFTER evidence exists
+    //
+    // The original 250ms/350ms pair satisfied neither once cold-start pre-search
+    // work (refresh + self-heal on a freshly copied fixture) grew past 250ms:
+    // `search` was shed BEFORE it ran, so the payload had no evidence to preserve
+    // and this test failed while never once exercising the contract it names.
+    // Measured on a cold fixture, the injected delay was irrelevant — 250ms with
+    // NO delay fails identically.
+    //
+    // 3000/6000 clears both margins with room and was verified reachable on three
+    // consecutive cold runs (timed_out=true AND evidence=1). The assertions are
+    // unchanged; only the timing parameters moved.
     let output = base_cmd()
-        .env("CASS_PACK_BUDGET_MS", "250")
-        .env("CASS_TEST_PACK_SLOW_MS", "350")
+        .env("CASS_PACK_BUDGET_MS", "3000")
+        .env("CASS_TEST_PACK_SLOW_MS", "6000")
         .args([
             "pack",
             "hello",
