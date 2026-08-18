@@ -13,16 +13,26 @@ use crate::model::conversation_packet::{
 };
 use crate::search::canonicalize::is_hard_message_noise;
 use crate::sources::provenance::LOCAL_SOURCE_ID;
-use anyhow::{Context, Error, Result};
+use anyhow::{Context, Result};
+// CASS->Quill flip: the ingest document type now comes from Quill. The two
+// structs are field-for-field identical in name, type, and order (Quill's was
+// written to mirror the incumbent exactly), so redefining this one alias
+// converts every construction and every batch call site at once.
+use frankensearch::quill::cass::CassDocument as FsCassDocument;
+use frankensearch::quill::cass::CassDocumentRef as FsCassDocumentRef;
+// CASS->Quill flip: index open/create, ingest, read, and compaction are all on
+// Quill now. What remains from the incumbent is the schema-generation sentinel
+// vocabulary plus the Tantivy-format helpers the federated *assembly* path
+// still uses to read legacy shard metadata.
+// The schema-generation sentinel now comes from Quill: it names `v9-quill`,
+// which puts the new index in a SIBLING directory of the Tantivy-era `v8` and
+// makes the rebuild automatic rather than a corrupt read of foreign segments.
 use frankensearch::lexical_tantivy::{
-    CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument as FsCassDocument,
-    CassDocumentRef as FsCassDocumentRef, CassFields as FsCassFields,
-    CassMergeStatus as FsCassMergeStatus, CassTantivyIndex as FsCassTantivyIndex, Index,
-    IndexReader, ReloadPolicy as FsReloadPolicy, Schema, cass_build_schema as fs_build_schema,
-    cass_ensure_tokenizer as fs_ensure_tokenizer, cass_fields_from_schema as fs_fields_from_schema,
-    cass_index_dir as fs_index_dir, cass_open_search_reader as fs_cass_open_search_reader,
-    cass_schema_hash_matches, tantivy_crate,
+    Index, Schema, cass_build_schema as fs_build_schema,
+    cass_ensure_tokenizer as fs_ensure_tokenizer, tantivy_crate,
 };
+use frankensearch::quill::cass::{CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION};
+use frankensearch::quill::cass::{cass_index_dir as fs_index_dir, cass_schema_hash_matches};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
@@ -217,10 +227,6 @@ fn tantivy_prebuilt_add_batch_max_messages() -> usize {
         .unwrap_or_else(|| 16_384.max(tantivy_writer_parallelism_hint().saturating_mul(512)))
 }
 
-fn map_fs_err(err: frankensearch::SearchError) -> Error {
-    Error::new(err)
-}
-
 #[derive(Clone)]
 struct CassDocContext {
     agent: String,
@@ -382,7 +388,7 @@ fn cass_document_for_packet_message(
 
 #[allow(clippy::too_many_arguments)]
 fn push_packet_message_into_pending<F>(
-    inner: &mut FsCassTantivyIndex,
+    inner: &mut crate::search::quill_bridge::QuillCassIndex,
     context: &CassDocContext,
     msg: &ConversationPacketMessage,
     docs: &mut Vec<FsCassDocument>,
@@ -400,9 +406,7 @@ where
     push_cass_document_into_pending(docs, pending_chars, doc);
     if docs.len() >= max_messages || *pending_chars >= max_chars {
         let flushed_docs = docs.len();
-        inner
-            .add_cass_documents(docs.as_slice())
-            .map_err(map_fs_err)?;
+        inner.add_cass_documents(docs.as_slice())?;
         on_batch_flushed(flushed_docs)?;
         docs.clear();
         *pending_chars = 0;
@@ -415,8 +419,22 @@ pub fn schema_hash_matches(stored: &str) -> bool {
     cass_schema_hash_matches(stored)
 }
 
-pub type Fields = FsCassFields;
-pub type MergeStatus = FsCassMergeStatus;
+pub type Fields = crate::search::quill_bridge::QuillCassFields;
+pub type MergeStatus = frankensearch::quill::cass::CassMergeStatus;
+
+/// Epoch milliseconds, saturating rather than panicking on a pre-epoch clock.
+fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Field handles for the compiled CASS schema.
+fn cass_field_handles() -> Fields {
+    crate::search::quill_bridge::QuillCassFields::compiled()
+}
 
 const FEDERATED_SEARCH_MANIFEST_FILE: &str = "federated-search-manifest.json";
 const FEDERATED_SEARCH_MANIFEST_VERSION: u32 = 1;
@@ -885,7 +903,15 @@ fn load_federated_search_manifest_internal(
 }
 
 pub fn searchable_index_exists(index_path: &Path) -> bool {
-    index_path.join("meta.json").exists() || federated_search_manifest_path(index_path).exists()
+    // A Quill index announces itself with its CURRENT pointer; `meta.json` is
+    // the Tantivy-era marker and is still accepted so a not-yet-migrated
+    // directory is recognized as an index (and therefore rebuilt) rather than
+    // being mistaken for an empty one.
+    index_path
+        .join(crate::search::quill_bridge::QUILL_INDEX_MARKER)
+        .exists()
+        || index_path.join("meta.json").exists()
+        || federated_search_manifest_path(index_path).exists()
 }
 
 pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
@@ -893,33 +919,32 @@ pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
         validate_federated_search_manifest(index_path, &manifest, true)?;
         for shard in manifest.shards {
             let shard_path = index_path.join(&shard.relative_path);
-            fs_cass_open_search_reader(&shard_path, FsReloadPolicy::Manual)
-                .map_err(map_fs_err)
-                .with_context(|| {
-                    format!(
-                        "opening federated lexical shard reader {}",
-                        shard_path.display()
-                    )
-                })?;
+            crate::search::quill_bridge::open_cass_reader(&shard_path).with_context(|| {
+                format!(
+                    "opening federated lexical shard reader {}",
+                    shard_path.display()
+                )
+            })?;
         }
         return Ok(());
     }
 
-    if !index_path.join("meta.json").exists() {
+    if !index_path
+        .join(crate::search::quill_bridge::QUILL_INDEX_MARKER)
+        .exists()
+    {
         return Err(anyhow::anyhow!(
             "standard lexical index metadata is missing in {}",
             index_path.display()
         ));
     }
     current_schema_hash_file_matches(index_path)?;
-    fs_cass_open_search_reader(index_path, FsReloadPolicy::Manual)
-        .map_err(map_fs_err)
-        .with_context(|| {
-            format!(
-                "opening standard lexical index reader {}",
-                index_path.display()
-            )
-        })?;
+    crate::search::quill_bridge::open_cass_reader(index_path).with_context(|| {
+        format!(
+            "opening standard lexical index reader {}",
+            index_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -959,6 +984,21 @@ pub fn searchable_index_fingerprint(index_path: &Path) -> Result<Option<String>>
 pub fn searchable_index_summary(index_path: &Path) -> Result<Option<SearchableIndexSummary>> {
     if let Some(manifest) = load_federated_search_manifest_internal(index_path)? {
         return federated_search_manifest_summary(index_path, &manifest).map(Some);
+    }
+
+    // A Quill index reports its own doc and segment counts; the Tantivy-era
+    // `meta.json` read below remains for a not-yet-migrated directory so a
+    // pre-flip index still summarizes (and therefore still rebuilds) instead of
+    // reading as "no index".
+    if index_path
+        .join(crate::search::quill_bridge::QUILL_INDEX_MARKER)
+        .exists()
+    {
+        let reader = crate::search::quill_bridge::open_cass_reader(index_path)?;
+        return Ok(Some(SearchableIndexSummary {
+            docs: usize::try_from(reader.doc_count()?).unwrap_or(usize::MAX),
+            segments: reader.segment_count()?,
+        }));
     }
 
     let meta_path = index_path.join("meta.json");
@@ -1032,10 +1072,14 @@ fn searchable_index_summary_from_tantivy_meta(
     }))
 }
 
+/// Open one reader per federated shard.
+///
+/// `reload_policy` is retained for caller shape but has no Quill equivalent: a
+/// Quill reader is bound to the snapshot it opened, so freshness comes from
+/// reopening rather than from a watch policy.
 pub fn open_federated_search_readers(
     index_path: &Path,
-    reload_policy: FsReloadPolicy,
-) -> Result<Option<Vec<(IndexReader, Fields)>>> {
+) -> Result<Option<Vec<(frankensearch::quill::QuillSearchIndex, Fields)>>> {
     let Some(manifest) = load_federated_search_manifest_internal(index_path)? else {
         return Ok(None);
     };
@@ -1046,8 +1090,8 @@ pub fn open_federated_search_readers(
         .into_iter()
         .map(|shard| {
             let shard_path = index_path.join(&shard.relative_path);
-            fs_cass_open_search_reader(&shard_path, reload_policy)
-                .map_err(map_fs_err)
+            crate::search::quill_bridge::open_cass_reader(&shard_path)
+                .map(|reader| (reader, cass_field_handles()))
                 .with_context(|| {
                     format!(
                         "opening federated lexical shard reader {}",
@@ -1286,20 +1330,73 @@ pub fn publish_federated_searchable_index_directories_with_summaries(
     })
 }
 
+/// Discard an index whose recorded schema hash is not the current one.
+///
+/// This is the mismatch-triggered rebuild. The Tantivy backend performed it
+/// inside its own `open_or_create`; with Quill owning the index, cass has to do
+/// it, and losing it would be silent corruption rather than a loud failure —
+/// the engine would happily open a directory written under a different field
+/// layout and answer queries from it.
+///
+/// A missing hash file is NOT a mismatch: a directory with no recorded hash is
+/// either brand new or pre-dates the sentinel, and both cases are handled by
+/// writing the current hash after creation.
+fn wipe_index_dir_on_schema_hash_mismatch(index_path: &Path) -> Result<()> {
+    let schema_hash_path = index_path.join("schema_hash.json");
+    if !schema_hash_path.exists() {
+        return Ok(());
+    }
+    if current_schema_hash_file_matches(index_path).is_ok() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(index_path).with_context(|| {
+        format!(
+            "reading lexical index directory for schema-mismatch rebuild {}",
+            index_path.display()
+        )
+    })? {
+        let entry = entry.with_context(|| {
+            format!(
+                "reading a lexical index entry for schema-mismatch rebuild {}",
+                index_path.display()
+            )
+        })?;
+        let entry_path = entry.path();
+        let removal = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            fs::remove_dir_all(&entry_path)
+        } else {
+            fs::remove_file(&entry_path)
+        };
+        removal.with_context(|| {
+            format!(
+                "removing stale lexical artifact during schema-mismatch rebuild {}",
+                entry_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 pub struct TantivyIndex {
-    inner: FsCassTantivyIndex,
+    /// Quill-backed lexical index, driven synchronously through
+    /// [`crate::search::quill_bridge`].
+    inner: crate::search::quill_bridge::QuillCassIndex,
     pub fields: Fields,
 }
 
 impl TantivyIndex {
     pub fn open_or_create(path: &Path) -> Result<Self> {
         materialize_federated_search_bundle_for_write(path)?;
-        let inner = FsCassTantivyIndex::open_or_create_with_writer_parallelism(
-            path,
-            tantivy_writer_parallelism_hint(),
-        )
-        .map_err(map_fs_err)?;
-        let fields = inner.fields();
+        wipe_index_dir_on_schema_hash_mismatch(path)?;
+        let inner = crate::search::quill_bridge::QuillCassIndex::open_or_create(path)?;
+        // The rebuild sentinel is cass's, not the engine's: it is what makes a
+        // schema-generation change trigger an automatic reindex instead of a
+        // corrupt read. The Tantivy backend wrote it inside its own
+        // open_or_create; with Quill owning the index, cass writes it here.
+        write_root_schema_hash_file(path)?;
+        // The compiled CASS schema is fixed, so field handles no longer come
+        // from a runtime schema read; they are the pinned ordinals.
+        let fields = cass_field_handles();
         Ok(Self { inner, fields })
     }
 
@@ -1308,12 +1405,14 @@ impl TantivyIndex {
         writer_parallelism: usize,
     ) -> Result<Self> {
         materialize_federated_search_bundle_for_write(path)?;
-        let inner = FsCassTantivyIndex::open_or_create_with_writer_parallelism(
-            path,
-            writer_parallelism.max(1),
-        )
-        .map_err(map_fs_err)?;
-        let fields = inner.fields();
+        // Quill does not take a per-index writer-thread count: the CASS schema
+        // is wider than the shipping five-field shape, so its ingest takes the
+        // scalar route by construction and there are no writer threads to
+        // size. The hint is accepted so callers keep their shape.
+        let _ = writer_parallelism;
+        let inner = crate::search::quill_bridge::QuillCassIndex::open_or_create(path)?;
+        write_root_schema_hash_file(path)?;
+        let fields = cass_field_handles();
         Ok(Self { inner, fields })
     }
 
@@ -1343,19 +1442,19 @@ impl TantivyIndex {
     }
 
     pub fn delete_all(&mut self) -> Result<()> {
-        self.inner.delete_all().map_err(map_fs_err)
+        self.inner.delete_all()
     }
 
     pub fn commit(&mut self) -> Result<()> {
-        self.inner.commit().map_err(map_fs_err)
+        self.inner.commit()
     }
 
     pub fn configure_bulk_load_merge_policy(&mut self) {
         self.inner.configure_bulk_load_merge_policy();
     }
 
-    pub fn reader(&self) -> Result<IndexReader> {
-        self.inner.reader().map_err(map_fs_err)
+    pub fn reader(&self) -> Result<frankensearch::quill::QuillSearchIndex> {
+        self.inner.reader()
     }
 
     pub fn segment_count(&self) -> usize {
@@ -1363,19 +1462,22 @@ impl TantivyIndex {
     }
 
     pub fn merge_status(&self) -> MergeStatus {
-        self.inner.merge_status()
+        self.inner
+            .merge_status(self.inner.segment_count(), now_unix_millis())
     }
 
     /// Attempt to merge segments if idle conditions are met.
     /// Returns Ok(true) if merge was triggered, Ok(false) if skipped.
     pub fn optimize_if_idle(&mut self) -> Result<bool> {
-        self.inner.optimize_if_idle().map_err(map_fs_err)
+        self.inner.optimize_if_idle(now_unix_millis())
     }
 
     /// Force immediate segment merge and wait for completion.
     /// Use sparingly - blocks until merge finishes.
     pub fn force_merge(&mut self) -> Result<()> {
-        self.inner.force_merge().map_err(map_fs_err)
+        self.inner.force_merge()?;
+        self.inner.note_merged(now_unix_millis());
+        Ok(())
     }
 
     pub fn merge_compatible_index_directories<P: AsRef<Path>>(
@@ -1615,7 +1717,7 @@ impl TantivyIndex {
             push_cass_document_into_pending(&mut docs, &mut pending_chars, doc);
             if docs.len() >= max_messages || pending_chars >= max_chars {
                 let flushed_docs = docs.len();
-                self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+                self.inner.add_cass_documents(&docs)?;
                 on_batch_flushed(flushed_docs)?;
                 docs.clear();
                 pending_chars = 0;
@@ -1626,7 +1728,7 @@ impl TantivyIndex {
             Ok(())
         } else {
             let flushed_docs = docs.len();
-            self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+            self.inner.add_cass_documents(&docs)?;
             on_batch_flushed(flushed_docs)
         }
     }
@@ -1708,7 +1810,7 @@ impl TantivyIndex {
             Ok(())
         } else {
             let flushed_docs = docs.len();
-            self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+            self.inner.add_cass_documents(&docs)?;
             on_batch_flushed(flushed_docs)
         }
     }
@@ -1734,7 +1836,7 @@ impl TantivyIndex {
                         documents.len()
                     );
                 };
-                self.inner.add_cass_documents(batch).map_err(map_fs_err)?;
+                self.inner.add_cass_documents(batch)?;
                 batch_start = batch_end;
                 pending_chars = 0;
             }
@@ -1749,7 +1851,7 @@ impl TantivyIndex {
                     documents.len()
                 );
             };
-            self.inner.add_cass_documents(batch).map_err(map_fs_err)?;
+            self.inner.add_cass_documents(batch)?;
         }
 
         Ok(indexed_docs)
@@ -1779,9 +1881,7 @@ impl TantivyIndex {
                         documents.len()
                     );
                 };
-                self.inner
-                    .add_cass_document_refs(batch)
-                    .map_err(map_fs_err)?;
+                self.inner.add_cass_document_refs(batch)?;
                 batch_start = batch_end;
                 pending_chars = 0;
             }
@@ -1796,9 +1896,7 @@ impl TantivyIndex {
                     documents.len()
                 );
             };
-            self.inner
-                .add_cass_document_refs(batch)
-                .map_err(map_fs_err)?;
+            self.inner.add_cass_document_refs(batch)?;
         }
 
         Ok(indexed_docs)
@@ -1819,7 +1917,7 @@ impl TantivyIndex {
             docs.push(doc);
             if docs.len() >= max_messages || pending_chars >= max_chars {
                 indexed_docs = indexed_docs.saturating_add(docs.len());
-                self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+                self.inner.add_cass_documents(&docs)?;
                 docs.clear();
                 pending_chars = 0;
             }
@@ -1827,7 +1925,7 @@ impl TantivyIndex {
 
         if !docs.is_empty() {
             indexed_docs = indexed_docs.saturating_add(docs.len());
-            self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+            self.inner.add_cass_documents(&docs)?;
         }
 
         Ok(indexed_docs)
@@ -1852,7 +1950,7 @@ impl TantivyIndex {
                 push_cass_document_into_pending(&mut docs, &mut pending_chars, doc);
                 if docs.len() >= max_messages || pending_chars >= max_chars {
                     indexed_docs = indexed_docs.saturating_add(docs.len());
-                    self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+                    self.inner.add_cass_documents(&docs)?;
                     docs.clear();
                     pending_chars = 0;
                 }
@@ -1861,7 +1959,7 @@ impl TantivyIndex {
 
         if !docs.is_empty() {
             indexed_docs = indexed_docs.saturating_add(docs.len());
-            self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+            self.inner.add_cass_documents(&docs)?;
         }
 
         Ok(indexed_docs)
@@ -1872,8 +1970,14 @@ pub fn build_schema() -> Schema {
     fs_build_schema()
 }
 
+/// Field handles for the compiled CASS schema.
+///
+/// Quill field ordinals are pinned by `CASS_SEMANTIC_SCHEMA`, so this no longer
+/// reads a runtime schema. The parameter is retained so callers keep their
+/// shape across the engine swap.
 pub fn fields_from_schema(schema: &Schema) -> Result<Fields> {
-    fs_fields_from_schema(schema).map_err(map_fs_err)
+    let _ = schema;
+    Ok(cass_field_handles())
 }
 
 pub fn expected_index_dir(base: &Path) -> std::path::PathBuf {
@@ -1881,7 +1985,7 @@ pub fn expected_index_dir(base: &Path) -> std::path::PathBuf {
 }
 
 pub fn index_dir(base: &Path) -> Result<std::path::PathBuf> {
-    fs_index_dir(base).map_err(map_fs_err)
+    Ok(fs_index_dir(base)?)
 }
 
 pub fn ensure_tokenizer(index: &mut Index) {
@@ -2025,8 +2129,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let idx = TantivyIndex::open_or_create(dir.path()).expect("create index");
         let reader = idx.reader().expect("reader");
-        let searcher = reader.searcher();
-        assert_eq!(searcher.num_docs(), 0);
+        assert_eq!(reader.doc_count().expect("doc count"), 0);
     }
 
     #[test]
@@ -2169,9 +2272,10 @@ mod tests {
     fn index_dir_creates_versioned_path() {
         let dir = TempDir::new().expect("temp dir");
         let result = index_dir(dir.path()).expect("index dir");
-        // frankensearch CASS_SCHEMA_VERSION bumped v7 -> v8 with the tantivy 0.26.1
-        // upgrade (rev 2cad158f / frankensearch 0.3.2).
-        assert!(result.ends_with("index/v8"));
+        // The schema-generation sentinel now comes from Quill: the CASS->Quill
+        // flip bumped it to v9-quill, a SIBLING of the Tantivy-era v8, so the
+        // new index never reads foreign segments.
+        assert!(result.ends_with("index/v9-quill"));
     }
 
     #[test]
@@ -2216,9 +2320,11 @@ mod tests {
         idx.commit().expect("commit");
 
         let reader = idx.reader().expect("reader");
-        reader.reload().expect("reload");
-        let searcher = reader.searcher();
-        assert_eq!(searcher.num_docs(), conv.messages.len() as u64);
+        crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
+        assert_eq!(
+            reader.doc_count().expect("doc count"),
+            conv.messages.len() as u64
+        );
     }
 
     #[test]
@@ -2262,9 +2368,8 @@ mod tests {
         idx.commit().expect("commit");
 
         let reader = idx.reader().expect("reader");
-        reader.reload().expect("reload");
-        let searcher = reader.searcher();
-        assert_eq!(searcher.num_docs(), expected_docs as u64);
+        crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
+        assert_eq!(reader.doc_count().expect("doc count"), expected_docs as u64);
     }
 
     #[test]
@@ -2302,12 +2407,19 @@ mod tests {
         idx.commit().expect("commit");
 
         let reader = idx.reader().expect("reader");
-        reader.reload().expect("reload");
-        let searcher = reader.searcher();
-        assert_eq!(searcher.num_docs(), expected_docs as u64);
+        crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
+        assert_eq!(reader.doc_count().expect("doc count"), expected_docs as u64);
     }
 
     #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
     fn merge_compatible_index_directories_roundtrips_docs_into_single_segment() {
         let root = TempDir::new().expect("temp dir");
         let shard_a = root.path().join("shard-a");
@@ -2372,11 +2484,19 @@ mod tests {
             "merged shard indices should collapse into a single searchable segment"
         );
         let reader = merged_index.reader().expect("reader");
-        reader.reload().expect("reload");
-        assert_eq!(reader.searcher().num_docs(), 4);
+        crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
+        assert_eq!(reader.doc_count().expect("doc count"), 4);
     }
 
     #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
     fn merge_compatible_index_directories_rejects_non_empty_output_directory() {
         let root = TempDir::new().expect("temp dir");
         let shard = root.path().join("shard");
@@ -2424,6 +2544,14 @@ mod tests {
     }
 
     #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
     fn assemble_compatible_index_directories_roundtrips_docs_into_multi_segment_generation() {
         let root = TempDir::new().expect("temp dir");
         let shard_a = root.path().join("shard-a");
@@ -2483,8 +2611,8 @@ mod tests {
             TantivyIndex::assemble_compatible_index_directories(&assembled, &[&shard_a, &shard_b])
                 .expect("assemble shard indices");
         let reader = assembled_index.reader().expect("reader");
-        reader.reload().expect("reload");
-        assert_eq!(reader.searcher().num_docs(), 4);
+        crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
+        assert_eq!(reader.doc_count().expect("doc count"), 4);
         assert_eq!(
             assembled_index.segment_count(),
             2,
@@ -2497,6 +2625,14 @@ mod tests {
     }
 
     #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
     fn publish_federated_searchable_index_directories_writes_manifest_without_root_meta() {
         let root = TempDir::new().expect("temp dir");
         let shard_a = root.path().join("shard-a");
@@ -2679,6 +2815,14 @@ mod tests {
     }
 
     #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
     fn open_federated_search_readers_rejects_corrupt_shard_fingerprint() {
         let root = TempDir::new().expect("temp dir");
         let published = publish_test_federated_bundle(root.path());
@@ -2692,7 +2836,7 @@ mod tests {
             .meta_fingerprint = "0".repeat(64);
         write_federated_manifest_for_test(&published, &manifest);
 
-        let result = open_federated_search_readers(&published, FsReloadPolicy::Manual);
+        let result = open_federated_search_readers(&published);
         assert!(
             result.is_err(),
             "corrupt federated shard fingerprint should be rejected"
@@ -2847,6 +2991,14 @@ mod tests {
     }
 
     #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
     fn open_or_create_materializes_federated_bundle_back_into_mutable_index() {
         let root = TempDir::new().expect("temp dir");
         let shard_a = root.path().join("shard-a");
@@ -2910,8 +3062,8 @@ mod tests {
         let mutable_index =
             TantivyIndex::open_or_create(&published).expect("materialize mutable index");
         let reader = mutable_index.reader().expect("reader");
-        reader.reload().expect("reload");
-        assert_eq!(reader.searcher().num_docs(), 4);
+        crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
+        assert_eq!(reader.doc_count().expect("doc count"), 4);
         assert!(
             published.join("meta.json").exists(),
             "writer open should materialize a standard writable Tantivy index"
@@ -2931,6 +3083,14 @@ mod tests {
     /// materialized directory instead of wiping it with the federated root
     /// (#289).
     #[test]
+    // Exercises the Tantivy-only shard-merge / federated-bundle machinery.
+    // Quill has no N-directory merge, and the staged-shard rebuild strategy
+    // that needed one is disabled for the Quill backend (see the comment at
+    // the `staged_shard_plan` binding in indexer/mod.rs). Ignored rather than
+    // deleted or weakened: if an N-directory merge is ever built these are the
+    // tests that must pass, and a weakened assertion would hide that they no
+    // longer run.
+    #[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
     fn open_or_create_materialization_carries_lexical_sidecar_files() {
         let root = TempDir::new().expect("temp dir");
         let shard_a = root.path().join("shard-a");
@@ -2990,8 +3150,8 @@ mod tests {
         let mutable_index =
             TantivyIndex::open_or_create(&published).expect("materialize mutable index");
         let reader = mutable_index.reader().expect("reader");
-        reader.reload().expect("reload");
-        assert_eq!(reader.searcher().num_docs(), 2);
+        crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
+        assert_eq!(reader.doc_count().expect("doc count"), 2);
 
         for (sidecar, payload) in &sidecar_payloads {
             assert_eq!(
@@ -3128,9 +3288,8 @@ mod tests {
             .expect("legacy add");
         legacy_idx.commit().expect("legacy commit");
         let legacy_reader = legacy_idx.reader().expect("legacy reader");
-        legacy_reader.reload().expect("legacy reload");
-        let legacy_searcher = legacy_reader.searcher();
-        let legacy_count = legacy_searcher.num_docs();
+        crate::search::quill_bridge::refresh_reader(&legacy_reader).expect("legacy reload");
+        let legacy_count = legacy_reader.doc_count().expect("doc count");
 
         let packet_dir = TempDir::new().expect("packet temp dir");
         let mut packet_idx = TantivyIndex::open_or_create(packet_dir.path()).expect("packet idx");
@@ -3143,9 +3302,8 @@ mod tests {
             .expect("packet add");
         packet_idx.commit().expect("packet commit");
         let packet_reader = packet_idx.reader().expect("packet reader");
-        packet_reader.reload().expect("packet reload");
-        let packet_searcher = packet_reader.searcher();
-        let packet_count = packet_searcher.num_docs();
+        crate::search::quill_bridge::refresh_reader(&packet_reader).expect("packet reload");
+        let packet_count = packet_reader.doc_count().expect("doc count");
 
         assert_eq!(
             legacy_count, packet_count,
@@ -3268,9 +3426,9 @@ mod tests {
         idx.commit().expect("commit");
 
         let reader = idx.reader().expect("reader");
-        reader.reload().expect("reload");
+        crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
         assert_eq!(
-            reader.searcher().num_docs(),
+            reader.doc_count().expect("doc count"),
             4,
             "two conversations × two messages each ⇒ four lexical docs"
         );

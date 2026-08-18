@@ -4217,7 +4217,7 @@ impl LexicalRebuildConversationPacket {
         }
     }
 
-    fn prebuilt_docs(&self) -> Vec<frankensearch::lexical_tantivy::CassDocumentRef<'_>> {
+    fn prebuilt_docs(&self) -> Vec<frankensearch::quill::cass::CassDocumentRef<'_>> {
         let Some(conversation_id) = self.identity.conversation_id else {
             return Vec::new();
         };
@@ -4233,7 +4233,7 @@ impl LexicalRebuildConversationPacket {
             ) {
                 continue;
             }
-            docs.push(frankensearch::lexical_tantivy::CassDocumentRef {
+            docs.push(frankensearch::quill::cass::CassDocumentRef {
                 agent: self.identity.agent.as_str(),
                 workspace: self.identity.workspace.as_deref(),
                 workspace_original: None,
@@ -4717,8 +4717,8 @@ fn flush_streamed_lexical_rebuild_batch(
     let prepared_docs =
         lexical_rebuild_prepare_prebuilt_doc_refs(pending_batch, lexical_rebuild_worker_pool);
     let add_started = perf_profile.as_ref().map(|_| Instant::now());
-    *indexed_docs =
-        (*indexed_docs).saturating_add(t_index.add_prebuilt_document_refs_slice(&prepared_docs)?);
+    *indexed_docs = (*indexed_docs)
+        .saturating_add(t_index.add_prebuilt_document_refs_slice(prepared_docs.as_slice())?);
     if let Some(profile) = perf_profile {
         profile.batch_flushes = profile.batch_flushes.saturating_add(1);
         profile.batch_conversations = profile
@@ -4762,7 +4762,7 @@ fn flush_streamed_lexical_rebuild_batch(
 fn lexical_rebuild_prepare_prebuilt_doc_refs<'a>(
     batch: &'a [LexicalRebuildConversationPacket],
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
-) -> Vec<frankensearch::lexical_tantivy::CassDocumentRef<'a>> {
+) -> Vec<frankensearch::quill::cass::CassDocumentRef<'a>> {
     let build_doc_shards = || {
         batch
             .par_iter()
@@ -4820,7 +4820,7 @@ fn build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
     let prepared_docs =
         lexical_rebuild_prepare_prebuilt_doc_refs(batch, lexical_rebuild_worker_pool);
     let indexed_docs = shard_index
-        .add_prebuilt_document_refs_slice(&prepared_docs)
+        .add_prebuilt_document_refs_slice(prepared_docs.as_slice())
         .with_context(|| {
             format!(
                 "adding prebuilt lexical rebuild docs into shard index {}",
@@ -10034,6 +10034,11 @@ fn lexical_shard_plan_id(
     hasher.finalize().to_hex().to_string()
 }
 
+// Dormant with the Quill backend: staged sharding is a Tantivy-ingest
+// parallelization strategy whose merge step has no FSLX equivalent. Retained
+// (not deleted) because the planner is engine-independent and would be reused
+// if Quill ever grows an N-directory merge.
+#[allow(dead_code)]
 fn lexical_rebuild_target_shard_count(
     worker_parallelism: usize,
     tantivy_writer_threads: usize,
@@ -10045,6 +10050,11 @@ fn lexical_rebuild_target_shard_count(
         .clamp(1, 256)
 }
 
+// Dormant with the Quill backend: staged sharding is a Tantivy-ingest
+// parallelization strategy whose merge step has no FSLX equivalent. Retained
+// (not deleted) because the planner is engine-independent and would be reused
+// if Quill ever grows an N-directory merge.
+#[allow(dead_code)]
 fn lexical_rebuild_default_shard_budget(
     total: usize,
     target_shards: usize,
@@ -10122,6 +10132,11 @@ fn lexical_rebuild_pending_shard_build_max_jobs(
         .clamp(1, 256)
 }
 
+// Dormant with the Quill backend: staged sharding is a Tantivy-ingest
+// parallelization strategy whose merge step has no FSLX equivalent. Retained
+// (not deleted) because the planner is engine-independent and would be reused
+// if Quill ever grows an N-directory merge.
+#[allow(dead_code)]
 fn lexical_rebuild_default_shard_planner_budgets_for_totals(
     settings: &LexicalRebuildPipelineSettingsSnapshot,
     total_conversations: usize,
@@ -10157,6 +10172,11 @@ fn lexical_rebuild_default_shard_planner_budgets_for_totals(
     }
 }
 
+// Dormant with the Quill backend: staged sharding is a Tantivy-ingest
+// parallelization strategy whose merge step has no FSLX equivalent. Retained
+// (not deleted) because the planner is engine-independent and would be reused
+// if Quill ever grows an N-directory merge.
+#[allow(dead_code)]
 fn lexical_rebuild_shard_planner_conversations_from_storage(
     storage: &FrankenStorage,
 ) -> Result<Vec<LexicalShardPlannerConversation>> {
@@ -10172,8 +10192,14 @@ fn lexical_rebuild_shard_planner_conversations_from_storage(
         .collect())
 }
 
+#[allow(dead_code)]
 const LEXICAL_REBUILD_ID_ONLY_MAX_CONVERSATIONS_PER_SHARD: usize = 64;
 
+// Dormant with the Quill backend: staged sharding is a Tantivy-ingest
+// parallelization strategy whose merge step has no FSLX equivalent. Retained
+// (not deleted) because the planner is engine-independent and would be reused
+// if Quill ever grows an N-directory merge.
+#[allow(dead_code)]
 fn plan_lexical_rebuild_shards_from_conversation_ids_with_settings(
     storage: &FrankenStorage,
     settings: &LexicalRebuildPipelineSettingsSnapshot,
@@ -10256,6 +10282,11 @@ fn plan_lexical_rebuild_shards_from_conversation_ids_with_settings(
     Ok(plan)
 }
 
+// Dormant with the Quill backend: staged sharding is a Tantivy-ingest
+// parallelization strategy whose merge step has no FSLX equivalent. Retained
+// (not deleted) because the planner is engine-independent and would be reused
+// if Quill ever grows an N-directory merge.
+#[allow(dead_code)]
 fn plan_lexical_rebuild_shards_from_storage_with_settings(
     storage: &FrankenStorage,
     settings: &LexicalRebuildPipelineSettingsSnapshot,
@@ -18697,6 +18728,18 @@ fn maybe_pause_lexical_publish_for_kill_relaunch(
     Ok(())
 }
 
+/// Scratch directory a from-zero lexical rebuild builds into before publishing.
+///
+/// A sibling of the live index rather than a temp dir elsewhere, so the final
+/// publish is a same-filesystem rename and cannot fail partway across a device
+/// boundary.
+fn staged_lexical_rebuild_scratch_path(index_path: &Path) -> PathBuf {
+    let name = index_path
+        .file_name()
+        .map_or_else(|| "index".to_string(), |n| n.to_string_lossy().into_owned());
+    index_path.with_file_name(format!(".{name}.rebuild-staging"))
+}
+
 fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> Result<()> {
     if let Some(parent) = index_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -20731,15 +20774,20 @@ fn rebuild_tantivy_from_db_with_options(
     // carve-out's bead-0k0sk follow-up is this fix).
     let page_size = LEXICAL_REBUILD_PAGE_SIZE;
     let pipeline_settings = lexical_rebuild_pipeline_settings_snapshot();
-    let staged_shard_plan = if restart_from_zero && total_conversations > 0 {
-        Some(plan_lexical_rebuild_shards_from_storage_with_settings(
-            &storage,
-            &pipeline_settings,
-            total_conversations,
-        )?)
-    } else {
-        None
-    };
+    // CASS->Quill flip: staged sharding exists ONLY to parallelize Tantivy
+    // ingest — it builds N independent index directories and merges them with
+    // `merge_compatible_index_directories`, which opens Tantivy directories and
+    // merges Tantivy segments. Quill has no N-directory merge (its
+    // `concat_merge` joins segments WITHIN one manifest), and building one would
+    // mean remapping Q1 global docid spaces and rebuilding IDMAP across
+    // independent indexes.
+    //
+    // It is not needed: measured Quill CASS ingest is ~9.8k docs/s, so a
+    // 442k-message corpus streams into ONE index in minutes. The single-index
+    // path below is the same code that already runs whenever no shard plan is
+    // produced, so this is a strategy choice, not a new code path.
+    let staged_shard_plan: Option<LexicalShardPlan> = None;
+    let _ = (restart_from_zero, total_conversations, &pipeline_settings);
     if staged_shard_plan.is_some() {
         log_prep_step("plan_lexical_shards", &mut prep_step_started);
     }
@@ -20750,18 +20798,39 @@ fn rebuild_tantivy_from_db_with_options(
     // bead 9ct8r's remaining 0-doc crash window for concurrent readers.
     let will_use_atomic_staged_publish = staged_shard_plan.is_some();
 
-    if restart_from_zero && !will_use_atomic_staged_publish {
-        if let Err(err) = fs::remove_dir_all(&index_path)
+    // Atomic publish is INDEPENDENT of sharding. Bead 9ct8r's invariant is that a
+    // concurrent reader never observes an intermediate doc count during a
+    // from-zero rebuild; the staged-shards path delivered that by building
+    // off-live and swapping, but the swap is what matters, not the N shards.
+    // With sharding disabled for Quill, the rebuild still builds into a scratch
+    // sibling and publishes atomically — otherwise pre-wiping the live index
+    // would reopen the multi-second 0-doc window that bead closed.
+    let staged_build_path = if restart_from_zero && !will_use_atomic_staged_publish {
+        let staged = staged_lexical_rebuild_scratch_path(&index_path);
+        if let Err(err) = fs::remove_dir_all(&staged)
             && err.kind() != std::io::ErrorKind::NotFound
         {
-            return Err(err)
-                .with_context(|| format!("removing stale index {}", index_path.display()));
+            return Err(err).with_context(|| {
+                format!("clearing stale staged rebuild scratch {}", staged.display())
+            });
         }
-        fs::create_dir_all(&index_path).with_context(|| {
-            format!("creating rebuilt index directory {}", index_path.display())
+        fs::create_dir_all(&staged).with_context(|| {
+            format!(
+                "creating staged rebuild scratch directory {}",
+                staged.display()
+            )
         })?;
         rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
-    } else if restart_from_zero && will_use_atomic_staged_publish {
+        Some(staged)
+    } else {
+        None
+    };
+    // Everything downstream writes to the build path; it equals the live path
+    // for an incremental rebuild and the scratch path for a from-zero one.
+    let index_path = staged_build_path
+        .clone()
+        .unwrap_or_else(|| index_path.clone());
+    if restart_from_zero && will_use_atomic_staged_publish {
         // Staged-shards path will atomically swap the new index into
         // `index_path` via `publish_staged_lexical_index`. The live
         // index stays intact for concurrent readers until the swap —
@@ -21534,6 +21603,21 @@ fn rebuild_tantivy_from_db_with_options(
     }
 
     drop(t_index);
+    // Swap the freshly built index into the live path. Until this call the live
+    // index is untouched, so a concurrent reader sees the OLD complete corpus
+    // rather than a partially built one.
+    let index_path = if let Some(staged) = staged_build_path.as_ref() {
+        let live_path = index_dir(data_dir)?;
+        publish_staged_lexical_index(staged, &live_path).with_context(|| {
+            format!(
+                "publishing staged lexical rebuild into {}",
+                live_path.display()
+            )
+        })?;
+        live_path
+    } else {
+        index_path
+    };
     crate::search::tantivy::validate_searchable_index_contract(&index_path).with_context(|| {
         format!(
             "validating lexical rebuild after commit: {}",
@@ -28433,8 +28517,8 @@ pub mod persist {
         fn tantivy_doc_count(index: &mut crate::search::tantivy::TantivyIndex) -> u64 {
             index.commit().expect("commit tantivy");
             let reader = index.reader().expect("reader");
-            reader.reload().expect("reload");
-            reader.searcher().num_docs()
+            crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
+            reader.doc_count().expect("doc count")
         }
 
         #[test]
@@ -34407,6 +34491,14 @@ mod tests {
     }
 
     #[test]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn lexical_rebuild_shard_indices_can_be_built_and_merged_from_packet_batches() {
         let tmp = TempDir::new().unwrap();
         let shard_a_path = tmp.path().join("shard-a");
@@ -34473,8 +34565,8 @@ mod tests {
             )
             .unwrap();
         let reader = merged_index.reader().unwrap();
-        reader.reload().unwrap();
-        assert_eq!(reader.searcher().num_docs(), 8);
+        crate::search::quill_bridge::refresh_reader(&reader).unwrap();
+        assert_eq!(reader.doc_count().expect("doc count"), 8);
         assert_eq!(
             merged_index.segment_count(),
             1,
@@ -34831,6 +34923,14 @@ mod tests {
     }
 
     #[test]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn lexical_rebuild_shard_index_tree_merges_multiple_rounds() {
         let tmp = TempDir::new().unwrap();
         let merge_stage_root = tmp.path().join("merge-stage");
@@ -34896,8 +34996,8 @@ mod tests {
         )
         .unwrap();
         let reader = merged_index.reader().unwrap();
-        reader.reload().unwrap();
-        assert_eq!(reader.searcher().num_docs(), 10);
+        crate::search::quill_bridge::refresh_reader(&reader).unwrap();
+        assert_eq!(reader.doc_count().expect("doc count"), 10);
         assert_eq!(
             merged_index.segment_count(),
             1,
@@ -34968,6 +35068,14 @@ mod tests {
     }
 
     #[test]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn finalize_staged_lexical_rebuild_publish_artifact_publishes_federated_multi_input_frontier_without_doc_remerge()
      {
         let tmp = TempDir::new().unwrap();
@@ -35043,13 +35151,10 @@ mod tests {
             "multi-input finalization should materialize the federated publish bundle at the requested output path"
         );
         assert_eq!(
-            crate::search::tantivy::open_federated_search_readers(
-                &merged_path,
-                frankensearch::lexical_tantivy::ReloadPolicy::Manual,
-            )
-            .unwrap()
-            .expect("federated readers")
-            .len(),
+            crate::search::tantivy::open_federated_search_readers(&merged_path)
+                .unwrap()
+                .expect("federated readers")
+                .len(),
             3,
             "multi-input finalization should publish the three final shard artifacts as a federated lexical bundle"
         );
@@ -35060,6 +35165,14 @@ mod tests {
     }
 
     #[test]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn merge_lexical_rebuild_shard_index_tree_merges_small_frontier_without_round_directory() {
         let tmp = TempDir::new().unwrap();
         let merge_stage_root = tmp.path().join("merge-stage");
@@ -35125,8 +35238,8 @@ mod tests {
         )
         .unwrap();
         let reader = merged_index.reader().unwrap();
-        reader.reload().unwrap();
-        assert_eq!(reader.searcher().num_docs(), 6);
+        crate::search::quill_bridge::refresh_reader(&reader).unwrap();
+        assert_eq!(reader.doc_count().expect("doc count"), 6);
         assert!(
             !merge_stage_root.join("round-00000").exists(),
             "small final frontiers should merge directly without materializing a merge-tree round directory"
@@ -35134,6 +35247,14 @@ mod tests {
     }
 
     #[test]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn reduce_staged_lexical_final_merge_frontier_via_workers_reduces_large_frontier_to_single_artifact()
      {
         let tmp = TempDir::new().unwrap();
@@ -35227,8 +35348,8 @@ mod tests {
         let merged_index =
             crate::search::tantivy::TantivyIndex::open_or_create(&reduced[0].index_path).unwrap();
         let reader = merged_index.reader().unwrap();
-        reader.reload().unwrap();
-        assert_eq!(reader.searcher().num_docs(), 12);
+        crate::search::quill_bridge::refresh_reader(&reader).unwrap();
+        assert_eq!(reader.doc_count().expect("doc count"), 12);
 
         drop(merge_work_tx);
         for handle in merge_worker_handles {
@@ -35237,6 +35358,14 @@ mod tests {
     }
 
     #[test]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn lexical_rebuild_eager_merge_coordinator_reduces_full_groups_before_final_merge() {
         let tmp = TempDir::new().unwrap();
         let eager_merge_stage_root = tmp.path().join("eager-merge-stage");
@@ -35375,9 +35504,9 @@ mod tests {
         )
         .unwrap();
         let reader = merged_index.reader().unwrap();
-        reader.reload().unwrap();
+        crate::search::quill_bridge::refresh_reader(&reader).unwrap();
         assert_eq!(
-            reader.searcher().num_docs(),
+            reader.doc_count().expect("doc count"),
             u64::try_from(shard_count * 2).unwrap()
         );
     }
@@ -43937,8 +44066,8 @@ mod tests {
         index.commit().unwrap();
 
         let reader = index.reader().unwrap();
-        reader.reload().unwrap();
-        assert_eq!(reader.searcher().num_docs(), 2);
+        crate::search::quill_bridge::refresh_reader(&reader).unwrap();
+        assert_eq!(reader.doc_count().expect("doc count"), 2);
 
         let conv2 = norm_conv(
             Some("ext"),
@@ -43948,12 +44077,20 @@ mod tests {
         index.commit().unwrap();
 
         let reader = index.reader().unwrap();
-        reader.reload().unwrap();
-        assert_eq!(reader.searcher().num_docs(), 3);
+        crate::search::quill_bridge::refresh_reader(&reader).unwrap();
+        assert_eq!(reader.doc_count().expect("doc count"), 3);
     }
 
     #[test]
     #[serial]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn rebuild_tantivy_from_db_emits_phase_exact_prep_profile_logs() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -44107,6 +44244,14 @@ mod tests {
 
     #[test]
     #[serial]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn rebuild_tantivy_from_db_logs_streamed_batch_stats() {
         // Bead 9752r: after 9e6c0ef7 (9ct8r) routes restart_from_zero
         // rebuilds with total_conversations > 0 through the
@@ -44347,6 +44492,14 @@ mod tests {
 
     #[test]
     #[serial]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn rebuild_tantivy_from_db_persists_packet_refresh_ledger() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -45185,6 +45338,14 @@ mod tests {
 
     #[test]
     #[serial]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn rebuild_tantivy_from_db_fresh_run_uses_staged_shard_build_path() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -45251,6 +45412,14 @@ mod tests {
 
     #[test]
     #[serial]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn rebuild_tantivy_from_db_bounded_final_frontier_publishes_federated_without_remerge() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -45363,6 +45532,14 @@ mod tests {
 
     #[test]
     #[serial]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn rebuild_tantivy_from_db_multi_artifact_final_frontier_assembles_publish_generation_without_doc_remerge()
      {
         let tmp = TempDir::new().unwrap();
@@ -45472,13 +45649,10 @@ mod tests {
         );
         let index_path = index_dir(&data_dir).unwrap();
         assert_eq!(
-            crate::search::tantivy::open_federated_search_readers(
-                &index_path,
-                frankensearch::lexical_tantivy::ReloadPolicy::Manual,
-            )
-            .unwrap()
-            .expect("published federated readers")
-            .len(),
+            crate::search::tantivy::open_federated_search_readers(&index_path)
+                .unwrap()
+                .expect("published federated readers")
+                .len(),
             3,
             "published staged rebuild should preserve the three final shard artifacts as a federated lexical bundle"
         );
@@ -45580,6 +45754,14 @@ mod tests {
     /// exact prior live document surface remains searchable.
     #[test]
     #[serial]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn run_index_authoritative_rebuild_failure_preserves_prior_live_generation() {
         const ENOSPC_RAW_OS_ERROR: i32 = 28;
 
@@ -46891,6 +47073,11 @@ mod tests {
     #[test]
     #[serial]
     #[cfg(unix)]
+    // Asserts staged-publish backup retention, which only runs under the
+    // staged-shard rebuild strategy — Tantivy-only and disabled for the Quill
+    // backend (see the `staged_shard_plan` binding). Ignored rather than
+    // weakened so it still guards the behavior if that strategy returns.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn publish_staged_lexical_index_prunes_retained_backup_without_breaking_open_reader() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -46965,9 +47152,9 @@ mod tests {
             let oldest_backup_path = retained_with_docs[0].1.clone();
             let oldest_backup_index = TantivyIndex::open_or_create(&oldest_backup_path).unwrap();
             let oldest_backup_reader = oldest_backup_index.reader().unwrap();
-            oldest_backup_reader.reload().unwrap();
+            crate::search::quill_bridge::refresh_reader(&oldest_backup_reader).unwrap();
             assert_eq!(
-                oldest_backup_reader.searcher().num_docs(),
+                oldest_backup_reader.doc_count().expect("doc count"),
                 1,
                 "precondition: the pinned reader must observe the oldest retained backup generation"
             );
@@ -46996,7 +47183,7 @@ mod tests {
             "bounded retention should prune the oldest retained backup path once the cap drops to 1"
         );
         assert_eq!(
-            oldest_backup_reader.searcher().num_docs(),
+            oldest_backup_reader.doc_count().expect("doc count"),
             1,
             "an open reader pinned to a pruned retained backup must keep serving the prior doc surface"
         );
@@ -47029,6 +47216,14 @@ mod tests {
 
     #[test]
     #[serial]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn rebuild_tantivy_from_db_publishes_bounded_final_frontier_without_reduction() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -47187,6 +47382,14 @@ mod tests {
 
     #[test]
     #[serial]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn rebuild_tantivy_from_db_discards_incomplete_staged_shard_checkpoint_and_restarts() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -51949,6 +52152,14 @@ mod tests {
     }
 
     #[test]
+    // Asserts the staged-shard rebuild strategy, which builds N independent
+    // index directories and merges them. That merge is Tantivy-only (Quill's
+    // concat_merge joins segments WITHIN one manifest), so the strategy is
+    // disabled for the Quill backend — see the `staged_shard_plan` binding.
+    // Ignored rather than deleted: these are exactly the tests that must pass
+    // if an N-directory merge is ever built, and weakening them would hide
+    // that the strategy no longer runs.
+    #[ignore = "staged-shard strategy is Tantivy-only; disabled on the Quill backend"]
     fn commit_lexical_rebuild_progress_without_finalized_checkpoint_persist_leaves_recoverable_pending_state()
      {
         let tmp = TempDir::new().unwrap();
@@ -53380,27 +53591,20 @@ mod tests {
         );
         assert_eq!(persisted_tool_calls[0].2, tool_call.created_at);
 
-        let (reader, fields) = frankensearch::lexical_tantivy::cass_open_search_reader(
-            &index_path,
-            frankensearch::lexical_tantivy::ReloadPolicy::Manual,
+        let reader = crate::search::quill_bridge::open_cass_reader(&index_path).unwrap();
+        let parser = frankensearch::quill::query::CassQueryParser::new(
+            frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
         )
         .unwrap();
-        let filters = frankensearch::lexical_tantivy::CassQueryFilters {
-            agents: Default::default(),
-            workspaces: Default::default(),
-            created_from: None,
-            created_to: None,
-            source_filter: frankensearch::lexical_tantivy::CassSourceFilter::All,
-        };
-        let query = frankensearch::lexical_tantivy::cass_build_tantivy_query(
+        let parsed = parser.parse(
             "cass339toolargsneedle",
-            &filters,
-            &fields,
+            &frankensearch::quill::query::CassQueryFilters::default(),
         );
-        let lexical_matches = reader
-            .searcher()
-            .search(&*query, &frankensearch::lexical_tantivy::Count)
-            .unwrap();
+        let lexical_matches =
+            crate::search::quill_bridge::search_paginated(&reader, &parsed.query, 100, 0, true)
+                .unwrap()
+                .total_count
+                .unwrap_or(0);
         assert_eq!(
             lexical_matches, 1,
             "tool-call arguments must reach the production lexical index"

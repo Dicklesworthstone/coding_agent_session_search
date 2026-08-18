@@ -22,10 +22,13 @@ fn open_or_create_writes_schema_hash() {
         "schema_hash.json should contain current schema hash"
     );
 
-    // meta.json should exist, indicating Tantivy index initialized
+    // The published manifest is what marks the directory as a real index;
+    // `meta.json` was the Tantivy-era equivalent.
     assert!(
-        dir.path().join("meta.json").exists(),
-        "meta.json should be present"
+        dir.path()
+            .join(coding_agent_search::search::quill_bridge::QUILL_INDEX_MARKER)
+            .exists(),
+        "the published Quill manifest should be present"
     );
 }
 
@@ -155,8 +158,7 @@ fn incremental_commit_preserves_existing_docs() {
     index.commit().expect("commit a");
 
     let reader = index.reader().expect("reader");
-    let searcher = reader.searcher();
-    let initial_docs = searcher.num_docs();
+    let initial_docs = reader.doc_count().expect("doc count");
     assert_eq!(initial_docs, 1, "one doc after first commit");
 
     // Second conversation: incremental add, new commit should preserve prior doc
@@ -184,8 +186,7 @@ fn incremental_commit_preserves_existing_docs() {
     index.commit().expect("commit b");
 
     let reader2 = index.reader().expect("reader2");
-    let searcher2 = reader2.searcher();
-    let docs_after = searcher2.num_docs();
+    let docs_after = reader2.doc_count().expect("doc count");
     assert_eq!(
         docs_after, 2,
         "incremental commit should retain existing docs and add new ones"

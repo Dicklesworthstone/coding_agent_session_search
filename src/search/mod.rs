@@ -49,6 +49,7 @@ pub(crate) mod progress_contract;
 pub(crate) mod proof_log;
 pub(crate) mod quarantine_status;
 pub mod query;
+pub mod quill_bridge;
 pub(crate) mod readiness;
 pub(crate) mod readiness_fixtures;
 pub(crate) mod readiness_projection;

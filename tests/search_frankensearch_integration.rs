@@ -457,6 +457,11 @@ fn lexical_search_through_frankensearch_pipeline() {
 /// to survive the facade flip: create, ingest, commit, reopen, merge, query,
 /// drop, and fresh reopen.
 #[test]
+// Merges two independently-built shard directories, which is the Tantivy-only
+// N-directory merge. Quill's concat_merge joins segments within ONE manifest,
+// so the staged-shard strategy that needed this is disabled for the Quill
+// backend. Ignored rather than weakened; see the `staged_shard_plan` binding.
+#[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
 fn cass_schema_v8_survives_create_merge_query_and_fresh_reopen() {
     assert_eq!(
         frankensearch::lexical_tantivy::CASS_SCHEMA_VERSION,
@@ -510,9 +515,19 @@ fn cass_schema_v8_survives_create_merge_query_and_fresh_reopen() {
         || {
             let left = TantivyIndex::open_or_create(&left_path).expect("reopen left shard");
             let right = TantivyIndex::open_or_create(&right_path).expect("reopen right shard");
-            assert_eq!(left.reader().expect("left reader").searcher().num_docs(), 1);
             assert_eq!(
-                right.reader().expect("right reader").searcher().num_docs(),
+                left.reader()
+                    .expect("left reader")
+                    .doc_count()
+                    .expect("doc count"),
+                1
+            );
+            assert_eq!(
+                right
+                    .reader()
+                    .expect("right reader")
+                    .doc_count()
+                    .expect("doc count"),
                 1
             );
             drop((left, right));
@@ -526,8 +541,8 @@ fn cass_schema_v8_survives_create_merge_query_and_fresh_reopen() {
                 merged
                     .reader()
                     .expect("merged reader")
-                    .searcher()
-                    .num_docs(),
+                    .doc_count()
+                    .expect("doc count"),
                 2
             );
         },

@@ -171,7 +171,11 @@ const CONTRACTS: &[DependencyContract] = &[
         // separate `-baseline` build is needed). Bead tg5o9 retired the vacuous
         // cass `semantic` feature; semantic readiness is now determined solely
         // by runtime model/vector assets.
-        expected_features: &["ann", "cass-compat", "hash", "native"],
+        // `quill` added for the CASS->Quill lexical flip: it links the native
+        // Quill engine alongside the Tantivy incumbent so the two can be
+        // compared before Tantivy is dropped. `cass-compat` leaves with
+        // Tantivy once the flip completes.
+        expected_features: &["ann", "cass-compat", "hash", "native", "quill"],
         expected_default_features: Some(false),
         repo_rel: "../frankensearch",
         manifest_rel: "frankensearch/Cargo.toml",

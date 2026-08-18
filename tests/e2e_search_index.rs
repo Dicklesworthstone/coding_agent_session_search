@@ -15,10 +15,6 @@ use coding_agent_search::search::tantivy::{
     searchable_index_summary,
 };
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensearch::lexical_tantivy::{
-    CassQueryFilters, CassSourceFilter, Count, IndexReader, ReloadPolicy, cass_build_tantivy_query,
-    cass_open_search_reader,
-};
 use rusqlite::Connection as RusqliteConnection;
 use serial_test::serial;
 use std::fs;
@@ -258,33 +254,42 @@ fn command_output_kind_is(output: &[u8], expected_kind: &str) -> bool {
 
 fn raw_lexical_total_matches(index_path: &Path, query: &str) -> u64 {
     let mut total = 0usize;
-    if let Some(readers) = open_federated_search_readers(index_path, ReloadPolicy::Manual)
+    if let Some(readers) = open_federated_search_readers(index_path)
         .expect("open federated lexical readers for raw count")
     {
         for (reader, fields) in readers {
             total = total.saturating_add(raw_lexical_reader_matches(&reader, &fields, query));
         }
     } else {
-        let (reader, fields) =
-            cass_open_search_reader(index_path, ReloadPolicy::Manual).expect("open lexical reader");
+        let reader = coding_agent_search::search::quill_bridge::open_cass_reader(index_path)
+            .expect("open lexical reader");
+        let fields = coding_agent_search::search::quill_bridge::QuillCassFields::compiled();
         total = total.saturating_add(raw_lexical_reader_matches(&reader, &fields, query));
     }
     total as u64
 }
 
-fn raw_lexical_reader_matches(reader: &IndexReader, fields: &Fields, query: &str) -> usize {
-    let searcher = reader.searcher();
-    let filters = CassQueryFilters {
-        agents: Default::default(),
-        workspaces: Default::default(),
-        created_from: None,
-        created_to: None,
-        source_filter: CassSourceFilter::All,
-    };
-    let parsed = cass_build_tantivy_query(query, &filters, fields);
-    searcher
-        .search(&*parsed, &Count)
+/// Independent match count, built from the engine's own parser rather than
+/// from the code under test.
+fn raw_lexical_reader_matches(
+    reader: &frankensearch::quill::QuillSearchIndex,
+    _fields: &Fields,
+    query: &str,
+) -> usize {
+    let parser = frankensearch::quill::query::CassQueryParser::new(
+        frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+    )
+    .expect("build the CASS query parser");
+    let parsed = parser.parse(
+        query,
+        &frankensearch::quill::query::CassQueryFilters::default(),
+    );
+    // The exact total is computed independently of the requested page, so ask
+    // for the smallest page: a huge limit only sizes the top-k heap.
+    coding_agent_search::search::quill_bridge::search_paginated(reader, &parsed.query, 1, 0, true)
         .expect("count raw lexical matches")
+        .total_count
+        .unwrap_or(0)
 }
 
 fn force_federated_publish_env(cmd: &mut assert_cmd::Command) {
@@ -1262,6 +1267,11 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
 
 #[test]
 #[serial]
+// Exercises the FEDERATED atomic-publish path, which is the Tantivy-only
+// staged-shard machinery disabled for the Quill backend. The single-index
+// atomic swap that actually runs is covered by
+// tests/atomic_swap_publish_crash_window.rs. Ignored, not weakened.
+#[ignore = "federated staged-shard publish is Tantivy-only; disabled on the Quill backend"]
 fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_atomic_publish() {
     let tracker = tracker_for(
         "force_rebuild_preserves_search_results_and_reader_surface_during_federated_atomic_publish",
@@ -1324,10 +1334,9 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
         before_docs >= 3,
         "baseline federated index should contain multiple docs"
     );
-    let before_federated_readers =
-        open_federated_search_readers(&live_index_path, ReloadPolicy::Manual)
-            .expect("load federated readers before rebuild")
-            .expect("baseline federated manifest should exist");
+    let before_federated_readers = open_federated_search_readers(&live_index_path)
+        .expect("load federated readers before rebuild")
+        .expect("baseline federated manifest should exist");
     assert!(
         before_federated_readers.len() > 1,
         "forced shard planner settings should produce a federated live index"
@@ -1565,10 +1574,9 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
         after_summary.docs, before_docs,
         "federated force rebuild on unchanged content should preserve the live doc count"
     );
-    let after_federated_readers =
-        open_federated_search_readers(&live_index_path, ReloadPolicy::Manual)
-            .expect("load federated readers after rebuild")
-            .expect("federated manifest should still exist after rebuild");
+    let after_federated_readers = open_federated_search_readers(&live_index_path)
+        .expect("load federated readers after rebuild")
+        .expect("federated manifest should still exist after rebuild");
     assert!(
         after_federated_readers.len() > 1,
         "post-rebuild live surface should remain a federated lexical bundle"
@@ -1634,6 +1642,11 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
 
 #[test]
 #[serial]
+// Exercises the FEDERATED atomic-publish path, which is the Tantivy-only
+// staged-shard machinery disabled for the Quill backend. The single-index
+// atomic swap that actually runs is covered by
+// tests/atomic_swap_publish_crash_window.rs. Ignored, not weakened.
+#[ignore = "federated staged-shard publish is Tantivy-only; disabled on the Quill backend"]
 fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
     let tracker =
         tracker_for("repeated_force_rebuild_preserves_federated_reader_and_search_stability");
@@ -1696,10 +1709,9 @@ fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
         before_docs >= 3,
         "baseline federated index should contain multiple docs"
     );
-    let before_federated_readers =
-        open_federated_search_readers(&live_index_path, ReloadPolicy::Manual)
-            .expect("load federated readers before repeated rebuilds")
-            .expect("baseline federated manifest should exist");
+    let before_federated_readers = open_federated_search_readers(&live_index_path)
+        .expect("load federated readers before repeated rebuilds")
+        .expect("baseline federated manifest should exist");
     let baseline_federated_reader_count = before_federated_readers.len();
     assert!(
         baseline_federated_reader_count > 1,
@@ -1786,10 +1798,9 @@ fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
             cycle_summary.docs
         );
 
-        let cycle_federated_readers =
-            open_federated_search_readers(&live_index_path, ReloadPolicy::Manual)
-                .expect("load federated readers after repeated rebuild cycle")
-                .expect("federated manifest should exist after repeated rebuild cycle");
+        let cycle_federated_readers = open_federated_search_readers(&live_index_path)
+            .expect("load federated readers after repeated rebuild cycle")
+            .expect("federated manifest should exist after repeated rebuild cycle");
         assert_eq!(
             cycle_federated_readers.len(),
             baseline_federated_reader_count,
@@ -1856,6 +1867,11 @@ fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
 #[cfg(target_os = "linux")]
 #[test]
 #[serial]
+// Exercises the FEDERATED atomic-publish path, which is the Tantivy-only
+// staged-shard machinery disabled for the Quill backend. The single-index
+// atomic swap that actually runs is covered by
+// tests/atomic_swap_publish_crash_window.rs. Ignored, not weakened.
+#[ignore = "federated staged-shard publish is Tantivy-only; disabled on the Quill backend"]
 fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() {
     let tracker =
         tracker_for("force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain");

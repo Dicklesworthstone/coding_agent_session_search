@@ -31,7 +31,6 @@ use assert_cmd::Command;
 use coding_agent_search::search::tantivy::{
     SearchableIndexSummary, open_federated_search_readers, searchable_index_summary,
 };
-use frankensearch::lexical_tantivy::ReloadPolicy;
 use serde_json::json;
 use std::fs;
 use std::sync::Arc;
@@ -251,6 +250,11 @@ fn concurrent_reader_never_sees_half_torn_lexical_index_during_publish_swap() {
 }
 
 #[test]
+// Drives the FEDERATED publish path (forced via force_federated_publish_env),
+// which is the Tantivy-only staged-shard machinery disabled for the Quill
+// backend. The non-federated sibling test covers the same atomic-swap
+// invariant on the path that actually runs. Ignored, not weakened.
+#[ignore = "federated staged-shard publish is Tantivy-only; disabled on the Quill backend"]
 fn concurrent_reader_never_sees_half_torn_federated_lexical_index_during_publish_swap() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().to_path_buf();
@@ -284,7 +288,7 @@ fn concurrent_reader_never_sees_half_torn_federated_lexical_index_during_publish
         before_docs >= 3,
         "precondition: live federated index should contain multiple docs"
     );
-    let before_federated_readers = open_federated_search_readers(&index_path, ReloadPolicy::Manual)
+    let before_federated_readers = open_federated_search_readers(&index_path)
         .expect("load federated readers before rebuild")
         .expect("federated manifest should exist before rebuild");
     assert!(
@@ -324,7 +328,7 @@ fn concurrent_reader_never_sees_half_torn_federated_lexical_index_during_publish
         after.docs, before_docs,
         "forced federated --force-rebuild on unchanged content must preserve the doc count"
     );
-    let after_federated_readers = open_federated_search_readers(&index_path, ReloadPolicy::Manual)
+    let after_federated_readers = open_federated_search_readers(&index_path)
         .expect("load federated readers after rebuild")
         .expect("federated manifest should still exist after rebuild");
     assert!(
@@ -358,6 +362,11 @@ fn concurrent_reader_never_sees_half_torn_federated_lexical_index_during_publish
 /// so we don't rely on race timing.
 #[cfg(target_os = "linux")]
 #[test]
+// Drives the FEDERATED publish path (forced via force_federated_publish_env),
+// which is the Tantivy-only staged-shard machinery disabled for the Quill
+// backend. The non-federated sibling test covers the same atomic-swap
+// invariant on the path that actually runs. Ignored, not weakened.
+#[ignore = "federated staged-shard publish is Tantivy-only; disabled on the Quill backend"]
 fn kill_relaunch_recovers_lexical_publish_and_search_stays_stable() {
     use std::process::{Command as StdCommand, Stdio};
 
