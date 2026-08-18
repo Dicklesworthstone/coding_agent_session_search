@@ -20805,29 +20805,44 @@ fn rebuild_tantivy_from_db_with_options(
     // With sharding disabled for Quill, the rebuild still builds into a scratch
     // sibling and publishes atomically — otherwise pre-wiping the live index
     // would reopen the multi-second 0-doc window that bead closed.
+    //
+    // IMPORTANT: only the INDEX CONTENT goes to the scratch directory. The
+    // rebuild state file stays on the LIVE path, because that is where the next
+    // run looks for it (`load_lexical_rebuild_state(&index_path)` above). Moving
+    // the state into the scratch dir would make every interrupted from-zero
+    // rebuild restart from zero — the exact failure #380 reports.
+    let scratch_path = staged_lexical_rebuild_scratch_path(&index_path);
+    let scratch_exists = scratch_path.is_dir();
     let staged_build_path = if restart_from_zero && !will_use_atomic_staged_publish {
-        let staged = staged_lexical_rebuild_scratch_path(&index_path);
-        if let Err(err) = fs::remove_dir_all(&staged)
+        // Fresh staged build: discard any scratch left by an abandoned run.
+        if let Err(err) = fs::remove_dir_all(&scratch_path)
             && err.kind() != std::io::ErrorKind::NotFound
         {
             return Err(err).with_context(|| {
-                format!("clearing stale staged rebuild scratch {}", staged.display())
+                format!(
+                    "clearing stale staged rebuild scratch {}",
+                    scratch_path.display()
+                )
             });
         }
-        fs::create_dir_all(&staged).with_context(|| {
+        fs::create_dir_all(&scratch_path).with_context(|| {
             format!(
                 "creating staged rebuild scratch directory {}",
-                staged.display()
+                scratch_path.display()
             )
         })?;
         rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
-        Some(staged)
+        Some(scratch_path.clone())
+    } else if scratch_exists && !will_use_atomic_staged_publish {
+        // Resuming a staged build that was interrupted: the partial index lives
+        // in the scratch dir, so continue there rather than in the live index.
+        Some(scratch_path.clone())
     } else {
         None
     };
-    // Everything downstream writes to the build path; it equals the live path
-    // for an incremental rebuild and the scratch path for a from-zero one.
-    let index_path = staged_build_path
+    // Where the index CONTENT is built. Equals the live path for an ordinary
+    // in-place incremental run; the scratch path for a staged full rebuild.
+    let build_path = staged_build_path
         .clone()
         .unwrap_or_else(|| index_path.clone());
     if restart_from_zero && will_use_atomic_staged_publish {
@@ -21031,7 +21046,7 @@ fn rebuild_tantivy_from_db_with_options(
     }
 
     let mut t_index = match (|| -> Result<TantivyIndex> {
-        let mut t_index = match TantivyIndex::open_or_create(&index_path) {
+        let mut t_index = match TantivyIndex::open_or_create(&build_path) {
             Ok(index) => index,
             Err(err)
                 if rebuild_state.processed_conversations > 0 || rebuild_state.pending.is_some() =>
@@ -21041,14 +21056,14 @@ fn rebuild_tantivy_from_db_with_options(
                     error = %err,
                     "partial lexical index could not be reopened; restarting lexical rebuild from zero"
                 );
-                if let Err(remove_err) = fs::remove_dir_all(&index_path)
+                if let Err(remove_err) = fs::remove_dir_all(&build_path)
                     && remove_err.kind() != std::io::ErrorKind::NotFound
                 {
                     return Err(remove_err).with_context(|| {
                         format!("removing unreadable index {}", index_path.display())
                     });
                 }
-                fs::create_dir_all(&index_path).with_context(|| {
+                fs::create_dir_all(&build_path).with_context(|| {
                     format!(
                         "recreating lexical index directory after open failure {}",
                         index_path.display()
@@ -21056,7 +21071,7 @@ fn rebuild_tantivy_from_db_with_options(
                 })?;
                 rebuild_state =
                     LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
-                TantivyIndex::open_or_create(&index_path)?
+                TantivyIndex::open_or_create(&build_path)?
             }
             Err(err) => return Err(err),
         };
@@ -21606,18 +21621,14 @@ fn rebuild_tantivy_from_db_with_options(
     // Swap the freshly built index into the live path. Until this call the live
     // index is untouched, so a concurrent reader sees the OLD complete corpus
     // rather than a partially built one.
-    let index_path = if let Some(staged) = staged_build_path.as_ref() {
-        let live_path = index_dir(data_dir)?;
-        publish_staged_lexical_index(staged, &live_path).with_context(|| {
+    if let Some(staged) = staged_build_path.as_ref() {
+        publish_staged_lexical_index(staged, &index_path).with_context(|| {
             format!(
                 "publishing staged lexical rebuild into {}",
-                live_path.display()
+                index_path.display()
             )
         })?;
-        live_path
-    } else {
-        index_path
-    };
+    }
     crate::search::tantivy::validate_searchable_index_contract(&index_path).with_context(|| {
         format!(
             "validating lexical rebuild after commit: {}",
