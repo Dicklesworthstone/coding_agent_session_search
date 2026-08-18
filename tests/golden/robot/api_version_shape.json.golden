@@ -4,6 +4,9 @@
     "crate_version": {
       "type": "string"
     },
+    "build_commit": {
+      "type": "string"
+    },
     "api_version": {
       "type": "integer"
     },

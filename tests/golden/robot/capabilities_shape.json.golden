@@ -7,6 +7,12 @@
     "crate_version": {
       "type": "string"
     },
+    "build_commit": {
+      "type": "string"
+    },
+    "build_commit_date": {
+      "type": "string"
+    },
     "api_version": {
       "type": "integer"
     },
