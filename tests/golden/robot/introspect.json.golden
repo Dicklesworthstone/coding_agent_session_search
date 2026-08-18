@@ -636,7 +636,7 @@
         },
         {
           "name": "force-rebuild",
-          "description": "Force Tantivy index rebuild even if schema matches",
+          "description": "Force lexical index rebuild even if schema matches",
           "arg_type": "flag",
           "required": false,
           "default": "false",

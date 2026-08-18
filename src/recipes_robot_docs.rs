@@ -169,7 +169,7 @@ Robot/JSON output must stay parseable even when a dependency logs. When a
 failure surfaces, attribute it before reacting:
 
   * storage / "database is busy" / OpenRead -> likely `frankensqlite`.
-  * lexical / vector / hybrid search -> likely `frankensearch` (Tantivy/vector).
+  * lexical / vector / hybrid search -> likely `frankensearch` (Quill/vector).
   * runtime / scheduler / load stalls -> likely `asupersync` or host load.
   * remote transport -> SSH / rsync / scp / SFTP.
 

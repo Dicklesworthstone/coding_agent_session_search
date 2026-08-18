@@ -695,7 +695,7 @@
   "lexical": {
     "exists": false,
     "status": "missing",
-    "reason": "lexical Tantivy metadata missing",
+    "reason": "lexical index metadata missing",
     "fresh": false,
     "partial": false,
     "partial_reason": null,
@@ -3145,7 +3145,7 @@
     {
       "name": "index",
       "status": "warn",
-      "message": "Search index not initialized yet - run the first index to build Tantivy metadata",
+      "message": "Search index not initialized yet - run the first index to build lexical metadata",
       "anomaly_class": "derived-lexical-stale",
       "health_class": "degraded-derived-assets",
       "severity": "warn",

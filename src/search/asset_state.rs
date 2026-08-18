@@ -1453,7 +1453,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     } else if rebuilding {
         Some("lexical rebuild is in progress".to_string())
     } else if !exists {
-        Some("lexical Tantivy metadata missing".to_string())
+        Some("lexical index metadata missing".to_string())
     } else if checkpoint_db_mismatch {
         Some("lexical rebuild checkpoint points at a different database".to_string())
     } else if contract_mismatch {
@@ -2499,7 +2499,7 @@ mod tests {
         assert!(!state.fresh);
         assert_eq!(
             state.status_reason.as_deref(),
-            Some("lexical Tantivy metadata missing")
+            Some("lexical index metadata missing")
         );
     }
 

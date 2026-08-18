@@ -255,7 +255,7 @@
         },
         {
           "name": "force-rebuild",
-          "description": "Force Tantivy index rebuild even if schema matches",
+          "description": "Force lexical index rebuild even if schema matches",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -3435,7 +3435,7 @@
     {
       "name": "CASS_STREAMING_CONSUMER_COMMIT_SECS",
       "default": "5",
-      "description": "Base Tantivy commit cadence for the streaming consumer."
+      "description": "Base lexical commit cadence for the streaming consumer."
     },
     {
       "name": "CASS_STREAMING_CONSUMER_COMBINE",

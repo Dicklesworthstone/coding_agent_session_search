@@ -9,7 +9,7 @@
   "index": {
     "exists": false,
     "status": "missing",
-    "reason": "lexical Tantivy metadata missing",
+    "reason": "lexical index metadata missing",
     "fresh": false,
     "partial": false,
     "partial_reason": null,

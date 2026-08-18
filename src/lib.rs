@@ -371,7 +371,7 @@ pub enum Commands {
         #[arg(long)]
         full: bool,
 
-        /// Force Tantivy index rebuild even if schema matches
+        /// Force lexical index rebuild even if schema matches
         #[arg(long, default_value_t = false, visible_alias = "force")]
         force_rebuild: bool,
 
@@ -22883,7 +22883,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_RESPONSIVENESS_CONFORMAL_ALPHA_SEVERE=<F>  FP rate for severe quantile (0<α<pressured, default 0.01)".to_string(),
             "  CASS_RESPONSIVENESS_DRIFT_DELTA=<F>      Page-Hinkley drift tolerance δ (default 0.01)".to_string(),
             "  CASS_RESPONSIVENESS_DRIFT_LAMBDA=<F>     Page-Hinkley trigger λ for calibration reset (default 0.5)".to_string(),
-            "  CASS_STREAMING_CONSUMER_COMMIT_SECS=<N>  base streaming-consumer Tantivy commit cadence (default 5)".to_string(),
+            "  CASS_STREAMING_CONSUMER_COMMIT_SECS=<N>  base streaming-consumer lexical commit cadence (default 5)".to_string(),
             "  CASS_SEMANTIC_BATCH_SIZE=<N>             embedder batch size (default 128)".to_string(),
             "  CASS_SEMANTIC_PREP_PARALLEL=1            opt in to rayon-parallel canonicalize+hash prep (default off: serial is measurably faster on the common cheap-embedder path)".to_string(),
             "  CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS=30000  warn when one embedder batch exceeds the cass#257-derived 30s healthy-run threshold".to_string(),
@@ -25404,7 +25404,7 @@ fn run_cli_search(
         } else if db_exists && !tantivy_index_initialized {
             (
                 format!(
-                    "Search index not found at {}. The archive database exists, but the Tantivy index has not been built yet.",
+                    "Search index not found at {}. The archive database exists, but the lexical index has not been built yet.",
                     index_path.display()
                 ),
                 Some("Run 'cass index --full' to build the search index for this archive.".to_string()),
@@ -26895,7 +26895,7 @@ fn pack_missing_index_error(
     } else if db_exists && !tantivy_index_initialized {
         (
             format!(
-                "Search index not found at {}. The archive database exists, but the Tantivy index has not been built yet.",
+                "Search index not found at {}. The archive database exists, but the lexical index has not been built yet.",
                 index_path.display()
             ),
             Some("Run 'cass index --full' to build the search index for this archive.".to_string()),
@@ -30691,7 +30691,7 @@ fn run_diag(
     println!("Paths:");
     println!("  Data directory: {}", data_dir.display());
     println!("  Database: {}", db_path.display());
-    println!("  Tantivy index: {}", index_path.display());
+    println!("  Lexical index: {}", index_path.display());
     println!();
     println!("Database Status:");
     if db_exists {
@@ -78968,7 +78968,7 @@ pub(crate) fn run_doctor_impl(
         add_check!(
             "index",
             "warn",
-            "Search index not initialized yet - run the first index to build Tantivy metadata",
+            "Search index not initialized yet - run the first index to build lexical metadata",
             false
         );
     } else {
@@ -82752,7 +82752,7 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
         env_var_capability(
             "CASS_STREAMING_CONSUMER_COMMIT_SECS",
             Some("5"),
-            "Base Tantivy commit cadence for the streaming consumer.",
+            "Base lexical commit cadence for the streaming consumer.",
         ),
         env_var_capability(
             "CASS_STREAMING_CONSUMER_COMBINE",
