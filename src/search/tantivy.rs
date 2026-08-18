@@ -959,6 +959,24 @@ pub fn searchable_index_modified_time(index_path: &Path) -> Option<SystemTime> {
 }
 
 pub fn searchable_index_fingerprint(index_path: &Path) -> Result<Option<String>> {
+    // A Quill index publishes its state as MANIFEST; hashing it gives the same
+    // "changes exactly when a new generation is published" property the
+    // Tantivy-era `meta.json` hash had. Checked FIRST because it is the current
+    // format — `meta.json` below is only reachable for a not-yet-migrated
+    // directory, and returning None for a live Quill index silently broke the
+    // daemon's served-generation tracking and the rebuild checkpoint's meta
+    // fingerprint (both treat None as "no published index").
+    let quill_manifest = index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER);
+    match fs::read(&quill_manifest) {
+        Ok(bytes) => return Ok(Some(blake3::hash(&bytes).to_hex().to_string())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("reading Quill index manifest {}", quill_manifest.display())
+            });
+        }
+    }
+
     let meta_path = index_path.join("meta.json");
     match fs::read(&meta_path) {
         Ok(bytes) => Ok(Some(blake3::hash(&bytes).to_hex().to_string())),
@@ -2266,6 +2284,35 @@ mod tests {
             cooldown_ms: 300_000,
         };
         assert!(status.should_merge());
+    }
+
+    /// A published Quill index must produce a fingerprint the daemon can parse.
+    ///
+    /// Regression: the fingerprint reader only knew Tantivy's `meta.json`, so a
+    /// live Quill index returned `None`. Both consumers treat `None` as "no
+    /// published index", which silently broke the daemon's served-generation
+    /// tracking and the rebuild checkpoint's meta fingerprint. Asserting only
+    /// "is Some" would be too weak — the daemon parses the first 16 characters
+    /// as hex, so a non-hex fingerprint would satisfy `is_some()` and still
+    /// break it.
+    #[test]
+    fn searchable_index_fingerprint_recognizes_a_published_quill_index() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut index = TantivyIndex::open_or_create(dir.path()).expect("create index");
+        index.commit().expect("commit");
+
+        let fingerprint = searchable_index_fingerprint(dir.path())
+            .expect("fingerprint read must not error")
+            .expect("a published Quill index must have a fingerprint");
+
+        assert!(
+            fingerprint.len() >= 16,
+            "fingerprint too short for the daemon's 16-char generation slice: {fingerprint:?}"
+        );
+        assert!(
+            u64::from_str_radix(&fingerprint[..16], 16).is_ok(),
+            "daemon parses the first 16 chars as hex; got {fingerprint:?}"
+        );
     }
 
     #[test]

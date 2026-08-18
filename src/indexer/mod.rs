@@ -18733,6 +18733,22 @@ fn maybe_pause_lexical_publish_for_kill_relaunch(
 /// A sibling of the live index rather than a temp dir elsewhere, so the final
 /// publish is a same-filesystem rename and cannot fail partway across a device
 /// boundary.
+///
+/// # Why this name is deliberately NOT a `staging_reclaim` staging prefix
+///
+/// `staging_reclaim` deletes `LockSerialized` staging directories once they are
+/// 60 seconds old. A from-zero rebuild of a large archive runs for minutes to
+/// hours, and a directory's mtime does not necessarily advance while content is
+/// written into its subdirectories — so adopting a reclaimable prefix would let
+/// a concurrent sweep delete a live rebuild out from under itself. Trading a
+/// bounded disk residue for that is a bad trade.
+///
+/// The residue is bounded without reclaim: on the success path the publish
+/// `RENAME_EXCHANGE` consumes this directory (it ends up holding the prior-live
+/// index, which the retained-backup contract then owns), and on the crash path
+/// the next from-zero rebuild clears it before reuse while an interrupted run
+/// resumes into it. Worst case is one stale scratch directory, never a growing
+/// set.
 fn staged_lexical_rebuild_scratch_path(index_path: &Path) -> PathBuf {
     let name = index_path
         .file_name()
