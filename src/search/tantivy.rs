@@ -488,6 +488,16 @@ fn federated_search_manifest_path(index_path: &Path) -> PathBuf {
     index_path.join(FEDERATED_SEARCH_MANIFEST_FILE)
 }
 
+/// Write the schema-generation sentinel.
+///
+/// Deliberately a plain `fs::write` rather than a temp-file-plus-rename. A crash
+/// mid-write leaves a truncated file, which `current_schema_hash_file_matches`
+/// fails to parse and `wipe_index_dir_on_schema_hash_mismatch` therefore treats
+/// as a mismatch — the index is discarded and rebuilt. That is the FAIL-SAFE
+/// direction: the cost of a torn sentinel is a rebuild, never a stale-schema
+/// index read as current. Making it atomic would only save an unnecessary
+/// rebuild in a rare crash window, and the atomic helpers in this tree are
+/// private to other modules.
 fn write_root_schema_hash_file(index_path: &Path) -> Result<()> {
     fs::write(
         index_path.join("schema_hash.json"),
@@ -929,6 +939,14 @@ pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // No `meta.json` fallback here, unlike `searchable_index_exists` — the
+    // asymmetry is deliberate. `exists` answers "is there an index generation
+    // here?", so a pre-migration Tantivy directory counts (it is an index, and
+    // recognizing it is what makes the flip REBUILD rather than mistake the
+    // directory for empty). This function answers "is the index usable by the
+    // current engine?", and a Tantivy `meta.json` is not: Quill cannot read
+    // those segments. Accepting it here would report a contract-valid index
+    // that no reader can open.
     if !index_path
         .join(crate::search::quill_bridge::QUILL_INDEX_MARKER)
         .exists()
