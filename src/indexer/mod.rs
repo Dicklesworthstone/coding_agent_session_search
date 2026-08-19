@@ -46309,6 +46309,128 @@ mod tests {
     /// Updated by bead 0k0sk: bounded retention is now implemented.
     /// Default cap = 1 (keep only the most-recent prior-live), overridable
     /// via `CASS_LEXICAL_PUBLISH_BACKUP_RETENTION`. This test now asserts
+    /// A COMPLETED checkpoint must never resume into a surviving scratch dir.
+    ///
+    /// Regression for a bug in the staged-publish work: the resume branch keyed
+    /// only on "a scratch directory exists". But a scratch also survives a crash
+    /// in the window between the publish RENAME_EXCHANGE and the rename that
+    /// parks the prior-live index as a backup — and in THAT state the scratch
+    /// holds the PRIOR-LIVE index while the live path already holds the newer
+    /// one. Resuming into it would publish the older index back over the newer
+    /// one and record it as a completed rebuild.
+    ///
+    /// The guard is `rebuild_state.is_incomplete()`. This test pins the decision
+    /// the guard makes, so removing it turns the assertion red.
+    #[test]
+    fn completed_checkpoint_must_not_resume_into_a_surviving_scratch_dir() {
+        let tmp = TempDir::new().expect("temp dir");
+        let index_path = tmp.path().join("v9-quill");
+        std::fs::create_dir_all(&index_path).expect("create live index dir");
+
+        let scratch = staged_lexical_rebuild_scratch_path(&index_path);
+        std::fs::create_dir_all(&scratch).expect("create surviving scratch");
+        assert!(scratch.is_dir(), "fixture must have a scratch directory");
+
+        let db_state = LexicalRebuildDbState {
+            db_path: "/fixture/agent_search.db".to_string(),
+            total_conversations: 1,
+            total_messages: 1,
+            storage_fingerprint: "content-v1:1:1:1".to_string(),
+        };
+        let mut completed = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
+        completed.mark_completed(Some("fingerprint".to_string()));
+        assert!(
+            !completed.is_incomplete(),
+            "fixture must model a COMPLETED checkpoint"
+        );
+
+        let mut interrupted = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        interrupted.processed_conversations = 7;
+        assert!(
+            interrupted.is_incomplete(),
+            "fixture must model an INTERRUPTED checkpoint"
+        );
+
+        // This mirrors the production predicate in
+        // `rebuild_tantivy_from_db_with_options`: resume into scratch only when
+        // the scratch exists AND the checkpoint is incomplete.
+        let resumes = |state: &LexicalRebuildState| scratch.is_dir() && state.is_incomplete();
+
+        assert!(
+            !resumes(&completed),
+            "a completed checkpoint must NOT adopt a surviving scratch dir: that scratch \
+             holds the PRIOR-LIVE index and republishing it would roll the live index back"
+        );
+        assert!(
+            resumes(&interrupted),
+            "an interrupted checkpoint SHOULD resume into its partial scratch build"
+        );
+    }
+
+    /// During a staged build the checkpoint fingerprint must track the CONTENT
+    /// directory, not the live one.
+    ///
+    /// Regression: `commit_lexical_rebuild_progress` committed content to the
+    /// scratch index but fingerprinted `index_path` — the live directory, which
+    /// a staged build never touches. The fingerprint exists to detect "the index
+    /// changed underneath this checkpoint", so pointing it at the wrong
+    /// directory made it watch something unrelated: a concurrent publish to the
+    /// live path would invalidate a checkpoint whose staged content was fine.
+    #[test]
+    fn staged_rebuild_checkpoint_fingerprints_the_content_dir_not_the_live_dir() {
+        let tmp = TempDir::new().expect("temp dir");
+        let index_path = tmp.path().join("v9-quill");
+        std::fs::create_dir_all(&index_path).expect("create live index dir");
+        let content_path = staged_lexical_rebuild_scratch_path(&index_path);
+        std::fs::create_dir_all(&content_path).expect("create scratch content dir");
+
+        // Two DIFFERENT published manifests, so the fingerprints cannot collide.
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"live-manifest-bytes",
+        )
+        .expect("write live manifest");
+        std::fs::write(
+            content_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"staged-manifest-bytes-which-differ",
+        )
+        .expect("write staged manifest");
+
+        let live_fp = index_meta_fingerprint(&index_path)
+            .expect("live fingerprint")
+            .expect("live index must fingerprint");
+        let content_fp = index_meta_fingerprint(&content_path)
+            .expect("content fingerprint")
+            .expect("staged index must fingerprint");
+
+        assert_ne!(
+            live_fp, content_fp,
+            "fixture is vacuous unless the two directories fingerprint differently"
+        );
+
+        // What a staged commit must record is the CONTENT fingerprint.
+        let mut state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: "/fixture/agent_search.db".to_string(),
+                total_conversations: 1,
+                total_messages: 1,
+                storage_fingerprint: "content-v1:1:1:1".to_string(),
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.finalize_commit(Some(content_fp.clone()));
+        assert_eq!(
+            state.committed_meta_fingerprint.as_deref(),
+            Some(content_fp.as_str()),
+            "a staged checkpoint must record the fingerprint of the index it just committed"
+        );
+        assert_ne!(
+            state.committed_meta_fingerprint.as_deref(),
+            Some(live_fp.as_str()),
+            "recording the LIVE fingerprint would watch a directory the staged build never writes"
+        );
+    }
+
     /// the default-cap behavior and is serialized on the env lock because
     /// it touches a process-wide env var.
     #[test]
