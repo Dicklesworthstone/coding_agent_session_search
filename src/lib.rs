@@ -34549,8 +34549,8 @@ fn doctor_verification_contract_report() -> DoctorVerificationContractReport {
                 feature_area: "backup verification and restore",
                 proof_layers: vec!["unit", "integration", "scripted_e2e"],
                 representative_commands: vec![
-                    "cass doctor restore --dry-run --json",
-                    "cass doctor restore --apply --json",
+                    "cass doctor backups restore <id> --dry-run --json",
+                    "cass doctor backups restore <id> --yes --json",
                 ],
                 required_artifacts: vec![
                     "manifest.json",

@@ -1815,8 +1815,8 @@
             "scripted_e2e"
           ],
           "representative_commands": [
-            "cass doctor restore --dry-run --json",
-            "cass doctor restore --apply --json"
+            "cass doctor backups restore <id> --dry-run --json",
+            "cass doctor backups restore <id> --yes --json"
           ],
           "required_artifacts": [
             "manifest.json",
