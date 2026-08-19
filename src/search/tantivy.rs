@@ -1359,6 +1359,27 @@ pub fn publish_federated_searchable_index_directories_with_summaries(
 /// A missing hash file is NOT a mismatch: a directory with no recorded hash is
 /// either brand new or pre-dates the sentinel, and both cases are handled by
 /// writing the current hash after creation.
+///
+/// # This deletes the sidecars too, deliberately
+///
+/// The generation directory holds more than segments: `.lexical-rebuild-state.json`,
+/// `.lexical-rebuild-equivalence.json`, `.lexical-refresh-ledger.json`,
+/// `.lexical-refresh-evidence.json`, and `lexical-generation-manifest.json` all
+/// live here. Every one of them describes THIS generation's index, so once the
+/// index is discarded for a schema mismatch they describe something that no
+/// longer exists — a checkpoint whose committed offsets index documents in a
+/// different field layout is worse than no checkpoint, because resuming from it
+/// would append current-schema documents onto a stale-schema index.
+///
+/// `load_lexical_rebuild_state` maps a missing state file to `Ok(None)`, which
+/// the caller reads as restart-from-zero. That is exactly right here: a schema
+/// mismatch means the whole generation is rebuilt regardless.
+///
+/// This matches the Tantivy backend's behavior, which called
+/// `remove_dir_all(path)` on the same condition (`cass_compat.rs`), so the flip
+/// preserves it rather than introducing it. Anything that must OUTLIVE a
+/// generation belongs in the index ROOT (e.g. `.lexical-publish-backups/`),
+/// not inside the generation directory.
 fn wipe_index_dir_on_schema_hash_mismatch(index_path: &Path) -> Result<()> {
     let schema_hash_path = index_path.join("schema_hash.json");
     if !schema_hash_path.exists() {
