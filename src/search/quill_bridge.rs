@@ -57,16 +57,48 @@ where
                 .build()
                 .expect("failed to build Quill sync-bridge runtime")
         });
-    let output = runtime.block_on(async {
-        let cx = Cx::for_request();
-        call(cx).await
-    });
-    DRIVER.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(runtime);
+    // Restore the runtime on the way out even if the driven future panics.
+    //
+    // The slot is TAKEN for the duration of the call so a reentrant bridge call
+    // finds it empty and builds its own runtime instead of re-entering
+    // `block_on` on this one. That take must be paired with a put-back on every
+    // exit path: with a plain sequential restore, a panic escaping `block_on`
+    // would unwind past it and leave the slot permanently empty, so every later
+    // call on this thread would build a fresh runtime. Not a correctness bug —
+    // a fresh runtime is always valid — but it silently converts a cached
+    // runtime into a per-call allocation for the rest of the thread's life.
+    struct RestoreOnDrop(Option<Runtime>);
+    impl Drop for RestoreOnDrop {
+        fn drop(&mut self) {
+            if let Some(runtime) = self.0.take() {
+                DRIVER.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    // Only reclaim the slot if it is still empty: a reentrant
+                    // call may have built and parked its own runtime while this
+                    // one was driving, and clobbering it would drop a live
+                    // runtime that an outer frame is still using.
+                    if slot.is_none() {
+                        *slot = Some(runtime);
+                    }
+                });
+            }
         }
-    });
+    }
+
+    // The guard OWNS the runtime across the call, so an unwind runs its Drop
+    // with the runtime still in hand. Setting the guard after `block_on`
+    // returns would be pointless: a panic unwinds before that assignment and
+    // drops the runtime instead of parking it.
+    let guard = RestoreOnDrop(Some(runtime));
+    let output = guard
+        .0
+        .as_ref()
+        .expect("sync-bridge runtime is present for the duration of the call")
+        .block_on(async {
+            let cx = Cx::for_request();
+            call(cx).await
+        });
+    drop(guard);
     output
 }
 
