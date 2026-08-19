@@ -6026,8 +6026,21 @@ fn flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Commit a batch and checkpoint the rebuild.
+///
+/// `state_path` and `content_path` are separate because a staged full rebuild
+/// builds index CONTENT into a scratch sibling while its checkpoint stays next
+/// to the live index. They are the same directory for an ordinary in-place
+/// incremental run.
+///
+/// Mixing them up is silent: the checkpoint would record the fingerprint of the
+/// LIVE index (untouched during a staged build) rather than of the index just
+/// committed, so the fingerprint would be watching the wrong directory for
+/// change. A concurrent publish to the live path would then invalidate a
+/// checkpoint whose staged content is perfectly fine, forcing a full restart.
 fn commit_lexical_rebuild_progress(
-    index_path: &Path,
+    state_path: &Path,
+    content_path: &Path,
     rebuild_state: &mut LexicalRebuildState,
     next_conversation_id: Option<i64>,
     processed_conversations: usize,
@@ -6039,7 +6052,7 @@ fn commit_lexical_rebuild_progress(
 ) -> Result<()> {
     let pending_progress_started = perf_profile.as_ref().map(|_| Instant::now());
     persist_pending_lexical_rebuild_progress(
-        index_path,
+        state_path,
         rebuild_state,
         next_conversation_id,
         processed_conversations,
@@ -6056,14 +6069,14 @@ fn commit_lexical_rebuild_progress(
         profile.commit_duration += started.elapsed();
     }
     let meta_fingerprint_started = perf_profile.as_ref().map(|_| Instant::now());
-    let meta_fingerprint = index_meta_fingerprint(index_path)?;
+    let meta_fingerprint = index_meta_fingerprint(content_path)?;
     if let (Some(profile), Some(started)) = (perf_profile.as_mut(), meta_fingerprint_started) {
         profile.meta_fingerprint_duration += started.elapsed();
     }
     let checkpoint_persist_started = perf_profile.as_ref().map(|_| Instant::now());
     rebuild_state.finalize_commit(meta_fingerprint);
     if persist_finalized_checkpoint {
-        persist_lexical_rebuild_state(index_path, rebuild_state)?;
+        persist_lexical_rebuild_state(state_path, rebuild_state)?;
         if let (Some(profile), Some(started)) = (perf_profile.as_mut(), checkpoint_persist_started)
         {
             profile.checkpoint_persist_duration += started.elapsed();
@@ -20848,9 +20861,20 @@ fn rebuild_tantivy_from_db_with_options(
         })?;
         rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
         Some(scratch_path.clone())
-    } else if scratch_exists && !will_use_atomic_staged_publish {
-        // Resuming a staged build that was interrupted: the partial index lives
-        // in the scratch dir, so continue there rather than in the live index.
+    } else if scratch_exists && !will_use_atomic_staged_publish && rebuild_state.is_incomplete() {
+        // Resuming a staged build that was interrupted mid-flight: the partial
+        // index lives in the scratch dir, so continue there rather than in the
+        // live index.
+        //
+        // `is_incomplete()` is load-bearing, not defensive. A scratch directory
+        // can also survive a crash in the narrow window between the publish
+        // RENAME_EXCHANGE and the rename that parks the prior-live index as a
+        // backup. In that state the scratch holds the PRIOR-LIVE index while
+        // `index_path` already holds the newer one, and the checkpoint is
+        // `completed`. Resuming into it would publish the older index back over
+        // the newer one and then record that as a completed rebuild. Requiring
+        // an incomplete checkpoint keeps that debris out of the publish path;
+        // it is discarded by the next from-zero rebuild's wipe above.
         Some(scratch_path.clone())
     } else {
         None
@@ -21311,6 +21335,7 @@ fn rebuild_tantivy_from_db_with_options(
                     );
                     commit_lexical_rebuild_progress(
                         &index_path,
+                        &build_path,
                         &mut rebuild_state,
                         last_processed_conversation_id,
                         processed_conversations,
@@ -21621,6 +21646,7 @@ fn rebuild_tantivy_from_db_with_options(
         // completion, restart reconciliation still lands the pending commit.
         commit_lexical_rebuild_progress(
             &index_path,
+            &build_path,
             &mut rebuild_state,
             last_processed_conversation_id,
             processed_conversations,
@@ -52240,6 +52266,7 @@ mod tests {
         };
 
         commit_lexical_rebuild_progress(
+            &index_path,
             &index_path,
             &mut state,
             Some(1),
