@@ -677,6 +677,7 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
     let path_str = path.to_string_lossy().to_string();
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
+    let mut wal_recovery_attempted = false;
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
         match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -698,6 +699,15 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
                     remaining,
                     Duration::from_millis(128),
                 );
+            }
+            // gh #389: hard readonly failure + non-empty `-wal` sidecar is
+            // the unclean-shutdown dirty-WAL shape; checkpoint it through the
+            // write path (under the doctor guard held above) and retry the
+            // readonly open exactly once.
+            Err(err) if !wal_recovery_attempted
+                && attempt_dirty_wal_recovery_checkpoint(path, &err) =>
+            {
+                wal_recovery_attempted = true;
             }
             Err(err) => return Err(err),
         }
@@ -762,6 +772,92 @@ pub(crate) fn retry_transient_storage_op<T>(
                 delay = (delay * 2).min(Duration::from_millis(400));
             }
             Err(err) => return Err(err),
+        }
+    }
+}
+
+/// gh #389: recover a dirty WAL before surfacing a hard readonly-open failure.
+///
+/// A readonly-first open of a WAL-mode archive whose WAL still holds
+/// unreplayed frames (the normal artifact of an unclean host shutdown) fails
+/// with a CANTOPEN-class error, because a readonly connection may not write
+/// the wal-index it needs to recover the WAL. Every cass surface probes
+/// readonly-first, so one unclean shutdown used to wedge the whole tool and
+/// route doctor toward a multi-hour archive reconstruction — while the actual
+/// repair is the same read-write open + TRUNCATE checkpoint that
+/// `run_final_wal_checkpoint` performs on every clean indexer shutdown.
+///
+/// This helper attempts that checkpoint exactly once, and only when it is the
+/// safe interpretation of the failure:
+/// - never on a retryable busy/lock-class error — that is a live writer doing
+///   real work, not a dirty WAL (the caller's bounded retry loop owns that
+///   case);
+/// - only when a non-empty regular-file `-wal` sidecar is actually present.
+///
+/// Returns `true` when a checkpoint ran to completion, in which case the
+/// caller should retry its readonly open once. A failed recovery attempt is
+/// logged and returns `false`; the caller then surfaces the ORIGINAL open
+/// error, so recovery can never mask the underlying failure.
+pub(crate) fn attempt_dirty_wal_recovery_checkpoint(
+    db_path: &Path,
+    original_err: &anyhow::Error,
+) -> bool {
+    if retryable_franken_anyhow(original_err) {
+        return false;
+    }
+    // Never let the recovery write-open CREATE a database: a stray `-wal`
+    // next to a missing main file must surface the original open failure.
+    if !db_path.is_file() {
+        return false;
+    }
+    let wal_path = database_sidecar_path(db_path, "-wal");
+    let Ok(meta) = std::fs::symlink_metadata(&wal_path) else {
+        return false;
+    };
+    // A WAL of 32 bytes or fewer is header-only (or empty): no frames to
+    // recover, so a checkpoint cannot explain or fix the open failure.
+    if !meta.file_type().is_file() || meta.len() <= 32 {
+        return false;
+    }
+    let conn = match crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned()) {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::warn!(
+                db = %db_path.display(),
+                wal_bytes = meta.len(),
+                error = %err,
+                "dirty-WAL recovery: read-write open failed; surfacing the original readonly failure"
+            );
+            return false;
+        }
+    };
+    let checkpoint = conn.query("PRAGMA wal_checkpoint(TRUNCATE);");
+    let close_result = conn.close();
+    match (&checkpoint, &close_result) {
+        (Ok(_), Ok(())) => {
+            tracing::info!(
+                db = %db_path.display(),
+                wal_bytes = meta.len(),
+                "dirty-WAL recovery: checkpoint(TRUNCATE) completed after failed readonly open; retrying readonly open"
+            );
+            true
+        }
+        _ => {
+            if let Err(err) = &checkpoint {
+                tracing::warn!(
+                    db = %db_path.display(),
+                    error = %err,
+                    "dirty-WAL recovery: checkpoint failed; surfacing the original readonly failure"
+                );
+            }
+            if let Err(err) = &close_result {
+                tracing::warn!(
+                    db = %db_path.display(),
+                    error = %err,
+                    "dirty-WAL recovery: close failed after checkpoint attempt"
+                );
+            }
+            false
         }
     }
 }
@@ -4693,6 +4789,22 @@ impl FrankenStorage {
                 dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
                 open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
                     .map_err(anyhow::Error::new)?
+            }
+            // gh #389: a hard (non-busy) readonly failure with a non-empty
+            // `-wal` present is the unclean-shutdown dirty-WAL shape — the
+            // readonly connection cannot write the wal-index it needs to
+            // recover. Run the same RW-open + TRUNCATE checkpoint the clean
+            // shutdown path uses, then retry the readonly open once. The
+            // doctor mutation guard acquired above is still held here.
+            Err(err) if attempt_dirty_wal_recovery_checkpoint(path, &err) => {
+                open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(anyhow::Error::new)
+                    .with_context(|| {
+                        format!(
+                            "reopening frankensqlite db readonly after dirty-WAL checkpoint recovery at {}",
+                            path.display()
+                        )
+                    })?
             }
             Err(err) => {
                 return Err(err).with_context(|| {
@@ -20623,6 +20735,96 @@ mod tests {
         // Now open readonly
         let storage = SqliteStorage::open_readonly(&db_path).unwrap();
         assert!(storage.schema_version().is_ok());
+    }
+
+    // gh #389: dirty-WAL recovery must never fire without a non-empty WAL
+    // sidecar, and must never fire on retryable (live-writer) failures.
+    #[test]
+    fn dirty_wal_recovery_declines_without_wal_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("no-wal.db");
+        drop(SqliteStorage::open(&db_path).unwrap());
+        // A clean close leaves no (or an empty) WAL: recovery must decline.
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        if wal_path.exists() {
+            std::fs::write(&wal_path, b"").unwrap();
+        }
+        let hard_err = anyhow!("unable to open database file");
+        assert!(!attempt_dirty_wal_recovery_checkpoint(&db_path, &hard_err));
+    }
+
+    #[test]
+    fn dirty_wal_recovery_declines_on_retryable_error() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("busy.db");
+        drop(SqliteStorage::open(&db_path).unwrap());
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        std::fs::write(&wal_path, vec![0_u8; 4096]).unwrap();
+        // A busy/lock-class failure is a live writer, not a dirty WAL: the
+        // recovery write-open must not be attempted at all.
+        let busy_err = anyhow!("database is busy (snapshot conflict on pages: 12)");
+        assert!(!attempt_dirty_wal_recovery_checkpoint(&db_path, &busy_err));
+        // The fabricated WAL is untouched (recovery never opened the DB).
+        assert_eq!(
+            std::fs::symlink_metadata(&wal_path).unwrap().len(),
+            4096,
+            "recovery must not touch the WAL on a retryable failure"
+        );
+    }
+
+    #[test]
+    fn dirty_wal_recovery_checkpoints_nonempty_wal() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("dirty.db");
+        // Write real rows, then close WITHOUT the final checkpoint so the WAL
+        // keeps its unreplayed frames — the unclean-shutdown artifact from
+        // gh #389.
+        {
+            let mut conn = crate::franken_sync::Connection::open(
+                db_path.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+            conn.execute("INSERT INTO t (x) VALUES (1), (2), (3);")
+                .unwrap();
+            close_franken_in_place_with_busy_retry(&mut conn, false).unwrap();
+        }
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let dirty_len = std::fs::symlink_metadata(&wal_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert!(
+            dirty_len > 32,
+            "precondition: close-without-checkpoint must leave a WAL with frames \
+             (len={dirty_len}; engine behavior changed; rework this test)"
+        );
+        let hard_err = anyhow!("unable to open database file");
+        assert!(
+            attempt_dirty_wal_recovery_checkpoint(&db_path, &hard_err),
+            "recovery must checkpoint a present non-empty WAL"
+        );
+        // TRUNCATE checkpoint drains the WAL frames; fsqlite retains the
+        // 32-byte header, so "no frames left" is `len <= 32`. The rows
+        // survive in the main DB.
+        let truncated_len = std::fs::symlink_metadata(&wal_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert!(
+            truncated_len <= 32,
+            "checkpoint(TRUNCATE) must leave a frame-free WAL (len={truncated_len}, was {dirty_len})"
+        );
+        let storage = SqliteStorage::open_readonly(&db_path);
+        // The DB has no cass schema, so open_readonly may object to schema
+        // shape — but the raw rows must be readable through a raw connection.
+        drop(storage);
+        let conn = crate::franken_sync::Connection::open(
+            db_path.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        let rows = conn.query("SELECT COUNT(*) FROM t;").unwrap();
+        let count: i64 = rows.first().unwrap().get_typed(0).unwrap();
+        assert_eq!(count, 3, "checkpointed rows must survive recovery");
+        conn.close().unwrap();
     }
 
     #[test]
