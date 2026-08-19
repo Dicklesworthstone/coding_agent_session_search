@@ -1488,7 +1488,10 @@ fn execute_query_with_bounded_exact_count(
     offset: usize,
 ) -> Result<CassLexicalSearchResult> {
     let page = crate::search::quill_bridge::search_paginated(reader, query, limit, offset, false)?;
-    let page_saturated = page.hits.len() == limit;
+    // `limit == 0` must not read as saturated: an empty page would equal an
+    // empty limit and trigger the expensive exact-count pass for a caller that
+    // asked for no rows at all.
+    let page_saturated = limit > 0 && page.hits.len() == limit;
     let index_doc_count = page.doc_count;
     let total_count = if page_saturated {
         if should_collect_exact_total_count(index_doc_count, exact_total_count_max_docs()) {
@@ -3587,6 +3590,25 @@ fn should_skip_automatic_wildcard_fallback_for_long_zero_hit_query(
     }
 
     false
+}
+
+/// Words from `query` to highlight in a snippet.
+///
+/// The generator analyzes the SOURCE text and looks each token up in this set,
+/// so a term that never occurs in the source is inert — a stray boolean
+/// operator costs nothing but a map lookup. What is NOT inert is a
+/// `field:value` token: matched whole it would highlight nothing, so the value
+/// half is taken. Quoted phrases contribute their words individually, matching
+/// what the incumbent's snippet did.
+fn snippet_terms_for_query(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| c == '"' || c == '\''))
+        .filter(|word| !matches!(*word, "AND" | "OR" | "NOT"))
+        .map(|word| word.rsplit(':').next().unwrap_or(word))
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn snippet_from_preview_without_full_content(
@@ -7073,7 +7095,7 @@ impl SearchClient {
             && pending_hits
                 .iter()
                 .any(|pending| pending.stored_preview_snippet.is_none());
-        let snippet_generator = if needs_tantivy_snippet_generator {
+        let mut snippet_generator = if needs_tantivy_snippet_generator {
             let snippet_cfg = frankensearch::quill::SnippetConfig {
                 max_chars: 160,
                 highlight_prefix: "<b>".to_string(),
@@ -7081,10 +7103,7 @@ impl SearchClient {
             };
             // Quill compiles a generator from terms and renders against source
             // text, so the query's terms drive it directly.
-            let terms: Vec<String> = sanitized_query
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect();
+            let terms = snippet_terms_for_query(sanitized_query);
             Some(crate::search::quill_bridge::content_snippet_generator(
                 &terms,
                 snippet_cfg,
@@ -7128,8 +7147,12 @@ impl SearchClient {
             let snippet = if wants_snippet {
                 if let Some(snippet) = pending.stored_preview_snippet.clone() {
                     snippet
-                } else if let Some(r#gen) = &snippet_generator {
-                    let mut generator = r#gen.clone();
+                } else if let Some(generator) = snippet_generator.as_mut() {
+                    // Borrowed mutably rather than cloned per hit: `snippet()`
+                    // takes `&mut self` only for the analyzer's internal
+                    // buffers — it reads the config and term weights and keeps
+                    // no state between calls — so one generator serves every
+                    // hit and the per-hit clone was pure allocation.
                     let rendered = if !pending.stored_content.is_empty() {
                         generator.snippet(&pending.stored_content)
                     } else if !effective_content.is_empty() {
@@ -8675,6 +8698,21 @@ fn maybe_spawn_warm_worker(
     let handle = std::thread::Builder::new()
         .name("cass-warm-worker".into())
         .spawn(move || {
+            // Built once for the worker's lifetime: the CASS schema is fixed, so
+            // re-parsing it per warm job was pure overhead on a loop whose entire
+            // purpose is to be cheap.
+            let warm_parser = match frankensearch::quill::query::CassQueryParser::new(
+                frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+            ) {
+                Ok(parser) => parser,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "warm worker could not build the CASS query parser; warm searches disabled"
+                    );
+                    return;
+                }
+            };
             // Simple debounce: process at most one warmup every WARM_DEBOUNCE_MS.
             let mut last_run = Instant::now();
             while let Ok(job) = rx.recv() {
@@ -8704,22 +8742,28 @@ fn maybe_spawn_warm_worker(
                 // incumbent hand-built here, so this warms the identical
                 // posting lists. Limit 1 doc.
                 if !job.query.trim().is_empty() {
-                    let _ = frankensearch::quill::query::CassQueryParser::new(
-                        frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
-                    )
-                    .map(|parser| {
-                        let parsed = parser.parse(
-                            &job.query,
-                            &frankensearch::quill::query::CassQueryFilters::default(),
+                    let parsed = warm_parser.parse(
+                        &job.query,
+                        &frankensearch::quill::query::CassQueryFilters::default(),
+                    );
+                    // A failed warm search is not an error for the caller — the
+                    // real query path will surface anything that matters — but
+                    // swallowing it entirely makes a persistently broken warm
+                    // path invisible. Log at debug so it is diagnosable without
+                    // being noisy.
+                    if let Err(err) = crate::search::quill_bridge::search_paginated(
+                        &reader,
+                        &parsed.query,
+                        1,
+                        0,
+                        false,
+                    ) {
+                        tracing::debug!(
+                            error = %err,
+                            query = %job.query,
+                            "warm search failed; cache prefill skipped for this job"
                         );
-                        crate::search::quill_bridge::search_paginated(
-                            &reader,
-                            &parsed.query,
-                            1,
-                            0,
-                            false,
-                        )
-                    });
+                    }
                 }
             }
         })
@@ -16723,6 +16767,46 @@ mod tests {
         assert!(!result.hits.is_empty());
 
         Ok(())
+    }
+
+    /// Snippet terms must be the words a reader would expect highlighted.
+    ///
+    /// The `field:value` case is the one that matters: matched whole, the token
+    /// never occurs in the source and the hit renders with NO highlight at all.
+    #[test]
+    fn snippet_terms_drop_operators_and_field_prefixes() {
+        assert_eq!(
+            snippet_terms_for_query("hello world"),
+            vec!["hello".to_string(), "world".to_string()]
+        );
+        assert_eq!(
+            snippet_terms_for_query("agent:claude error"),
+            vec!["claude".to_string(), "error".to_string()],
+            "a field-qualified token must contribute its VALUE, not the whole token"
+        );
+        assert_eq!(
+            snippet_terms_for_query("\"exact phrase\" here"),
+            vec!["exact".to_string(), "phrase".to_string(), "here".to_string()],
+            "a quoted phrase contributes its words individually"
+        );
+        assert_eq!(
+            snippet_terms_for_query("foo AND bar OR baz NOT qux"),
+            vec![
+                "foo".to_string(),
+                "bar".to_string(),
+                "baz".to_string(),
+                "qux".to_string()
+            ],
+            "boolean operators are not literal words to highlight"
+        );
+        assert!(
+            snippet_terms_for_query("   ").is_empty(),
+            "a whitespace-only query yields no terms"
+        );
+        assert!(
+            snippet_terms_for_query("agent:").is_empty(),
+            "a bare field prefix with no value yields no terms"
+        );
     }
 
     #[test]
