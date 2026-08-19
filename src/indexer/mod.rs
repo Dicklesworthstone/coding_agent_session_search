@@ -16994,14 +16994,13 @@ fn canonical_archive_unhealthy_for_index_error(db_path: &Path, reason: &str) -> 
          corruption blocks the open itself so even that repair cannot read the \
          archive — GH #368 — treat it as unopenable and use reconstruct below). \
          If the archive \
-         cannot be opened at all, run 'cass doctor reconstruct --json': it rebuilds \
-         the canonical archive from the checksum-verified raw-mirror blobs (reading \
-         the mirror, not the dead DB) and promotes it behind a coverage gate with a \
-         backup of the corrupt bundle. If instead the archive opens read-only but is \
+         cannot be opened at all, rebuild from the checksum-verified raw mirror with \
+         'cass doctor --recover-from-archive <DIR> --json' (it reads the mirror, not \
+         the dead DB). If instead the archive opens read-only but is \
          malformed, 'cass doctor --recover-from-archive <DIR>' rebuilds the source \
          JSONL from cass's preserved extra_json/extra_bin envelopes for re-ingest. \
-         An explicit backup restore via 'cass doctor backups restore <id>' also \
-         remains available.",
+         An explicit backup restore via 'cass doctor backups list --json' followed \
+         by 'cass doctor backups restore <id> --json' also remains available.",
         db_path.display()
     )
 }
