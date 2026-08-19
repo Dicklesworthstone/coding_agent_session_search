@@ -91423,13 +91423,18 @@ impl IndexStallWatchdog {
         }
 
         self.stall_abort_reported_for_phase = Some(phase_code);
+        // gh #400: report the threshold that actually gated this abort. When
+        // the finalize/persist grace is active the process was allowed
+        // `effective_abort_threshold` (e.g. 1800s) of quiescence, so emitting
+        // the base `abort_threshold` (300s) here made the payload claim an
+        // abort budget the watchdog never applied.
         Some(self.stall_payload(
             index_progress,
             elapsed_ms,
             stall_elapsed,
             threshold,
             "stall_aborting",
-            Some(abort_threshold),
+            Some(effective_abort_threshold),
         ))
     }
 
