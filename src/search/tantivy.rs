@@ -1444,6 +1444,11 @@ impl TantivyIndex {
         writer_parallelism: usize,
     ) -> Result<Self> {
         materialize_federated_search_bundle_for_write(path)?;
+        // Same mismatch guard as `open_or_create`. Without it this constructor
+        // would open a stale-schema index and then `write_root_schema_hash_file`
+        // would STAMP it as current — turning a detectable mismatch into a
+        // silent one, which is strictly worse than not checking at all.
+        wipe_index_dir_on_schema_hash_mismatch(path)?;
         // Quill does not take a per-index writer-thread count: the CASS schema
         // is wider than the shipping five-field shape, so its ingest takes the
         // scalar route by construction and there are no writer threads to
