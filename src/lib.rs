@@ -41083,7 +41083,7 @@ fn build_doctor_archive_scan_context(data_dir: &Path, db_path: &Path) -> DoctorA
                 raw_mirror.summary.invalid_manifest_count
             )],
             confidence: "high",
-            recommendation: "cass doctor reconstruct --json",
+            recommendation: "cass doctor --recover-from-archive <DIR> --json",
             safe_to_normalize: false,
             normalization_kind: None,
         }));
@@ -41100,7 +41100,7 @@ fn build_doctor_archive_scan_context(data_dir: &Path, db_path: &Path) -> DoctorA
                 raw_mirror.summary.missing_blob_count
             )],
             confidence: "high",
-            recommendation: "cass doctor restore --json or cass doctor reconstruct --json",
+            recommendation: "cass doctor backups list --json, then cass doctor backups restore <id> --json",
             safe_to_normalize: false,
             normalization_kind: None,
         }));
@@ -41120,7 +41120,7 @@ fn build_doctor_archive_scan_context(data_dir: &Path, db_path: &Path) -> DoctorA
                 raw_mirror.summary.manifest_checksum_mismatch_count
             )],
             confidence: "high",
-            recommendation: "cass doctor restore --json or cass doctor reconstruct --json",
+            recommendation: "cass doctor backups list --json, then cass doctor backups restore <id> --json",
             safe_to_normalize: false,
             normalization_kind: None,
         }));
