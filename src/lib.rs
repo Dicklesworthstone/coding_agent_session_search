@@ -25347,17 +25347,26 @@ fn run_cli_search(
         return Ok(());
     }
 
-    let search_self_heal = ensure_lexical_assets_for_search(
-        &data_dir,
-        &db_path,
-        &index_path,
-        timeout_ms,
-        start_time,
-        dry_run,
-        // #287: robot callers get a bounded degraded refusal (stable reason
-        // code) instead of a silent multi-minute inline lexical rebuild.
-        effective_robot.is_some(),
-    )?;
+    // A deliberately semantic-only request does not consult Tantivy.  In
+    // particular, `--mode semantic --approximate` must be able to use an
+    // already-attested HNSW graph even when the independently-maintained
+    // lexical checkpoint needs repair.  Running lexical self-heal here can
+    // otherwise turn a read query into a long rebuild before ANN is reached.
+    let search_self_heal = if matches!(mode, Some(SearchMode::Semantic)) {
+        SearchLexicalSelfHeal::skipped()
+    } else {
+        ensure_lexical_assets_for_search(
+            &data_dir,
+            &db_path,
+            &index_path,
+            timeout_ms,
+            start_time,
+            dry_run,
+            // #287: robot callers get a bounded degraded refusal (stable reason
+            // code) instead of a silent multi-minute inline lexical rebuild.
+            effective_robot.is_some(),
+        )?
+    };
     if search_self_heal.action != "skipped" {
         tracing::info!(
             action = search_self_heal.action,
