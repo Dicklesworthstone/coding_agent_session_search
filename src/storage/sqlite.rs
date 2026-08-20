@@ -704,8 +704,8 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
             // the unclean-shutdown dirty-WAL shape; checkpoint it through the
             // write path (under the doctor guard held above) and retry the
             // readonly open exactly once.
-            Err(err) if !wal_recovery_attempted
-                && attempt_dirty_wal_recovery_checkpoint(path, &err) =>
+            Err(err)
+                if !wal_recovery_attempted && attempt_dirty_wal_recovery_checkpoint(path, &err) =>
             {
                 wal_recovery_attempted = true;
             }
@@ -20780,10 +20780,9 @@ mod tests {
         // keeps its unreplayed frames — the unclean-shutdown artifact from
         // gh #389.
         {
-            let mut conn = crate::franken_sync::Connection::open(
-                db_path.to_string_lossy().into_owned(),
-            )
-            .unwrap();
+            let mut conn =
+                crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+                    .unwrap();
             conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
             conn.execute("INSERT INTO t (x) VALUES (1), (2), (3);")
                 .unwrap();
@@ -20817,10 +20816,8 @@ mod tests {
         // The DB has no cass schema, so open_readonly may object to schema
         // shape — but the raw rows must be readable through a raw connection.
         drop(storage);
-        let conn = crate::franken_sync::Connection::open(
-            db_path.to_string_lossy().into_owned(),
-        )
-        .unwrap();
+        let conn =
+            crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         let rows = conn.query("SELECT COUNT(*) FROM t;").unwrap();
         let count: i64 = rows.first().unwrap().get_typed(0).unwrap();
         assert_eq!(count, 3, "checkpointed rows must survive recovery");
