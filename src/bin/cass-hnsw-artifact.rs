@@ -108,7 +108,7 @@ struct QualityArtifact {
 fn read_manifest(path: &Path) -> Result<Value> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("read semantic manifest {}", path.display()))?;
-    let manifest = serde_json::from_slice(&bytes)
+    let manifest: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse semantic manifest JSON {}", path.display()))?;
     ensure!(
         manifest.is_object(),
