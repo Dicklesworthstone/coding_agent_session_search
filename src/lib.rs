@@ -98,6 +98,23 @@ const CONTRACT_VERSION: &str = "1";
 const DEFAULT_STALE_THRESHOLD_SECS: u64 = 1800;
 const DEFAULT_PACK_FRESHNESS_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
 
+/// Install rustls's `ring` crypto provider as the process default.
+///
+/// reqwest 0.13 is built with `rustls-no-provider`, so rustls has no crypto
+/// provider until one is installed; without it the first TLS handshake
+/// panics. cass keeps `ring` (already linked) rather than letting reqwest's
+/// default `rustls` feature pull aws-lc-sys and its cmake build into every
+/// release target. Safe to call from every HTTP client construction site:
+/// `install_default` only fails when a provider is already installed, and
+/// that provider is equally usable.
+pub(crate) fn ensure_rustls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return;
+    }
+    // A lost install race is fine: the provider that won is equally usable.
+    let _installed = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[cfg(test)]
 fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
     dotenvy::var("CASS_TEST_WATCH_PATHS")
@@ -83864,6 +83881,7 @@ fn gather_live_release_observations(
 ) -> crate::release_verify::ReleaseVerifyRequest {
     use crate::release_verify::{ChannelObservationInput, ReleaseChannel, ReleaseVerifyRequest};
 
+    ensure_rustls_crypto_provider();
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(RELEASE_VERIFY_HTTP_TIMEOUT_SECS))
