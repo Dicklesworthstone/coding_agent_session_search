@@ -16786,7 +16786,11 @@ mod tests {
         );
         assert_eq!(
             snippet_terms_for_query("\"exact phrase\" here"),
-            vec!["exact".to_string(), "phrase".to_string(), "here".to_string()],
+            vec![
+                "exact".to_string(),
+                "phrase".to_string(),
+                "here".to_string()
+            ],
             "a quoted phrase contributes its words individually"
         );
         assert_eq!(
