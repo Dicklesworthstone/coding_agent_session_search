@@ -146,7 +146,7 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 24, "Expected 24 connector factories");
+    assert_eq!(slugs.len(), 25, "Expected 25 connector factories");
 }
 
 // ---------------------------------------------------------------------------

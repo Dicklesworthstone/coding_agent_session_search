@@ -83,6 +83,7 @@ const DOCUMENTED_CONNECTOR_NAMES: &[&str] = &[
     "grok",
     "hermes",
     "kimi",
+    "muse",
     "openclaw",
     "opencode",
     "openhands",
