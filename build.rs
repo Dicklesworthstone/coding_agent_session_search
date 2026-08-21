@@ -142,7 +142,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.5",
+        expected_version: "0.4.9",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",

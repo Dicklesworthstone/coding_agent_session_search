@@ -957,7 +957,7 @@ mod tests {
             ),
         )?;
         ensure(
-            asupersync.version.as_deref() == Some("=0.4.5"),
+            asupersync.version.as_deref() == Some("=0.4.9"),
             "asupersync version pin should match Cargo.toml",
         )
     }
