@@ -883,6 +883,7 @@ async fn fetch_latest_release() -> Result<GitHubRelease> {
 /// Fetch latest release using a short-timeout blocking HTTP client.
 fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
     let url = format!("{}/releases/latest", release_api_base_url());
+    crate::ensure_rustls_crypto_provider();
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))

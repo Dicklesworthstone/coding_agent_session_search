@@ -1344,6 +1344,7 @@ impl ModelDownloader {
         let progress_callback = on_progress.cloned();
         let max_body_size = model_http_max_body_size(expected_size);
 
+        crate::ensure_rustls_crypto_provider();
         let client = reqwest::blocking::Client::builder()
             .user_agent(concat!(
                 "cass/",
