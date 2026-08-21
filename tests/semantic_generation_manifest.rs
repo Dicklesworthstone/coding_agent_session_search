@@ -27,7 +27,7 @@ const CHILD_CORPUS_ENV: &str = "CASS_TEST_SEMANTIC_CORPUS_SHA256";
 const CHILD_MARKER: &str = "semantic_generation_fresh_process_verified";
 
 fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn corpus_identity() -> SemanticCorpusSnapshotIdentity {
@@ -302,7 +302,7 @@ const CHILD_STREAM_CAP: usize = CHILD_OUTPUT_CAP / 2;
 const CHILD_LINE_CAP: usize = 10_000;
 
 fn accepted_sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn accepted_corpus_identity() -> SemanticCorpusSnapshotIdentity {

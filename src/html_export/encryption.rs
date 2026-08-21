@@ -157,9 +157,10 @@ pub fn encrypt_content(
     let cipher = Aes256Gcm::new_from_slice(key.as_ref())
         .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
 
-    let nonce = Nonce::from_slice(&iv);
+    let nonce = Nonce::try_from(iv.as_slice())
+        .map_err(|e| EncryptionError::EncryptionFailed(format!("IV length rejected: {e}")))?;
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
 
     let encrypted = EncryptedContent {
@@ -188,8 +189,10 @@ fn fill_encryption_random(label: &str, output: &mut [u8]) {
         return;
     }
 
-    use aes_gcm::aead::{OsRng, rand_core::RngCore};
-    OsRng.fill_bytes(output);
+    // Same CSPRNG the export key/nonce generators use (`rand::rng()` is
+    // reseeded from the OS); aes-gcm 0.11 no longer re-exports `OsRng`.
+    use rand::Rng;
+    rand::rng().fill_bytes(output);
 }
 
 /// Deterministic bytes for debug/test golden generation only.
@@ -384,8 +387,10 @@ mod tests {
         );
 
         let cipher = Aes256Gcm::new_from_slice(&key).expect("cipher");
-        let nonce = Nonce::from_slice(&iv);
-        let decrypted = cipher.decrypt(nonce, ciphertext.as_ref()).expect("decrypt");
+        let nonce = Nonce::try_from(iv.as_slice()).expect("iv is 12 bytes");
+        let decrypted = cipher
+            .decrypt(&nonce, ciphertext.as_ref())
+            .expect("decrypt");
 
         assert_eq!(plaintext, String::from_utf8(decrypted).expect("utf8"));
     }

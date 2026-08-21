@@ -84,7 +84,7 @@ fn file_sha256_hex(path: &std::path::Path) -> String {
         hasher.update(&buffer[..read]);
     }
 
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(unix)]

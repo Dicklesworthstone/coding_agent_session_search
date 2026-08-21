@@ -565,7 +565,7 @@ impl EncryptionEngine {
             // Encrypt with AEAD
             let ciphertext = cipher
                 .encrypt(
-                    Nonce::from_slice(&nonce),
+                    &Nonce::from(nonce),
                     Payload {
                         msg: &compressed,
                         aad: &aad,
@@ -1148,7 +1148,7 @@ impl DecryptionEngine {
             // Decrypt
             let compressed = cipher
                 .decrypt(
-                    Nonce::from_slice(&nonce),
+                    &Nonce::from(nonce),
                     Payload {
                         msg: &ciphertext,
                         aad: &aad,
@@ -1447,7 +1447,7 @@ fn wrap_key(
 
     let wrapped = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: dek,
                 aad: &aad,
@@ -1478,7 +1478,7 @@ fn unwrap_key(
 
     let dek = cipher
         .decrypt(
-            Nonce::from_slice(nonce),
+            &Nonce::from(*nonce),
             Payload {
                 msg: wrapped,
                 aad: &aad,

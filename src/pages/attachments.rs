@@ -352,7 +352,7 @@ impl AttachmentProcessor {
             // Encrypt
             let ciphertext = cipher
                 .encrypt(
-                    Nonce::from_slice(&nonce),
+                    &Nonce::from(nonce),
                     Payload {
                         msg: data.as_slice(),
                         aad: &aad,
@@ -381,7 +381,7 @@ impl AttachmentProcessor {
         // AAD for manifest: just export_id
         let manifest_ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&manifest_nonce),
+                &Nonce::from(manifest_nonce),
                 Payload {
                     msg: &manifest_json,
                     aad: export_id,
@@ -441,7 +441,7 @@ pub fn decrypt_blob(
     // Decrypt
     let plaintext = cipher
         .decrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: ciphertext,
                 aad: &aad,
@@ -466,7 +466,7 @@ pub fn decrypt_manifest(
     // Decrypt
     let plaintext = cipher
         .decrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: ciphertext,
                 aad: export_id,
@@ -556,7 +556,7 @@ pub(crate) fn reencrypt_blobs_into_dir(
 
         let ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 Payload {
                     msg: data.as_slice(),
                     aad: &aad,
@@ -577,7 +577,7 @@ pub(crate) fn reencrypt_blobs_into_dir(
     let manifest_nonce = derive_blob_nonce("manifest");
     let reencrypted_manifest = cipher
         .encrypt(
-            Nonce::from_slice(&manifest_nonce),
+            &Nonce::from(manifest_nonce),
             Payload {
                 msg: &manifest_json,
                 aad: new_export_id,
@@ -1011,7 +1011,7 @@ mod tests {
 
         let ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 Payload {
                     msg: &data[..],
                     aad: &aad,
@@ -1171,7 +1171,7 @@ mod tests {
 
         let ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 Payload {
                     msg: &manifest_json,
                     aad: &export_id,

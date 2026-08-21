@@ -38,7 +38,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["blocking"
 # the default `rustls` feature pull aws-lc-sys and its cmake build into every
 # release target. The platform verifier supplies the trust roots.
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
-toon = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/toon_rust", rev = "5669b72a", package = "tru" }
+toon = { version = "0.2.3", git = "https://github.com/Dicklesworthstone/toon_rust", rev = "d7185c78", package = "tru" }
 tempfile = "3.27.0"
 wait-timeout = "0.2.1"
 rmp-serde = "1.3.1"  # MessagePack for binary metadata serialization (Opt 3.1)
@@ -77,10 +77,10 @@ regex = "1.12.3"
 portable-pty = "0.9.0"
 # FrankenTUI migration foundation (bead 2noh9.2.1).
 # Strategy: pin a Git revision for reproducible CI builds.
-ftui = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankentui", rev = "5f78cfa0" }
-ftui-runtime = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankentui", rev = "5f78cfa0", features = ["native-backend", "crossterm-compat"] }
-ftui-tty = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankentui", rev = "5f78cfa0" }
-ftui-extras = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankentui", rev = "5f78cfa0", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
+ftui = { version = "=0.5.0" }
+ftui-runtime = { version = "=0.5.0", features = ["native-backend", "crossterm-compat"] }
+ftui-tty = { version = "=0.5.0" }
+ftui-extras = { version = "=0.5.0", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
 dirs = "6.0.0"
 walkdir = "2.5.0"
 glob = "0.3.3"
@@ -109,7 +109,7 @@ bytemuck = "1.25.0"
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
 frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "46a3aefce1aa658fa98f27f0b3676f073160e15c", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
-franken-agent-detection = { version = "0.1.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "57d2789e8d03f6e4b75b0a1a9a5709fc8b290d19", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
+franken-agent-detection = { version = "0.1.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "17f28ad8fbea9181134d63e109a310ea7bf31997", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -122,13 +122,13 @@ ouroboros = "0.18.5"  # Safe self-referential wrapper for HNSW loader lifetime
 # hkdf 0.12 export. Leaving these as wildcards lets cargo upgrade hkdf + hmac
 # to 0.13 (digest 0.11), which fails to satisfy aes-gcm's KeyInit bound and
 # breaks the encryption.rs build with ~29 trait-bound errors.
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 ring = "0.17.14"
 url = "2.5.8"
 pbkdf2 = "0.13.0"  # PBKDF2 key derivation for Web Crypto compatible HTML export encryption
 
 # SHA256 hashing for model verification
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4.3"
 
 # Interactive terminal prompts for setup wizard
@@ -137,7 +137,7 @@ dialoguer = "0.12.0"
 # SFTP fallback for sync when rsync is unavailable
 ssh2 = "0.9.5"
 argon2 = "0.5.3"
-hkdf = "0.12"  # Must match hmac 0.12 / sha2 0.10 / aes-gcm 0.10 digest family; see comment above.
+hkdf = "0.13"  # Must match sha2 0.11 / aes-gcm 0.11 (digest 0.11 family); see comment above.
 zeroize = { version = "1.8.2", features = ["derive"] }
 flate2 = "1.1.9"
 rand = "0.10"

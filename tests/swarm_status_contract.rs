@@ -4354,8 +4354,7 @@ fn string_field<'a>(value: &'a Value, field: &str) -> &'a str {
 
 fn sha256_hex(path: &Path) -> String {
     let bytes = fs::read(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-    let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn assert_no_forbidden_fixture_leaks(fixture_id: &str, value: &Value) {

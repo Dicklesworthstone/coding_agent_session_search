@@ -1,5 +1,5 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::{Aes256Gcm, Nonce};
 use ring::{
     hkdf::{self as ring_hkdf, KeyType},
     hmac,
@@ -39,9 +39,9 @@ pub fn aes_gcm_encrypt(
     validate_length("AES-GCM key", key.len(), AES_GCM_KEY_LEN)?;
     validate_length("AES-GCM nonce", nonce.len(), AES_GCM_NONCE_LEN)?;
 
-    let key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Nonce::from_slice(nonce);
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|err| format!("AES-GCM key rejected: {err}"))?;
+    let nonce = Nonce::try_from(nonce).map_err(|err| format!("AES-GCM nonce rejected: {err}"))?;
     let payload = Payload {
         msg: plaintext,
         aad,
@@ -49,7 +49,7 @@ pub fn aes_gcm_encrypt(
 
     // aes-gcm returns ciphertext + tag appended.
     let ciphertext_with_tag = cipher
-        .encrypt(nonce, payload)
+        .encrypt(&nonce, payload)
         .map_err(|e| format!("encryption failure: {}", e))?;
 
     if ciphertext_with_tag.len() < AES_GCM_TAG_LEN {
@@ -74,9 +74,9 @@ pub fn aes_gcm_decrypt(
     validate_length("AES-GCM nonce", nonce.len(), AES_GCM_NONCE_LEN)?;
     validate_length("AES-GCM tag", tag.len(), AES_GCM_TAG_LEN)?;
 
-    let key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Nonce::from_slice(nonce);
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|err| format!("AES-GCM key rejected: {err}"))?;
+    let nonce = Nonce::try_from(nonce).map_err(|err| format!("AES-GCM nonce rejected: {err}"))?;
 
     // Combine ciphertext and tag for decryption (aes-gcm crate expects them together)
     // Use the Payload API directly to avoid manual concatenation.
@@ -90,7 +90,7 @@ pub fn aes_gcm_decrypt(
     };
 
     cipher
-        .decrypt(nonce, payload)
+        .decrypt(&nonce, payload)
         .map_err(|e| format!("decryption failed: {}", e))
 }
 

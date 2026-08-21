@@ -4307,7 +4307,7 @@ fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn sha256_reader(file: &fs::File) -> std::io::Result<String> {
@@ -4321,7 +4321,7 @@ fn sha256_reader(file: &fs::File) -> std::io::Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

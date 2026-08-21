@@ -1223,8 +1223,7 @@ fn now_unix_ms() -> i64 {
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
-    let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[cfg(test)]

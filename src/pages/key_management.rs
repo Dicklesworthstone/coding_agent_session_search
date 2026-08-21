@@ -561,7 +561,7 @@ fn unwrap_key(
 
     let dek = cipher
         .decrypt(
-            Nonce::from_slice(nonce),
+            &Nonce::from(*nonce),
             Payload {
                 msg: wrapped,
                 aad: &aad,
@@ -686,7 +686,7 @@ fn wrap_key(
 
     let wrapped = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: dek,
                 aad: &aad,
@@ -791,7 +791,7 @@ fn decrypt_all_chunks(
         // Decrypt
         let compressed = cipher
             .decrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 Payload {
                     msg: &ciphertext,
                     aad: &aad,
@@ -866,7 +866,7 @@ fn encrypt_all_chunks(
         // Encrypt
         let ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 Payload {
                     msg: &compressed,
                     aad: &aad,
@@ -2364,7 +2364,7 @@ mod tests {
         let cipher = Aes256Gcm::new_from_slice(&kek).expect("Invalid key length");
         let mut wrapped = cipher
             .encrypt(
-                Nonce::from_slice(&nonce_bytes),
+                &Nonce::from(nonce_bytes),
                 Payload {
                     msg: &dek,
                     aad: &aad,

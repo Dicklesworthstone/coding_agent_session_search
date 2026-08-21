@@ -41,8 +41,8 @@ fn load_fixture_bytes(rel_path: &str) -> Vec<u8> {
 
 fn encrypt_chatgpt_payload(plaintext: &[u8], nonce_bytes: [u8; 12]) -> Vec<u8> {
     let cipher = Aes256Gcm::new_from_slice(&CHATGPT_TEST_KEY).unwrap();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher.encrypt(nonce, plaintext).unwrap();
+    let nonce = Nonce::from(nonce_bytes);
+    let ciphertext = cipher.encrypt(&nonce, plaintext).unwrap();
     let mut output = nonce_bytes.to_vec();
     output.extend_from_slice(&ciphertext);
     output
