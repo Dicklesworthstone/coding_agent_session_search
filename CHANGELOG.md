@@ -40,6 +40,16 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ### Fixed
 
+- **`--source remote` returned nothing on the lexical lane; `--source local`
+  excluded named local-kind sources** (bead 5bf29). The Quill backend's
+  `Remote` clause matches the `origin_kind` term `ssh` while cass indexes
+  remote provenance as `remote`, so after the Tantivy→Quill flip a remote
+  filter could never match a cass document. Remote selection now happens on
+  hydrated hits through the same over-fetch/retry path `--sessions-from`
+  uses, and `local`/`remote` select by origin *kind* on every lane (lexical,
+  SQLite fallback, semantic filter maps), so a configured local-kind source
+  such as a backup root or `chatgpt-import` is local. Analytics and
+  incident-discovery filters still classify by id.
 - **Stale or mid-backfill vector assets are no longer consulted by search**
   ([#404](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/404)).
   The query path admitted any FSVI/HNSW artifact that parsed, so a default
