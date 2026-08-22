@@ -57731,6 +57731,9 @@
                   "properties": {
                     "type": {
                       "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
                     }
                   }
                 },
@@ -58754,6 +58757,9 @@
                                   "type": "object",
                                   "properties": {
                                     "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
                                       "type": "string"
                                     }
                                   }

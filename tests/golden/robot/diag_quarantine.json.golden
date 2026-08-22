@@ -7,7 +7,7 @@
   "paths": {
     "data_dir": "[TEST_HOME]/cass-data",
     "db_path": "[TEST_HOME]/cass-data/agent_search.db",
-    "index_path": "[TEST_HOME]/cass-data/index/v8"
+    "index_path": "[TEST_HOME]/cass-data/index/v9-quill"
   },
   "database": {
     "exists": false,
@@ -97,6 +97,11 @@
     },
     {
       "name": "kimi",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "muse",
       "path": "(not detected)",
       "found": false
     },

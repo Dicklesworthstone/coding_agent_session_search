@@ -30489,7 +30489,8 @@
           "type": "integer"
         },
         "total_matches": {
-          "type": "integer"
+          "type": "integer",
+          "description": "Matches known to exist for this query. Exact only when `_meta.pagination.count_precision` is `exact` (lexical paths that return a backend count); otherwise a lower bound derived from the current page window — `offset + returned + (1 if has_more)` — so it tracks the requested limit rather than counting the corpus (GH #404). Branch on `has_more`, not on this number, to decide whether to page."
         },
         "max_tokens": {
           "type": [
@@ -30935,7 +30936,8 @@
                   "type": "integer"
                 },
                 "total_matches": {
-                  "type": "integer"
+                  "type": "integer",
+                  "description": "Same value as the top-level total_matches; exact only when count_precision is `exact`, otherwise the page-window lower bound `offset + returned + (1 if has_more)`."
                 },
                 "field_mask": {
                   "type": "object",
