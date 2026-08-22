@@ -97,6 +97,12 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
   directory as an explicit local source (`chatgpt-import`) in `sources.toml`
   (on non-macOS, or whenever `--output-dir` is given); explicit roots are
   scanned regardless of detection. `--json` output carries `scan_root`.
+  Output filenames are now derived safely: an export `id` is used verbatim
+  only when it is a plain token, otherwise (path separators, whitespace,
+  missing id) the file is named by a BLAKE3 digest of the conversation —
+  content-keyed rather than positional, so a re-export in a different order
+  no longer silently skips different conversations. Covered end to end by
+  `tests/e2e_import_chatgpt.rs` (import → index → search through the binary).
 - **Daemon fallback is no longer silent**
   ([#409](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/409)).
   At the pinned frankensearch rev the legacy `DaemonFallbackEmbedder`
