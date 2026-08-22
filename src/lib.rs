@@ -2064,6 +2064,10 @@ pub enum ImportCommand {
         /// Output directory (default: ChatGPT app support dir on macOS, or ~/.local/share/cass/chatgpt/ on Linux)
         #[arg(long)]
         output_dir: Option<PathBuf>,
+
+        /// Output as JSON (`{"success", "total", "imported", "skipped", "output_dir", "scan_root"}`)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
     },
 }
 
@@ -8342,8 +8346,12 @@ async fn execute_cli(
 
 async fn handle_import(cmd: ImportCommand, cli: &Cli) -> CliResult<()> {
     match cmd {
-        ImportCommand::Chatgpt { path, output_dir } => {
-            let structured_format = cli.robot_format.or_else(robot_format_from_env);
+        ImportCommand::Chatgpt {
+            path,
+            output_dir,
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
             import_chatgpt_export(&path, output_dir.as_deref(), structured_format).await
         }
     }
@@ -22696,7 +22704,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             QuarantineCommand::List { json, .. } | QuarantineCommand::Clear { json, .. },
         ) => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Import(cmd) => match cmd {
-            ImportCommand::Chatgpt { .. } => cli.robot_format.is_some() || env_robot_mode,
+            ImportCommand::Chatgpt { json, .. } => {
+                resolve_subcommand_structured_format(cli, *json).is_some()
+            }
         },
         Commands::Models(_) => cli.robot_format.is_some() || env_robot_mode,
         Commands::Analytics(cmd) => analytics_requests_structured_output(cmd, cli),
@@ -87463,7 +87473,7 @@ fn response_schema_cursor_manifest() -> serde_json::Value {
             "realized_limit": { "type": "integer" },
             "returned_count": { "type": "integer" },
             "search_page_count": { "type": "integer" },
-            "total_matches": { "type": "integer" },
+            "total_matches": { "type": "integer", "description": "Same value as the top-level total_matches; exact only when count_precision is `exact`, otherwise the page-window lower bound `offset + returned + (1 if has_more)`." },
             "field_mask": {
                 "type": "object",
                 "properties": {
@@ -87726,7 +87736,13 @@ fn response_schema_search() -> serde_json::Value {
         ("limit", serde_json::json!({ "type": "integer" })),
         ("offset", serde_json::json!({ "type": "integer" })),
         ("count", serde_json::json!({ "type": "integer" })),
-        ("total_matches", serde_json::json!({ "type": "integer" })),
+        (
+            "total_matches",
+            serde_json::json!({
+                "type": "integer",
+                "description": "Matches known to exist for this query. Exact only when `_meta.pagination.count_precision` is `exact` (lexical paths that return a backend count); otherwise a lower bound derived from the current page window — `offset + returned + (1 if has_more)` — so it tracks the requested limit rather than counting the corpus (GH #404). Branch on `has_more`, not on this number, to decide whether to page."
+            }),
+        ),
         (
             "max_tokens",
             serde_json::json!({ "type": ["integer", "null"] }),
