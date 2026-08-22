@@ -1045,7 +1045,11 @@ fn refuse_stale_semantic_assets(
     } else {
         &state.quality_tier
     };
-    let served_tier_not_current = served_tier.present
+    // Only a record for *this* embedder can vouch for or refuse this artifact;
+    // a tier record built by some other embedder says nothing about it.
+    let served_tier_describes_artifact =
+        served_tier.present && served_tier.embedder_id.as_deref() == Some(served_embedder_id);
+    let served_tier_not_current = served_tier_describes_artifact
         && (!served_tier.ready || served_tier.current_db_matches == Some(false));
     if state.can_search && !served_tier_not_current {
         return None;

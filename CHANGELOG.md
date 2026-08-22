@@ -77,7 +77,8 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
   into a persistent `token_daily_stats_rebuild_stage` table, commits every
   1000-conversation batch together with a `meta` cursor (ledger fingerprint +
   last conversation id), resumes from that cursor when the `token_usage`
-  ledger is unchanged, and swaps stage→live atomically at the end.
+  ledger is unchanged, swaps stage→live atomically at the end, and drops the
+  scratch table so a finished rebuild leaves the archive schema untouched.
 - **`cass import chatgpt` output is now indexed on Linux and Windows**
   ([#378](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/378)).
   The connector's only default root is the macOS app-support dir and the

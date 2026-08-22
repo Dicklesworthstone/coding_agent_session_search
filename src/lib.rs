@@ -17906,11 +17906,13 @@ async fn import_chatgpt_export(
             Err(err) => {
                 eprintln!(
                     "Warning: imported conversations were written to {} but could not be \
-                     registered as a scan root in sources.toml ({err}); run \
-                     `cass sources add --name {CHATGPT_IMPORT_SOURCE_NAME} --path {}` manually \
-                     or `cass index` will not see them.",
+                     registered as a scan root in sources.toml ({err}). Add it by hand \
+                     (see `cass robot-docs sources`):\n\
+                     [[sources]]\n  name = \"{CHATGPT_IMPORT_SOURCE_NAME}\"\n  type = \"local\"\n  \
+                     paths = [{:?}]\n\
+                     Until then `cass index` will not see the imported conversations.",
                     conv_dir.display(),
-                    conv_dir.display()
+                    conv_dir.display().to_string()
                 );
                 None
             }

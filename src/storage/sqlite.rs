@@ -15940,12 +15940,18 @@ impl FrankenStorage {
             "token_daily_stats_rebuild_start"
         );
 
+        // A cursor is only meaningful together with the stage table it
+        // describes; a cursor whose stage is gone (manual cleanup, partial
+        // restore) must reset rather than resume onto an empty stage.
+        let stage_table_present =
+            historical_table_exists(&self.conn, TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE)?;
         self.conn
             .execute(&token_daily_stats_rebuild_stage_ddl())
             .context("creating token_daily_stats rebuild stage table")?;
 
-        let resume = read_token_daily_stats_rebuild_cursor(&self.conn)?
-            .filter(|cursor| cursor.ledger_fingerprint == ledger.fingerprint());
+        let resume = read_token_daily_stats_rebuild_cursor(&self.conn)?.filter(|cursor| {
+            stage_table_present && cursor.ledger_fingerprint == ledger.fingerprint()
+        });
         let (mut last_conversation_id, mut rows_created) = match resume {
             Some(cursor) => {
                 tracing::info!(
@@ -16123,8 +16129,25 @@ impl FrankenStorage {
             );
         }
 
+        // Per-batch commits mean the scan is not one snapshot: a concurrent
+        // writer appending `token_usage` rows during the run leaves them out
+        // of the staged aggregate. Say so rather than hide it; the live
+        // rollup is still replaced (it reflects the ledger as scanned), and
+        // the next rebuild starts clean because the cursor is retired below.
+        let ledger_after = token_daily_stats_ledger_fingerprint(&self.conn)?;
+        if ledger_after.fingerprint() != ledger.fingerprint() {
+            tracing::warn!(
+                target: "cass::analytics",
+                before = %ledger.fingerprint(),
+                after = %ledger_after.fingerprint(),
+                "token_usage ledger changed during the token_daily_stats rebuild; rows appended during the run are not in this rollup — rerun `cass analytics rebuild --track b` once ingest is idle"
+            );
+        }
+
         // Final atomic swap: the staged aggregate becomes the live rollup in
-        // one transaction, and the checkpoint is retired with it.
+        // one transaction, the checkpoint is retired with it, and the scratch
+        // table is dropped so a finished rebuild leaves the archive schema
+        // exactly as it found it.
         let mut tx = self.conn.transaction()?;
         tx.execute(&format!("DELETE FROM {TOKEN_DAILY_STATS_TABLE}"))?;
         tx.execute(&format!(
@@ -16146,7 +16169,7 @@ impl FrankenStorage {
             FROM {TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE}"
         ))?;
         tx.execute(&format!(
-            "DELETE FROM {TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE}"
+            "DROP TABLE IF EXISTS {TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE}"
         ))?;
         tx.execute_compat(
             "DELETE FROM meta WHERE key = ?1",
@@ -30837,14 +30860,14 @@ mod tests {
                 .unwrap()
         };
 
-        // A complete run leaves no checkpoint and an empty stage behind.
+        // A complete run leaves no checkpoint and no scratch table behind.
         let full_rows = storage.rebuild_token_daily_stats().unwrap();
         assert!(full_rows > 0);
         let live_after_full = count("SELECT COUNT(*) FROM token_daily_stats");
         assert!(live_after_full > 0);
-        assert_eq!(
-            count("SELECT COUNT(*) FROM token_daily_stats_rebuild_stage"),
-            0
+        assert!(
+            !historical_table_exists(raw, TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE).unwrap(),
+            "a finished rebuild must drop its stage table"
         );
         assert!(
             read_token_daily_stats_rebuild_cursor(raw)
@@ -30862,6 +30885,7 @@ mod tests {
         // points past the last conversation id. Resuming must NOT rescan —
         // the sentinel (not the true aggregate) becomes the live table.
         let ledger = token_daily_stats_ledger_fingerprint(raw).unwrap();
+        raw.execute(&token_daily_stats_rebuild_stage_ddl()).unwrap();
         raw.execute_compat(
             "INSERT INTO token_daily_stats_rebuild_stage(
                  day_id, agent_slug, source_id, model_family, grand_total_tokens, last_updated
@@ -30898,6 +30922,7 @@ mod tests {
 
         // A checkpoint taken against a different ledger is discarded: the
         // rebuild starts from zero and recomputes the true aggregate.
+        raw.execute(&token_daily_stats_rebuild_stage_ddl()).unwrap();
         raw.execute_compat(
             "INSERT INTO token_daily_stats_rebuild_stage(
                  day_id, agent_slug, source_id, model_family, grand_total_tokens, last_updated
