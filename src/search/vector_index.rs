@@ -568,7 +568,21 @@ impl SemanticFilterMaps {
     fn sources_from_filter(&self, filter: &SourceFilter) -> Result<Option<HashSet<u32>>> {
         let result = match filter {
             SourceFilter::All => None,
-            SourceFilter::Local => Some(HashSet::from([self.source_id(LOCAL_SOURCE_ID)])),
+            // Every known local-*kind* source (backup roots, chatgpt-import),
+            // not only the built-in `local` id — the complement of the
+            // remote set, which is already classified by `sources.kind`
+            // (bead 5bf29). The built-in id is included even when the
+            // archive has no `sources` row for it.
+            SourceFilter::Local => {
+                let mut local: HashSet<u32> = self
+                    .source_id_to_id
+                    .values()
+                    .copied()
+                    .filter(|id| !self.remote_source_ids.contains(id))
+                    .collect();
+                local.insert(self.source_id(LOCAL_SOURCE_ID));
+                Some(local)
+            }
             SourceFilter::Remote => Some(self.remote_source_ids.clone()),
             SourceFilter::SourceId(id) => Some(HashSet::from([self.source_id(id)])),
         };

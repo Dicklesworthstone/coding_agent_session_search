@@ -1609,6 +1609,27 @@ fn normalized_search_source_id_sql_expr(
     )
 }
 
+/// SQL twin of [`normalized_search_hit_origin_kind`]: the normalized origin
+/// kind (`local` / `remote` / other lowercase kind) of a conversation row,
+/// from its `sources.kind` with the same `source_id` fallback the hit
+/// derivation uses. Lets the SQLite lane's `--source local|remote` select by
+/// kind instead of by `source_id == 'local'` (bead 5bf29).
+fn normalized_search_origin_kind_sql_expr(
+    source_id_column: &str,
+    origin_kind_column: &str,
+) -> String {
+    format!(
+        "CASE \
+            WHEN LOWER(TRIM(COALESCE({origin_kind_column}, ''))) = '{local}' THEN '{local}' \
+            WHEN LOWER(TRIM(COALESCE({origin_kind_column}, ''))) IN ('ssh', 'remote') THEN 'remote' \
+            WHEN TRIM(COALESCE({origin_kind_column}, '')) != '' THEN LOWER(TRIM({origin_kind_column})) \
+            WHEN LOWER(TRIM(COALESCE({source_id_column}, ''))) = '{local}' THEN '{local}' \
+            ELSE 'remote' \
+         END",
+        local = crate::sources::provenance::LOCAL_SOURCE_ID,
+    )
+}
+
 fn normalize_search_source_filter_value(source_id: &str) -> String {
     let trimmed = source_id.trim();
     if trimmed.eq_ignore_ascii_case(crate::sources::provenance::LOCAL_SOURCE_ID) {
@@ -3538,6 +3559,13 @@ pub(crate) fn deduplicate_hits_with_query(hits: Vec<SearchHit>, query: &str) -> 
     deduped
 }
 
+/// `--source remote` is selected on hydrated hits rather than in the engine
+/// clause (see the lexical filter mapping in `search_tantivy`): a hit is
+/// remote iff its normalized `origin_kind` is not the local kind.
+fn remote_source_filter_is_post_applied(filter: &SourceFilter) -> bool {
+    matches!(filter, SourceFilter::Remote)
+}
+
 /// Production CASS result reducer shared by lexical, semantic, progressive,
 /// and feature-gated conformance callers.
 fn postprocess_hits_page_core(
@@ -3838,7 +3866,10 @@ impl SearchClient {
             // Retry logic below preserves correctness on duplicate-heavy corpora.
             target_hits.saturating_mul(3).div_ceil(2)
         };
-        let session_path_filter_active = !filters.session_paths.is_empty();
+        // Filters applied after hydration (not in the engine clause) can
+        // discard most of a page, so their retry fetch must reach deep.
+        let session_path_filter_active = !filters.session_paths.is_empty()
+            || remote_source_filter_is_post_applied(&filters.source_filter);
         let fallback_fetch_limit = if session_path_filter_active {
             self.total_docs()
                 .min(no_limit_result_cap())
@@ -6316,12 +6347,15 @@ impl SearchClient {
 
     fn postprocess_hits_page(
         &self,
-        hits: Vec<SearchHit>,
+        mut hits: Vec<SearchHit>,
         query: &str,
         filters: &SearchFilters,
         limit: usize,
         offset: usize,
     ) -> (usize, Vec<SearchHit>) {
+        if remote_source_filter_is_post_applied(&filters.source_filter) {
+            hits.retain(|hit| hit.origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID);
+        }
         postprocess_hits_page_core(hits, query, &filters.session_paths, limit, offset)
     }
 
@@ -6948,12 +6982,20 @@ impl SearchClient {
             source_filter: match filters.source_filter {
                 SourceFilter::All => FsCassSourceFilter::All,
                 SourceFilter::Local => FsCassSourceFilter::Local,
-                SourceFilter::Remote => FsCassSourceFilter::Remote,
+                // The engine's `Remote` clause matches the `origin_kind` term
+                // `ssh`, but cass indexes remote provenance as `remote` (see
+                // `normalized_index_origin_kind`), so the engine clause can
+                // never match a cass document. Fetch unfiltered and select
+                // remote hits in `postprocess_hits_page`, which already owns
+                // the other stored-but-not-indexed filter (`session_paths`)
+                // and its over-fetch/retry accounting (bead 5bf29).
+                SourceFilter::Remote => FsCassSourceFilter::All,
                 SourceFilter::SourceId(id) => {
                     FsCassSourceFilter::SourceId(normalize_search_source_filter_value(&id))
                 }
             },
         };
+        let remote_post_filter = remote_source_filter_is_post_applied(&filters.source_filter);
 
         // NOTE: session_paths filtering is applied post-search since source_path
         // is STORED but not indexed. See apply_session_paths_filter().
@@ -6968,7 +7010,13 @@ impl SearchClient {
 
         let prefix_only = is_prefix_only(sanitized_query);
         let top_docs = execute_query_with_bounded_exact_count(reader, &q, limit, offset)?;
-        let tantivy_total_count = top_docs.total_count;
+        // With the remote selection applied after hydration the engine count
+        // covers every origin, so it is no longer an exact total for the page.
+        let tantivy_total_count = if remote_post_filter {
+            None
+        } else {
+            top_docs.total_count
+        };
         let query_match_type = dominant_match_type(sanitized_query);
         let mut pending_hits = Vec::with_capacity(top_docs.hits.len());
         let mut missing_exact_content_keys = Vec::new();
@@ -7487,18 +7535,10 @@ impl SearchClient {
 
         match &filters.source_filter {
             SourceFilter::All => true,
-            SourceFilter::Local => matches!(
-                hit.source_id
-                    .as_str()
-                    .cmp(crate::sources::provenance::LOCAL_SOURCE_ID),
-                CmpOrdering::Equal
-            ),
-            SourceFilter::Remote => !matches!(
-                hit.source_id
-                    .as_str()
-                    .cmp(crate::sources::provenance::LOCAL_SOURCE_ID),
-                CmpOrdering::Equal
-            ),
+            // Kind, not id: a named local-kind source (backup root,
+            // chatgpt-import) is local too (bead 5bf29).
+            SourceFilter::Local => hit.origin_kind == crate::sources::provenance::LOCAL_SOURCE_ID,
+            SourceFilter::Remote => hit.origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID,
             SourceFilter::SourceId(id) => {
                 let normalized = normalize_search_source_filter_value(id);
                 matches!(
@@ -8307,15 +8347,17 @@ impl SearchClient {
             params.push(ParamValue::from(created_to));
         }
 
-        // Apply source filter
+        // Apply source filter. `local`/`remote` select by origin *kind*
+        // (bead 5bf29); only `SourceId` matches the normalized id.
+        let origin_kind_sql = normalized_search_origin_kind_sql_expr("c.source_id", "s.kind");
         match &filters.source_filter {
             SourceFilter::All => {}
             SourceFilter::Local => sql.push_str(&format!(
-                " AND {normalized_source_sql} = '{local}'",
+                " AND {origin_kind_sql} = '{local}'",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             )),
             SourceFilter::Remote => sql.push_str(&format!(
-                " AND {normalized_source_sql} != '{local}'",
+                " AND {origin_kind_sql} != '{local}'",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             )),
             SourceFilter::SourceId(id) => {
@@ -13538,6 +13580,29 @@ mod tests {
                 42_i64
             ],
         )?;
+        // A *named* local-kind source (backup root / chatgpt-import): local by
+        // kind even though its id is not "local" (bead 5bf29).
+        conn.execute("INSERT INTO sources(id, kind) VALUES('backup-local', 'local')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+             VALUES(2, 1, NULL, 'backup-local', NULL, 'backup title', '/tmp/backup-filter.jsonl')",
+        )?;
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(2, 2, 0, 'remote filter proof from backup', 43)",
+        )?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+            params![
+                2_i64,
+                "remote filter proof from backup",
+                "backup title",
+                "codex",
+                "/tmp/backup-filter.jsonl",
+                43_i64
+            ],
+        )?;
 
         let client = SearchClient {
             reader: None,
@@ -13584,6 +13649,20 @@ mod tests {
         assert_eq!(source_hits.len(), 1);
         assert_eq!(source_hits[0].source_id, "dev@laptop");
         assert_eq!(source_hits[0].origin_kind, "remote");
+
+        let local_hits = client.search(
+            "remote",
+            SearchFilters {
+                source_filter: SourceFilter::Local,
+                ..Default::default()
+            },
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(local_hits.len(), 1, "the named local-kind source is local");
+        assert_eq!(local_hits[0].source_id, "backup-local");
+        assert_eq!(local_hits[0].origin_kind, "local");
 
         Ok(())
     }
@@ -18073,6 +18152,87 @@ mod tests {
         assert_eq!(hits[0].origin_kind, "remote");
         assert_eq!(hits[0].origin_host.as_deref(), Some("dev@laptop"));
 
+        Ok(())
+    }
+
+    /// `--source remote` / `--source local` on the lexical lane must select by
+    /// origin kind. The index stores `origin_kind` as `local`/`remote`
+    /// (see `normalized_index_origin_kind`), while the Quill `Remote` filter
+    /// term is `ssh`, so `Remote` used to match nothing at all (bead 5bf29).
+    #[test]
+    fn lexical_source_filters_select_by_origin_kind() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        let conv_with_origin = |name: &str, origin: serde_json::Value| NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some(format!("{name} title")),
+            workspace: None,
+            source_path: dir.path().join(format!("{name}.jsonl")),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: serde_json::json!({ "cass": { "origin": origin } }),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(100),
+                content: "sourcefilter proof".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+        index.add_conversation(&conv_with_origin(
+            "local-doc",
+            serde_json::json!({ "source_id": "local", "kind": "local" }),
+        ))?;
+        index.add_conversation(&conv_with_origin(
+            "ssh-doc",
+            serde_json::json!({ "source_id": "laptop", "kind": "ssh", "host": "dev@laptop" }),
+        ))?;
+        index.add_conversation(&conv_with_origin(
+            "backup-doc",
+            serde_json::json!({ "source_id": "backup-local", "kind": "local" }),
+        ))?;
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let search = |filter: SourceFilter| -> Result<Vec<String>> {
+            let hits = client.search(
+                "sourcefilter",
+                SearchFilters {
+                    source_filter: filter,
+                    ..Default::default()
+                },
+                10,
+                0,
+                FieldMask::FULL,
+            )?;
+            let mut ids: Vec<String> = hits.into_iter().map(|hit| hit.source_id).collect();
+            ids.sort();
+            Ok(ids)
+        };
+
+        assert_eq!(
+            search(SourceFilter::All)?,
+            vec!["backup-local", "laptop", "local"]
+        );
+        assert_eq!(
+            search(SourceFilter::Remote)?,
+            vec!["laptop"],
+            "remote must select the ssh-origin document"
+        );
+        assert_eq!(
+            search(SourceFilter::Local)?,
+            vec!["backup-local", "local"],
+            "local must select every local-kind origin, not only source_id == local"
+        );
+        assert_eq!(
+            search(SourceFilter::SourceId("backup-local".into()))?,
+            vec!["backup-local"]
+        );
         Ok(())
     }
 
