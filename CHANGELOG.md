@@ -50,9 +50,9 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
   verdict status uses (computed on the DB handle it already opens, no second
   archive open): hybrid fails open to lexical with the reason in `_meta`,
   explicit `--mode semantic` returns exit 15. New
-  `SemanticAvailability::IndexStale`. The response schema now documents that
-  `total_matches` is a page-window lower bound unless
-  `_meta.pagination.count_precision` is `exact`.
+  `SemanticAvailability::IndexStale`. (`total_matches` remains a page-window
+  lower bound unless `_meta.pagination.count_precision` is `exact`; that
+  semantics is surfaced by `count_precision`/`count_reason` in `_meta`.)
 - **Explicit `--mode semantic` no longer runs lexical self-heal first**
   ([#407](https://github.com/Dicklesworthstone/coding_agent_session_search/pull/407)
   idea, reimplemented). A semantic-only request never fails open to lexical,

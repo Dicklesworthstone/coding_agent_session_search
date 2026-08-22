@@ -87403,7 +87403,7 @@ fn response_schema_cursor_manifest() -> serde_json::Value {
             "realized_limit": { "type": "integer" },
             "returned_count": { "type": "integer" },
             "search_page_count": { "type": "integer" },
-            "total_matches": { "type": "integer", "description": "Same value as the top-level total_matches; exact only when count_precision is `exact`, otherwise the page-window lower bound `offset + returned + (1 if has_more)`." },
+            "total_matches": { "type": "integer" },
             "field_mask": {
                 "type": "object",
                 "properties": {
@@ -87666,13 +87666,7 @@ fn response_schema_search() -> serde_json::Value {
         ("limit", serde_json::json!({ "type": "integer" })),
         ("offset", serde_json::json!({ "type": "integer" })),
         ("count", serde_json::json!({ "type": "integer" })),
-        (
-            "total_matches",
-            serde_json::json!({
-                "type": "integer",
-                "description": "Matches known to exist for this query. Exact only when `_meta.pagination.count_precision` is `exact` (lexical paths that return a backend count); otherwise a lower bound derived from the current page window — `offset + returned + (1 if has_more)` — so it tracks the requested limit rather than counting the corpus (GH #404). Branch on `has_more`, not on this number, to decide whether to page."
-            }),
-        ),
+        ("total_matches", serde_json::json!({ "type": "integer" })),
         (
             "max_tokens",
             serde_json::json!({ "type": ["integer", "null"] }),
