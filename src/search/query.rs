@@ -6974,6 +6974,7 @@ impl SearchClient {
 
         // Delegate cass-compatible query parsing + Tantivy clause construction to frankensearch.
         // cass retains ownership of paging/fallback orchestration and stored-field hydration.
+        let remote_post_filter = remote_source_filter_is_post_applied(&filters.source_filter);
         let fs_filters = FsCassQueryFilters {
             agents: filters.agents.into_iter().collect(),
             workspaces: filters.workspaces.into_iter().collect(),
@@ -6995,7 +6996,6 @@ impl SearchClient {
                 }
             },
         };
-        let remote_post_filter = remote_source_filter_is_post_applied(&filters.source_filter);
 
         // NOTE: session_paths filtering is applied post-search since source_path
         // is STORED but not indexed. See apply_session_paths_filter().
