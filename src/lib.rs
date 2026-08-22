@@ -17848,16 +17848,8 @@ async fn import_chatgpt_export(
     let mut imported = 0u64;
     let mut skipped = 0u64;
 
-    for (i, conv) in conversations.iter().enumerate() {
-        // Extract conversation ID
-        let conv_id = conv
-            .get("id")
-            .or_else(|| conv.get("conversation_id"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("conv-{i}"));
-
-        let filepath = conv_dir.join(format!("{conv_id}.json"));
+    for conv in &conversations {
+        let filepath = conv_dir.join(format!("{}.json", chatgpt_import_file_stem(conv)));
 
         // Idempotent: skip if already exists
         if filepath.exists() {
@@ -17964,6 +17956,73 @@ async fn import_chatgpt_export(
     }
 
     Ok(())
+}
+
+/// File stem for one imported ChatGPT conversation.
+///
+/// The export's `id`/`conversation_id` is user-controlled text that lands in a
+/// filename, so it is accepted only when it is a plain token (`[A-Za-z0-9._-]`,
+/// not `.`/`..`) — anything else (path separators, whitespace, a missing id)
+/// falls back to a BLAKE3 digest of the conversation itself. The digest, not
+/// the array position, is the fallback because import is idempotent *by
+/// filename*: a positional `conv-{i}` name would make a re-export with a
+/// different ordering silently skip different conversations.
+fn chatgpt_import_file_stem(conv: &serde_json::Value) -> String {
+    let plain_id = conv
+        .get("id")
+        .or_else(|| conv.get("conversation_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| {
+            !id.is_empty()
+                && *id != "."
+                && *id != ".."
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        });
+    match plain_id {
+        Some(id) => id.to_string(),
+        None => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(conv.to_string().as_bytes());
+            format!("conv-{}", &hasher.finalize().to_hex()[..32])
+        }
+    }
+}
+
+#[cfg(test)]
+mod chatgpt_import_file_stem_tests {
+    use super::chatgpt_import_file_stem;
+
+    #[test]
+    fn plain_ids_are_used_verbatim() {
+        let conv = serde_json::json!({ "id": "7f3a-conv_01.v2", "title": "x" });
+        assert_eq!(chatgpt_import_file_stem(&conv), "7f3a-conv_01.v2");
+        let alt = serde_json::json!({ "conversation_id": "abc123" });
+        assert_eq!(chatgpt_import_file_stem(&alt), "abc123");
+    }
+
+    #[test]
+    fn unsafe_or_missing_ids_fall_back_to_a_content_digest() {
+        for bad in ["../escape", "a/b", "", "  ", ".", "..", "with space"] {
+            let conv = serde_json::json!({ "id": bad, "title": "t" });
+            let stem = chatgpt_import_file_stem(&conv);
+            assert!(stem.starts_with("conv-"), "{bad:?} -> {stem}");
+            assert!(!stem.contains('/') && !stem.contains(".."), "{stem}");
+        }
+        let missing = serde_json::json!({ "title": "no id" });
+        assert!(chatgpt_import_file_stem(&missing).starts_with("conv-"));
+    }
+
+    #[test]
+    fn digest_fallback_is_content_keyed_not_positional() {
+        let a = serde_json::json!({ "title": "first" });
+        let b = serde_json::json!({ "title": "second" });
+        assert_ne!(chatgpt_import_file_stem(&a), chatgpt_import_file_stem(&b));
+        assert_eq!(chatgpt_import_file_stem(&a), chatgpt_import_file_stem(&a));
+    }
 }
 
 /// `sources.toml` source name under which `cass import chatgpt` registers its
@@ -25606,11 +25665,10 @@ fn run_cli_search(
     // read-only ANN query into a multi-minute rebuild wait. Hybrid and lexical
     // requests keep the full repair path.
     let search_self_heal = if search_request_skips_lexical_self_heal(mode) {
-        SearchLexicalSelfHeal {
-            action: "skipped",
-            reason: Some("explicit semantic request does not consume the lexical tier".to_string()),
-            indexed_docs: None,
-        }
+        tracing::debug!(
+            "search lexical self-heal skipped: explicit semantic request does not consume the lexical tier"
+        );
+        SearchLexicalSelfHeal::skipped()
     } else {
         ensure_lexical_assets_for_search(
             &data_dir,
