@@ -17891,6 +17891,34 @@ async fn import_chatgpt_export(
         imported += 1;
     }
 
+    // GH #378: the indexer only scans a connector's *default* roots when
+    // franken_agent_detection reports the agent as installed, and the ChatGPT
+    // connector's default root is macOS-only (`com.openai.chat`). On Linux and
+    // Windows — and on macOS with a custom `--output-dir` — the files written
+    // above therefore sat in a directory nothing ever scanned, so `cass index`
+    // "succeeded" and silently indexed none of them. Explicit scan roots from
+    // `sources.toml` are scanned regardless of detection, so register the
+    // resolved output directory as a local source. Idempotent: re-imports
+    // reuse the same source and only append a path that is not already there.
+    let registered_scan_root = if output_dir.is_some() || !cfg!(target_os = "macos") {
+        match register_import_scan_root(CHATGPT_IMPORT_SOURCE_NAME, &conv_dir) {
+            Ok(state) => Some(state),
+            Err(err) => {
+                eprintln!(
+                    "Warning: imported conversations were written to {} but could not be \
+                     registered as a scan root in sources.toml ({err}); run \
+                     `cass sources add --name {CHATGPT_IMPORT_SOURCE_NAME} --path {}` manually \
+                     or `cass index` will not see them.",
+                    conv_dir.display(),
+                    conv_dir.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
@@ -17906,6 +17934,11 @@ async fn import_chatgpt_export(
             "imported": imported,
             "skipped": skipped,
             "output_dir": conv_dir.display().to_string(),
+            "scan_root": registered_scan_root.as_ref().map(|state| serde_json::json!({
+                "source": CHATGPT_IMPORT_SOURCE_NAME,
+                "path": conv_dir.display().to_string(),
+                "registration": state.as_str(),
+            })),
         });
         println!(
             "{}",
@@ -17917,11 +17950,149 @@ async fn import_chatgpt_export(
         println!("  Newly imported:      {imported}");
         println!("  Skipped (existing):  {skipped}");
         println!("  Output directory:    {}", conv_dir.display());
+        if let Some(state) = registered_scan_root {
+            println!(
+                "  Scan root:           {} (sources.toml source '{CHATGPT_IMPORT_SOURCE_NAME}', {})",
+                conv_dir.display(),
+                state.as_str()
+            );
+        }
         println!();
         println!("Next step: Run `cass index` to index the conversations.");
     }
 
     Ok(())
+}
+
+/// `sources.toml` source name under which `cass import chatgpt` registers its
+/// output directory so the indexer scans it without relying on connector
+/// auto-detection (GH #378).
+const CHATGPT_IMPORT_SOURCE_NAME: &str = "chatgpt-import";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportScanRootRegistration {
+    /// The source did not exist and was created with this path.
+    Created,
+    /// The source existed; this path was appended to it.
+    PathAdded,
+    /// The source already listed this path; nothing written.
+    AlreadyRegistered,
+}
+
+impl ImportScanRootRegistration {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::PathAdded => "path_added",
+            Self::AlreadyRegistered => "already_registered",
+        }
+    }
+}
+
+/// Register `path` as a local explicit scan root under the named source in
+/// `sources.toml` (GH #378). Loads the current config, mutates only the named
+/// source, and saves atomically through `SourcesConfig::save`.
+fn register_import_scan_root(
+    source_name: &str,
+    path: &Path,
+) -> Result<ImportScanRootRegistration, crate::sources::config::ConfigError> {
+    let mut config = crate::sources::config::SourcesConfig::load()?;
+    let state = register_import_scan_root_in(&mut config, source_name, path)?;
+    if state != ImportScanRootRegistration::AlreadyRegistered {
+        config.save()?;
+    }
+    Ok(state)
+}
+
+/// Pure half of [`register_import_scan_root`]: mutates `config` in memory and
+/// reports what changed, so callers decide whether a save is needed.
+fn register_import_scan_root_in(
+    config: &mut crate::sources::config::SourcesConfig,
+    source_name: &str,
+    path: &Path,
+) -> Result<ImportScanRootRegistration, crate::sources::config::ConfigError> {
+    use crate::sources::config::SourceDefinition;
+
+    let path_str = path.to_string_lossy().into_owned();
+    if let Some(source) = config.find_source_mut(source_name) {
+        if source.paths.iter().any(|existing| existing == &path_str) {
+            return Ok(ImportScanRootRegistration::AlreadyRegistered);
+        }
+        source.paths.push(path_str);
+        source.validate()?;
+        Ok(ImportScanRootRegistration::PathAdded)
+    } else {
+        let mut source = SourceDefinition::local(source_name);
+        source.paths.push(path_str);
+        config.add_source(source)?;
+        Ok(ImportScanRootRegistration::Created)
+    }
+}
+
+#[cfg(test)]
+mod chatgpt_import_scan_root_tests {
+    use super::{
+        CHATGPT_IMPORT_SOURCE_NAME, ImportScanRootRegistration, register_import_scan_root_in,
+    };
+    use crate::sources::config::SourcesConfig;
+    use crate::sources::provenance::SourceKind;
+
+    /// GH #378: the import output directory must become an explicit local
+    /// scan root, and re-running the import must not duplicate it.
+    #[test]
+    fn import_registers_its_output_dir_once_as_a_local_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let conv_dir = tmp.path().join("chatgpt").join("conversations-web-export");
+        std::fs::create_dir_all(&conv_dir).expect("fixture dir");
+        let mut config = SourcesConfig::default();
+
+        assert_eq!(
+            register_import_scan_root_in(&mut config, CHATGPT_IMPORT_SOURCE_NAME, &conv_dir)
+                .expect("first registration"),
+            ImportScanRootRegistration::Created
+        );
+        let source = config
+            .find_source(CHATGPT_IMPORT_SOURCE_NAME)
+            .expect("source created");
+        assert_eq!(source.source_type, SourceKind::Local);
+        assert!(!source.is_remote());
+        assert_eq!(source.paths, vec![conv_dir.to_string_lossy().into_owned()]);
+
+        assert_eq!(
+            register_import_scan_root_in(&mut config, CHATGPT_IMPORT_SOURCE_NAME, &conv_dir)
+                .expect("re-registration"),
+            ImportScanRootRegistration::AlreadyRegistered
+        );
+        assert_eq!(
+            config
+                .find_source(CHATGPT_IMPORT_SOURCE_NAME)
+                .expect("source")
+                .paths
+                .len(),
+            1,
+            "a re-import must not duplicate the path"
+        );
+
+        // A second import with a different --output-dir joins the same source.
+        let other_dir = tmp
+            .path()
+            .join("elsewhere")
+            .join("conversations-web-export");
+        std::fs::create_dir_all(&other_dir).expect("fixture dir");
+        assert_eq!(
+            register_import_scan_root_in(&mut config, CHATGPT_IMPORT_SOURCE_NAME, &other_dir)
+                .expect("second path"),
+            ImportScanRootRegistration::PathAdded
+        );
+        assert_eq!(
+            config
+                .find_source(CHATGPT_IMPORT_SOURCE_NAME)
+                .expect("source")
+                .paths
+                .len(),
+            2
+        );
+    }
 }
 
 /// Compute lightweight state snapshot (index/db freshness) for robot meta and state command reuse
@@ -23557,6 +23728,7 @@ fn compose_daemon_embedder_or_verified_local(
     embedder: Arc<dyn crate::search::embedder::Embedder>,
     config: crate::search::daemon_client::DaemonRetryConfig,
 ) -> Arc<dyn crate::search::embedder::Embedder> {
+    let daemon_reachable = daemon.is_available();
     match crate::search::daemon_client::DaemonFallbackEmbedder::new(
         daemon,
         Arc::clone(&embedder),
@@ -23567,8 +23739,26 @@ fn compose_daemon_embedder_or_verified_local(
             tracing::warn!(
                 error = %error,
                 embedder_id = %embedder.id(),
+                daemon_reachable,
                 "Daemon embedding identity is unverifiable; using the verified local embedder"
             );
+            // GH #409: this is not a transient daemon hiccup — at the pinned
+            // frankensearch rev the legacy constructor rejects every
+            // caller-supplied daemon identity, so an operator with a warm
+            // daemon is about to pay full in-process model load + direct
+            // inference. A tracing warn is invisible by default; say it on
+            // stderr (diagnostics channel, stdout stays data-only) so the
+            // fallback is never silent. Only when a daemon was actually
+            // reachable — the no-daemon case is the ordinary local path.
+            if daemon_reachable {
+                eprintln!(
+                    "Warning: a local embedding daemon is running but was not used ({error}); \
+                     falling back to in-process {} inference. The daemon path needs a \
+                     producer-attested handshake that cass's daemon protocol does not \
+                     provide yet (GH #409); pass --no-daemon to skip daemon discovery.",
+                    embedder.id()
+                );
+            }
             embedder
         }
     }
@@ -23880,6 +24070,48 @@ impl SearchLexicalSelfHeal {
             reason: None,
             indexed_docs: None,
         }
+    }
+}
+
+/// Whether a search request may bypass the pre-query lexical self-heal.
+///
+/// Only an *explicit* `--mode semantic` qualifies: it is served from the
+/// vector/HNSW assets and never fails open to lexical, so a stale lexical
+/// checkpoint is irrelevant to its answer. The default (hybrid) and lexical
+/// requests must keep the repair path because lexical is their required tier.
+fn search_request_skips_lexical_self_heal(
+    requested_mode: Option<crate::search::query::SearchMode>,
+) -> bool {
+    matches!(
+        requested_mode,
+        Some(crate::search::query::SearchMode::Semantic)
+    )
+}
+
+#[cfg(test)]
+mod search_lexical_self_heal_gate_tests {
+    use super::search_request_skips_lexical_self_heal;
+    use crate::search::query::SearchMode;
+
+    #[test]
+    fn explicit_semantic_skips_lexical_self_heal() {
+        assert!(search_request_skips_lexical_self_heal(Some(
+            SearchMode::Semantic
+        )));
+    }
+
+    #[test]
+    fn lexical_hybrid_and_default_keep_lexical_self_heal() {
+        assert!(!search_request_skips_lexical_self_heal(Some(
+            SearchMode::Lexical
+        )));
+        assert!(!search_request_skips_lexical_self_heal(Some(
+            SearchMode::Hybrid
+        )));
+        assert!(
+            !search_request_skips_lexical_self_heal(None),
+            "the default request resolves to hybrid and must still repair lexical"
+        );
     }
 }
 
@@ -25364,17 +25596,32 @@ fn run_cli_search(
         return Ok(());
     }
 
-    let search_self_heal = ensure_lexical_assets_for_search(
-        &data_dir,
-        &db_path,
-        &index_path,
-        timeout_ms,
-        start_time,
-        dry_run,
-        // #287: robot callers get a bounded degraded refusal (stable reason
-        // code) instead of a silent multi-minute inline lexical rebuild.
-        effective_robot.is_some(),
-    )?;
+    // Lexical self-heal only matters for requests that can be served by the
+    // lexical tier. An explicit `--mode semantic` never fails open to lexical
+    // (see `SearchModeMeta::fail_open_on_semantic_unavailable`), so rebuilding
+    // or lock-waiting on a stale lexical checkpoint before it can reach the
+    // vector/HNSW assets is pure latency — on a large archive it turned a
+    // read-only ANN query into a multi-minute rebuild wait. Hybrid and lexical
+    // requests keep the full repair path.
+    let search_self_heal = if search_request_skips_lexical_self_heal(mode) {
+        SearchLexicalSelfHeal {
+            action: "skipped",
+            reason: Some("explicit semantic request does not consume the lexical tier".to_string()),
+            indexed_docs: None,
+        }
+    } else {
+        ensure_lexical_assets_for_search(
+            &data_dir,
+            &db_path,
+            &index_path,
+            timeout_ms,
+            start_time,
+            dry_run,
+            // #287: robot callers get a bounded degraded refusal (stable reason
+            // code) instead of a silent multi-minute inline lexical rebuild.
+            effective_robot.is_some(),
+        )?
+    };
     if search_self_heal.action != "skipped" {
         tracing::info!(
             action = search_self_heal.action,
@@ -77905,11 +78152,36 @@ fn doctor_archive_db_probe_hard_timeout() -> Duration {
 // A skipped check is reported as unchecked (or satisfied by a still-current
 // cached attestation), never silently promoted to a pass.
 const DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Opt-in override for the size gate above (GH #390): operators on long-lived
+/// archives need a supported way to run the full-page frankensqlite
+/// `integrity_check` through doctor instead of being told to leave the
+/// process. The probe still runs under the hard `recv_timeout` deadline
+/// (`CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS`), so lifting the byte cap without
+/// raising the deadline yields a timed-out probe, not an unbounded wait on the
+/// doctor thread.
+const CASS_DOCTOR_FULL_PAGE_INTEGRITY_PROBE: &str = "CASS_DOCTOR_FULL_PAGE_INTEGRITY_PROBE";
 
-fn doctor_franken_deep_integrity_skip_reason_for_bytes(bundle_bytes: u64) -> Option<String> {
+fn doctor_full_page_integrity_probe_requested() -> bool {
+    dotenvy::var(CASS_DOCTOR_FULL_PAGE_INTEGRITY_PROBE)
+        .ok()
+        .is_some_and(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
+fn doctor_franken_deep_integrity_skip_reason_for_bytes(
+    bundle_bytes: u64,
+    full_probe_requested: bool,
+) -> Option<String> {
+    if full_probe_requested {
+        return None;
+    }
     (bundle_bytes > DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES).then(|| {
         format!(
-            "frankensqlite_full_page_integrity_probe_deferred: archive bundle is {bundle_bytes} bytes, above the bounded doctor limit of {DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES} bytes"
+            "frankensqlite_full_page_integrity_probe_deferred: archive bundle is {bundle_bytes} bytes, above the bounded doctor limit of {DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES} bytes; set {CASS_DOCTOR_FULL_PAGE_INTEGRITY_PROBE}=1 (and raise CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS) to run the full-page integrity probe anyway"
         )
     })
 }
@@ -77959,7 +78231,10 @@ fn doctor_franken_deep_integrity_skip_reason(db_path: &Path) -> Option<String> {
             ));
         }
     }
-    doctor_franken_deep_integrity_skip_reason_for_bytes(bundle_bytes)
+    doctor_franken_deep_integrity_skip_reason_for_bytes(
+        bundle_bytes,
+        doctor_full_page_integrity_probe_requested(),
+    )
 }
 
 fn doctor_archive_queryable_for_non_destructive_derived_rebuild(
@@ -78012,15 +78287,34 @@ fn doctor_archive_wide_collectors_deferred_reason(
 fn doctor_franken_deep_integrity_size_gate_has_an_exact_boundary() {
     assert!(
         doctor_franken_deep_integrity_skip_reason_for_bytes(
-            DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES
+            DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES,
+            false
         )
         .is_none()
     );
     let reason = doctor_franken_deep_integrity_skip_reason_for_bytes(
         DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES + 1,
+        false,
     )
     .expect("one byte above the bounded budget must defer the full-page PRAGMA");
     assert!(reason.contains("full_page_integrity_probe_deferred"));
+    assert!(
+        reason.contains(CASS_DOCTOR_FULL_PAGE_INTEGRITY_PROBE),
+        "the deferral must name its own override (GH #390): {reason}"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_franken_deep_integrity_size_gate_is_lifted_by_explicit_opt_in() {
+    assert!(
+        doctor_franken_deep_integrity_skip_reason_for_bytes(
+            DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES * 8,
+            true
+        )
+        .is_none(),
+        "GH #390: an explicit full-probe request must lift the byte cap"
+    );
 }
 
 #[cfg(test)]
@@ -87109,7 +87403,7 @@ fn response_schema_cursor_manifest() -> serde_json::Value {
             "realized_limit": { "type": "integer" },
             "returned_count": { "type": "integer" },
             "search_page_count": { "type": "integer" },
-            "total_matches": { "type": "integer" },
+            "total_matches": { "type": "integer", "description": "Same value as the top-level total_matches; exact only when count_precision is `exact`, otherwise the page-window lower bound `offset + returned + (1 if has_more)`." },
             "field_mask": {
                 "type": "object",
                 "properties": {
@@ -87372,7 +87666,13 @@ fn response_schema_search() -> serde_json::Value {
         ("limit", serde_json::json!({ "type": "integer" })),
         ("offset", serde_json::json!({ "type": "integer" })),
         ("count", serde_json::json!({ "type": "integer" })),
-        ("total_matches", serde_json::json!({ "type": "integer" })),
+        (
+            "total_matches",
+            serde_json::json!({
+                "type": "integer",
+                "description": "Matches known to exist for this query. Exact only when `_meta.pagination.count_precision` is `exact` (lexical paths that return a backend count); otherwise a lower bound derived from the current page window — `offset + returned + (1 if has_more)` — so it tracks the requested limit rather than counting the corpus (GH #404). Branch on `has_more`, not on this number, to decide whether to page."
+            }),
+        ),
         (
             "max_tokens",
             serde_json::json!({ "type": ["integer", "null"] }),

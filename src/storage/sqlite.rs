@@ -15472,16 +15472,38 @@ fn franken_update_token_daily_stats_batched_in_tx(
     tx: &FrankenTransaction<'_>,
     entries: &[(i64, String, String, String, TokenStatsDelta)],
 ) -> Result<usize> {
+    franken_update_token_daily_stats_batched_in_tx_for_table(tx, TOKEN_DAILY_STATS_TABLE, entries)
+}
+
+/// Live Track B rollup table.
+const TOKEN_DAILY_STATS_TABLE: &str = "token_daily_stats";
+/// Persistent staging table for a resumable Track B rebuild (GH #386). Same
+/// shape as [`TOKEN_DAILY_STATS_TABLE`]; the live table is only touched by the
+/// final atomic swap.
+const TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE: &str = "token_daily_stats_rebuild_stage";
+/// `meta` key holding the persisted rebuild cursor (GH #386).
+const TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY: &str = "token_daily_stats_rebuild_cursor";
+
+/// Same upsert as the live-table writer, addressed to `table` — which must be
+/// one of the two compile-time table-name constants above (never caller
+/// input; it is spliced into SQL text).
+fn franken_update_token_daily_stats_batched_in_tx_for_table(
+    tx: &FrankenTransaction<'_>,
+    table: &'static str,
+    entries: &[(i64, String, String, String, TokenStatsDelta)],
+) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
+    debug_assert!(
+        table == TOKEN_DAILY_STATS_TABLE || table == TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE,
+        "token daily stats upsert target must be a known table constant"
+    );
 
     let now = FrankenStorage::now_millis();
     let mut total_affected = 0;
-
-    for (day_id, agent, source, model, delta) in entries {
-        total_affected += tx.execute_compat(
-            "INSERT INTO token_daily_stats (
+    let sql = format!(
+        "INSERT INTO {table} (
                 day_id, agent_slug, source_id, model_family,
                 api_call_count, user_message_count, assistant_message_count, tool_message_count,
                 total_input_tokens, total_output_tokens, total_cache_read_tokens,
@@ -15505,7 +15527,12 @@ fn franken_update_token_daily_stats_batched_in_tx(
                 total_tool_calls = total_tool_calls + excluded.total_tool_calls,
                 estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
                 session_count = session_count + excluded.session_count,
-                last_updated = excluded.last_updated",
+                last_updated = excluded.last_updated"
+    );
+
+    for (day_id, agent, source, model, delta) in entries {
+        total_affected += tx.execute_compat(
+            &sql,
             fparams![
                 *day_id,
                 agent.as_str(),
@@ -15791,30 +15818,164 @@ fn franken_update_conversation_token_summaries_in_tx(
     Ok(())
 }
 
+/// Identity of the `token_usage` ledger a Track B rebuild checkpoint was taken
+/// against (GH #386). Any ledger change invalidates the staged aggregate.
+struct TokenDailyStatsLedgerFingerprint {
+    row_count: i64,
+    max_id: i64,
+}
+
+impl TokenDailyStatsLedgerFingerprint {
+    fn fingerprint(&self) -> String {
+        format!("token_usage-v1:{}:{}", self.row_count, self.max_id)
+    }
+}
+
+fn token_daily_stats_ledger_fingerprint(
+    conn: &FrankenConnection,
+) -> Result<TokenDailyStatsLedgerFingerprint> {
+    let (row_count, max_id): (i64, i64) = conn.query_row_map(
+        "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM token_usage",
+        fparams![],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+    )?;
+    Ok(TokenDailyStatsLedgerFingerprint { row_count, max_id })
+}
+
+/// Persisted Track B rebuild cursor (GH #386), stored as JSON under
+/// [`TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY`] in `meta`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TokenDailyStatsRebuildCursor {
+    ledger_fingerprint: String,
+    last_conversation_id: i64,
+    rows_created: usize,
+}
+
+fn token_daily_stats_rebuild_stage_ddl() -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE} (
+            day_id INTEGER NOT NULL,
+            agent_slug TEXT NOT NULL,
+            source_id TEXT NOT NULL DEFAULT 'all',
+            model_family TEXT NOT NULL DEFAULT 'all',
+            api_call_count INTEGER NOT NULL DEFAULT 0,
+            user_message_count INTEGER NOT NULL DEFAULT 0,
+            assistant_message_count INTEGER NOT NULL DEFAULT 0,
+            tool_message_count INTEGER NOT NULL DEFAULT 0,
+            total_input_tokens INTEGER NOT NULL DEFAULT 0,
+            total_output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+            total_thinking_tokens INTEGER NOT NULL DEFAULT 0,
+            grand_total_tokens INTEGER NOT NULL DEFAULT 0,
+            total_content_chars INTEGER NOT NULL DEFAULT 0,
+            total_tool_calls INTEGER NOT NULL DEFAULT 0,
+            estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
+            session_count INTEGER NOT NULL DEFAULT 0,
+            last_updated INTEGER NOT NULL,
+            PRIMARY KEY (day_id, agent_slug, source_id, model_family)
+        )"
+    )
+}
+
+fn read_token_daily_stats_rebuild_cursor(
+    conn: &FrankenConnection,
+) -> Result<Option<TokenDailyStatsRebuildCursor>> {
+    let raw: Option<String> = conn
+        .query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY],
+            |row| row.get_typed::<String>(0),
+        )
+        .ok();
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match serde_json::from_str::<TokenDailyStatsRebuildCursor>(&raw) {
+        Ok(cursor) => Ok(Some(cursor)),
+        Err(err) => {
+            // A malformed cursor is treated as "no checkpoint": the rebuild
+            // resets the stage rather than trusting an unreadable position.
+            tracing::warn!(
+                target: "cass::analytics",
+                error = %err,
+                "token_daily_stats rebuild cursor is unreadable; restarting from zero"
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn write_token_daily_stats_rebuild_cursor(
+    tx: &FrankenTransaction<'_>,
+    cursor: &TokenDailyStatsRebuildCursor,
+) -> Result<()> {
+    let value = serde_json::to_string(cursor).context("serializing token_daily_stats cursor")?;
+    tx.execute_compat(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY, value.as_str()],
+    )?;
+    Ok(())
+}
+
 impl FrankenStorage {
     /// Rebuild token_daily_stats from the token_usage ledger.
+    ///
+    /// Resumable (GH #386): every conversation batch is aggregated into a
+    /// persistent staging table and committed together with a `meta` cursor
+    /// (`last_conversation_id` + a ledger fingerprint). An interrupted run —
+    /// watchdog exit, OOM kill, Ctrl-C — therefore resumes from the last
+    /// committed batch instead of restarting the message scan from zero, as
+    /// long as the `token_usage` ledger has not changed underneath it. The
+    /// live `token_daily_stats` table is replaced only by the final atomic
+    /// swap, so readers never observe a half-rebuilt rollup.
     pub fn rebuild_token_daily_stats(&self) -> Result<usize> {
         const CONVERSATION_BATCH_SIZE: usize = 1_000;
         const TOKEN_USAGE_BATCH_SIZE: usize = 10_000;
 
-        let total_usage_rows: i64 =
-            self.conn
-                .query_row_map("SELECT COUNT(*) FROM token_usage", fparams![], |row| {
-                    row.get_typed(0)
-                })?;
+        let ledger = token_daily_stats_ledger_fingerprint(&self.conn)?;
         tracing::info!(
             target: "cass::analytics",
-            total_usage_rows,
+            total_usage_rows = ledger.row_count,
             "token_daily_stats_rebuild_start"
         );
 
-        let mut tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM token_daily_stats")?;
+        self.conn
+            .execute(&token_daily_stats_rebuild_stage_ddl())
+            .context("creating token_daily_stats rebuild stage table")?;
 
-        let mut last_conversation_id = 0_i64;
-        let mut rows_created = 0_usize;
+        let resume = read_token_daily_stats_rebuild_cursor(&self.conn)?
+            .filter(|cursor| cursor.ledger_fingerprint == ledger.fingerprint());
+        let (mut last_conversation_id, mut rows_created) = match resume {
+            Some(cursor) => {
+                tracing::info!(
+                    target: "cass::analytics",
+                    last_conversation_id = cursor.last_conversation_id,
+                    rows_created = cursor.rows_created,
+                    "token_daily_stats_rebuild_resume"
+                );
+                (cursor.last_conversation_id, cursor.rows_created)
+            }
+            None => {
+                // No checkpoint, or the ledger changed since it was taken:
+                // the staged partial aggregate is unusable. Reset it in one
+                // transaction so a crash here leaves either the old
+                // checkpoint (still consistent) or a clean slate.
+                let mut tx = self.conn.transaction()?;
+                tx.execute(&format!(
+                    "DELETE FROM {TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE}"
+                ))?;
+                tx.execute_compat(
+                    "DELETE FROM meta WHERE key = ?1",
+                    fparams![TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY],
+                )?;
+                tx.commit()?;
+                (0_i64, 0_usize)
+            }
+        };
 
         loop {
+            let mut tx = self.conn.transaction()?;
             let conversation_rows = tx.query_map_collect(
                 "SELECT c.id, c.started_at, c.source_id,
                         COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown')
@@ -15940,9 +16101,57 @@ impl FrankenStorage {
 
             let entries = aggregate.expand();
             rows_created = rows_created.saturating_add(entries.len());
-            franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
+            franken_update_token_daily_stats_batched_in_tx_for_table(
+                &tx,
+                TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE,
+                &entries,
+            )?;
+            write_token_daily_stats_rebuild_cursor(
+                &tx,
+                &TokenDailyStatsRebuildCursor {
+                    ledger_fingerprint: ledger.fingerprint(),
+                    last_conversation_id,
+                    rows_created,
+                },
+            )?;
+            tx.commit()?;
+            tracing::debug!(
+                target: "cass::analytics",
+                last_conversation_id,
+                rows_created,
+                "token_daily_stats_rebuild_checkpoint"
+            );
         }
 
+        // Final atomic swap: the staged aggregate becomes the live rollup in
+        // one transaction, and the checkpoint is retired with it.
+        let mut tx = self.conn.transaction()?;
+        tx.execute(&format!("DELETE FROM {TOKEN_DAILY_STATS_TABLE}"))?;
+        tx.execute(&format!(
+            "INSERT INTO {TOKEN_DAILY_STATS_TABLE} (
+                day_id, agent_slug, source_id, model_family,
+                api_call_count, user_message_count, assistant_message_count, tool_message_count,
+                total_input_tokens, total_output_tokens, total_cache_read_tokens,
+                total_cache_creation_tokens, total_thinking_tokens, grand_total_tokens,
+                total_content_chars, total_tool_calls, estimated_cost_usd, session_count,
+                last_updated
+            )
+            SELECT
+                day_id, agent_slug, source_id, model_family,
+                api_call_count, user_message_count, assistant_message_count, tool_message_count,
+                total_input_tokens, total_output_tokens, total_cache_read_tokens,
+                total_cache_creation_tokens, total_thinking_tokens, grand_total_tokens,
+                total_content_chars, total_tool_calls, estimated_cost_usd, session_count,
+                last_updated
+            FROM {TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE}"
+        ))?;
+        tx.execute(&format!(
+            "DELETE FROM {TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE}"
+        ))?;
+        tx.execute_compat(
+            "DELETE FROM meta WHERE key = ?1",
+            fparams![TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY],
+        )?;
         tx.commit()?;
 
         tracing::info!(
@@ -30578,6 +30787,150 @@ mod tests {
         let _r1 = mgr.reader();
         let idx_after = mgr.reader_idx.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(idx_after, idx_before + 1, "reader index should advance");
+    }
+
+    /// GH #386: a Track B rebuild must checkpoint per batch and resume from
+    /// the persisted cursor instead of rescanning from zero, and must discard
+    /// that checkpoint when the ledger underneath it has changed.
+    #[test]
+    fn token_daily_stats_rebuild_resumes_from_persisted_cursor() {
+        use crate::franken_sync::compat::{ConnectionExt as _, RowExt as _};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("track-b.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let raw = storage.raw();
+        raw.execute_compat(
+            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+             VALUES(1, 'codex', 'codex', 'cli', 0, 0)",
+            fparams![],
+        )
+        .unwrap();
+        for conversation_id in 1_i64..=3 {
+            raw.execute_compat(
+                "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
+                 VALUES(?1, 1, 'local', ?2, 86400000)",
+                fparams![
+                    conversation_id,
+                    format!("/tmp/conv-{conversation_id}.jsonl")
+                ],
+            )
+            .unwrap();
+            raw.execute_compat(
+                "INSERT INTO messages(id, conversation_id, idx, role, content) \
+                 VALUES(?1, ?1, 0, 'assistant', 'answer')",
+                fparams![conversation_id],
+            )
+            .unwrap();
+            raw.execute_compat(
+                "INSERT INTO token_usage(
+                     message_id, conversation_id, agent_id, timestamp_ms, day_id,
+                     role, content_chars, input_tokens, output_tokens, total_tokens
+                 ) VALUES(?1, ?1, 1, 86400000, 1, 'assistant', 6, 10, 5, 15)",
+                fparams![conversation_id],
+            )
+            .unwrap();
+        }
+
+        let count = |sql: &str| -> i64 {
+            raw.query_row_map(sql, fparams![], |row| row.get_typed(0))
+                .unwrap()
+        };
+
+        // A complete run leaves no checkpoint and an empty stage behind.
+        let full_rows = storage.rebuild_token_daily_stats().unwrap();
+        assert!(full_rows > 0);
+        let live_after_full = count("SELECT COUNT(*) FROM token_daily_stats");
+        assert!(live_after_full > 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM token_daily_stats_rebuild_stage"),
+            0
+        );
+        assert!(
+            read_token_daily_stats_rebuild_cursor(raw)
+                .unwrap()
+                .is_none()
+        );
+        let full_total_tokens = count(
+            "SELECT COALESCE(SUM(grand_total_tokens), 0) FROM token_daily_stats \
+             WHERE agent_slug = 'all' AND source_id = 'all' AND model_family = 'all'",
+        );
+        assert_eq!(full_total_tokens, 45, "three conversations x 15 tokens");
+
+        // Simulate an interrupted run that had already processed every
+        // conversation: the stage holds a sentinel aggregate and the cursor
+        // points past the last conversation id. Resuming must NOT rescan —
+        // the sentinel (not the true aggregate) becomes the live table.
+        let ledger = token_daily_stats_ledger_fingerprint(raw).unwrap();
+        raw.execute_compat(
+            "INSERT INTO token_daily_stats_rebuild_stage(
+                 day_id, agent_slug, source_id, model_family, grand_total_tokens, last_updated
+             ) VALUES(1, 'all', 'all', 'all', 999, 0)",
+            fparams![],
+        )
+        .unwrap();
+        {
+            let mut tx = raw.transaction().unwrap();
+            write_token_daily_stats_rebuild_cursor(
+                &tx,
+                &TokenDailyStatsRebuildCursor {
+                    ledger_fingerprint: ledger.fingerprint(),
+                    last_conversation_id: 3,
+                    rows_created: 1,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let resumed_rows = storage.rebuild_token_daily_stats().unwrap();
+        assert_eq!(resumed_rows, 1, "resume reports the checkpointed count");
+        assert_eq!(count("SELECT COUNT(*) FROM token_daily_stats"), 1);
+        assert_eq!(
+            count("SELECT grand_total_tokens FROM token_daily_stats"),
+            999,
+            "the staged aggregate was swapped in without rescanning"
+        );
+        assert!(
+            read_token_daily_stats_rebuild_cursor(raw)
+                .unwrap()
+                .is_none()
+        );
+
+        // A checkpoint taken against a different ledger is discarded: the
+        // rebuild starts from zero and recomputes the true aggregate.
+        raw.execute_compat(
+            "INSERT INTO token_daily_stats_rebuild_stage(
+                 day_id, agent_slug, source_id, model_family, grand_total_tokens, last_updated
+             ) VALUES(1, 'all', 'all', 'all', 999, 0)",
+            fparams![],
+        )
+        .unwrap();
+        {
+            let mut tx = raw.transaction().unwrap();
+            write_token_daily_stats_rebuild_cursor(
+                &tx,
+                &TokenDailyStatsRebuildCursor {
+                    ledger_fingerprint: "token_usage-v1:0:0".to_string(),
+                    last_conversation_id: 3,
+                    rows_created: 1,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(storage.rebuild_token_daily_stats().unwrap(), full_rows);
+        assert_eq!(
+            count(
+                "SELECT COALESCE(SUM(grand_total_tokens), 0) FROM token_daily_stats \
+                 WHERE agent_slug = 'all' AND source_id = 'all' AND model_family = 'all'"
+            ),
+            45,
+            "a stale checkpoint must be thrown away, not swapped in"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM token_daily_stats"),
+            live_after_full
+        );
     }
 
     #[test]

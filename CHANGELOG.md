@@ -40,6 +40,60 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ### Fixed
 
+- **Stale or mid-backfill vector assets are no longer consulted by search**
+  ([#404](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/404)).
+  The query path admitted any FSVI/HNSW artifact that parsed, so a default
+  (hybrid) search against a vector index built for an older database returned
+  `k` arbitrary nearest neighbours for an out-of-vocabulary term while
+  `cass status` reported `can_search:false` / `fallback_mode:"lexical"`.
+  Semantic context loading now applies the same manifest-vs-live-DB readiness
+  verdict status uses (computed on the DB handle it already opens, no second
+  archive open): hybrid fails open to lexical with the reason in `_meta`,
+  explicit `--mode semantic` returns exit 15. New
+  `SemanticAvailability::IndexStale`. The response schema now documents that
+  `total_matches` is a page-window lower bound unless
+  `_meta.pagination.count_precision` is `exact`.
+- **Explicit `--mode semantic` no longer runs lexical self-heal first**
+  ([#407](https://github.com/Dicklesworthstone/coding_agent_session_search/pull/407)
+  idea, reimplemented). A semantic-only request never fails open to lexical,
+  so repairing or lock-waiting on a stale lexical checkpoint before reaching
+  HNSW was pure latency; hybrid/lexical requests keep the repair path.
+- **Doctor's `>256 MiB` full-page integrity deferral now names its override**
+  ([#390](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/390)).
+  `CASS_DOCTOR_FULL_PAGE_INTEGRITY_PROBE=1` lifts the byte cap (the probe
+  still runs under `CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS`), so operators on
+  long-lived archives can run the full frankensqlite `integrity_check`
+  through doctor instead of only stock `sqlite3`.
+- **Serial persist chunks retry transient engine contention**
+  ([#401](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/401),
+  [#406](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/406)).
+  A single `BusySnapshot`/`WriteConflict` on one batch was surfaced as a fatal
+  `exit 7` that discarded the run; the serial writer path now reuses the
+  existing jittered bounded retry (8 attempts, ~1.5 s) before giving up.
+- **`cass analytics rebuild --track b` checkpoints and resumes**
+  ([#386](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/386)).
+  `rebuild_token_daily_stats` was one transaction with in-memory cursors, so
+  every interruption restarted the message scan from zero. It now aggregates
+  into a persistent `token_daily_stats_rebuild_stage` table, commits every
+  1000-conversation batch together with a `meta` cursor (ledger fingerprint +
+  last conversation id), resumes from that cursor when the `token_usage`
+  ledger is unchanged, and swaps stage→live atomically at the end.
+- **`cass import chatgpt` output is now indexed on Linux and Windows**
+  ([#378](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/378)).
+  The connector's only default root is the macOS app-support dir and the
+  indexer scans default roots only for detected agents, so imported files sat
+  in a directory nothing scanned. Import now registers its resolved output
+  directory as an explicit local source (`chatgpt-import`) in `sources.toml`
+  (on non-macOS, or whenever `--output-dir` is given); explicit roots are
+  scanned regardless of detection. `--json` output carries `scan_root`.
+- **Daemon fallback is no longer silent**
+  ([#409](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/409)).
+  At the pinned frankensearch rev the legacy `DaemonFallbackEmbedder`
+  constructor rejects every caller-supplied daemon identity, so a reachable
+  warm daemon was bypassed for full in-process inference with only a
+  debug-level trace. cass now prints a stderr warning naming the cause
+  whenever a reachable daemon is bypassed. The producer-attested daemon
+  protocol itself is tracked as follow-up work.
 - **`--db` now isolates the whole sandbox, not just the SQLite file**
   ([#403](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/403)).
   When `--db` points outside the default data dir, derived assets — lexical

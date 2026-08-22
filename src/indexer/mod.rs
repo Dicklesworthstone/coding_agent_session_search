@@ -10649,6 +10649,16 @@ pub(crate) fn lexical_storage_fingerprint_for_db(db_path: &Path) -> Result<Strin
     lexical_rebuild_storage_fingerprint(db_path)
 }
 
+/// Same fingerprint as [`lexical_storage_fingerprint_for_db`], computed on an
+/// already-open read-only handle so callers that have paid the archive open
+/// cost (semantic context loading, which opens the DB for filter maps anyway)
+/// do not pay it a second time just to learn whether their vector assets
+/// still describe the current database (GH #404).
+pub(crate) fn lexical_storage_fingerprint_for_storage(storage: &FrankenStorage) -> Result<String> {
+    let total_conversations = count_total_conversations_exact(storage)?;
+    lexical_rebuild_content_fingerprint(storage, total_conversations)
+}
+
 /// True iff a *completed* lexical-rebuild checkpoint exists for `db_path` whose
 /// recorded storage fingerprint matches the current canonical DB. Used to
 /// recognize an already-published, still-valid lexical generation and skip a
@@ -27207,6 +27217,14 @@ pub mod persist {
         })
     }
 
+    /// Bounded retries for one serial persist chunk on retryable engine
+    /// contention (GH #401/#406). With the 4ms→256ms doubling jittered
+    /// backoff in [`with_concurrent_retry`] this is roughly 1.5s of total
+    /// waiting before the conflict is surfaced as exit 7 — enough to ride
+    /// out a peer epoch unwind, short enough that a real lock holder still
+    /// fails fast.
+    pub(super) const SERIAL_CHUNK_CONTENTION_RETRIES: usize = 8;
+
     /// Retry wrapper for any retryable FrankenError (BusySnapshot, WriteConflict, etc.)
     pub(super) fn with_concurrent_retry<F, T>(max_retries: usize, mut f: F) -> Result<T>
     where
@@ -28189,7 +28207,18 @@ pub mod persist {
                 for start in (0..prepared.len()).step_by(chunk_size) {
                     let end = (start + chunk_size).min(prepared.len());
                     let chunk_refs = &prepared[start..end];
-                    outcomes.extend(writer.insert_conversations_batched(chunk_refs)?);
+                    // GH #401/#406: a single writer can still see a transient
+                    // `BusySnapshot`/`WriteConflict` from the engine (the
+                    // fsqlite 0.3.1 freelist append-gate false positive, or a
+                    // peer reader's epoch unwinding). The batch transaction is
+                    // the rollback boundary and the writer merges by
+                    // conversation key, so re-running the whole chunk is
+                    // idempotent; bound it instead of surfacing one transient
+                    // conflict as a fatal exit 7 that discards the run.
+                    outcomes.extend(with_concurrent_retry(
+                        SERIAL_CHUNK_CONTENTION_RETRIES,
+                        || writer.insert_conversations_batched(chunk_refs),
+                    )?);
                     // gh373/oeu5a: each written chunk is live work even while
                     // the batch-level `current` bump waits for the whole
                     // persist call to return.

@@ -80,6 +80,13 @@ pub enum SemanticAvailability {
         total_items: u64,
     },
 
+    /// Vector assets load, but the semantic manifest says they do not describe
+    /// the current database (stale generation, or a backfill that has not yet
+    /// published a queryable tier). Serving them would return nearest
+    /// neighbours of an outdated corpus, so the query path must not consult
+    /// them (GH #404). `reason` carries the manifest-derived verdict.
+    IndexStale { embedder_id: String, reason: String },
+
     /// User explicitly opted for hash-based degraded mode (no ML model).
     HashFallback,
 
@@ -126,6 +133,12 @@ impl SemanticAvailability {
     /// Check if the index is being rebuilt.
     pub fn is_building(&self) -> bool {
         matches!(self, SemanticAvailability::IndexBuilding { .. })
+    }
+
+    /// Check if loadable vector assets were refused because they do not
+    /// describe the current database (GH #404).
+    pub fn is_index_stale(&self) -> bool {
+        matches!(self, SemanticAvailability::IndexStale { .. })
     }
 
     /// Check if a download is in progress.
@@ -208,6 +221,7 @@ impl SemanticAvailability {
             SemanticAvailability::Downloading { .. } => "DL...",
             SemanticAvailability::Verifying => "VFY...",
             SemanticAvailability::IndexBuilding { .. } => "IDX...",
+            SemanticAvailability::IndexStale { .. } => "STALE",
             SemanticAvailability::Disabled { .. } => "OFF",
             SemanticAvailability::ModelMissing { .. } => "NOMODEL",
             SemanticAvailability::IndexMissing { .. } => "NOIDX",
@@ -246,6 +260,9 @@ impl SemanticAvailability {
                 } else {
                     format!("building index: {items_indexed}/{total_items}")
                 }
+            }
+            SemanticAvailability::IndexStale { reason, .. } => {
+                format!("semantic assets not current: {reason}")
             }
             SemanticAvailability::HashFallback => "using explicit hash mode".to_string(),
             SemanticAvailability::Disabled { reason } => {
@@ -721,6 +738,19 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
         }
     };
 
+    if let Some(availability) = refuse_stale_semantic_assets(
+        data_dir,
+        &storage,
+        embedder.id(),
+        &SemanticAvailability::HashFallback,
+        crate::search::asset_state::SemanticPreference::HashFallback,
+    ) {
+        return SemanticSetup {
+            availability,
+            context: None,
+        };
+    }
+
     let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
         Ok(maps) => maps,
         Err(err) => {
@@ -882,6 +912,21 @@ fn load_semantic_context_inner(
         }
     };
 
+    if let Some(availability) = refuse_stale_semantic_assets(
+        data_dir,
+        &storage,
+        &config.embedder_id,
+        &SemanticAvailability::Ready {
+            embedder_id: config.embedder_id.clone(),
+        },
+        crate::search::asset_state::SemanticPreference::DefaultModel,
+    ) {
+        return SemanticSetup {
+            availability,
+            context: None,
+        };
+    }
+
     let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
         Ok(maps) => maps,
         Err(err) => {
@@ -947,6 +992,86 @@ fn load_semantic_context_inner(
             roles,
         }),
     }
+}
+
+/// GH #404: refuse vector assets that load but do not describe the current
+/// database.
+///
+/// `cass status` already computes a readiness verdict (`can_search`,
+/// `fallback_mode`) from the semantic manifest against the live DB
+/// fingerprint, but the query path used to admit any artifact that merely
+/// parsed. A stale or mid-backfill FSVI/HNSW has no relevance floor, so an
+/// out-of-vocabulary query returned `k` arbitrary neighbours while status
+/// said `fallback_mode: "lexical"`. This applies the same verdict before a
+/// context is handed to `SearchClient`, reusing the read-only handle the
+/// caller already opened for filter maps (no second archive open).
+///
+/// Returns `Some(unavailable)` when serving must be refused; `None` when the
+/// assets are current (or when there is no manifest to contradict them, which
+/// preserves legacy manifest-less installs).
+fn refuse_stale_semantic_assets(
+    data_dir: &Path,
+    storage: &FrankenStorage,
+    served_embedder_id: &str,
+    availability_if_served: &SemanticAvailability,
+    preference: crate::search::asset_state::SemanticPreference,
+) -> Option<SemanticAvailability> {
+    let db_fingerprint = match crate::indexer::lexical_storage_fingerprint_for_storage(storage) {
+        Ok(fingerprint) => fingerprint,
+        Err(err) => {
+            // The archive answered the open but not the fingerprint queries;
+            // the filter-map load right after this will surface the real
+            // error, so do not invent a staleness verdict here.
+            tracing::debug!(
+                error = %format!("{err:#}"),
+                embedder = served_embedder_id,
+                "semantic staleness gate skipped: could not fingerprint current DB"
+            );
+            return None;
+        }
+    };
+    let state = crate::search::asset_state::semantic_state_from_availability(
+        data_dir,
+        availability_if_served,
+        preference,
+        Some(&db_fingerprint),
+    );
+    // The tier that actually backs the artifact being served. The overall
+    // verdict can be `can_search` on the strength of the *other* tier (e.g.
+    // a current hash fast tier while the MiniLM quality tier is stale), which
+    // is fine for status but not for handing out this specific artifact.
+    let served_tier = if served_embedder_id == HashEmbedder::default().id() {
+        &state.fast_tier
+    } else {
+        &state.quality_tier
+    };
+    let served_tier_not_current = served_tier.present
+        && (!served_tier.ready || served_tier.current_db_matches == Some(false));
+    if state.can_search && !served_tier_not_current {
+        return None;
+    }
+    let reason = match (&state.hint, served_tier_not_current) {
+        (_, true) if state.can_search => format!(
+            "published {} tier for {served_embedder_id} does not match the current database; run 'cass index --semantic' to refresh it",
+            if served_embedder_id == HashEmbedder::default().id() {
+                "fast"
+            } else {
+                "quality"
+            }
+        ),
+        (Some(hint), _) => format!("{}; {hint}", state.summary),
+        (None, _) => state.summary.clone(),
+    };
+    tracing::info!(
+        embedder = served_embedder_id,
+        status = state.status,
+        fallback_mode = state.fallback_mode,
+        "refusing semantic assets that do not describe the current database (GH #404)"
+    );
+    Some(SemanticAvailability::IndexStale {
+        embedder_id: served_embedder_id.to_string(),
+        reason,
+    })
 }
 
 fn active_policy_embedder_name() -> &'static str {
@@ -1315,6 +1440,89 @@ mod tests {
             with_ann.artifacts[0].ann_path(),
             Some(ann_path.as_path()),
             "an existing CASS-owned ANN path must stay paired with its exact FSVI"
+        );
+    }
+
+    /// GH #404: a vector index that parses but whose manifest record was
+    /// built against a different database fingerprint must not be served —
+    /// `cass status` already reports `can_search:false` for it, and the
+    /// query path must agree instead of returning k arbitrary neighbours.
+    #[test]
+    fn stale_manifest_tier_is_refused_even_when_the_artifact_loads() {
+        use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+
+        let tmp = tempdir().expect("stale context fixture");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("create cass db");
+        drop(storage);
+
+        let embedder = HashEmbedder::default();
+        let fsvi_path = vector_index_path(tmp.path(), embedder.id());
+        write_hash_vector_index(&fsvi_path, 1);
+        let ann_path = hnsw_index_path(tmp.path(), embedder.id());
+        std::fs::write(&ann_path, b"selected CASS ANN sidecar fixture")
+            .expect("write selected ANN sidecar");
+
+        // Control: with no manifest at all, the legacy manifest-less artifact
+        // still serves (no verdict contradicts it).
+        assert!(
+            load_hash_semantic_context(tmp.path(), &db_path)
+                .context
+                .is_some(),
+            "manifest-less artifacts keep serving"
+        );
+
+        // A manifest record whose fingerprint belongs to some other database.
+        let mut manifest = SemanticManifest::load_or_default(tmp.path()).expect("manifest");
+        assert!(manifest.adopt_legacy_artifact(
+            TierKind::Fast,
+            embedder.id(),
+            "hash",
+            embedder.dimension(),
+            1,
+            1,
+            "content-v1:999999:999999:999999",
+            "vector_index/index-fnv1a-384.fsvi",
+            1,
+        ));
+        manifest.save(tmp.path()).expect("save stale manifest");
+
+        let setup = load_hash_semantic_context(tmp.path(), &db_path);
+        assert!(
+            setup.context.is_none(),
+            "stale tier must not produce a serving context"
+        );
+        assert!(
+            setup.availability.is_index_stale(),
+            "expected IndexStale, got {:?}",
+            setup.availability
+        );
+        assert!(
+            !setup.availability.can_search(),
+            "stale assets must report can_search=false to the query path"
+        );
+
+        // Once the record matches the live database again, serving resumes.
+        let current = crate::indexer::lexical_storage_fingerprint_for_db(&db_path)
+            .expect("current fingerprint");
+        let mut manifest = SemanticManifest::load_or_default(tmp.path()).expect("manifest");
+        assert!(manifest.adopt_legacy_artifact(
+            TierKind::Fast,
+            embedder.id(),
+            "hash",
+            embedder.dimension(),
+            1,
+            1,
+            &current,
+            "vector_index/index-fnv1a-384.fsvi",
+            1,
+        ));
+        manifest.save(tmp.path()).expect("save current manifest");
+        assert!(
+            load_hash_semantic_context(tmp.path(), &db_path)
+                .context
+                .is_some(),
+            "a current tier record must serve again"
         );
     }
 
