@@ -59,10 +59,10 @@ notify = "8.2.0"
 # (!Send futures); CASS's synchronous call shape is preserved by
 # src/franken_sync.rs, which drives every engine future on a private
 # current-thread asupersync runtime.
-frankensqlite = { version = "=0.3.4", package = "fsqlite", features = ["fts5"] }
+frankensqlite = { version = "=0.3.8", package = "fsqlite", features = ["fts5"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.3.4", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.8", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -207,7 +207,7 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.3.4", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.8", package = "fsqlite-types" }
 
 # The fsqlite family now resolves from crates.io (0.3.1) for every direct and
 # transitive consumer, so the former [patch.crates-io] git override is gone.
