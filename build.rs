@@ -163,7 +163,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // surface. The latter keeps CASS schema-v8 access independent from
         // FrankenSearch's swappable generic lexical backend (cass #308,
         // bd-8nqz.5).
-        expected_rev: "46a3aefce1aa658fa98f27f0b3676f073160e15c",
+        expected_rev: "22859f74056c31fd3a713bacecd4a1f22f0cf82d",
         expected_version: "0.3.2",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
