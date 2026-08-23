@@ -17245,6 +17245,72 @@ fn run_analytics_tokens(
 ///
 /// Currently rebuilds Track A (message_metrics + usage_hourly + usage_daily).
 /// Track B rebuild will be wired when z9fse.13 lands.
+/// Resolve the rebuild window from `--days` / `--since`, and reject the
+/// `AnalyticsCommon` filters a rebuild cannot honor.
+///
+/// `--until`, `--agent`, `--workspace` and `--source` are query-time filters;
+/// applying them to a rebuild would leave the rollup tables partially
+/// populated with no way to tell. Refusing is better than the previous
+/// behavior of accepting and ignoring them (GH #412).
+fn analytics_rebuild_since_ms(common: &AnalyticsCommon) -> CliResult<Option<i64>> {
+    let mut unsupported: Vec<&str> = Vec::new();
+    if common.until.is_some() {
+        unsupported.push("--until");
+    }
+    if !common.agent.is_empty() {
+        unsupported.push("--agent");
+    }
+    if !common.workspace.is_empty() {
+        unsupported.push("--workspace");
+    }
+    if common.source.is_some() {
+        unsupported.push("--source");
+    }
+    if !unsupported.is_empty() {
+        return Err(CliError::usage(
+            format!(
+                "analytics rebuild does not support {}: rollups are rebuilt for every agent, workspace and source",
+                unsupported.join(", ")
+            ),
+            Some(
+                "Use --since <date|-Nd> or --days N to limit the rebuild to recent days, or omit filters for a full rebuild."
+                    .into(),
+            ),
+        ));
+    }
+
+    if let Some(days) = common.days {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        return Ok(Some(now_ms.saturating_sub(i64::from(days).saturating_mul(86_400_000))));
+    }
+
+    match common.since.as_deref() {
+        None => Ok(None),
+        Some(raw) => parse_datetime_str(raw).map(Some).ok_or_else(|| {
+            CliError::usage(
+                format!("could not parse --since value {raw:?}"),
+                Some(
+                    "Use an ISO date (YYYY-MM-DD), a keyword (today/yesterday), or a relative offset (-7d, -24h)."
+                        .into(),
+                ),
+            )
+        }),
+    }
+}
+
+/// Human-readable UTC day label for the rebuild cutoff (day-aligned, matching
+/// what the storage layer actually rescans).
+fn format_rebuild_cutoff(since_ms: i64) -> String {
+    use crate::storage::sqlite::SqliteStorage;
+    let day_start_ms = SqliteStorage::millis_from_day_id(SqliteStorage::day_id_from_millis(since_ms));
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(day_start_ms)
+        .map(|dt| dt.format("%Y-%m-%d UTC").to_string())
+        .unwrap_or_else(|| format!("{day_start_ms} ms"))
+}
+
 fn run_analytics_rebuild(
     common: &AnalyticsCommon,
     _force: bool,
@@ -17285,10 +17351,26 @@ fn run_analytics_rebuild(
     let mut tracks_rebuilt: Vec<&str> = Vec::new();
     let mut payload = serde_json::Map::new();
 
+    // GH #412: `--since` / `--days` used to be parsed and then dropped on the
+    // floor, so a "cheap daily refresh" silently became a full rescan.
+    let since_ms = analytics_rebuild_since_ms(common)?;
+    if let Some(ms) = since_ms {
+        let cutoff_day = crate::storage::sqlite::SqliteStorage::day_id_from_millis(ms);
+        let cutoff_ms = crate::storage::sqlite::SqliteStorage::millis_from_day_id(cutoff_day);
+        payload.insert("since_ms".into(), serde_json::json!(cutoff_ms));
+        payload.insert("since_day_id".into(), serde_json::json!(cutoff_day));
+    }
+
     if rebuild_a {
         // Progress diagnostics go to stderr.
-        eprintln!("Rebuilding analytics (Track A)...");
-        let result = storage.rebuild_analytics().map_err(|e| CliError {
+        match since_ms {
+            Some(ms) => eprintln!(
+                "Rebuilding analytics (Track A) for messages since {}...",
+                format_rebuild_cutoff(ms)
+            ),
+            None => eprintln!("Rebuilding analytics (Track A)..."),
+        }
+        let result = storage.rebuild_analytics_since(since_ms).map_err(|e| CliError {
             code: 9,
             kind: CliErrorKind::RebuildError.kind_str(),
             message: format!("Analytics rebuild failed: {e}"),
@@ -17321,7 +17403,16 @@ fn run_analytics_rebuild(
         // #397: `analytics validate` has recommended `--track all` for Track B
         // drift since the two-track split; this is the path that actually
         // rebuilds token_daily_stats from the token_usage ledger.
-        eprintln!("Rebuilding analytics (Track B: token_daily_stats)...");
+        if since_ms.is_some() {
+            // Track B is derived from the `token_usage` ledger with its own
+            // checkpointing (GH #386); it has no windowed mode, so say so
+            // rather than let `--since` look like it applied.
+            eprintln!(
+                "Rebuilding analytics (Track B: token_daily_stats; --since/--days do not apply to Track B, rebuilding fully)..."
+            );
+        } else {
+            eprintln!("Rebuilding analytics (Track B: token_daily_stats)...");
+        }
         let track_b_start = std::time::Instant::now();
         let rows_created = storage.rebuild_token_daily_stats().map_err(|e| CliError {
             code: 9,
@@ -17379,6 +17470,67 @@ fn run_analytics_tools(
     analytics::query::query_tools(&conn, &filter, group_by.into(), limit)
         .map(|r| r.to_cli_json())
         .map_err(analytics_query_cli_error)
+}
+
+#[cfg(test)]
+mod analytics_rebuild_since_tests {
+    use super::*;
+
+    fn common() -> AnalyticsCommon {
+        AnalyticsCommon {
+            since: None,
+            until: None,
+            days: None,
+            agent: vec![],
+            workspace: vec![],
+            source: None,
+            json: false,
+            data_dir: None,
+        }
+    }
+
+    #[test]
+    fn no_flags_means_full_rebuild() {
+        assert_eq!(analytics_rebuild_since_ms(&common()).unwrap(), None);
+    }
+
+    #[test]
+    fn days_and_since_resolve_to_a_cutoff() {
+        let mut c = common();
+        c.days = Some(1);
+        let now_ms = Utc::now().timestamp_millis();
+        let got = analytics_rebuild_since_ms(&c).unwrap().unwrap();
+        assert!((now_ms - 86_400_000 - got).abs() < 60_000, "got {got}");
+
+        let mut c = common();
+        c.since = Some("2026-02-06".into());
+        let got = analytics_rebuild_since_ms(&c).unwrap().unwrap();
+        assert_eq!(
+            crate::storage::sqlite::SqliteStorage::day_id_from_millis(got),
+            crate::storage::sqlite::SqliteStorage::day_id_from_millis(1_770_551_400_000)
+        );
+        assert_eq!(format_rebuild_cutoff(got), "2026-02-06 UTC");
+    }
+
+    #[test]
+    fn unparseable_since_is_a_usage_error() {
+        let mut c = common();
+        c.since = Some("not-a-date".into());
+        let err = analytics_rebuild_since_ms(&c).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("--since"), "{}", err.message);
+    }
+
+    #[test]
+    fn query_only_filters_are_rejected_not_ignored() {
+        let mut c = common();
+        c.agent = vec!["claude_code".into()];
+        c.until = Some("today".into());
+        let err = analytics_rebuild_since_ms(&c).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("--until"), "{}", err.message);
+        assert!(err.message.contains("--agent"), "{}", err.message);
+    }
 }
 
 #[cfg(test)]

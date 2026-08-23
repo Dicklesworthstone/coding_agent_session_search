@@ -16188,29 +16188,101 @@ impl FrankenStorage {
 
     /// Rebuild analytics tables (message_metrics + rollups) from existing
     /// messages in the database. Does NOT re-parse raw agent session files.
+    ///
+    /// Full rebuild: equivalent to [`Self::rebuild_analytics_since`] with
+    /// `None`.
     pub fn rebuild_analytics(&self) -> Result<AnalyticsRebuildResult> {
+        self.rebuild_analytics_since(None)
+    }
+
+    /// Rebuild analytics tables (message_metrics + rollups) from existing
+    /// messages, optionally restricted to messages on or after `since_ms`.
+    ///
+    /// With `since_ms = None` every rollup row is dropped and re-derived from
+    /// the whole `messages` table. With a cutoff, the window is widened to the
+    /// start of the UTC day containing `since_ms` (rollups are bucketed by
+    /// day/hour, so a partial day cannot be rebuilt independently): rollup
+    /// rows for `day_id >= cutoff_day` (and `hour_id` within those days) are
+    /// dropped and only messages whose effective timestamp
+    /// (`COALESCE(created_at, conversation.started_at)`) falls on or after
+    /// that day start are rescanned. Older rollup rows are left untouched
+    /// (GH #412).
+    ///
+    /// Pagination is keyset (`WHERE m.id > last_id`), so the cost is linear in
+    /// the number of rescanned rows rather than quadratic as the previous
+    /// `LIMIT/OFFSET` form was. A progress event is logged per chunk.
+    pub fn rebuild_analytics_since(
+        &self,
+        since_ms: Option<i64>,
+    ) -> Result<AnalyticsRebuildResult> {
         let start = Instant::now();
 
-        let total_messages: i64 =
-            self.conn
+        // Day-aligned scope. `None` => full rebuild.
+        let scope = since_ms.map(|ms| {
+            let cutoff_day = Self::day_id_from_millis(ms);
+            let cutoff_ms = Self::millis_from_day_id(cutoff_day);
+            let cutoff_hour = Self::hour_id_from_millis(cutoff_ms);
+            (cutoff_day, cutoff_hour, cutoff_ms)
+        });
+
+        let total_messages: i64 = match scope {
+            None => self
+                .conn
                 .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
                     row.get_typed(0)
-                })?;
+                })?,
+            Some((_, _, cutoff_ms)) => self.conn.query_row_map(
+                "SELECT COUNT(*)
+                 FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 WHERE COALESCE(m.created_at, c.started_at, 0) >= ?1",
+                fparams![cutoff_ms],
+                |row| row.get_typed(0),
+            )?,
+        };
         tracing::info!(
             target: "cass::analytics",
             total_messages,
+            since_ms = scope.map(|(_, _, ms)| ms),
             "analytics_rebuild_start"
         );
 
         let mut tx = self.conn.transaction()?;
 
-        tx.execute("DELETE FROM message_metrics")?;
-        tx.execute("DELETE FROM usage_hourly")?;
-        tx.execute("DELETE FROM usage_daily")?;
-        tx.execute("DELETE FROM usage_models_daily")?;
+        match scope {
+            None => {
+                tx.execute("DELETE FROM message_metrics")?;
+                tx.execute("DELETE FROM usage_hourly")?;
+                tx.execute("DELETE FROM usage_daily")?;
+                tx.execute("DELETE FROM usage_models_daily")?;
+            }
+            Some((cutoff_day, cutoff_hour, _)) => {
+                tx.execute_compat(
+                    "DELETE FROM message_metrics WHERE day_id >= ?1",
+                    fparams![cutoff_day],
+                )?;
+                tx.execute_compat(
+                    "DELETE FROM usage_hourly WHERE hour_id >= ?1",
+                    fparams![cutoff_hour],
+                )?;
+                tx.execute_compat(
+                    "DELETE FROM usage_daily WHERE day_id >= ?1",
+                    fparams![cutoff_day],
+                )?;
+                tx.execute_compat(
+                    "DELETE FROM usage_models_daily WHERE day_id >= ?1",
+                    fparams![cutoff_day],
+                )?;
+            }
+        }
 
         const CHUNK_SIZE: i64 = 10_000;
-        let mut offset: i64 = 0;
+        // Keyset cursor: the largest message id processed so far.
+        let mut last_id: i64 = 0;
+        // Lower bound on the effective timestamp; 0 admits every row
+        // (effective timestamps are never negative after COALESCE(..., 0)).
+        let cutoff_ms: i64 = scope.map_or(0, |(_, _, ms)| ms);
+        let mut processed: i64 = 0;
         let mut total_inserted: usize = 0;
         let mut usage_hourly_rows: usize = 0;
         let mut usage_daily_rows: usize = 0;
@@ -16241,9 +16313,11 @@ impl FrankenStorage {
                         COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown') AS agent_slug
                  FROM messages m
                  JOIN conversations c ON m.conversation_id = c.id
+                 WHERE m.id > ?1
+                   AND COALESCE(m.created_at, c.started_at, 0) >= ?2
                  ORDER BY m.id
-                 LIMIT ?1 OFFSET ?2",
-                fparams![CHUNK_SIZE, offset],
+                 LIMIT ?3",
+                fparams![last_id, cutoff_ms, CHUNK_SIZE],
                 |row| {
                     let msg_id: i64 = row.get_typed(0)?;
                     let role: String = row.get_typed(2)?;
@@ -16363,15 +16437,30 @@ impl FrankenStorage {
             usage_hourly_rows += hourly;
             usage_daily_rows += daily;
             usage_models_daily_rows += models_daily;
-            offset += chunk_len as i64;
+            // Rows are ordered by m.id, so the last row carries the cursor.
+            if let Some((max_id, ..)) = rows.last() {
+                last_id = *max_id;
+            }
+            processed += chunk_len as i64;
 
-            tracing::debug!(
+            // Per-chunk progress at INFO so a multi-hour rebuild is
+            // distinguishable from a hang (GH #412).
+            let elapsed_secs = start.elapsed().as_secs_f64();
+            let rate = if elapsed_secs > 0.0 {
+                processed as f64 / elapsed_secs
+            } else {
+                0.0
+            };
+            tracing::info!(
                 target: "cass::analytics",
-                offset,
+                processed,
+                total = total_messages,
+                last_id,
                 chunk = chunk_len,
-                inserted = entries.len(),
-                total = total_inserted,
-                "analytics_rebuild_chunk"
+                inserted = total_inserted,
+                elapsed_secs = format!("{elapsed_secs:.1}"),
+                msgs_per_sec = format!("{rate:.0}"),
+                "analytics_rebuild_progress"
             );
 
             if (chunk_len as i64) < CHUNK_SIZE {
@@ -22120,6 +22209,137 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ud_msg, 3);
+    }
+
+    /// GH #412: `rebuild_analytics_since` must rebuild only the day-aligned
+    /// window, leave older rollups untouched, and be idempotent.
+    #[test]
+    fn rebuild_analytics_since_rebuilds_only_recent_days() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: Some("1.0".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        // Day 1: 2026-02-06 10:30 UTC. Day 2: three days later, same time.
+        let day1_ts = 1_770_551_400_000_i64;
+        let day2_ts = day1_ts + 3 * 86_400_000;
+        let day1 = SqliteStorage::day_id_from_millis(day1_ts);
+        let day2 = SqliteStorage::day_id_from_millis(day2_ts);
+        assert_eq!(day2 - day1, 3);
+
+        let make_conv = |ext: &str, ts: i64, n: usize| Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some(ext.into()),
+            title: None,
+            source_path: PathBuf::from(format!("/tmp/{ext}.jsonl")),
+            started_at: Some(ts),
+            ended_at: Some(ts + 60_000),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: (0..n)
+                .map(|i| Message {
+                    id: None,
+                    idx: i as i64,
+                    role: if i % 2 == 0 {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Agent
+                    },
+                    author: None,
+                    created_at: Some(ts + (i as i64) * 1_000),
+                    content: format!("message {i} of {ext}"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: vec![],
+                })
+                .collect(),
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        let conv1 = make_conv("since-day1", day1_ts, 2);
+        let conv2 = make_conv("since-day2", day2_ts, 5);
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &conv1), (agent_id, None, &conv2)])
+            .unwrap();
+
+        let conn = storage.raw();
+        let daily_count = |day: i64| -> i64 {
+            conn.query_row_map(
+                "SELECT COALESCE(SUM(message_count), 0) FROM usage_daily WHERE day_id = ?1",
+                fparams![day],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+        };
+        let metrics_count = |day: i64| -> i64 {
+            conn.query_row_map(
+                "SELECT COUNT(*) FROM message_metrics WHERE day_id = ?1",
+                fparams![day],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(daily_count(day1), 2);
+        assert_eq!(daily_count(day2), 5);
+
+        // Wipe every rollup, then rebuild only from the middle of day 2.
+        conn.execute("DELETE FROM message_metrics").unwrap();
+        conn.execute("DELETE FROM usage_hourly").unwrap();
+        conn.execute("DELETE FROM usage_daily").unwrap();
+        conn.execute("DELETE FROM usage_models_daily").unwrap();
+
+        // A cutoff *after* the day-2 messages but on the same UTC day must
+        // still rescan them: the window is widened to the start of that day.
+        let result = storage
+            .rebuild_analytics_since(Some(day2_ts + 6 * 3_600_000))
+            .unwrap();
+        assert_eq!(result.message_metrics_rows, 5);
+        assert_eq!(metrics_count(day2), 5);
+        assert_eq!(daily_count(day2), 5);
+        // Day 1 was outside the window and stays untouched (still wiped).
+        assert_eq!(metrics_count(day1), 0);
+        assert_eq!(daily_count(day1), 0);
+
+        // Re-running the same windowed rebuild must not double count.
+        let again = storage
+            .rebuild_analytics_since(Some(day2_ts))
+            .unwrap();
+        assert_eq!(again.message_metrics_rows, 5);
+        assert_eq!(daily_count(day2), 5);
+        let hourly_day2: i64 = conn
+            .query_row_map(
+                "SELECT COALESCE(SUM(message_count), 0) FROM usage_hourly WHERE hour_id = ?1",
+                fparams![SqliteStorage::hour_id_from_millis(day2_ts)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(hourly_day2, 5);
+
+        // A window reaching back to day 1 restores it without disturbing day 2.
+        let full_window = storage
+            .rebuild_analytics_since(Some(day1_ts))
+            .unwrap();
+        assert_eq!(full_window.message_metrics_rows, 7);
+        assert_eq!(daily_count(day1), 2);
+        assert_eq!(daily_count(day2), 5);
+
+        // And the unwindowed path still matches.
+        let full = storage.rebuild_analytics().unwrap();
+        assert_eq!(full.message_metrics_rows, 7);
+        assert_eq!(daily_count(day1), 2);
+        assert_eq!(daily_count(day2), 5);
     }
 
     #[test]
