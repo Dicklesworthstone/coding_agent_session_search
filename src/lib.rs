@@ -17241,10 +17241,6 @@ fn run_analytics_tokens(
 // analytics rebuild (br-z9fse.3.4)
 // ---------------------------------------------------------------------------
 
-/// Run `cass analytics rebuild` — rebuild analytics rollup tables.
-///
-/// Currently rebuilds Track A (message_metrics + usage_hourly + usage_daily).
-/// Track B rebuild will be wired when z9fse.13 lands.
 /// Resolve the rebuild window from `--days` / `--since`, and reject the
 /// `AnalyticsCommon` filters a rebuild cannot honor.
 ///
@@ -17311,6 +17307,12 @@ fn format_rebuild_cutoff(since_ms: i64) -> String {
         .unwrap_or_else(|| format!("{day_start_ms} ms"))
 }
 
+/// Run `cass analytics rebuild` — rebuild analytics rollup tables.
+///
+/// Track A (message_metrics + usage_hourly + usage_daily +
+/// usage_models_daily) is rebuilt from `messages`, optionally windowed by
+/// `--since`/`--days` (GH #412). Track B (token_daily_stats) is rebuilt from
+/// the `token_usage` ledger and is always full.
 fn run_analytics_rebuild(
     common: &AnalyticsCommon,
     _force: bool,
@@ -17502,14 +17504,32 @@ mod analytics_rebuild_since_tests {
         let got = analytics_rebuild_since_ms(&c).unwrap().unwrap();
         assert!((now_ms - 86_400_000 - got).abs() < 60_000, "got {got}");
 
+        // `--since YYYY-MM-DD` parses as *local* midnight; the storage layer
+        // then floors to the UTC day, so the resolved day is either the named
+        // UTC day or the one before it (never after — the window is always a
+        // superset of the requested local day).
         let mut c = common();
         c.since = Some("2026-02-06".into());
         let got = analytics_rebuild_since_ms(&c).unwrap().unwrap();
-        assert_eq!(
-            crate::storage::sqlite::SqliteStorage::day_id_from_millis(got),
-            crate::storage::sqlite::SqliteStorage::day_id_from_millis(1_770_551_400_000)
+        let got_day = crate::storage::sqlite::SqliteStorage::day_id_from_millis(got);
+        let feb6_utc_ms = chrono::NaiveDate::from_ymd_opt(2026, 2, 6)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        let feb6_day = crate::storage::sqlite::SqliteStorage::day_id_from_millis(feb6_utc_ms);
+        assert!(
+            got_day == feb6_day || got_day == feb6_day - 1,
+            "got day {got_day}, expected {feb6_day} or {}",
+            feb6_day - 1
         );
-        assert_eq!(format_rebuild_cutoff(got), "2026-02-06 UTC");
+
+        // The label is day-aligned UTC regardless of the intra-day offset.
+        assert_eq!(
+            format_rebuild_cutoff(feb6_utc_ms + 13 * 3_600_000),
+            "2026-02-06 UTC"
+        );
     }
 
     #[test]

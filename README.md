@@ -2473,6 +2473,30 @@ cass index --full
 cass analytics rebuild --track a
 ```
 
+### Rebuilding Analytics Rollups
+
+`cass analytics rebuild` re-derives the Track A rollups (`message_metrics`,
+`usage_hourly`, `usage_daily`, `usage_models_daily`) from messages already in
+the archive; it never re-parses raw session files. On a large archive a full
+rebuild is a long single-core job, so daily refreshes should be windowed:
+
+```bash
+# Full rebuild (every rollup row dropped and recomputed)
+cass analytics rebuild
+
+# Only recompute the last two UTC days; older rollups are left untouched
+cass analytics rebuild --days 2
+cass analytics rebuild --since -2d        # same window, relative syntax
+cass analytics rebuild --since 2026-08-20 # from a date
+```
+
+The window is widened to the start of the UTC day containing the cutoff,
+because rollups are bucketed by day and hour. Progress is logged per 10k
+messages (`analytics_rebuild_progress`). `--until`, `--agent`, `--workspace`
+and `--source` are query-time filters and are rejected here rather than
+silently ignored; `--since`/`--days` do not apply to Track B
+(`--track b`/`all`), which always rebuilds fully from the `token_usage` ledger.
+
 ---
 
 ## 🐚 Shell Completions
