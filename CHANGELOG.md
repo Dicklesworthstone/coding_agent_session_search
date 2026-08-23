@@ -38,8 +38,39 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
   stale. The JSON payload carries the active `exit_policy`
   (`"archive"`/`"binary-only"`).
 
+### Changed
+
+- **Lexical backend flipped from Tantivy to Quill; a one-time `cass index
+  --full` is required after upgrading** ([`ac2fe916`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ac2fe916),
+  follow-ups through [#400](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/400)).
+  The lexical index is keyed by its schema generation (`index/<generation>/`),
+  and the flip bumped that generation to `v9-quill`, a sibling of the
+  Tantivy-era `v8` directory. An archive indexed by v0.6.25 or earlier is
+  therefore reported by `cass status` as `Not found - run 'cass index --full'`
+  — not stale, not corrupt — until it is rebuilt once. The SQLite archive,
+  analytics rollups and semantic vectors are untouched by the rebuild, and the
+  old `v8` directory is left in place until the next schema-mismatch wipe.
+  Interrupted rebuilds now resume rather than restart from zero, and the
+  staged Tantivy merge path that large-archive rebuilds stalled in
+  (#400) no longer exists.
+
 ### Fixed
 
+- **`analytics rebuild --since`/`--days` were parsed and silently ignored;
+  every run was a full rescan with quadratic pagination and no progress**
+  ([#412](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/412)).
+  The rebuild now honors `--since <date|-Nd>` / `--days N`: the window is
+  widened to the start of the UTC day containing the cutoff, rollup rows for
+  those days are dropped, and only messages on or after that day start are
+  rescanned — older rollups are left intact. Pagination is keyset
+  (`WHERE id > last_id`) instead of `LIMIT/OFFSET`, so a full rebuild is
+  linear in the archive instead of re-reading every preceding row per chunk.
+  Each 10k-message chunk logs an `analytics_rebuild_progress` event
+  (processed/total, rate) so a long run is distinguishable from a hang.
+  `--until`, `--agent`, `--workspace` and `--source` are query-time filters a
+  rebuild cannot honor and are now rejected with a usage error instead of
+  being accepted and ignored; `--since`/`--days` do not apply to Track B
+  (`token_daily_stats`), which says so on stderr and rebuilds fully.
 - **`--source remote` returned nothing on the lexical lane; `--source local`
   excluded named local-kind sources** (bead 5bf29). The Quill backend's
   `Remote` clause matches the `origin_kind` term `ssh` while cass indexes

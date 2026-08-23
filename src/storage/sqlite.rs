@@ -16206,7 +16206,10 @@ impl FrankenStorage {
     /// dropped and only messages whose effective timestamp
     /// (`COALESCE(created_at, conversation.started_at)`) falls on or after
     /// that day start are rescanned. Older rollup rows are left untouched
-    /// (GH #412).
+    /// (GH #412). Limitation: if a message's timestamp moved from a day
+    /// outside the window to one inside it, its stale `message_metrics` row
+    /// is kept (`INSERT OR IGNORE`) and the old day's rollup still counts
+    /// it; a full rebuild reconciles that.
     ///
     /// Pagination is keyset (`WHERE m.id > last_id`), so the cost is linear in
     /// the number of rescanned rows rather than quadratic as the previous
@@ -16277,11 +16280,14 @@ impl FrankenStorage {
         }
 
         const CHUNK_SIZE: i64 = 10_000;
-        // Keyset cursor: the largest message id processed so far.
-        let mut last_id: i64 = 0;
-        // Lower bound on the effective timestamp; 0 admits every row
-        // (effective timestamps are never negative after COALESCE(..., 0)).
-        let cutoff_ms: i64 = scope.map_or(0, |(_, _, ms)| ms);
+        // Keyset cursor: the largest message id processed so far. Starts
+        // below every representable rowid so nothing is skipped even if an
+        // id is zero or negative.
+        let mut last_id: i64 = i64::MIN;
+        // Lower bound on the effective timestamp. A full rebuild must admit
+        // every row (including any pre-1970 negative timestamp), so it uses
+        // `i64::MIN` rather than 0.
+        let cutoff_ms: i64 = scope.map_or(i64::MIN, |(_, _, ms)| ms);
         let mut processed: i64 = 0;
         let mut total_inserted: usize = 0;
         let mut usage_hourly_rows: usize = 0;
