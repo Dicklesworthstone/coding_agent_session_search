@@ -97357,6 +97357,21 @@ fn strip_stdin_line_ending(mut input: String) -> String {
     input
 }
 
+fn format_export_duration(session_start: Option<i64>, session_end: Option<i64>) -> Option<String> {
+    let (Some(start), Some(end)) = (session_start, session_end) else {
+        return None;
+    };
+    let elapsed_ms = end.checked_sub(start).filter(|elapsed| *elapsed > 0)?;
+    let mins = elapsed_ms / 60_000;
+    if mins >= 60 {
+        Some(format!("{}h {}m", mins / 60, mins % 60))
+    } else if mins > 0 {
+        Some(format!("{}m", mins))
+    } else {
+        Some("< 1m".to_string())
+    }
+}
+
 fn publish_unique_export_output_file(
     output_directory: &Path,
     final_filename: &str,
@@ -97611,7 +97626,19 @@ fn run_export_html(
                 hint: None,
                 retryable: false,
             })?;
-            Some(zeroize::Zeroizing::new(strip_stdin_line_ending(pwd)))
+            let pwd = strip_stdin_line_ending(pwd);
+            if pwd.is_empty() {
+                let err = CliError {
+                    code: 6,
+                    kind: CliErrorKind::PasswordRequired.kind_str(),
+                    message: "Password read from stdin was empty".to_string(),
+                    hint: Some("Provide a non-empty password via --password-stdin".to_string()),
+                    retryable: false,
+                };
+                emit_structured_error(&err);
+                return Err(err);
+            }
+            Some(zeroize::Zeroizing::new(pwd))
         } else {
             let err = CliError {
                 code: 6,
@@ -98032,19 +98059,7 @@ fn run_export_html(
     let message_count = messages.len();
 
     // --- Build metadata ---
-    let duration = match (session_start, session_end) {
-        (Some(start), Some(end)) if end > start => {
-            let mins = (end - start) / 60_000;
-            if mins >= 60 {
-                Some(format!("{}h {}m", mins / 60, mins % 60))
-            } else if mins > 0 {
-                Some(format!("{}m", mins))
-            } else {
-                Some("< 1m".to_string())
-            }
-        }
-        _ => None,
-    };
+    let duration = format_export_duration(session_start, session_end);
 
     let metadata = TemplateMetadata {
         timestamp: session_start.map(|ts| {
@@ -99129,8 +99144,8 @@ mod opencode_export_tests {
 #[cfg(test)]
 mod export_timestamp_tests {
     use super::{
-        extract_message_timestamp, publish_unique_export_output_file, run_export_html,
-        write_unique_export_output_file,
+        extract_message_timestamp, format_export_duration, publish_unique_export_output_file,
+        run_export_html, write_unique_export_output_file,
     };
     use serde_json::json;
     use std::fs;
@@ -99158,6 +99173,28 @@ mod export_timestamp_tests {
         assert_eq!(
             extract_message_timestamp(&nested_payload),
             Some(1_733_000_123_000)
+        );
+    }
+
+    #[test]
+    fn export_duration_handles_boundaries_without_overflow() {
+        assert_eq!(
+            format_export_duration(Some(0), Some(59_999)).as_deref(),
+            Some("< 1m")
+        );
+        assert_eq!(
+            format_export_duration(Some(0), Some(60_000)).as_deref(),
+            Some("1m")
+        );
+        assert_eq!(
+            format_export_duration(Some(0), Some(3_660_000)).as_deref(),
+            Some("1h 1m")
+        );
+        assert_eq!(format_export_duration(Some(1), Some(1)), None);
+        assert_eq!(format_export_duration(Some(2), Some(1)), None);
+        assert_eq!(
+            format_export_duration(Some(i64::MIN), Some(i64::MAX)),
+            None
         );
     }
 
@@ -102254,14 +102291,45 @@ mod message_grouping_tests {
 
     #[test]
     fn test_orphan_tool_result() {
-        // Tool result without preceding tool call should be handled gracefully
+        // A full archive must preserve a tool result even when no originating
+        // call is available for correlation.
         let msgs = vec![
             msg_user("Hello"),
             msg_tool_result("Read", "orphan result", ToolStatus::Success),
         ];
         let groups = group_messages_for_export(msgs);
-        // Should have user group, orphan tool result might be dropped or attached
-        assert!(!groups.is_empty());
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].group_type, MessageGroupType::User);
+        assert_eq!(groups[1].group_type, MessageGroupType::ToolOnly);
+        assert_eq!(groups[1].primary.content, "orphan result");
+        assert_eq!(groups[1].primary.author.as_deref(), Some("Read result"));
+    }
+
+    #[test]
+    fn mismatched_correlated_tool_result_is_preserved_without_wrong_pairing() {
+        let mut call = msg_assistant_with_tool("Reading a file", "Read", "/expected");
+        call.tool_call
+            .as_mut()
+            .expect("tool call")
+            .correlation_id = Some("call-expected".to_string());
+
+        let mut result = msg_tool_result("Read", "different result", ToolStatus::Error);
+        result
+            .tool_call
+            .as_mut()
+            .expect("tool result")
+            .correlation_id = Some("call-other".to_string());
+
+        let groups = group_messages_for_export(vec![call, result]);
+
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups[0].tool_calls[0].result.is_none(),
+            "an explicit mismatched correlation ID must never pair by name"
+        );
+        assert_eq!(groups[1].group_type, MessageGroupType::ToolOnly);
+        assert_eq!(groups[1].primary.content, "different result");
+        assert_eq!(groups[1].primary.author.as_deref(), Some("Read error"));
     }
 
     #[test]

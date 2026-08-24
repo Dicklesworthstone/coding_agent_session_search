@@ -54,6 +54,8 @@ const SQLITE_CONTENT_ARTIFACT_SUFFIXES: &[&str] = &[
 const SQLITE_LOCK_SUFFIXES: &[&str] = &["-lock-shared", "-lock-reserved", "-lock-pending"];
 const SQLITE_VFS_LOCK_ROOT_SUFFIXES: &[&str] =
     &["-journal", "-wal", "-wal-cert", "-wal-cert-head"];
+const SQLITE_WAL_SEGMENT_DIRECTORY_ENTRY_LIMIT: usize = 65_536;
+const SQLITE_WAL_SEGMENT_MATCH_LIMIT: usize = 4_096;
 
 fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut file_name = path
@@ -111,10 +113,74 @@ fn sqlite_runtime_artifact_paths(path: &Path) -> Vec<PathBuf> {
 /// Exact, finite Pages SQLite artifact family shared by publication cleanup
 /// and secret-scan attestation. Do not replace this with a prefix glob: nearby
 /// paths may belong to another process or generation.
-fn sqlite_artifact_paths(path: &Path) -> Vec<PathBuf> {
+fn sqlite_fixed_artifact_paths(path: &Path) -> Vec<PathBuf> {
     let mut paths = sqlite_content_artifact_paths(path);
     paths.extend(sqlite_runtime_artifact_paths(path));
     paths
+}
+
+/// Enumerate FrankenSQLite's variable parallel-WAL segments in the database's
+/// direct parent. Pinned 0.3.8 treats every `<db-name>-wal-seg-*` entry as a
+/// recovery companion, including malformed epochs, so this mirrors that exact
+/// prefix rather than guessing which suffix payloads are valid.
+fn sqlite_wal_segment_artifact_paths(path: &Path) -> Result<Vec<PathBuf>> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let db_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("SQLite artifact path has no file name: {}", path.display()))?;
+    let mut segment_prefix = db_name.to_os_string();
+    segment_prefix.push("-wal-seg-");
+
+    let entries = std::fs::read_dir(parent).with_context(|| {
+        format!(
+            "Failed to enumerate SQLite artifact directory {} for {}",
+            parent.display(),
+            path.display()
+        )
+    })?;
+    let mut matches = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= SQLITE_WAL_SEGMENT_DIRECTORY_ENTRY_LIMIT {
+            bail!(
+                "SQLite artifact directory {} exceeds the {}-entry WAL-segment scan bound for {}",
+                parent.display(),
+                SQLITE_WAL_SEGMENT_DIRECTORY_ENTRY_LIMIT,
+                path.display()
+            );
+        }
+        let entry = entry.with_context(|| {
+            format!(
+                "Failed reading SQLite artifact directory entry in {} for {}",
+                parent.display(),
+                path.display()
+            )
+        })?;
+        if entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(segment_prefix.as_encoded_bytes())
+        {
+            if matches.len() >= SQLITE_WAL_SEGMENT_MATCH_LIMIT {
+                bail!(
+                    "SQLite artifact family for {} exceeds the {} WAL-segment match bound",
+                    path.display(),
+                    SQLITE_WAL_SEGMENT_MATCH_LIMIT
+                );
+            }
+            matches.push(entry.path());
+        }
+    }
+    matches.sort_unstable();
+    Ok(matches)
+}
+
+fn sqlite_artifact_paths(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = sqlite_fixed_artifact_paths(path);
+    paths.extend(sqlite_wal_segment_artifact_paths(path)?);
+    Ok(paths)
 }
 
 fn ensure_real_directory(path: &Path, metadata: &Metadata, label: &str) -> Result<()> {

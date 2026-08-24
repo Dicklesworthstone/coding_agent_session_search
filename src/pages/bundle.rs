@@ -537,7 +537,6 @@ fn bundle_publish_marker_exists(bundle_dir: &Path) -> Result<bool> {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn write_bundle_publish_marker(bundle_dir: &Path) -> Result<()> {
     let marker_path = bundle_publish_marker_path(bundle_dir);
     let mut marker = OpenOptions::new()
@@ -706,6 +705,12 @@ fn replace_dir_from_temp(
     }
 
     let backup_dir = bundle_publish_in_progress_backup_path(final_dir);
+    // Every replacement candidate carries the same durable ownership marker,
+    // including the non-Linux rename-pair path. Recovery may only remove one
+    // of two simultaneously present trees when this marker identifies which
+    // tree is NEW; an unmarked deterministic sidecar could predate cass and
+    // must never be guessed away.
+    write_bundle_publish_marker(temp_dir)?;
 
     #[cfg(target_os = "linux")]
     {
@@ -787,7 +792,11 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
             })
         }
         (false, true) => cleanup_rejected_atomic_staged_bundle(&backup_dir, final_dir),
-        (false, false) => cleanup_prior_bundle_after_publish(&backup_dir, final_dir),
+        (false, false) => bail!(
+            "ambiguous interrupted bundle publish: live bundle {} and recovery sidecar {} are both unmarked; neither tree was removed",
+            final_dir.display(),
+            backup_dir.display()
+        ),
         (true, true) => bail!(
             "ambiguous interrupted bundle publish: both live bundle {} and recovery sidecar {} carry the in-progress marker; neither tree was removed",
             final_dir.display(),
@@ -855,7 +864,6 @@ fn try_publish_linux_bundle_via_atomic_exchange(
     backup_dir: &Path,
     retain_temp_on_error: &mut bool,
 ) -> Result<bool> {
-    write_bundle_publish_marker(temp_dir)?;
     fs::rename(temp_dir, backup_dir).with_context(|| {
         format!(
             "failed moving staged bundle {} to deterministic atomic-exchange path {}",
@@ -971,12 +979,6 @@ fn restore_linux_atomic_staged_candidate(
             temp_dir.display(),
             backup_dir.display()
         )
-    })?;
-    remove_bundle_publish_marker(temp_dir).with_context(|| {
-        format!(
-            "restored staged bundle at {}, but could not remove its atomic-exchange marker",
-            temp_dir.display()
-        )
     })
 }
 
@@ -1043,7 +1045,12 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
                 *retain_temp_on_error = true;
                 return Err(cleanup_error);
             }
-            Ok(())
+            remove_bundle_publish_marker(final_dir).with_context(|| {
+                format!(
+                    "new bundle is live at {}, but its completed rename-pair publish marker could not be cleaned",
+                    final_dir.display()
+                )
+            })
         }
         Err(publish_error) => match fs::rename(backup_dir, final_dir) {
             Ok(()) => {
@@ -2954,6 +2961,10 @@ mod tests {
             !bundle_publish_in_progress_backup_path(&final_dir).exists(),
             "deterministic recovery sidecar should be cleaned up"
         );
+        assert!(
+            !bundle_publish_marker_path(&final_dir).exists(),
+            "completed replacement marker should be cleaned up"
+        );
     }
 
     #[test]
@@ -3024,6 +3035,11 @@ mod tests {
         fs::write(final_dir.join("private/old-private.txt"), "old").unwrap();
         fs::create_dir_all(staged_dir.join("private")).unwrap();
         fs::write(staged_dir.join("private/new-private.txt"), "new").unwrap();
+        fs::write(
+            bundle_publish_marker_path(&staged_dir),
+            BUNDLE_PUBLISH_MARKER_CONTENT,
+        )
+        .unwrap();
 
         // Failpoint state: OLD was parked and NEW reached the live handle,
         // then the process died before removing OLD.
@@ -3038,6 +3054,33 @@ mod tests {
         );
         assert!(!final_dir.join("private/old-private.txt").exists());
         assert!(!backup_dir.exists());
+        assert!(!bundle_publish_marker_path(&final_dir).exists());
+    }
+
+    #[test]
+    fn test_recover_interrupted_publish_preserves_unmarked_ambiguous_sidecar() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+
+        fs::create_dir_all(final_dir.join("site")).unwrap();
+        fs::write(final_dir.join("site/live.txt"), "live").unwrap();
+        fs::create_dir_all(backup_dir.join("unrelated")).unwrap();
+        fs::write(backup_dir.join("unrelated/sentinel.txt"), "preserve").unwrap();
+
+        let error = recover_interrupted_bundle_publish(&final_dir)
+            .expect_err("two unmarked trees must be preserved as ambiguous");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("both unmarked"), "unexpected error: {message}");
+        assert_eq!(
+            fs::read_to_string(final_dir.join("site/live.txt")).unwrap(),
+            "live"
+        );
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("unrelated/sentinel.txt")).unwrap(),
+            "preserve"
+        );
     }
 
     #[test]
@@ -3113,6 +3156,11 @@ mod tests {
         fs::write(final_dir.join("site/old.txt"), "old").unwrap();
         fs::create_dir_all(staged_dir.join("site")).unwrap();
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
+        fs::write(
+            bundle_publish_marker_path(&staged_dir),
+            BUNDLE_PUBLISH_MARKER_CONTENT,
+        )
+        .unwrap();
 
         let mut retain_temp_on_error = false;
         replace_dir_from_temp_via_recoverable_rename_pair(
@@ -3129,6 +3177,7 @@ mod tests {
             "new"
         );
         assert!(!backup_dir.exists());
+        assert!(!bundle_publish_marker_path(&final_dir).exists());
     }
 
     #[test]

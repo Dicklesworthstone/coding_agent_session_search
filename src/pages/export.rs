@@ -1,6 +1,6 @@
 use super::{
-    sqlite_artifact_paths, sqlite_content_artifact_paths, sqlite_migration_marker_path,
-    sqlite_runtime_artifact_paths,
+    sqlite_artifact_paths, sqlite_content_artifact_paths, sqlite_fixed_artifact_paths,
+    sqlite_migration_marker_path, sqlite_runtime_artifact_paths,
 };
 use crate::franken_sync::compat::{
     ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt,
@@ -11,6 +11,7 @@ use crate::ui::time_parser::parse_time_input;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -140,7 +141,7 @@ impl ExportEngine {
         let builder_path =
             unique_atomic_sidecar_path(&self.output_path, "builder", "pages_export.db");
         let temp_output_path =
-            unique_atomic_sidecar_path(&self.output_path, "tmp", "pages_export.db");
+            unpredictable_atomic_sidecar_path(&self.output_path, "tmp", "pages_export.db")?;
         let mut retain_temp_on_replace_error = false;
         let result = (|| -> Result<(ExportStats, T)> {
             create_staged_export_file(&builder_path)?;
@@ -535,42 +536,24 @@ impl ExportEngine {
             let source_rollback_result = src_tx
                 .rollback()
                 .context("Failed to close source database read snapshot");
-            let export_result = match (export_result, source_rollback_result) {
-                (Ok(stats), Ok(())) => Ok(stats),
-                (Err(export_error), Ok(())) => Err(export_error),
-                (Ok(_), Err(rollback_error)) => Err(rollback_error),
-                (Err(export_error), Err(rollback_error)) => {
-                    Err(export_error.context(format!(
-                        "source read-snapshot rollback also failed: {rollback_error:#}"
-                    )))
-                }
-            };
-
-            let vacuum_result = match export_result {
-                Ok(stats) => {
-                    let candidate_path = temp_output_path.to_string_lossy();
-                    dest.execute_compat(
-                        "VACUUM INTO ?1;",
-                        params![candidate_path.as_ref()],
-                    )
-                    .context("Failed to materialize self-contained Pages export candidate")
-                    .map(|_| stats)
-                }
-                Err(error) => Err(error),
-            };
-            let close_result = dest
-                .close()
-                .context("Failed to close and checkpoint Pages export builder");
-            let (processed, msg_processed) = match (vacuum_result, close_result) {
+            let (processed, msg_processed) = match (export_result, source_rollback_result) {
                 (Ok(stats), Ok(())) => stats,
                 (Err(export_error), Ok(())) => return Err(export_error),
-                (Ok(_), Err(close_error)) => return Err(close_error),
-                (Err(export_error), Err(close_error)) => {
+                (Ok(_), Err(rollback_error)) => return Err(rollback_error),
+                (Err(export_error), Err(rollback_error)) => {
                     return Err(export_error.context(format!(
-                        "Pages export builder close also failed: {close_error:#}"
+                        "source read-snapshot rollback also failed: {rollback_error:#}"
                     )));
                 }
             };
+
+            let candidate_path = temp_output_path.to_string_lossy();
+            dest.execute_compat("VACUUM INTO ?1;", params![candidate_path.as_ref()])
+                .context("Failed to materialize self-contained Pages export candidate")?;
+            dest.close()
+                .context("Failed to close and checkpoint Pages export builder")?;
+            cleanup_sqlite_temp_artifacts(&builder_path)
+                .context("Failed to remove closed Pages export builder artifacts")?;
             finalize_staged_sqlite_sidecars(&temp_output_path)
                 .context("Failed to finalize staged Pages export as one SQLite main file")?;
 
@@ -594,6 +577,18 @@ impl ExportEngine {
                 verification,
             ))
         })();
+
+        let result = match cleanup_sqlite_temp_artifacts(&builder_path) {
+            Ok(()) => result,
+            Err(cleanup_error) => match result {
+                Ok(_) => Err(cleanup_error.context(
+                    "completed Pages export was not published because its private builder could not be removed",
+                )),
+                Err(export_error) => Err(export_error.context(format!(
+                    "failed to remove private Pages export builder artifacts: {cleanup_error:#}"
+                ))),
+            },
+        };
 
         match result {
             // Only the catastrophic Windows backup/restore failure retains the
@@ -789,9 +784,26 @@ fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) ->
     ))
 }
 
+fn unpredictable_atomic_sidecar_path(
+    path: &Path,
+    suffix: &str,
+    fallback_name: &str,
+) -> Result<PathBuf> {
+    let mut nonce = [0_u8; 16];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| anyhow::anyhow!("failed to obtain randomness for Pages export staging"))?;
+    let mut file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new(fallback_name))
+        .to_os_string();
+    file_name.push(format!(".{suffix}.{}", hex::encode(nonce)));
+    Ok(path.with_file_name(file_name))
+}
+
 fn cleanup_sqlite_sidecars(path: &Path) -> Result<()> {
     let mut first_error = None;
-    for artifact in sqlite_artifact_paths(path) {
+    for artifact in sqlite_artifact_paths(path)? {
         match std::fs::remove_file(&artifact) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -996,7 +1008,7 @@ fn create_staged_export_file(path: &Path) -> Result<()> {
 /// readers observe a mixed or corrupt generation. The exporter cannot safely
 /// decide that an existing sidecar is stale, so preserve it and fail closed.
 fn reject_existing_sqlite_sidecars(path: &Path, artifact_label: &str) -> Result<()> {
-    for sidecar in sqlite_artifact_paths(path) {
+    for sidecar in sqlite_artifact_paths(path)? {
         match std::fs::symlink_metadata(&sidecar) {
             Ok(_) => {
                 bail!(
@@ -1840,8 +1852,10 @@ mod tests {
     fn rejected_export_cleanup_removes_every_sqlite_artifact() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let staged_path = temp_dir.path().join("export.tmp.db");
+        let wal_segment = temp_dir.path().join("export.tmp.db-wal-seg-not-an-epoch");
         let artifacts = std::iter::once(staged_path.clone())
-            .chain(sqlite_artifact_paths(&staged_path))
+            .chain(sqlite_fixed_artifact_paths(&staged_path))
+            .chain(std::iter::once(wal_segment))
             .collect::<Vec<_>>();
         for artifact in &artifacts {
             std::fs::write(artifact, b"staged bytes")?;
@@ -2020,6 +2034,52 @@ mod tests {
     }
 
     #[test]
+    fn vacuum_into_detaches_candidate_from_expected_builder_wal() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let builder_path = temp_dir.path().join("builder.db");
+        let candidate_path = temp_dir.path().join("candidate.db");
+        create_staged_export_file(&builder_path)?;
+
+        let builder = Connection::open(builder_path.to_string_lossy().as_ref())?;
+        builder.execute_batch(
+            "PRAGMA journal_mode = 'delete';
+             CREATE TABLE exported (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO exported VALUES (1, 'candidate row');",
+        )?;
+        builder.execute_compat(
+            "VACUUM INTO ?1;",
+            params![candidate_path.to_string_lossy().as_ref()],
+        )?;
+        builder.close()?;
+
+        let builder_wal = sqlite_content_artifact_paths(&builder_path)
+            .into_iter()
+            .find(|path| path.as_os_str().to_string_lossy().ends_with("-wal"))
+            .ok_or_else(|| anyhow::anyhow!("shared artifact family omitted builder WAL"))?;
+        assert!(
+            builder_wal.exists(),
+            "test requires pinned FrankenSQLite's retained bootstrap WAL"
+        );
+        reject_existing_sqlite_sidecars(&candidate_path, "VACUUM INTO candidate")?;
+        assert!(
+            std::fs::metadata(&candidate_path)?.len() > 0,
+            "VACUUM INTO candidate must contain a database image"
+        );
+
+        cleanup_sqlite_temp_artifacts(&builder_path)?;
+        assert!(
+            !builder_wal.exists(),
+            "closed private builder WAL survived exact-family cleanup"
+        );
+
+        let candidate = crate::pages::open_existing_sqlite_db(&candidate_path)?;
+        let row = candidate.query_row("SELECT COUNT(*) FROM exported")?;
+        assert_eq!(row.get_typed::<i64>(0)?, 1);
+        candidate.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn replace_file_from_temp_via_backup_overwrites_existing_file() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let final_path = temp_dir.path().join("export.db");
@@ -2085,7 +2145,7 @@ mod tests {
 
     #[test]
     fn replacement_rejects_existing_sqlite_sidecars_without_mutating_artifacts() -> Result<()> {
-        let artifact_paths = sqlite_artifact_paths(Path::new("export.db"));
+        let artifact_paths = sqlite_fixed_artifact_paths(Path::new("export.db"));
         for relative_path in artifact_paths {
             let temp_dir = TempDir::new()?;
             let final_path = temp_dir.path().join("export.db");
