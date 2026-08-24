@@ -12,7 +12,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -279,6 +279,29 @@ struct RedactionRange {
     end: usize,
 }
 
+#[derive(Debug, Clone)]
+struct FindingOccurrence {
+    source_path: Option<String>,
+    conversation_id: Option<i64>,
+    message_id: Option<i64>,
+    message_idx: Option<i64>,
+    location: SecretLocation,
+    start: usize,
+    end: usize,
+}
+
+impl FindingOccurrence {
+    fn overlaps(&self, candidate: &FindingCandidate<'_>) -> bool {
+        self.source_path == candidate.ctx.source_path
+            && self.conversation_id == candidate.ctx.conversation_id
+            && self.message_id == candidate.ctx.message_id
+            && self.message_idx == candidate.ctx.message_idx
+            && self.location == candidate.location
+            && self.start < candidate.end
+            && candidate.start < self.end
+    }
+}
+
 pub fn scan_database<P: AsRef<Path>>(
     db_path: P,
     filters: &SecretScanFilters,
@@ -290,7 +313,7 @@ pub fn scan_database<P: AsRef<Path>>(
         .context("Failed to open database for secret scan")?;
 
     let mut findings: Vec<SecretFinding> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen = Vec::new();
     let mut truncated = false;
 
     // LEFT JOIN + COALESCE on agents so secret scanning also covers legacy
@@ -735,7 +758,7 @@ fn scan_text(
     ctx: &ScanContext,
     config: &SecretScanConfig,
     findings: &mut Vec<SecretFinding>,
-    seen: &mut HashSet<String>,
+    seen: &mut Vec<FindingOccurrence>,
     truncated: &mut bool,
 ) {
     if *truncated || text.is_empty() {
@@ -859,7 +882,7 @@ fn scan_text(
 
 fn push_finding(
     findings: &mut Vec<SecretFinding>,
-    seen: &mut HashSet<String>,
+    seen: &mut Vec<FindingOccurrence>,
     candidate: FindingCandidate<'_>,
     config: &SecretScanConfig,
     context_redactions: &[RedactionRange],
@@ -874,18 +897,21 @@ fn push_finding(
         context_redactions,
     );
 
-    let key = format!(
-        "{}:{}:{}:{}:{}",
-        candidate.ctx.conversation_id.unwrap_or_default(),
-        candidate.ctx.message_id.unwrap_or_default(),
-        candidate.location.label(),
-        candidate.kind,
-        match_redacted
-    );
-
-    if !seen.insert(key) {
+    if seen
+        .iter()
+        .any(|occurrence| occurrence.overlaps(&candidate))
+    {
         return;
     }
+    seen.push(FindingOccurrence {
+        source_path: candidate.ctx.source_path.clone(),
+        conversation_id: candidate.ctx.conversation_id,
+        message_id: candidate.ctx.message_id,
+        message_idx: candidate.ctx.message_idx,
+        location: candidate.location.clone(),
+        start: candidate.start,
+        end: candidate.end,
+    });
 
     findings.push(SecretFinding {
         severity: candidate.severity,
@@ -1710,7 +1736,7 @@ mod tests {
             message_idx: None,
         };
         let mut findings = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = Vec::new();
         let mut truncated = false;
 
         scan_text(
@@ -1738,7 +1764,7 @@ mod tests {
             message_idx: None,
         };
         let mut findings = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = Vec::new();
         let mut truncated = true; // pre-set
 
         scan_text(
@@ -1767,7 +1793,7 @@ mod tests {
             message_idx: Some(0),
         };
         let mut findings = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = Vec::new();
         let mut truncated = false;
 
         scan_text(
@@ -1798,7 +1824,7 @@ mod tests {
             message_idx: Some(0),
         };
         let mut findings = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = Vec::new();
         let mut truncated = false;
 
         scan_text(
@@ -1830,7 +1856,7 @@ mod tests {
             message_idx: Some(0),
         };
         let mut findings = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = Vec::new();
         let mut truncated = false;
 
         // Scan same text twice — same context, so duplicates should be skipped
@@ -1879,7 +1905,7 @@ mod tests {
             message_idx: Some(0),
         };
         let mut findings = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = Vec::new();
         let mut truncated = false;
 
         // Each match is >8 chars so redact_token produces unique output per token
@@ -1916,7 +1942,7 @@ mod tests {
             message_idx: Some(0),
         };
         let mut findings = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = Vec::new();
         let mut truncated = false;
 
         // This is a pure alphabetic string — should be skipped by the heuristic

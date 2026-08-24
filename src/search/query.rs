@@ -55,15 +55,6 @@ use crate::franken_sync::params;
 /// errors out of the worker protocol while preserving the former fallible row
 /// mapper semantics.
 trait SearchSqliteConnectionExt {
-    fn query_row_map<T, F>(
-        &self,
-        sql: &str,
-        params: &[ParamValue],
-        map: F,
-    ) -> Result<T, crate::franken_sync::FrankenError>
-    where
-        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>;
-
     fn query_map_collect<T, F>(
         &self,
         sql: &str,
@@ -73,28 +64,9 @@ trait SearchSqliteConnectionExt {
     where
         F: FnMut(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>;
 
-    fn execute_compat(
-        &self,
-        sql: &str,
-        params: &[ParamValue],
-    ) -> Result<usize, crate::franken_sync::FrankenError>;
 }
 
 impl SearchSqliteConnectionExt for SearchSqliteConnection {
-    fn query_row_map<T, F>(
-        &self,
-        sql: &str,
-        params: &[ParamValue],
-        map: F,
-    ) -> Result<T, crate::franken_sync::FrankenError>
-    where
-        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
-    {
-        let values = param_slice_to_values(params);
-        let row = self.query_row_with_params_sync(sql, &values)?;
-        map(&row)
-    }
-
     fn query_map_collect<T, F>(
         &self,
         sql: &str,
@@ -109,14 +81,6 @@ impl SearchSqliteConnectionExt for SearchSqliteConnection {
         rows.iter().map(&mut map).collect()
     }
 
-    fn execute_compat(
-        &self,
-        sql: &str,
-        params: &[ParamValue],
-    ) -> Result<usize, crate::franken_sync::FrankenError> {
-        let values = param_slice_to_values(params);
-        self.execute_with_params_sync(sql, &values)
-    }
 }
 
 #[cfg(test)]
@@ -133,6 +97,21 @@ trait SearchSqliteFixtureExt {
     ) -> Result<usize, crate::franken_sync::FrankenError>;
 
     fn execute_batch(&self, sql: &str) -> Result<(), crate::franken_sync::FrankenError>;
+
+    fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>;
+
+    fn execute_compat(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+    ) -> Result<usize, crate::franken_sync::FrankenError>;
 }
 
 #[cfg(test)]
@@ -154,6 +133,29 @@ impl SearchSqliteFixtureExt for SearchSqliteConnection {
 
     fn execute_batch(&self, sql: &str) -> Result<(), crate::franken_sync::FrankenError> {
         self.execute_batch_sync(sql)
+    }
+
+    fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
+    {
+        let values = param_slice_to_values(params);
+        let row = self.query_row_with_params_sync(sql, &values)?;
+        map(&row)
+    }
+
+    fn execute_compat(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+    ) -> Result<usize, crate::franken_sync::FrankenError> {
+        let values = param_slice_to_values(params);
+        self.execute_with_params_sync(sql, &values)
     }
 }
 
@@ -8060,7 +8062,7 @@ impl SearchClient {
             query_match_type,
         };
         if let Err(err) =
-            crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
+            crate::storage::sqlite::validate_fts_messages_integrity_for_async_connection(conn)
         {
             tracing::warn!(
                 error = %err,

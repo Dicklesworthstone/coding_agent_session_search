@@ -13,6 +13,7 @@ use crate::franken_sync::{
 use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow, bail};
+use frankensqlite::AsyncConnection as FrankenAsyncConnection;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -704,6 +705,61 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
             // the unclean-shutdown dirty-WAL shape; checkpoint it through the
             // write path (under the doctor guard held above) and retry the
             // readonly open exactly once.
+            Err(err)
+                if !wal_recovery_attempted && attempt_dirty_wal_recovery_checkpoint(path, &err) =>
+            {
+                wal_recovery_attempted = true;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Open a read-only FrankenSQLite connection whose raw engine remains on one
+/// dedicated owner thread for its entire lifetime.
+///
+/// This mirrors [`open_franken_raw_readonly_connection_with_timeout`]'s doctor
+/// lock, bounded contention retry, and one-shot dirty-WAL recovery contract,
+/// but returns the thread-safe dispatch handle required by shared search
+/// clients. The worker creates, uses, closes, and drops the `!Send` raw
+/// connection on that same worker thread.
+pub(crate) fn open_franken_async_readonly_connection_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<FrankenAsyncConnection> {
+    if !path.exists() {
+        return Err(anyhow!("Database not found at {}", path.display()));
+    }
+
+    let path_str = path.to_string_lossy().to_string();
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(4);
+    let mut wal_recovery_attempted = false;
+    loop {
+        let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
+        match FrankenAsyncConnection::open_with_flags_sync(
+            &path_str,
+            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .with_context(|| {
+            format!(
+                "opening dedicated-owner frankensqlite db readonly at {}",
+                path.display()
+            )
+        }) {
+            Ok(conn) => return Ok(conn),
+            Err(err) if retryable_franken_anyhow(&err) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(err);
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(128),
+                );
+            }
             Err(err)
                 if !wal_recovery_attempted && attempt_dirty_wal_recovery_checkpoint(path, &err) =>
             {
@@ -1406,19 +1462,21 @@ fn fts_schema_tolerates_missing_shadow_metadata(sql: &str) -> bool {
         && !normalized.contains("message_id")
 }
 
-pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) -> Result<()> {
-    let fts_schema_sql: Vec<String> = conn
-        .query_map_collect(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
-            fparams![],
-            |row: &FrankenRow| row.get_typed::<String>(0),
-        )
+fn validate_fts_messages_integrity_with_queries(
+    query_strings: impl Fn(
+        &str,
+    ) -> std::result::Result<Vec<String>, crate::franken_sync::FrankenError>,
+    probe: impl Fn(&str) -> std::result::Result<(), crate::franken_sync::FrankenError>,
+) -> Result<()> {
+    let fts_schema_sql = query_strings(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
+    )
         .with_context(|| "checking for fts_messages in sqlite_master")?;
     if fts_schema_sql.is_empty() {
         return Ok(());
     }
 
-    let probe_error = conn.query(FTS_MESSAGES_INTEGRITY_PROBE_SQL).err();
+    let probe_error = probe(FTS_MESSAGES_INTEGRITY_PROBE_SQL).err();
     if probe_error.is_none()
         && fts_schema_sql
             .iter()
@@ -1427,9 +1485,8 @@ pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) 
         return Ok(());
     }
 
-    let present_shadow_tables: HashSet<String> = conn
-        .query_map_collect(
-            "SELECT name FROM sqlite_master
+    let present_shadow_tables: HashSet<String> = query_strings(
+        "SELECT name FROM sqlite_master
              WHERE type = 'table'
                AND name IN (
                  'fts_messages_config',
@@ -1438,9 +1495,7 @@ pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) 
                  'fts_messages_docsize',
                  'fts_messages_idx'
                )",
-            fparams![],
-            |row: &FrankenRow| row.get_typed::<String>(0),
-        )
+    )
         .map(|rows| rows.into_iter().collect())
         .map_err(|err| {
             FtsMessagesIntegrityError::new(
@@ -1478,6 +1533,31 @@ pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) 
         probe_error.map(|err| err.to_string()),
     )
     .into())
+}
+
+pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) -> Result<()> {
+    validate_fts_messages_integrity_with_queries(
+        |sql| {
+            conn.query_map_collect(sql, fparams![], |row: &FrankenRow| {
+                row.get_typed::<String>(0)
+            })
+        },
+        |sql| conn.query(sql).map(|_| ()),
+    )
+}
+
+pub(crate) fn validate_fts_messages_integrity_for_async_connection(
+    conn: &FrankenAsyncConnection,
+) -> Result<()> {
+    validate_fts_messages_integrity_with_queries(
+        |sql| {
+            let rows = conn.query_sync(sql)?;
+            rows.iter()
+                .map(|row: &FrankenRow| row.get_typed::<String>(0))
+                .collect()
+        },
+        |sql| conn.query_sync(sql).map(|_| ()),
+    )
 }
 
 /// Remove historical duplicate `fts_messages` rows from `sqlite_master`,

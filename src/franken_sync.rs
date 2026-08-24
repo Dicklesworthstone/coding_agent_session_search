@@ -559,9 +559,12 @@ mod tests {
 
         let result = conn.execute(
             "INSERT INTO replay_guard (value) VALUES (1); \
-             INSERT INTO missing_replay_target (value) VALUES (2);",
+             SELECT * FROM missing_replay_target;",
         );
-        assert!(result.is_err(), "missing target unexpectedly accepted");
+        assert!(
+            matches!(&result, Err(FrankenError::NoSuchTable { .. })),
+            "missing SELECT target did not surface NoSuchTable: {result:?}"
+        );
 
         let count = conn
             .query_row("SELECT COUNT(*) FROM replay_guard;")?
