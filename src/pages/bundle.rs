@@ -1190,7 +1190,7 @@ fn write_private_artifact_file(private_dir: &Path, filename: &str, contents: &[u
     Ok(())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn private_artifact_path_entry_exists(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),

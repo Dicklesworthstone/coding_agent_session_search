@@ -16,7 +16,7 @@ use std::path::Path;
 
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
 use super::bundle::IntegrityManifest;
-use super::encrypt::{EncryptionConfig, SCHEMA_VERSION};
+use super::encrypt::{EncryptionConfig, KdfAlgorithm, SCHEMA_VERSION, SlotType};
 use std::fmt;
 
 /// Maximum chunk file size (GitHub Pages hard limit)
@@ -24,6 +24,9 @@ const MAX_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 
 /// Maximum chunk_size config value (32 MiB)
 const MAX_CONFIG_CHUNK_SIZE: usize = 32 * 1024 * 1024;
+
+/// Integrity manifest schema understood by this verifier.
+const INTEGRITY_MANIFEST_VERSION: u8 = 1;
 
 /// Required files that must exist in site/
 const REQUIRED_FILES: &[&str] = &[
@@ -236,6 +239,49 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
     })
 }
 
+fn failed_check_details(verification: &VerifyResult) -> String {
+    [
+        ("required_files", &verification.checks.required_files),
+        ("config_schema", &verification.checks.config_schema),
+        (
+            "payload_manifest",
+            &verification.checks.payload_manifest,
+        ),
+        ("size_limits", &verification.checks.size_limits),
+        ("integrity", &verification.checks.integrity),
+        (
+            "no_secrets_in_site",
+            &verification.checks.no_secrets_in_site,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, check)| !check.passed)
+    .map(|(name, check)| match check.details.as_deref() {
+        Some(details) => format!("{name}: {details}"),
+        None => name.to_string(),
+    })
+    .collect::<Vec<_>>()
+    .join("; ")
+}
+
+/// Require every full-bundle verification check to pass.
+///
+/// This is the fail-closed gate for completed local/config exports. It returns
+/// the detailed verification result only when the bundle is safe to report as
+/// successfully built or ready for manual deployment.
+pub fn ensure_valid_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
+    let site_dir = super::resolve_site_dir(path)?;
+    let verification = verify_bundle(&site_dir, verbose)?;
+    if verification.status != "valid" {
+        bail!(
+            "Pages bundle at {} failed full verification: {}",
+            site_dir.display(),
+            failed_check_details(&verification)
+        );
+    }
+    Ok(verification)
+}
+
 /// Run a deployment action only after the exact site path it receives passes
 /// every Pages bundle verification check.
 ///
@@ -250,28 +296,10 @@ pub fn with_verified_bundle_for_deployment<T>(
     let site_dir = super::resolve_site_dir(path)?;
     let verification = verify_bundle(&site_dir, verbose)?;
     if verification.status != "valid" {
-        let failed_checks = [
-            ("required_files", &verification.checks.required_files),
-            ("config_schema", &verification.checks.config_schema),
-            ("payload_manifest", &verification.checks.payload_manifest),
-            ("size_limits", &verification.checks.size_limits),
-            ("integrity", &verification.checks.integrity),
-            (
-                "no_secrets_in_site",
-                &verification.checks.no_secrets_in_site,
-            ),
-        ]
-        .into_iter()
-        .filter(|(_, check)| !check.passed)
-        .map(|(name, check)| match check.details.as_deref() {
-            Some(details) => format!("{name}: {details}"),
-            None => name.to_string(),
-        })
-        .collect::<Vec<_>>();
         bail!(
             "Refusing to deploy invalid Pages bundle at {}: {}",
             site_dir.display(),
-            failed_checks.join("; ")
+            failed_check_details(&verification)
         );
     }
 
@@ -493,20 +521,75 @@ fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
         errors.push("key_slots cannot be empty".to_string());
     }
 
+    for (name, value) in [
+        ("memory_kb", config.kdf_defaults.memory_kb),
+        ("iterations", config.kdf_defaults.iterations),
+        ("parallelism", config.kdf_defaults.parallelism),
+    ] {
+        if value == 0 {
+            errors.push(format!("kdf_defaults.{name} must be greater than zero"));
+        }
+    }
+
+    let mut slot_ids = HashSet::new();
     for (i, slot) in config.key_slots.iter().enumerate() {
-        // Validate slot.salt is base64
-        if BASE64_STANDARD.decode(&slot.salt).is_err() {
-            errors.push(format!("key_slot[{}].salt is not valid base64", i));
+        if !slot_ids.insert(slot.id) {
+            errors.push(format!("key_slot[{i}].id duplicates slot id {}", slot.id));
         }
 
-        // Validate slot.wrapped_dek is base64
-        if BASE64_STANDARD.decode(&slot.wrapped_dek).is_err() {
-            errors.push(format!("key_slot[{}].wrapped_dek is not valid base64", i));
+        let expected_kdf = match slot.slot_type {
+            SlotType::Password => KdfAlgorithm::Argon2id,
+            SlotType::Recovery => KdfAlgorithm::HkdfSha256,
+        };
+        if slot.kdf != expected_kdf {
+            errors.push(format!(
+                "key_slot[{i}].kdf does not match its {:?} slot type",
+                slot.slot_type
+            ));
         }
 
-        // Validate slot.nonce is base64
-        if BASE64_STANDARD.decode(&slot.nonce).is_err() {
-            errors.push(format!("key_slot[{}].nonce is not valid base64", i));
+        match slot.slot_type {
+            SlotType::Password => match slot.argon2_params.as_ref() {
+                Some(params) if params == &config.kdf_defaults => {}
+                Some(_) => errors.push(format!(
+                    "key_slot[{i}].argon2_params must match kdf_defaults"
+                )),
+                None => errors.push(format!(
+                    "key_slot[{i}] password slot is missing argon2_params"
+                )),
+            },
+            SlotType::Recovery if slot.argon2_params.is_some() => errors.push(format!(
+                "key_slot[{i}] recovery slot must not contain argon2_params"
+            )),
+            SlotType::Recovery => {}
+        }
+
+        match BASE64_STANDARD.decode(&slot.salt) {
+            Ok(bytes) if bytes.is_empty() => {
+                errors.push(format!("key_slot[{i}].salt must not be empty"));
+            }
+            Ok(_) => {}
+            Err(_) => errors.push(format!("key_slot[{i}].salt is not valid base64")),
+        }
+
+        match BASE64_STANDARD.decode(&slot.wrapped_dek) {
+            Ok(bytes) if bytes.len() == 48 => {}
+            Ok(bytes) => errors.push(format!(
+                "key_slot[{i}].wrapped_dek should be 48 bytes, got {}",
+                bytes.len()
+            )),
+            Err(_) => errors.push(format!(
+                "key_slot[{i}].wrapped_dek is not valid base64"
+            )),
+        }
+
+        match BASE64_STANDARD.decode(&slot.nonce) {
+            Ok(bytes) if bytes.len() == 12 => {}
+            Ok(bytes) => errors.push(format!(
+                "key_slot[{i}].nonce should be 12 bytes, got {}",
+                bytes.len()
+            )),
+            Err(_) => errors.push(format!("key_slot[{i}].nonce is not valid base64")),
         }
     }
 
@@ -818,6 +901,13 @@ fn check_integrity(site_dir: &Path, verbose: bool) -> CheckResult {
         Ok(m) => m,
         Err(e) => return CheckResult::fail(format!("Failed to parse integrity.json: {}", e)),
     };
+
+    if manifest.version != INTEGRITY_MANIFEST_VERSION {
+        return CheckResult::fail(format!(
+            "Unsupported integrity manifest version {}; expected {}",
+            manifest.version, INTEGRITY_MANIFEST_VERSION
+        ));
+    }
 
     let mut errors = Vec::new();
     let mut checked_files: HashSet<String> = HashSet::new();
