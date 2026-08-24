@@ -8328,7 +8328,13 @@ impl FrankenStorage {
                          JOIN conversations current
                            ON current.source_id = legacy.source_id
                           AND current.agent_id = ?1
-                          AND current.external_id = legacy.external_id
+                          AND (
+                               current.source_path = legacy.source_path
+                               OR (
+                                    legacy.external_id IS NOT NULL
+                                    AND current.external_id = legacy.external_id
+                               )
+                          )
                          WHERE legacy.id = ?2
                            AND legacy.agent_id = ?3
                      )",
@@ -29478,6 +29484,146 @@ mod tests {
             conversations
                 .iter()
                 .all(|conversation| conversation.agent_slug == "omp")
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_omp_reclassification_rejects_same_source_path_with_different_identity()
+    -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");
+        let _omp_sessions = set_env_var("PI_CODING_AGENT_SESSION_DIR", "");
+        let _shared_agent = set_env_var("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env_var("CASS_OMP_DATA_ROOT", "");
+        let _config_dir = set_env_var("PI_CONFIG_DIR", "");
+        let _profile = set_env_var("OMP_PROFILE", "");
+        let _legacy_profile = set_env_var("PI_PROFILE", "");
+        let _xdg = set_env_var("XDG_DATA_HOME", "");
+        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let pi_agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "pi_agent".into(),
+            name: "Pi Agent".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let omp_agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "omp".into(),
+            name: "Oh My Pi".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let shared_path = dir
+            .path()
+            .join("home/.omp/agent/sessions/project/session.jsonl");
+        let shared_path = shared_path.to_string_lossy();
+        storage.conn.execute_compat(
+            "INSERT INTO conversations(
+                 agent_id, source_id, external_id, title, source_path, started_at
+             ) VALUES(?1, 'local', NULL, 'Legacy OMP', ?2, 1000)",
+            fparams![pi_agent_id, shared_path.as_ref()],
+        )?;
+        storage.conn.execute_compat(
+            "INSERT INTO conversations(
+                 agent_id, source_id, external_id, title, source_path, started_at
+             ) VALUES(?1, 'local', 'current-id', 'First-class OMP', ?2, 1000)",
+            fparams![omp_agent_id, shared_path.as_ref()],
+        )?;
+
+        let error = storage
+            .reclassify_legacy_omp_conversations()
+            .expect_err("the exact same source path cannot acquire two OMP identities");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot reclassify 1 legacy OMP conversation"),
+            "unexpected collision diagnostic: {error:#}"
+        );
+        let slugs = storage.conn.query_map_collect(
+            "SELECT a.slug
+             FROM conversations c
+             JOIN agents a ON a.id = c.agent_id
+             ORDER BY c.id",
+            fparams![],
+            |row| row.get_typed::<String>(0),
+        )?;
+        assert_eq!(slugs, vec!["pi_agent", "omp"]);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_omp_reclassification_preserves_distinct_remote_sources() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");
+        let _omp_sessions = set_env_var("PI_CODING_AGENT_SESSION_DIR", "");
+        let _shared_agent = set_env_var("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env_var("CASS_OMP_DATA_ROOT", "");
+        let _config_dir = set_env_var("PI_CONFIG_DIR", "");
+        let _profile = set_env_var("OMP_PROFILE", "");
+        let _legacy_profile = set_env_var("PI_PROFILE", "");
+        let _xdg = set_env_var("XDG_DATA_HOME", "");
+        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let pi_agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "pi_agent".into(),
+            name: "Pi Agent".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let omp_agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "omp".into(),
+            name: "Oh My Pi".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        for source_id in ["remote-a", "remote-b"] {
+            storage.conn.execute_compat(
+                "INSERT INTO sources(id, kind, host_label, created_at, updated_at)
+                 VALUES(?1, 'ssh', ?1, 1000, 1000)",
+                fparams![source_id],
+            )?;
+        }
+        let shared_path = "/home/dev/.omp/agent/sessions/project/session.jsonl";
+        storage.conn.execute_compat(
+            "INSERT INTO conversations(
+                 agent_id, source_id, external_id, title, source_path, started_at
+             ) VALUES(?1, 'remote-a', 'same-id', 'Remote A', ?2, 1000)",
+            fparams![pi_agent_id, shared_path],
+        )?;
+        storage.conn.execute_compat(
+            "INSERT INTO conversations(
+                 agent_id, source_id, external_id, title, source_path, started_at
+             ) VALUES(?1, 'remote-b', 'same-id', 'Remote B', ?2, 1000)",
+            fparams![omp_agent_id, shared_path],
+        )?;
+
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 1,
+                lexical_rebuild_required: true,
+            },
+            "an identical remote path and external id on another source must not collapse provenance"
+        );
+        let rows = storage.conn.query_map_collect(
+            "SELECT c.source_id, a.slug
+             FROM conversations c
+             JOIN agents a ON a.id = c.agent_id
+             ORDER BY c.source_id",
+            fparams![],
+            |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
+        )?;
+        assert_eq!(
+            rows,
+            vec![
+                ("remote-a".to_string(), "omp".to_string()),
+                ("remote-b".to_string(), "omp".to_string()),
+            ]
         );
         Ok(())
     }

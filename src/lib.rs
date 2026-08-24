@@ -97357,24 +97357,44 @@ fn strip_stdin_line_ending(mut input: String) -> String {
     input
 }
 
-fn create_unique_export_output_file(
+fn publish_unique_export_output_file(
     output_directory: &Path,
     final_filename: &str,
     output_path: &mut PathBuf,
-) -> io::Result<std::fs::File> {
+    write_staged: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     const OUTPUT_CREATE_ATTEMPTS: usize = 1000;
 
+    let mut staged = tempfile::Builder::new()
+        .prefix(".cass-export-")
+        .suffix(".tmp")
+        .tempfile_in(output_directory)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    write_staged(staged.as_file_mut())?;
+    staged.as_file_mut().flush()?;
+    staged.as_file().sync_all()?;
+
     for _ in 0..OUTPUT_CREATE_ATTEMPTS {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(output_path.as_path())
-        {
-            Ok(file) => return Ok(file),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+        match staged.persist_noclobber(output_path.as_path()) {
+            Ok(published) => {
+                published.sync_all()?;
+                sync_export_parent_directory(output_path)?;
+                return Ok(());
+            }
+            Err(err) if err.error.kind() == io::ErrorKind::AlreadyExists => {
+                staged = err.file;
                 *output_path = html_export::unique_filename(output_directory, final_filename);
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.error),
         }
     }
 
@@ -97382,6 +97402,35 @@ fn create_unique_export_output_file(
         io::ErrorKind::AlreadyExists,
         format!("could not reserve a unique output filename after {OUTPUT_CREATE_ATTEMPTS} tries"),
     ))
+}
+
+fn write_unique_export_output_file(
+    output_directory: &Path,
+    final_filename: &str,
+    output_path: &mut PathBuf,
+    contents: &[u8],
+) -> io::Result<()> {
+    publish_unique_export_output_file(
+        output_directory,
+        final_filename,
+        output_path,
+        |file| file.write_all(contents),
+    )
+}
+
+#[cfg(not(windows))]
+fn sync_export_parent_directory(path: &Path) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_export_parent_directory(_path: &Path) -> io::Result<()> {
+    // Windows does not document FlushFileBuffers for directory handles. The
+    // staged file itself is synced before and after the no-clobber publish.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -97552,7 +97601,7 @@ fn run_export_html(
     }
 
     // --- Get password if encryption requested ---
-    let final_password: Option<String> = if encrypt {
+    let final_password: Option<zeroize::Zeroizing<String>> = if encrypt {
         if password_stdin {
             let mut pwd = String::new();
             io::stdin().read_line(&mut pwd).map_err(|e| CliError {
@@ -97562,7 +97611,7 @@ fn run_export_html(
                 hint: None,
                 retryable: false,
             })?;
-            Some(strip_stdin_line_ending(pwd))
+            Some(zeroize::Zeroizing::new(strip_stdin_line_ending(pwd)))
         } else {
             let err = CliError {
                 code: 6,
@@ -98120,7 +98169,12 @@ fn run_export_html(
     let message_groups = group_messages_for_export(messages);
 
     let html = exporter
-        .export_messages(title, &message_groups, metadata, final_password.as_deref())
+        .export_messages(
+            title,
+            &message_groups,
+            metadata,
+            final_password.as_ref().map(|password| password.as_str()),
+        )
         .map_err(|e| {
             let err = CliError {
                 code: 5,
@@ -98149,28 +98203,35 @@ fn run_export_html(
         emit_structured_error(&err);
         err
     })?;
-    let mut file =
-        create_unique_export_output_file(&output_directory, &final_filename, &mut output_path)
-            .map_err(|e| {
-                let err = CliError {
-                    code: 4,
-                    kind: CliErrorKind::OutputNotWritable.kind_str(),
-                    message: format!("Could not create output file: {e}"),
-                    hint: Some(format!(
-                        "Check permissions for {}",
-                        output_directory.display()
-                    )),
-                    retryable: false,
-                };
-                emit_structured_error(&err);
-                err
-            })?;
-    file.write_all(html.as_bytes()).map_err(|e| {
+    write_unique_export_output_file(
+        &output_directory,
+        &final_filename,
+        &mut output_path,
+        html.as_bytes(),
+    )
+    .map_err(|e| {
+        let output_unavailable = matches!(
+            e.kind(),
+            io::ErrorKind::PermissionDenied
+                | io::ErrorKind::NotFound
+                | io::ErrorKind::AlreadyExists
+        );
         let err = CliError {
             code: 4,
-            kind: CliErrorKind::WriteFailed.kind_str(),
-            message: format!("Failed to write file: {e}"),
-            hint: None,
+            kind: if output_unavailable {
+                CliErrorKind::OutputNotWritable.kind_str()
+            } else {
+                CliErrorKind::WriteFailed.kind_str()
+            },
+            message: if output_unavailable {
+                format!("Could not create output file: {e}")
+            } else {
+                format!("Failed to publish complete output file: {e}")
+            },
+            hint: Some(format!(
+                "Check permissions and available space for {}",
+                output_directory.display()
+            )),
             retryable: false,
         };
         emit_structured_error(&err);
@@ -98583,6 +98644,31 @@ fn flush_group(
     }
 }
 
+fn standalone_tool_result_group(msg: &html_export::Message) -> html_export::MessageGroup {
+    let mut primary = msg.clone();
+    if primary.content.trim().is_empty()
+        && let Some(output) = primary
+            .tool_call
+            .as_ref()
+            .and_then(|tool_call| tool_call.output.clone())
+    {
+        primary.content = output;
+    }
+
+    if let Some(tool_call) = primary.tool_call.as_ref() {
+        primary.author = Some(match tool_call.status {
+            Some(html_export::ToolStatus::Error) => format!("{} error", tool_call.name),
+            Some(html_export::ToolStatus::Pending) => {
+                format!("{} pending result", tool_call.name)
+            }
+            _ => format!("{} result", tool_call.name),
+        });
+    }
+    primary.role = "tool".to_string();
+    primary.tool_call = None;
+    html_export::MessageGroup::tool_only(primary)
+}
+
 /// Groups flat messages into MessageGroups with tool correlation.
 ///
 /// # Algorithm
@@ -98675,7 +98761,10 @@ pub fn group_messages_for_export(
             }
 
             MessageClassification::ToolResult => {
-                // Tool results attach to current group
+                // Tool results attach to the current group when correlation is
+                // unambiguous. Preserve unmatched/orphaned results as their own
+                // transcript group rather than silently dropping source bytes.
+                let mut attached = false;
                 if let Some(ref mut g) = current_group {
                     // Create a ToolResult from the message
                     let tool_name = msg
@@ -98704,14 +98793,20 @@ pub fn group_messages_for_export(
                         result = result.with_correlation_id(corr_id);
                     }
 
-                    g.add_tool_result(result);
-                    g.update_end_timestamp(msg.timestamp.clone());
-                    trace!(tool_name = %tool_name, "Added tool result to group");
-                } else {
+                    attached = g.add_tool_result(result);
+                    if attached {
+                        g.update_end_timestamp(msg.timestamp.clone());
+                        trace!(tool_name = %tool_name, "Added tool result to group");
+                    }
+                }
+
+                if !attached {
                     debug!(
                         idx = idx,
-                        "Orphan tool result, no current group to attach to"
+                        "Preserving unmatched tool result as a standalone group"
                     );
+                    flush_group(&mut groups, &mut current_group);
+                    current_group = Some(standalone_tool_result_group(msg));
                 }
             }
 
@@ -99033,7 +99128,10 @@ mod opencode_export_tests {
 
 #[cfg(test)]
 mod export_timestamp_tests {
-    use super::{create_unique_export_output_file, extract_message_timestamp, run_export_html};
+    use super::{
+        extract_message_timestamp, publish_unique_export_output_file, run_export_html,
+        write_unique_export_output_file,
+    };
     use serde_json::json;
     use std::fs;
     use std::io::Write;
@@ -99160,11 +99258,13 @@ mod export_timestamp_tests {
 
         fs::write(&output_path, "first writer").expect("create race winner");
 
-        let mut file = create_unique_export_output_file(temp.path(), "out.html", &mut output_path)
-            .expect("retry with suffixed filename");
-        file.write_all(b"second writer")
-            .expect("write retry output");
-        drop(file);
+        write_unique_export_output_file(
+            temp.path(),
+            "out.html",
+            &mut output_path,
+            b"second writer",
+        )
+        .expect("retry with suffixed filename");
 
         assert_eq!(
             fs::read_to_string(temp.path().join("out.html")).expect("read original"),
@@ -99178,6 +99278,62 @@ mod export_timestamp_tests {
             fs::read_to_string(&output_path).expect("read retry output"),
             "second writer"
         );
+    }
+
+    #[test]
+    fn export_output_publish_failure_never_exposes_partial_final_file() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut output_path = temp.path().join("out.html");
+
+        let err = publish_unique_export_output_file(
+            temp.path(),
+            "out.html",
+            &mut output_path,
+            |file| {
+                file.write_all(b"partial bytes")?;
+                Err(std::io::Error::other("injected staged-write failure"))
+            },
+        )
+        .expect_err("injected staged write should fail");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(
+            !output_path.exists(),
+            "a failed staged write must not expose a partial final export"
+        );
+        let retained_entries = fs::read_dir(temp.path())
+            .expect("read output directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            retained_entries.is_empty(),
+            "failed staged export should clean up private temporary files: {retained_entries:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn export_output_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temp dir");
+        let mut output_path = temp.path().join("out.html");
+
+        write_unique_export_output_file(
+            temp.path(),
+            "out.html",
+            &mut output_path,
+            b"private transcript",
+        )
+        .expect("publish private export");
+
+        let mode = fs::metadata(&output_path)
+            .expect("output metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "HTML exports must not be group/world-readable");
     }
 
     #[test]

@@ -347,8 +347,9 @@ impl MessageGroup {
     /// Add a tool result, matching it with an existing call by correlation ID.
     ///
     /// If a matching call is found, the result is attached to it.
-    /// If no match is found, the result is dropped with a warning.
-    pub fn add_tool_result(&mut self, result: ToolResult) {
+    /// If no match is found, returns `false` so the caller can preserve the
+    /// result as a standalone transcript entry instead of silently losing it.
+    pub fn add_tool_result(&mut self, result: ToolResult) -> bool {
         // Try to match by correlation ID first
         if let Some(ref corr_id) = result.correlation_id {
             for tc in &mut self.tool_calls {
@@ -359,7 +360,7 @@ impl MessageGroup {
                         "Matched tool result to call"
                     );
                     tc.result = Some(result);
-                    return;
+                    return true;
                 }
             }
             tracing::warn!(
@@ -367,7 +368,7 @@ impl MessageGroup {
                 correlation_id = %corr_id,
                 "Could not match correlated tool result to any call"
             );
-            return;
+            return false;
         }
 
         // Fall back to matching by tool name (first unmatched call)
@@ -378,7 +379,7 @@ impl MessageGroup {
                     "Matched tool result to call by name"
                 );
                 tc.result = Some(result);
-                return;
+                return true;
             }
         }
 
@@ -387,6 +388,7 @@ impl MessageGroup {
             correlation_id = ?result.correlation_id,
             "Could not match tool result to any call"
         );
+        false
     }
 
     /// Update the end timestamp if the given timestamp is later.
@@ -1901,10 +1903,10 @@ mod tests {
 
         // Add tool calls
         group.add_tool_call(test_tool_call("Read"), Some("toolu_abc123".to_string()));
-        group.add_tool_result(
+        assert!(group.add_tool_result(
             ToolResult::new("Read", "file contents here", ToolStatus::Success)
                 .with_correlation_id("toolu_abc123"),
-        );
+        ));
 
         let opts = RenderOptions::default();
         let html = render_message_group(&group, 0, &opts).unwrap();
@@ -1924,10 +1926,10 @@ mod tests {
         group.add_tool_call(test_tool_call("Read"), Some("toolu_first".to_string()));
         group.add_tool_call(test_tool_call("Read"), Some("toolu_second".to_string()));
 
-        group.add_tool_result(
+        assert!(group.add_tool_result(
             ToolResult::new("Read", "second file contents", ToolStatus::Success)
                 .with_correlation_id("toolu_second"),
-        );
+        ));
 
         assert!(
             group.tool_calls[0].result.is_none(),
@@ -1948,10 +1950,10 @@ mod tests {
         let mut group = MessageGroup::assistant(msg);
         group.add_tool_call(test_tool_call("Read"), Some("toolu_expected".to_string()));
 
-        group.add_tool_result(
+        assert!(!group.add_tool_result(
             ToolResult::new("Read", "wrong file contents", ToolStatus::Success)
                 .with_correlation_id("toolu_other"),
-        );
+        ));
 
         assert!(
             group.tool_calls[0].result.is_none(),

@@ -1,4 +1,7 @@
-use super::{sqlite_artifact_paths, sqlite_content_artifact_paths, sqlite_runtime_artifact_paths};
+use super::{
+    sqlite_artifact_paths, sqlite_content_artifact_paths, sqlite_migration_marker_path,
+    sqlite_runtime_artifact_paths,
+};
 use crate::franken_sync::compat::{
     ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt,
 };
@@ -10,6 +13,7 @@ use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -128,14 +132,19 @@ impl ExportEngine {
         let src = super::open_existing_sqlite_db(&self.source_db_path)
             .context("Failed to open source database")?;
 
-        // 2. Build the export into a unique temp database, then atomically
-        // replace the final output only after a successful commit.
+        // 2. Build into a private writer database, then ask FrankenSQLite to
+        // produce a separate, self-contained candidate with VACUUM INTO. A
+        // brand-new on-disk connection permanently retains its bootstrap WAL;
+        // the engine's bounded image contract therefore explicitly requires
+        // VACUUM INTO rather than publishing an in-place writer database.
+        let builder_path =
+            unique_atomic_sidecar_path(&self.output_path, "builder", "pages_export.db");
         let temp_output_path =
             unique_atomic_sidecar_path(&self.output_path, "tmp", "pages_export.db");
         let mut retain_temp_on_replace_error = false;
         let result = (|| -> Result<(ExportStats, T)> {
-            create_staged_export_file(&temp_output_path)?;
-            let output_path = temp_output_path.to_string_lossy().to_string();
+            create_staged_export_file(&builder_path)?;
+            let output_path = builder_path.to_string_lossy().to_string();
             let dest =
                 Connection::open(&output_path).context("Failed to create output database")?;
 
@@ -526,18 +535,42 @@ impl ExportEngine {
             let source_rollback_result = src_tx
                 .rollback()
                 .context("Failed to close source database read snapshot");
-            let (processed, msg_processed) = match (export_result, source_rollback_result) {
+            let export_result = match (export_result, source_rollback_result) {
+                (Ok(stats), Ok(())) => Ok(stats),
+                (Err(export_error), Ok(())) => Err(export_error),
+                (Ok(_), Err(rollback_error)) => Err(rollback_error),
+                (Err(export_error), Err(rollback_error)) => {
+                    Err(export_error.context(format!(
+                        "source read-snapshot rollback also failed: {rollback_error:#}"
+                    )))
+                }
+            };
+
+            let vacuum_result = match export_result {
+                Ok(stats) => {
+                    let candidate_path = temp_output_path.to_string_lossy();
+                    dest.execute_compat(
+                        "VACUUM INTO ?1;",
+                        params![candidate_path.as_ref()],
+                    )
+                    .context("Failed to materialize self-contained Pages export candidate")
+                    .map(|_| stats)
+                }
+                Err(error) => Err(error),
+            };
+            let close_result = dest
+                .close()
+                .context("Failed to close and checkpoint Pages export builder");
+            let (processed, msg_processed) = match (vacuum_result, close_result) {
                 (Ok(stats), Ok(())) => stats,
                 (Err(export_error), Ok(())) => return Err(export_error),
-                (Ok(_), Err(rollback_error)) => return Err(rollback_error),
-                (Err(export_error), Err(rollback_error)) => {
+                (Ok(_), Err(close_error)) => return Err(close_error),
+                (Err(export_error), Err(close_error)) => {
                     return Err(export_error.context(format!(
-                        "source read-snapshot rollback also failed: {rollback_error:#}"
+                        "Pages export builder close also failed: {close_error:#}"
                     )));
                 }
             };
-            dest.close()
-                .context("Failed to close and checkpoint completed destination export")?;
             finalize_staged_sqlite_sidecars(&temp_output_path)
                 .context("Failed to finalize staged Pages export as one SQLite main file")?;
 
@@ -775,15 +808,114 @@ fn cleanup_sqlite_sidecars(path: &Path) -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
+const STAGED_MIGRATION_MARKER_MAX_BYTES: u64 = 4 * 1024;
+const EXPECTED_STAGED_MIGRATION_VERSION: u32 = 1;
+const STAGED_MIGRATION_CLOCK_SKEW_SECONDS: u64 = 300;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedMigrationMarker {
+    last_upgrade_version: u32,
+    last_run_at: u64,
+    repairs_applied: Vec<String>,
+}
+
+fn remove_expected_staged_migration_marker(path: &Path) -> Result<()> {
+    let marker_path = sqlite_migration_marker_path(path);
+    let metadata = match std::fs::symlink_metadata(&marker_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed inspecting staged FrankenSQLite migration marker {}",
+                    marker_path.display()
+                )
+            });
+        }
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "staged FrankenSQLite migration marker is not a regular file: {}",
+            marker_path.display()
+        );
+    }
+    if metadata.len() > STAGED_MIGRATION_MARKER_MAX_BYTES {
+        bail!(
+            "staged FrankenSQLite migration marker {} is {} bytes, exceeding the {}-byte validation bound",
+            marker_path.display(),
+            metadata.len(),
+            STAGED_MIGRATION_MARKER_MAX_BYTES
+        );
+    }
+
+    let mut bytes = Vec::new();
+    std::fs::File::open(&marker_path)
+        .with_context(|| {
+            format!(
+                "failed opening staged FrankenSQLite migration marker {}",
+                marker_path.display()
+            )
+        })?
+        .take(STAGED_MIGRATION_MARKER_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "failed reading staged FrankenSQLite migration marker {}",
+                marker_path.display()
+            )
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > STAGED_MIGRATION_MARKER_MAX_BYTES {
+        bail!(
+            "staged FrankenSQLite migration marker {} grew beyond the {}-byte validation bound",
+            marker_path.display(),
+            STAGED_MIGRATION_MARKER_MAX_BYTES
+        );
+    }
+
+    let marker: StagedMigrationMarker = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "staged FrankenSQLite migration marker is malformed: {}",
+            marker_path.display()
+        )
+    })?;
+    let latest_sane_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(STAGED_MIGRATION_CLOCK_SKEW_SECONDS);
+    if marker.last_upgrade_version != EXPECTED_STAGED_MIGRATION_VERSION
+        || marker.last_run_at == 0
+        || marker.last_run_at > latest_sane_timestamp
+        || !marker.repairs_applied.is_empty()
+    {
+        bail!(
+            "staged FrankenSQLite migration marker {} is not the expected fresh-database marker-at-birth",
+            marker_path.display()
+        );
+    }
+
+    std::fs::remove_file(&marker_path).with_context(|| {
+        format!(
+            "failed removing validated staged FrankenSQLite migration marker {}",
+            marker_path.display()
+        )
+    })
+}
+
 fn finalize_staged_sqlite_sidecars(path: &Path) -> Result<()> {
     // Rollback journals, WAL/SHM, FrankenSQLite's WAL-FEC recovery files,
-    // parallel-WAL commit certificates, and durable migration marker can
-    // describe database state that does not belong to a standalone main file.
-    // Journal mode is DELETE for Pages exports, so any survivor is unexpected
-    // and must block publication rather than be discarded. Only the explicitly
-    // closed writer's exact lock and namespace paths are operational metadata
-    // that can be removed before main-file-only verification.
-    for sidecar in sqlite_content_artifact_paths(path) {
+    // parallel-WAL commit certificates, and an incomplete migration-marker
+    // write can describe state that does not belong to a standalone main file.
+    // Journal mode is DELETE for Pages exports, so those survivors are
+    // unexpected and must block publication rather than be discarded. The
+    // completed migration marker is handled separately below because pinned
+    // FrankenSQLite stamps a known marker at birth on every new database.
+    let migration_marker = sqlite_migration_marker_path(path);
+    for sidecar in sqlite_content_artifact_paths(path)
+        .into_iter()
+        .filter(|sidecar| sidecar != &migration_marker)
+    {
         match std::fs::symlink_metadata(&sidecar) {
             Ok(_) => {
                 bail!(
@@ -802,6 +934,11 @@ fn finalize_staged_sqlite_sidecars(path: &Path) -> Result<()> {
             }
         }
     }
+
+    // FrankenSQLite 0.3.8 stamps a marker on every fresh on-disk database.
+    // It is removable producer metadata only when its bounded JSON content is
+    // exactly the no-repair marker-at-birth expected for this unique stage.
+    remove_expected_staged_migration_marker(path)?;
 
     let mut first_error = None;
     for sidecar in sqlite_runtime_artifact_paths(path) {
@@ -1726,7 +1863,11 @@ mod tests {
     #[test]
     fn staged_finalization_rejects_content_sidecars_without_mutating_them() -> Result<()> {
         let content_paths = sqlite_content_artifact_paths(Path::new("export.tmp.db"));
-        for relative_path in content_paths {
+        let marker_path = sqlite_migration_marker_path(Path::new("export.tmp.db"));
+        for relative_path in content_paths
+            .into_iter()
+            .filter(|path| path != &marker_path)
+        {
             let temp_dir = TempDir::new()?;
             let staged_path = temp_dir.path().join("export.tmp.db");
             let sentinel_path = temp_dir.path().join(relative_path);
@@ -1754,6 +1895,98 @@ mod tests {
                     sentinel_path.display()
                 ));
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn staged_finalization_removes_only_a_valid_marker_at_birth() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let staged_path = temp_dir.path().join("export.tmp.db");
+        let marker_path = sqlite_migration_marker_path(&staged_path);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        std::fs::write(&staged_path, b"staged main")?;
+        std::fs::write(
+            &marker_path,
+            format!(
+                r#"{{"last_upgrade_version":1,"last_run_at":{now},"repairs_applied":[]}}"#
+            ),
+        )?;
+
+        finalize_staged_sqlite_sidecars(&staged_path)?;
+
+        assert_eq!(std::fs::read(&staged_path)?, b"staged main");
+        assert!(
+            matches!(
+                std::fs::symlink_metadata(&marker_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "validated marker-at-birth survived staged finalization"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_finalization_preserves_invalid_migration_markers() -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let invalid_markers = [
+            ("malformed", b"{".to_vec()),
+            (
+                "wrong-version",
+                format!(
+                    r#"{{"last_upgrade_version":2,"last_run_at":{now},"repairs_applied":[]}}"#
+                )
+                .into_bytes(),
+            ),
+            (
+                "repairs-applied",
+                format!(
+                    r#"{{"last_upgrade_version":1,"last_run_at":{now},"repairs_applied":["repair_orphaned_pages:1"]}}"#
+                )
+                .into_bytes(),
+            ),
+            (
+                "future-timestamp",
+                format!(
+                    r#"{{"last_upgrade_version":1,"last_run_at":{},"repairs_applied":[]}}"#,
+                    now.saturating_add(3_600)
+                )
+                .into_bytes(),
+            ),
+            (
+                "oversized",
+                vec![b'x'; usize::try_from(STAGED_MIGRATION_MARKER_MAX_BYTES)? + 1],
+            ),
+        ];
+
+        for (case, marker_bytes) in invalid_markers {
+            let temp_dir = TempDir::new()?;
+            let staged_path = temp_dir.path().join("export.tmp.db");
+            let marker_path = sqlite_migration_marker_path(&staged_path);
+            std::fs::write(&staged_path, b"staged main")?;
+            std::fs::write(&marker_path, &marker_bytes)?;
+
+            let error = finalize_staged_sqlite_sidecars(&staged_path)
+                .expect_err("an invalid migration marker must block publication");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&marker_path.display().to_string()),
+                "{case} rejection omitted marker path: {message}"
+            );
+            assert_eq!(
+                std::fs::read(&staged_path)?,
+                b"staged main",
+                "{case} rejection mutated staged main"
+            );
+            assert_eq!(
+                std::fs::read(&marker_path)?,
+                marker_bytes,
+                "{case} rejection mutated marker"
+            );
         }
         Ok(())
     }
