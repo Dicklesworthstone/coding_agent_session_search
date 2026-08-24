@@ -15,7 +15,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
-use super::bundle::IntegrityManifest;
+use super::bundle::{IntegrityManifest, validate_pinned_vendor_assets};
 use super::encrypt::{
     EncryptionConfig, KdfAlgorithm, SCHEMA_VERSION, SlotType, validate_supported_payload_format,
 };
@@ -332,6 +332,10 @@ fn check_required_files(site_dir: &Path) -> CheckResult {
     // Also check payload/ directory exists
     if !site_dir.join("payload").is_dir() {
         missing.push("payload/");
+    }
+
+    if let Err(error) = validate_pinned_vendor_assets(site_dir) {
+        invalid.push(format!("vendor runtime ({error:#})"));
     }
 
     if missing.is_empty() && invalid.is_empty() {
@@ -1528,7 +1532,9 @@ fn print_check(name: &str, result: &CheckResult, verbose: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pages::bundle::IntegrityEntry;
+    use crate::pages::bundle::{
+        IntegrityEntry, generate_integrity_manifest, write_pinned_vendor_assets,
+    };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -1542,7 +1548,19 @@ mod tests {
     /// `fixture_name` is the subdirectory under tests/fixtures/pages_verify/ (e.g., "valid", "unencrypted")
     fn copy_fixture(fixture_name: &str, dest: &Path) -> Result<()> {
         let src = fixtures_dir().join(fixture_name).join("site");
-        copy_dir_recursive(&src, dest)
+        let had_integrity_manifest = src.join("integrity.json").is_file();
+        copy_dir_recursive(&src, dest)?;
+        write_pinned_vendor_assets(dest)?;
+
+        if had_integrity_manifest {
+            let manifest = generate_integrity_manifest(dest)?;
+            fs::write(
+                dest.join("integrity.json"),
+                serde_json::to_vec_pretty(&manifest)?,
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Recursively copy a directory and its contents

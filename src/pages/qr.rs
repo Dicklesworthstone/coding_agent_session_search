@@ -22,6 +22,7 @@
 
 #![allow(unexpected_cfgs)]
 
+use crate::pages::encrypt::MIN_RECOVERY_SECRET_BYTES;
 use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use chrono::Utc;
@@ -73,10 +74,11 @@ impl RecoverySecret {
 
     /// Create a recovery secret from existing bytes.
     ///
-    /// Returns None if the bytes are too short (< 24 bytes / 192 bits).
-    /// NIST recommends 192+ bits for long-term cryptographic material.
+    /// Returns None if the material is shorter than the encryption API's
+    /// minimum. This constructor cannot assess caller-supplied entropy; prefer
+    /// [`Self::generate`] for new recovery secrets.
     pub fn from_bytes(bytes: Vec<u8>) -> Option<Self> {
-        if bytes.len() < 24 {
+        if bytes.len() < MIN_RECOVERY_SECRET_BYTES {
             return None;
         }
         let encoded = BASE64_URL_SAFE_NO_PAD.encode(&bytes);
@@ -88,8 +90,10 @@ impl RecoverySecret {
         let bytes = BASE64_URL_SAFE_NO_PAD
             .decode(encoded)
             .context("Invalid base64url encoding")?;
-        if bytes.len() < 24 {
-            bail!("Recovery secret too short (minimum 192 bits for long-term security)");
+        if bytes.len() < MIN_RECOVERY_SECRET_BYTES {
+            bail!(
+                "Recovery secret too short (minimum {MIN_RECOVERY_SECRET_BYTES} bytes / 192 bits)"
+            );
         }
         Ok(Self {
             bytes,

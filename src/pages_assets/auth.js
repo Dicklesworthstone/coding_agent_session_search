@@ -87,9 +87,7 @@ async function init() {
     // Initialize crypto worker
     // Note: Using classic worker (not module) because crypto_worker.js uses importScripts()
     try {
-        worker = new Worker('./crypto_worker.js');
-        worker.onmessage = handleWorkerMessage;
-        worker.onerror = handleWorkerError;
+        initializeCryptoWorker();
     } catch (error) {
         showError('Failed to initialize decryption worker. Your browser may not support Web Workers.');
         console.error('Worker init error:', error);
@@ -189,6 +187,44 @@ function allocateWorkerRequestId() {
     return requestId;
 }
 
+function initializeCryptoWorker() {
+    const nextWorker = new Worker('./crypto_worker.js');
+    nextWorker.onmessage = handleWorkerMessage;
+    nextWorker.onerror = handleWorkerError;
+    worker = nextWorker;
+}
+
+function terminateCryptoWorker() {
+    const previousWorker = worker;
+    worker = null;
+    if (previousWorker) {
+        previousWorker.onmessage = null;
+        previousWorker.onerror = null;
+        previousWorker.terminate();
+    }
+}
+
+/**
+ * Terminate the current worker before creating its replacement. Worker
+ * termination is the hard cancellation boundary for in-flight KDF and
+ * decryption work; a queued CLEAR_KEYS message cannot provide that guarantee.
+ */
+function resetCryptoWorker() {
+    terminateCryptoWorker();
+
+    if (isUnencryptedArchive) {
+        return true;
+    }
+
+    try {
+        initializeCryptoWorker();
+        return true;
+    } catch (error) {
+        console.error('Crypto worker reinitialization failed:', error);
+        return false;
+    }
+}
+
 function beginAppInitAttempt() {
     activeAppInitToken += 1;
     return activeAppInitToken;
@@ -213,14 +249,6 @@ function invalidateQrScannerSession() {
 
 function isCurrentQrScannerSession(sessionToken) {
     return sessionToken === activeQrScannerSession;
-}
-
-function clearWorkerKeys() {
-    try {
-        worker?.postMessage({ type: 'CLEAR_KEYS' });
-    } catch (error) {
-        console.warn('Failed to clear worker keys:', error);
-    }
 }
 
 function clearActiveSessionExpiryTimer() {
@@ -824,25 +852,30 @@ async function handleWorkerError(error) {
         || unlockInFlight
         || !!window.cassSession?.dek;
     invalidateAppInitAttempt();
+    // Do not automatically recreate a worker which has crashed: a missing or
+    // invalid script would otherwise create an unbounded crash/restart loop.
+    terminateCryptoWorker();
     unlockInFlight = false;
     decryptInFlight = false;
-    await closeQrScanner();
     activeUnlockRequestId = null;
     activeDecryptRequestId = null;
     clearActiveSessionExpiry();
-    clearWorkerKeys();
     clearStoredSession();
     window.cassSession = null;
+    if (elements.passwordInput) {
+        elements.passwordInput.value = '';
+    }
+    await closeQrScanner();
     await closeLiveDatabase();
     hideProgress();
-    enableForm();
+    disableForm();
     if (hadActiveSession) {
         broadcastAuthLock('lock');
         elements.appScreen.classList.add('hidden');
         elements.authScreen.classList.remove('hidden');
         elements.passwordInput.value = '';
     }
-    showError('An error occurred during decryption. Please try again.');
+    showError('The decryption worker stopped unexpectedly. Reload this page to try again.');
 }
 
 /**
@@ -852,6 +885,9 @@ function handleUnlockSuccess(data) {
     unlockInFlight = false;
     activeUnlockRequestId = null;
     hideProgress();
+    if (elements.passwordInput) {
+        elements.passwordInput.value = '';
+    }
 
     // Store session key in memory
     window.cassSession = {
@@ -949,16 +985,22 @@ async function handleDecryptSuccess(data) {
  */
 function handleDecryptFailed(data) {
     invalidateAppInitAttempt();
+    const workerReady = resetCryptoWorker();
     decryptInFlight = false;
     activeDecryptRequestId = null;
     void closeQrScanner();
     hideProgress();
-    showError(`Decryption failed: ${data.error}`);
-    enableForm();
+    showError(workerReady
+        ? `Decryption failed: ${data.error}`
+        : 'The decryption worker could not be restarted. Reload this page to try again.');
+    if (workerReady) {
+        enableForm();
+    } else {
+        disableForm();
+    }
     elements.appScreen.classList.add('hidden');
     elements.authScreen.classList.remove('hidden');
     clearActiveSessionExpiry();
-    clearWorkerKeys();
     clearStoredSession();
     window.cassSession = null;
     void closeLiveDatabase();
@@ -982,26 +1024,32 @@ async function recoverFromAppInitFailure(message, error, initToken = activeAppIn
         return;
     }
     invalidateAppInitAttempt();
+    const workerReady = resetCryptoWorker();
     console.error(message, error);
     unlockInFlight = false;
     decryptInFlight = false;
-    await closeQrScanner();
     activeUnlockRequestId = null;
     activeDecryptRequestId = null;
     clearActiveSessionExpiry();
-    clearWorkerKeys();
     clearStoredSession();
     window.cassSession = null;
-    await closeLiveDatabase();
-    broadcastAuthLock('lock');
-    hideProgress();
-    enableForm();
-    elements.appScreen.classList.add('hidden');
-    elements.authScreen.classList.remove('hidden');
     if (elements.passwordInput) {
         elements.passwordInput.value = '';
     }
-    showError(message);
+    await closeQrScanner();
+    await closeLiveDatabase();
+    broadcastAuthLock('lock');
+    hideProgress();
+    if (workerReady) {
+        enableForm();
+    } else {
+        disableForm();
+    }
+    elements.appScreen.classList.add('hidden');
+    elements.authScreen.classList.remove('hidden');
+    showError(workerReady
+        ? message
+        : 'The decryption worker could not be restarted. Reload this page to try again.');
 }
 
 /**
@@ -1201,9 +1249,9 @@ async function closeLiveDatabase() {
 async function lockArchive(options = {}) {
     const { broadcast = false, action = 'lock' } = options;
     invalidateAppInitAttempt();
+    const workerReady = resetCryptoWorker();
     unlockInFlight = false;
     decryptInFlight = false;
-    await closeQrScanner();
     activeUnlockRequestId = null;
     activeDecryptRequestId = null;
     clearActiveSessionExpiry();
@@ -1211,9 +1259,8 @@ async function lockArchive(options = {}) {
     // Clear session
     window.cassSession = null;
     clearStoredSession();
-
-    // Tell worker to clear keys
-    clearWorkerKeys();
+    elements.passwordInput.value = '';
+    await closeQrScanner();
 
     if (broadcast) {
         broadcastAuthLock(action);
@@ -1226,9 +1273,13 @@ async function lockArchive(options = {}) {
     elements.authScreen.classList.remove('hidden');
 
     // Reset form
-    elements.passwordInput.value = '';
-    enableForm();
-    hideError();
+    if (workerReady) {
+        enableForm();
+        hideError();
+    } else {
+        disableForm();
+        showError('The decryption worker could not be restarted. Reload this page to try again.');
+    }
     hideProgress();
 }
 

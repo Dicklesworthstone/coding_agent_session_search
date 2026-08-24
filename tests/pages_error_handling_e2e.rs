@@ -817,6 +817,87 @@ fn test_graceful_degradation_corrupted_archive() {
     );
 }
 
+#[test]
+fn browser_lock_terminates_in_flight_crypto_before_reinitializing() {
+    let auth_js = include_str!("../src/pages_assets/auth.js");
+    let terminate_body = auth_js
+        .split_once("function terminateCryptoWorker()")
+        .expect("auth.js should define the crypto-worker termination boundary")
+        .1
+        .split_once("function resetCryptoWorker()")
+        .expect("worker termination should remain a bounded helper")
+        .0;
+    assert!(
+        terminate_body.contains("previousWorker.terminate();"),
+        "worker termination must cancel in-flight cryptographic work"
+    );
+
+    let reset_body = auth_js
+        .split_once("function resetCryptoWorker()")
+        .expect("auth.js should define the crypto-worker reset boundary")
+        .1
+        .split_once("function beginAppInitAttempt()")
+        .expect("worker reset should remain a bounded helper")
+        .0;
+    let terminate_offset = reset_body
+        .find("terminateCryptoWorker();")
+        .expect("worker reset must use the hard termination boundary");
+    let reinitialize_offset = reset_body
+        .find("initializeCryptoWorker();")
+        .expect("worker reset must create a clean replacement");
+    assert!(
+        terminate_offset < reinitialize_offset,
+        "the old worker must be terminated before its replacement is started"
+    );
+
+    let lock_body = auth_js
+        .split_once("async function lockArchive(options = {})")
+        .expect("auth.js should define lockArchive")
+        .1
+        .split_once("async function loadQrScannerLibrary()")
+        .expect("lockArchive should remain a bounded helper")
+        .0;
+    let reset_offset = lock_body
+        .find("const workerReady = resetCryptoWorker();")
+        .expect("locking must reset the crypto worker");
+    let clear_session_offset = lock_body
+        .find("window.cassSession = null;")
+        .expect("locking must clear the in-memory session key");
+    let first_await_offset = lock_body
+        .find("await closeQrScanner();")
+        .expect("locking should still close the QR scanner");
+    assert!(
+        reset_offset < first_await_offset,
+        "worker termination must happen synchronously before lockArchive yields"
+    );
+    assert!(
+        clear_session_offset < first_await_offset,
+        "the in-memory session key must be cleared before lockArchive yields"
+    );
+    assert!(
+        !auth_js.contains("postMessage({ type: 'CLEAR_KEYS' })"),
+        "a queued CLEAR_KEYS message is not a cancellation boundary"
+    );
+
+    let unlock_success_body = auth_js
+        .split_once("function handleUnlockSuccess(data)")
+        .expect("auth.js should define the successful-unlock transition")
+        .1
+        .split_once("function handleUnlockFailed(data)")
+        .expect("successful unlock should remain a bounded helper")
+        .0;
+    let clear_password_offset = unlock_success_body
+        .find("elements.passwordInput.value = '';")
+        .expect("a successful unlock must erase the password input");
+    let persist_session_offset = unlock_success_body
+        .find("persistSession(data.dek);")
+        .expect("successful unlock should still establish the configured session");
+    assert!(
+        clear_password_offset < persist_session_offset,
+        "the plaintext password must not remain in the DOM for the unlocked session"
+    );
+}
+
 // =============================================================================
 // Performance: Error Path Performance
 // =============================================================================

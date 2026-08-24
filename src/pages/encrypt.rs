@@ -36,7 +36,10 @@ pub const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 /// Maximum chunk size (32 MiB)
 pub const MAX_CHUNK_SIZE: usize = 32 * 1024 * 1024;
-/// Recovery material must carry at least 192 bits of caller-supplied entropy.
+/// Minimum recovery-material length accepted by the raw encryption API.
+///
+/// Length alone cannot prove entropy; callers should normally use
+/// [`crate::pages::qr::RecoverySecret::generate`] to obtain 256 random bits.
 pub const MIN_RECOVERY_SECRET_BYTES: usize = 24;
 
 const MAX_ARCHIVE_CHUNKS: u64 = u32::MAX as u64;
@@ -1833,7 +1836,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_slot_enforces_minimum_entropy_length() {
+    fn recovery_slot_enforces_minimum_material_length() {
         let mut engine = EncryptionEngine::default();
         let err = engine
             .add_recovery_slot(&[0xA5; MIN_RECOVERY_SECRET_BYTES - 1])

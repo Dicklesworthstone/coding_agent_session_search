@@ -5,44 +5,25 @@
  * All expensive cryptographic operations run here to keep the main thread responsive.
  */
 
-// State
-let dek = null;
-let config = null;
+// Key state is retained only so CLEAR_KEYS can explicitly zero the most
+// recently returned DEK. All request processing uses request-local config and
+// key bytes so overlapping messages cannot cross-contaminate archive context.
+let currentDek = null;
+let activeUnlockGeneration = 0;
+let argon2LoadPromise = null;
 
 const MAX_ARCHIVE_CHUNK_SIZE = 32 * 1024 * 1024;
 const MAX_ARCHIVE_CHUNKS = 0xFFFFFFFF;
 const MIN_RECOVERY_SECRET_BYTES = 24;
 const AES_GCM_TAG_SIZE = 16;
 const MAX_DEFLATE_OVERHEAD_ALLOWANCE = 64 * 1024;
+const FFLATE_INPUT_SLICE_SIZE = 16 * 1024;
+const MAX_ARGON2_WASM_SIZE = 1024 * 1024;
 const SUPPORTED_ARGON2_PARAMS = Object.freeze({
     memory_kb: 65536,
     iterations: 3,
     parallelism: 4,
 });
-
-function hashScopeId(input) {
-    let hash = 0x811c9dc5;
-    for (let i = 0; i < input.length; i++) {
-        hash ^= input.charCodeAt(i);
-        hash = Math.imul(hash, 0x01000193) >>> 0;
-    }
-    return hash.toString(16).padStart(8, '0');
-}
-
-function getArchiveScopeId() {
-    try {
-        return hashScopeId(new URL('./', self.location.href).href);
-    } catch (error) {
-        const href = typeof self?.location?.href === 'string'
-            ? self.location.href
-            : 'unknown';
-        return hashScopeId(href.split('#')[0].split('?')[0]);
-    }
-}
-
-function getArchiveOpfsDbName() {
-    return `cass-archive-${getArchiveScopeId()}.db`;
-}
 
 /**
  * Handle messages from main thread
@@ -75,7 +56,7 @@ self.onmessage = async (event) => {
                 break;
 
             case 'DECRYPT_DATABASE':
-                await handleDecryptDatabase(data.dek, data.config, data.opfsEnabled, requestId);
+                await handleDecryptDatabase(data.dek, data.config, requestId);
                 break;
 
             case 'CLEAR_KEYS':
@@ -107,112 +88,166 @@ function getWorkerFailureMessageType(type) {
     }
 }
 
+function clearCurrentDek() {
+    if (currentDek instanceof Uint8Array) {
+        currentDek.fill(0);
+    }
+    currentDek = null;
+}
+
+function beginUnlockAttempt() {
+    activeUnlockGeneration += 1;
+    clearCurrentDek();
+    return activeUnlockGeneration;
+}
+
+function invalidateUnlockAttempts() {
+    activeUnlockGeneration += 1;
+    clearCurrentDek();
+}
+
+function ensureCurrentUnlockAttempt(generation) {
+    if (generation !== activeUnlockGeneration) {
+        throw new Error('Unlock request was superseded');
+    }
+}
+
+function commitUnlockResult(generation, unwrappedDek, requestId) {
+    if (!(unwrappedDek instanceof Uint8Array) || unwrappedDek.byteLength !== 32) {
+        unwrappedDek?.fill?.(0);
+        throw new Error('Unwrapped data encryption key has an invalid length');
+    }
+    try {
+        ensureCurrentUnlockAttempt(generation);
+    } catch (error) {
+        unwrappedDek.fill(0);
+        throw error;
+    }
+
+    clearCurrentDek();
+    currentDek = unwrappedDek;
+    self.postMessage({
+        type: 'UNLOCK_SUCCESS',
+        dek: arrayToBase64(currentDek),
+        requestId,
+    });
+}
+
 /**
  * Handle password-based unlock
  */
 async function handleUnlockPassword(password, cfg, requestId) {
-    config = cfg;
-    validateSupportedPayloadFormat(config);
-    if (typeof password !== 'string' || password.trim().length === 0) {
-        throw new Error('Please enter a password');
-    }
+    const generation = beginUnlockAttempt();
+    let committed = false;
+    try {
+        validateSupportedPayloadFormat(cfg);
+        if (typeof password !== 'string' || password.trim().length === 0) {
+            throw new Error('Please enter a password');
+        }
 
-    // Find password slot
-    const passwordSlots = config.key_slots.filter(
-        slot => slot.slot_type === 'password' && isValidKeySlotMetadata(slot)
-    );
-    if (passwordSlots.length === 0) {
-        throw new Error('No password slot found in archive');
-    }
+        const passwordSlots = cfg.key_slots.filter(
+            slot => slot.slot_type === 'password' && isValidKeySlotMetadata(slot)
+        );
+        if (passwordSlots.length === 0) {
+            throw new Error('No password slot found in archive');
+        }
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Deriving key...', percent: 10, requestId });
+        self.postMessage({ type: 'PROGRESS', phase: 'Deriving key...', percent: 10, requestId });
 
-    // Try each password slot
-    for (const slot of passwordSlots) {
-        try {
-            const kek = await deriveKekFromPassword(password, slot);
-            self.postMessage({ type: 'PROGRESS', phase: 'Unwrapping key...', percent: 80, requestId });
+        for (const slot of passwordSlots) {
+            let kek = null;
+            try {
+                ensureCurrentUnlockAttempt(generation);
+                kek = await deriveKekFromPassword(password, slot);
+                ensureCurrentUnlockAttempt(generation);
+                self.postMessage({ type: 'PROGRESS', phase: 'Unwrapping key...', percent: 80, requestId });
 
-            const unwrappedDek = await unwrapDek(kek, slot, config.export_id);
-            dek = unwrappedDek;
+                const unwrappedDek = await unwrapDek(kek, slot, cfg.export_id);
+                commitUnlockResult(generation, unwrappedDek, requestId);
+                committed = true;
+                return;
+            } catch (error) {
+                ensureCurrentUnlockAttempt(generation);
+                console.debug('Slot unlock failed:', error);
+            } finally {
+                kek?.fill(0);
+            }
+        }
 
-            self.postMessage({
-                type: 'UNLOCK_SUCCESS',
-                dek: arrayToBase64(dek),
-                requestId,
-            });
-            return;
-        } catch (error) {
-            // Try next slot
-            console.debug('Slot unlock failed:', error);
+        throw new Error('Incorrect password');
+    } finally {
+        if (!committed && generation === activeUnlockGeneration) {
+            clearCurrentDek();
         }
     }
-
-    throw new Error('Incorrect password');
 }
 
 /**
  * Handle recovery secret-based unlock
  */
 async function handleUnlockRecovery(recoverySecret, cfg, requestId) {
-    config = cfg;
-    validateSupportedPayloadFormat(config);
+    const generation = beginUnlockAttempt();
+    let committed = false;
+    let secretBytes = null;
+    try {
+        validateSupportedPayloadFormat(cfg);
 
-    // Find recovery slot
-    const recoverySlots = config.key_slots.filter(
-        slot => slot.slot_type === 'recovery' && isValidKeySlotMetadata(slot)
-    );
-    if (recoverySlots.length === 0) {
-        throw new Error('No recovery slot found in archive');
-    }
-
-    self.postMessage({ type: 'PROGRESS', phase: 'Deriving key...', percent: 10, requestId });
-
-    // Convert recovery secret to bytes
-    let secretBytes;
-    if (typeof recoverySecret === 'string') {
-        // Try base64 first, then UTF-8
-        try {
-            secretBytes = base64ToArray(recoverySecret);
-        } catch {
-            secretBytes = new TextEncoder().encode(recoverySecret);
+        const recoverySlots = cfg.key_slots.filter(
+            slot => slot.slot_type === 'recovery' && isValidKeySlotMetadata(slot)
+        );
+        if (recoverySlots.length === 0) {
+            throw new Error('No recovery slot found in archive');
         }
-    } else {
-        secretBytes = recoverySecret;
-    }
-    if (!(secretBytes instanceof Uint8Array) || secretBytes.byteLength < MIN_RECOVERY_SECRET_BYTES) {
-        throw new Error('Recovery secret must contain at least 192 bits');
-    }
 
-    // Try each recovery slot
-    for (const slot of recoverySlots) {
-        try {
-            const kek = await deriveKekFromRecovery(secretBytes, slot);
-            self.postMessage({ type: 'PROGRESS', phase: 'Unwrapping key...', percent: 80, requestId });
+        self.postMessage({ type: 'PROGRESS', phase: 'Deriving key...', percent: 10, requestId });
 
-            const unwrappedDek = await unwrapDek(kek, slot, config.export_id);
-            dek = unwrappedDek;
+        if (typeof recoverySecret === 'string') {
+            try {
+                secretBytes = base64ToArray(recoverySecret);
+            } catch {
+                secretBytes = new TextEncoder().encode(recoverySecret);
+            }
+        } else if (recoverySecret instanceof Uint8Array) {
+            secretBytes = new Uint8Array(recoverySecret);
+        }
+        if (!secretBytes || secretBytes.byteLength < MIN_RECOVERY_SECRET_BYTES) {
+            throw new Error('Recovery secret must contain at least 192 bits');
+        }
 
-            self.postMessage({
-                type: 'UNLOCK_SUCCESS',
-                dek: arrayToBase64(dek),
-                requestId,
-            });
-            return;
-        } catch (error) {
-            // Try next slot
-            console.debug('Recovery slot unlock failed:', error);
+        for (const slot of recoverySlots) {
+            let kek = null;
+            try {
+                ensureCurrentUnlockAttempt(generation);
+                kek = await deriveKekFromRecovery(secretBytes, slot);
+                ensureCurrentUnlockAttempt(generation);
+                self.postMessage({ type: 'PROGRESS', phase: 'Unwrapping key...', percent: 80, requestId });
+
+                const unwrappedDek = await unwrapDek(kek, slot, cfg.export_id);
+                commitUnlockResult(generation, unwrappedDek, requestId);
+                committed = true;
+                return;
+            } catch (error) {
+                ensureCurrentUnlockAttempt(generation);
+                console.debug('Recovery slot unlock failed:', error);
+            } finally {
+                kek?.fill(0);
+            }
+        }
+
+        throw new Error('Invalid recovery code');
+    } finally {
+        secretBytes?.fill(0);
+        if (!committed && generation === activeUnlockGeneration) {
+            clearCurrentDek();
         }
     }
-
-    throw new Error('Invalid recovery code');
 }
 
 /**
  * Derive KEK from password using Argon2id
  */
 async function deriveKekFromPassword(password, slot) {
-    const params = slot.argon2_params || config.kdf_defaults;
+    const params = slot.argon2_params;
     const salt = base64ToArray(slot.salt);
 
     // Load Argon2 if not loaded
@@ -303,33 +338,36 @@ async function unwrapDek(kek, slot, exportId) {
 /**
  * Handle database decryption
  */
-async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled, requestId) {
-    config = cfg;
-    validateSupportedPayloadFormat(config);
-    dek = base64ToArray(dekBase64);
-    if (dek.byteLength !== 32) {
-        throw new Error('Invalid data encryption key length');
-    }
-    const { payload } = config;
-    const totalChunks = payload.chunk_count;
-    const baseNonce = base64ToArray(config.base_nonce);
-    const exportId = base64ToArray(config.export_id);
+async function handleDecryptDatabase(dekBase64, cfg, requestId) {
+    invalidateUnlockAttempts();
+    validateSupportedPayloadFormat(cfg);
+    const requestDek = base64ToArray(dekBase64);
+    const plaintextChunks = [];
+    let dbBytes = null;
+    try {
+        if (requestDek.byteLength !== 32) {
+            throw new Error('Invalid data encryption key length');
+        }
+        const { payload } = cfg;
+        const totalChunks = payload.chunk_count;
+        const baseNonce = base64ToArray(cfg.base_nonce);
+        const exportId = base64ToArray(cfg.export_id);
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Decrypting...', percent: 0, requestId });
+        self.postMessage({ type: 'PROGRESS', phase: 'Decrypting...', percent: 0, requestId });
 
-    // Import DEK for decryption
-    const dekKey = await crypto.subtle.importKey(
-        'raw',
-        dek,
-        { name: 'AES-GCM' },
-        false,
-        ['decrypt']
-    );
+        // Import DEK for decryption. The CryptoKey and all archive context are
+        // request-local so overlapping messages cannot swap export metadata.
+        const dekKey = await crypto.subtle.importKey(
+            'raw',
+            requestDek,
+            { name: 'AES-GCM' },
+            false,
+            ['decrypt']
+        );
 
     // Decrypt and decompress each chunk. Rust writes one independent deflate
     // stream per encrypted chunk, so concatenating compressed streams before
     // inflate would drop data in browsers/engines that stop at the first stream.
-    const plaintextChunks = [];
     let totalDecrypted = 0;
     let totalCiphertext = 0;
 
@@ -415,23 +453,33 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled, requestId) {
 
     self.postMessage({ type: 'PROGRESS', phase: 'Loading database...', percent: 95, requestId });
 
-    // Store in OPFS or memory
-    const dbBytes = concatenateChunks(plaintextChunks);
+    dbBytes = concatenateChunks(plaintextChunks);
+    for (const plaintext of plaintextChunks) {
+        plaintext.fill(0);
+    }
+    const dbSize = dbBytes.byteLength;
+    // concatenateChunks() creates an exact full-buffer view, so transfer that
+    // buffer directly instead of retaining a second plaintext database copy.
+    const transfer = dbBytes.buffer;
 
-    const transfer = dbBytes.buffer.slice(
-        dbBytes.byteOffset,
-        dbBytes.byteOffset + dbBytes.byteLength
-    );
-
-    self.postMessage(
-        {
-            type: 'DECRYPT_SUCCESS',
-            dbSize: dbBytes.byteLength,
-            dbBytes: transfer,
-            requestId,
-        },
-        [transfer]
-    );
+        self.postMessage(
+            {
+                type: 'DECRYPT_SUCCESS',
+                dbSize,
+                dbBytes: transfer,
+                requestId,
+            },
+            [transfer]
+        );
+    } finally {
+        requestDek.fill(0);
+        for (const plaintext of plaintextChunks) {
+            plaintext.fill(0);
+        }
+        if (dbBytes?.byteLength) {
+            dbBytes.fill(0);
+        }
+    }
 }
 
 function validateSupportedPayloadFormat(cfg) {
@@ -668,8 +716,18 @@ function concatenateChunks(chunks) {
 async function decompressDeflate(compressed, maximumOutputBytes) {
     // Prefer native streaming decompression when available so expansion can be
     // stopped before an archive-controlled stream allocates unbounded memory.
-    if (self.DecompressionStream) {
-        const ds = new self.DecompressionStream('deflate-raw');
+    let nativeStream = null;
+    if (typeof self.DecompressionStream === 'function') {
+        try {
+            nativeStream = new self.DecompressionStream('deflate-raw');
+        } catch (error) {
+            // Safari and older Chromium builds may expose the constructor but
+            // reject deflate-raw. Continue through the bounded fflate path.
+            console.debug('Native deflate-raw decompression unavailable:', error);
+        }
+    }
+    if (nativeStream) {
+        const ds = nativeStream;
         const writer = ds.writable.getWriter();
         const reader = ds.readable.getReader();
         const chunks = [];
@@ -728,7 +786,18 @@ async function decompressDeflate(compressed, maximumOutputBytes) {
         finalChunkSeen ||= final;
     });
     try {
-        inflater.push(compressed, true);
+        if (compressed.byteLength === 0) {
+            inflater.push(compressed, true);
+        } else {
+            const sliceSize = Math.min(
+                FFLATE_INPUT_SLICE_SIZE,
+                Math.max(1, maximumOutputBytes)
+            );
+            for (let offset = 0; offset < compressed.byteLength; offset += sliceSize) {
+                const end = Math.min(offset + sliceSize, compressed.byteLength);
+                inflater.push(compressed.subarray(offset, end), end === compressed.byteLength);
+            }
+        }
     } catch (error) {
         if (error === limitError) {
             throw limitError;

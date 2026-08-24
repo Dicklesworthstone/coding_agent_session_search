@@ -103,30 +103,13 @@ impl ExportEngine {
         F: Fn(usize, usize),
         V: FnOnce(&Path) -> Result<T>,
     {
-        let src_canon = std::fs::canonicalize(&self.source_db_path)
-            .unwrap_or_else(|_| self.source_db_path.clone());
-        let out_canon =
-            std::fs::canonicalize(&self.output_path).unwrap_or_else(|_| self.output_path.clone());
-        if src_canon == out_canon {
-            bail!("output path must be different from source database path");
-        }
+        let output_path = resolve_export_output_path(&self.source_db_path, &self.output_path)?;
 
-        if self.output_path.exists() && self.output_path.is_dir() {
+        if output_path.exists() && output_path.is_dir() {
             bail!(
                 "output path points to a directory, expected a file: {}",
-                self.output_path.display()
+                output_path.display()
             );
-        }
-
-        if let Some(parent) = self.output_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create export output directory {}",
-                    parent.display()
-                )
-            })?;
         }
 
         // 1. Open source DB
@@ -139,12 +122,12 @@ impl ExportEngine {
         // the engine's bounded image contract therefore explicitly requires
         // VACUUM INTO rather than publishing an in-place writer database.
         let builder_path = unpredictable_atomic_sidecar_path(
-            &self.output_path,
+            &output_path,
             "builder",
             "pages_export.db",
         )?;
         let temp_output_path =
-            unpredictable_atomic_sidecar_path(&self.output_path, "tmp", "pages_export.db")?;
+            unpredictable_atomic_sidecar_path(&output_path, "tmp", "pages_export.db")?;
         let mut retain_temp_on_replace_error = false;
         let mut builder_owned = false;
         let mut candidate_owned = false;
@@ -580,7 +563,7 @@ impl ExportEngine {
 
             replace_file_from_temp(
                 &temp_output_path,
-                &self.output_path,
+                &output_path,
                 &mut retain_temp_on_replace_error,
             )
             .context("Failed to install completed export database")?;
@@ -658,6 +641,105 @@ impl ExportEngine {
             }
         }
     }
+}
+
+/// Resolve the destination entry only after its parent exists, then prove it
+/// does not name the source database.
+///
+/// Canonicalizing a not-yet-created output path and falling back to its raw
+/// spelling is unsafe: creating a missing parent can make a path containing
+/// `..` start resolving to an existing source file. Resolve the parent first
+/// and use that stable directory spelling for staging and publication so the
+/// alias check and the eventual rename address the same entry.
+fn resolve_export_output_path(source_db_path: &Path, output_path: &Path) -> Result<PathBuf> {
+    let source_canonical = std::fs::canonicalize(source_db_path).with_context(|| {
+        format!(
+            "Failed to resolve source database path {}",
+            source_db_path.display()
+        )
+    })?;
+    let output_name = output_path.file_name().ok_or_else(|| {
+        anyhow::anyhow!(
+            "export output path has no file name: {}",
+            output_path.display()
+        )
+    })?;
+    let output_parent = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(output_parent).with_context(|| {
+        format!(
+            "Failed to create export output directory {}",
+            output_parent.display()
+        )
+    })?;
+    let resolved_parent = std::fs::canonicalize(output_parent).with_context(|| {
+        format!(
+            "Failed to resolve export output directory {}",
+            output_parent.display()
+        )
+    })?;
+    let resolved_output = resolved_parent.join(output_name);
+
+    match std::fs::canonicalize(&resolved_output) {
+        Ok(output_canonical) if output_canonical == source_canonical => {
+            bail!("output path must be different from source database path");
+        }
+        Ok(_) if existing_regular_files_share_identity(&source_canonical, &resolved_output)? => {
+            bail!(
+                "output path must not refer to the same filesystem object as the source database"
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to resolve export output path {}",
+                    resolved_output.display()
+                )
+            });
+        }
+    }
+
+    Ok(resolved_output)
+}
+
+fn existing_regular_files_share_identity(first: &Path, second: &Path) -> Result<bool> {
+    let first_file = std::fs::File::open(first)
+        .with_context(|| format!("Failed to open source identity probe {}", first.display()))?;
+    if !first_file
+        .metadata()
+        .with_context(|| format!("Failed to inspect source identity probe {}", first.display()))?
+        .is_file()
+    {
+        return Ok(false);
+    }
+    let second_file = std::fs::File::open(second).with_context(|| {
+        format!(
+            "Failed to open export output identity probe {}",
+            second.display()
+        )
+    })?;
+    if !second_file
+        .metadata()
+        .with_context(|| {
+            format!(
+                "Failed to inspect export output identity probe {}",
+                second.display()
+            )
+        })?
+        .is_file()
+    {
+        return Ok(false);
+    }
+
+    let first_identity = crate::franken_sync::FileIdentity::from_file(&first_file)
+        .context("Failed to identify source database filesystem object")?;
+    let second_identity = crate::franken_sync::FileIdentity::from_file(&second_file)
+        .context("Failed to identify export output filesystem object")?;
+    Ok(first_identity.is_some() && first_identity == second_identity)
 }
 
 type MessageExportRow = (
@@ -860,22 +942,69 @@ fn cleanup_sqlite_temp_artifacts(path: &Path) -> Result<()> {
     // bounded directory scan cannot prove the dynamic WAL-segment set, fail
     // without mutation rather than losing the namespace anchor first.
     let sidecars = sqlite_artifact_paths(path)?;
-    let main_result = match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(anyhow::Error::new(err).context(format!(
-            "failed removing staged SQLite artifact {}",
+    let main_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ensure_no_unbound_sqlite_sidecars(path, sidecars);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed inspecting staged SQLite artifact {} before cleanup",
+                    path.display()
+                )
+            });
+        }
+    };
+    if !main_metadata.file_type().is_file() {
+        bail!(
+            "staged SQLite artifact {} is no longer a regular file; preserved every companion",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    if main_metadata.nlink() != 1 {
+        bail!(
+            "staged SQLite artifact {} has {} hard links; preserved every companion because exclusive pathname ownership is no longer provable",
+            path.display(),
+            main_metadata.nlink()
+        );
+    }
+
+    match std::fs::remove_file(path) {
+        Ok(()) => cleanup_sqlite_sidecars(sidecars),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ensure_no_unbound_sqlite_sidecars(path, sidecars)
+        }
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "failed removing staged SQLite artifact {}; preserved every companion",
             path.display()
         ))),
-    };
-    let sidecar_result = cleanup_sqlite_sidecars(sidecars);
-    match (main_result, sidecar_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(main_error), Err(sidecar_error)) => Err(main_error.context(format!(
-            "staged SQLite sidecar cleanup also failed: {sidecar_error:#}"
-        ))),
     }
+}
+
+fn ensure_no_unbound_sqlite_sidecars(path: &Path, sidecars: Vec<PathBuf>) -> Result<()> {
+    for sidecar in sidecars {
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => {
+                bail!(
+                    "staged SQLite main file {} disappeared before cleanup while companion {} still exists; preserved the companion because pathname ownership is no longer provable",
+                    path.display(),
+                    sidecar.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed inspecting staged SQLite companion {} after main-file disappearance",
+                        sidecar.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn create_staged_export_file(path: &Path) -> Result<()> {
@@ -1742,6 +1871,75 @@ mod tests {
         assert!(engine.output_path.starts_with(temp_dir.path()));
     }
 
+    #[test]
+    fn output_resolution_rejects_alias_created_by_missing_parent() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let source_path = temp_dir.path().join("source.db");
+        let missing_parent = temp_dir.path().join("created-during-export");
+        let output_path = missing_parent.join("..").join("source.db");
+        std::fs::write(&source_path, b"source generation")?;
+
+        assert!(
+            std::fs::canonicalize(&output_path).is_err(),
+            "the regression requires the raw output alias to be unresolved before its parent exists"
+        );
+        let error = resolve_export_output_path(&source_path, &output_path)
+            .expect_err("creating the parent must expose and reject the source alias");
+
+        assert!(
+            format!("{error:#}").contains("output path must be different"),
+            "unexpected alias rejection: {error:#}"
+        );
+        assert!(
+            missing_parent.is_dir(),
+            "the test must cross the state transition that used to make the alias dangerous"
+        );
+        assert_eq!(
+            std::fs::read(&source_path)?,
+            b"source generation",
+            "alias rejection must preserve the source database"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn output_resolution_returns_entry_under_resolved_created_parent() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let source_path = temp_dir.path().join("source.db");
+        let output_path = temp_dir.path().join("new-parent").join("export.db");
+        std::fs::write(&source_path, b"source generation")?;
+
+        let resolved = resolve_export_output_path(&source_path, &output_path)?;
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(temp_dir.path().join("new-parent"))?.join("export.db")
+        );
+        assert_ne!(resolved, std::fs::canonicalize(source_path)?);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_resolution_rejects_existing_hard_link_to_source() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let source_path = temp_dir.path().join("source.db");
+        let output_path = temp_dir.path().join("export.db");
+        std::fs::write(&source_path, b"source generation")?;
+        std::fs::hard_link(&source_path, &output_path)?;
+
+        let error = resolve_export_output_path(&source_path, &output_path)
+            .expect_err("an existing output with the source identity must be rejected");
+
+        assert!(
+            format!("{error:#}").contains("same filesystem object"),
+            "unexpected filesystem-identity rejection: {error:#}"
+        );
+        assert_eq!(std::fs::read(source_path)?, b"source generation");
+        assert_eq!(std::fs::read(output_path)?, b"source generation");
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn replacement_path_entry_exists_detects_dangling_symlink() -> Result<()> {
@@ -1851,6 +2049,85 @@ mod tests {
                 ));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_export_cleanup_preserves_sidecars_when_main_removal_fails() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let staged_path = temp_dir.path().join("export.tmp.db");
+        let sidecar_path = sqlite_content_artifact_paths(&staged_path)
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("SQLite artifact family unexpectedly empty"))?;
+        std::fs::create_dir(&staged_path)?;
+        std::fs::write(&sidecar_path, b"recovery bytes")?;
+
+        let error = cleanup_sqlite_temp_artifacts(&staged_path)
+            .expect_err("a non-file main path must make cleanup fail closed");
+
+        assert!(
+            format!("{error:#}").contains("preserved every companion"),
+            "unexpected main-removal error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&sidecar_path)?,
+            b"recovery bytes",
+            "failed main removal must not destroy a recoverable companion"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_export_cleanup_preserves_sidecars_after_main_identity_loss() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let staged_path = temp_dir.path().join("export.tmp.db");
+        let sidecar_path = sqlite_content_artifact_paths(&staged_path)
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("SQLite artifact family unexpectedly empty"))?;
+        std::fs::write(&sidecar_path, b"unbound recovery bytes")?;
+
+        let error = cleanup_sqlite_temp_artifacts(&staged_path)
+            .expect_err("a surviving companion without its main anchor must be preserved");
+
+        assert!(
+            format!("{error:#}").contains("pathname ownership is no longer provable"),
+            "unexpected missing-main cleanup error: {error:#}"
+        );
+        assert_eq!(std::fs::read(&sidecar_path)?, b"unbound recovery bytes");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_export_cleanup_preserves_replacement_symlink_and_sidecars() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new()?;
+        let staged_path = temp_dir.path().join("export.tmp.db");
+        let replacement_target = temp_dir.path().join("replacement-target.db");
+        let sidecar_path = sqlite_content_artifact_paths(&staged_path)
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("SQLite artifact family unexpectedly empty"))?;
+        std::fs::write(&replacement_target, b"unowned replacement")?;
+        symlink(&replacement_target, &staged_path)?;
+        std::fs::write(&sidecar_path, b"unowned sidecar")?;
+
+        let error = cleanup_sqlite_temp_artifacts(&staged_path)
+            .expect_err("cleanup must not unlink a replacement symlink");
+
+        assert!(
+            format!("{error:#}").contains("no longer a regular file"),
+            "unexpected replacement-entry error: {error:#}"
+        );
+        assert_eq!(std::fs::read(&replacement_target)?, b"unowned replacement");
+        assert!(
+            std::fs::symlink_metadata(&staged_path)?.file_type().is_symlink(),
+            "replacement symlink must be preserved"
+        );
+        assert_eq!(std::fs::read(&sidecar_path)?, b"unowned sidecar");
         Ok(())
     }
 

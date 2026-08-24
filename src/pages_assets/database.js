@@ -2,7 +2,12 @@
  * cass Archive Database Module
  *
  * sqlite-wasm integration for browser-based database queries.
- * Uses OPFS for persistence when user has opted in, falls back to in-memory.
+ *
+ * The live database is a read-only in-memory deserialization. The official
+ * sqlite-wasm OPFS VFS requires a dedicated worker because its synchronous VFS
+ * bridge uses Atomics.wait(), while this module intentionally exposes
+ * synchronous query helpers on the main thread. When OPFS is enabled, we cache
+ * the validated decrypted bytes there but do not open them through OpfsDb.
  */
 
 import { getArchiveOpfsDbFiles, getArchiveOpfsPrimaryDbName, isOpfsEnabled } from './storage.js';
@@ -11,6 +16,13 @@ import { getArchiveOpfsDbFiles, getArchiveOpfsPrimaryDbName, isOpfsEnabled } fro
 let sqlite3 = null;
 let db = null;
 let isInitialized = false;
+let initializationPromise = null;
+let lifecycleGeneration = 0;
+
+// sqlite3.h's stable sqlite3_deserialize() flags. The official JS wrapper
+// exposes sqlite3_deserialize() but does not export these preprocessor macros.
+const SQLITE_DESERIALIZE_FREEONCLOSE = 0x01;
+const SQLITE_DESERIALIZE_READONLY = 0x04;
 
 /**
  * Initialize sqlite-wasm with decrypted database bytes
@@ -22,40 +34,91 @@ export async function initDatabase(dbBytes) {
         console.warn('[DB] Already initialized');
         return;
     }
+    if (initializationPromise) {
+        throw new Error('Database initialization is already in progress');
+    }
+    if (!(dbBytes instanceof Uint8Array) || dbBytes.byteLength === 0) {
+        throw new TypeError('Database payload must be a non-empty Uint8Array');
+    }
 
     console.log('[DB] Initializing sqlite-wasm...');
-
-    // Load sqlite-wasm module
-    sqlite3 = await loadSqliteWasm();
-
-    // Try OPFS first (better performance, persists in cache) if user opted in
-    if (isOpfsEnabled() && sqlite3.oo1.OpfsDb && navigator.storage?.getDirectory) {
-        try {
-            const opfsDbName = getArchiveOpfsPrimaryDbName();
-            await writeBytesToOPFS(dbBytes);
-            db = new sqlite3.oo1.OpfsDb(`/${opfsDbName}`);
-            console.log('[DB] Loaded from OPFS');
-            isInitialized = true;
-            return;
-        } catch (error) {
-            await cleanupArchiveOpfsDatabaseFiles();
-            console.warn('[DB] OPFS unavailable, using in-memory:', error.message);
+    const generation = ++lifecycleGeneration;
+    // Own a stable copy across module loading/OPFS awaits. The caller is free
+    // to transfer, overwrite, or release its view after this function starts.
+    const ownedBytes = new Uint8Array(dbBytes);
+    const pending = initializeDatabase(ownedBytes, generation);
+    initializationPromise = pending;
+    try {
+        await pending;
+    } finally {
+        ownedBytes.fill(0);
+        if (initializationPromise === pending) {
+            initializationPromise = null;
         }
     }
+}
 
-    // Fallback: in-memory database
-    db = new sqlite3.oo1.DB();
+async function initializeDatabase(dbBytes, generation) {
+    const sqliteApi = sqlite3 || await loadSqliteWasm();
+    if (generation !== lifecycleGeneration) {
+        throw new Error('Database initialization was cancelled');
+    }
+    sqlite3 = sqliteApi;
 
-    // Deserialize database bytes
-    const ptr = sqlite3.wasm.allocFromTypedArray(dbBytes);
+    let candidateDb = null;
+    let wasmPtr = 0;
+    let sqliteOwnsBytes = false;
     try {
-        db.deserialize(ptr, dbBytes.length);
-        console.log('[DB] Loaded into memory');
-    } finally {
-        sqlite3.wasm.dealloc(ptr);
+        candidateDb = new sqliteApi.oo1.DB();
+        wasmPtr = sqliteApi.wasm.allocFromTypedArray(dbBytes);
+        const flags = SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_READONLY;
+        const resultCode = sqliteApi.capi.sqlite3_deserialize(
+            candidateDb.pointer,
+            'main',
+            wasmPtr,
+            dbBytes.byteLength,
+            dbBytes.byteLength,
+            flags
+        );
+        // Once the C call returns, FREEONCLOSE makes SQLite responsible for
+        // this allocation on both success and error. Do not double-free it.
+        sqliteOwnsBytes = true;
+        candidateDb.checkRc(resultCode);
+
+        if (isOpfsEnabled() && navigator.storage?.getDirectory) {
+            try {
+                await writeBytesToOPFS(dbBytes);
+                console.log('[DB] Cached decrypted database bytes in OPFS');
+            } catch (error) {
+                await cleanupArchiveOpfsDatabaseFiles();
+                console.warn('[DB] OPFS cache unavailable, continuing in memory:', error.message);
+            }
+        }
+
+        if (generation !== lifecycleGeneration) {
+            throw new Error('Database initialization was cancelled');
+        }
+
+        db = candidateDb;
+        candidateDb = null;
+        isInitialized = true;
+        console.log('[DB] Loaded read-only database into memory');
+    } catch (error) {
+        // A JS wrapper failure before sqlite3_deserialize() reaches C leaves
+        // ownership with us. A returned C result with FREEONCLOSE does not.
+        if (wasmPtr && !sqliteOwnsBytes) {
+            sqliteApi.wasm.dealloc(wasmPtr);
+        }
+        if (candidateDb) {
+            try {
+                candidateDb.close();
+            } catch (closeError) {
+                console.warn('[DB] Failed to close rejected database handle:', closeError);
+            }
+        }
+        throw error;
     }
 
-    isInitialized = true;
 }
 
 /**
@@ -63,12 +126,17 @@ export async function initDatabase(dbBytes) {
  */
 async function loadSqliteWasm() {
     try {
-        // Dynamic import from vendor folder
-        const module = await import('./vendor/sqlite3.js');
-        return await module.default();
+        const moduleUrl = new URL('./vendor/sqlite3.mjs', import.meta.url);
+        const module = await import(moduleUrl.href);
+        if (typeof module.default !== 'function') {
+            throw new Error('sqlite-wasm module has no default initializer');
+        }
+        return await module.default({
+            locateFile: (filename) => new URL(filename, moduleUrl).href,
+        });
     } catch (error) {
         console.error('[DB] Failed to load sqlite-wasm:', error);
-        throw new Error('SQLite library not available. Ensure sqlite3.js is in the vendor folder.');
+        throw new Error('SQLite runtime is unavailable or invalid.');
     }
 }
 
@@ -79,8 +147,17 @@ async function writeBytesToOPFS(bytes) {
     const root = await navigator.storage.getDirectory();
     const handle = await root.getFileHandle(getArchiveOpfsPrimaryDbName(), { create: true });
     const writable = await handle.createWritable();
-    await writable.write(bytes);
-    await writable.close();
+    try {
+        await writable.write(bytes);
+        await writable.close();
+    } catch (error) {
+        try {
+            await writable.abort();
+        } catch {
+            // The stream may already be closed or aborted.
+        }
+        throw error;
+    }
 }
 
 async function cleanupArchiveOpfsDatabaseFiles() {
@@ -102,7 +179,7 @@ async function cleanupArchiveOpfsDatabaseFiles() {
 
 /**
  * Execute query with automatic resource cleanup
- * Prevents memory leaks by ensuring statements are freed.
+ * Prevents memory leaks by ensuring statements are finalized.
  *
  * @param {string} sql - SQL query
  * @param {Array} params - Query parameters
@@ -121,7 +198,7 @@ export function withQuery(sql, params = [], callback) {
         }
         return callback(stmt);
     } finally {
-        stmt.free(); // Critical: free WASM memory
+        stmt.finalize();
     }
 }
 
@@ -135,7 +212,7 @@ export function queryAll(sql, params = []) {
     return withQuery(sql, params, (stmt) => {
         const results = [];
         while (stmt.step()) {
-            results.push(stmt.getAsObject());
+            results.push(stmt.get({}));
         }
         return results;
     });
@@ -149,7 +226,7 @@ export function queryAll(sql, params = []) {
  */
 export function queryOne(sql, params = []) {
     return withQuery(sql, params, (stmt) => {
-        return stmt.step() ? stmt.getAsObject() : null;
+        return stmt.step() ? stmt.get({}) : null;
     });
 }
 
@@ -161,7 +238,7 @@ export function queryOne(sql, params = []) {
  */
 export function queryValue(sql, params = []) {
     return withQuery(sql, params, (stmt) => {
-        return stmt.step() ? stmt.get()[0] : null;
+        return stmt.step() ? stmt.get(0) : null;
     });
 }
 
@@ -175,9 +252,9 @@ export function execute(sql, params = []) {
     if (!db) {
         throw new Error('Database not initialized');
     }
-
-    db.exec(sql, { bind: params });
-    return db.changes();
+    void sql;
+    void params;
+    throw new Error('Archive database is read-only');
 }
 
 // ============================================
@@ -521,11 +598,11 @@ export function getConversationsByTimeRange(since, until, limit = 50) {
  * @returns {Object|null} Memory usage info
  */
 export function getMemoryUsage() {
-    if (!sqlite3?.wasm?.HEAPU8) {
+    if (typeof sqlite3?.wasm?.heap8u !== 'function') {
         return null;
     }
 
-    const heap = sqlite3.wasm.HEAPU8;
+    const heap = sqlite3.wasm.heap8u();
     const limit = 256 * 1024 * 1024; // 256MB typical WASM limit
 
     return {
@@ -552,6 +629,7 @@ export function checkMemoryPressure() {
  * Close the database connection
  */
 export function closeDatabase() {
+    lifecycleGeneration += 1;
     if (db) {
         try {
             db.close();
@@ -560,9 +638,9 @@ export function closeDatabase() {
             console.warn('[DB] Close failed, resetting handle anyway:', error);
         } finally {
             db = null;
-            isInitialized = false;
         }
     }
+    isInitialized = false;
 }
 
 /**

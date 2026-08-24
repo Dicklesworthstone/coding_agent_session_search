@@ -15285,6 +15285,13 @@ pub fn run_index(
                 )?;
             }
             if semantic_identity_rebuild_required && semantic_manifest_published {
+                crate::indexer::semantic::invalidate_identity_stale_semantic_shards(
+                    &opts.data_dir,
+                    semantic_indexer.embedder_id(),
+                )
+                .with_context(|| {
+                    "revoking identity-stale semantic shard generations after direct publish"
+                })?;
                 persist::with_ephemeral_writer(
                     &storage,
                     false,
@@ -16765,6 +16772,13 @@ fn run_targeted_semantic_watch_once_publish(
             .map_err(|err| anyhow::anyhow!("lock storage after semantic watch-once: {err}"))?;
         let semantic_identity_tier = storage_semantic_identity_tier(selection.tier);
         if guard.semantic_identity_rebuild_required(semantic_identity_tier)? {
+            crate::indexer::semantic::invalidate_identity_stale_semantic_shards(
+                data_dir,
+                indexer.embedder_id(),
+            )
+            .with_context(|| {
+                "revoking identity-stale semantic shard generations after watch-once publish"
+            })?;
             persist::with_ephemeral_writer(
                 &guard,
                 false,

@@ -5,7 +5,7 @@
  * offline caching, and proper resource management.
  */
 
-const CACHE_VERSION = 'v4';
+const CACHE_VERSION = 'v5';
 const STATIC_ASSETS = [
     './',
     './index.html',
@@ -27,10 +27,19 @@ const STATIC_ASSETS = [
     './attachments.js',
     './settings.js',
     './sw-register.js',
-    './vendor/sqlite3.js',
+    './vendor/sqlite3.mjs',
     './vendor/sqlite3.wasm',
+    './vendor/sqlite3-opfs-async-proxy.js',
+    './vendor/argon2.js',
     './vendor/argon2-wasm.js',
-    './vendor/fflate.min.js',
+    './vendor/argon2.wasm',
+    './vendor/fflate.js',
+    './vendor/html5-qrcode.min.js',
+    './vendor/manifest.json',
+    './vendor/LICENSE-sqlite-wasm.txt',
+    './vendor/LICENSE-argon2-browser.txt',
+    './vendor/LICENSE-fflate.txt',
+    './vendor/LICENSE-html5-qrcode.txt',
 ];
 
 // Log levels
@@ -87,14 +96,10 @@ self.addEventListener('install', (event) => {
         caches.open(cacheName)
             .then((cache) => {
                 log(LOG.INFO, 'Caching static assets');
-                // Cache each asset individually to handle missing files gracefully
-                return Promise.allSettled(
-                    STATIC_ASSETS.map(asset =>
-                        cache.add(asset).catch(e => {
-                            log(LOG.WARN, `Failed to cache ${asset}:`, e.message);
-                        })
-                    )
-                );
+                // Runtime dependencies are part of the bundle contract. A
+                // missing asset must fail installation instead of producing a
+                // service worker that only breaks once the archive is offline.
+                return Promise.all(STATIC_ASSETS.map(asset => cache.add(asset)));
             })
             .then(() => {
                 log(LOG.INFO, 'Service worker installed');
@@ -103,6 +108,7 @@ self.addEventListener('install', (event) => {
             })
             .catch((error) => {
                 log(LOG.ERROR, 'Installation failed:', error);
+                throw error;
             })
     );
 });

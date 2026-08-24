@@ -8488,8 +8488,8 @@ impl FrankenStorage {
             // a successful semantic republish clears the marker later.
             for semantic_tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
                 tx.execute_compat(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'required')",
-                    fparams![semantic_tier.meta_key()],
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    fparams![semantic_tier.meta_key(), pending_state.as_str()],
                 )?;
             }
             tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
@@ -8583,8 +8583,8 @@ impl FrankenStorage {
             )?;
             for semantic_tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
                 tx.execute_compat(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'required')",
-                    fparams![semantic_tier.meta_key()],
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    fparams![semantic_tier.meta_key(), pending_state.as_str()],
                 )?;
             }
             tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
@@ -13213,6 +13213,16 @@ impl FrankenStorage {
         &self,
         tier: SemanticIdentityTier,
     ) -> Result<bool> {
+        Ok(self.semantic_identity_rebuild_generation(tier)?.is_some())
+    }
+
+    /// Durable generation that namespaces resumable semantic checkpoints.
+    /// `None` means the selected tier already describes current canonical
+    /// filter identity.
+    pub(crate) fn semantic_identity_rebuild_generation(
+        &self,
+        tier: SemanticIdentityTier,
+    ) -> Result<Option<String>> {
         let state: Option<String> = self
             .conn
             .query_row_map(
@@ -13221,7 +13231,7 @@ impl FrankenStorage {
                 |row| row.get_typed(0),
             )
             .optional()?;
-        Ok(state.is_some_and(|value| value != "complete"))
+        Ok(state.filter(|value| value != "complete"))
     }
 
     /// Mark semantic filter identity stale until a full artifact publish has
@@ -13232,7 +13242,7 @@ impl FrankenStorage {
         tier: SemanticIdentityTier,
     ) -> Result<()> {
         self.conn.execute_compat(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'required')",
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'required:test')",
             fparams![tier.meta_key()],
         )?;
         Ok(())

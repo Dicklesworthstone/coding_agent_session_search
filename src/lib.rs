@@ -108134,6 +108134,19 @@ fn resolve_semantic_index_embedder(raw: &str) -> String {
     }
 }
 
+fn semantic_identity_backfill_fingerprint(
+    canonical_db_fingerprint: &str,
+    identity_generation: Option<&str>,
+) -> String {
+    identity_generation.map_or_else(
+        || canonical_db_fingerprint.to_owned(),
+        |generation| {
+            let generation_hash = blake3::hash(generation.as_bytes()).to_hex();
+            format!("identity-v1:{generation_hash}:{canonical_db_fingerprint}")
+        },
+    )
+}
+
 fn run_models_backfill(
     tier_raw: &str,
     embedder_override: Option<&str>,
@@ -108261,7 +108274,7 @@ fn run_models_backfill(
             decision.scheduled_batch_conversations
         });
 
-    let db_fingerprint =
+    let canonical_db_fingerprint =
         crate::indexer::lexical_storage_fingerprint_for_db(&db_path).map_err(|e| CliError {
             code: 5,
             kind: CliErrorKind::StorageFingerprint.kind_str(),
@@ -108309,6 +108322,35 @@ fn run_models_backfill(
         }),
         retryable: embedder_type != "hash",
     })?;
+    // Identity invalidation follows the physical vector space that query
+    // serving selects, not the user-facing manifest tier. Tests and operators
+    // may deliberately backfill the quality tier with the hash embedder.
+    let identity_tier = if indexer.embedder_id() == "fnv1a-384" {
+        SemanticIdentityTier::Fast
+    } else {
+        SemanticIdentityTier::Quality
+    };
+    let identity_rebuild_generation = storage
+        .semantic_identity_rebuild_generation(identity_tier)
+        .map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!("Failed to inspect semantic identity rebuild state: {e}"),
+            hint: Some(
+                "Retry the semantic backfill; stale semantic serving remains fail-closed".into(),
+            ),
+            retryable: true,
+        })?;
+    // The ordinary content fingerprint intentionally contains only
+    // counts/max rowids, so a Pi -> OMP identity rewrite does not invalidate
+    // an in-progress checkpoint. Namespace checkpoint and staging identity by
+    // the durable migration generation; a stale Pi-era cursor can then never
+    // resume into the rebuilt artifact. The published manifest is rebound to
+    // the canonical content fingerprint below before serving is re-enabled.
+    let backfill_db_fingerprint = semantic_identity_backfill_fingerprint(
+        &canonical_db_fingerprint,
+        identity_rebuild_generation.as_deref(),
+    );
 
     // Sub-fix 1 for cass#257: open a JSONL progress sink whose
     // destination is taken from `CASS_SEMANTIC_PROGRESS_JSONL`. The
@@ -108327,7 +108369,7 @@ fn run_models_backfill(
             &mut manifest,
             SemanticBackfillStoragePlan {
                 tier,
-                db_fingerprint,
+                db_fingerprint: backfill_db_fingerprint.clone(),
                 model_revision,
                 max_conversations: effective_batch_conversations,
             },
@@ -108343,36 +108385,69 @@ fn run_models_backfill(
             retryable: true,
         })?;
 
-    if outcome.published {
-        let identity_tier = match outcome.tier {
-            TierKind::Fast => SemanticIdentityTier::Fast,
-            TierKind::Quality => SemanticIdentityTier::Quality,
-        };
-        if storage
-            .semantic_identity_rebuild_required(identity_tier)
+    if outcome.published && identity_rebuild_generation.is_some() {
+        let published_artifact = match outcome.tier {
+            TierKind::Fast => manifest.fast_tier.as_mut(),
+            TierKind::Quality => manifest.quality_tier.as_mut(),
+        }
+        .ok_or_else(|| CliError {
+            code: 5,
+            kind: CliErrorKind::SemanticManifest.kind_str(),
+            message: "Semantic identity rebuild published without a tier artifact".to_string(),
+            hint: Some(
+                "Retry the semantic backfill; stale semantic serving remains fail-closed".into(),
+            ),
+            retryable: true,
+        })?;
+        if published_artifact.db_fingerprint != backfill_db_fingerprint {
+            return Err(CliError {
+                code: 5,
+                kind: CliErrorKind::SemanticManifest.kind_str(),
+                message: "Semantic identity rebuild published an unexpected generation"
+                    .to_string(),
+                hint: Some(
+                    "Retry the semantic backfill; stale semantic serving remains fail-closed"
+                        .into(),
+                ),
+                retryable: true,
+            });
+        }
+        published_artifact.db_fingerprint = canonical_db_fingerprint.clone();
+        manifest.refresh_backlog(outcome.total_conversations, &canonical_db_fingerprint);
+        manifest.save(&data_dir).map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::SemanticManifest.kind_str(),
+            message: format!("Failed to finalize semantic identity manifest: {e}"),
+            hint: Some(
+                "Retry the semantic backfill; stale semantic serving remains fail-closed".into(),
+            ),
+            retryable: true,
+        })?;
+        crate::indexer::semantic::invalidate_identity_stale_semantic_shards(
+            &data_dir,
+            indexer.embedder_id(),
+        )
+        .map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::SemanticManifest.kind_str(),
+            message: format!("Failed to revoke stale semantic shard generations: {e}"),
+            hint: Some(
+                "Retry the semantic backfill; stale semantic serving remains fail-closed".into(),
+            ),
+            retryable: true,
+        })?;
+        storage
+            .complete_semantic_identity_rebuild(identity_tier)
             .map_err(|e| CliError {
                 code: 5,
                 kind: CliErrorKind::Storage.kind_str(),
-                message: format!("Failed to inspect semantic identity rebuild state: {e}"),
+                message: format!("Failed to complete semantic identity rebuild: {e}"),
                 hint: Some(
-                    "Retry the semantic backfill; the published artifact is preserved".into(),
+                    "Retry the semantic backfill; stale semantic serving remains fail-closed"
+                        .into(),
                 ),
                 retryable: true,
-            })?
-        {
-            storage
-                .complete_semantic_identity_rebuild(identity_tier)
-                .map_err(|e| CliError {
-                    code: 5,
-                    kind: CliErrorKind::Storage.kind_str(),
-                    message: format!("Failed to complete semantic identity rebuild: {e}"),
-                    hint: Some(
-                        "Retry the semantic backfill; stale semantic serving remains fail-closed"
-                            .into(),
-                    ),
-                    retryable: true,
-                })?;
-        }
+            })?;
     }
 
     let progress_pct = outcome.progress_pct();
@@ -108448,6 +108523,56 @@ fn run_models_backfill(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod semantic_identity_backfill_checkpoint_tests {
+    use super::semantic_identity_backfill_fingerprint;
+    use crate::search::semantic_manifest::{BuildCheckpoint, TierKind};
+
+    fn fast_checkpoint() -> BuildCheckpoint {
+        BuildCheckpoint {
+            tier: TierKind::Fast,
+            embedder_id: "fnv1a-384".to_string(),
+            last_offset: 41,
+            docs_embedded: 41,
+            conversations_processed: 41,
+            total_conversations: 82,
+            db_fingerprint: "content-v1:82:82:820".to_string(),
+            schema_version: 1,
+            chunking_version: 1,
+            saved_at_ms: 1,
+            last_message_id: Some(410),
+            cursor_exhausted: false,
+        }
+    }
+
+    #[test]
+    fn identity_generation_invalidates_count_compatible_semantic_checkpoints() {
+        let canonical = "content-v1:82:82:820";
+        let checkpoint = fast_checkpoint();
+        assert!(checkpoint.is_valid(canonical));
+
+        let first_generation =
+            semantic_identity_backfill_fingerprint(canonical, Some("ownership-context-a"));
+        let second_generation =
+            semantic_identity_backfill_fingerprint(canonical, Some("ownership-context-b"));
+        assert!(
+            !checkpoint.is_valid(&first_generation),
+            "a count/max-id-compatible Pi-era checkpoint must not resume after an OMP identity rewrite"
+        );
+        assert_ne!(first_generation, second_generation);
+        let mut first_generation_checkpoint = checkpoint.clone();
+        first_generation_checkpoint.db_fingerprint = first_generation;
+        assert!(
+            !first_generation_checkpoint.is_valid(&second_generation),
+            "a later ownership-context rewrite must invalidate an earlier partial identity rebuild"
+        );
+        assert_eq!(
+            semantic_identity_backfill_fingerprint(canonical, None),
+            canonical
+        );
+    }
 }
 
 /// Remove model files
