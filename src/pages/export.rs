@@ -1,7 +1,9 @@
 use super::{
-    sqlite_artifact_paths, sqlite_content_artifact_paths, sqlite_fixed_artifact_paths,
-    sqlite_runtime_artifact_paths, sqlite_wal_segment_artifact_paths,
+    sqlite_artifact_paths, sqlite_content_artifact_paths, sqlite_runtime_artifact_paths,
+    sqlite_wal_segment_artifact_paths,
 };
+#[cfg(test)]
+use super::sqlite_fixed_artifact_paths;
 use crate::franken_sync::compat::{
     ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt,
 };
@@ -137,13 +139,19 @@ impl ExportEngine {
         // brand-new on-disk connection permanently retains its bootstrap WAL;
         // the engine's bounded image contract therefore explicitly requires
         // VACUUM INTO rather than publishing an in-place writer database.
-        let builder_path =
-            unique_atomic_sidecar_path(&self.output_path, "builder", "pages_export.db");
+        let builder_path = unpredictable_atomic_sidecar_path(
+            &self.output_path,
+            "builder",
+            "pages_export.db",
+        )?;
         let temp_output_path =
             unpredictable_atomic_sidecar_path(&self.output_path, "tmp", "pages_export.db")?;
         let mut retain_temp_on_replace_error = false;
+        let mut builder_owned = false;
+        let mut candidate_owned = false;
         let result = (|| -> Result<(ExportStats, T)> {
             create_staged_export_file(&builder_path)?;
+            builder_owned = true;
             let output_path = builder_path.to_string_lossy().to_string();
             let dest =
                 Connection::open(&output_path).context("Failed to create output database")?;
@@ -549,11 +557,13 @@ impl ExportEngine {
             let candidate_path = temp_output_path.to_string_lossy();
             dest.execute_compat("VACUUM INTO ?1;", params![candidate_path.as_ref()])
                 .context("Failed to materialize self-contained Pages export candidate")?;
+            candidate_owned = true;
             dest.close()
                 .context("Failed to close and checkpoint Pages export builder")?;
             enforce_private_candidate_permissions(&temp_output_path)?;
             cleanup_sqlite_temp_artifacts(&builder_path)
                 .context("Failed to remove closed Pages export builder artifacts")?;
+            builder_owned = false;
             finalize_staged_sqlite_sidecars(&temp_output_path)
                 .context("Failed to finalize staged Pages export as one SQLite main file")?;
 
@@ -568,6 +578,7 @@ impl ExportEngine {
                 &mut retain_temp_on_replace_error,
             )
             .context("Failed to install completed export database")?;
+            candidate_owned = false;
 
             Ok((
                 ExportStats {
@@ -578,23 +589,29 @@ impl ExportEngine {
             ))
         })();
 
-        let result = match cleanup_sqlite_temp_artifacts(&builder_path) {
-            Ok(()) => result,
-            Err(cleanup_error) => match result {
-                Ok(_) => Err(cleanup_error.context(
-                    "completed Pages export was not published because its private builder could not be removed",
-                )),
-                Err(export_error) => Err(export_error.context(format!(
-                    "failed to remove private Pages export builder artifacts: {cleanup_error:#}"
-                ))),
-            },
+        let result = if builder_owned {
+            match cleanup_sqlite_temp_artifacts(&builder_path) {
+                Ok(()) => result,
+                Err(cleanup_error) => match result {
+                    Ok(_) => Err(cleanup_error.context(
+                        "completed Pages export was not published because its private builder could not be removed",
+                    )),
+                    Err(export_error) => Err(export_error.context(format!(
+                        "failed to remove private Pages export builder artifacts: {cleanup_error:#}"
+                    ))),
+                },
+            }
+        } else {
+            result
         };
 
         match result {
             // Only the catastrophic Windows backup/restore failure retains the
-            // staged database for recovery. Every ordinary rejection or failed
-            // replacement removes the complete SQLite artifact family.
-            Err(export_error) if !retain_temp_on_replace_error => {
+            // owned candidate for recovery. Every ordinary rejection after a
+            // successful VACUUM reservation removes that exact artifact family;
+            // a pre-reservation path collision is preserved rather than guessed
+            // to belong to this export.
+            Err(export_error) if candidate_owned && !retain_temp_on_replace_error => {
                 match cleanup_sqlite_temp_artifacts(&temp_output_path) {
                     Ok(()) => Err(export_error),
                     Err(cleanup_error) => Err(export_error.context(format!(
@@ -763,6 +780,7 @@ fn unique_replace_backup_path(path: &Path) -> PathBuf {
     unique_atomic_sidecar_path(path, "bak", "pages_export.db")
 }
 
+#[cfg(any(windows, test))]
 fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
     static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -793,12 +811,14 @@ fn unpredictable_atomic_sidecar_path(
     SystemRandom::new()
         .fill(&mut nonce)
         .map_err(|_| anyhow::anyhow!("failed to obtain randomness for Pages export staging"))?;
-    let mut file_name = path
+    let file_name = path
         .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new(fallback_name))
-        .to_os_string();
-    file_name.push(format!(".{suffix}.{}", hex::encode(nonce)));
-    Ok(path.with_file_name(file_name))
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+    Ok(path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}",
+        hex::encode(nonce)
+    )))
 }
 
 fn cleanup_sqlite_sidecars(path: &Path) -> Result<()> {
@@ -902,6 +922,11 @@ fn create_staged_export_file(path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn enforce_private_candidate_permissions(path: &Path) -> Result<()> {
+    let path_metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed inspecting staged export {}", path.display()))?;
+    if !path_metadata.file_type().is_file() {
+        bail!("staged Pages export is not a regular file: {}", path.display());
+    }
     let file = std::fs::File::open(path)
         .with_context(|| format!("failed opening staged export {} for chmod", path.display()))?;
     let metadata = file
@@ -912,6 +937,12 @@ fn enforce_private_candidate_permissions(path: &Path) -> Result<()> {
     }
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed setting staged export {} to mode 0600", path.display()))?;
+    file.sync_all().with_context(|| {
+        format!(
+            "failed syncing staged export {} after setting mode 0600",
+            path.display()
+        )
+    })?;
     let mode = file
         .metadata()
         .with_context(|| format!("failed verifying staged export mode for {}", path.display()))?
@@ -1760,6 +1791,29 @@ mod tests {
             ));
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_candidate_path_uses_fresh_unpredictable_names() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let first = unpredictable_atomic_sidecar_path(&final_path, "tmp", "pages_export.db")?;
+        let second = unpredictable_atomic_sidecar_path(&final_path, "tmp", "pages_export.db")?;
+
+        assert_ne!(first, second, "candidate nonce was reused");
+        for path in [first, second] {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow::anyhow!("candidate name is not UTF-8"))?;
+            assert!(name.starts_with(".export.db.tmp."), "unexpected name: {name}");
+            assert_eq!(
+                name.rsplit_once('.').map(|(_, nonce)| nonce.len()),
+                Some(32),
+                "candidate nonce must carry 128 bits"
+            );
+        }
         Ok(())
     }
 

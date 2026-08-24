@@ -296,8 +296,13 @@ pub fn is_valid_filename(name: &str) -> bool {
         return false;
     }
 
-    // Check for invalid characters
-    if name.chars().any(|c| INVALID_CHARS.contains(&c)) {
+    // Windows rejects the full ASCII control range, not only tab/newline/NUL.
+    // Reject all Unicode control characters as well so custom export names
+    // cannot contain invisible terminal-control bytes on other platforms.
+    if name
+        .chars()
+        .any(|c| INVALID_CHARS.contains(&c) || c.is_control())
+    {
         return false;
     }
 
@@ -858,6 +863,7 @@ mod tests {
 
         assert!(!is_valid_filename(""));
         assert!(!is_valid_filename("file<name"));
+        assert!(!is_valid_filename("invisible\u{0007}bell.html"));
         assert!(!is_valid_filename("CON")); // Reserved on Windows
         assert!(!is_valid_filename(".hidden")); // Leading dot
     }
