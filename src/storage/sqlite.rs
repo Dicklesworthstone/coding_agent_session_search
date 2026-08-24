@@ -7379,6 +7379,15 @@ fn franken_find_existing_conversation_with_tail_by_key(
         if let Some(existing) = franken_find_external_conversation_tail_lookup(tx, &lookup_key)? {
             return Ok(Some(existing));
         }
+        if let Some(existing) = franken_promote_omp_external_identity_by_source_path(
+            tx,
+            source_id,
+            *agent_id,
+            external_id,
+            conv,
+        )? {
+            return Ok(Some(existing));
+        }
         return Ok(None);
     }
 
@@ -14493,6 +14502,122 @@ fn franken_insert_external_conversation_tail_lookup(
     )
 }
 
+/// Recover the first first-class OMP ingest after a legacy Pi-owned row was
+/// reclassified with an absent or older external id.
+///
+/// OMP external ids are paths relative to the particular discovery root. The
+/// same transcript can therefore acquire a different external id when a newer
+/// detector selects a more-specific root. The transcript's source-qualified
+/// absolute path plus the normal source-path merge evidence is the durable
+/// identity in that upgrade case. Keep this fallback OMP-only: other providers
+/// may legitimately reuse a source path for unrelated external sessions.
+fn franken_promote_omp_external_identity_by_source_path(
+    tx: &FrankenTransaction<'_>,
+    source_id: &str,
+    agent_id: i64,
+    external_id: &str,
+    conv: Option<&Conversation>,
+) -> Result<Option<ExistingConversationWithTail>> {
+    let Some(conv) = conv.filter(|conv| conv.agent_slug == "omp") else {
+        return Ok(None);
+    };
+
+    // A missing derived lookup must not make the path fallback select a
+    // different row when the canonical external identity already exists.
+    let exact_external_id = tx
+        .query_row_map(
+            "SELECT id
+             FROM conversations
+             WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
+            fparams![source_id, agent_id, external_id],
+            |row| row.get_typed::<i64>(0),
+        )
+        .optional()?;
+
+    let existing_id = if let Some(existing_id) = exact_external_id {
+        existing_id
+    } else {
+        let source_path = path_to_string(&conv.source_path);
+        let path_candidates: Vec<i64> = tx.query_map_collect(
+            "SELECT id
+             FROM conversations
+             WHERE source_id = ?1 AND agent_id = ?2 AND source_path = ?3
+             ORDER BY id
+             LIMIT 2",
+            fparams![source_id, agent_id, source_path.as_str()],
+            |row| row.get_typed(0),
+        )?;
+        match path_candidates.as_slice() {
+            [] => return Ok(None),
+            [_] => {}
+            _ => {
+                bail!(
+                    "cannot promote OMP external identity for source_id={source_id} path={source_path}: multiple canonical conversations share the source-qualified path"
+                );
+            }
+        }
+
+        // Do not merge merely because a path was reused. Require the same
+        // start/message evidence as the established no-external-id lane.
+        let source_path_key = PendingConversationKey::SourcePath {
+            source_id: source_id.to_owned(),
+            agent_id,
+            source_path,
+            started_at: conversation_effective_started_at(conv),
+        };
+        let Some(existing_id) =
+            franken_find_existing_conversation_by_key_impl(
+                tx,
+                &source_path_key,
+                Some(conv),
+                false,
+            )?
+        else {
+            return Ok(None);
+        };
+        existing_id
+    };
+
+    let existing_external_id: Option<String> = tx.query_row_map(
+        "SELECT external_id FROM conversations WHERE id = ?1",
+        fparams![existing_id],
+        |row| row.get_typed(0),
+    )?;
+    if existing_external_id.as_deref() != Some(external_id) {
+        tx.execute_compat(
+            "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
+            fparams![existing_id],
+        )?;
+        tx.execute_compat(
+            "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
+            fparams![existing_id],
+        )?;
+        tx.execute_compat(
+            "UPDATE conversations SET external_id = ?1 WHERE id = ?2",
+            fparams![external_id, existing_id],
+        )?;
+    }
+
+    let existing = ExistingConversationWithTail {
+        id: existing_id,
+        tail_state: franken_existing_conversation_append_tail_state(tx, existing_id)?,
+    };
+    let lookup_key = conversation_external_lookup_key(source_id, agent_id, external_id);
+    tx.execute_compat(
+        "INSERT OR REPLACE INTO conversation_external_lookup(lookup_key, conversation_id)
+         VALUES(?1, ?2)",
+        fparams![lookup_key.as_str(), existing_id],
+    )?;
+    franken_insert_external_conversation_tail_lookup(
+        tx,
+        source_id,
+        agent_id,
+        external_id,
+        existing,
+    )?;
+    Ok(Some(existing))
+}
+
 fn franken_update_external_conversation_tail_lookup_key(
     tx: &FrankenTransaction<'_>,
     lookup_key: &str,
@@ -14627,6 +14752,15 @@ fn franken_find_existing_conversation_by_key_impl(
             let lookup_key = conversation_external_lookup_key(source_id, *agent_id, external_id);
             if let Some(existing_id) = franken_find_external_conversation_lookup(tx, &lookup_key)? {
                 return Ok(Some(existing_id));
+            }
+            if let Some(existing) = franken_promote_omp_external_identity_by_source_path(
+                tx,
+                source_id,
+                *agent_id,
+                external_id,
+                conv,
+            )? {
+                return Ok(Some(existing.id));
             }
             if !allow_legacy_external_scan {
                 return Ok(None);
@@ -29699,6 +29833,208 @@ mod tests {
 
     #[test]
     #[serial]
+    fn legacy_omp_first_scan_promotes_missing_or_changed_external_identity()
+    -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");
+        let _omp_sessions = set_env_var("PI_CODING_AGENT_SESSION_DIR", "");
+        let _shared_agent = set_env_var("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env_var("CASS_OMP_DATA_ROOT", "");
+        let _config_dir = set_env_var("PI_CONFIG_DIR", "");
+        let _profile = set_env_var("OMP_PROFILE", "");
+        let _legacy_profile = set_env_var("PI_PROFILE", "");
+        let _xdg = set_env_var("XDG_DATA_HOME", "");
+        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let pi_agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "pi_agent".into(),
+            name: "Pi Agent".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+
+        let cases = [
+            ("missing.jsonl", None, "current-missing", 1_000_i64),
+            (
+                "changed.jsonl",
+                Some("legacy-relative-id"),
+                "current-relative-id",
+                2_000_i64,
+            ),
+        ];
+        let legacy = cases
+            .iter()
+            .map(|(filename, legacy_external_id, _, started_at)| Conversation {
+                id: None,
+                agent_slug: "pi_agent".into(),
+                workspace: None,
+                external_id: legacy_external_id.map(str::to_owned),
+                title: Some(format!("Legacy {filename}")),
+                source_path: dir
+                    .path()
+                    .join("home/.omp/agent/sessions/project")
+                    .join(filename),
+                started_at: Some(*started_at),
+                ended_at: Some(*started_at + 1),
+                approx_tokens: None,
+                metadata_json: serde_json::json!({"source":"pi_agent"}),
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(*started_at),
+                    content: format!("initial {filename}"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            })
+            .collect::<Vec<_>>();
+        let legacy_batch = legacy
+            .iter()
+            .map(|conversation| (pi_agent_id, None, conversation))
+            .collect::<Vec<_>>();
+        storage.insert_conversations_batched(&legacy_batch)?;
+
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 2,
+                lexical_rebuild_required: true,
+            }
+        );
+        let omp_agent_id: i64 = storage.conn.query_row_map(
+            "SELECT id FROM agents WHERE slug = 'omp'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+
+        let current = cases
+            .iter()
+            .map(|(filename, _, current_external_id, started_at)| Conversation {
+                id: None,
+                agent_slug: "omp".into(),
+                workspace: None,
+                external_id: Some((*current_external_id).to_owned()),
+                title: Some(format!("Current {filename}")),
+                source_path: dir
+                    .path()
+                    .join("home/.omp/agent/sessions/project")
+                    .join(filename),
+                started_at: Some(*started_at),
+                ended_at: Some(*started_at + 2),
+                approx_tokens: None,
+                metadata_json: serde_json::json!({"source":"omp"}),
+                messages: vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(*started_at),
+                        content: format!("initial {filename}"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(*started_at + 2),
+                        content: format!("appended {filename}"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                ],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            })
+            .collect::<Vec<_>>();
+        let current_batch = current
+            .iter()
+            .map(|conversation| (omp_agent_id, None, conversation))
+            .collect::<Vec<_>>();
+        let outcomes = storage.insert_conversations_batched(&current_batch)?;
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|outcome| !outcome.conversation_inserted));
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.inserted_indices == vec![1])
+        );
+
+        let omp_conversation_count: i64 = storage.conn.query_row_map(
+            "SELECT COUNT(*) FROM conversations WHERE agent_id = ?1",
+            fparams![omp_agent_id],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            omp_conversation_count, 2,
+            "the first current scan must reuse both reclassified rows"
+        );
+        for (filename, legacy_external_id, current_external_id, _) in cases {
+            let source_path = dir
+                .path()
+                .join("home/.omp/agent/sessions/project")
+                .join(filename);
+            let (conversation_id, stored_external_id): (i64, String) =
+                storage.conn.query_row_map(
+                    "SELECT id, external_id
+                     FROM conversations
+                     WHERE source_id = ?1 AND agent_id = ?2 AND source_path = ?3",
+                    fparams![
+                        LOCAL_SOURCE_ID,
+                        omp_agent_id,
+                        source_path.to_string_lossy().as_ref()
+                    ],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )?;
+            assert_eq!(stored_external_id, current_external_id);
+            let message_count: i64 = storage.conn.query_row_map(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                fparams![conversation_id],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(message_count, 2);
+
+            let current_lookup = conversation_external_lookup_key(
+                LOCAL_SOURCE_ID,
+                omp_agent_id,
+                current_external_id,
+            );
+            let current_lookup_id: i64 = storage.conn.query_row_map(
+                "SELECT conversation_id
+                 FROM conversation_external_tail_lookup
+                 WHERE lookup_key = ?1",
+                fparams![current_lookup.as_str()],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(current_lookup_id, conversation_id);
+
+            if let Some(legacy_external_id) = legacy_external_id {
+                let legacy_lookup = conversation_external_lookup_key(
+                    LOCAL_SOURCE_ID,
+                    omp_agent_id,
+                    legacy_external_id,
+                );
+                let stale_lookup_count: i64 = storage.conn.query_row_map(
+                    "SELECT COUNT(*)
+                     FROM conversation_external_tail_lookup
+                     WHERE lookup_key = ?1",
+                    fparams![legacy_lookup.as_str()],
+                    |row| row.get_typed(0),
+                )?;
+                assert_eq!(stale_lookup_count, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
     fn legacy_omp_reclassification_rejects_same_source_path_with_different_identity()
     -> anyhow::Result<()> {
         let dir = TempDir::new()?;
@@ -29891,6 +30227,55 @@ mod tests {
                 ("remote-a".to_string(), "omp".to_string()),
                 ("remote-b".to_string(), "omp".to_string()),
             ]
+        );
+
+        let current_remote_a = Conversation {
+            id: None,
+            agent_slug: "omp".into(),
+            workspace: None,
+            external_id: Some("remote-a-current-id".into()),
+            title: Some("Current Remote A".into()),
+            source_path: PathBuf::from(shared_path),
+            started_at: Some(1000),
+            ended_at: Some(1001),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"source":"omp"}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1000),
+                content: "remote A current scan".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "remote-a".into(),
+            origin_host: Some("remote-a".into()),
+        };
+        let outcome = storage
+            .insert_conversations_batched(&[(omp_agent_id, None, &current_remote_a)])?
+            .pop()
+            .expect("one remote OMP insert outcome");
+        assert!(
+            !outcome.conversation_inserted,
+            "a changed root-relative id must promote the reclassified remote row"
+        );
+        let remote_identities = storage.conn.query_map_collect(
+            "SELECT source_id, external_id
+             FROM conversations
+             WHERE agent_id = ?1 AND source_path = ?2
+             ORDER BY source_id",
+            fparams![omp_agent_id, shared_path],
+            |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
+        )?;
+        assert_eq!(
+            remote_identities,
+            vec![
+                ("remote-a".to_string(), "remote-a-current-id".to_string()),
+                ("remote-b".to_string(), "same-id".to_string()),
+            ],
+            "path recovery must never cross the source provenance boundary"
         );
         Ok(())
     }
