@@ -136,8 +136,8 @@ const CONTRACTS: &[DependencyContract] = &[
         // crates.io-only exact pin: every source (direct dep, frankensqlite
         // transitive, frankensearch transitive) resolves to a single published
         // release. The 0.4.x line (>=0.4.3,<0.5) is required by fsqlite 0.3.x,
-        // whose public API names asupersync 0.4.x types; 0.4.4 additionally
-        // preserves typed task results across cancellation acknowledgement.
+        // whose public API names asupersync 0.4.x types. The current 0.4.9 pin
+        // preserves the 0.4.x typed-result cancellation contract.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
         // to skip git/rev checks.
         expected_git: "",

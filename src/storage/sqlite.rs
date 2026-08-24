@@ -7993,6 +7993,25 @@ impl FrankenStorage {
     /// creating a second copy under another agent id. Analytics are derived
     /// from canonical messages and rebuilt after the identity swap.
     pub fn reclassify_legacy_omp_conversations(&self) -> Result<LegacyOmpReclassificationResult> {
+        self.reclassify_legacy_omp_conversations_inner(false)
+    }
+
+    /// Recheck for legacy OMP rows after a historical bundle import.
+    ///
+    /// A completed marker only describes the canonical archive as it existed
+    /// when the marker was written. Historical salvage can subsequently add
+    /// older Pi-labeled `.omp/agent` rows, so the importer must bypass the
+    /// normal fast path once after it has actually imported messages.
+    pub(crate) fn reclassify_legacy_omp_conversations_after_historical_import(
+        &self,
+    ) -> Result<LegacyOmpReclassificationResult> {
+        self.reclassify_legacy_omp_conversations_inner(true)
+    }
+
+    fn reclassify_legacy_omp_conversations_inner(
+        &self,
+        recheck_complete_archive: bool,
+    ) -> Result<LegacyOmpReclassificationResult> {
         const LEGACY_PATH_PREDICATE: &str = r"(
             REPLACE(c.source_path, '\', '/') LIKE '%/.omp/agent/%'
             OR REPLACE(c.source_path, '\', '/') LIKE '.omp/agent/%'
@@ -8006,7 +8025,7 @@ impl FrankenStorage {
                 |row| row.get_typed(0),
             )
             .optional()?;
-        if state.as_deref() == Some("complete") {
+        if state.as_deref() == Some("complete") && !recheck_complete_archive {
             return Ok(LegacyOmpReclassificationResult::default());
         }
         let assets_were_pending = state.as_deref() == Some("analytics_pending");
@@ -28998,7 +29017,7 @@ mod tests {
             version: None,
             kind: AgentKind::Cli,
         })?;
-        let conversation = Conversation {
+        let mut conversation = Conversation {
             id: None,
             agent_slug: "pi_agent".into(),
             workspace: None,
@@ -29083,6 +29102,35 @@ mod tests {
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,
             LegacyOmpReclassificationResult::default()
+        );
+
+        // A historical import can add legacy rows after the marker was
+        // completed. Routine startup keeps trusting the marker, while the
+        // import-specific path must deliberately recheck the new archive data.
+        conversation.external_id = Some("-projects-cass/imported-legacy-omp".into());
+        conversation.title = Some("Imported legacy OMP".into());
+        conversation.source_path = dir
+            .path()
+            .join("backup/.omp/agent/sessions/-projects-cass/imported-legacy-omp.jsonl");
+        storage.insert_conversations_batched(&[(pi_agent_id, None, &conversation)])?;
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult::default(),
+            "the normal startup fast path should continue to trust a completed marker"
+        );
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations_after_historical_import()?,
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 1,
+                lexical_rebuild_required: true,
+            }
+        );
+        let conversations = storage.list_conversations(10, 0)?;
+        assert_eq!(conversations.len(), 2);
+        assert!(
+            conversations
+                .iter()
+                .all(|conversation| conversation.agent_slug == "omp")
         );
         Ok(())
     }
