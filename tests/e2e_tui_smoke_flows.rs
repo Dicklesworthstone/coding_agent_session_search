@@ -1367,11 +1367,20 @@ fn tui_search_flow_with_logging() {
     fs::create_dir_all(&data_dir).unwrap();
 
     make_codex_fixture(&data_dir);
+    // Isolate HOME/XDG so spawned `cass` subprocesses only see the fixture
+    // corpus. Without this, connector default discovery walks the REAL
+    // `~/.codex` / `~/.claude` archives of whoever runs the suite, which on a
+    // dev host means indexing gigabytes inside the test timeout
+    // (coding_agent_session_search-mwkw0).
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_var("XDG_DATA_HOME", &xdg);
     tracker.end("setup", Some("Fixtures created"), setup_start);
 
     // Index phase
     let index_start = tracker.start("index", Some("Building search index"));
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let output = command
         .arg("index")
         .arg("--full")
@@ -1406,7 +1415,7 @@ fn tui_search_flow_with_logging() {
 
     // Search flow: simulate search for "hello"
     let search_start = tracker.start("search_hello", Some("Simulating TUI search: 'hello'"));
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let search_output = command
         .arg("search")
         .arg("hello")
@@ -1441,7 +1450,7 @@ fn tui_search_flow_with_logging() {
         "search_auth",
         Some("Simulating TUI search: 'authentication'"),
     );
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let search2_output = command
         .arg("search")
         .arg("authentication")
@@ -1469,7 +1478,7 @@ fn tui_search_flow_with_logging() {
         "tui_headless",
         Some("Verifying TUI launches in headless mode"),
     );
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let tui_output = command
         .arg("tui")
         .arg("--data-dir")
@@ -1551,18 +1560,28 @@ fn tui_filter_flow_with_logging() {
 
     let data_dir = tmp.path().join("data");
     let codex_home = tmp.path().join("codex_home");
-    let claude_home = tmp.path().join(".claude");
+    // The Claude connector's default discovery root is `~/.claude`, so the
+    // fixture must live inside the isolated HOME to be found.
+    let claude_home = home.join(".claude");
     fs::create_dir_all(&data_dir).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
     fs::create_dir_all(&claude_home).unwrap();
 
     make_codex_fixture(&codex_home);
     make_claude_fixture(&claude_home, "testproject");
+    // Isolate HOME/XDG/CODEX_HOME so spawned `cass` subprocesses only see the
+    // fixture corpus, never the host's real session archives
+    // (coding_agent_session_search-mwkw0).
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_codex_home(&codex_home)
+        .with_var("XDG_DATA_HOME", &xdg);
     tracker.end("setup", Some("Multi-agent fixtures created"), setup_start);
 
     // Index
     let index_start = tracker.start("index", Some("Building multi-agent index"));
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let output = command
         .arg("index")
         .arg("--full")
@@ -1586,7 +1605,7 @@ fn tui_filter_flow_with_logging() {
 
     // Filter by agent: Codex
     let filter_start = tracker.start("filter_codex", Some("Simulating TUI filter: agent=codex"));
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let filter_output = command
         .arg("search")
         .arg("hello")
@@ -1613,7 +1632,7 @@ fn tui_filter_flow_with_logging() {
 
     // TUI launch with filter
     let tui_start = tracker.start("tui_headless", Some("Verifying TUI with filter"));
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let tui_output = command
         .arg("tui")
         .arg("--data-dir")
@@ -1680,11 +1699,18 @@ fn tui_export_flow_with_logging() {
     fs::create_dir_all(&data_dir).unwrap();
 
     let export_session_path = make_codex_fixture(&data_dir);
+    // Isolate HOME/XDG so spawned `cass` subprocesses only see the fixture
+    // corpus, never the host's real session archives
+    // (coding_agent_session_search-mwkw0).
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_var("XDG_DATA_HOME", &xdg);
     tracker.end("setup", Some("Fixtures created"), setup_start);
 
     // Index
     let index_start = tracker.start("index", Some("Building index"));
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let output = command
         .arg("index")
         .arg("--full")
@@ -1705,7 +1731,7 @@ fn tui_export_flow_with_logging() {
         "search_for_export",
         Some("Search to identify exportable content"),
     );
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let search_output = command
         .arg("search")
         .arg("hello")
@@ -1750,7 +1776,7 @@ fn tui_export_flow_with_logging() {
         "export_html",
         Some("Exporting selected session content to HTML"),
     );
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let export_output = command
         .arg("export-html")
         .arg(&export_session_path)
@@ -1800,7 +1826,7 @@ fn tui_export_flow_with_logging() {
         "tui_headless",
         Some("Verifying TUI launches for export flow"),
     );
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let tui_output = command
         .arg("tui")
         .arg("--data-dir")
@@ -1874,11 +1900,19 @@ fn tui_empty_dataset_flow_with_logging() {
     let empty_codex = tmp.path().join("empty_codex");
     fs::create_dir_all(&empty_codex).unwrap();
 
+    // Isolate HOME/XDG/CODEX_HOME so the "empty dataset" really is empty —
+    // without this, connector default discovery indexes the host's real
+    // session archives (coding_agent_session_search-mwkw0).
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_codex_home(&empty_codex)
+        .with_var("XDG_DATA_HOME", &xdg);
     tracker.end("setup", Some("Empty environment created"), setup_start);
 
     // Index empty dataset
     let index_start = tracker.start("index_empty", Some("Building empty index"));
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let output = command
         .arg("index")
         .arg("--full")
@@ -1895,7 +1929,7 @@ fn tui_empty_dataset_flow_with_logging() {
 
     // Search empty dataset
     let search_start = tracker.start("search_empty", Some("Searching empty dataset"));
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let search_output = command
         .arg("search")
         .arg("anything")
@@ -1920,7 +1954,7 @@ fn tui_empty_dataset_flow_with_logging() {
 
     // TUI with empty dataset
     let tui_start = tracker.start("tui_empty", Some("TUI with empty dataset"));
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let tui_output = command
         .arg("tui")
         .arg("--data-dir")
@@ -2002,11 +2036,18 @@ fn tui_unicode_flow_with_logging() {
 "#;
     fs::write(file, sample).unwrap();
 
+    // Isolate HOME/XDG so spawned `cass` subprocesses only see the fixture
+    // corpus, never the host's real session archives
+    // (coding_agent_session_search-mwkw0).
+    let command_env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_var("XDG_DATA_HOME", &xdg);
     tracker.end("setup", Some("Unicode fixtures created"), setup_start);
 
     // Index
     let index_start = tracker.start("index", Some("Building unicode index"));
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let output = command
         .arg("index")
         .arg("--full")
@@ -2024,7 +2065,7 @@ fn tui_unicode_flow_with_logging() {
 
     // Search for unicode content
     let search_start = tracker.start("search_unicode", Some("Searching for unicode content"));
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let search_output = command
         .arg("search")
         .arg("日本語")
@@ -2053,7 +2094,7 @@ fn tui_unicode_flow_with_logging() {
 
     // TUI with unicode
     let tui_start = tracker.start("tui_unicode", Some("TUI with unicode content"));
-    let mut command = tracker.cass_assert_command();
+    let mut command = command_env.cass_assert_command();
     let tui_output = command
         .arg("tui")
         .arg("--data-dir")

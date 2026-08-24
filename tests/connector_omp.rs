@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use coding_agent_search::connectors::{
     Connector, Origin, Platform, ScanContext, ScanRoot, extract_tokens_for_agent,
-    omp::OmpConnector, pi_agent::PiAgentConnector,
+    get_connector_factories, omp::OmpConnector,
 };
 use serde_json::json;
 
@@ -46,6 +46,13 @@ fn write_omp_subagent(main_session: &Path, id: &str) -> PathBuf {
     path
 }
 
+fn runtime_connector(name: &str) -> Box<dyn Connector + Send> {
+    get_connector_factories()
+        .into_iter()
+        .find_map(|(slug, factory)| (slug == name).then_some(factory))
+        .unwrap_or_else(|| panic!("missing runtime connector factory for {name}"))()
+}
+
 #[test]
 fn omp_v18_profiles_are_first_class_and_not_scanned_by_pi_agent() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -61,7 +68,9 @@ fn omp_v18_profiles_are_first_class_and_not_scanned_by_pi_agent() {
         vec![ScanRoot::local(home.clone())],
         None,
     );
-    let mut conversations = OmpConnector::new().scan(&ctx).expect("scan OMP fixtures");
+    let mut conversations = runtime_connector("omp")
+        .scan(&ctx)
+        .expect("scan OMP fixtures through the production registry");
     conversations.sort_by(|left, right| left.external_id.cmp(&right.external_id));
 
     assert_eq!(conversations.len(), 3);
@@ -89,13 +98,33 @@ fn omp_v18_profiles_are_first_class_and_not_scanned_by_pi_agent() {
         "OMP sub-agent transcripts must remain independently searchable"
     );
 
-    let pi_conversations = PiAgentConnector::new()
+    let pi_conversations = runtime_connector("pi_agent")
         .scan(&ctx)
-        .expect("scan Pi Agent against the same copied home");
+        .expect("scan Pi Agent through the production registry against the same copied home");
     assert!(
         pi_conversations.is_empty(),
         "the dedicated Pi Agent connector must not duplicate OMP sessions"
     );
+}
+
+#[test]
+fn omp_direct_profile_root_preserves_profile_metadata() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_agent = temp.path().join(".omp/profiles/review/agent");
+    write_omp_session(&profile_agent, "omp-review", "Profile root OMP session");
+    let ctx = ScanContext::with_roots(
+        temp.path().join("cass-state"),
+        vec![ScanRoot::local(profile_agent.join("sessions"))],
+        None,
+    );
+
+    let conversations = runtime_connector("omp")
+        .scan(&ctx)
+        .expect("scan a direct OMP profile root through the production registry");
+
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].agent_slug, "omp");
+    assert_eq!(conversations[0].metadata["profile"], "review");
 }
 
 #[test]
