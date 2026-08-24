@@ -100661,6 +100661,240 @@ This should stay behind the indexed html export.
     }
 
     #[test]
+    fn html_export_without_tools_omits_tool_role_from_arbitrary_direct_path() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("missing.db");
+        let output_dir = tmp.path().join("html-out");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        // Deliberately avoid every provider marker recognized by
+        // infer_followup_agent_and_workspace. The wire data is valid OMP, but
+        // an arbitrary user-selected path must not be required to advertise
+        // that fact merely to make --include-tools=false reliable.
+        let direct_path = tmp.path().join("opaque/session.jsonl");
+        std::fs::create_dir_all(direct_path.parent().expect("direct parent"))
+            .expect("create direct session dir");
+        let direct_jsonl = [
+            serde_json::json!({
+                "type": "message",
+                "message": { "role": "user", "content": "OPAQUEUSERSENTINEL" }
+            }),
+            serde_json::json!({
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "OPAQUEASSISTANTSENTINEL" },
+                        {
+                            "type": "toolCall",
+                            "id": "opaque-call",
+                            "name": "opaque_inspect",
+                            "arguments": { "path": "OPAQUEARGUMENTSENTINEL" }
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "message",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "opaque-call",
+                    "toolName": "opaque_inspect",
+                    "content": [{ "type": "text", "text": "OPAQUERESULTSENTINEL" }]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&direct_path, format!("{direct_jsonl}\n")).expect("write direct JSONL");
+
+        run_export_html(
+            &direct_path,
+            Some(db_path),
+            None,
+            Some(output_dir.as_path()),
+            Some("opaque-without-tools.html"),
+            false,
+            false,
+            false,
+            true,
+            true,
+            false,
+            "system",
+            false,
+            false,
+            false,
+            Some(RobotFormat::Json),
+        )
+        .expect("export arbitrary-path OMP HTML without tools");
+
+        let html = std::fs::read_to_string(output_dir.join("opaque-without-tools.html"))
+            .expect("read arbitrary-path export");
+        for retained in ["OPAQUEUSERSENTINEL", "OPAQUEASSISTANTSENTINEL"] {
+            assert!(
+                html.contains(retained),
+                "tool-free export should retain conversational content {retained}"
+            );
+        }
+        for omitted in [
+            "opaque_inspect",
+            "OPAQUEARGUMENTSENTINEL",
+            "OPAQUERESULTSENTINEL",
+        ] {
+            assert!(
+                !html.contains(omitted),
+                "tool-free export must omit {omitted} without provider metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_omp_export_without_tools_omits_flattened_calls_without_valid_envelopes() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let output_dir = tmp.path().join("html-out");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).expect("open db");
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "omp".to_string(),
+                name: "Oh My Pi".to_string(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .expect("ensure OMP agent");
+
+        let cases = [
+            ("missing", serde_json::Value::Null),
+            (
+                "malformed",
+                serde_json::json!({
+                    "__cass_historical_raw_json__": "{not-valid-json"
+                }),
+            ),
+        ];
+        let mut exports = Vec::new();
+        for (case, unavailable_envelope) in cases {
+            let indexed_path = tmp.path().join(format!("indexed/{case}.jsonl"));
+            let assistant_sentinel = format!("{case}-assistant-sentinel");
+            let argument_sentinel = format!("{case}-argument-sentinel");
+            let result_sentinel = format!("{case}-result-sentinel");
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "omp".to_string(),
+                        workspace: Some(PathBuf::from("/workspace/cass")),
+                        external_id: Some(format!("omp-{case}")),
+                        title: Some(format!("{case}-user-sentinel")),
+                        source_path: indexed_path.clone(),
+                        started_at: Some(1_787_572_800_000),
+                        ended_at: Some(1_787_572_803_000),
+                        approx_tokens: None,
+                        metadata_json: serde_json::json!({}),
+                        messages: vec![
+                            Message {
+                                id: None,
+                                idx: 0,
+                                role: MessageRole::User,
+                                author: None,
+                                created_at: Some(1_787_572_801_000),
+                                content: format!("{case}-user-sentinel"),
+                                extra_json: serde_json::Value::Null,
+                                snippets: Vec::new(),
+                            },
+                            Message {
+                                id: None,
+                                idx: 1,
+                                role: MessageRole::Agent,
+                                author: None,
+                                created_at: Some(1_787_572_802_000),
+                                content: format!(
+                                    "[Thinking] {case}-thinking-sentinel\n{assistant_sentinel}\n[Tool: inspect_workspace] path={argument_sentinel}"
+                                ),
+                                extra_json: unavailable_envelope.clone(),
+                                snippets: Vec::new(),
+                            },
+                            Message {
+                                id: None,
+                                idx: 2,
+                                role: MessageRole::Tool,
+                                author: None,
+                                created_at: Some(1_787_572_803_000),
+                                content: result_sentinel.clone(),
+                                extra_json: unavailable_envelope,
+                                snippets: Vec::new(),
+                            },
+                        ],
+                        source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+                        origin_host: None,
+                    },
+                )
+                .expect("insert indexed OMP conversation");
+            exports.push((
+                case,
+                indexed_path,
+                assistant_sentinel,
+                argument_sentinel,
+                result_sentinel,
+            ));
+        }
+        drop(storage);
+
+        for (case, indexed_path, assistant_sentinel, argument_sentinel, result_sentinel) in exports {
+            let filename = format!("{case}-without-tools.html");
+            run_export_html(
+                &indexed_path,
+                Some(db_path.clone()),
+                None,
+                Some(output_dir.as_path()),
+                Some(&filename),
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                "system",
+                false,
+                false,
+                false,
+                Some(RobotFormat::Json),
+            )
+            .expect("export indexed OMP HTML without tools");
+
+            let html = std::fs::read_to_string(output_dir.join(&filename))
+                .expect("read indexed OMP export");
+            for retained in [
+                format!("{case}-user-sentinel"),
+                format!("{case}-thinking-sentinel"),
+                assistant_sentinel,
+            ] {
+                assert!(
+                    html.contains(&retained),
+                    "{case} envelope fallback should retain {retained}"
+                );
+            }
+            for omitted in [
+                "inspect_workspace".to_string(),
+                argument_sentinel,
+                result_sentinel,
+            ] {
+                assert!(
+                    !html.contains(&omitted),
+                    "{case} envelope fallback must omit {omitted}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn omp_html_export_preserves_direct_and_indexed_pi_wire_semantics() {
         let tmp = TempDir::new().expect("temp dir");
         let db_path = tmp.path().join("agent_search.db");
