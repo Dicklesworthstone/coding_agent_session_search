@@ -298,7 +298,7 @@ struct SqliteMessageScanRequest<'a> {
     filters: &'a SearchFilters,
     limit: usize,
     offset: usize,
-    scan_limit: usize,
+    scan_page_rows: usize,
     field_mask: FieldMask,
     query_match_type: MatchType,
 }
@@ -316,7 +316,7 @@ const SQLITE_FTS5_HYDRATE_PARAM_CHUNK: usize = 30_000;
 const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
 const SQLITE_FTS5_POST_FILTER_SCAN_CHUNK: usize = 1_024;
 const SQLITE_FTS5_POST_FILTER_SCAN_LIMIT: usize = 30_000;
-const SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT: usize = 30_000;
+const SQLITE_MESSAGE_SCAN_FALLBACK_PAGE_ROWS: usize = 30_000;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
 const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
@@ -7988,7 +7988,7 @@ impl SearchClient {
     fn sqlite_message_scan_query_sql(
         field_mask: FieldMask,
         filters: &SearchFilters,
-        scan_limit: usize,
+        scan_page_rows: usize,
     ) -> (String, Vec<ParamValue>) {
         let mut session_paths = filters
             .session_paths
@@ -8000,7 +8000,8 @@ impl SearchClient {
             field_mask,
             filters,
             session_paths.as_slice(),
-            scan_limit,
+            None,
+            scan_page_rows,
         )
     }
 
@@ -8008,7 +8009,8 @@ impl SearchClient {
         field_mask: FieldMask,
         filters: &SearchFilters,
         session_paths: &[&str],
-        scan_limit: usize,
+        after_message_id: Option<i64>,
+        scan_page_rows: usize,
     ) -> (String, Vec<ParamValue>) {
         let title_expr = if field_mask.wants_title() {
             "COALESCE(c.title, '')"
@@ -8105,9 +8107,114 @@ impl SearchClient {
             }
         }
 
+        if let Some(after_message_id) = after_message_id {
+            sql.push_str(" AND m.id > ?");
+            params.push(ParamValue::from(after_message_id));
+        }
+
         sql.push_str(" ORDER BY m.id LIMIT ?");
-        params.push(ParamValue::from(scan_limit as i64));
+        params.push(ParamValue::from(
+            i64::try_from(scan_page_rows).unwrap_or(i64::MAX),
+        ));
         (sql, params)
+    }
+
+    fn sqlite_message_scan_row_to_hit(
+        row: (SqliteFtsMessageRow, String, String),
+        scan_query: &SqliteMessageScanQuery,
+        request: SqliteMessageScanRequest<'_>,
+    ) -> Option<(i64, SearchHit)> {
+        let (
+            (
+                message_id,
+                title,
+                raw_content,
+                agent,
+                workspace,
+                source_path,
+                created_at,
+                idx,
+                conversation_id,
+                raw_source_id,
+                origin_host,
+                raw_origin_kind,
+            ),
+            scan_content,
+            scan_title,
+        ) = row;
+
+        // The primary CASS lexical query targets title/content; agent,
+        // workspace, and source are filters rather than searchable text.
+        // Keep the two text fields separate so a quoted phrase cannot
+        // accidentally bridge the content/title boundary.
+        let scan_haystacks = [scan_content.to_lowercase(), scan_title.to_lowercase()];
+        let score = Self::sqlite_message_scan_score(&scan_haystacks, scan_query);
+        if score <= 0.0 {
+            return None;
+        }
+
+        let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
+        let source_id = normalized_search_hit_source_id_parts(
+            raw_source_id.as_str(),
+            raw_origin_kind.as_deref().unwrap_or_default(),
+            origin_host.as_deref(),
+        );
+        let origin_kind =
+            normalized_search_hit_origin_kind(source_id.as_str(), raw_origin_kind.as_deref());
+        let line_number = idx
+            .and_then(|i| usize::try_from(i).ok())
+            .map(|i| i.saturating_add(1));
+        let snippet = if request.field_mask.wants_snippet() {
+            snippet_from_content(&scan_content)
+        } else {
+            String::new()
+        };
+        let content = if request.field_mask.needs_content() {
+            raw_content
+        } else {
+            String::new()
+        };
+        let content_hash = if content.is_empty() {
+            stable_hit_hash(&snippet, &source_path, line_number, created_at)
+        } else {
+            stable_hit_hash(&content, &source_path, line_number, created_at)
+        };
+
+        let hit = SearchHit {
+            title,
+            snippet,
+            content,
+            content_hash,
+            conversation_id,
+            score,
+            source_path,
+            agent,
+            workspace,
+            workspace_original: None,
+            created_at,
+            line_number,
+            match_type: request.query_match_type,
+            source_id,
+            origin_kind,
+            origin_host,
+        };
+
+        Self::sqlite_fts5_hit_matches_filters(&hit, request.filters)
+            .then_some((message_id, hit))
+    }
+
+    fn trim_sqlite_message_scan_hits(
+        scored_hits: &mut Vec<(i64, SearchHit)>,
+        retained_hit_count: usize,
+    ) {
+        scored_hits.sort_by(|(left_id, left), (right_id, right)| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(CmpOrdering::Equal)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        scored_hits.truncate(retained_hit_count);
     }
 
     fn search_sqlite_message_scan(
@@ -8115,9 +8222,13 @@ impl SearchClient {
         conn: &SearchSqliteConnection,
         request: SqliteMessageScanRequest<'_>,
     ) -> Result<Vec<SearchHit>> {
+        if request.limit == 0 || request.scan_page_rows == 0 {
+            return Ok(Vec::new());
+        }
         let Some(scan_query) = Self::sqlite_message_scan_query(request.raw_query) else {
             return Ok(Vec::new());
         };
+        let retained_hit_count = request.offset.saturating_add(request.limit);
 
         let fixed_param_count = request
             .filters
@@ -8142,7 +8253,7 @@ impl SearchClient {
             } else {
                 0
             })
-            .saturating_add(1); // scan LIMIT
+            .saturating_add(2); // pagination cursor + page LIMIT
         if fixed_param_count > SQLITE_MAX_VARIABLE_NUMBER {
             bail!(
                 "SQLite source-scan filters require {fixed_param_count} fixed parameters; maximum is {SQLITE_MAX_VARIABLE_NUMBER}"
@@ -8156,6 +8267,7 @@ impl SearchClient {
             .map(String::as_str)
             .collect::<Vec<_>>();
         session_paths.sort_unstable();
+        session_paths.dedup();
         let session_path_chunk_size = SQLITE_MAX_VARIABLE_NUMBER - fixed_param_count;
         if !session_paths.is_empty() && session_path_chunk_size == 0 {
             bail!(
@@ -8163,139 +8275,80 @@ impl SearchClient {
             );
         }
 
-        let mut rows: Vec<(SqliteFtsMessageRow, String, String)> = Vec::new();
+        let mut scored_hits = Vec::with_capacity(retained_hit_count.min(request.scan_page_rows));
         let session_path_chunks = if session_paths.is_empty() {
             vec![session_paths.as_slice()]
         } else {
             session_paths.chunks(session_path_chunk_size).collect()
         };
         for session_path_chunk in session_path_chunks {
-            let (sql, params) = Self::sqlite_message_scan_query_sql_for_session_paths(
-                request.field_mask,
-                request.filters,
-                session_path_chunk,
-                request.scan_limit,
-            );
-            let mut chunk_rows = franken_query_map_collect_retry(conn, &sql, &params, |row| {
-                Ok((
-                    (
-                        row.get_typed(0)?,
-                        row.get_typed(1)?,
-                        row.get_typed(2)?,
-                        row.get_typed(3)?,
-                        row.get_typed(4)?,
-                        row.get_typed(5)?,
-                        row.get_typed(6)?,
-                        row.get_typed(7)?,
-                        row.get_typed(8)?,
-                        row.get_typed::<Option<String>>(9)?,
-                        row.get_typed(10)?,
-                        row.get_typed(11)?,
-                    ),
-                    row.get_typed(12)?,
-                    row.get_typed(13)?,
-                ))
-            })?;
-            rows.append(&mut chunk_rows);
-            if rows.len() > request.scan_limit {
-                rows.sort_by_key(|row| row.0.0);
-                rows.truncate(request.scan_limit);
+            let mut after_message_id = None;
+            loop {
+                let (sql, params) = Self::sqlite_message_scan_query_sql_for_session_paths(
+                    request.field_mask,
+                    request.filters,
+                    session_path_chunk,
+                    after_message_id,
+                    request.scan_page_rows,
+                );
+                let page_rows = franken_query_map_collect_retry(conn, &sql, &params, |row| {
+                    Ok((
+                        (
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                            row.get_typed(4)?,
+                            row.get_typed(5)?,
+                            row.get_typed(6)?,
+                            row.get_typed(7)?,
+                            row.get_typed(8)?,
+                            row.get_typed::<Option<String>>(9)?,
+                            row.get_typed(10)?,
+                            row.get_typed(11)?,
+                        ),
+                        row.get_typed(12)?,
+                        row.get_typed(13)?,
+                    ))
+                })?;
+                let page_len = page_rows.len();
+                let next_after_message_id = page_rows.last().map(|row| row.0.0);
+
+                for row in page_rows {
+                    if let Some(hit) =
+                        Self::sqlite_message_scan_row_to_hit(row, &scan_query, request)
+                    {
+                        scored_hits.push(hit);
+                    }
+                }
+                if scored_hits.len() > retained_hit_count {
+                    Self::trim_sqlite_message_scan_hits(
+                        &mut scored_hits,
+                        retained_hit_count,
+                    );
+                }
+
+                if page_len < request.scan_page_rows {
+                    break;
+                }
+                let Some(next_after_message_id) = next_after_message_id else {
+                    break;
+                };
+                if after_message_id.is_some_and(|previous| next_after_message_id <= previous) {
+                    bail!(
+                        "SQLite source-scan pagination did not advance beyond message id {next_after_message_id}"
+                    );
+                }
+                after_message_id = Some(next_after_message_id);
             }
         }
-        rows.sort_by_key(|row| row.0.0);
-
-        let mut scored_hits = Vec::new();
-        for (
-            (
-                _message_id,
-                title,
-                raw_content,
-                agent,
-                workspace,
-                source_path,
-                created_at,
-                idx,
-                conversation_id,
-                raw_source_id,
-                origin_host,
-                raw_origin_kind,
-            ),
-            scan_content,
-            scan_title,
-        ) in rows
-        {
-            // The primary CASS lexical query targets title/content; agent,
-            // workspace, and source are filters rather than searchable text.
-            // Keep the two text fields separate so a quoted phrase cannot
-            // accidentally bridge the content/title boundary.
-            let scan_haystacks = [scan_content.to_lowercase(), scan_title.to_lowercase()];
-            let score = Self::sqlite_message_scan_score(&scan_haystacks, &scan_query);
-            if score <= 0.0 {
-                continue;
-            }
-
-            let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
-            let source_id = normalized_search_hit_source_id_parts(
-                raw_source_id.as_str(),
-                raw_origin_kind.as_deref().unwrap_or_default(),
-                origin_host.as_deref(),
-            );
-            let origin_kind =
-                normalized_search_hit_origin_kind(source_id.as_str(), raw_origin_kind.as_deref());
-            let line_number = idx
-                .and_then(|i| usize::try_from(i).ok())
-                .map(|i| i.saturating_add(1));
-            let snippet = if request.field_mask.wants_snippet() {
-                snippet_from_content(&scan_content)
-            } else {
-                String::new()
-            };
-            let content = if request.field_mask.needs_content() {
-                raw_content
-            } else {
-                String::new()
-            };
-            let content_hash = if content.is_empty() {
-                stable_hit_hash(&snippet, &source_path, line_number, created_at)
-            } else {
-                stable_hit_hash(&content, &source_path, line_number, created_at)
-            };
-
-            let hit = SearchHit {
-                title,
-                snippet,
-                content,
-                content_hash,
-                conversation_id,
-                score,
-                source_path,
-                agent,
-                workspace,
-                workspace_original: None,
-                created_at,
-                line_number,
-                match_type: request.query_match_type,
-                source_id,
-                origin_kind,
-                origin_host,
-            };
-
-            if Self::sqlite_fts5_hit_matches_filters(&hit, request.filters) {
-                scored_hits.push(hit);
-            }
-        }
-
-        scored_hits.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(CmpOrdering::Equal)
-        });
+        Self::trim_sqlite_message_scan_hits(&mut scored_hits, retained_hit_count);
 
         Ok(scored_hits
             .into_iter()
             .skip(request.offset)
             .take(request.limit)
+            .map(|(_, hit)| hit)
             .collect())
     }
 
@@ -8323,7 +8376,7 @@ impl SearchClient {
             filters: &filters,
             limit,
             offset,
-            scan_limit: SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT,
+            scan_page_rows: SQLITE_MESSAGE_SCAN_FALLBACK_PAGE_ROWS,
             field_mask,
             query_match_type,
         };
@@ -14613,7 +14666,7 @@ mod tests {
                 filters: &filters,
                 limit: 10,
                 offset: 0,
-                scan_limit: 1,
+                scan_page_rows: 1,
                 field_mask: FieldMask::FULL,
                 query_match_type: MatchType::Exact,
             },
@@ -14637,7 +14690,7 @@ mod tests {
                 filters: &local_filters,
                 limit: 10,
                 offset: 0,
-                scan_limit: 1,
+                scan_page_rows: 1,
                 field_mask: FieldMask::FULL,
                 query_match_type: MatchType::Exact,
             },
@@ -14646,6 +14699,80 @@ mod tests {
         assert_eq!(local_hits[0].source_path, "/tmp/target.jsonl");
         assert_eq!(local_hits[0].source_id, "local");
         assert_eq!(local_hits[0].origin_kind, "local");
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_message_scan_paginates_past_prefix_and_ranks_globally() -> Result<()> {
+        let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER,
+                content TEXT NOT NULL,
+                created_at INTEGER
+             );
+             INSERT INTO sources(id, kind) VALUES('local', 'local');
+             INSERT INTO agents(id, slug) VALUES(1, 'codex');
+             INSERT INTO workspaces(id, path) VALUES(1, '/workspace');
+             INSERT INTO conversations(
+                id, agent_id, workspace_id, source_id, origin_host, title, source_path
+             ) VALUES(1, 1, 1, 'local', NULL, 'fallback title', '/tmp/fallback.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES
+                (1, 1, 0, 'prefix noise', 1),
+                (2, 1, 1, 'needle', 2),
+                (3, 1, 2, 'needle needle', 3);",
+        )?;
+        let client = cass_layer_b_test_client(None);
+        let filters = SearchFilters::default();
+
+        let hits = client.search_sqlite_message_scan(
+            conn.connection(),
+            SqliteMessageScanRequest {
+                raw_query: "needle",
+                filters: &filters,
+                limit: 10,
+                offset: 0,
+                scan_page_rows: 1,
+                field_mask: FieldMask::FULL,
+                query_match_type: MatchType::Exact,
+            },
+        )?;
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["needle needle", "needle"],
+            "a one-row page must neither hide later matches nor truncate global ranking"
+        );
+
+        let offset_hit = client.search_sqlite_message_scan(
+            conn.connection(),
+            SqliteMessageScanRequest {
+                raw_query: "needle",
+                filters: &filters,
+                limit: 1,
+                offset: 1,
+                scan_page_rows: 1,
+                field_mask: FieldMask::FULL,
+                query_match_type: MatchType::Exact,
+            },
+        )?;
+        assert_eq!(offset_hit.len(), 1);
+        assert_eq!(offset_hit[0].content, "needle");
         Ok(())
     }
 
