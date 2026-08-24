@@ -112,8 +112,6 @@ franken-agent-detection = { version = "0.2.1", git = "https://github.com/Dickles
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
-hnsw_rs = "0.3.4"  # Opt 9: Approximate Nearest Neighbor with HNSW
-ouroboros = "0.18.5"  # Safe self-referential wrapper for HNSW loader lifetime
 
 # Crypto for ChatGPT encrypted conversations and HTML export encryption.
 # The aes-gcm + digest + hkdf + hmac + sha2 family must stay on compatible
