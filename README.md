@@ -11,7 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, and Grok Build into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Oh My Pi, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi Code, Muse Code, Qwen Code, Factory (Droid), Antigravity, OpenHands, and Grok Build into a single, searchable timeline.
 
 <div align="center">
 
@@ -360,7 +360,7 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from 24 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
+Ingests history from 26 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
 - **Codex**: `~/.codex/sessions` (Rollout JSONL)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
@@ -374,7 +374,8 @@ Ingests history from 24 local agents, normalizing them into a unified `Conversat
 - **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
 - **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
-- **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content), plus Oh My Pi (`omp`) at `~/.omp/agent/sessions` — same wire format, including per-session sub-agent transcripts
+- **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content)
+- **Oh My Pi (`omp`)**: OMP v18's default `~/.omp/agent/sessions`, named profiles under `~/.omp/profiles/<name>/agent/sessions`, XDG stores under `$XDG_DATA_HOME/omp`, and explicit session/agent-directory overrides (pi-family JSONL, including per-session sub-agent transcripts)
 - **GitHub Copilot Chat**: VS Code global storage under `github.copilot-chat` (JSON)
 - **Copilot CLI**: `~/.copilot/session-state`, legacy `~/.copilot/history-session-state`, and `gh copilot` config paths (JSONL/JSON)
 - **OpenClaw**: `~/.openclaw/agents/*/sessions` (Session JSONL)
@@ -382,6 +383,7 @@ Ingests history from 24 local agents, normalizing them into a unified `Conversat
 - **Crush**: `~/.crush/crush.db` and per-project `.crush/crush.db` (SQLite)
 - **Hermes**: `~/.hermes/state.db` and project-local `.hermes/state.db` (SQLite)
 - **Kimi Code**: `$KIMI_CODE_HOME/sessions/*/*/agents/*/wire.jsonl` (default `~/.kimi-code`; sub-agents index as `<sessionId>:<agentId>`), plus the legacy `~/.kimi/sessions/*/*/wire.jsonl` layout (Session JSONL)
+- **Muse Code**: `~/.local/share/muse/sessions/<YYYY>/<MM>/<DD>/<session-id>/session.jsonl`, including nested `subagent/*/session.jsonl` transcripts (override with `CASS_MUSE_DATA_ROOT`)
 - **Qwen Code**: `~/.qwen/tmp/*/chats/session-*.json` (Chat JSON)
 - **Factory (Droid)**: `~/.factory/sessions` (JSONL files organized by workspace slug)
 - **Antigravity (agy)**: `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl` (clean JSONL transcript), with the durable per-conversation `conversations/<uuid>.db` (SQLite) mirrored alongside. Resume with `cass resume <transcript> --agent agy` (`agy --conversation <uuid>`).
@@ -396,10 +398,18 @@ that the conversation body is unavailable.
 #### Connector Details
 
 **Pi-Agent** parses JSONL session files with rich event structure:
-- **Location**: `~/.pi/agent/sessions/` (override with `PI_CODING_AGENT_DIR` env var)
+- **Location**: `~/.pi/agent/sessions/` (override the agent home with `PI_CODING_AGENT_DIR`, or the sessions directory directly with `PI_SESSIONS_DIR`)
 - **Format**: Typed events—`session_start`, `message`, `model_change`, `thinking_level_change`
 - **Features**: Extracts extended thinking content, flattens tool calls with arguments, tracks model changes
 - **Detection**: Scans for `*_*.jsonl` pattern in sessions directory
+
+**Oh My Pi (`omp`)** uses the same pi-family wire format but remains a separate
+agent identity throughout search, analytics, resume, TUI, and HTML export:
+- **Default and profiles**: `~/.omp/agent/sessions/` and `~/.omp/profiles/<name>/agent/sessions/`; `OMP_PROFILE` selects a profile and takes precedence over legacy `PI_PROFILE`
+- **XDG**: `$XDG_DATA_HOME/omp/sessions/` and `$XDG_DATA_HOME/omp/profiles/<name>/sessions/` when the OMP XDG root exists
+- **Overrides**: `PI_CODING_AGENT_SESSION_DIR` names the exact OMP sessions directory; `PI_CODING_AGENT_DIR` names the agent directory when no named profile is active; `PI_CONFIG_DIR` changes the home-relative `.omp` config directory name
+- **Resume**: named-profile results use `omp --profile <name> --resume <id>`; default XDG and explicit-root results preserve their store with `omp --session-dir <dir> --resume <id>`
+- **Upgrade behavior**: archives created by older cass versions are reclassified once from `pi_agent` to `omp` for canonical `.omp/agent` paths, then the derived lexical index and analytics are rebuilt so a transcript cannot remain attributed to both agents
 
 **OpenCode** reads SQLite databases from workspace directories:
 - **Location**: `.opencode/` directories (scans recursively from home)
@@ -2181,7 +2191,7 @@ classDiagram
 `cass` uses frankensqlite as the durable source of truth and frankensearch as a derived speed layer, powered by a suite of integrated "franken" libraries.
 
 ### The Pipeline
-1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 23 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi, Qwen, Factory, OpenHands, Antigravity, Grok Build).
+1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 26 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Oh My Pi, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Goose, Hermes, Kimi, Muse Code, Qwen, Factory, OpenHands, Antigravity, Grok Build).
 2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation with `BEGIN CONCURRENT` support for MVCC multi-writer transactions.
 3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
@@ -3047,7 +3057,14 @@ Update check state is stored in the data directory:
 | `CODING_AGENT_SEARCH_NO_UPDATE_PROMPT` | unset | Disable update notifications |
 | **Connector Overrides** | | |
 | `CASS_AIDER_DATA_ROOT` | `~/.aider.chat.history.md` | Aider history location |
-| `PI_CODING_AGENT_DIR` | `~/.pi/agent/sessions` | Pi-Agent sessions |
+| `PI_SESSIONS_DIR` | unset | Exact Pi-Agent sessions directory |
+| `PI_CODING_AGENT_DIR` | unset | Pi-Agent agent home; also the OMP agent-directory override when no named OMP profile is active |
+| `PI_CODING_AGENT_SESSION_DIR` | unset | Exact OMP sessions directory |
+| `OMP_PROFILE` | unset | Active OMP profile; takes precedence over `PI_PROFILE` |
+| `PI_PROFILE` | unset | Legacy OMP profile selector when `OMP_PROFILE` is unset |
+| `PI_CONFIG_DIR` | `.omp` | Home-relative OMP config directory name |
+| `XDG_DATA_HOME` | platform default | OMP XDG data root (`$XDG_DATA_HOME/omp`) when present |
+| `CASS_MUSE_DATA_ROOT` | `~/.local/share/muse` | Muse Code data root |
 | `CODEX_HOME` | `~/.codex` | Codex data directory |
 | `GEMINI_HOME` | `~/.gemini` | Gemini CLI directory |
 | `OPENCODE_STORAGE_ROOT` | (scans home) | OpenCode storage |
@@ -3062,7 +3079,7 @@ Update check state is stored in the data directory:
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | crates.io `=0.3.8` (the 0.2.1 line — the existing-only schema-open contract that the old same-version `0.1.19` registry archive lacks [cass#345], deferred-FTS5-validation opens [cass#368], the FTS5 overlong-term skip cap [cass#362], the ns-lifecycle wave, and GH#294 mutation-free default-flags opens — plus the asupersync 0.4.3 runtime migration and the 0.3.0 fix wave: GH#333 concurrent-open BusyRecovery retries, GH#334 `FileIdentity` re-derivation after file replacement including the cass#393 st_dev namespace-sidecar repair, the 8-writer rollback cascade, and cross-connection visibility — and the 0.3.1 correctness wave: allocator post-savepoint page-aliasing quarantine, committed-freelist resurrection refusal, shared concurrent-writer EOF high-water, sidecar-less read-only first-contact opens [GH#140], and Darwin OFD locking. The historical `[patch.crates-io]` git override is retired; `build.rs` instead fails the build if any patch entry targets the fsqlite family or the lockfile resolves any `fsqlite*` crate away from registry `0.3.8`. The engine API is async; `src/franken_sync.rs` preserves cass's synchronous call shape via a current-thread asupersync `block_on` bridge) |
-| `franken-agent-detection` | `17f28ad8` (2026-08-19 head with the Muse Code + VS Code Copilot connectors; previously `57d2789e`, the fsqlite 0.3.0 + asupersync 0.4.3 lockstep bump atop the sqlite_sync bridge for the SQLite-backed connectors; plus Kimi/omp fresh-eyes hardening: canonical scan-root dedup, prompt-echo dedup across bookkeeping events, first-result-wins tool.result with standalone fallback, `KIMI_CODE_HOME` override replaces defaults, omp slug false-positive guard; plus current Kimi Code layout + `KIMI_CODE_HOME` [cass #351], Oh My Pi probe roots + sub-agent transcripts, OpenCode remote-root scan isolation [cass #357], Grok Build connector [cass #328], Gemini CLI JSONL discovery and role normalization [cass #341]) |
+| `franken-agent-detection` | `82424dc8` (v0.2.1, 2026-08-23: first-class Oh My Pi v18 connector with profile, XDG, direct-root, and sub-agent discovery; preserves pi-family remote provenance; includes Muse Code and VS Code Copilot; aligned with fsqlite 0.3.x + asupersync 0.4.x) |
 | `asupersync` | `=0.4.4` (fsqlite 0.3.x requires the 0.4.x line, whose types its public API names; 0.4.4 adds the preserved-typed-result cancellation contract) |
 | `frankensearch` | `22859f74` (the v1.7.0 tag commit, 2026-08-23, aligned with fsqlite 0.3.8 + asupersync 0.4.9; carries the CASS→Quill lexical flip — the lexical backend is Quill, with `cass-compat` → `lexical-tantivy` retained only for the differential oracle and the schema-generation sentinel; pure-Rust `native`, architecture-safe HNSW with native-only read admission that never rebuilds a rejected selected artifact, explicit `cass-compat` → `lexical-tantivy`, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission, cancellation-safe facade opening, generation-pinned Quill hydration, and the restored positionless-term-frequency plumbing; frankentorch remains pinned by git rev inside frankensearch — cass #308, #333, bd-8nqz.5, bd-07os, bd-r65a.1) |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |

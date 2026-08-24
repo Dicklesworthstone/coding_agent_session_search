@@ -383,7 +383,7 @@ rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target cargo test --all-fea
 
 | Directory / File | Focus Areas |
 |-----------------|-------------|
-| `tests/connector_*.rs` | Per-provider session parsing (Claude, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, Pi Agent, Copilot, OpenClaw, ClawdBot, Vibe) |
+| `tests/connector_*.rs` | Per-provider session parsing (Claude, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, Pi Agent, Oh My Pi, Copilot, OpenClaw, ClawdBot, Vibe) |
 | `tests/search_*.rs` | Search pipeline, caching, filters, wildcard fallback |
 | `tests/semantic_integration.rs` | Semantic search, embeddings, two-tier search |
 | `tests/e2e_*.rs` | End-to-end CLI flows, filters, search, sources, TUI, deploy |
@@ -411,7 +411,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ## cass — Coding Agent Session Search
 
-**This is the project you're working on.** cass indexes conversations from Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, Pi Agent, Copilot, OpenClaw, ClawdBot, Vibe, and more into a unified, searchable index with a TUI and robot-mode CLI.
+**This is the project you're working on.** cass indexes conversations from Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, Pi Agent, Oh My Pi, Copilot, OpenClaw, ClawdBot, Vibe, and more into a unified, searchable index with a TUI and robot-mode CLI.
 
 **NEVER run bare `cass`** — it launches an interactive TUI. Always use `--robot` or `--json`.
 
@@ -470,6 +470,7 @@ coding_agent_session_search/
 │   │   ├── cline.rs              # Cline sessions
 │   │   ├── opencode.rs           # OpenCode sessions
 │   │   ├── pi_agent.rs           # Pi Agent sessions
+│   │   ├── omp.rs                # Oh My Pi sessions
 │   │   ├── copilot.rs            # Copilot sessions
 │   │   ├── copilot_cli.rs        # Copilot CLI sessions
 │   │   ├── openclaw.rs           # OpenClaw sessions
@@ -560,6 +561,7 @@ cass robot-docs guide         # LLM-optimized docs
 | Cline | `cline.rs` | JSONL |
 | OpenCode | `opencode.rs` | JSONL |
 | Pi Agent | `pi_agent.rs` | JSONL |
+| Oh My Pi | `omp.rs` | JSONL |
 | Copilot | `copilot.rs` | JSONL |
 | Copilot CLI | `copilot_cli.rs` | JSONL |
 | OpenClaw | `openclaw.rs` | JSONL |

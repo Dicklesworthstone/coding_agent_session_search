@@ -19,6 +19,16 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ### Added
 
+- **First-class Oh My Pi (`omp`) v18 support** ([#411](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/411)).
+  cass now indexes OMP as its own agent instead of folding `.omp` transcripts
+  into `pi_agent`. Discovery covers the default store, every named profile,
+  existence-gated XDG stores, direct session/agent-directory overrides, and
+  per-session sub-agent transcripts. OMP is wired through incremental watch,
+  remote-source presets and probing, capabilities/diagnostics, token
+  extraction, profile-aware `cass resume`, the TUI, and HTML export. On first
+  index after upgrade, canonical legacy `.omp/agent` rows are reclassified in
+  SQLite and the derived lexical/analytics assets are rebuilt, preventing one
+  transcript from surviving under both `pi_agent` and `omp`.
 - **Build commit embedded in the binary** ([#399](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/399)).
   `cass --version` now prints `cass <semver> (<short-sha> <commit-date>)` for
   builds made from a git checkout (with a `-dirty` suffix for uncommitted
