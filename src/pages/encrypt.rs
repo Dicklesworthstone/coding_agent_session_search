@@ -36,6 +36,8 @@ pub const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 /// Maximum chunk size (32 MiB)
 pub const MAX_CHUNK_SIZE: usize = 32 * 1024 * 1024;
+/// Recovery material must carry at least 192 bits of caller-supplied entropy.
+pub const MIN_RECOVERY_SECRET_BYTES: usize = 24;
 
 const MAX_ARCHIVE_CHUNKS: u64 = u32::MAX as u64;
 const AES_GCM_TAG_SIZE: u64 = 16;
@@ -545,8 +547,10 @@ impl EncryptionEngine {
 
     /// Add a recovery secret slot using HKDF-SHA256
     pub fn add_recovery_slot(&mut self, secret: &[u8]) -> Result<u8> {
-        if secret.is_empty() {
-            bail!("Recovery secret cannot be empty");
+        if secret.len() < MIN_RECOVERY_SECRET_BYTES {
+            bail!(
+                "Recovery secret must contain at least {MIN_RECOVERY_SECRET_BYTES} bytes (192 bits)"
+            );
         }
 
         let slot_id = key_slot_id_for_len(self.key_slots.len())?;
@@ -1145,6 +1149,11 @@ impl DecryptionEngine {
     /// Unlock with recovery secret
     pub fn unlock_with_recovery(config: EncryptionConfig, secret: &[u8]) -> Result<Self> {
         validate_supported_payload_format(&config)?;
+        if secret.len() < MIN_RECOVERY_SECRET_BYTES {
+            bail!(
+                "Recovery secret must contain at least {MIN_RECOVERY_SECRET_BYTES} bytes (192 bits)"
+            );
+        }
 
         let supported_argon2_params = Argon2Params::default();
         for slot in &config.key_slots {
@@ -1824,16 +1833,48 @@ mod tests {
     }
 
     #[test]
-    fn recovery_slot_rejects_empty_secret() {
+    fn recovery_slot_enforces_minimum_entropy_length() {
         let mut engine = EncryptionEngine::default();
         let err = engine
-            .add_recovery_slot(&[])
-            .expect_err("an empty recovery secret must never create a key slot");
+            .add_recovery_slot(&[0xA5; MIN_RECOVERY_SECRET_BYTES - 1])
+            .expect_err("a recovery secret below 192 bits must never create a key slot");
         assert!(
-            err.to_string().contains("cannot be empty"),
-            "unexpected empty-recovery-secret error: {err:#}"
+            err.to_string().contains("192 bits"),
+            "unexpected short-recovery-secret error: {err:#}"
         );
         assert_eq!(engine.key_slot_count(), 0);
+
+        engine
+            .add_recovery_slot(&[0x5A; MIN_RECOVERY_SECRET_BYTES])
+            .expect("the documented 192-bit boundary should be accepted");
+        assert_eq!(engine.key_slot_count(), 1);
+    }
+
+    #[test]
+    fn recovery_unlock_rejects_short_material_before_key_derivation() {
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.txt");
+        let output_dir = temp_dir.path().join("encrypted");
+        std::fs::write(&input_path, b"recovery length validation").unwrap();
+
+        let mut engine = EncryptionEngine::new(1024).unwrap();
+        engine
+            .add_recovery_slot(&[0x5A; MIN_RECOVERY_SECRET_BYTES])
+            .unwrap();
+        let config = engine
+            .encrypt_file(&input_path, &output_dir, |_, _| {})
+            .unwrap();
+
+        let err = DecryptionEngine::unlock_with_recovery(
+            config,
+            &[0x5A; MIN_RECOVERY_SECRET_BYTES - 1],
+        )
+        .err()
+        .expect("short recovery material must be rejected");
+        assert!(
+            err.to_string().contains("192 bits"),
+            "unexpected short-recovery unlock error: {err:#}"
+        );
     }
 
     #[test]
@@ -2154,7 +2195,8 @@ mod tests {
         let mut engine = EncryptionEngine::new(1024).unwrap();
         engine.add_password_slot("password1").unwrap();
         engine.add_password_slot("password2").unwrap();
-        engine.add_recovery_slot(b"recovery-secret").unwrap();
+        let recovery_secret = [0xA5; 32];
+        engine.add_recovery_slot(&recovery_secret).unwrap();
 
         let config = engine
             .encrypt_file(&input_path, &output_dir, |_, _| {})
@@ -2175,8 +2217,7 @@ mod tests {
         assert_file_bytes(&decrypted_path, test_data);
 
         // Decrypt with recovery secret
-        let d3 =
-            DecryptionEngine::unlock_with_recovery(config.clone(), b"recovery-secret").unwrap();
+        let d3 = DecryptionEngine::unlock_with_recovery(config.clone(), &recovery_secret).unwrap();
         d3.decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
             .unwrap();
         assert_file_bytes(&decrypted_path, test_data);

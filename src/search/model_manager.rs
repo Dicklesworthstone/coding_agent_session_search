@@ -31,7 +31,7 @@ use crate::search::vector_index::{
     ROLE_ASSISTANT, ROLE_USER, SemanticFilterMaps, SemanticIndexArtifact,
     SemanticProgressiveUnavailableReason, VectorIndex, vector_index_path,
 };
-use crate::storage::sqlite::FrankenStorage;
+use crate::storage::sqlite::{FrankenStorage, SemanticIdentityTier};
 
 /// Unified TUI state machine for semantic search availability.
 ///
@@ -1016,7 +1016,12 @@ fn refuse_stale_semantic_assets(
     availability_if_served: &SemanticAvailability,
     preference: crate::search::asset_state::SemanticPreference,
 ) -> Option<SemanticAvailability> {
-    match storage.semantic_identity_rebuild_required() {
+    let semantic_identity_tier = if served_embedder_id == HashEmbedder::default().id() {
+        SemanticIdentityTier::Fast
+    } else {
+        SemanticIdentityTier::Quality
+    };
+    match storage.semantic_identity_rebuild_required(semantic_identity_tier) {
         Ok(true) => {
             return Some(SemanticAvailability::IndexStale {
                 embedder_id: served_embedder_id.to_string(),
@@ -1499,7 +1504,7 @@ mod tests {
         // serving allowance until a semantic republish acknowledges it.
         let storage = FrankenStorage::open(&db_path).expect("open identity marker fixture");
         storage
-            .mark_semantic_identity_rebuild_required()
+            .mark_semantic_identity_rebuild_required(SemanticIdentityTier::Fast)
             .expect("mark semantic identity stale");
         drop(storage);
         let identity_stale = load_hash_semantic_context(tmp.path(), &db_path);
@@ -1511,7 +1516,7 @@ mod tests {
         );
         let storage = FrankenStorage::open(&db_path).expect("reopen identity marker fixture");
         storage
-            .complete_semantic_identity_rebuild()
+            .complete_semantic_identity_rebuild(SemanticIdentityTier::Fast)
             .expect("complete semantic identity rebuild");
         drop(storage);
         assert!(

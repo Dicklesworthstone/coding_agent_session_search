@@ -21,7 +21,9 @@ fn malformed_key_slot_nonce_returns_error_without_panic() {
     .unwrap();
 
     let mut engine = EncryptionEngine::new(1024).unwrap();
-    engine.add_recovery_slot(b"real-recovery-secret").unwrap();
+    engine
+        .add_recovery_slot(b"real-recovery-secret-32-byte-pad")
+        .unwrap();
     engine
         .encrypt_file(&input_path, &encrypted_dir, |_, _| {})
         .unwrap();
@@ -31,7 +33,7 @@ fn malformed_key_slot_nonce_returns_error_without_panic() {
     config.key_slots[0].nonce = BASE64_STANDARD.encode([0x42_u8; 8]);
 
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        DecryptionEngine::unlock_with_recovery(config, b"real-recovery-secret")
+        DecryptionEngine::unlock_with_recovery(config, b"real-recovery-secret-32-byte-pad")
     }));
     let result = outcome.expect("malformed key-slot nonce must not panic");
     match result {

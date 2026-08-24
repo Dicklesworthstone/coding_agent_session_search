@@ -365,7 +365,7 @@ fn test_recovery_key_authentication() {
 
     // Test invalid recovery key
     let enc_config = load_config(&artifacts.bundle.site_dir).expect("Failed to load config");
-    let result = DecryptionEngine::unlock_with_recovery(enc_config, b"wrong-recovery-key");
+    let result = DecryptionEngine::unlock_with_recovery(enc_config, &[0xEE; 32]);
     assert!(result.is_err(), "Should fail with wrong recovery key");
 
     info!("=== Recovery Key Authentication Test PASSED ===");

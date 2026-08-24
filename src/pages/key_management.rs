@@ -17,8 +17,9 @@
 
 use crate::pages::attachments::reencrypt_blobs_into_dir;
 use crate::pages::encrypt::{
-    Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType, decompress_archive_chunk,
-    load_config, max_archive_ciphertext_chunk_size, validate_supported_payload_format,
+    Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, MIN_RECOVERY_SECRET_BYTES, SlotType,
+    decompress_archive_chunk, load_config, max_archive_ciphertext_chunk_size,
+    validate_supported_payload_format,
 };
 use crate::pages::qr::RecoverySecret;
 use aes_gcm::{
@@ -652,8 +653,10 @@ fn create_recovery_slot(
     export_id_b64: &str,
     slot_id: u8,
 ) -> Result<KeySlot> {
-    if secret.is_empty() {
-        bail!("Recovery secret cannot be empty");
+    if secret.len() < MIN_RECOVERY_SECRET_BYTES {
+        bail!(
+            "Recovery secret must contain at least {MIN_RECOVERY_SECRET_BYTES} bytes (192 bits)"
+        );
     }
     let export_id = BASE64_STANDARD.decode(export_id_b64)?;
 

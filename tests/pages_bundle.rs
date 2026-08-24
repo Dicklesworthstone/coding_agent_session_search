@@ -2352,7 +2352,8 @@ mod tests {
         let crypto_worker_js = include_str!("../src/pages_assets/crypto_worker.js");
         assert!(
             crypto_worker_js.contains("const plaintextChunks = [];")
-                && crypto_worker_js.contains("await decompressDeflate(new Uint8Array(decrypted))")
+                && crypto_worker_js.contains("const plaintext = await decompressDeflate(")
+                && crypto_worker_js.contains("payload.chunk_size")
                 && crypto_worker_js.contains("const dbBytes = concatenateChunks(plaintextChunks);")
                 && !crypto_worker_js
                     .contains("const compressed = concatenateChunks(decryptedChunks);"),
@@ -2380,6 +2381,8 @@ mod tests {
                 const code = fs.readFileSync('./src/pages_assets/crypto_worker.js', 'utf8');
                 const context = {
                     console,
+                    atob: globalThis.atob,
+                    btoa: globalThis.btoa,
                     self: {
                         location: { href: 'https://example.test/archive/' },
                         postMessage() {},
@@ -2394,8 +2397,30 @@ mod tests {
                     payload: {
                         chunk_size: 32 * 1024 * 1024,
                         chunk_count: 0,
+                        total_compressed_size: 0,
+                        total_plaintext_size: 0,
                         files: [],
                     },
+                    export_id: Buffer.alloc(16).toString('base64'),
+                    base_nonce: Buffer.alloc(12).toString('base64'),
+                    kdf_defaults: {
+                        memory_kb: 65536,
+                        iterations: 3,
+                        parallelism: 4,
+                    },
+                    key_slots: [{
+                        id: 0,
+                        slot_type: 'password',
+                        kdf: 'argon2id',
+                        salt: Buffer.alloc(16).toString('base64'),
+                        wrapped_dek: Buffer.alloc(48).toString('base64'),
+                        nonce: Buffer.alloc(12).toString('base64'),
+                        argon2_params: {
+                            memory_kb: 65536,
+                            iterations: 3,
+                            parallelism: 4,
+                        },
+                    }],
                 };
 
                 context.validateSupportedPayloadFormat(config);
@@ -2413,6 +2438,136 @@ mod tests {
 
                 if (!rejected) {
                     throw new Error('oversized encrypted archive chunk_size should be rejected');
+                }
+            "#,
+        )
+    }
+
+    #[test]
+    fn crypto_worker_rejects_dangerous_archive_metadata_before_crypto() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const code = fs.readFileSync('./src/pages_assets/crypto_worker.js', 'utf8');
+                const context = {
+                    console,
+                    atob: globalThis.atob,
+                    btoa: globalThis.btoa,
+                    self: {
+                        location: { href: 'https://example.test/archive/' },
+                        postMessage() {},
+                    },
+                };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+
+                const baseConfig = () => ({
+                    version: 2,
+                    compression: 'deflate',
+                    export_id: Buffer.alloc(16).toString('base64'),
+                    base_nonce: Buffer.alloc(12).toString('base64'),
+                    kdf_defaults: {
+                        memory_kb: 65536,
+                        iterations: 3,
+                        parallelism: 4,
+                    },
+                    payload: {
+                        chunk_size: 1024,
+                        chunk_count: 0,
+                        total_compressed_size: 0,
+                        total_plaintext_size: 0,
+                        files: [],
+                    },
+                    key_slots: [{
+                        id: 0,
+                        slot_type: 'password',
+                        kdf: 'argon2id',
+                        salt: Buffer.alloc(16).toString('base64'),
+                        wrapped_dek: Buffer.alloc(48).toString('base64'),
+                        nonce: Buffer.alloc(12).toString('base64'),
+                        argon2_params: {
+                            memory_kb: 65536,
+                            iterations: 3,
+                            parallelism: 4,
+                        },
+                    }],
+                });
+
+                const expectRejected = (mutate, expectedMessage) => {
+                    const config = baseConfig();
+                    mutate(config);
+                    try {
+                        context.validateSupportedPayloadFormat(config);
+                    } catch (error) {
+                        if (!String(error.message).includes(expectedMessage)) {
+                            throw new Error(`expected ${expectedMessage}, got: ${error.message}`);
+                        }
+                        return;
+                    }
+                    throw new Error(`dangerous metadata was accepted: ${expectedMessage}`);
+                };
+
+                context.validateSupportedPayloadFormat(baseConfig());
+                expectRejected(config => { config.key_slots = []; }, 'at least one key slot');
+                expectRejected(config => {
+                    config.key_slots[0].argon2_params.memory_kb = 0x7fffffff;
+                }, 'Unsupported archive key_slots.argon2_params.memory_kb');
+                expectRejected(config => {
+                    config.key_slots.push({ ...config.key_slots[0] });
+                }, 'Duplicate archive key slot id');
+                expectRejected(config => {
+                    config.payload.total_plaintext_size = 1;
+                }, 'expected 1 chunks');
+                expectRejected(config => {
+                    config.payload.files = ['payload/../secret.bin'];
+                    config.payload.chunk_count = 1;
+                    config.payload.total_plaintext_size = 1;
+                    config.payload.total_compressed_size = 17;
+                }, 'Invalid payload file entry 0');
+            "#,
+        )
+    }
+
+    #[test]
+    fn crypto_worker_streaming_inflater_enforces_plaintext_bound() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const code = fs.readFileSync('./src/pages_assets/crypto_worker.js', 'utf8');
+                const context = {
+                    console,
+                    atob: globalThis.atob,
+                    btoa: globalThis.btoa,
+                    Uint8Array,
+                    self: {
+                        location: { href: 'https://example.test/archive/' },
+                        postMessage() {},
+                        fflate: {
+                            Inflate: class {
+                                constructor(ondata) { this.ondata = ondata; }
+                                push() { this.ondata(new Uint8Array(5), true); }
+                            },
+                        },
+                    },
+                };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+
+                let rejected = false;
+                try {
+                    await context.decompressDeflate(new Uint8Array([1]), 4);
+                } catch (error) {
+                    if (!String(error.message).includes('4-byte archive limit')) {
+                        throw new Error(`unexpected decompression-bound error: ${error.message}`);
+                    }
+                    rejected = true;
+                }
+                if (!rejected) {
+                    throw new Error('streaming inflater accepted expansion past declared chunk_size');
                 }
             "#,
         )

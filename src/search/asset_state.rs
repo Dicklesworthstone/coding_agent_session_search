@@ -40,6 +40,7 @@ use crate::search::tantivy::SCHEMA_HASH;
 #[cfg(test)]
 use crate::search::vector_index::VECTOR_INDEX_DIR;
 use crate::search::vector_index::{SemanticProgressiveUnavailableReason, vector_index_path};
+use crate::storage::sqlite::{FrankenStorage, SemanticIdentityTier};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum SearchMaintenanceMode {
@@ -762,7 +763,43 @@ pub(crate) fn inspect_semantic_assets(
         SemanticPreference::DefaultModel => probe_semantic_availability(data_dir),
         SemanticPreference::HashFallback => probe_hash_semantic_availability(data_dir),
     };
+    let availability = apply_semantic_identity_invalidation(db_path, availability, preference);
     semantic_state_from_availability(data_dir, &availability, preference, current_db_fingerprint)
+}
+
+fn apply_semantic_identity_invalidation(
+    db_path: &Path,
+    availability: SemanticAvailability,
+    preference: SemanticPreference,
+) -> SemanticAvailability {
+    if !availability.can_search() {
+        return availability;
+    }
+    let identity_tier = match preference {
+        SemanticPreference::HashFallback => SemanticIdentityTier::Fast,
+        SemanticPreference::DefaultModel => SemanticIdentityTier::Quality,
+    };
+    let storage = match FrankenStorage::open_readonly(db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            return SemanticAvailability::DatabaseUnavailable {
+                db_path: db_path.to_path_buf(),
+                error: format!("checking semantic identity invalidation: {err}"),
+            };
+        }
+    };
+    match storage.semantic_identity_rebuild_required(identity_tier) {
+        Ok(true) => SemanticAvailability::IndexStale {
+            embedder_id: semantic_embedder_id(&availability, preference)
+                .unwrap_or_else(|| "semantic".to_string()),
+            reason: "canonical agent/source identity changed; run 'cass index --semantic' to rebuild semantic filter metadata"
+                .to_string(),
+        },
+        Ok(false) => availability,
+        Err(err) => SemanticAvailability::LoadFailed {
+            context: format!("checking semantic identity invalidation marker: {err}"),
+        },
+    }
 }
 
 pub(crate) fn semantic_state_from_availability(
@@ -2156,6 +2193,39 @@ pub(crate) fn unified_maintenance_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_identity_marker_overrides_ready_asset_status_per_tier() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("create cass db");
+        storage
+            .mark_semantic_identity_rebuild_required(SemanticIdentityTier::Fast)
+            .expect("mark fast semantic identity stale");
+        drop(storage);
+
+        let stale = apply_semantic_identity_invalidation(
+            &db_path,
+            SemanticAvailability::HashFallback,
+            SemanticPreference::HashFallback,
+        );
+        assert!(
+            stale.is_index_stale(),
+            "status must not advertise a Pi-era fast-tier artifact as ready: {stale:?}"
+        );
+
+        let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+        storage
+            .complete_semantic_identity_rebuild(SemanticIdentityTier::Fast)
+            .expect("complete fast semantic identity rebuild");
+        drop(storage);
+        let ready = apply_semantic_identity_invalidation(
+            &db_path,
+            SemanticAvailability::HashFallback,
+            SemanticPreference::HashFallback,
+        );
+        assert!(ready.is_hash_fallback());
+    }
 
     #[cfg(windows)]
     fn active_lock_fixture_pid(_non_windows_pid: u32) -> u32 {
