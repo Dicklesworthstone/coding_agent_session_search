@@ -7,6 +7,12 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+use crate::indexer::redact_secrets::{
+    ANTHROPIC_API_KEY_PATTERN, AWS_ACCESS_KEY_PATTERN, AWS_SECRET_KEY_PATTERN,
+    AWS_SESSION_TOKEN_PATTERN, BEARER_TOKEN_PATTERN, DATABASE_URL_PATTERN,
+    GENERIC_SECRET_ASSIGNMENT_PATTERN, GITHUB_TOKEN_PATTERN, OPENAI_API_KEY_PATTERN,
+    SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN,
+};
 use crate::pages::redact::CustomPattern;
 
 /// Categories of sensitive patterns for organizational clarity.
@@ -56,7 +62,7 @@ pub static AWS_ACCESS_KEY: PatternDef = PatternDef {
     name: "AWS Access Key ID",
     category: PatternCategory::ApiKeys,
     description: "AWS long-lived and temporary access key identifiers (AKIA... / ASIA...)",
-    pattern: r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+    pattern: AWS_ACCESS_KEY_PATTERN,
     replacement: "[AWS_KEY_REDACTED]",
 };
 
@@ -65,16 +71,25 @@ pub static AWS_SECRET_KEY: PatternDef = PatternDef {
     name: "AWS Secret Key",
     category: PatternCategory::ApiKeys,
     description: "AWS secret access keys in configuration contexts",
-    pattern: r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#,
+    pattern: AWS_SECRET_KEY_PATTERN,
     replacement: "[AWS_SECRET_REDACTED]",
+};
+
+pub static AWS_SESSION_TOKEN: PatternDef = PatternDef {
+    id: "aws_session_token",
+    name: "AWS Session Token",
+    category: PatternCategory::ApiKeys,
+    description: "AWS STS session/security tokens in configuration contexts",
+    pattern: AWS_SESSION_TOKEN_PATTERN,
+    replacement: "[AWS_SESSION_TOKEN_REDACTED]",
 };
 
 pub static OPENAI_KEY: PatternDef = PatternDef {
     id: "openai_key",
     name: "OpenAI API Key",
     category: PatternCategory::ApiKeys,
-    description: "OpenAI API keys (sk-...)",
-    pattern: r"\bsk-[A-Za-z0-9]{20,}\b",
+    description: "OpenAI legacy, project, and admin API keys",
+    pattern: OPENAI_API_KEY_PATTERN,
     replacement: "[OPENAI_KEY_REDACTED]",
 };
 
@@ -82,8 +97,8 @@ pub static ANTHROPIC_KEY: PatternDef = PatternDef {
     id: "anthropic_key",
     name: "Anthropic API Key",
     category: PatternCategory::ApiKeys,
-    description: "Anthropic API keys (sk-ant-...)",
-    pattern: r"\bsk-ant-[A-Za-z0-9\-]{20,}\b",
+    description: "Anthropic API keys, including segmented apiNN keys",
+    pattern: ANTHROPIC_API_KEY_PATTERN,
     replacement: "[ANTHROPIC_KEY_REDACTED]",
 };
 
@@ -91,8 +106,8 @@ pub static GITHUB_TOKEN: PatternDef = PatternDef {
     id: "github_token",
     name: "GitHub Token",
     category: PatternCategory::ApiKeys,
-    description: "GitHub personal access tokens and app tokens",
-    pattern: r"\bgh[pousr]_[A-Za-z0-9]{36}\b",
+    description: "GitHub classic, fine-grained personal access, and app tokens",
+    pattern: GITHUB_TOKEN_PATTERN,
     replacement: "[GITHUB_TOKEN_REDACTED]",
 };
 
@@ -101,7 +116,7 @@ pub static GENERIC_API_KEY: PatternDef = PatternDef {
     name: "Generic API Key",
     category: PatternCategory::ApiKeys,
     description: "Generic API keys, tokens, and secrets in assignment contexts",
-    pattern: r#"(?i)(api[_-]?key|api[_-]?token|auth[_-]?token|access[_-]?token|secret[_-]?key)\s*[:=]\s*['"]?[A-Za-z0-9_\-]{16,}['"]?"#,
+    pattern: GENERIC_SECRET_ASSIGNMENT_PATTERN,
     replacement: "[API_KEY_REDACTED]",
 };
 
@@ -110,8 +125,26 @@ pub static BEARER_TOKEN: PatternDef = PatternDef {
     name: "Bearer Token",
     category: PatternCategory::ApiKeys,
     description: "Bearer authorization tokens in headers",
-    pattern: r"(?i)Bearer\s+[A-Za-z0-9\-_.~+/]+=*",
+    pattern: BEARER_TOKEN_PATTERN,
     replacement: "Bearer [TOKEN_REDACTED]",
+};
+
+pub static SLACK_TOKEN: PatternDef = PatternDef {
+    id: "slack_token",
+    name: "Slack Token",
+    category: PatternCategory::ApiKeys,
+    description: "Slack xox-family service and user tokens",
+    pattern: SLACK_TOKEN_PATTERN,
+    replacement: "[SLACK_TOKEN_REDACTED]",
+};
+
+pub static STRIPE_KEY: PatternDef = PatternDef {
+    id: "stripe_key",
+    name: "Stripe Live Key",
+    category: PatternCategory::ApiKeys,
+    description: "Stripe live secret, publishable, and restricted keys",
+    pattern: STRIPE_KEY_PATTERN,
+    replacement: "[STRIPE_KEY_REDACTED]",
 };
 
 // ============================================================================
@@ -173,7 +206,7 @@ pub static DATABASE_URL: PatternDef = PatternDef {
     name: "Database URL",
     category: PatternCategory::ConnectionStrings,
     description: "PostgreSQL, MySQL, MongoDB, and Redis connection strings",
-    pattern: r#"(?i)\b(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'""]+"#,
+    pattern: DATABASE_URL_PATTERN,
     replacement: "[DATABASE_URL_REDACTED]",
 };
 

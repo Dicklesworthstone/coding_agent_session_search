@@ -28,7 +28,7 @@ const REDACTED: &str = "[REDACTED]";
 /// semantics. Normalization deliberately accepts the common snake/kebab/camel
 /// spellings while using an exact allowlist to avoid broad false positives such
 /// as `keyframe`, `monkey`, or `token_count`.
-fn is_sensitive_json_field(key: &str) -> bool {
+pub(crate) fn is_sensitive_json_field(key: &str) -> bool {
     let normalized = key
         .bytes()
         .filter(|byte| byte.is_ascii_alphanumeric())
@@ -37,8 +37,7 @@ fn is_sensitive_json_field(key: &str) -> bool {
 
     matches!(
         normalized.as_str(),
-        "password"
-            | "passwd"
+        "passwd"
             | "pwd"
             | "passphrase"
             | "pin"
@@ -52,6 +51,7 @@ fn is_sensitive_json_field(key: &str) -> bool {
             | "sessiontoken"
             | "bearertoken"
             | "secrettoken"
+            | "oauthtoken"
             | "secret"
             | "secretkey"
             | "accesskey"
@@ -59,16 +59,23 @@ fn is_sensitive_json_field(key: &str) -> bool {
             | "awssecretaccesskey"
             | "awssessiontoken"
             | "awssecuritytoken"
-            | "clientsecret"
             | "clienttoken"
             | "credential"
             | "credentials"
             | "authorization"
+            | "cookie"
+            | "setcookie"
             | "privatekey"
             | "privatekeypem"
-            | "databasepassword"
-            | "dbpassword"
-    )
+            | "databaseurl"
+            | "connectionstring"
+    ) || normalized.ends_with("password")
+        || normalized.ends_with("passwordhash")
+        || normalized.ends_with("hashedpassword")
+        || normalized.ends_with("secret")
+        || normalized.ends_with("token")
+        || normalized.ends_with("apikey")
+        || normalized.ends_with("credential")
 }
 
 fn redact_sensitive_json_value(
@@ -234,7 +241,7 @@ fn apply_replacements<'a>(input: &'a str, matches: &regex::SetMatches) -> Cow<'a
 /// whose distinct source key redacted to the same placeholder. Generated
 /// suffixes contain only public punctuation/digits, so collision handling
 /// never reintroduces source-key bytes.
-fn insert_redacted_json_entry(
+pub(crate) fn insert_redacted_json_entry(
     object: &mut serde_json::Map<String, serde_json::Value>,
     next_suffixes: &mut HashMap<String, usize>,
     redacted_key: String,
@@ -934,7 +941,11 @@ mod tests {
             },
             "nested": {
                 "clientSecret": ["short", "values"],
-                "private_key_pem": {"body": "short"}
+                "private_key_pem": {"body": "short"},
+                "oauth_token": "opaque-short-value",
+                "service_password_hash": "not-pattern-shaped",
+                "cookie": "session=short",
+                "connection_string": "custom-driver opaque value"
             },
             "null_password": null,
             "keyframe": "animation-safe",
@@ -958,6 +969,10 @@ mod tests {
             "/credentials",
             "/nested/clientSecret",
             "/nested/private_key_pem",
+            "/nested/oauth_token",
+            "/nested/service_password_hash",
+            "/nested/cookie",
+            "/nested/connection_string",
         ] {
             if plain.pointer(pointer) != Some(&json!(REDACTED)) {
                 return Err(format!("sensitive field was not fully redacted: {pointer}"));

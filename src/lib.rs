@@ -21371,29 +21371,7 @@ fn default_trace_metadata_enabled(metadata: &tracing::Metadata<'_>) -> bool {
 }
 
 fn trace_field_is_sensitive(field: &str) -> bool {
-    let normalized = field.to_ascii_lowercase().replace('-', "_");
-    matches!(
-        normalized.as_str(),
-        "password"
-            | "passwd"
-            | "secret"
-            | "client_secret"
-            | "token"
-            | "access_token"
-            | "refresh_token"
-            | "api_key"
-            | "apikey"
-            | "authorization"
-            | "credential"
-            | "credentials"
-            | "cookie"
-            | "set_cookie"
-            | "private_key"
-    ) || normalized.ends_with("_password")
-        || normalized.ends_with("_secret")
-        || normalized.ends_with("_token")
-        || normalized.ends_with("_api_key")
-        || normalized.ends_with("_credential")
+    crate::indexer::redact_secrets::is_sensitive_json_field(field)
 }
 
 static TRACE_REDACTION_ENGINE: once_cell::sync::Lazy<crate::pages::redact::RedactionEngine> =
@@ -21475,6 +21453,7 @@ fn redact_trace_json(value: &serde_json::Value) -> serde_json::Value {
         }
         serde_json::Value::Object(fields) => {
             let mut redacted = serde_json::Map::with_capacity(fields.len());
+            let mut next_suffixes = std::collections::HashMap::new();
             for (field, value) in fields {
                 let sanitized_trace_value = if trace_field_is_sensitive(field) {
                     serde_json::Value::String("[REDACTED]".to_string())
@@ -21482,7 +21461,12 @@ fn redact_trace_json(value: &serde_json::Value) -> serde_json::Value {
                     redact_trace_json(value)
                 };
                 let field = redact_trace_text(field);
-                redacted.insert(field, sanitized_trace_value);
+                crate::indexer::redact_secrets::insert_redacted_json_entry(
+                    &mut redacted,
+                    &mut next_suffixes,
+                    field,
+                    sanitized_trace_value,
+                );
             }
             serde_json::Value::Object(redacted)
         }
