@@ -78,7 +78,9 @@ pub enum LazyDbError {
 pub struct FrankenOwnerConnection(FrankenAsyncConnection);
 
 impl FrankenOwnerConnection {
-    fn open(path: impl Into<String>) -> std::result::Result<Self, crate::franken_sync::FrankenError> {
+    fn open(
+        path: impl Into<String>,
+    ) -> std::result::Result<Self, crate::franken_sync::FrankenError> {
         FrankenAsyncConnection::open_sync(path).map(Self)
     }
 

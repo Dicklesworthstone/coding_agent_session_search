@@ -77,19 +77,59 @@ fn redact(text: &str, tally: &mut RedactionTally) -> String {
     out
 }
 
-/// Recursively redact every string value in an arbitrary JSON value.
+/// Redact arbitrary JSON with the canonical key-aware secret policy followed
+/// by the strict swarm-evidence policy. Object keys are output strings too,
+/// and credential-bearing keys can make otherwise innocuous short scalars
+/// sensitive, so a value-only walk is not sufficient here.
 fn redact_value(value: &Value, tally: &mut RedactionTally) -> Value {
+    tally.strings_seen = tally
+        .strings_seen
+        .saturating_add(json_output_string_count(value));
+    tally.fields_scrubbed = tally
+        .fields_scrubbed
+        .saturating_add(json_redaction_count(value));
+    crate::pages::redact::redact_swarm_json_value(value)
+}
+
+fn json_output_string_count(value: &Value) -> usize {
     match value {
-        Value::String(text) => Value::String(redact(text, tally)),
-        Value::Array(items) => {
-            Value::Array(items.iter().map(|item| redact_value(item, tally)).collect())
+        Value::String(_) => 1,
+        Value::Array(items) => items.iter().fold(0usize, |total, item| {
+            total.saturating_add(json_output_string_count(item))
+        }),
+        Value::Object(map) => map.iter().fold(0usize, |total, (_, value)| {
+            total
+                .saturating_add(1)
+                .saturating_add(json_output_string_count(value))
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    }
+}
+
+fn json_redaction_count(value: &Value) -> usize {
+    match value {
+        Value::String(text) => {
+            let redacted = crate::pages::redact::redact_swarm_text(text);
+            usize::from(redacted != text.as_str())
         }
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(key, val)| (key.clone(), redact_value(val, tally)))
-                .collect(),
-        ),
-        other => other.clone(),
+        Value::Array(items) => items.iter().fold(0usize, |total, item| {
+            total.saturating_add(json_redaction_count(item))
+        }),
+        Value::Object(map) => map.iter().fold(0usize, |total, (key, value)| {
+            let redacted_key = crate::pages::redact::redact_swarm_text(key);
+            let key_changed = usize::from(redacted_key != key.as_str());
+            let value_changes = if crate::indexer::redact_secrets::is_sensitive_json_field(key)
+                && !value.is_null()
+            {
+                usize::from(value.as_str() != Some("[REDACTED]"))
+            } else {
+                json_redaction_count(value)
+            };
+            total
+                .saturating_add(key_changed)
+                .saturating_add(value_changes)
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
     }
 }
 
@@ -428,6 +468,51 @@ mod tests {
         assert_no_leak(&out);
         assert_ne!(out["capsule"]["session_text"], json!(OMITTED));
         assert_eq!(out["privacy"]["session_text_opt_in"], json!(true));
+    }
+
+    #[test]
+    fn structured_json_redacts_keys_and_short_sensitive_values_without_loss() {
+        let short_password = ["a", "bc"].concat();
+        let first_secret_key = ["api_key=", "abcdefgh12345678"].concat();
+        let second_secret_key = ["password=", "abcdefgh12345678"].concat();
+        let source = json!({
+            "incident_kind": "ci-failure",
+            "env": {
+                "password": short_password,
+                (first_secret_key.clone()): "first",
+                (second_secret_key.clone()): "second",
+            },
+            "health_excerpt": {
+                "nested": { "pin": ["12", "34"].concat() },
+            },
+        });
+
+        let out = render_repro_capsule_fixture("capsule", Some(&source));
+        let serialized = serde_json::to_string(&out).expect("serialize redacted capsule");
+        for raw in [first_secret_key.as_str(), second_secret_key.as_str()] {
+            assert!(!serialized.contains(raw), "structured JSON leaked {raw:?}");
+        }
+        assert_eq!(out["capsule"]["env_summary"]["password"], "[REDACTED]");
+        assert_eq!(
+            out["capsule"]["health_excerpt"]["nested"]["pin"],
+            "[REDACTED]"
+        );
+
+        let env = out["capsule"]["env_summary"]
+            .as_object()
+            .expect("redacted env object");
+        let mut collision_values = env
+            .iter()
+            .filter(|(key, _)| key.starts_with("[REDACTED]"))
+            .map(|(_, value)| value.as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        collision_values.sort_unstable();
+        assert_eq!(collision_values, vec!["first", "second"]);
+        assert!(
+            out["redaction_report"]["fields_scrubbed"]
+                .as_u64()
+                .is_some_and(|count| count >= 4)
+        );
     }
 
     #[test]
