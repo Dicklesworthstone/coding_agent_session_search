@@ -167,10 +167,19 @@ impl FrankenOwnerConnection {
         self.0.close_sync()
     }
 
-    fn close_without_checkpoint_sync(
+    pub(crate) fn close_without_checkpoint_sync(
         &mut self,
     ) -> std::result::Result<(), Arc<crate::franken_sync::FrankenError>> {
         self.0.close_without_checkpoint_sync()
+    }
+
+    fn close_best_effort_in_place(&mut self) {
+        if let Err(err) = self.close_sync() {
+            tracing::debug!(
+                error = %err,
+                "failed to close dedicated-owner frankensqlite connection"
+            );
+        }
     }
 }
 
@@ -836,6 +845,16 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
     }
 }
 
+/// Open the synchronous dedicated-owner facade used by non-async callers
+/// that must safely transfer a read handle between worker threads.
+pub(crate) fn open_franken_owner_readonly_connection_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<FrankenOwnerConnection> {
+    open_franken_async_readonly_connection_with_timeout(path, timeout)
+        .map(FrankenOwnerConnection)
+}
+
 pub(crate) fn retryable_franken_error(err: &crate::franken_sync::FrankenError) -> bool {
     matches!(
         err,
@@ -989,7 +1008,7 @@ impl Drop for LazyFrankenDb {
         let Some(mut conn) = self.conn.get_mut().take() else {
             return;
         };
-        conn.0.close_best_effort_in_place();
+        conn.close_best_effort_in_place();
     }
 }
 
@@ -1028,11 +1047,11 @@ impl Default for ConnectionManagerConfig {
 /// - Controlled creation of writer connections with token-based limits
 /// - RAII guards that auto-rollback uncommitted transactions on drop
 ///
-/// Thread-safe: reader connections are wrapped in Mutex (FrankenConnection is !Sync).
-/// Writer connections are created per-request (each thread gets its own).
+/// Thread-safe: reader handles dispatch to dedicated owner threads. Writer
+/// connections remain thread-affine and are created and consumed per request.
 pub struct FrankenConnectionManager {
     db_path: PathBuf,
-    readers: Vec<parking_lot::Mutex<SendFrankenConnection>>,
+    readers: Vec<parking_lot::Mutex<FrankenOwnerConnection>>,
     reader_idx: std::sync::atomic::AtomicUsize,
     /// Token-based writer limit: channel pre-filled with `max_writers` tokens.
     /// `recv()` = acquire slot, `send()` = release slot.
@@ -1042,13 +1061,6 @@ pub struct FrankenConnectionManager {
     ),
     config: ConnectionManagerConfig,
 }
-
-// Safety: FrankenConnectionManager is Send+Sync because:
-// - readers wrapped in Mutex<SendFrankenConnection> (exclusive access)
-// - writer_tokens uses crossbeam (Send+Sync)
-// - db_path is PathBuf (Send+Sync)
-unsafe impl Send for FrankenConnectionManager {}
-unsafe impl Sync for FrankenConnectionManager {}
 
 impl FrankenConnectionManager {
     /// Create a new connection manager.
@@ -1062,12 +1074,12 @@ impl FrankenConnectionManager {
         let reader_count = config.reader_count.max(1);
         let mut readers = Vec::with_capacity(reader_count);
         for _ in 0..reader_count {
-            let conn = FrankenConnection::open(&path_str)
+            let conn = FrankenOwnerConnection::open(path_str.clone())
                 .with_context(|| format!("opening reader connection at {}", db_path.display()))?;
             // Apply read-tuned config (no migration, no write PRAGMAs)
             let _ = conn.execute("PRAGMA busy_timeout = 5000;"); // match writer config
             let _ = conn.execute("PRAGMA cache_size = -16384;"); // 16MB reader cache
-            readers.push(parking_lot::Mutex::new(SendFrankenConnection::new(conn)));
+            readers.push(parking_lot::Mutex::new(conn));
         }
 
         let max_writers = config.max_writers.max(1);
@@ -1096,8 +1108,8 @@ impl FrankenConnectionManager {
     /// Get a reader connection (round-robin from the pool).
     ///
     /// Returns a mutex guard wrapping the connection. The guard prevents
-    /// concurrent access to the same connection (FrankenConnection is !Sync).
-    pub fn reader(&self) -> parking_lot::MutexGuard<'_, SendFrankenConnection> {
+    /// concurrent command streams through the same owner handle.
+    pub fn reader(&self) -> parking_lot::MutexGuard<'_, FrankenOwnerConnection> {
         let idx = self
             .reader_idx
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1190,7 +1202,7 @@ impl FrankenConnectionManager {
 impl Drop for FrankenConnectionManager {
     fn drop(&mut self) {
         for reader in &mut self.readers {
-            reader.get_mut().0.close_best_effort_in_place();
+            reader.get_mut().close_best_effort_in_place();
         }
     }
 }
@@ -4376,8 +4388,42 @@ const FTS_MESSAGES_PRESENT_PRESENT: i8 = 2;
 
 enum CachedEphemeralWriter {
     Uninitialized,
-    Cached(Box<SendFrankenConnection>),
+    Cached(Box<CachedRawFrankenConnection>),
     InUse,
+}
+
+/// Thread-affine writer state cached only inside the owning `FrankenStorage`.
+///
+/// Unlike the public reader facade, this intentionally contains the raw
+/// `!Send` connection and has no manual auto-trait implementation. That makes
+/// moving a storage (and therefore a cached writer) across OS threads a
+/// compile-time error while preserving the inexpensive same-thread reuse path.
+struct CachedRawFrankenConnection {
+    conn: FrankenConnection,
+    index_writer_checkpoint_pages: i64,
+    index_writer_busy_timeout_ms: u64,
+}
+
+impl CachedRawFrankenConnection {
+    fn new(
+        conn: FrankenConnection,
+        index_writer_checkpoint_pages: i64,
+        index_writer_busy_timeout_ms: u64,
+    ) -> Self {
+        Self {
+            conn,
+            index_writer_checkpoint_pages,
+            index_writer_busy_timeout_ms,
+        }
+    }
+
+    fn into_parts(self) -> (FrankenConnection, i64, u64) {
+        (
+            self.conn,
+            self.index_writer_checkpoint_pages,
+            self.index_writer_busy_timeout_ms,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4782,7 +4828,7 @@ impl FrankenStorage {
             "cached ephemeral writer state should be in-use when releasing"
         );
         *cached = CachedEphemeralWriter::Cached(Box::new(
-            SendFrankenConnection::new_with_index_writer_state(
+            CachedRawFrankenConnection::new(
                 conn,
                 checkpoint_pages,
                 busy_timeout_ms,
@@ -4890,7 +4936,7 @@ impl FrankenStorage {
             std::mem::replace(cached, CachedEphemeralWriter::Uninitialized)
         {
             let mut conn = conn;
-            conn.0.close_best_effort_in_place();
+            conn.conn.close_best_effort_in_place();
         }
     }
 
@@ -4898,7 +4944,7 @@ impl FrankenStorage {
         let cached = self.cached_ephemeral_writer.get_mut();
         match std::mem::replace(cached, CachedEphemeralWriter::Uninitialized) {
             CachedEphemeralWriter::Cached(mut conn) => {
-                close_franken_in_place_with_busy_retry(&mut conn.0, false)
+                close_franken_in_place_with_busy_retry(&mut conn.conn, false)
                     .with_context(|| "closing cached frankensqlite writer without final checkpoint")
             }
             CachedEphemeralWriter::Uninitialized | CachedEphemeralWriter::InUse => Ok(()),
