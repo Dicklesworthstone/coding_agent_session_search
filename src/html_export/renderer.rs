@@ -1628,6 +1628,16 @@ mod tests {
     }
 
     #[test]
+    fn pi_agent_slug_normalization_composes_with_renderer_identity() {
+        for alias in ["pi_agent", "pi-agent", "piagent", "pi"] {
+            let slug = crate::html_export::agent_slug(alias);
+            assert_eq!(slug, "pi_agent", "Pi Agent alias {alias:?}");
+            assert_eq!(agent_css_class(&slug), "agent-aider");
+            assert_eq!(agent_display_name(&slug), "Pi Agent");
+        }
+    }
+
+    #[test]
     fn connector_registry_slugs_have_specific_html_identity() {
         for (slug, _) in crate::indexer::get_connector_factories() {
             assert_ne!(

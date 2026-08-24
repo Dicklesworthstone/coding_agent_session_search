@@ -556,6 +556,29 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                 message_idx: None,
             };
 
+            // These provenance fields are part of the exported database too.
+            // Merely redacting them in the diagnostic report would otherwise
+            // allow a credential-bearing path/workspace to yield a false-clean
+            // approval while the original value remains in the payload.
+            for provenance in [
+                ctx.agent.as_deref(),
+                ctx.workspace.as_deref(),
+                ctx.source_path.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                scan_text(
+                    provenance,
+                    SecretLocation::ConversationMetadata,
+                    &ctx,
+                    config,
+                    &mut findings,
+                    &mut seen,
+                    &mut truncated,
+                );
+            }
+
             if let Some(title_text) = title {
                 scan_text(
                     &title_text,
@@ -620,6 +643,14 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
         let extra_json_projection = if has_extra_json { "m.extra_json" } else { "NULL" };
         let has_extra_bin = table_has_column(&conn, "messages", "extra_bin")?;
         let extra_bin_projection = if has_extra_bin { "m.extra_bin" } else { "NULL" };
+        let has_attachment_refs =
+            table_has_column(&conn, "messages", "attachment_refs")?;
+        let attachment_refs_projection =
+            if schema == SecretScanSchema::PagesExport && has_attachment_refs {
+                "m.attachment_refs"
+            } else {
+                "NULL"
+            };
         let (msg_where, msg_params) = build_where_clause_for_columns(
             filters,
             schema.agent_expression(),
@@ -631,7 +662,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
         )?;
         let msg_high_watermark = table_max_id(&conn, "messages")?;
         let msg_select = format!(
-            "SELECT m.id, m.idx, m.content, {extra_json_projection}, c.id, c.source_path, {}, {}, {extra_bin_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id{}",
+            "SELECT m.id, m.idx, m.content, {extra_json_projection}, c.id, c.source_path, {}, {}, {extra_bin_projection}, {attachment_refs_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id{}",
             schema.agent_expression(),
             schema.workspace_expression(),
             schema.conversation_joins(),
@@ -671,6 +702,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                 let agent_slug: String = row.get_typed(6)?;
                 let workspace_path: Option<String> = row.get_typed(7)?;
                 let extra_bin: Option<Vec<u8>> = row.get_typed(8)?;
+                let attachment_refs: Option<String> = row.get_typed(9)?;
                 last_msg_id = Some(msg_id);
 
                 let ctx = ScanContext {
@@ -691,6 +723,17 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                     &mut seen,
                     &mut truncated,
                 );
+                if let Some(attachment_refs) = attachment_refs.as_deref() {
+                    scan_text(
+                        attachment_refs,
+                        SecretLocation::MessageMetadata,
+                        &ctx,
+                        config,
+                        &mut findings,
+                        &mut seen,
+                        &mut truncated,
+                    );
+                }
                 if let Some(extra) = structured_metadata_scan_text(
                     extra_bin.as_deref(),
                     extra_json.as_deref(),
@@ -752,7 +795,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
         )?;
         let snip_high_watermark = table_max_id(&conn, "snippets")?;
         let snip_select = format!(
-            "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, {}, {}\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id{}",
+            "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, {}, {}, s.file_path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id{}",
             schema.agent_expression(),
             schema.workspace_expression(),
             schema.conversation_joins(),
@@ -791,6 +834,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                 let source_path: String = row.get_typed(5)?;
                 let agent_slug: String = row.get_typed(6)?;
                 let workspace_path: Option<String> = row.get_typed(7)?;
+                let snippet_file_path: Option<String> = row.get_typed(8)?;
                 last_snippet_id = Some(snippet_id);
 
                 let ctx = ScanContext {
@@ -811,6 +855,17 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                     &mut seen,
                     &mut truncated,
                 );
+                if let Some(snippet_file_path) = snippet_file_path.as_deref() {
+                    scan_text(
+                        snippet_file_path,
+                        SecretLocation::MessageMetadata,
+                        &ctx,
+                        config,
+                        &mut findings,
+                        &mut seen,
+                        &mut truncated,
+                    );
+                }
 
                 if truncated {
                     break;

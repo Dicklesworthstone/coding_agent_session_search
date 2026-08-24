@@ -556,7 +556,7 @@ pub fn agent_slug(agent: &str) -> String {
         "antigravity" | "antigravitycli" | "agy" => "antigravity".to_string(),
         "codex" | "codexcli" => "codex".to_string(),
         "aider" => "aider".to_string(),
-        "piagent" | "pi" => "piagent".to_string(),
+        "piagent" | "pi" => "pi_agent".to_string(),
         "factory" | "droid" => "factory".to_string(),
         "opencode" => "opencode".to_string(),
         "cline" => "cline".to_string(),
@@ -998,6 +998,9 @@ mod tests {
         assert_eq!(agent_slug("ChatGPT"), "chatgpt");
         assert_eq!(agent_slug("gemini-cli"), "gemini");
         assert_eq!(agent_slug("github_copilot"), "copilot");
+        for alias in ["pi_agent", "pi-agent", "piagent", "pi"] {
+            assert_eq!(agent_slug(alias), "pi_agent", "Pi Agent alias {alias:?}");
+        }
         for alias in ["omp", "Oh My Pi", "oh-my-pi", "oh_my_pi", "ohmypi"] {
             assert_eq!(agent_slug(alias), "omp", "OMP alias {alias:?}");
         }

@@ -194,6 +194,21 @@ fn redact_home_path(core: &str) -> Option<String> {
             });
         }
     }
+    let bytes = core.as_bytes();
+    if bytes.len() >= 9
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+        && bytes[3..9].eq_ignore_ascii_case(b"Users\\")
+    {
+        let rest = &core[9..];
+        let tail = rest.split_once('\\').map(|(_, tail)| tail).unwrap_or("");
+        return Some(if tail.is_empty() {
+            "<home>".to_string()
+        } else {
+            format!("<home>\\{tail}")
+        });
+    }
     None
 }
 
@@ -653,6 +668,14 @@ mod tests {
         assert_eq!(report.home_paths, 1);
     }
 
+    #[test]
+    fn redact_strips_windows_home_username() {
+        let (out, report) = redact(r"see C:\Users\bob\notes.md");
+        assert_eq!(out, r"see <home>\notes.md");
+        assert!(!out.contains("bob"));
+        assert_eq!(report.home_paths, 1);
+    }
+
     // ---- classification ---------------------------------------------------
 
     #[test]
@@ -865,6 +888,52 @@ mod tests {
         assert!(!json.contains("realuser"), "username leaked: {json}");
         assert!(!json.contains("@corp.example"), "email leaked: {json}");
         assert!(redaction_total >= 2);
+    }
+
+    #[test]
+    fn every_serialized_metadata_field_crosses_the_redaction_boundary() {
+        let secret_status = ["sk", "proj", &"A".repeat(24)].join("-");
+        let evidence = LessonsEvidence {
+            project: "/Users/project-owner/private-repo".to_string(),
+            commits: vec![CommitEvidence {
+                sha: "abc123".to_string(),
+                subject: "fix(/Users/commit-owner/private): keep metadata safe".to_string(),
+                body: String::new(),
+                timestamp_ms: 1,
+            }],
+            beads: vec![BeadEvidence {
+                id: "bead-owner@example.com".to_string(),
+                title: "metadata boundary".to_string(),
+                close_reason: "landed".to_string(),
+                issue_type: "task".to_string(),
+                status: "closed".to_string(),
+                labels: vec!["/Users/label-owner/private".to_string()],
+                updated_ms: 2,
+            }],
+            proofs: vec![ProofEvidence {
+                name: "/Users/proof-owner/private-gate".to_string(),
+                status: secret_status.clone(),
+                command: String::new(),
+                timestamp_ms: 3,
+            }],
+        };
+
+        let result = extract(&evidence);
+        let redaction_total = result.manifest.redaction.total();
+        let graph = LessonGraph::build(result.candidates);
+        let json = serde_json::to_string(&graph).unwrap();
+        for sensitive in [
+            "project-owner",
+            "commit-owner",
+            "bead-owner@example.com",
+            "label-owner",
+            "proof-owner",
+            secret_status.as_str(),
+        ] {
+            assert!(!json.contains(sensitive), "metadata leaked {sensitive}: {json}");
+        }
+        assert!(json.contains("commit:abc123"), "validated commit id lost: {json}");
+        assert!(redaction_total >= 6, "redactions were not audited: {redaction_total}");
     }
 
     #[test]

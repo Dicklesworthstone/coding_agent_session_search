@@ -40,7 +40,8 @@ pub enum ProofStatus {
     /// Assertions ran and at least one failed (a genuine, attributable failure).
     Fail,
     /// A partial proof: the run started and produced *some* evidence but did not
-    /// complete (e.g. a bounded surface returned partial results).
+    /// prove successful process completion (e.g. a bounded surface returned
+    /// partial results, or the harness never observed an exit status).
     PartialProof,
     /// The run produced/refreshed artifacts but executed NO assertions — evidence
     /// exists but proves nothing about behavior (the "generated-only" trap).
@@ -209,6 +210,10 @@ impl ProofArtifact {
             ProofStatus::StaleArtifact => format!(
                 "stale artifact (age {}ms): {}",
                 run.artifact_age_ms.unwrap_or(0),
+                run.command
+            ),
+            ProofStatus::PartialProof if run.exit_code.is_none() => format!(
+                "partial proof (missing process exit status): {}",
                 run.command
             ),
             ProofStatus::PartialProof => {
@@ -1399,6 +1404,10 @@ mod tests {
         let artifact = ProofArtifact::from_run(run);
         assert_eq!(artifact.status, ProofStatus::PartialProof);
         assert!(!artifact.is_trustworthy_pass());
+        assert_eq!(
+            artifact.summary,
+            "partial proof (missing process exit status): cargo test --lib"
+        );
     }
 
     #[test]

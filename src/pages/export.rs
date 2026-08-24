@@ -117,7 +117,7 @@ impl ExportEngine {
         let temp_output_path =
             unique_atomic_sidecar_path(&self.output_path, "tmp", "pages_export.db");
         let mut replace_attempted = false;
-        let result = (|| -> Result<ExportStats> {
+        let result = (|| -> Result<(ExportStats, T)> {
             let output_path = temp_output_path.to_string_lossy().to_string();
             let dest =
                 Connection::open(&output_path).context("Failed to create output database")?;
@@ -880,7 +880,6 @@ where
     F: Fn(usize, usize),
     V: FnOnce(&Path) -> Result<T>,
 {
-
     let db_path = db_path.unwrap_or_else(crate::default_db_path);
 
     let since_dt = parse_export_time_arg("--since", since.as_deref())?;
