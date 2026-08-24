@@ -10,6 +10,7 @@
 // key bytes so overlapping messages cannot cross-contaminate archive context.
 let currentDek = null;
 let activeUnlockGeneration = 0;
+let activeDecryptGeneration = 0;
 let argon2LoadPromise = null;
 
 const MAX_ARCHIVE_CHUNK_SIZE = 32 * 1024 * 1024;
@@ -102,6 +103,7 @@ function clearCurrentDek() {
 
 function beginUnlockAttempt() {
     activeUnlockGeneration += 1;
+    activeDecryptGeneration += 1;
     clearCurrentDek();
     return activeUnlockGeneration;
 }
@@ -114,6 +116,22 @@ function invalidateUnlockAttempts() {
 function ensureCurrentUnlockAttempt(generation) {
     if (generation !== activeUnlockGeneration) {
         throw new Error('Unlock request was superseded');
+    }
+}
+
+function beginDecryptAttempt() {
+    invalidateUnlockAttempts();
+    activeDecryptGeneration += 1;
+    return activeDecryptGeneration;
+}
+
+function invalidateDecryptAttempts() {
+    activeDecryptGeneration += 1;
+}
+
+function ensureCurrentDecryptAttempt(generation) {
+    if (generation !== activeDecryptGeneration) {
+        throw new Error('Database decryption request was superseded');
     }
 }
 
@@ -267,13 +285,14 @@ async function handleUnlockRecovery(recoverySecret, cfg, requestId) {
 async function deriveKekFromPassword(password, slot) {
     const params = slot.argon2_params;
     const salt = base64ToArray(slot.salt);
+    const passwordBytes = new TextEncoder().encode(password);
     try {
         if (!self.argon2) {
             await loadArgon2();
         }
 
         const result = await self.argon2.hash({
-            pass: password,
+            pass: passwordBytes,
             salt,
             time: params.iterations,
             mem: params.memory_kb,
@@ -281,9 +300,19 @@ async function deriveKekFromPassword(password, slot) {
             hashLen: 32,
             type: self.argon2.ArgonType.Argon2id,
         });
-
-        return new Uint8Array(result.hash);
+        if (!(result?.hash instanceof Uint8Array) || result.hash.byteLength !== 32) {
+            result?.hash?.fill?.(0);
+            throw new Error('Argon2 returned an invalid key');
+        }
+        try {
+            return new Uint8Array(result.hash);
+        } finally {
+            result.hash.fill(0);
+            result.hashHex = null;
+            result.encoded = null;
+        }
     } finally {
+        passwordBytes.fill(0);
         salt.fill(0);
     }
 }
@@ -369,18 +398,20 @@ async function unwrapDek(kek, slot, exportId) {
  * Handle database decryption
  */
 async function handleDecryptDatabase(dekBase64, cfg, requestId) {
-    invalidateUnlockAttempts();
+    const generation = beginDecryptAttempt();
     validateSupportedPayloadFormat(cfg);
     const requestDek = base64ToArray(dekBase64);
     let dbBytes = null;
+    let baseNonce = null;
+    let exportId = null;
     try {
         if (requestDek.byteLength !== 32) {
             throw new Error('Invalid data encryption key length');
         }
         const { payload } = cfg;
         const totalChunks = payload.chunk_count;
-        const baseNonce = base64ToArray(cfg.base_nonce);
-        const exportId = base64ToArray(cfg.export_id);
+        baseNonce = base64ToArray(cfg.base_nonce);
+        exportId = base64ToArray(cfg.export_id);
         dbBytes = new Uint8Array(payload.total_plaintext_size);
 
         self.postMessage({ type: 'PROGRESS', phase: 'Decrypting...', percent: 0, requestId });
@@ -394,6 +425,7 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
             false,
             ['decrypt']
         );
+        ensureCurrentDecryptAttempt(generation);
 
         // Decrypt and decompress each chunk. Rust writes one independent deflate
         // stream per encrypted chunk, so concatenating compressed streams before
@@ -409,16 +441,21 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
             }
             const chunkUrl = `./payload/${chunkName}`;
 
+            let encryptedChunk = null;
+            let chunkNonce = null;
+            let aad = null;
             try {
                 const response = await fetch(chunkUrl);
+                ensureCurrentDecryptAttempt(generation);
                 if (!response.ok) {
                     throw new Error(`Failed to fetch chunk ${i}: ${response.status}`);
                 }
-                const encryptedChunk = await readResponseBytesBounded(
+                encryptedChunk = await readResponseBytesBounded(
                     response,
                     maxCiphertextChunkSize(payload.chunk_size),
                     `encrypted chunk ${i}`
                 );
+                ensureCurrentDecryptAttempt(generation);
                 totalCiphertext += encryptedChunk.byteLength;
                 if (
                     !Number.isSafeInteger(totalCiphertext)
@@ -428,10 +465,10 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
                 }
 
                 // Derive chunk nonce: first 8 bytes from base_nonce, last 4 bytes are counter
-                const chunkNonce = deriveChunkNonce(baseNonce, i);
+                chunkNonce = deriveChunkNonce(baseNonce, i);
 
                 // Build chunk AAD: export_id || chunk_index (big-endian u32)
-                const aad = buildChunkAad(exportId, i);
+                aad = buildChunkAad(exportId, i);
 
                 const decrypted = await crypto.subtle.decrypt(
                     {
@@ -444,11 +481,13 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
                 );
                 const compressedChunk = new Uint8Array(decrypted);
                 try {
+                    ensureCurrentDecryptAttempt(generation);
                     const plaintext = await decompressDeflate(
                         compressedChunk,
                         payload.chunk_size
                     );
                     try {
+                        ensureCurrentDecryptAttempt(generation);
                         const nextTotal = totalDecrypted + plaintext.byteLength;
                         if (
                             !Number.isSafeInteger(nextTotal)
@@ -477,6 +516,10 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
                 throw new Error(
                     `Failed to decrypt chunk ${i}: ${error?.message || String(error)}`
                 );
+            } finally {
+                encryptedChunk?.fill(0);
+                chunkNonce?.fill(0);
+                aad?.fill(0);
             }
         }
 
@@ -492,6 +535,7 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
         }
 
         self.postMessage({ type: 'PROGRESS', phase: 'Loading database...', percent: 95, requestId });
+        ensureCurrentDecryptAttempt(generation);
 
         const dbSize = dbBytes.byteLength;
         // dbBytes is the exact preallocated database buffer. Transfer it
@@ -509,6 +553,8 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
         );
     } finally {
         requestDek.fill(0);
+        baseNonce?.fill(0);
+        exportId?.fill(0);
         if (dbBytes?.byteLength) {
             dbBytes.fill(0);
         }
@@ -600,8 +646,8 @@ function validateSupportedPayloadFormat(cfg) {
         }
     }
 
-    decodeBase64Field('export_id', cfg.export_id, 16);
-    decodeBase64Field('base_nonce', cfg.base_nonce, 12);
+    decodeBase64Field('export_id', cfg.export_id, 16).fill(0);
+    decodeBase64Field('base_nonce', cfg.base_nonce, 12).fill(0);
     validateArgon2Params(cfg.kdf_defaults, 'kdf_defaults');
 
     if (!Array.isArray(cfg.key_slots) || cfg.key_slots.length === 0) {
@@ -667,11 +713,15 @@ function validateKeySlotMetadata(slot) {
     }
 
     const salt = decodeBase64Field('key_slots.salt', slot.salt);
-    if (salt.byteLength === 0) {
-        throw new Error('Archive key slot salt must not be empty');
+    try {
+        if (salt.byteLength === 0) {
+            throw new Error('Archive key slot salt must not be empty');
+        }
+    } finally {
+        salt.fill(0);
     }
-    decodeBase64Field('key_slots.wrapped_dek', slot.wrapped_dek, 48);
-    decodeBase64Field('key_slots.nonce', slot.nonce, 12);
+    decodeBase64Field('key_slots.wrapped_dek', slot.wrapped_dek, 48).fill(0);
+    decodeBase64Field('key_slots.nonce', slot.nonce, 12).fill(0);
 }
 
 function isValidKeySlotMetadata(slot) {
@@ -699,6 +749,7 @@ function decodeBase64Field(fieldName, encoded, expectedLength = null) {
         throw new Error(`Invalid archive ${fieldName} encoding`);
     }
     if (expectedLength !== null && decoded.byteLength !== expectedLength) {
+        decoded.fill(0);
         throw new Error(`Invalid archive ${fieldName} length`);
     }
     return decoded;
@@ -773,6 +824,9 @@ function concatenateAndZeroChunks(chunks) {
  * Decompress deflate data
  */
 async function decompressDeflate(compressed, maximumOutputBytes) {
+    if (!Number.isSafeInteger(maximumOutputBytes) || maximumOutputBytes <= 0) {
+        throw new Error('Archive chunk has an invalid decompression limit');
+    }
     // Prefer native streaming decompression when available so expansion can be
     // stopped before an archive-controlled stream allocates unbounded memory.
     let nativeStream = null;
@@ -905,11 +959,15 @@ async function readResponseBytesBounded(response, maximumBytes, label) {
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            totalLength += value.byteLength;
-            if (totalLength > maximumBytes) {
+            if (!(value instanceof Uint8Array)) {
+                throw new Error(`${label} returned an invalid response chunk`);
+            }
+            const nextLength = totalLength + value.byteLength;
+            if (!Number.isSafeInteger(nextLength) || nextLength > maximumBytes) {
                 value.fill(0);
                 throw new Error(`${label} exceeds the ${maximumBytes}-byte download limit`);
             }
+            totalLength = nextLength;
             chunks.push(value);
         }
         return concatenateAndZeroChunks(chunks);
@@ -932,6 +990,7 @@ async function readResponseBytesBounded(response, maximumBytes, label) {
  */
 function clearKeys() {
     invalidateUnlockAttempts();
+    invalidateDecryptAttempts();
 }
 
 /**

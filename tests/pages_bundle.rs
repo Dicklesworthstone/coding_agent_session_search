@@ -1049,7 +1049,11 @@ mod tests {
                         storage: SESSION_CONFIG.STORAGE_SESSION,
                         duration: 60_000,
                     });
-                    await seedManager.startSession(new Uint8Array([1, 2, 3, 4]), true);
+                    const expectedDek = Uint8Array.from(
+                        { length: 32 },
+                        (_, index) => index + 1
+                    );
+                    await seedManager.startSession(new Uint8Array(expectedDek), true);
 
                     const persistedEntries = new Map(globalThis.sessionStorage.data);
                     seedManager.endSession();
@@ -1064,7 +1068,11 @@ mod tests {
                     });
 
                     const restoredDek = await restoredManager.restoreSession();
-                    if (!(restoredDek instanceof Uint8Array) || restoredDek.length !== 4) {
+                    if (
+                        !(restoredDek instanceof Uint8Array)
+                        || restoredDek.length !== expectedDek.length
+                        || restoredDek.some((byte, index) => byte !== expectedDek[index])
+                    ) {
                         throw new Error('expected restoreSession to return the persisted DEK');
                     }
 
@@ -1582,7 +1590,7 @@ mod tests {
                 && !settings_js.contains("opfs-toggle")
                 && !settings_js.contains("handleOPFSToggle")
                 && settings_js.contains("await rerenderSettingsUI('storage mode cancellation');")
-                && settings_js.contains("await rerenderSettingsUI('storage mode change failure');")
+                && settings_js.contains("await rerenderSettingsUI('storage mode change failure');"),
             "settings must describe OPFS as legacy plaintext residue, not expose it as an active cache mode"
         );
 
@@ -2899,6 +2907,17 @@ mod tests {
                     if (latest.some(byte => byte !== 0)) {
                         throw new Error('CLEAR_KEYS did not zero the current DEK');
                     }
+                    const decryptGeneration = beginDecryptAttempt();
+                    clearKeys();
+                    let decryptSuperseded = false;
+                    try {
+                        ensureCurrentDecryptAttempt(decryptGeneration);
+                    } catch (error) {
+                        decryptSuperseded = String(error.message).includes('superseded');
+                    }
+                    if (!decryptSuperseded) {
+                        throw new Error('CLEAR_KEYS did not invalidate an in-flight database decrypt');
+                    }
                 `, context);
             "#,
         )
@@ -2957,6 +2976,12 @@ mod tests {
                 && worker_js.contains("MAX_BROWSER_ARCHIVE_CHUNKS = 4096")
                 && worker_js.contains("cannot be read safely without streaming response support")
                 && worker_js.contains("return concatenateAndZeroChunks(chunks);")
+                && worker_js.contains("const generation = beginDecryptAttempt();")
+                && worker_js.contains("ensureCurrentDecryptAttempt(generation);")
+                && worker_js.contains("invalidateDecryptAttempts();")
+                && worker_js.contains("encryptedChunk?.fill(0);")
+                && worker_js.contains("passwordBytes.fill(0);")
+                && worker_js.contains("result.hash.fill(0);")
                 && !worker_js.contains("await response.arrayBuffer()")
                 && worker_js.matches("await writer.abort(error);").count() == 1
         );

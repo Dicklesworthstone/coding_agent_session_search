@@ -1075,7 +1075,7 @@ fn browser_opfs_cleanup_is_scope_bound_and_truthful() {
         globalThis.localStorage = new StorageMock();
 
         try {
-            const { clearOPFS, getArchiveScopeId } = await import('./src/pages_assets/storage.js');
+            const { clearOPFS, getArchiveScopeId, getStorageStats } = await import('./src/pages_assets/storage.js');
             const scopeId = getArchiveScopeId();
             const otherScopeId = scopeId === 'deadbeef' ? 'feedface' : 'deadbeef';
             const currentDb = `cass-archive-${scopeId}.sqlite3`;
@@ -1120,6 +1120,10 @@ fn browser_opfs_cleanup_is_scope_bound_and_truthful() {
             }
             if (localStorage.getItem(otherPreference) !== 'true') {
                 throw new Error('scoped OPFS cleanup must preserve another archive preference');
+            }
+            const partialStats = await getStorageStats();
+            if (!partialStats.opfs.dbFiles.includes(currentDb)) {
+                throw new Error('OPFS stats must report detected residue even when file metadata is inaccessible');
             }
 
             root.failedEntries.clear();
@@ -1171,13 +1175,11 @@ fn browser_cache_and_registration_cleanup_are_scope_bound() {
         try {
             const cacheNames = new Set();
             const failedCacheNames = new Set();
-            const cacheDeleteAttempts = [];
             const cacheApi = {
                 async keys() {
                     return [...cacheNames];
                 },
                 async delete(name) {
-                    cacheDeleteAttempts.push(name);
                     if (failedCacheNames.has(name)) {
                         throw new Error(`injected cache delete failure for ${name}`);
                     }
