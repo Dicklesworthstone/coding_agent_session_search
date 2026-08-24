@@ -270,16 +270,26 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
     path.starts_with(root)
 }
 
-fn path_parts(path: &Path) -> Vec<String> {
+fn path_parts(path: &Path) -> Option<Vec<String>> {
     // Archived paths may have been written on another operating system. Split
     // both separator styles explicitly instead of letting the current host's
     // `Path::components` reinterpret a Windows path as one Unix component.
-    path.as_os_str()
+    // A parent component invalidates structural evidence entirely: archived or
+    // missing paths cannot be canonicalized reliably, and accepting a marker
+    // before `..` would let the resolved path escape into another provider.
+    let mut parts = Vec::new();
+    for component in path
+        .as_os_str()
         .to_string_lossy()
         .split(['/', '\\'])
         .filter(|component| !component.is_empty() && *component != ".")
-        .map(str::to_owned)
-        .collect()
+    {
+        if component == ".." {
+            return None;
+        }
+        parts.push(component.to_owned());
+    }
+    Some(parts)
 }
 
 fn has_config_omp_layout_marker(parts: &[String]) -> bool {
@@ -295,9 +305,11 @@ fn has_config_omp_layout_marker(parts: &[String]) -> bool {
 }
 
 fn has_pi_agent_layout_marker(path: &Path) -> bool {
-    path_parts(path)
-        .windows(2)
-        .any(|parts| parts[0] == ".pi" && parts[1] == "agent")
+    path_parts(path).is_some_and(|parts| {
+        parts
+            .windows(2)
+            .any(|parts| parts[0] == ".pi" && parts[1] == "agent")
+    })
 }
 
 fn is_safe_mirror_hash(value: &str) -> bool {
@@ -381,7 +393,7 @@ pub(crate) enum OmpArchivePathClass {
 
 #[must_use]
 pub(crate) fn classify_omp_archive_path(path: &Path) -> Option<OmpArchivePathClass> {
-    let parts = path_parts(path);
+    let parts = path_parts(path)?;
     if has_config_omp_layout_marker(&parts) || has_sanitized_omp_mirror_marker(&parts) {
         return Some(OmpArchivePathClass::ConfigOrMirror);
     }
@@ -959,6 +971,26 @@ mod tests {
         assert!(!has_omp_layout_marker(Path::new(
             r"C:\Users\dev\.omp-cache\agent\sessions\project\session.jsonl"
         )));
+    }
+
+    #[test]
+    fn parent_traversal_invalidates_all_pi_family_layout_evidence() {
+        let policy = ownership(None, None, None, Vec::new(), None);
+        for path in [
+            Path::new("/archive/.omp/agent/../../.pi/agent/sessions/x.jsonl"),
+            Path::new(r"C:\archive\.omp\agent\..\..\.pi\agent\sessions\x.jsonl"),
+            Path::new("/archive/.pi/agent/../../.omp/agent/sessions/x.jsonl"),
+            Path::new(r"C:\archive\.pi\agent\..\..\.omp\agent\sessions\x.jsonl"),
+        ] {
+            assert_eq!(classify_omp_archive_path(path), None);
+            assert!(!has_pi_agent_layout_marker(path));
+            assert_eq!(
+                policy.owner(path),
+                PiFamilyOwner::Unknown,
+                "a lexical parent traversal must fail closed for both providers: {}",
+                path.display()
+            );
+        }
     }
 
     #[test]

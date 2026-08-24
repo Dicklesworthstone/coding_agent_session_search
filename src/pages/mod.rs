@@ -48,6 +48,7 @@ const SQLITE_SIDECAR_SUFFIXES: &[&str] = &[
     "-fsqlite-ns-use",
     "-wal-cert",
     "-wal-cert-head",
+    ".fsqlite-migration-state",
 ];
 
 fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {

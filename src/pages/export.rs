@@ -536,7 +536,8 @@ impl ExportEngine {
                     )));
                 }
             };
-            drop(dest);
+            dest.close()
+                .context("Failed to close and checkpoint completed destination export")?;
             finalize_staged_sqlite_sidecars(&temp_output_path)
                 .context("Failed to finalize staged Pages export as one SQLite main file")?;
 
@@ -775,14 +776,24 @@ fn cleanup_sqlite_sidecars(path: &Path) -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
+const STAGED_CONTENT_SIDECAR_SUFFIXES: &[&str] = &[
+    "-journal",
+    "-wal",
+    "-shm",
+    "-wal-cert",
+    "-wal-cert-head",
+    ".fsqlite-migration-state",
+];
+
 fn finalize_staged_sqlite_sidecars(path: &Path) -> Result<()> {
-    // A rollback journal, WAL, or SHM file can carry database state that has
-    // not reached the main file. Journal mode is DELETE for Pages exports, so
-    // any survivor is unexpected and must block publication rather than be
-    // discarded. FrankenSQLite's lock/namespace/certification sidecars are
-    // operational metadata; after the sole writer is closed they can be
-    // removed so the verifier receives the promised main-file-only artifact.
-    for suffix in ["-journal", "-wal", "-shm"] {
+    // Rollback journals, WAL/SHM, FrankenSQLite's parallel-WAL commit
+    // certificates, and its durable migration marker can describe database
+    // state that does not belong to a standalone main file. Journal mode is
+    // DELETE for Pages exports, so any survivor is unexpected and must block
+    // publication rather than be discarded. Only the closed writer's lock and
+    // namespace sidecars are operational metadata that can be removed before
+    // main-file-only verification.
+    for suffix in STAGED_CONTENT_SIDECAR_SUFFIXES {
         let sidecar = sqlite_sidecar_path(path, suffix);
         match std::fs::symlink_metadata(&sidecar) {
             Ok(_) => {
@@ -807,7 +818,7 @@ fn finalize_staged_sqlite_sidecars(path: &Path) -> Result<()> {
     for suffix in SQLITE_SIDECAR_SUFFIXES
         .iter()
         .copied()
-        .filter(|suffix| !matches!(*suffix, "-journal" | "-wal" | "-shm"))
+        .filter(|suffix| !STAGED_CONTENT_SIDECAR_SUFFIXES.contains(suffix))
     {
         let sidecar = sqlite_sidecar_path(path, suffix);
         match std::fs::remove_file(&sidecar) {
@@ -1735,7 +1746,7 @@ mod tests {
 
     #[test]
     fn staged_finalization_rejects_content_sidecars_without_mutating_them() -> Result<()> {
-        for suffix in ["-journal", "-wal", "-shm"] {
+        for suffix in STAGED_CONTENT_SIDECAR_SUFFIXES {
             let temp_dir = TempDir::new()?;
             let staged_path = temp_dir.path().join("export.tmp.db");
             let sentinel_path = sqlite_sidecar_path(&staged_path, suffix);
@@ -1773,7 +1784,7 @@ mod tests {
         let runtime_sidecars = SQLITE_SIDECAR_SUFFIXES
             .iter()
             .copied()
-            .filter(|suffix| !matches!(*suffix, "-journal" | "-wal" | "-shm"))
+            .filter(|suffix| !STAGED_CONTENT_SIDECAR_SUFFIXES.contains(suffix))
             .map(|suffix| sqlite_sidecar_path(&staged_path, suffix))
             .collect::<Vec<_>>();
         for sidecar in &runtime_sidecars {

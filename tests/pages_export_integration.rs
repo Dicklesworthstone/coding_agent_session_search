@@ -957,6 +957,64 @@ fn export_engine_preserves_existing_output_when_staged_verifier_rejects() {
 }
 
 #[test]
+fn export_engine_rejects_sidecar_created_by_staged_verifier() {
+    let tmp = TempDir::new().unwrap();
+    let source_path = tmp.path().join("source.db");
+    let output_path = tmp.path().join("export.db");
+
+    let src_conn = open_db(&source_path).unwrap();
+    create_source_db(&src_conn).unwrap();
+    insert_test_data(&src_conn).unwrap();
+    drop(src_conn);
+    std::fs::write(&output_path, b"previous approved generation").unwrap();
+
+    let filter = ExportFilter {
+        agents: None,
+        workspaces: None,
+        since: None,
+        until: None,
+        path_mode: PathMode::Full,
+    };
+    let engine = ExportEngine::new(&source_path, &output_path, filter);
+    let error = engine
+        .execute_verified(|_, _| {}, None, |staged_path| {
+            let mut sidecar = staged_path.as_os_str().to_os_string();
+            sidecar.push("-wal-cert-head");
+            std::fs::write(sidecar, b"verifier-created sidecar")?;
+            Ok(())
+        })
+        .expect_err("a verifier-created sidecar must block main-file-only publication");
+
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("verifier left an unbound SQLite sidecar"),
+        "unexpected verifier-sidecar error: {message}"
+    );
+    assert!(
+        message.contains("-wal-cert-head"),
+        "verifier-sidecar error omitted exact artifact: {message}"
+    );
+    assert_eq!(
+        std::fs::read(&output_path).unwrap(),
+        b"previous approved generation"
+    );
+    let rejected_sidecars: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".export.db.tmp.")
+        })
+        .collect();
+    assert!(
+        rejected_sidecars.is_empty(),
+        "verifier-created sidecar rejection leaked staging artifacts: {rejected_sidecars:?}"
+    );
+}
+
+#[test]
 fn export_engine_reads_counts_messages_and_snippets_from_one_snapshot() {
     let tmp = TempDir::new().unwrap();
     let source_path = tmp.path().join("source.db");

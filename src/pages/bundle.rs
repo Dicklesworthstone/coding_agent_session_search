@@ -67,6 +67,8 @@ const PAGES_ASSETS: &[(&str, &[u8])] = &[
 
 const MASTER_KEY_BACKUP_NOTE: &str =
     "This file contains the wrapped DEK. Keep it with your recovery secret.";
+const BUNDLE_PUBLISH_MARKER_NAME: &str = ".cass-pages-publish-in-progress-v1";
+const BUNDLE_PUBLISH_MARKER_CONTENT: &[u8] = b"cass-pages-publish-in-progress-v1\n";
 
 /// Integrity entry for a single file
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,11 +475,91 @@ fn unique_bundle_dir(path: &Path, suffix: &str) -> Result<PathBuf> {
 }
 
 fn bundle_publish_in_progress_backup_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("pages_bundle");
-    path.with_file_name(format!(".{file_name}.publish-in-progress.bak"))
+    let mut backup_name = std::ffi::OsString::from(".");
+    backup_name.push(
+        path.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("pages_bundle")),
+    );
+    backup_name.push(".publish-in-progress.bak");
+    path.with_file_name(backup_name)
+}
+
+fn bundle_publish_marker_path(bundle_dir: &Path) -> PathBuf {
+    bundle_dir.join(BUNDLE_PUBLISH_MARKER_NAME)
+}
+
+fn bundle_publish_marker_exists(bundle_dir: &Path) -> Result<bool> {
+    let marker_path = bundle_publish_marker_path(bundle_dir);
+    match fs::symlink_metadata(&marker_path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "bundle publish marker must not be a symlink: {}",
+                    marker_path.display()
+                );
+            }
+            if !file_type.is_file() {
+                bail!(
+                    "bundle publish marker must be a regular file: {}",
+                    marker_path.display()
+                );
+            }
+            let contents = fs::read(&marker_path).with_context(|| {
+                format!("failed reading bundle publish marker {}", marker_path.display())
+            })?;
+            if contents != BUNDLE_PUBLISH_MARKER_CONTENT {
+                bail!(
+                    "bundle publish marker has unrecognized contents and will not be trusted: {}",
+                    marker_path.display()
+                );
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed inspecting bundle publish marker {}",
+                marker_path.display()
+            )
+        }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_bundle_publish_marker(bundle_dir: &Path) -> Result<()> {
+    let marker_path = bundle_publish_marker_path(bundle_dir);
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+        .with_context(|| {
+            format!(
+                "failed creating bundle publish marker {}",
+                marker_path.display()
+            )
+        })?;
+    marker
+        .write_all(BUNDLE_PUBLISH_MARKER_CONTENT)
+        .with_context(|| format!("failed writing bundle publish marker {}", marker_path.display()))?;
+    marker
+        .sync_all()
+        .with_context(|| format!("failed syncing bundle publish marker {}", marker_path.display()))?;
+    sync_parent_directory(&marker_path)
+}
+
+fn remove_bundle_publish_marker(bundle_dir: &Path) -> Result<()> {
+    if !bundle_publish_marker_exists(bundle_dir)? {
+        return Ok(());
+    }
+    let marker_path = bundle_publish_marker_path(bundle_dir);
+    fs::remove_file(&marker_path).with_context(|| {
+        format!(
+            "failed removing completed bundle publish marker {}",
+            marker_path.display()
+        )
+    })?;
+    sync_parent_directory(&marker_path)
 }
 
 fn unique_bundle_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> Result<PathBuf> {
@@ -616,33 +698,13 @@ fn replace_dir_from_temp(
 
     #[cfg(target_os = "linux")]
     {
-        match crate::indexer::atomic_exchange_paths(final_dir, temp_dir) {
-            Ok(()) => {
-                return finish_linux_atomic_bundle_exchange(
-                    temp_dir,
-                    final_dir,
-                    &backup_dir,
-                    retain_temp_on_error,
-                );
-            }
-            Err(exchange_error)
-                if crate::indexer::linux_atomic_exchange_is_unsupported(&exchange_error) =>
-            {
-                tracing::info!(
-                    live_bundle_path = %final_dir.display(),
-                    staged_bundle_path = %temp_dir.display(),
-                    "renameat2(RENAME_EXCHANGE) is unsupported for the Pages bundle output; using recoverable rename-pair publication"
-                );
-            }
-            Err(exchange_error) => {
-                return Err(exchange_error).with_context(|| {
-                    format!(
-                        "failed atomically exchanging staged bundle {} with live bundle {}",
-                        temp_dir.display(),
-                        final_dir.display()
-                    )
-                });
-            }
+        if try_publish_linux_bundle_via_atomic_exchange(
+            temp_dir,
+            final_dir,
+            &backup_dir,
+            retain_temp_on_error,
+        )? {
+            return Ok(());
         }
     }
 
@@ -656,30 +718,89 @@ fn replace_dir_from_temp(
 
 fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
     let backup_dir = bundle_publish_in_progress_backup_path(final_dir);
-    if !ensure_bundle_directory_entry(&backup_dir, "bundle publish recovery backup")? {
+    let final_exists = ensure_replaceable_bundle_output_dir(final_dir)?;
+    let final_has_marker = if final_exists {
+        bundle_publish_marker_exists(final_dir)?
+    } else {
+        false
+    };
+    let backup_exists =
+        ensure_bundle_directory_entry(&backup_dir, "bundle publish recovery backup")?;
+    if !backup_exists {
+        if final_has_marker {
+            remove_bundle_publish_marker(final_dir).with_context(|| {
+                format!(
+                    "the published bundle is live at {}, but its completed publish marker could not be cleaned",
+                    final_dir.display()
+                )
+            })?;
+        }
+        return Ok(());
+    }
+    let backup_has_marker = bundle_publish_marker_exists(&backup_dir)?;
+
+    if !final_exists {
+        if backup_has_marker {
+            bail!(
+                "interrupted atomic bundle publish is missing its prior live handle {}; staged candidate containing private artifacts retained at {}",
+                final_dir.display(),
+                backup_dir.display()
+            );
+        }
+
+        fs::rename(&backup_dir, final_dir).with_context(|| {
+            format!(
+                "failed restoring the only prior live bundle from interrupted-publish backup {} to {}",
+                backup_dir.display(),
+                final_dir.display()
+            )
+        })?;
+        sync_parent_directory(final_dir).with_context(|| {
+            format!(
+                "restored the prior live bundle at {} from {}, but could not durably sync the recovery",
+                final_dir.display(),
+                backup_dir.display()
+            )
+        })?;
         return Ok(());
     }
 
-    if ensure_replaceable_bundle_output_dir(final_dir)? {
-        cleanup_prior_bundle_after_publish(&backup_dir, final_dir)?;
-        return Ok(());
-    }
-
-    fs::rename(&backup_dir, final_dir).with_context(|| {
-        format!(
-            "failed restoring the only prior live bundle from interrupted-publish backup {} to {}",
-            backup_dir.display(),
-            final_dir.display()
-        )
-    })?;
-    sync_parent_directory(final_dir).with_context(|| {
-        format!(
-            "restored the prior live bundle at {} from {}, but could not durably sync the recovery",
+    match (final_has_marker, backup_has_marker) {
+        (true, false) => {
+            cleanup_prior_bundle_after_publish(&backup_dir, final_dir)?;
+            remove_bundle_publish_marker(final_dir).with_context(|| {
+                format!(
+                    "new bundle is live at {}, but its completed atomic-publish marker could not be cleaned",
+                    final_dir.display()
+                )
+            })
+        }
+        (false, true) => cleanup_rejected_atomic_staged_bundle(&backup_dir, final_dir),
+        (false, false) => cleanup_prior_bundle_after_publish(&backup_dir, final_dir),
+        (true, true) => bail!(
+            "ambiguous interrupted bundle publish: both live bundle {} and recovery sidecar {} carry the in-progress marker; neither tree was removed",
             final_dir.display(),
             backup_dir.display()
+        ),
+    }
+}
+
+fn cleanup_rejected_atomic_staged_bundle(staged_dir: &Path, final_dir: &Path) -> Result<()> {
+    if !ensure_bundle_directory_entry(staged_dir, "rejected atomic staged bundle path")? {
+        bail!(
+            "prior live bundle remains at {}, but rejected staged bundle path disappeared before cleanup: {}",
+            final_dir.display(),
+            staged_dir.display()
+        );
+    }
+    fs::remove_dir_all(staged_dir).with_context(|| {
+        format!(
+            "prior live bundle remains at {}, but failed to remove rejected staged bundle containing private artifacts retained at {}",
+            final_dir.display(),
+            staged_dir.display()
         )
     })?;
-    Ok(())
+    sync_parent_directory(final_dir)
 }
 
 fn cleanup_prior_bundle_after_publish(backup_dir: &Path, final_dir: &Path) -> Result<()> {
@@ -717,42 +838,135 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn finish_linux_atomic_bundle_exchange(
-    prior_bundle_at_staged_path: &Path,
+fn try_publish_linux_bundle_via_atomic_exchange(
+    temp_dir: &Path,
     final_dir: &Path,
     backup_dir: &Path,
     retain_temp_on_error: &mut bool,
-) -> Result<()> {
-    if let Err(sync_error) = sync_parent_directory(final_dir) {
-        *retain_temp_on_error = true;
-        bail!(
-            "new bundle is live at {} after atomic exchange, but the parent directory sync failed: {}; prior bundle containing private artifacts retained at {}",
-            final_dir.display(),
-            sync_error,
-            prior_bundle_at_staged_path.display()
-        );
-    }
-
-    if let Err(park_error) = fs::rename(prior_bundle_at_staged_path, backup_dir) {
-        *retain_temp_on_error = true;
-        bail!(
-            "new bundle is live at {}, but failed to move the prior bundle into deterministic recovery storage {}: {}; prior bundle containing private artifacts retained at {}",
-            final_dir.display(),
-            backup_dir.display(),
-            park_error,
-            prior_bundle_at_staged_path.display()
-        );
-    }
-    if let Err(sync_error) = sync_parent_directory(final_dir) {
-        bail!(
-            "new bundle is live at {}, but could not durably record the prior bundle recovery path after atomic exchange: {}; prior bundle containing private artifacts retained at {}",
-            final_dir.display(),
-            sync_error,
+) -> Result<bool> {
+    write_bundle_publish_marker(temp_dir)?;
+    fs::rename(temp_dir, backup_dir).with_context(|| {
+        format!(
+            "failed moving staged bundle {} to deterministic atomic-exchange path {}",
+            temp_dir.display(),
             backup_dir.display()
-        );
+        )
+    })?;
+    if let Err(sync_error) = sync_parent_directory(backup_dir) {
+        return match restore_linux_atomic_staged_candidate(
+            backup_dir,
+            temp_dir,
+            retain_temp_on_error,
+        ) {
+            Ok(()) => Err(sync_error).with_context(|| {
+                format!(
+                    "failed durably staging bundle at deterministic atomic-exchange path {}; restored candidate at {}",
+                    backup_dir.display(),
+                    temp_dir.display()
+                )
+            }),
+            Err(restore_error) => Err(anyhow!(
+                "failed durably staging bundle at deterministic atomic-exchange path {}: {sync_error:#}; failed restoring staged candidate to {}: {restore_error:#}",
+                backup_dir.display(),
+                temp_dir.display()
+            )),
+        };
     }
 
-    cleanup_prior_bundle_after_publish(backup_dir, final_dir)
+    match crate::indexer::atomic_exchange_paths(final_dir, backup_dir) {
+        Ok(()) => {
+            if let Err(sync_error) = sync_parent_directory(final_dir) {
+                *retain_temp_on_error = true;
+                bail!(
+                    "new bundle is live at {} after atomic exchange, but the parent directory sync failed: {}; prior bundle containing private artifacts retained at {}",
+                    final_dir.display(),
+                    sync_error,
+                    backup_dir.display()
+                );
+            }
+            if let Err(cleanup_error) =
+                cleanup_prior_bundle_after_publish(backup_dir, final_dir)
+            {
+                *retain_temp_on_error = true;
+                return Err(cleanup_error);
+            }
+            remove_bundle_publish_marker(final_dir).with_context(|| {
+                format!(
+                    "new bundle is live at {}, but its completed atomic-publish marker could not be cleaned",
+                    final_dir.display()
+                )
+            })?;
+            Ok(true)
+        }
+        Err(exchange_error)
+            if crate::indexer::linux_atomic_exchange_is_unsupported(&exchange_error) =>
+        {
+            restore_linux_atomic_staged_candidate(
+                backup_dir,
+                temp_dir,
+                retain_temp_on_error,
+            )
+            .context(
+                "atomic bundle exchange is unsupported and the staged candidate could not be restored for rename-pair publication",
+            )?;
+            tracing::info!(
+                live_bundle_path = %final_dir.display(),
+                staged_bundle_path = %temp_dir.display(),
+                "renameat2(RENAME_EXCHANGE) is unsupported for the Pages bundle output; using recoverable rename-pair publication"
+            );
+            Ok(false)
+        }
+        Err(exchange_error) => match restore_linux_atomic_staged_candidate(
+            backup_dir,
+            temp_dir,
+            retain_temp_on_error,
+        ) {
+            Ok(()) => Err(exchange_error).with_context(|| {
+                format!(
+                    "failed atomically exchanging staged bundle {} with live bundle {}",
+                    temp_dir.display(),
+                    final_dir.display()
+                )
+            }),
+            Err(restore_error) => Err(anyhow!(
+                "failed atomically exchanging staged bundle {} with live bundle {}: {exchange_error:#}; failed restoring staged candidate from {}: {restore_error:#}",
+                temp_dir.display(),
+                final_dir.display(),
+                backup_dir.display()
+            )),
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restore_linux_atomic_staged_candidate(
+    backup_dir: &Path,
+    temp_dir: &Path,
+    retain_temp_on_error: &mut bool,
+) -> Result<()> {
+    if let Err(restore_error) = fs::rename(backup_dir, temp_dir) {
+        *retain_temp_on_error = true;
+        bail!(
+            "failed restoring staged bundle from deterministic atomic-exchange path {} to {}; staged bundle containing private artifacts retained at {}: {}",
+            backup_dir.display(),
+            temp_dir.display(),
+            backup_dir.display(),
+            restore_error
+        );
+    }
+    sync_parent_directory(temp_dir).with_context(|| {
+        format!(
+            "restored staged bundle to {}, but could not durably sync the rename from {}",
+            temp_dir.display(),
+            backup_dir.display()
+        )
+    })?;
+    remove_bundle_publish_marker(temp_dir).with_context(|| {
+        format!(
+            "restored staged bundle at {}, but could not remove its atomic-exchange marker",
+            temp_dir.display()
+        )
+    })
 }
 
 fn replace_dir_from_temp_via_recoverable_rename_pair(
