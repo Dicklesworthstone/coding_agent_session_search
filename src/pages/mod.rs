@@ -38,6 +38,8 @@ pub mod wizard;
 /// not a self-contained main file. These are the finite companions emitted by
 /// the pinned FrankenSQLite 0.3.8 producer; publication must preserve and
 /// reject them rather than guessing that they are stale.
+const SQLITE_MIGRATION_MARKER_SUFFIX: &str = ".fsqlite-migration-state";
+const SQLITE_MIGRATION_MARKER_TEMP_SUFFIX: &str = ".fsqlite-migration-state.tmp";
 const SQLITE_CONTENT_ARTIFACT_SUFFIXES: &[&str] = &[
     "-journal",
     "-wal",
@@ -45,10 +47,13 @@ const SQLITE_CONTENT_ARTIFACT_SUFFIXES: &[&str] = &[
     "-wal-fec",
     "-wal-cert",
     "-wal-cert-head",
-    ".fsqlite-migration-state",
+    SQLITE_MIGRATION_MARKER_SUFFIX,
+    SQLITE_MIGRATION_MARKER_TEMP_SUFFIX,
 ];
 
 const SQLITE_LOCK_SUFFIXES: &[&str] = &["-lock-shared", "-lock-reserved", "-lock-pending"];
+const SQLITE_VFS_LOCK_ROOT_SUFFIXES: &[&str] =
+    &["-journal", "-wal", "-wal-cert", "-wal-cert-head"];
 
 fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut file_name = path
@@ -57,6 +62,10 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
         .to_os_string();
     file_name.push(suffix);
     path.with_file_name(file_name)
+}
+
+fn sqlite_migration_marker_path(path: &Path) -> PathBuf {
+    sqlite_sidecar_path(path, SQLITE_MIGRATION_MARKER_SUFFIX)
 }
 
 /// Return every content/recovery path associated with `path`.
@@ -74,19 +83,21 @@ fn sqlite_content_artifact_paths(path: &Path) -> Vec<PathBuf> {
 }
 
 /// Return operational companions left by an explicitly closed FrankenSQLite
-/// writer. Windows creates its lock triplet for each read-write VFS artifact;
-/// pinned 0.3.8 steady-state coverage identifies the main file, WAL, and WAL
-/// certificate. Namespace gate/use files are scoped to the main database.
+/// writer. Windows creates its lock triplet for each read-write VFS artifact.
+/// Pinned 0.3.8 opens the rollback journal, WAL, WAL certificate, and WAL
+/// certificate handoff through that path in addition to the main file. SHM
+/// and WAL-FEC use separate direct-file paths and do not acquire this triplet.
+/// Namespace gate/use files are scoped to the main database.
 fn sqlite_runtime_artifact_paths(path: &Path) -> Vec<PathBuf> {
     let mut paths = vec![
         sqlite_sidecar_path(path, "-fsqlite-ns-gate"),
         sqlite_sidecar_path(path, "-fsqlite-ns-use"),
     ];
-    let lock_roots = [
-        path.to_path_buf(),
-        sqlite_sidecar_path(path, "-wal"),
-        sqlite_sidecar_path(path, "-wal-cert"),
-    ];
+    let lock_roots = std::iter::once(path.to_path_buf()).chain(
+        SQLITE_VFS_LOCK_ROOT_SUFFIXES
+            .iter()
+            .map(|suffix| sqlite_sidecar_path(path, suffix)),
+    );
     for root in lock_roots {
         paths.extend(
             SQLITE_LOCK_SUFFIXES
@@ -211,6 +222,52 @@ pub(crate) fn write_file_durably(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_artifact_paths_match_fsqlite_non_append_and_nested_names() {
+        let db = Path::new("export.db");
+        let content = sqlite_content_artifact_paths(db);
+        let runtime = sqlite_runtime_artifact_paths(db);
+
+        assert_eq!(
+            content,
+            [
+                "export.db-journal",
+                "export.db-wal",
+                "export.db-shm",
+                "export.db-wal-fec",
+                "export.db-wal-cert",
+                "export.db-wal-cert-head",
+                "export.db.fsqlite-migration-state",
+                "export.db.fsqlite-migration-state.tmp",
+                "export.wal-fec.tmp",
+            ]
+            .map(PathBuf::from)
+        );
+        assert_eq!(
+            runtime,
+            [
+                "export.db-fsqlite-ns-gate",
+                "export.db-fsqlite-ns-use",
+                "export.db-lock-shared",
+                "export.db-lock-reserved",
+                "export.db-lock-pending",
+                "export.db-journal-lock-shared",
+                "export.db-journal-lock-reserved",
+                "export.db-journal-lock-pending",
+                "export.db-wal-lock-shared",
+                "export.db-wal-lock-reserved",
+                "export.db-wal-lock-pending",
+                "export.db-wal-cert-lock-shared",
+                "export.db-wal-cert-lock-reserved",
+                "export.db-wal-cert-lock-pending",
+                "export.db-wal-cert-head-lock-shared",
+                "export.db-wal-cert-head-lock-reserved",
+                "export.db-wal-cert-head-lock-pending",
+            ]
+            .map(PathBuf::from)
+        );
+    }
 
     #[test]
     fn write_file_durably_writes_bytes_and_fsyncs() {
