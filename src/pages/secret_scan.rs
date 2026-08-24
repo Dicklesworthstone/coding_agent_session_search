@@ -310,8 +310,29 @@ impl FindingOccurrence {
     }
 }
 
-fn ensure_secret_scan_running(cancellation_requested: &mut impl FnMut() -> bool) -> Result<()> {
-    if cancellation_requested() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretScanCheckpoint {
+    BeforeOpen,
+    AfterOpen,
+    BeforeConversationHighWatermark,
+    BeforeConversationPage,
+    ConversationRow,
+    AfterConversations,
+    BeforeMessageHighWatermark,
+    BeforeMessagePage,
+    MessageRow,
+    AfterMessages,
+    BeforeSnippetHighWatermark,
+    BeforeSnippetPage,
+    SnippetRow,
+    AfterSnippets,
+}
+
+fn ensure_secret_scan_running(
+    cancellation_requested: &mut impl FnMut(SecretScanCheckpoint) -> bool,
+    checkpoint: SecretScanCheckpoint,
+) -> Result<()> {
+    if cancellation_requested(checkpoint) {
         bail!("Secret scan cancelled before completion");
     }
     Ok(())
@@ -324,7 +345,7 @@ pub fn scan_database<P: AsRef<Path>>(
     running: Option<Arc<AtomicBool>>,
     progress: Option<&ProgressBar>,
 ) -> Result<SecretScanReport> {
-    scan_database_with_cancel_check(db_path, filters, config, progress, || {
+    scan_database_with_cancel_check(db_path, filters, config, progress, |_| {
         running
             .as_ref()
             .is_some_and(|flag| !flag.load(Ordering::Relaxed))
@@ -336,15 +357,18 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
     filters: &SecretScanFilters,
     config: &SecretScanConfig,
     progress: Option<&ProgressBar>,
-    mut cancellation_requested: impl FnMut() -> bool,
+    mut cancellation_requested: impl FnMut(SecretScanCheckpoint) -> bool,
 ) -> Result<SecretScanReport> {
     // Cancellation must never be represented as a complete (and potentially
     // false-clean) report. Check before opening the database as well as at
     // every query/row boundary below, and return a distinct error on abort.
-    ensure_secret_scan_running(&mut cancellation_requested)?;
+    ensure_secret_scan_running(
+        &mut cancellation_requested,
+        SecretScanCheckpoint::BeforeOpen,
+    )?;
     let conn = super::open_existing_sqlite_db(db_path.as_ref())
         .context("Failed to open database for secret scan")?;
-    ensure_secret_scan_running(&mut cancellation_requested)?;
+    ensure_secret_scan_running(&mut cancellation_requested, SecretScanCheckpoint::AfterOpen)?;
 
     let mut findings: Vec<SecretFinding> = Vec::new();
     let mut seen = Vec::new();
@@ -360,14 +384,20 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
         "NULL"
     };
     let (conv_where, conv_params) = build_where_clause(filters)?;
-    ensure_secret_scan_running(&mut cancellation_requested)?;
+    ensure_secret_scan_running(
+        &mut cancellation_requested,
+        SecretScanCheckpoint::BeforeConversationHighWatermark,
+    )?;
     let conv_high_watermark = table_max_id(&conn, "conversations")?;
     let conv_select = format!(
         "SELECT c.id, c.title, c.metadata_json, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {metadata_bin_projection}\n         FROM conversations c\n         LEFT JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id"
     );
     let mut last_conv_id = None;
     while !truncated {
-        ensure_secret_scan_running(&mut cancellation_requested)?;
+        ensure_secret_scan_running(
+            &mut cancellation_requested,
+            SecretScanCheckpoint::BeforeConversationPage,
+        )?;
         let page_where = bounded_keyset_page_where(&conv_where, "c.id", last_conv_id);
         let conv_sql = format!(
             "{conv_select}{page_where} ORDER BY c.id LIMIT {SCAN_PAGE_ROWS}"
@@ -385,7 +415,10 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
         let page_len = conv_rows.len();
 
         for row in &conv_rows {
-            ensure_secret_scan_running(&mut cancellation_requested)?;
+            ensure_secret_scan_running(
+                &mut cancellation_requested,
+                SecretScanCheckpoint::ConversationRow,
+            )?;
             let conv_id: i64 = row.get_typed(0)?;
             let title: Option<String> = row.get_typed(1)?;
             let metadata_json: Option<String> = row.get_typed(2)?;
@@ -458,20 +491,29 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
             break;
         }
     }
-    ensure_secret_scan_running(&mut cancellation_requested)?;
+    ensure_secret_scan_running(
+        &mut cancellation_requested,
+        SecretScanCheckpoint::AfterConversations,
+    )?;
 
     if !truncated {
         let has_extra_bin = table_has_column(&conn, "messages", "extra_bin")?;
         let extra_bin_projection = if has_extra_bin { "m.extra_bin" } else { "NULL" };
         let (msg_where, msg_params) = build_where_clause(filters)?;
-        ensure_secret_scan_running(&mut cancellation_requested)?;
+        ensure_secret_scan_running(
+            &mut cancellation_requested,
+            SecretScanCheckpoint::BeforeMessageHighWatermark,
+        )?;
         let msg_high_watermark = table_max_id(&conn, "messages")?;
         let msg_select = format!(
             "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {extra_bin_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id"
         );
         let mut last_msg_id = None;
         while !truncated {
-            ensure_secret_scan_running(&mut cancellation_requested)?;
+            ensure_secret_scan_running(
+                &mut cancellation_requested,
+                SecretScanCheckpoint::BeforeMessagePage,
+            )?;
             let page_where = bounded_keyset_page_where(&msg_where, "m.id", last_msg_id);
             let msg_sql =
                 format!("{msg_select}{page_where} ORDER BY m.id LIMIT {SCAN_PAGE_ROWS}");
@@ -488,7 +530,10 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
             let page_len = msg_rows.len();
 
             for row in &msg_rows {
-                ensure_secret_scan_running(&mut cancellation_requested)?;
+                ensure_secret_scan_running(
+                    &mut cancellation_requested,
+                    SecretScanCheckpoint::MessageRow,
+                )?;
                 let msg_id: i64 = row.get_typed(0)?;
                 let msg_idx: i64 = row.get_typed(1)?;
                 let content: String = row.get_typed(2)?;
@@ -562,16 +607,25 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
             }
         }
     }
-    ensure_secret_scan_running(&mut cancellation_requested)?;
+    ensure_secret_scan_running(
+        &mut cancellation_requested,
+        SecretScanCheckpoint::AfterMessages,
+    )?;
 
     if !truncated && table_exists(&conn, "snippets")? {
         let (snip_where, snip_params) = build_where_clause(filters)?;
-        ensure_secret_scan_running(&mut cancellation_requested)?;
+        ensure_secret_scan_running(
+            &mut cancellation_requested,
+            SecretScanCheckpoint::BeforeSnippetHighWatermark,
+        )?;
         let snip_high_watermark = table_max_id(&conn, "snippets")?;
         let snip_select = "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id";
         let mut last_snippet_id = None;
         while !truncated {
-            ensure_secret_scan_running(&mut cancellation_requested)?;
+            ensure_secret_scan_running(
+                &mut cancellation_requested,
+                SecretScanCheckpoint::BeforeSnippetPage,
+            )?;
             let page_where = bounded_keyset_page_where(&snip_where, "s.id", last_snippet_id);
             let snip_sql =
                 format!("{snip_select}{page_where} ORDER BY s.id LIMIT {SCAN_PAGE_ROWS}");
@@ -588,7 +642,10 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
             let page_len = snip_rows.len();
 
             for row in &snip_rows {
-                ensure_secret_scan_running(&mut cancellation_requested)?;
+                ensure_secret_scan_running(
+                    &mut cancellation_requested,
+                    SecretScanCheckpoint::SnippetRow,
+                )?;
                 let snippet_id: i64 = row.get_typed(0)?;
                 let snippet_text: String = row.get_typed(1)?;
                 let msg_id: i64 = row.get_typed(2)?;
@@ -632,7 +689,10 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
             }
         }
     }
-    ensure_secret_scan_running(&mut cancellation_requested)?;
+    ensure_secret_scan_running(
+        &mut cancellation_requested,
+        SecretScanCheckpoint::AfterSnippets,
+    )?;
 
     findings.sort_by(|a, b| {
         a.severity
@@ -1950,6 +2010,64 @@ mod tests {
         assert!(
             error.to_string().contains("Invalid SQLite identifier"),
             "unexpected invalid-identifier diagnostic: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_at_conversation_page_boundary_stops_before_message_schema() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("scan.db");
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL
+            );
+            CREATE TABLE workspaces (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL
+            );
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                started_at INTEGER,
+                metadata_json TEXT
+            );
+            INSERT INTO agents (id, slug) VALUES (1, 'codex');
+            INSERT INTO workspaces (id, path) VALUES (1, '/tmp/project');
+            INSERT INTO conversations (
+                id, agent_id, workspace_id, title, source_path, started_at, metadata_json
+            ) VALUES (
+                1, 1, 1, 'safe title', '/tmp/project/session.jsonl', 1700000000000, '{}'
+            );
+            "#,
+        )?;
+        drop(conn);
+
+        let filters = SecretScanFilters {
+            agents: None,
+            workspaces: None,
+            since_ts: None,
+            until_ts: None,
+        };
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        let error = scan_database_with_cancel_check(
+            &db_path,
+            &filters,
+            &config,
+            None,
+            |checkpoint| checkpoint == SecretScanCheckpoint::AfterConversations,
+        )
+        .expect_err("page-boundary cancellation must abort instead of probing messages");
+
+        assert!(
+            error.to_string().contains("Secret scan cancelled"),
+            "the missing messages table must never be probed after cancellation: {error:#}"
         );
         Ok(())
     }
