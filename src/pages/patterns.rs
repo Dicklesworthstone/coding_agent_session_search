@@ -318,11 +318,14 @@ pub static ALL_PATTERNS: Lazy<Vec<&'static PatternDef>> = Lazy::new(|| {
         // API Keys
         &AWS_ACCESS_KEY,
         &AWS_SECRET_KEY,
+        &AWS_SESSION_TOKEN,
         &OPENAI_KEY,
         &ANTHROPIC_KEY,
         &GITHUB_TOKEN,
         &GENERIC_API_KEY,
         &BEARER_TOKEN,
+        &SLACK_TOKEN,
+        &STRIPE_KEY,
         // Private Keys
         &SSH_PRIVATE_KEY,
         &PEM_PRIVATE_KEY,
@@ -365,11 +368,14 @@ pub fn patterns_for_public() -> Vec<CustomPattern> {
         // All API keys and tokens
         &AWS_ACCESS_KEY,
         &AWS_SECRET_KEY,
+        &AWS_SESSION_TOKEN,
         &OPENAI_KEY,
         &ANTHROPIC_KEY,
         &GITHUB_TOKEN,
         &GENERIC_API_KEY,
         &BEARER_TOKEN,
+        &SLACK_TOKEN,
+        &STRIPE_KEY,
         // All private keys
         &SSH_PRIVATE_KEY,
         &PEM_PRIVATE_KEY,
@@ -404,9 +410,12 @@ pub fn patterns_for_team() -> Vec<CustomPattern> {
         // External API keys only
         &AWS_ACCESS_KEY,
         &AWS_SECRET_KEY,
+        &AWS_SESSION_TOKEN,
         &OPENAI_KEY,
         &ANTHROPIC_KEY,
         &GITHUB_TOKEN,
+        &SLACK_TOKEN,
+        &STRIPE_KEY,
         // Private keys (always sensitive)
         &SSH_PRIVATE_KEY,
         &PEM_PRIVATE_KEY,
@@ -438,6 +447,7 @@ pub fn patterns_for_personal() -> Vec<CustomPattern> {
         // Cloud provider keys
         &AWS_ACCESS_KEY,
         &AWS_SECRET_KEY,
+        &AWS_SESSION_TOKEN,
         // Database credentials with passwords
         &DATABASE_PASSWORD,
     ];
@@ -541,7 +551,61 @@ mod tests {
     fn test_pattern_matches_openai_key() {
         let pattern = Regex::new(OPENAI_KEY.pattern).unwrap();
         assert!(pattern.is_match("Using sk-abc123def456ghi789jkl012mno345pqr678"));
+        assert!(pattern.is_match("sk-proj-AbCdEf_0123456789-xYz987654321"));
+        assert!(pattern.is_match("sk-admin-AbCdEf_0123456789-xYz987654321"));
         assert!(!pattern.is_match("sk-short")); // Too short
+        assert!(!pattern.is_match("sk-project-AbCdEf_0123456789-xYz987654321"));
+    }
+
+    #[test]
+    fn current_provider_and_assignment_patterns_are_covered() {
+        let stripe_key = format!("{}_{}", "sk_live", "ABCdef0123456789AAAAbbbb0007");
+        let cases = [
+            (
+                &ANTHROPIC_KEY,
+                "sk-ant-api03-AbCdEf_0123456789-xYz987654321",
+            ),
+            (
+                &GITHUB_TOKEN,
+                "github_pat_AbCdEf_0123456789_xYz987654321",
+            ),
+            (
+                &AWS_SESSION_TOKEN,
+                "AWS_SESSION_TOKEN=AQoEXAMPLE0123456789/value+=",
+            ),
+            (&SLACK_TOKEN, "xoxo-1234567890-abcdefghij"),
+            (&STRIPE_KEY, stripe_key.as_str()),
+            (
+                &GENERIC_API_KEY,
+                "password=\"correct horse battery staple!\"",
+            ),
+            (&GENERIC_API_KEY, "api_key:'abc.def$ghi'"),
+            (&BEARER_TOKEN, "Bearer ab/cd+ef=gh~ij"),
+        ];
+
+        for (definition, input) in cases {
+            let pattern = Regex::new(definition.pattern).unwrap();
+            assert!(
+                pattern.is_match(input),
+                "{} did not match {input:?}",
+                definition.id
+            );
+        }
+
+        for (definition, near_miss) in [
+            (&ANTHROPIC_KEY, "sk-ant-api03-short"),
+            (&GITHUB_TOKEN, "github_pat_short"),
+            (&AWS_SESSION_TOKEN, "AWS_SESSION_TOKEN=short"),
+            (&GENERIC_API_KEY, "password=short"),
+            (&BEARER_TOKEN, "Bearer short"),
+        ] {
+            let pattern = Regex::new(definition.pattern).unwrap();
+            assert!(
+                !pattern.is_match(near_miss),
+                "{} overmatched {near_miss:?}",
+                definition.id
+            );
+        }
     }
 
     #[test]
@@ -566,6 +630,7 @@ mod tests {
         let pattern = Regex::new(DATABASE_URL.pattern).unwrap();
         assert!(pattern.is_match("postgres://user:pass@host:5432/db"));
         assert!(pattern.is_match("mongodb+srv://user:pass@cluster.mongodb.net/db"));
+        assert!(pattern.is_match("amqp://user:pass@broker.internal/vhost"));
         assert!(pattern.is_match("redis://localhost:6379"));
     }
 

@@ -735,6 +735,17 @@ mod tests {
         let output = redact_text(input);
         assert_eq!(output, "my key is [REDACTED]");
         assert!(!output.contains("sk-ABCDE"));
+
+        for current in [
+            "sk-proj-AbCdEf_0123456789-xYz987654321",
+            "sk-admin-AbCdEf_0123456789-xYz987654321",
+        ] {
+            assert_eq!(redact_text(current), REDACTED);
+        }
+        assert_eq!(
+            redact_text("sk-project-AbCdEf_0123456789-xYz987654321"),
+            "sk-project-AbCdEf_0123456789-xYz987654321"
+        );
     }
 
     #[test]
@@ -742,6 +753,11 @@ mod tests {
         let input = "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
         let output = redact_text(input);
         assert_eq!(output, "[REDACTED]");
+        assert_eq!(
+            redact_text("sk-ant-api03-AbCdEf_0123456789-xYz987654321"),
+            REDACTED
+        );
+        assert_eq!(redact_text("sk-ant-api03-short"), "sk-ant-api03-short");
     }
 
     #[test]
@@ -749,6 +765,11 @@ mod tests {
         let input = "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
         let output = redact_text(input);
         assert_eq!(output, "token [REDACTED]");
+        assert_eq!(
+            redact_text("github_pat_AbCdEf_0123456789_xYz987654321"),
+            REDACTED
+        );
+        assert_eq!(redact_text("github_pat_short"), "github_pat_short");
     }
 
     #[test]
@@ -819,16 +840,30 @@ mod tests {
 
     #[test]
     fn redacts_generic_api_key_assignment() {
-        let input = "api_key=abcdefgh12345678";
-        let output = redact_text(input);
-        assert_eq!(output, "[REDACTED]");
+        for input in [
+            "api_key=abcdefgh12345678",
+            "password=\"correct horse battery staple!\"",
+            "password=P@ssw0rd!",
+            "api_key:'abc.def$ghi'",
+            "AWS_SESSION_TOKEN=AQoEXAMPLE0123456789/value+=",
+        ] {
+            assert_eq!(redact_text(input), REDACTED, "secret survived in {input:?}");
+        }
+        for near_miss in ["password=short", "AWS_SESSION_TOKEN=short"] {
+            assert_eq!(redact_text(near_miss), near_miss);
+        }
     }
 
     #[test]
     fn redacts_database_url() {
-        let input = "DATABASE_URL=postgres://user:pass@host:5432/db";
-        let output = redact_text(input);
-        assert!(!output.contains("user:pass"));
+        for input in [
+            "DATABASE_URL=postgres://user:pass@host:5432/db",
+            "mongodb+srv://user:pass@cluster.mongodb.net/db",
+            "amqp://user:pass@broker.internal/vhost",
+        ] {
+            let output = redact_text(input);
+            assert!(!output.contains("user:pass"), "credential URL survived: {output}");
+        }
     }
 
     #[test]
@@ -841,9 +876,12 @@ mod tests {
 
     #[test]
     fn redacts_slack_token() {
-        let input = "xoxb-123456789-abcdefghij";
-        let output = redact_text(input);
-        assert_eq!(output, "[REDACTED]");
+        for input in [
+            "xoxb-123456789-abcdefghij",
+            "xoxo-123456789-abcdefghij",
+        ] {
+            assert_eq!(redact_text(input), REDACTED);
+        }
     }
 
     #[test]
