@@ -1889,6 +1889,69 @@ mod tests {
     }
 
     #[test]
+    fn scan_text_preserves_distinct_occurrences_with_identical_display_masks() {
+        let config = SecretScanConfig::from_inputs_with_env(
+            &[],
+            &[r"AA[0-9]{8}ZZ".to_string()],
+            false,
+        )
+        .unwrap();
+        let ctx = ScanContext {
+            agent: None,
+            workspace: None,
+            source_path: Some("fixture.jsonl".to_string()),
+            conversation_id: Some(1),
+            message_id: Some(1),
+            message_idx: Some(0),
+        };
+        let mut findings = Vec::new();
+        let mut seen = Vec::new();
+        let mut truncated = false;
+
+        scan_text(
+            "AA11111111ZZ AA22222222ZZ",
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut seen,
+            &mut truncated,
+        );
+
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].match_redacted, findings[1].match_redacted);
+    }
+
+    #[test]
+    fn scan_text_reports_overlapping_detectors_as_one_occurrence() {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false).unwrap();
+        let ctx = ScanContext {
+            agent: None,
+            workspace: None,
+            source_path: Some("fixture.jsonl".to_string()),
+            conversation_id: Some(1),
+            message_id: Some(1),
+            message_idx: Some(0),
+        };
+        let mut findings = Vec::new();
+        let mut seen = Vec::new();
+        let mut truncated = false;
+
+        scan_text(
+            "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut seen,
+            &mut truncated,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, "github_pat");
+    }
+
+    #[test]
     fn scan_text_max_findings_truncates() {
         // Use longer tokens (>8 chars) so each gets a unique redacted form for dedup
         let mut config =

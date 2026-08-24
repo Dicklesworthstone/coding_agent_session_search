@@ -12971,6 +12971,8 @@ mod tests {
             cache_size, -SEARCH_SQLITE_HYDRATION_CACHE_KIB,
             "search hydration should not inherit the general storage cache profile"
         );
+        conn.execute_sync("DELETE FROM meta WHERE 1 = 0")
+            .expect_err("search hydration connection must remain physically read-only");
         drop(guard);
 
         // The read-only open must not rewrite the rebuild-generation marker.
@@ -12999,8 +13001,108 @@ mod tests {
     }
 
     #[test]
+    fn search_client_hydrates_one_lazy_connection_from_multiple_workers() -> Result<()> {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<SearchSqliteConnection>();
+        assert_send_sync::<SearchClient>();
+
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("cross-worker-hydration.db");
+        {
+            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())?;
+            conn.execute_batch(
+                "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+                 CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+                 CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+                 CREATE TABLE conversations (
+                     id INTEGER PRIMARY KEY,
+                     agent_id INTEGER,
+                     workspace_id INTEGER,
+                     source_id TEXT,
+                     origin_host TEXT,
+                     title TEXT,
+                     source_path TEXT NOT NULL
+                 );
+                 CREATE TABLE messages (
+                     id INTEGER PRIMARY KEY,
+                     conversation_id INTEGER NOT NULL,
+                     idx INTEGER NOT NULL,
+                     content TEXT NOT NULL,
+                     created_at INTEGER
+                 );
+                 INSERT INTO sources(id, kind) VALUES('local', 'local');
+                 INSERT INTO agents(id, slug) VALUES(1, 'codex');
+                 INSERT INTO workspaces(id, path) VALUES(1, '/cross-worker');
+                 INSERT INTO conversations(
+                     id, agent_id, workspace_id, source_id, origin_host, title, source_path
+                 ) VALUES(
+                     1, 1, 1, 'local', NULL, 'worker-owned archive', '/tmp/cross-worker.jsonl'
+                 );
+                 INSERT INTO messages(id, conversation_id, idx, content, created_at)
+                 VALUES(1, 1, 0, 'cross worker hydration sentinel', 42);",
+            )?;
+        }
+
+        let client = Arc::new(SearchClient {
+            reader: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:cross-worker"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        });
+        let worker_count = 4;
+        let start = Arc::new(std::sync::Barrier::new(worker_count + 1));
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let client = Arc::clone(&client);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || -> Result<()> {
+                start.wait();
+                for _ in 0..3 {
+                    let hits = client.browse_by_date(
+                        SearchFilters::default(),
+                        1,
+                        0,
+                        true,
+                        FieldMask::FULL,
+                    )?;
+                    assert_eq!(hits.len(), 1);
+                    assert_eq!(hits[0].content, "cross worker hydration sentinel");
+                    assert_eq!(hits[0].source_path, "/tmp/cross-worker.jsonl");
+                }
+                Ok(())
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow!("cross-worker hydration worker panicked"))??;
+        }
+
+        assert!(
+            client.sqlite_guard()?.is_some(),
+            "the shared client should retain one dedicated-owner connection"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn sqlite_path_rusqlite_fallback_matches_hyphenated_ids_with_workspace_filter() -> Result<()> {
-        fn fts_match_count(conn: &FrankenConnection, fts_query: &str) -> Result<Option<usize>> {
+        fn fts_match_count_async(
+            conn: &SearchSqliteConnection,
+            fts_query: &str,
+        ) -> Result<Option<usize>> {
             let match_mode = SearchClient::sqlite_fts_match_mode(conn)?;
             let sql = format!(
                 "SELECT COUNT(*) FROM fts_messages WHERE {}",
@@ -13011,6 +13113,42 @@ mod tests {
             match franken_query_map_collect_retry(conn, &sql, &params, |row| row.get_typed(0)) {
                 Ok(rows) => {
                     let count: i64 = rows.into_iter().next().unwrap_or(0);
+                    Ok(Some(usize::try_from(count.max(0)).unwrap_or(usize::MAX)))
+                }
+                Err(err) if err.to_string().contains("no such function: MATCH/2") => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        }
+
+        fn fts_match_count_raw(
+            conn: &FrankenConnection,
+            fts_query: &str,
+        ) -> Result<Option<usize>> {
+            let probe_params = [ParamValue::from("__cass_fts_probe_no_match__")];
+            let match_mode = match conn.query_map_collect(
+                "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?",
+                &probe_params,
+                |row| row.get_typed::<i64>(0),
+            ) {
+                Ok(_) => SqliteFtsMatchMode::Table,
+                Err(err)
+                    if err
+                        .to_string()
+                        .contains("no such column: fts_messages in table fts_messages") =>
+                {
+                    SqliteFtsMatchMode::IndexedColumns
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let sql = format!(
+                "SELECT COUNT(*) FROM fts_messages WHERE {}",
+                SearchClient::sqlite_fts5_match_clause(match_mode)
+            );
+            let mut params = Vec::new();
+            SearchClient::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
+            match conn.query_map_collect(&sql, &params, |row| row.get_typed::<i64>(0)) {
+                Ok(rows) => {
+                    let count = rows.into_iter().next().unwrap_or(0);
                     Ok(Some(usize::try_from(count.max(0)).unwrap_or(usize::MAX)))
                 }
                 Err(err) if err.to_string().contains("no such function: MATCH/2") => Ok(None),
@@ -13084,7 +13222,7 @@ mod tests {
                 "freshly seeded file-backed FTS should retain the inserted rows"
             );
             let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-            if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
+            if let Some(match_count) = fts_match_count_raw(conn, transpiled.as_str())? {
                 assert_eq!(
                     match_count, 2,
                     "freshly seeded file-backed FTS should match the transpiled hyphenated query before reopen"
@@ -13120,7 +13258,7 @@ mod tests {
             "reopened file-backed FTS should still contain the seeded rows"
         );
         let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-        if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
+        if let Some(match_count) = fts_match_count_async(conn, transpiled.as_str())? {
             assert_eq!(
                 match_count, 2,
                 "reopened file-backed FTS should still match the transpiled hyphenated query"
