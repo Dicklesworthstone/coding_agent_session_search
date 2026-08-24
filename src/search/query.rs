@@ -298,6 +298,7 @@ struct SqliteMessageScanRequest<'a> {
     filters: &'a SearchFilters,
     limit: usize,
     offset: usize,
+    scan_limit: usize,
     field_mask: FieldMask,
     query_match_type: MatchType,
 }
@@ -7981,7 +7982,11 @@ impl SearchClient {
         }
     }
 
-    fn sqlite_message_scan_query_sql(field_mask: FieldMask) -> String {
+    fn sqlite_message_scan_query_sql(
+        field_mask: FieldMask,
+        filters: &SearchFilters,
+        scan_limit: usize,
+    ) -> (String, Vec<ParamValue>) {
         let title_expr = if field_mask.wants_title() {
             "COALESCE(c.title, '')"
         } else {
@@ -7995,7 +8000,7 @@ impl SearchClient {
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
 
-        format!(
+        let mut sql = format!(
             "SELECT m.id,
                     {title_expr},
                     {content_expr},
@@ -8015,9 +8020,70 @@ impl SearchClient {
              LEFT JOIN sources s ON c.source_id = s.id
              LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
-             ORDER BY m.id
-             LIMIT ?"
-        )
+             WHERE 1=1"
+        );
+        let mut params = Vec::new();
+
+        // The scan budget bounds query-text evaluation, not the unfiltered
+        // archive prefix. Apply every metadata filter before LIMIT so a small,
+        // selective corpus is not hidden behind earlier unrelated messages.
+        if !filters.agents.is_empty() {
+            let placeholders = sql_placeholders(filters.agents.len());
+            sql.push_str(&format!(
+                " AND COALESCE(a.slug, '') IN ({placeholders})"
+            ));
+            for agent in &filters.agents {
+                params.push(ParamValue::from(agent.as_str()));
+            }
+        }
+        if !filters.workspaces.is_empty() {
+            let placeholders = sql_placeholders(filters.workspaces.len());
+            sql.push_str(&format!(
+                " AND COALESCE(w.path, '') IN ({placeholders})"
+            ));
+            for workspace in &filters.workspaces {
+                params.push(ParamValue::from(workspace.as_str()));
+            }
+        }
+        if let Some(created_from) = filters.created_from {
+            sql.push_str(" AND m.created_at >= ?");
+            params.push(ParamValue::from(created_from));
+        }
+        if let Some(created_to) = filters.created_to {
+            sql.push_str(" AND m.created_at <= ?");
+            params.push(ParamValue::from(created_to));
+        }
+
+        let origin_kind_sql = normalized_search_origin_kind_sql_expr("c.source_id", "s.kind");
+        match &filters.source_filter {
+            SourceFilter::All => {}
+            SourceFilter::Local => sql.push_str(&format!(
+                " AND {origin_kind_sql} = '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            )),
+            SourceFilter::Remote => sql.push_str(&format!(
+                " AND {origin_kind_sql} != '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            )),
+            SourceFilter::SourceId(id) => {
+                sql.push_str(&format!(" AND {normalized_source_sql} = ?"));
+                params.push(ParamValue::from(normalize_search_source_filter_value(id)));
+            }
+        }
+
+        if !filters.session_paths.is_empty() {
+            let placeholders = sql_placeholders(filters.session_paths.len());
+            sql.push_str(&format!(
+                " AND COALESCE(c.source_path, '') IN ({placeholders})"
+            ));
+            for source_path in &filters.session_paths {
+                params.push(ParamValue::from(source_path.as_str()));
+            }
+        }
+
+        sql.push_str(" ORDER BY m.id LIMIT ?");
+        params.push(ParamValue::from(scan_limit as i64));
+        (sql, params)
     }
 
     fn search_sqlite_message_scan(
@@ -8029,8 +8095,11 @@ impl SearchClient {
             return Ok(Vec::new());
         };
 
-        let sql = Self::sqlite_message_scan_query_sql(request.field_mask);
-        let params = [ParamValue::from(SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT as i64)];
+        let (sql, params) = Self::sqlite_message_scan_query_sql(
+            request.field_mask,
+            request.filters,
+            request.scan_limit,
+        );
         let rows: Vec<(SqliteFtsMessageRow, String, String)> =
             franken_query_map_collect_retry(conn, &sql, &params, |row| {
                 Ok((
@@ -8172,6 +8241,7 @@ impl SearchClient {
             filters: &filters,
             limit,
             offset,
+            scan_limit: SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT,
             field_mask,
             query_match_type,
         };
@@ -14356,6 +14426,115 @@ mod tests {
             0.0,
             "a prefix term must not degrade to an arbitrary substring"
         );
+    }
+
+    #[test]
+    fn sqlite_message_scan_pushes_all_filters_before_scan_limit() {
+        let filters = SearchFilters {
+            agents: HashSet::from(["codex".to_string()]),
+            workspaces: HashSet::from(["/workspace".to_string()]),
+            created_from: Some(10),
+            created_to: Some(20),
+            source_filter: SourceFilter::SourceId("remote-a".to_string()),
+            session_paths: HashSet::from(["/tmp/session.jsonl".to_string()]),
+        };
+        let (sql, params) =
+            SearchClient::sqlite_message_scan_query_sql(FieldMask::FULL, &filters, 7);
+        let limit_pos = sql.find(" ORDER BY m.id LIMIT ?").expect("bounded scan limit");
+
+        for predicate in [
+            "COALESCE(a.slug, '') IN (?)",
+            "COALESCE(w.path, '') IN (?)",
+            "m.created_at >= ?",
+            "m.created_at <= ?",
+            "c.origin_host",
+            "COALESCE(c.source_path, '') IN (?)",
+        ] {
+            let predicate_pos = sql.find(predicate).expect("source-scan filter predicate");
+            assert!(
+                predicate_pos < limit_pos,
+                "filter predicate must precede the bounded scan limit: {predicate}"
+            );
+        }
+        assert_eq!(params.len(), 7, "six filter values plus scan limit");
+
+        let (local_sql, _) = SearchClient::sqlite_message_scan_query_sql(
+            FieldMask::FULL,
+            &SearchFilters {
+                source_filter: SourceFilter::Local,
+                ..SearchFilters::default()
+            },
+            7,
+        );
+        let (remote_sql, _) = SearchClient::sqlite_message_scan_query_sql(
+            FieldMask::FULL,
+            &SearchFilters {
+                source_filter: SourceFilter::Remote,
+                ..SearchFilters::default()
+            },
+            7,
+        );
+        assert!(local_sql.contains("= 'local'"));
+        assert!(remote_sql.contains("!= 'local'"));
+    }
+
+    #[test]
+    fn sqlite_message_scan_filtering_precedes_low_scan_cap() -> Result<()> {
+        let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER,
+                content TEXT NOT NULL,
+                created_at INTEGER
+             );
+             INSERT INTO sources(id, kind) VALUES('local', 'local');
+             INSERT INTO agents(id, slug) VALUES(1, 'claude'), (2, 'codex');
+             INSERT INTO conversations(
+                id, agent_id, workspace_id, source_id, origin_host, title, source_path
+             ) VALUES
+                (1, 1, NULL, 'local', NULL, 'excluded', '/tmp/excluded.jsonl'),
+                (2, 2, NULL, 'local', NULL, 'target', '/tmp/target.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES
+                (1, 1, 0, 'needle in excluded row', 1),
+                (2, 2, 0, 'needle in target row', 2);",
+        )?;
+        let filters = SearchFilters {
+            agents: HashSet::from(["codex".to_string()]),
+            ..SearchFilters::default()
+        };
+        let client = cass_layer_b_test_client(None);
+
+        let hits = client.search_sqlite_message_scan(
+            conn.connection(),
+            SqliteMessageScanRequest {
+                raw_query: "needle",
+                filters: &filters,
+                limit: 10,
+                offset: 0,
+                scan_limit: 1,
+                field_mask: FieldMask::FULL,
+                query_match_type: MatchType::Exact,
+            },
+        )?;
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].agent, "codex");
+        assert_eq!(hits[0].source_path, "/tmp/target.jsonl");
+        Ok(())
     }
 
     #[test]
