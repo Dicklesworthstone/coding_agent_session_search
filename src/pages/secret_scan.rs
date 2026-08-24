@@ -3,8 +3,8 @@ use crate::franken_sync::params;
 use crate::indexer::redact_secrets::{
     ANTHROPIC_API_KEY_PATTERN, AWS_ACCESS_KEY_PATTERN, AWS_SECRET_KEY_PATTERN,
     AWS_SESSION_TOKEN_PATTERN, BEARER_TOKEN_PATTERN, DATABASE_URL_PATTERN,
-    GENERIC_SECRET_ASSIGNMENT_PATTERN, GITHUB_TOKEN_PATTERN, JWT_PATTERN,
-    OPENAI_API_KEY_PATTERN, PRIVATE_KEY_BLOCK_PATTERN, SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN,
+    GENERIC_SECRET_ASSIGNMENT_PATTERN, GITHUB_TOKEN_PATTERN, JWT_PATTERN, OPENAI_API_KEY_PATTERN,
+    PRIVATE_KEY_BLOCK_PATTERN, SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN,
 };
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
@@ -373,11 +373,7 @@ pub fn scan_database<P: AsRef<Path>>(
 
     if !truncated {
         let has_extra_bin = table_has_column(&conn, "messages", "extra_bin")?;
-        let extra_bin_projection = if has_extra_bin {
-            "m.extra_bin"
-        } else {
-            "NULL"
-        };
+        let extra_bin_projection = if has_extra_bin { "m.extra_bin" } else { "NULL" };
         let (msg_where, msg_params) = build_where_clause(filters)?;
         let msg_sql = format!(
             "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {extra_bin_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
@@ -1345,7 +1341,13 @@ mod tests {
         .expect("construct test secret-scan config");
         let redactions = collect_context_redactions(&text, &config);
         let start = text.find(focal).expect("focal fixture offset");
-        let result = redact_context(&text, start, start + focal.len(), text.len() * 2, &redactions);
+        let result = redact_context(
+            &text,
+            start,
+            start + focal.len(),
+            text.len() * 2,
+            &redactions,
+        );
 
         assert!(!result.contains(allowlisted), "allowlisted neighbor leaked");
         assert!(!result.contains(denied), "denylisted neighbor leaked");
