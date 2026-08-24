@@ -466,6 +466,7 @@ impl ThemePalette {
             "chatgpt" => (colors::AGENT_CHATGPT_BG, PackedRgba::rgb(16, 163, 127)), // ChatGPT green
             "opencode" => (colors::AGENT_OPENCODE_BG, colors::ROLE_USER), // Neutral/sage
             "pi_agent" => (colors::AGENT_CODEX_BG, PackedRgba::rgb(255, 140, 0)), // Orange for pi
+            "omp" => (PackedRgba::rgb(39, 24, 18), PackedRgba::rgb(245, 158, 66)), // Warm amber
             "factory" | "droid" => (colors::AGENT_FACTORY_BG, PackedRgba::rgb(230, 176, 60)), // Amber
             "clawdbot" => (colors::AGENT_CLAWDBOT_BG, PackedRgba::rgb(140, 130, 240)), // Indigo
             "vibe" | "mistral" => (colors::AGENT_VIBE_BG, PackedRgba::rgb(220, 100, 160)), // Rose
@@ -504,6 +505,7 @@ impl ThemePalette {
             "chatgpt" => "○",
             "opencode" => "□",
             "pi_agent" => "△",
+            "omp" => "◉",
             "factory" | "droid" => "▣",
             "clawdbot" => "⬢",
             "vibe" | "mistral" => "✦",
@@ -1649,6 +1651,7 @@ mod tests {
         "chatgpt",
         "opencode",
         "pi_agent",
+        "omp",
         "factory",
         "clawdbot",
         "vibe",

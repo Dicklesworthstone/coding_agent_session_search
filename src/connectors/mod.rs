@@ -34,7 +34,6 @@ pub use franken_agent_detection::{
     estimate_tokens_from_content,
     extract_claude_code_tokens,
     extract_codex_tokens,
-    extract_tokens_for_agent,
     file_modified_since,
     flatten_content,
     franken_detection_for_connector,
@@ -42,6 +41,25 @@ pub use franken_agent_detection::{
     parse_timestamp,
     reindex_messages,
 };
+
+/// Extract token/model metadata for every CASS connector identity.
+///
+/// OMP and Pi Agent share the pi-family wire schema, so they intentionally use
+/// the same token-extraction branch while retaining distinct archive slugs.
+#[must_use]
+pub fn extract_tokens_for_agent(
+    agent_slug: &str,
+    extra: &serde_json::Value,
+    content: &str,
+    role: &str,
+) -> ExtractedTokenUsage {
+    let extraction_slug = if agent_slug == "omp" {
+        "pi_agent"
+    } else {
+        agent_slug
+    };
+    franken_agent_detection::extract_tokens_for_agent(extraction_slug, extra, content, role)
+}
 
 /// Result of a Codex scan-root preflight. The preflight replaces directory
 /// roots with explicit rollout files while preserving each root's provenance
@@ -219,6 +237,7 @@ pub mod kimi;
 pub mod openclaw;
 pub mod opencode;
 pub mod openhands;
+pub mod omp;
 pub mod pi_agent;
 pub mod qwen;
 pub mod vibe;

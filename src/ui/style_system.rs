@@ -3521,6 +3521,7 @@ mod tests {
             "chatgpt",
             "opencode",
             "pi_agent",
+            "omp",
             "unknown_agent",
         ];
         for agent in agents {
