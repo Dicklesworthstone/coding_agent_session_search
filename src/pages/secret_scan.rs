@@ -273,6 +273,12 @@ struct FindingCandidate<'a> {
     ctx: &'a ScanContext,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RedactionRange {
+    start: usize,
+    end: usize,
+}
+
 pub fn scan_database<P: AsRef<Path>>(
     db_path: P,
     filters: &SecretScanFilters,
@@ -731,6 +737,11 @@ fn scan_text(
         return;
     }
 
+    // Context is a report surface, so it has a stronger rule than finding
+    // admission: every known secret span is masked, including allowlisted
+    // spans and adjacent matches that are not the focal finding.
+    let context_redactions = collect_context_redactions(text, config);
+
     // Denylist first (always critical)
     for deny in &config.denylist {
         for mat in deny.find_iter(text) {
@@ -744,7 +755,7 @@ fn scan_text(
                 FindingCandidate {
                     severity: SecretSeverity::Critical,
                     kind: "denylist",
-                    pattern: deny.as_str(),
+                    pattern: CUSTOM_DENYLIST_PATTERN_ID,
                     text,
                     start: mat.start(),
                     end: mat.end(),
@@ -752,6 +763,7 @@ fn scan_text(
                     ctx,
                 },
                 config,
+                &context_redactions,
             );
         }
     }
@@ -781,6 +793,7 @@ fn scan_text(
                     ctx,
                 },
                 config,
+                &context_redactions,
             );
         }
     }
@@ -792,20 +805,7 @@ fn scan_text(
             return;
         }
         let candidate = &text[mat.start()..mat.end()];
-        if candidate.len() < config.entropy_min_len {
-            continue;
-        }
-        if is_allowlisted(candidate, config) {
-            continue;
-        }
-        // Heuristic: Pure alphabetic strings are likely code identifiers (CamelCase), not secrets.
-        // Secrets usually have digits or symbols.
-        if candidate.chars().all(|c| c.is_ascii_alphabetic()) {
-            continue;
-        }
-
-        let entropy = shannon_entropy(candidate);
-        if entropy >= config.entropy_threshold {
+        if is_base64_entropy_secret(candidate, config, true) {
             push_finding(
                 findings,
                 seen,
@@ -820,6 +820,7 @@ fn scan_text(
                     ctx,
                 },
                 config,
+                &context_redactions,
             );
         }
     }
@@ -830,14 +831,7 @@ fn scan_text(
             return;
         }
         let candidate = &text[mat.start()..mat.end()];
-        if candidate.len() < 32 {
-            continue;
-        }
-        if is_allowlisted(candidate, config) {
-            continue;
-        }
-        let entropy = shannon_entropy(candidate);
-        if entropy >= 3.0 {
+        if is_hex_entropy_secret(candidate, config, true) {
             push_finding(
                 findings,
                 seen,
@@ -852,6 +846,7 @@ fn scan_text(
                     ctx,
                 },
                 config,
+                &context_redactions,
             );
         }
     }
@@ -862,6 +857,7 @@ fn push_finding(
     seen: &mut HashSet<String>,
     candidate: FindingCandidate<'_>,
     config: &SecretScanConfig,
+    context_redactions: &[RedactionRange],
 ) {
     let match_text = &candidate.text[candidate.start..candidate.end];
     let match_redacted = redact_token(match_text);
@@ -870,7 +866,7 @@ fn push_finding(
         candidate.start,
         candidate.end,
         config.context_bytes,
-        &match_redacted,
+        context_redactions,
     );
 
     let key = format!(
@@ -925,14 +921,20 @@ fn redact_context(
     start: usize,
     end: usize,
     window: usize,
-    replacement: &str,
+    redactions: &[RedactionRange],
 ) -> String {
     if text.is_empty() || start >= end || start >= text.len() {
         return String::new();
     }
 
-    let ctx_start = start.saturating_sub(window / 2);
-    let ctx_end = (end + window / 2).min(text.len());
+    let safe_start = adjust_to_char_boundary(text, start.min(text.len()), false);
+    let safe_end = adjust_to_char_boundary(text, end.min(text.len()), true);
+    if safe_start >= safe_end {
+        return String::new();
+    }
+
+    let ctx_start = safe_start.saturating_sub(window / 2);
+    let ctx_end = safe_end.saturating_add(window / 2).min(text.len());
     let ctx_start = adjust_to_char_boundary(text, ctx_start, false);
     let ctx_end = adjust_to_char_boundary(text, ctx_end, true);
 
@@ -940,17 +942,124 @@ fn redact_context(
         return String::new();
     }
 
-    let safe_start = start.min(text.len());
-    let safe_end = end.min(text.len());
+    let mut local_redactions = redactions
+        .iter()
+        .copied()
+        .filter(|range| range.start < ctx_end && range.end > ctx_start)
+        .collect::<Vec<_>>();
+    // The focal match must be masked even if a future finding source is not
+    // represented in `collect_context_redactions` yet.
+    local_redactions.push(RedactionRange {
+        start: safe_start,
+        end: safe_end,
+    });
+    let local_redactions = merge_redaction_ranges(local_redactions);
 
-    let prefix = &text[ctx_start..safe_start];
-    let suffix = &text[safe_end..ctx_end];
+    let mut snippet = String::with_capacity(ctx_end.saturating_sub(ctx_start));
+    let mut cursor = ctx_start;
+    for range in local_redactions {
+        let range_start = range.start.max(ctx_start);
+        let range_end = range.end.min(ctx_end);
+        if cursor < range_start {
+            snippet.push_str(&text[cursor..range_start]);
+        }
+        if cursor < range_end {
+            snippet.push_str(REDACTED_CONTEXT);
+            cursor = range_end;
+        }
+    }
+    if cursor < ctx_end {
+        snippet.push_str(&text[cursor..ctx_end]);
+    }
 
-    let mut snippet = String::new();
-    snippet.push_str(prefix);
-    snippet.push_str(replacement);
-    snippet.push_str(suffix);
-    snippet
+    // Defense in depth: the shared ingestion redactor is the canonical
+    // credential floor. The interval pass above additionally covers custom
+    // denylist and entropy matches, including secrets crossing context edges.
+    crate::indexer::redact_secrets::redact_text(&snippet).into_owned()
+}
+
+fn collect_context_redactions(text: &str, config: &SecretScanConfig) -> Vec<RedactionRange> {
+    let mut ranges = Vec::new();
+
+    for deny in &config.denylist {
+        ranges.extend(deny.find_iter(text).map(|mat| RedactionRange {
+            start: mat.start(),
+            end: mat.end(),
+        }));
+    }
+
+    for pattern in BUILTIN_PATTERNS.iter() {
+        ranges.extend(pattern.regex.find_iter(text).map(|mat| RedactionRange {
+            start: mat.start(),
+            end: mat.end(),
+        }));
+    }
+
+    ranges.extend(
+        ENTROPY_BASE64_RE
+            .find_iter(text)
+            .filter(|mat| is_base64_entropy_secret(mat.as_str(), config, false))
+            .map(|mat| RedactionRange {
+                start: mat.start(),
+                end: mat.end(),
+            }),
+    );
+    ranges.extend(
+        ENTROPY_HEX_RE
+            .find_iter(text)
+            .filter(|mat| is_hex_entropy_secret(mat.as_str(), config, false))
+            .map(|mat| RedactionRange {
+                start: mat.start(),
+                end: mat.end(),
+            }),
+    );
+
+    merge_redaction_ranges(ranges)
+}
+
+fn merge_redaction_ranges(mut ranges: Vec<RedactionRange>) -> Vec<RedactionRange> {
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<RedactionRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if range.start >= range.end {
+            continue;
+        }
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn is_base64_entropy_secret(
+    candidate: &str,
+    config: &SecretScanConfig,
+    honor_allowlist: bool,
+) -> bool {
+    if candidate.len() < config.entropy_min_len
+        || (honor_allowlist && is_allowlisted(candidate, config))
+    {
+        return false;
+    }
+    // Pure alphabetic strings are commonly code identifiers, not secrets.
+    if candidate.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return false;
+    }
+    shannon_entropy(candidate) >= config.entropy_threshold
+}
+
+fn is_hex_entropy_secret(
+    candidate: &str,
+    config: &SecretScanConfig,
+    honor_allowlist: bool,
+) -> bool {
+    candidate.len() >= 32
+        && !(honor_allowlist && is_allowlisted(candidate, config))
+        && shannon_entropy(candidate) >= 3.0
 }
 
 fn adjust_to_char_boundary(text: &str, idx: usize, forward: bool) -> usize {
