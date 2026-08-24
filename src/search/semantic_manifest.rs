@@ -496,6 +496,25 @@ impl SemanticShardManifest {
         });
     }
 
+    /// Stop every shard generation for one embedder from shadowing a freshly
+    /// rebuilt monolithic artifact while retaining its provenance record and
+    /// files for explicit inspection/GC.
+    pub fn mark_shards_stale_for_embedder(&mut self, embedder_id: &str) -> usize {
+        let mut changed = 0usize;
+        for shard in self
+            .shards
+            .iter_mut()
+            .filter(|shard| shard.embedder_id == embedder_id)
+        {
+            if shard.ready || shard.ann_ready {
+                shard.ready = false;
+                shard.ann_ready = false;
+                changed = changed.saturating_add(1);
+            }
+        }
+        changed
+    }
+
     pub fn summary(
         &self,
         tier: TierKind,
@@ -5789,6 +5808,39 @@ mod tests {
         assert_eq!(loaded.shards[0].shard_index, 0);
         assert_eq!(loaded.shards[1].shard_index, 1);
         assert!(loaded.updated_at_ms > 0);
+    }
+
+    #[test]
+    fn invalidating_embedder_shards_preserves_records_and_other_generations() {
+        let hash_fast = test_shard(0, 1, true);
+        let mut hash_quality = test_shard(0, 1, true);
+        hash_quality.tier = TierKind::Quality;
+        hash_quality.db_fingerprint = "fp-quality-hash".to_string();
+        let mut minilm_quality = test_shard(0, 1, true);
+        minilm_quality.tier = TierKind::Quality;
+        minilm_quality.embedder_id = "minilm-384".to_string();
+        minilm_quality.db_fingerprint = "fp-quality-minilm".to_string();
+        let mut shards = SemanticShardManifest {
+            shards: vec![hash_fast, hash_quality, minilm_quality],
+            ..Default::default()
+        };
+
+        assert_eq!(shards.mark_shards_stale_for_embedder("fnv1a-384"), 2);
+        assert_eq!(shards.shards.len(), 3);
+        assert!(
+            shards
+                .shards
+                .iter()
+                .filter(|shard| shard.embedder_id == "fnv1a-384")
+                .all(|shard| !shard.ready && !shard.ann_ready)
+        );
+        assert!(
+            shards
+                .shards
+                .iter()
+                .find(|shard| shard.embedder_id == "minilm-384")
+                .is_some_and(|shard| shard.ready)
+        );
     }
 
     #[test]

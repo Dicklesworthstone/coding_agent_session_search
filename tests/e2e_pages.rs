@@ -16,7 +16,8 @@
 //! cargo test --test e2e_pages test_full_export_pipeline_password_only
 //! ```
 
-use coding_agent_search::franken_sync::Connection;
+use coding_agent_search::franken_sync::compat::ConnectionExt;
+use coding_agent_search::franken_sync::{Connection, params as fparams};
 use coding_agent_search::model::types::{Agent, AgentKind};
 use coding_agent_search::pages::bundle::{BundleBuilder, BundleResult};
 use coding_agent_search::pages::encrypt::{DecryptionEngine, EncryptionEngine, load_config};
@@ -315,6 +316,17 @@ fn setup_test_db(data_dir: &Path, conversation_count: usize) -> std::path::PathB
     }
 
     db_path
+}
+
+fn inject_test_secret(db_path: &Path) {
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open fixture DB");
+    // ubs:ignore — deliberately credential-shaped mutation for fail-closed Pages tests.
+    let credential = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
+    conn.execute_compat(
+        "UPDATE messages SET content = ?1 WHERE id = (SELECT MIN(id) FROM messages)",
+        fparams![credential],
+    )
+    .expect("inject staged-scan fixture secret");
 }
 
 /// Build the complete pipeline and return artifacts.
@@ -778,6 +790,20 @@ fn test_cli_pages_full_workflow_end_to_end() {
     assert_eq!(export_json["status"].as_str(), Some("success"));
     assert_eq!(export_json["stats"]["conversations"].as_u64(), Some(4));
     assert_eq!(export_json["encryption"]["enabled"].as_bool(), Some(true));
+    assert_eq!(
+        export_json["secret_scan"]["complete"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        export_json["secret_scan"]["approval_state"].as_str(),
+        Some("clean")
+    );
+    assert_eq!(
+        export_json["secret_scan"]["artifact_sha256"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
 
     let site_dir = PathBuf::from(
         export_json["site_dir"]
@@ -940,6 +966,82 @@ fn test_cli_pages_full_workflow_end_to_end() {
     eprintln!(
         "{{\"test\":\"test_cli_pages_full_workflow_end_to_end\",\"duration_ms\":{},\"status\":\"PASS\"}}",
         test_start.elapsed().as_millis()
+    );
+}
+
+#[test]
+fn test_config_export_fails_closed_on_exact_staged_secret_scan() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let data_dir = temp_dir.path().join("data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let db_path = setup_test_db(&data_dir, 1);
+    inject_test_secret(&db_path);
+
+    let bundle_dir = temp_dir.path().join("bundle");
+    let config_path = temp_dir.path().join("pages-config.json");
+    write_pages_config(&config_path, &bundle_dir);
+
+    let output = std::process::Command::new(cass_bin_path())
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .arg("--db")
+        .arg(&db_path)
+        .arg("pages")
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--json")
+        .output()
+        .expect("run config Pages export");
+
+    assert!(
+        !output.status.success(),
+        "config export must reject staged secret findings"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Staged export contains"),
+        "stderr should explain the exact staged-scan rejection: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !bundle_dir.join("site").exists(),
+        "a rejected staged generation must not be bundled"
+    );
+}
+
+#[test]
+fn test_robot_export_only_rejects_secret_before_replacing_prior_output() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let data_dir = temp_dir.path().join("data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let db_path = setup_test_db(&data_dir, 1);
+    inject_test_secret(&db_path);
+
+    let output_path = temp_dir.path().join("export.db");
+    fs::write(&output_path, b"previous approved generation").expect("write prior output");
+
+    let output = std::process::Command::new(cass_bin_path())
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .arg("--db")
+        .arg(&db_path)
+        .arg("pages")
+        .arg("--export-only")
+        .arg(&output_path)
+        .arg("--json")
+        .output()
+        .expect("run robot export-only");
+
+    assert!(
+        !output.status.success(),
+        "robot export-only must fail closed on staged secret findings"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("robot/CI export-only runs fail closed"),
+        "stderr should explain the robot fail-closed policy: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(&output_path).expect("read preserved output"),
+        b"previous approved generation",
+        "failed secret approval must preserve the prior output generation"
     );
 }
 

@@ -3449,8 +3449,16 @@
       "description": "Override Aider session discovery root."
     },
     {
+      "name": "CASS_OMP_DATA_ROOT",
+      "description": "Declare an OMP-only archive/store root; CASS assigns OMP identity and resume plans preserve its exact sessions root."
+    },
+    {
+      "name": "PI_SESSIONS_DIR",
+      "description": "Override the exact Pi Agent sessions directory."
+    },
+    {
       "name": "PI_CODING_AGENT_DIR",
-      "description": "Override the Pi-family agent directory; OMP ignores it while a named profile is active."
+      "description": "Override the shared Pi-family agent directory; ambiguous paths remain Pi Agent-owned. Use CASS_OMP_DATA_ROOT for OMP-only ownership."
     },
     {
       "name": "PI_CODING_AGENT_SESSION_DIR",

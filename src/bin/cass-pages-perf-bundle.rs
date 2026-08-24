@@ -60,7 +60,7 @@ struct Args {
     #[arg(long, default_value = "test-password")]
     password: String,
 
-    /// Optional recovery secret (string)
+    /// Optional high-entropy recovery secret (at least 24 UTF-8 bytes)
     #[arg(long)]
     recovery_secret: Option<String>,
 

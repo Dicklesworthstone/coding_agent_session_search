@@ -82,7 +82,7 @@ use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{DailyStatsRebuildResult, StatsAggregator, StatsDelta};
 use crate::storage::sqlite::{
     FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,
-    LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
+    LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, SemanticIdentityTier,
     seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
@@ -8962,6 +8962,21 @@ fn semantic_tier_for_embedder_id(embedder_id: &str) -> Option<SemanticTierKind> 
     }
 }
 
+fn semantic_identity_tier_for_requested_embedder(embedder: &str) -> SemanticIdentityTier {
+    if matches!(embedder, "hash" | "fnv1a-384") {
+        SemanticIdentityTier::Fast
+    } else {
+        SemanticIdentityTier::Quality
+    }
+}
+
+fn storage_semantic_identity_tier(tier: SemanticTierKind) -> SemanticIdentityTier {
+    match tier {
+        SemanticTierKind::Fast => SemanticIdentityTier::Fast,
+        SemanticTierKind::Quality => SemanticIdentityTier::Quality,
+    }
+}
+
 fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
     if embedder_id == "fnv1a-384" {
         "hash".to_string()
@@ -15007,6 +15022,11 @@ pub fn run_index(
             "deferring broad semantic indexing until targeted watch-once ingest completes"
         );
     } else if opts.semantic {
+        let semantic_identity_tier =
+            semantic_identity_tier_for_requested_embedder(&opts.embedder);
+        let semantic_identity_rebuild_required = storage
+            .semantic_identity_rebuild_required(semantic_identity_tier)
+            .with_context(|| "checking whether canonical semantic filter identity changed")?;
         // In watch mode, skip the expensive bulk re-embed if a vector index and
         // watermark already exist. The incremental path in the watch callback
         // will pick up any new messages via WAL append.
@@ -15027,14 +15047,19 @@ pub fn run_index(
         // entirely and re-embed the whole corpus every run. When the existing
         // index + watermark already cover the newest message, there is nothing
         // to embed — skip the bulk pass on one-shot runs too.
-        let watermark_covers_corpus = has_existing_index
+        let watermark_covers_corpus = !semantic_identity_rebuild_required
+            && has_existing_index
             && match (last_embedded, storage.max_message_id()?) {
                 (Some(watermark), Some(max_id)) => watermark >= max_id,
                 (Some(_), None) => true,
                 (None, _) => false,
             };
 
-        if opts.watch && has_existing_index && has_watermark {
+        if opts.watch
+            && !semantic_identity_rebuild_required
+            && has_existing_index
+            && has_watermark
+        {
             tracing::info!(
                 dir = %vi_dir.display(),
                 "skipping bulk semantic re-embed (existing index + watermark found); \
@@ -15076,6 +15101,7 @@ pub fn run_index(
             tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
 
             let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+            let mut semantic_manifest_published = false;
             set_semantic_phase("semantic:replay");
             set_semantic_progress_phase(
                 opts.progress.as_ref(),
@@ -15232,6 +15258,7 @@ pub fn run_index(
                         stale/unavailable until next backfill cycle"
                     );
                 } else {
+                    semantic_manifest_published = true;
                     update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
                 }
             }
@@ -15255,6 +15282,21 @@ pub fn run_index(
                         writer
                             .set_last_embedded_message_id(i64::try_from(max_id).unwrap_or(i64::MAX))
                     },
+                )?;
+            }
+            if semantic_identity_rebuild_required && semantic_manifest_published {
+                crate::indexer::semantic::invalidate_identity_stale_semantic_shards(
+                    &opts.data_dir,
+                    semantic_indexer.embedder_id(),
+                )
+                .with_context(|| {
+                    "revoking identity-stale semantic shard generations after direct publish"
+                })?;
+                persist::with_ephemeral_writer(
+                    &storage,
+                    false,
+                    "completing semantic identity rebuild",
+                    |writer| writer.complete_semantic_identity_rebuild(semantic_identity_tier),
                 )?;
             }
             update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
@@ -16723,6 +16765,27 @@ fn run_targeted_semantic_watch_once_publish(
             raw_max_message_id,
             "updating semantic watch-once watermark",
         )?;
+    }
+    {
+        let guard = storage
+            .lock()
+            .map_err(|err| anyhow::anyhow!("lock storage after semantic watch-once: {err}"))?;
+        let semantic_identity_tier = storage_semantic_identity_tier(selection.tier);
+        if guard.semantic_identity_rebuild_required(semantic_identity_tier)? {
+            crate::indexer::semantic::invalidate_identity_stale_semantic_shards(
+                data_dir,
+                indexer.embedder_id(),
+            )
+            .with_context(|| {
+                "revoking identity-stale semantic shard generations after watch-once publish"
+            })?;
+            persist::with_ephemeral_writer(
+                &guard,
+                false,
+                "completing semantic identity rebuild after semantic watch-once",
+                |writer| writer.complete_semantic_identity_rebuild(semantic_identity_tier),
+            )?;
+        }
     }
 
     Ok(SemanticWatchOnceStats {
@@ -18933,12 +18996,7 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
             // explicitly via `err.chain()` and `Error::downcast_ref` on
             // each link — robust regardless of how anyhow's top-level
             // `downcast_ref` resolves chained types across versions.
-            let einval = err.chain().any(|cause| {
-                cause
-                    .downcast_ref::<std::io::Error>()
-                    .and_then(std::io::Error::raw_os_error)
-                    == Some(linux_publish_swap::EINVAL)
-            });
+            let einval = linux_atomic_exchange_is_unsupported(&err);
             if einval {
                 tracing::info!(
                     index_path = %index_path.display(),
@@ -19369,7 +19427,7 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
 }
 
 #[cfg(target_os = "linux")]
-fn atomic_exchange_paths(left: &Path, right: &Path) -> Result<()> {
+pub(crate) fn atomic_exchange_paths(left: &Path, right: &Path) -> Result<()> {
     let left_c = path_to_cstring(left)?;
     let right_c = path_to_cstring(right)?;
     let result = unsafe {
@@ -19391,6 +19449,16 @@ fn atomic_exchange_paths(left: &Path, right: &Path) -> Result<()> {
             left.display(),
             right.display()
         )
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_atomic_exchange_is_unsupported(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            == Some(linux_publish_swap::EINVAL)
     })
 }
 

@@ -538,6 +538,38 @@ fn semantic_staging_index_path(
     ))
 }
 
+/// Revoke shard-sidecar serving authority after a canonical identity rebuild.
+///
+/// Query loading prefers a complete current-fingerprint shard generation over
+/// the monolithic FSVI. Agent/source rewrites do not change that content
+/// fingerprint, so leaving old shard records published would resurrect Pi-era
+/// filter ids as soon as the durable identity marker was cleared. The shard
+/// files themselves remain untouched for explicit quarantine/GC policy.
+pub(crate) fn invalidate_identity_stale_semantic_shards(
+    data_dir: &Path,
+    embedder_id: &str,
+) -> Result<usize> {
+    let Some(mut manifest) = SemanticShardManifest::load(data_dir)
+        .map_err(|err| {
+            anyhow::anyhow!("loading semantic shard manifest for identity rebuild: {err}")
+        })?
+    else {
+        return Ok(0);
+    };
+    let invalidated = manifest.mark_shards_stale_for_embedder(embedder_id);
+    if invalidated > 0 {
+        manifest.save(data_dir).map_err(|err| {
+            anyhow::anyhow!("saving semantic shard manifest after identity rebuild: {err}")
+        })?;
+        tracing::info!(
+            embedder = embedder_id,
+            invalidated_shard_records = invalidated,
+            "revoked identity-stale semantic shard generations"
+        );
+    }
+    Ok(invalidated)
+}
+
 fn semantic_generation_fingerprint_component(db_fingerprint: &str) -> String {
     blake3::hash(db_fingerprint.as_bytes())
         .to_hex()

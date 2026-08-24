@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.6.26"
+version = "0.7.0"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -59,7 +59,7 @@ notify = "8.2.0"
 # (!Send futures); CASS's synchronous call shape is preserved by
 # src/franken_sync.rs, which drives every engine future on a private
 # current-thread asupersync runtime.
-frankensqlite = { version = "=0.3.8", package = "fsqlite", features = ["fts5"] }
+frankensqlite = { version = "=0.3.8", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
 fsqlite-types = { version = "=0.3.8", package = "fsqlite-types" }
@@ -112,8 +112,6 @@ franken-agent-detection = { version = "0.2.1", git = "https://github.com/Dickles
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
-hnsw_rs = "0.3.4"  # Opt 9: Approximate Nearest Neighbor with HNSW
-ouroboros = "0.18.5"  # Safe self-referential wrapper for HNSW loader lifetime
 
 # Crypto for ChatGPT encrypted conversations and HTML export encryption.
 # The aes-gcm + digest + hkdf + hmac + sha2 family must stay on compatible

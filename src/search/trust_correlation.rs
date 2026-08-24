@@ -451,8 +451,17 @@ fn build_for_repo(start: &Path) -> Option<CorrelationIndex> {
 /// preserves the content-stable id and supersession rules owned by the lessons
 /// core instead of reimplementing either rule in the trust layer.
 fn build_lesson_source_index(root: &Path) -> HashMap<String, Vec<String>> {
-    let evidence = crate::gather_repository_lessons_evidence(root);
-    let extraction = crate::lessons_extraction::extract(&evidence);
+    let gathered = crate::gather_repository_lessons_evidence(root);
+    let rejected = gathered.rejected_records;
+    if rejected.total() > 0 {
+        tracing::warn!(
+            target: "cass::lessons",
+            rejected_beads = rejected.beads,
+            rejected_proofs = rejected.proofs,
+            "lesson citation index is partial because malformed repository evidence was skipped"
+        );
+    }
+    let extraction = crate::lessons_extraction::extract(&gathered.evidence);
     let graph = crate::lessons::LessonGraph::build(extraction.candidates);
     let mut by_source: HashMap<String, Vec<String>> = HashMap::new();
     for lesson in graph.lessons {

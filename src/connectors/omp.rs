@@ -94,12 +94,14 @@ pub(crate) struct PiFamilyOwnership {
     shared_agent_dir: Option<PathBuf>,
     omp_config_root: Option<PathBuf>,
     omp_store_roots: Vec<(PathBuf, Option<String>)>,
+    active_profile: Option<String>,
 }
 
 impl PiFamilyOwnership {
     #[must_use]
     pub(crate) fn live() -> Self {
         let home = dirs::home_dir();
+        let active_profile = active_profile_from_env();
         let config_name = dotenvy::var("PI_CONFIG_DIR")
             .ok()
             .filter(|value| !value.is_empty())
@@ -113,7 +115,7 @@ impl PiFamilyOwnership {
             nonempty_env_path("PI_CODING_AGENT_SESSION_DIR").as_deref(),
             nonempty_env_path("CASS_OMP_DATA_ROOT").as_deref(),
             &config_name,
-            active_profile_from_env(),
+            active_profile.clone(),
         );
 
         Self {
@@ -122,6 +124,7 @@ impl PiFamilyOwnership {
             shared_agent_dir: nonempty_env_path("PI_CODING_AGENT_DIR"),
             omp_config_root,
             omp_store_roots: tagged_roots,
+            active_profile,
         }
     }
 
@@ -154,12 +157,12 @@ impl PiFamilyOwnership {
         {
             return PiFamilyOwner::Omp;
         }
+        let archive_layout = classify_omp_archive_path(path);
         if self
             .omp_config_root
             .as_deref()
             .is_some_and(|root| path_is_within(path, root))
-            || has_dot_omp_layout_marker(path)
-            || has_sanitized_omp_mirror_marker(path)
+            || archive_layout == Some(OmpArchivePathClass::ConfigOrMirror)
         {
             return PiFamilyOwner::Omp;
         }
@@ -171,7 +174,7 @@ impl PiFamilyOwnership {
         }) {
             return PiFamilyOwner::PiAgent;
         }
-        if has_xdg_omp_layout_marker(path) {
+        if archive_layout == Some(OmpArchivePathClass::Xdg) {
             return PiFamilyOwner::Omp;
         }
         PiFamilyOwner::Unknown
@@ -180,6 +183,27 @@ impl PiFamilyOwnership {
     #[must_use]
     fn omp_scan_roots(&self) -> &[(PathBuf, Option<String>)] {
         &self.omp_store_roots
+    }
+
+    /// Return the active process profile only when the transcript is inside
+    /// the exact live session-directory override that profile configures.
+    ///
+    /// OMP ownership alone is not sufficient evidence: CASS archive roots,
+    /// copied config homes, XDG stores, and remote mirrors may all belong to a
+    /// different invocation. Their profile must come from the path itself.
+    #[must_use]
+    fn live_session_override_profile(&self, path: &Path) -> Option<&str> {
+        if self
+            .pi_sessions_dir
+            .as_deref()
+            .is_some_and(|root| path_is_within(path, root))
+        {
+            return None;
+        }
+        self.omp_session_dir
+            .as_deref()
+            .filter(|root| path_is_within(path, root))?;
+        self.active_profile.as_deref()
     }
 
     #[must_use]
@@ -199,6 +223,33 @@ impl PiFamilyOwnership {
         dedupe_paths(&mut roots);
         roots
     }
+
+    /// Stable, non-reversible identity of the live inputs that can change
+    /// archive ownership. Storage binds its completed legacy-migration marker
+    /// to this value so adding a custom XDG/CASS root later cannot strand an
+    /// old Pi-labelled OMP row behind a stale fast path.
+    #[must_use]
+    pub(crate) fn archive_reclassification_context(&self) -> String {
+        fn add_path(hasher: &mut blake3::Hasher, label: &str, path: Option<&Path>) {
+            hasher.update(label.as_bytes());
+            hasher.update(b"\0");
+            if let Some(path) = path {
+                hasher.update(path.to_string_lossy().as_bytes());
+            }
+            hasher.update(b"\0");
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"cass-pi-family-ownership-v1\0");
+        add_path(&mut hasher, "pi_sessions_dir", self.pi_sessions_dir.as_deref());
+        add_path(&mut hasher, "omp_session_dir", self.omp_session_dir.as_deref());
+        add_path(&mut hasher, "shared_agent_dir", self.shared_agent_dir.as_deref());
+        add_path(&mut hasher, "omp_config_root", self.omp_config_root.as_deref());
+        for (root, _) in &self.omp_store_roots {
+            add_path(&mut hasher, "omp_store_root", Some(root));
+        }
+        hasher.finalize().to_hex().to_string()
+    }
 }
 
 fn nonempty_env_path(key: &str) -> Option<PathBuf> {
@@ -214,34 +265,88 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
     {
         return canonical_path.starts_with(canonical_root);
     }
+
+    // Lexical fallback is needed for historical paths that no longer exist,
+    // but it must not bless a prefix that a parent traversal subsequently
+    // escapes. The structural classifier applies the same fail-closed rule.
+    if path_parts(path).is_none() || path_parts(root).is_none() {
+        return false;
+    }
     path.starts_with(root)
 }
 
-fn path_parts(path: &Path) -> Vec<String> {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect()
+fn path_parts(path: &Path) -> Option<Vec<String>> {
+    // Archived paths may have been written on another operating system. Split
+    // both separator styles explicitly instead of letting the current host's
+    // `Path::components` reinterpret a Windows path as one Unix component.
+    // A parent component invalidates structural evidence entirely: archived or
+    // missing paths cannot be canonicalized reliably, and accepting a marker
+    // before `..` would let the resolved path escape into another provider.
+    let mut parts = Vec::new();
+    for component in path
+        .as_os_str()
+        .to_string_lossy()
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty() && *component != ".")
+    {
+        if component == ".." {
+            return None;
+        }
+        parts.push(component.to_owned());
+    }
+    Some(parts)
 }
 
-fn has_dot_omp_layout_marker(path: &Path) -> bool {
-    path_parts(path).iter().any(|part| part == ".omp")
+fn has_config_omp_layout_marker(parts: &[String]) -> bool {
+    parts
+        .windows(2)
+        .any(|window| window[0] == ".omp" && window[1] == "agent")
+        || parts.windows(4).any(|window| {
+            window[0] == ".omp"
+                && window[1] == "profiles"
+                && normalize_profile_name(&window[2]).is_some()
+                && window[3] == "agent"
+        })
 }
 
 fn has_pi_agent_layout_marker(path: &Path) -> bool {
-    path_parts(path)
-        .windows(2)
-        .any(|parts| parts[0] == ".pi" && parts[1] == "agent")
+    path_parts(path).is_some_and(|parts| {
+        parts
+            .windows(2)
+            .any(|parts| parts[0] == ".pi" && parts[1] == "agent")
+    })
 }
 
-fn has_sanitized_omp_mirror_marker(path: &Path) -> bool {
-    let parts = path_parts(path);
-    if parts
-        .iter()
-        .any(|part| part.starts_with(".omp_") || part.starts_with(".local_share_omp_"))
-    {
-        return true;
+fn is_safe_mirror_hash(value: &str) -> bool {
+    (8..=16).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn encoded_path_has_marker(encoded: &str, marker: &str) -> bool {
+    encoded.match_indices(marker).any(|(index, _)| {
+        let end = index + marker.len();
+        (index == 0 || encoded.as_bytes()[index - 1] == b'_')
+            && (end == encoded.len() || encoded.as_bytes()[end] == b'_')
+    })
+}
+
+fn safe_mirror_name_has_omp_layout(name: &str) -> bool {
+    let Some((encoded, hash)) = name.rsplit_once('_') else {
+        return false;
+    };
+    if !is_safe_mirror_hash(hash) {
+        return false;
     }
 
+    encoded == ".omp"
+        || encoded_path_has_marker(encoded, ".omp_agent")
+        || encoded_path_has_marker(encoded, ".omp_profiles")
+        || encoded_path_has_marker(encoded, ".local_share_omp")
+}
+
+fn has_sanitized_omp_mirror_marker(parts: &[String]) -> bool {
     // `sources sync` preserves a configured remote path in the mirror
     // container name. A tilde path starts with the provider marker, while an
     // absolute path retains its leading components, for example:
@@ -256,15 +361,48 @@ fn has_sanitized_omp_mirror_marker(path: &Path) -> bool {
     parts.windows(4).any(|window| {
         window[0] == "remotes"
             && window[2] == "mirror"
-            && (window[3].contains("_.omp_")
-                || window[3].contains("_.local_share_omp_"))
+            && safe_mirror_name_has_omp_layout(&window[3])
     })
 }
 
-fn has_xdg_omp_layout_marker(path: &Path) -> bool {
-    path_parts(path)
-        .windows(2)
-        .any(|parts| parts[0] == "omp" && (parts[1] == "sessions" || parts[1] == "profiles"))
+fn has_xdg_omp_layout_marker(parts: &[String]) -> bool {
+    parts
+        .windows(4)
+        .any(|window| {
+            window[0] == ".local"
+                && window[1] == "share"
+                && window[2] == "omp"
+                && window[3] == "sessions"
+        })
+        || parts.windows(5).any(|window| {
+            window[0] == ".local"
+                && window[1] == "share"
+                && window[2] == "omp"
+                && window[3] == "profiles"
+                && normalize_profile_name(&window[4]).is_some()
+        })
+}
+
+/// Durable OMP evidence encoded in an archived transcript path.
+///
+/// This classifier is deliberately independent of the live process
+/// environment so the connector ownership boundary and legacy SQLite
+/// reclassification use exactly the same structural evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OmpArchivePathClass {
+    /// A canonical `.omp` config layout or a production remote-mirror slot.
+    ConfigOrMirror,
+    /// The conventional `~/.local/share/omp` XDG layout.
+    Xdg,
+}
+
+#[must_use]
+pub(crate) fn classify_omp_archive_path(path: &Path) -> Option<OmpArchivePathClass> {
+    let parts = path_parts(path)?;
+    if has_config_omp_layout_marker(&parts) || has_sanitized_omp_mirror_marker(&parts) {
+        return Some(OmpArchivePathClass::ConfigOrMirror);
+    }
+    has_xdg_omp_layout_marker(&parts).then_some(OmpArchivePathClass::Xdg)
 }
 
 fn push_tagged_root(
@@ -408,20 +546,7 @@ fn dedupe_tagged_roots(roots: &mut Vec<(PathBuf, Option<String>)>) {
     });
 }
 
-fn configured_root_from_config_dir(path: &Path) -> Option<PathBuf> {
-    let config_name = dotenvy::var("PI_CONFIG_DIR")
-        .ok()
-        .filter(|value| !value.is_empty())?;
-    let home = dirs::home_dir()?;
-    let base = home.join(config_name.trim_start_matches(['/', '\\']));
-    let sessions = active_profile_from_env().map_or_else(
-        || base.join("agent/sessions"),
-        |profile| base.join("profiles").join(profile).join("agent/sessions"),
-    );
-    path.starts_with(&sessions).then_some(sessions)
-}
-
-/// Return a configured OMP session root that owns `path`.
+/// Return an explicit OMP session/store override that owns `path`.
 ///
 /// `PI_CODING_AGENT_DIR` is deliberately included only as a resume/scan-root
 /// resolver, not as an OMP identity signal: Pi Agent and OMP both honor that
@@ -455,34 +580,94 @@ pub(crate) fn configured_session_root(path: &Path) -> Option<PathBuf> {
         && let Some(agent_root) = nonempty_env_path("PI_CODING_AGENT_DIR")
     {
         let sessions = agent_root.join("sessions");
-        if path.starts_with(&sessions) {
+        if path_is_within(path, &sessions) {
             return Some(sessions);
         }
     }
 
-    configured_root_from_config_dir(path)
+    None
 }
 
 /// Recover a valid named profile from canonical, custom-config, or XDG OMP
 /// session paths. Callers must first establish that the path belongs to OMP.
 #[must_use]
 pub(crate) fn profile_from_session_path(path: &Path) -> Option<String> {
-    let parts = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>();
+    let parts = path_parts(path)?;
 
     for window in parts.windows(4) {
         if window[0] == "profiles" && window[2] == "agent" && window[3] == "sessions" {
-            return normalize_profile_name(window[1].as_ref());
+            return normalize_profile_name(&window[1]);
         }
     }
     for window in parts.windows(3) {
         if window[0] == "profiles" && window[2] == "sessions" {
-            return normalize_profile_name(window[1].as_ref());
+            return normalize_profile_name(&window[1]);
         }
     }
     None
+}
+
+/// Resolve the profile needed to reopen one OMP transcript.
+///
+/// A path-encoded named profile is durable provenance. The process profile is
+/// only valid for the exact `PI_CODING_AGENT_SESSION_DIR` live override; an
+/// unrelated active profile must never be attached to a CASS archive or copy.
+#[must_use]
+pub(crate) fn resume_profile_from_path(path: &Path) -> Option<String> {
+    profile_from_session_path(path).or_else(|| {
+        PiFamilyOwnership::live()
+            .live_session_override_profile(path)
+            .map(str::to_owned)
+    })
+}
+
+fn path_is_in_resolved_config_store_from(
+    path: &Path,
+    home: &Path,
+    config_name: &str,
+    active_profile: Option<&str>,
+) -> bool {
+    let path_profile = profile_from_session_path(path);
+    if path_profile.is_none() && active_profile.is_some() {
+        return false;
+    }
+
+    let config_root = home.join(config_name.trim_start_matches(['/', '\\']));
+    let sessions = path_profile.as_deref().map_or_else(
+        || config_root.join("agent/sessions"),
+        |profile| {
+            config_root
+                .join("profiles")
+                .join(profile)
+                .join("agent/sessions")
+        },
+    );
+    path_is_within(path, &sessions)
+}
+
+/// True only when `path` belongs to the home/config store that the generated
+/// OMP command will resolve without an explicit `--session-dir`.
+///
+/// Archive discovery intentionally indexes copied homes, remote mirrors, and
+/// secondary XDG stores as well. Structural `.omp` or profile markers alone
+/// therefore cannot prove that the current OMP process will reopen that same
+/// store.
+#[must_use]
+pub(crate) fn is_resolved_live_config_session_path(path: &Path) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let config_name = dotenvy::var("PI_CONFIG_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ".omp".to_string());
+    let active_profile = active_profile_from_env();
+    path_is_in_resolved_config_store_from(
+        path,
+        &home,
+        &config_name,
+        active_profile.as_deref(),
+    )
 }
 
 /// True when an unambiguous OMP layout or OMP-only environment override owns
@@ -494,13 +679,16 @@ pub(crate) fn owns_session_path(path: &Path) -> bool {
 
 #[cfg(test)]
 fn has_omp_layout_marker(path: &Path) -> bool {
-    has_dot_omp_layout_marker(path) || has_xdg_omp_layout_marker(path)
+    classify_omp_archive_path(path).is_some()
 }
 
 /// Reconcile profile provenance for explicit roots that FAD cannot tag on its
 /// own (for example `~/.omp/profiles/work/agent/sessions`). A structural path
 /// profile is authoritative over a process-level fallback tag.
-fn fill_missing_profiles(conversations: &mut [NormalizedConversation]) {
+fn fill_missing_profiles(
+    conversations: &mut [NormalizedConversation],
+    ownership: &PiFamilyOwnership,
+) {
     for conversation in conversations {
         // The transcript path is the durable provenance source. An explicit
         // fallback scan may have been seeded with the process's active profile,
@@ -521,10 +709,9 @@ fn fill_missing_profiles(conversations: &mut [NormalizedConversation]) {
         if !profile_missing {
             continue;
         }
-        let profile = profile_from_session_path(&conversation.source_path).or_else(|| {
-            configured_session_root(&conversation.source_path)
-                .and_then(|_| active_profile_from_env())
-        });
+        let profile = ownership
+            .live_session_override_profile(&conversation.source_path)
+            .map(str::to_owned);
         if let Some(profile) = profile
             && let Some(metadata) = conversation.metadata.as_object_mut()
         {
@@ -533,15 +720,16 @@ fn fill_missing_profiles(conversations: &mut [NormalizedConversation]) {
     }
 }
 
-fn direct_root_profile(root: &ScanRoot, active_profile: Option<&str>) -> Option<String> {
+fn direct_root_profile(root: &ScanRoot, ownership: &PiFamilyOwnership) -> Option<String> {
     profile_from_session_path(&root.path).or_else(|| {
-        // A process-level profile describes this local OMP invocation. It says
-        // nothing about a transcript copied from another machine, so leaving a
-        // remote profile unknown is more truthful than stealing the local one.
+        // A process-level profile describes only the live session override. It
+        // says nothing about a copied local transcript or a remote transcript.
         if root.origin.is_remote() {
             None
         } else {
-            active_profile.map(str::to_string)
+            ownership
+                .live_session_override_profile(&root.path)
+                .map(str::to_owned)
         }
     })
 }
@@ -644,15 +832,9 @@ impl Connector for OmpConnector {
 
         let direct_roots = unrecognized_direct_session_roots(ctx, &ownership);
         if !direct_roots.is_empty() {
-            let active_profile = active_profile_from_env();
             let tagged_roots = direct_roots
                 .iter()
-                .map(|root| {
-                    (
-                        root.path.clone(),
-                        direct_root_profile(root, active_profile.as_deref()),
-                    )
-                })
+                .map(|root| (root.path.clone(), direct_root_profile(root, &ownership)))
                 .collect::<Vec<_>>();
             let fallback = franken_agent_detection::connectors::pi_wire::scan_homes_tagged(
                 &tagged_roots,
@@ -664,7 +846,7 @@ impl Connector for OmpConnector {
         conversations.retain(|conversation| {
             ownership.owner(&conversation.source_path) == PiFamilyOwner::Omp
         });
-        fill_missing_profiles(&mut conversations);
+        fill_missing_profiles(&mut conversations, &ownership);
         Ok(conversations)
     }
 
@@ -724,6 +906,7 @@ mod tests {
         omp_session_dir: Option<PathBuf>,
         shared_agent_dir: Option<PathBuf>,
         omp_store_roots: Vec<PathBuf>,
+        active_profile: Option<&str>,
     ) -> PiFamilyOwnership {
         PiFamilyOwnership {
             pi_sessions_dir,
@@ -734,6 +917,7 @@ mod tests {
                 .into_iter()
                 .map(|path| (path, None))
                 .collect(),
+            active_profile: active_profile.map(str::to_owned),
         }
     }
 
@@ -759,6 +943,13 @@ mod tests {
         );
         assert_eq!(
             profile_from_session_path(Path::new(
+                r"C:\Users\dev\.omp\profiles\windows\agent\sessions\project\session.jsonl"
+            )),
+            Some("windows".to_string()),
+            "profile provenance must survive cross-platform archived paths"
+        );
+        assert_eq!(
+            profile_from_session_path(Path::new(
                 "/home/dev/.omp/profiles/con/agent/sessions/project/session.jsonl"
             )),
             None,
@@ -777,12 +968,172 @@ mod tests {
         assert!(!has_omp_layout_marker(Path::new(
             "/home/dev/.pi/agent/sessions/project/session.jsonl"
         )));
+        assert!(!has_omp_layout_marker(Path::new(
+            "/home/dev/.omp-cache/agent/sessions/project/session.jsonl"
+        )));
+        assert!(!has_omp_layout_marker(Path::new(
+            "/srv/omp/sessions/project/session.jsonl"
+        )));
+        assert!(has_omp_layout_marker(Path::new(
+            r"C:\Users\dev\.omp\agent\sessions\project\session.jsonl"
+        )));
+        assert!(!has_omp_layout_marker(Path::new(
+            r"C:\Users\dev\.omp-cache\agent\sessions\project\session.jsonl"
+        )));
+    }
+
+    #[test]
+    fn parent_traversal_invalidates_all_pi_family_layout_evidence() {
+        let policy = ownership(None, None, None, Vec::new(), None);
+        for path in [
+            Path::new("/archive/.omp/agent/../../.pi/agent/sessions/x.jsonl"),
+            Path::new(r"C:\archive\.omp\agent\..\..\.pi\agent\sessions\x.jsonl"),
+            Path::new("/archive/.pi/agent/../../.omp/agent/sessions/x.jsonl"),
+            Path::new(r"C:\archive\.pi\agent\..\..\.omp\agent\sessions\x.jsonl"),
+        ] {
+            assert_eq!(classify_omp_archive_path(path), None);
+            assert!(!has_pi_agent_layout_marker(path));
+            assert_eq!(
+                policy.owner(path),
+                PiFamilyOwner::Unknown,
+                "a lexical parent traversal must fail closed for both providers: {}",
+                path.display()
+            );
+        }
+
+        let omp_root = PathBuf::from("/srv/omp-sessions");
+        let omp_policy = ownership(None, Some(omp_root.clone()), None, Vec::new(), None);
+        assert_eq!(
+            omp_policy.owner(&omp_root.join("../pi-sessions/project/x.jsonl")),
+            PiFamilyOwner::Unknown,
+            "a missing historical path must not escape an explicit OMP root through lexical prefix matching"
+        );
+        let pi_root = PathBuf::from("/srv/pi-sessions");
+        let pi_policy = ownership(Some(pi_root.clone()), None, None, Vec::new(), None);
+        assert_eq!(
+            pi_policy.owner(&pi_root.join("../omp-sessions/project/x.jsonl")),
+            PiFamilyOwner::Unknown,
+            "a missing historical path must not escape an explicit Pi root through lexical prefix matching"
+        );
+    }
+
+    #[test]
+    fn archive_context_tracks_ownership_roots_not_profile_metadata() {
+        let root = PathBuf::from("/srv/omp-sessions");
+        let mut work = ownership(
+            None,
+            Some(root.clone()),
+            None,
+            vec![root.clone()],
+            Some("work"),
+        );
+        work.omp_store_roots[0].1 = Some("work".to_string());
+        let mut review = work.clone();
+        review.active_profile = Some("review".to_string());
+        review.omp_store_roots[0].1 = Some("review".to_string());
+        assert_eq!(
+            work.archive_reclassification_context(),
+            review.archive_reclassification_context(),
+            "profile tags change metadata and resume behavior, not archive ownership"
+        );
+
+        let mut moved = review;
+        moved.omp_session_dir = Some(PathBuf::from("/srv/other-omp-sessions"));
+        assert_ne!(
+            work.archive_reclassification_context(),
+            moved.archive_reclassification_context(),
+            "a provider-qualified ownership root change must invalidate migration completion"
+        );
+    }
+
+    #[test]
+    fn sanitized_omp_markers_require_the_exact_production_mirror_slot() {
+        let tilde_name =
+            crate::sources::sync::path_to_safe_dirname("~/.omp/agent/sessions");
+        let absolute_name = crate::sources::sync::path_to_safe_dirname(
+            "/home/dev/.local/share/omp/profiles/work/sessions",
+        );
+        for safe_name in [&tilde_name, &absolute_name] {
+            let production_path = PathBuf::from("/cass/remotes/build-host/mirror")
+                .join(safe_name)
+                .join("sessions/project/session.jsonl");
+            assert_eq!(
+                classify_omp_archive_path(&production_path),
+                Some(OmpArchivePathClass::ConfigOrMirror)
+            );
+
+            let incidental_path = PathBuf::from("/cass/ordinary-cache")
+                .join(safe_name)
+                .join("sessions/project/session.jsonl");
+            assert_eq!(classify_omp_archive_path(&incidental_path), None);
+        }
+
+        assert_eq!(
+            classify_omp_archive_path(Path::new(
+                "/cass/remotes/build-host/mirror/.omp_agent_sessions_not-a-hash/sessions/session.jsonl"
+            )),
+            None,
+            "a marker-shaped mirror name without the sync hash is not trustworthy provenance"
+        );
+        assert_eq!(
+            classify_omp_archive_path(Path::new(
+                "/cass/remotes/build-host/mirror/.omp_backup_0123456789abcdef/sessions/session.jsonl"
+            )),
+            None,
+            "an unrelated dot-directory must not become OMP merely because its name starts with .omp"
+        );
+        for invalid_hash in [
+            "0123456",
+            "0123456789abcdef0",
+            "0123456789abcdeF",
+            "0123456789abcdeg",
+        ] {
+            let path = PathBuf::from("/cass/remotes/build-host/mirror")
+                .join(format!(".omp_agent_sessions_{invalid_hash}"))
+                .join("sessions/session.jsonl");
+            assert_eq!(
+                classify_omp_archive_path(&path),
+                None,
+                "only the lowercase 8-to-16-character hex producer range is valid: {invalid_hash}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_config_store_rejects_copies_and_inactive_default_store() {
+        let home = Path::new("/home/dev");
+        assert!(path_is_in_resolved_config_store_from(
+            Path::new("/home/dev/.omp/agent/sessions/project/session.jsonl"),
+            home,
+            ".omp",
+            None,
+        ));
+        assert!(!path_is_in_resolved_config_store_from(
+            Path::new("/archive/dev/.omp/agent/sessions/project/session.jsonl"),
+            home,
+            ".omp",
+            None,
+        ));
+        assert!(!path_is_in_resolved_config_store_from(
+            Path::new("/home/dev/.omp/agent/sessions/project/session.jsonl"),
+            home,
+            ".omp",
+            Some("work"),
+        ));
+        assert!(path_is_in_resolved_config_store_from(
+            Path::new(
+                "/home/dev/custom/profiles/work/agent/sessions/project/session.jsonl"
+            ),
+            home,
+            "custom",
+            Some("other"),
+        ));
     }
 
     #[test]
     fn provider_specific_overrides_beat_conflicting_layout_markers() {
         let pi_root = PathBuf::from("/srv/omp/sessions");
-        let pi_policy = ownership(Some(pi_root.clone()), None, None, Vec::new());
+        let pi_policy = ownership(Some(pi_root.clone()), None, None, Vec::new(), None);
         assert_eq!(
             pi_policy.owner(&pi_root.join("project/session.jsonl")),
             PiFamilyOwner::PiAgent,
@@ -790,7 +1141,7 @@ mod tests {
         );
 
         let omp_root = PathBuf::from("/srv/.pi/agent/sessions");
-        let omp_policy = ownership(None, Some(omp_root.clone()), None, Vec::new());
+        let omp_policy = ownership(None, Some(omp_root.clone()), None, Vec::new(), None);
         assert_eq!(
             omp_policy.owner(&omp_root.join("project/session.jsonl")),
             PiFamilyOwner::Omp,
@@ -801,7 +1152,7 @@ mod tests {
     #[test]
     fn shared_agent_override_has_one_legacy_owner() {
         let shared = PathBuf::from("/srv/shared-agent");
-        let policy = ownership(None, None, Some(shared.clone()), Vec::new());
+        let policy = ownership(None, None, Some(shared.clone()), Vec::new(), None);
         assert_eq!(
             policy.owner(&shared.join("sessions/project/session.jsonl")),
             PiFamilyOwner::PiAgent
@@ -850,26 +1201,105 @@ mod tests {
             .expect("scan deliberately mistagged profile root");
         assert_eq!(conversations[0].metadata["profile"], "other");
 
-        fill_missing_profiles(&mut conversations);
+        let ownership = ownership(None, None, None, Vec::new(), None);
+        fill_missing_profiles(&mut conversations, &ownership);
 
         assert_eq!(conversations[0].metadata["profile"], "work");
     }
 
     #[test]
-    fn direct_remote_root_never_inherits_the_local_active_profile() {
+    fn missing_profile_fallback_is_limited_to_the_live_session_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive_root = temp.path().join("cass-archive");
+        write_session(&archive_root, "archive-profile");
+        let ctx = ScanContext::local_default(temp.path().join("cass-state"), None);
+        let mut archived = franken_agent_detection::connectors::pi_wire::scan_homes_tagged(
+            &[(archive_root.clone(), None)],
+            &ctx,
+            "omp",
+        )
+        .expect("scan untagged CASS archive");
+        let archive_policy = ownership(
+            None,
+            None,
+            None,
+            vec![archive_root],
+            Some("local-profile"),
+        );
+
+        fill_missing_profiles(&mut archived, &archive_policy);
+
+        assert!(
+            archived[0]
+                .metadata
+                .get("profile")
+                .and_then(serde_json::Value::as_str)
+                .is_none(),
+            "an unrelated process profile must not relabel an untagged CASS archive"
+        );
+
+        let override_root = temp.path().join("live-session-override");
+        write_session(&override_root, "live-profile");
+        let mut live = franken_agent_detection::connectors::pi_wire::scan_homes_tagged(
+            &[(override_root.clone(), None)],
+            &ctx,
+            "omp",
+        )
+        .expect("scan untagged live override");
+        let live_policy = ownership(
+            None,
+            Some(override_root),
+            None,
+            Vec::new(),
+            Some("local-profile"),
+        );
+
+        fill_missing_profiles(&mut live, &live_policy);
+
+        assert_eq!(live[0].metadata["profile"], "local-profile");
+    }
+
+    #[test]
+    fn only_the_live_session_override_inherits_the_active_profile() {
+        let local_profile = Some("local-profile");
+        let archive_root = PathBuf::from("/cass/archives/custom-store");
+        let archive_policy = ownership(
+            None,
+            None,
+            None,
+            vec![archive_root.clone()],
+            local_profile,
+        );
+        let local_archive = ScanRoot::local(archive_root);
+        assert_eq!(direct_root_profile(&local_archive, &archive_policy), None);
+
         let remote = ScanRoot::remote(
             PathBuf::from("/cass/remotes/build-host/mirror/custom-store"),
             Origin::remote_with_host("build-host", "build-host.example"),
             Some(Platform::Linux),
         );
-        assert_eq!(direct_root_profile(&remote, Some("local-profile")), None);
+        assert_eq!(direct_root_profile(&remote, &archive_policy), None);
 
         let structural = ScanRoot::local(PathBuf::from(
             "/home/dev/.local/share/omp/profiles/work/sessions",
         ));
         assert_eq!(
-            direct_root_profile(&structural, Some("local-profile")).as_deref(),
+            direct_root_profile(&structural, &archive_policy).as_deref(),
             Some("work")
+        );
+
+        let override_root = PathBuf::from("/srv/omp-live-sessions");
+        let override_policy = ownership(
+            None,
+            Some(override_root.clone()),
+            None,
+            Vec::new(),
+            local_profile,
+        );
+        let live_override = ScanRoot::local(override_root.join("project"));
+        assert_eq!(
+            direct_root_profile(&live_override, &override_policy).as_deref(),
+            local_profile
         );
     }
 

@@ -1,3 +1,6 @@
+use super::sqlite_artifact_paths;
+#[cfg(test)]
+use super::sqlite_fixed_artifact_paths;
 use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, params_from_iter};
 use crate::franken_sync::params;
 use crate::indexer::redact_secrets::{
@@ -12,8 +15,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,6 +120,13 @@ pub struct SecretScanSummary {
 pub struct SecretScanReport {
     pub summary: SecretScanSummary,
     pub findings: Vec<SecretFinding>,
+}
+
+/// Proof that a complete scan observed one immutable staged export artifact.
+#[derive(Debug, Clone)]
+pub struct StagedSecretScan {
+    pub report: SecretScanReport,
+    pub artifact_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +339,56 @@ enum SecretScanCheckpoint {
     AfterSnippets,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretScanSchema {
+    Archive,
+    PagesExport,
+}
+
+impl SecretScanSchema {
+    fn detect(conn: &crate::franken_sync::Connection) -> Result<Self> {
+        let has_export_agent = table_has_column(conn, "conversations", "agent")?;
+        let has_export_workspace = table_has_column(conn, "conversations", "workspace")?;
+        if has_export_agent && has_export_workspace {
+            return Ok(Self::PagesExport);
+        }
+
+        let has_archive_agent = table_has_column(conn, "conversations", "agent_id")?;
+        let has_archive_workspace =
+            table_has_column(conn, "conversations", "workspace_id")?;
+        if has_archive_agent && has_archive_workspace {
+            return Ok(Self::Archive);
+        }
+
+        bail!(
+            "Unsupported secret-scan database schema: conversations must contain either agent/workspace export columns or agent_id/workspace_id archive columns"
+        )
+    }
+
+    fn agent_expression(self) -> &'static str {
+        match self {
+            Self::Archive => "COALESCE(a.slug, 'unknown')",
+            Self::PagesExport => "COALESCE(c.agent, 'unknown')",
+        }
+    }
+
+    fn workspace_expression(self) -> &'static str {
+        match self {
+            Self::Archive => "w.path",
+            Self::PagesExport => "c.workspace",
+        }
+    }
+
+    fn conversation_joins(self) -> &'static str {
+        match self {
+            Self::Archive => {
+                "\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id"
+            }
+            Self::PagesExport => "",
+        }
+    }
+}
+
 fn ensure_secret_scan_running(
     cancellation_requested: &mut impl FnMut(SecretScanCheckpoint) -> bool,
     checkpoint: SecretScanCheckpoint,
@@ -352,6 +413,86 @@ pub fn scan_database<P: AsRef<Path>>(
     })
 }
 
+/// Scan an immutable Pages export and bind the report to its exact bytes.
+///
+/// The digest is checked on both sides of the scan. Any concurrent mutation or
+/// a finding-cap truncation is an error, never an approvable/clean result.
+pub fn scan_staged_export_database<P: AsRef<Path>>(
+    db_path: P,
+    config: &SecretScanConfig,
+) -> Result<StagedSecretScan> {
+    let db_path = db_path.as_ref();
+    ensure_staged_export_has_no_sidecars(db_path, "before verification")?;
+    let digest_before = sha256_file(db_path)?;
+    ensure_staged_export_has_no_sidecars(db_path, "after pre-scan hashing")?;
+    let filters = SecretScanFilters {
+        agents: None,
+        workspaces: None,
+        since_ts: None,
+        until_ts: None,
+    };
+    let report = scan_database(db_path, &filters, config, None, None)?;
+    ensure_staged_export_has_no_sidecars(db_path, "after the secret scan")?;
+    let digest_after = sha256_file(db_path)?;
+    ensure_staged_export_has_no_sidecars(db_path, "after post-scan hashing")?;
+
+    if digest_before != digest_after {
+        bail!(
+            "Staged Pages export changed while its secret scan was running; refusing approval"
+        );
+    }
+    if report.summary.truncated {
+        bail!(
+            "Staged Pages export secret scan reached its finding cap; refusing incomplete approval"
+        );
+    }
+
+    Ok(StagedSecretScan {
+        report,
+        artifact_sha256: digest_after,
+    })
+}
+
+fn ensure_staged_export_has_no_sidecars(db_path: &Path, phase: &str) -> Result<()> {
+    for sidecar_path in sqlite_artifact_paths(db_path)? {
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(_) => {
+                bail!(
+                    "Staged Pages export has SQLite sidecar {} {phase}; refusing a main-file-only artifact attestation",
+                    sidecar_path.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to inspect staged SQLite sidecar {} {phase}",
+                        sidecar_path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open staged export {} for hashing", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("Failed to hash staged export {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 fn scan_database_with_cancel_check<P: AsRef<Path>>(
     db_path: P,
     filters: &SecretScanFilters,
@@ -369,6 +510,41 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
     let conn = super::open_existing_sqlite_db(db_path.as_ref())
         .context("Failed to open database for secret scan")?;
     ensure_secret_scan_running(&mut cancellation_requested, SecretScanCheckpoint::AfterOpen)?;
+    conn.execute("BEGIN TRANSACTION")
+        .context("Failed to start secret-scan read snapshot")?;
+
+    let scan_result = scan_database_snapshot(
+        &conn,
+        filters,
+        config,
+        progress,
+        |checkpoint| cancellation_requested(checkpoint),
+    );
+    let rollback_result = conn
+        .execute("ROLLBACK")
+        .map(|_| ())
+        .context("Failed to close secret-scan read snapshot");
+    match (scan_result, rollback_result) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(scan_error), Ok(())) => Err(scan_error),
+        (Ok(_), Err(rollback_error)) => Err(rollback_error),
+        (Err(scan_error), Err(rollback_error)) => Err(scan_error.context(format!(
+            "secret-scan read-snapshot rollback also failed: {rollback_error:#}"
+        ))),
+    }
+}
+
+/// Read every secret-scan surface from the caller-owned transaction.
+/// High-water marks bound inserts, but the transaction also prevents updates
+/// to already-scanned rows from producing a mixed, false-clean report.
+fn scan_database_snapshot(
+    conn: &crate::franken_sync::Connection,
+    filters: &SecretScanFilters,
+    config: &SecretScanConfig,
+    progress: Option<&ProgressBar>,
+    mut cancellation_requested: impl FnMut(SecretScanCheckpoint) -> bool,
+) -> Result<SecretScanReport> {
+    let schema = SecretScanSchema::detect(conn)?;
 
     let mut findings: Vec<SecretFinding> = Vec::new();
     let mut seen = Vec::new();
@@ -377,20 +553,27 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
     // LEFT JOIN + COALESCE on agents so secret scanning also covers legacy
     // conversations with NULL agent_id — dropping them would hide credential
     // leaks rather than exposing them.
-    let has_metadata_bin = table_has_column(&conn, "conversations", "metadata_bin")?;
+    let has_metadata_bin = table_has_column(conn, "conversations", "metadata_bin")?;
     let metadata_bin_projection = if has_metadata_bin {
         "c.metadata_bin"
     } else {
         "NULL"
     };
-    let (conv_where, conv_params) = build_where_clause(filters)?;
+    let (conv_where, conv_params) = build_where_clause_for_columns(
+        filters,
+        schema.agent_expression(),
+        schema.workspace_expression(),
+    )?;
     ensure_secret_scan_running(
         &mut cancellation_requested,
         SecretScanCheckpoint::BeforeConversationHighWatermark,
     )?;
-    let conv_high_watermark = table_max_id(&conn, "conversations")?;
+    let conv_high_watermark = table_max_id(conn, "conversations")?;
     let conv_select = format!(
-        "SELECT c.id, c.title, c.metadata_json, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {metadata_bin_projection}\n         FROM conversations c\n         LEFT JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id"
+        "SELECT c.id, c.title, c.metadata_json, c.source_path, {}, {}, {metadata_bin_projection}\n         FROM conversations c{}",
+        schema.agent_expression(),
+        schema.workspace_expression(),
+        schema.conversation_joins(),
     );
     let mut last_conv_id = None;
     while !truncated {
@@ -436,6 +619,29 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                 message_id: None,
                 message_idx: None,
             };
+
+            // These provenance fields are part of the exported database too.
+            // Merely redacting them in the diagnostic report would otherwise
+            // allow a credential-bearing path/workspace to yield a false-clean
+            // approval while the original value remains in the payload.
+            for provenance in [
+                ctx.agent.as_deref(),
+                ctx.workspace.as_deref(),
+                ctx.source_path.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                scan_text(
+                    provenance,
+                    SecretLocation::ConversationMetadata,
+                    &ctx,
+                    config,
+                    &mut findings,
+                    &mut seen,
+                    &mut truncated,
+                );
+            }
 
             if let Some(title_text) = title {
                 scan_text(
@@ -497,16 +703,35 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
     )?;
 
     if !truncated {
-        let has_extra_bin = table_has_column(&conn, "messages", "extra_bin")?;
+        let has_extra_json = table_has_column(conn, "messages", "extra_json")?;
+        let extra_json_projection = if has_extra_json { "m.extra_json" } else { "NULL" };
+        let has_extra_bin = table_has_column(conn, "messages", "extra_bin")?;
         let extra_bin_projection = if has_extra_bin { "m.extra_bin" } else { "NULL" };
-        let (msg_where, msg_params) = build_where_clause(filters)?;
+        let has_attachment_refs =
+            table_has_column(conn, "messages", "attachment_refs")?;
+        let attachment_refs_projection =
+            if schema == SecretScanSchema::PagesExport && has_attachment_refs {
+                "m.attachment_refs"
+            } else {
+                "NULL"
+            };
+        let has_model = table_has_column(conn, "messages", "model")?;
+        let model_projection = if has_model { "m.model" } else { "NULL" };
+        let (msg_where, msg_params) = build_where_clause_for_columns(
+            filters,
+            schema.agent_expression(),
+            schema.workspace_expression(),
+        )?;
         ensure_secret_scan_running(
             &mut cancellation_requested,
             SecretScanCheckpoint::BeforeMessageHighWatermark,
         )?;
-        let msg_high_watermark = table_max_id(&conn, "messages")?;
+        let msg_high_watermark = table_max_id(conn, "messages")?;
         let msg_select = format!(
-            "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {extra_bin_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id"
+            "SELECT m.id, m.idx, m.content, {extra_json_projection}, c.id, c.source_path, {}, {}, {extra_bin_projection}, {attachment_refs_projection}, m.role, {model_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id{}",
+            schema.agent_expression(),
+            schema.workspace_expression(),
+            schema.conversation_joins(),
         );
         let mut last_msg_id = None;
         while !truncated {
@@ -543,6 +768,9 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                 let agent_slug: String = row.get_typed(6)?;
                 let workspace_path: Option<String> = row.get_typed(7)?;
                 let extra_bin: Option<Vec<u8>> = row.get_typed(8)?;
+                let attachment_refs: Option<String> = row.get_typed(9)?;
+                let role: String = row.get_typed(10)?;
+                let model: Option<String> = row.get_typed(11)?;
                 last_msg_id = Some(msg_id);
 
                 let ctx = ScanContext {
@@ -563,6 +791,31 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                     &mut seen,
                     &mut truncated,
                 );
+                if let Some(attachment_refs) = attachment_refs.as_deref() {
+                    scan_text(
+                        attachment_refs,
+                        SecretLocation::MessageMetadata,
+                        &ctx,
+                        config,
+                        &mut findings,
+                        &mut seen,
+                        &mut truncated,
+                    );
+                }
+                for metadata_text in [Some(role.as_str()), model.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    scan_text(
+                        metadata_text,
+                        SecretLocation::MessageMetadata,
+                        &ctx,
+                        config,
+                        &mut findings,
+                        &mut seen,
+                        &mut truncated,
+                    );
+                }
                 if let Some(extra) = structured_metadata_scan_text(
                     extra_bin.as_deref(),
                     extra_json.as_deref(),
@@ -612,14 +865,23 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
         SecretScanCheckpoint::AfterMessages,
     )?;
 
-    if !truncated && table_exists(&conn, "snippets")? {
-        let (snip_where, snip_params) = build_where_clause(filters)?;
+    if !truncated && table_exists(conn, "snippets")? {
+        let (snip_where, snip_params) = build_where_clause_for_columns(
+            filters,
+            schema.agent_expression(),
+            schema.workspace_expression(),
+        )?;
         ensure_secret_scan_running(
             &mut cancellation_requested,
             SecretScanCheckpoint::BeforeSnippetHighWatermark,
         )?;
-        let snip_high_watermark = table_max_id(&conn, "snippets")?;
-        let snip_select = "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id";
+        let snip_high_watermark = table_max_id(conn, "snippets")?;
+        let snip_select = format!(
+            "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, {}, {}, s.file_path, s.language\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id{}",
+            schema.agent_expression(),
+            schema.workspace_expression(),
+            schema.conversation_joins(),
+        );
         let mut last_snippet_id = None;
         while !truncated {
             ensure_secret_scan_running(
@@ -654,6 +916,8 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                 let source_path: String = row.get_typed(5)?;
                 let agent_slug: String = row.get_typed(6)?;
                 let workspace_path: Option<String> = row.get_typed(7)?;
+                let snippet_file_path: Option<String> = row.get_typed(8)?;
+                let snippet_language: Option<String> = row.get_typed(9)?;
                 last_snippet_id = Some(snippet_id);
 
                 let ctx = ScanContext {
@@ -674,6 +938,28 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                     &mut seen,
                     &mut truncated,
                 );
+                if let Some(snippet_file_path) = snippet_file_path.as_deref() {
+                    scan_text(
+                        snippet_file_path,
+                        SecretLocation::MessageMetadata,
+                        &ctx,
+                        config,
+                        &mut findings,
+                        &mut seen,
+                        &mut truncated,
+                    );
+                }
+                if let Some(snippet_language) = snippet_language.as_deref() {
+                    scan_text(
+                        snippet_language,
+                        SecretLocation::MessageMetadata,
+                        &ctx,
+                        config,
+                        &mut findings,
+                        &mut seen,
+                        &mut truncated,
+                    );
+                }
 
                 if truncated {
                     break;
@@ -1606,7 +1892,25 @@ fn is_fully_allowlisted(value: &str, config: &SecretScanConfig) -> bool {
     })
 }
 
+#[cfg(test)]
 fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamValue>)> {
+    build_where_clause_for_columns(filters, "COALESCE(a.slug, 'unknown')", "w.path")
+}
+
+fn build_where_clause_for_columns(
+    filters: &SecretScanFilters,
+    agent_expression: &str,
+    workspace_expression: &str,
+) -> Result<(String, Vec<ParamValue>)> {
+    for expression in [agent_expression, workspace_expression] {
+        if !expression.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '_' | '.' | '(' | ')' | ',' | '\'' | ' ')
+        }) {
+            bail!("Invalid SQLite expression while building secret-scan filters");
+        }
+    }
+
     let mut conditions: Vec<String> = Vec::new();
     let mut params: Vec<ParamValue> = Vec::new();
 
@@ -1616,7 +1920,7 @@ fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamV
         } else {
             let placeholders: Vec<&str> = agents.iter().map(|_| "?").collect();
             conditions.push(format!(
-                "COALESCE(a.slug, 'unknown') IN ({})",
+                "{agent_expression} IN ({})",
                 placeholders.join(", ")
             ));
             for agent in agents {
@@ -1630,7 +1934,10 @@ fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamV
             conditions.push("1=0".to_string());
         } else {
             let placeholders: Vec<&str> = workspaces.iter().map(|_| "?").collect();
-            conditions.push(format!("w.path IN ({})", placeholders.join(", ")));
+            conditions.push(format!(
+                "{workspace_expression} IN ({})",
+                placeholders.join(", ")
+            ));
             for ws in workspaces {
                 params.push(ParamValue::from(ws.to_string_lossy().to_string()));
             }
@@ -2015,6 +2322,168 @@ mod tests {
     }
 
     #[test]
+    fn staged_export_scan_reads_flat_pages_schema_and_binds_digest() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("export.db");
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent TEXT NOT NULL,
+                workspace TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                started_at INTEGER,
+                ended_at INTEGER,
+                message_count INTEGER,
+                metadata_json TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER,
+                updated_at INTEGER,
+                model TEXT,
+                attachment_refs TEXT
+            );
+            CREATE TABLE snippets (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                file_path TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                language TEXT,
+                snippet_text TEXT
+            );
+            INSERT INTO conversations (
+                id, agent, workspace, title, source_path, started_at,
+                message_count, metadata_json
+            ) VALUES (
+                1, 'codex', '/tmp/project', 'safe title',
+                'session.jsonl', 1700000000000, 2, '{}'
+            );
+            INSERT INTO messages (
+                id, conversation_id, idx, role, content, created_at
+            ) VALUES (
+                7, 1, 0, 'user', 'credential AKIAIOSFODNN7EXAMPLE',
+                1700000000000
+            );
+            INSERT INTO messages (
+                id, conversation_id, idx, role, content, created_at, model,
+                attachment_refs
+            ) VALUES (
+                8, 1, 1, 'assistant', 'safe content', 1700000000001,
+                'safe safe safe safe safe safe safe safe safe safe AUX_MODEL_CREDENTIAL',
+                'AUX_ATTACHMENT_CREDENTIAL'
+            );
+            INSERT INTO snippets (
+                id, message_id, file_path, language, snippet_text
+            ) VALUES (
+                9, 8,
+                'safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe AUX_PATH_CREDENTIAL',
+                'safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe AUX_LANGUAGE_CREDENTIAL',
+                'safe snippet'
+            );
+            "#,
+        )?;
+        drop(conn);
+
+        let config = SecretScanConfig::from_inputs_with_env(
+            &[],
+            &["AUX_(?:MODEL|ATTACHMENT|PATH|LANGUAGE)_CREDENTIAL".to_string()],
+            false,
+        )?;
+        let attestation = scan_staged_export_database(&db_path, &config)?;
+
+        assert_eq!(attestation.artifact_sha256.len(), 64);
+        assert!(!attestation.report.summary.truncated);
+        let finding = attestation
+            .report
+            .findings
+            .iter()
+            .find(|finding| finding.kind == "aws_access_key_id")
+            .expect("message content credential must be detected");
+        assert_eq!(finding.agent.as_deref(), Some("codex"));
+        assert_eq!(finding.workspace.as_deref(), Some("/tmp/project"));
+        assert_eq!(finding.message_id, Some(7));
+        let auxiliary_findings: Vec<_> = attestation
+            .report
+            .findings
+            .iter()
+            .filter(|finding| finding.pattern == CUSTOM_DENYLIST_PATTERN_ID)
+            .collect();
+        assert_eq!(
+            auxiliary_findings.len(),
+            4,
+            "model, attachment, snippet path, and snippet language must all be scanned"
+        );
+        assert!(auxiliary_findings.iter().all(|finding| {
+            finding.message_id == Some(8) && finding.location == SecretLocation::MessageMetadata
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn staged_export_scan_rejects_unbound_sqlite_sidecars() -> Result<()> {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        let artifact_paths = sqlite_fixed_artifact_paths(Path::new("export.db"));
+        for relative_path in artifact_paths {
+            let temp = tempfile::tempdir()?;
+            let db_path = temp.path().join("export.db");
+            let sentinel_path = temp.path().join(relative_path);
+            let artifact_label = sentinel_path.display().to_string();
+            std::fs::write(&db_path, b"main-file sentinel")?;
+            std::fs::write(&sentinel_path, b"unbound sidecar sentinel")?;
+
+            let error = scan_staged_export_database(&db_path, &config)
+                .expect_err("a main-file digest must not attest an unbound SQLite sidecar");
+            let diagnostic = format!("{error:#}");
+            assert!(
+                diagnostic.contains(&artifact_label),
+                "diagnostic omitted rejected artifact {artifact_label}: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("main-file-only artifact attestation"),
+                "unexpected error for {artifact_label}: {diagnostic}"
+            );
+            assert_eq!(
+                std::fs::read(&sentinel_path)?,
+                b"unbound sidecar sentinel",
+                "attestation rejection mutated sentinel {artifact_label}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn staged_export_scan_rejects_parallel_wal_segments_without_mutation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("export.db");
+        let segment_path = temp.path().join("export.db-wal-seg-not-an-epoch");
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        std::fs::write(&db_path, b"main-file sentinel")?;
+        std::fs::write(&segment_path, b"parallel WAL segment sentinel")?;
+
+        let error = scan_staged_export_database(&db_path, &config)
+            .expect_err("an unbound parallel WAL segment must block attestation");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains(&segment_path.display().to_string()),
+            "diagnostic omitted rejected WAL segment: {diagnostic}"
+        );
+        assert_eq!(std::fs::read(&db_path)?, b"main-file sentinel");
+        assert_eq!(
+            std::fs::read(&segment_path)?,
+            b"parallel WAL segment sentinel"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn cancellation_at_conversation_page_boundary_stops_before_message_schema() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let db_path = temp.path().join("scan.db");
@@ -2069,6 +2538,88 @@ mod tests {
             error.to_string().contains("Secret scan cancelled"),
             "the missing messages table must never be probed after cancellation: {error:#}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn database_scan_uses_one_snapshot_across_all_payload_surfaces() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("scan.db");
+        let setup = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
+        setup.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent TEXT NOT NULL,
+                workspace TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                metadata_json TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL
+            );
+            INSERT INTO conversations (
+                id, agent, workspace, title, source_path, metadata_json
+            ) VALUES (
+                1, 'codex', '/tmp/project', 'ordinary title',
+                '/tmp/project/session.jsonl', '{}'
+            );
+            INSERT INTO messages (id, conversation_id, idx, role, content)
+            VALUES (7, 1, 0, 'user', 'ordinary message');
+            "#,
+        )?;
+        drop(setup);
+
+        let writer = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
+        let mutation_committed = std::cell::Cell::new(false);
+        let filters = SecretScanFilters {
+            agents: None,
+            workspaces: None,
+            since_ts: None,
+            until_ts: None,
+        };
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+
+        let report = scan_database_with_cancel_check(
+            &db_path,
+            &filters,
+            &config,
+            None,
+            |checkpoint| {
+                if checkpoint == SecretScanCheckpoint::BeforeMessagePage
+                    && !mutation_committed.get()
+                {
+                    writer
+                        .execute(
+                            "UPDATE messages SET content = 'credential AKIAIOSFODNN7EXAMPLE' WHERE id = 7",
+                        )
+                        .expect("concurrent WAL update must commit during the scan");
+                    mutation_committed.set(true);
+                }
+                false
+            },
+        )?;
+
+        assert!(
+            mutation_committed.get(),
+            "the test must mutate the database after the scan snapshot is established"
+        );
+        assert_eq!(
+            report.summary.total, 0,
+            "one scan must not combine pre-update conversations with post-update messages"
+        );
+        let live_content: String = writer.query_row_map(
+            "SELECT content FROM messages WHERE id = 7",
+            params![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(live_content, "credential AKIAIOSFODNN7EXAMPLE");
         Ok(())
     }
 

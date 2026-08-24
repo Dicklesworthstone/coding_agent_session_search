@@ -47,6 +47,8 @@ pub struct GeneratedDoc {
 /// Configuration for documentation generation.
 #[derive(Debug, Clone, Default)]
 pub struct DocConfig {
+    /// Whether the published payload requires decryption before it can be read.
+    pub archive_mode: ArchiveMode,
     /// Target URL where the archive will be hosted.
     pub target_url: Option<String>,
     /// Repository URL for CASS source.
@@ -59,10 +61,21 @@ pub struct DocConfig {
     pub argon_parallelism: u32,
 }
 
+/// Security mode of the generated public archive documentation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ArchiveMode {
+    /// The payload is protected by the configured encryption key slots.
+    #[default]
+    Encrypted,
+    /// The SQLite payload is intentionally published as plaintext.
+    Unencrypted,
+}
+
 impl DocConfig {
     /// Create a new DocConfig with default CASS repo URL.
     pub fn new() -> Self {
         Self {
+            archive_mode: ArchiveMode::Encrypted,
             target_url: None,
             cass_repo_url: "https://github.com/Dicklesworthstone/coding_agent_session_search"
                 .to_string(),
@@ -75,6 +88,12 @@ impl DocConfig {
     /// Set the target URL.
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
         self.target_url = Some(url.into());
+        self
+    }
+
+    /// Describe the security mode of the payload these documents accompany.
+    pub fn with_archive_mode(mut self, archive_mode: ArchiveMode) -> Self {
+        self.archive_mode = archive_mode;
         self
     }
 
@@ -142,7 +161,11 @@ impl DocumentationGenerator {
         let slot_count = self.summary.key_slots.len();
         let date = Utc::now().format(DOC_DATE_FORMAT);
 
-        let content = README_TEMPLATE
+        let template = match self.config.archive_mode {
+            ArchiveMode::Encrypted => README_TEMPLATE,
+            ArchiveMode::Unencrypted => UNENCRYPTED_README_TEMPLATE,
+        };
+        let content = template
             .replace("{url}", url_display)
             .replace(
                 "{conversation_count}",
@@ -165,6 +188,16 @@ impl DocumentationGenerator {
 
     /// Generate SECURITY.md with threat model documentation.
     pub fn generate_security_doc(&self) -> GeneratedDoc {
+        if self.config.archive_mode == ArchiveMode::Unencrypted {
+            return GeneratedDoc {
+                filename: "SECURITY.md".to_string(),
+                content: UNENCRYPTED_SECURITY_TEMPLATE
+                    .replace("{repo_url}", &self.config.cass_repo_url)
+                    .replace("{version}", CASS_VERSION),
+                location: DocLocation::RepoRoot,
+            };
+        }
+
         let slot_descriptions = self
             .summary
             .key_slots
@@ -217,13 +250,25 @@ impl DocumentationGenerator {
     pub fn generate_help_html(&self) -> GeneratedDoc {
         GeneratedDoc {
             filename: "help.html".to_string(),
-            content: HELP_HTML_TEMPLATE.to_string(),
+            content: match self.config.archive_mode {
+                ArchiveMode::Encrypted => HELP_HTML_TEMPLATE,
+                ArchiveMode::Unencrypted => UNENCRYPTED_HELP_HTML_TEMPLATE,
+            }
+            .to_string(),
             location: DocLocation::WebRoot,
         }
     }
 
     /// Generate recovery.html with password recovery instructions.
     pub fn generate_recovery_html(&self) -> GeneratedDoc {
+        if self.config.archive_mode == ArchiveMode::Unencrypted {
+            return GeneratedDoc {
+                filename: "recovery.html".to_string(),
+                content: UNENCRYPTED_RECOVERY_HTML_TEMPLATE.to_string(),
+                location: DocLocation::WebRoot,
+            };
+        }
+
         let has_recovery_slot = self
             .summary
             .key_slots
@@ -252,7 +297,11 @@ impl DocumentationGenerator {
         let conversation_count = self.summary.total_conversations.to_string();
         let date = Utc::now().format(DOC_DATE_FORMAT);
 
-        let content = ABOUT_TXT_TEMPLATE
+        let template = match self.config.archive_mode {
+            ArchiveMode::Encrypted => ABOUT_TXT_TEMPLATE,
+            ArchiveMode::Unencrypted => UNENCRYPTED_ABOUT_TXT_TEMPLATE,
+        };
+        let content = template
             .replace("{url}", url_display)
             .replace("{conversation_count}", &conversation_count)
             .replace("{date}", &date.to_string())
@@ -708,6 +757,97 @@ Created: {date}
 Version: CASS v{version}
 "#;
 
+const UNENCRYPTED_README_TEMPLATE: &str = r#"# Unencrypted Coding Session Archive
+
+> **Warning:** This archive is not encrypted. Anyone who can access the hosted
+> files can read and download every included conversation without a password.
+
+Open the web viewer: [{url}]({url})
+
+## What This Contains
+
+This archive includes {conversation_count} conversations from the following sources:
+{agent_list}
+
+Date range: {start_date} to {end_date}
+
+## Access
+
+No password, recovery key, or decryption step is required. Host this archive
+only where public plaintext access is intentional.
+
+For the security implications, see [SECURITY.md](SECURITY.md).
+
+---
+Generated by CASS v{version} on {date}
+"#;
+
+const UNENCRYPTED_SECURITY_TEMPLATE: &str = r#"# Security Model: Unencrypted Archive
+
+## Warning
+
+This archive is **not encrypted**. Its SQLite payload is published as plaintext,
+so the hosting provider and anyone who can fetch the site can read all included
+conversation content. There is no password or recovery-key access control.
+
+Use transport security and hosting access controls where available, but do not
+treat either as payload encryption. Remove the published files if this exposure
+was not intended, then create a new encrypted export.
+
+For security issues with CASS, see {repo_url}/security.
+
+---
+Generated by CASS v{version}
+"#;
+
+const UNENCRYPTED_HELP_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Help - Unencrypted CASS Archive</title>
+</head>
+<body>
+    <h1>Unencrypted Archive Help</h1>
+    <p><strong>Warning:</strong> this archive is not encrypted. No password is required, and anyone with access to these files can read the included conversations.</p>
+    <p>Use the search box to find conversations, select a result to open it, and use the browser's navigation controls to return to the archive.</p>
+    <p>Host these files only where plaintext access is intentional.</p>
+    <a href="./">Back to Archive</a>
+</body>
+</html>
+"#;
+
+const UNENCRYPTED_RECOVERY_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Access - Unencrypted CASS Archive</title>
+</head>
+<body>
+    <h1>No Recovery Key Is Needed</h1>
+    <p>This archive is not encrypted, so it has no archive password or recovery key. Anyone who can access the hosted files can read the included conversations.</p>
+    <a href="./">Back to Archive</a>
+</body>
+</html>
+"#;
+
+const UNENCRYPTED_ABOUT_TXT_TEMPLATE: &str = r#"UNENCRYPTED CODING SESSION ARCHIVE
+==================================
+
+WARNING: This archive is not encrypted. Anyone who can access the hosted files
+can read and download all included conversation content without a password.
+
+This archive contains {conversation_count} conversations.
+Open the web viewer at: {url}
+
+Host these files only where plaintext access is intentional.
+
+---
+Created: {date}
+Version: CASS v{version}
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,12 +1058,44 @@ mod tests {
     fn test_doc_config_builder() {
         let config = DocConfig::new()
             .with_url("https://example.com")
-            .with_argon_params(65536, 3, 4);
+            .with_argon_params(65536, 3, 4)
+            .with_archive_mode(ArchiveMode::Unencrypted);
 
         assert_eq!(config.target_url, Some("https://example.com".to_string()));
         assert_eq!(config.argon_memory_kb, 65536);
         assert_eq!(config.argon_iterations, 3);
         assert_eq!(config.argon_parallelism, 4);
+        assert_eq!(config.archive_mode, ArchiveMode::Unencrypted);
+    }
+
+    #[test]
+    fn unencrypted_docs_never_claim_encrypted_or_password_gated_access() {
+        let config = DocConfig::new()
+            .with_url("https://example.com/public-archive")
+            .with_archive_mode(ArchiveMode::Unencrypted);
+        let generator = DocumentationGenerator::new(config, create_test_summary());
+
+        for doc in generator.generate_all() {
+            let lower = doc.content.to_ascii_lowercase();
+            assert!(
+                lower.contains("not encrypted"),
+                "{} must explicitly disclose plaintext access",
+                doc.filename
+            );
+            for false_claim in [
+                "AES-256-GCM",
+                "Argon2id",
+                "Enter the password",
+                "correct password",
+                "protected with",
+            ] {
+                assert!(
+                    !doc.content.contains(false_claim),
+                    "{} retained encrypted-mode claim {false_claim:?}",
+                    doc.filename
+                );
+            }
+        }
     }
 
     #[test]

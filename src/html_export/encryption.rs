@@ -130,8 +130,8 @@ pub fn encrypt_content(
     // Generate random salt and IV
     let mut salt = vec![0u8; params.salt_len];
     let mut iv = vec![0u8; params.iv_len];
-    fill_encryption_random("salt", &mut salt);
-    fill_encryption_random("iv", &mut iv);
+    fill_encryption_random(&mut salt);
+    fill_encryption_random(&mut iv);
 
     let derive_started = Instant::now();
     // Derive key using PBKDF2-SHA256
@@ -183,48 +183,13 @@ pub fn encrypt_content(
 
 /// Fill encryption entropy for salt/IV generation.
 #[cfg(feature = "encryption")]
-fn fill_encryption_random(label: &str, output: &mut [u8]) {
-    if let Some(bytes) = deterministic_test_bytes(label, output.len()) {
-        output.copy_from_slice(&bytes);
-        return;
-    }
-
+fn fill_encryption_random(output: &mut [u8]) {
     // Same CSPRNG the export key/nonce generators use (`rand::rng()` is
     // reseeded from the OS); aes-gcm 0.11 no longer re-exports `OsRng`.
+    // This must never be replaceable through runtime configuration: repeating
+    // an AES-GCM nonce under the same derived key breaks confidentiality.
     use rand::Rng;
     rand::rng().fill_bytes(output);
-}
-
-/// Deterministic bytes for debug/test golden generation only.
-#[cfg(feature = "encryption")]
-fn deterministic_test_bytes(entropy_label: &str, len: usize) -> Option<Vec<u8>> {
-    #[cfg(debug_assertions)]
-    {
-        let golden_label = dotenvy::var("CASS_HTML_EXPORT_GOLDEN_BYTES_LABEL").ok()?;
-        if golden_label.is_empty() {
-            return None;
-        }
-
-        let mut out = Vec::with_capacity(len);
-        let mut counter = 0u64;
-        while out.len() < len {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"cass-html-export-deterministic-encryption-v1");
-            hasher.update(golden_label.as_bytes());
-            hasher.update(entropy_label.as_bytes());
-            hasher.update(&counter.to_le_bytes());
-            out.extend_from_slice(hasher.finalize().as_bytes());
-            counter += 1;
-        }
-        out.truncate(len);
-        Some(out)
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = (entropy_label, len);
-        None
-    }
 }
 
 /// Placeholder encrypt function when encryption feature is disabled.

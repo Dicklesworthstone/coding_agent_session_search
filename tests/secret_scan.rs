@@ -53,6 +53,7 @@ mod tests {
                 conversation_id INTEGER NOT NULL,
                 idx INTEGER NOT NULL,
                 content TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
                 extra_json TEXT
             );
             "#,
@@ -108,6 +109,7 @@ mod tests {
                 conversation_id INTEGER NOT NULL,
                 idx INTEGER NOT NULL,
                 content TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
                 extra_json TEXT
             );
             "#,
@@ -171,6 +173,7 @@ mod tests {
                 conversation_id INTEGER NOT NULL,
                 idx INTEGER NOT NULL,
                 content TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
                 extra_json TEXT,
                 extra_bin BLOB
             );
@@ -223,6 +226,7 @@ mod tests {
                 conversation_id INTEGER NOT NULL,
                 idx INTEGER NOT NULL,
                 content TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
                 extra_json TEXT
             );
             "#,
@@ -664,7 +668,12 @@ mod tests {
         let report = scan(&db_path)?;
         assert!(
             report.findings.iter().any(|f| f.kind == "generic_api_key"),
-            "should detect generic API key"
+            "should detect generic API key; got: {:?}",
+            report
+                .findings
+                .iter()
+                .map(|f| (f.kind.clone(), f.severity))
+                .collect::<Vec<_>>()
         );
         let finding = report
             .findings
@@ -1071,8 +1080,8 @@ mod tests {
     fn legacy_json_detects_short_sensitive_fields() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        let metadata = serde_json::json!({ "pin": ["12", "34"].concat() }).to_string();
-        let extra = serde_json::json!({ "cookie": ["s", "id"].concat() }).to_string();
+        let metadata = serde_json::json!({ "pin": (["12", "34"].concat()) }).to_string();
+        let extra = serde_json::json!({ "cookie": (["s", "id"].concat()) }).to_string();
         let messages = [(0, "safe content", Some(extra.as_str()))];
         setup_db_full(
             &db_path,
@@ -1278,6 +1287,7 @@ mod tests {
                 conversation_id INTEGER NOT NULL,
                 idx INTEGER NOT NULL,
                 content TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
                 extra_json TEXT
             );
             CREATE TABLE snippets (
@@ -1506,7 +1516,8 @@ mod tests {
             );
             CREATE TABLE messages (
                 id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL,
-                idx INTEGER NOT NULL, content TEXT NOT NULL, extra_json TEXT
+                idx INTEGER NOT NULL, content TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user', extra_json TEXT
             );
             "#,
         )?;

@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
@@ -63,8 +65,102 @@ const PAGES_ASSETS: &[(&str, &[u8])] = &[
     ("settings.js", include_bytes!("../pages_assets/settings.js")),
 ];
 
+/// Immutable third-party runtime files embedded in every Pages bundle.
+///
+/// These are exact bytes from the upstream releases recorded in
+/// `pages_assets/vendor/manifest.json`. Keep the byte include, size, SHA-256,
+/// manifest record, and license in lockstep when updating a dependency.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PinnedVendorAsset {
+    pub path: &'static str,
+    pub bytes: &'static [u8],
+    pub size: u64,
+    pub sha256: &'static str,
+}
+
+macro_rules! pinned_vendor_asset {
+    ($path:literal, $size:literal, $sha256:literal) => {
+        PinnedVendorAsset {
+            path: concat!("vendor/", $path),
+            bytes: include_bytes!(concat!("../pages_assets/vendor/", $path)),
+            size: $size,
+            sha256: $sha256,
+        }
+    };
+}
+
+pub(crate) const PAGES_VENDOR_ASSETS: &[PinnedVendorAsset] = &[
+    pinned_vendor_asset!(
+        "sqlite3.mjs",
+        578_559,
+        "f80870f0fa03a39a3338d17ed3fbea04808d344c88e724d90d5f37b9b7b83154"
+    ),
+    pinned_vendor_asset!(
+        "sqlite3.wasm",
+        864_752,
+        "02d7e48164395fa68f81c6ec33e9da5461be397dc57602ac0cd89b4bbba1d312"
+    ),
+    pinned_vendor_asset!(
+        "sqlite3-opfs-async-proxy.js",
+        32_289,
+        "502762db7bd24130f345df6a42883166ec0a91815207940328c9739bb0f5ec2f"
+    ),
+    pinned_vendor_asset!(
+        "argon2.js",
+        11_835,
+        "ecfe330a8f3c6d491b92197391088f117ab13ad13c784cb01235a1afb5757a3b"
+    ),
+    pinned_vendor_asset!(
+        "argon2-wasm.js",
+        14_215,
+        "cdb6ef704dbc287ffa0056376d9af297c8691ddeb985f9137b96fc9b0ddea8b0"
+    ),
+    pinned_vendor_asset!(
+        "argon2.wasm",
+        25_725,
+        "0c2149886c13e4eae4a6ca25ee71d47423c5c8740a874cf04ff816d1b2c901d7"
+    ),
+    pinned_vendor_asset!(
+        "fflate.js",
+        33_044,
+        "462ef8041fc970e3615a20a9dd2b2e3047a073b2da729ef4f02b634bba8b7b83"
+    ),
+    pinned_vendor_asset!(
+        "html5-qrcode.min.js",
+        375_364,
+        "660b12437b1d747e3e68b8be0685c08cb728140110ad213f167b14b66f8b1d8e"
+    ),
+    pinned_vendor_asset!(
+        "LICENSE-sqlite-wasm.txt",
+        11_358,
+        "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    ),
+    pinned_vendor_asset!(
+        "LICENSE-argon2-browser.txt",
+        1_058,
+        "524a1d77701975a063a590424637abbd7fa519042a113f2bbe2eaf4cde76296d"
+    ),
+    pinned_vendor_asset!(
+        "LICENSE-fflate.txt",
+        1_069,
+        "0a1df3a083d0c010560aa342e87959c8c1070e6fd54545741f083f22d0c8b551"
+    ),
+    pinned_vendor_asset!(
+        "LICENSE-html5-qrcode.txt",
+        11_361,
+        "306bc450da41244fefb92fec6fba30f27afb9d9b0eaa72b96372c23e2338c612"
+    ),
+    pinned_vendor_asset!(
+        "manifest.json",
+        4_802,
+        "bd7571df7a9ddd1553c398474b4f69f2ab64ea8f2f887fe85f14c8518c1c44bb"
+    ),
+];
+
 const MASTER_KEY_BACKUP_NOTE: &str =
     "This file contains the wrapped DEK. Keep it with your recovery secret.";
+const BUNDLE_PUBLISH_MARKER_NAME: &str = ".cass-pages-publish-in-progress-v1";
+const BUNDLE_PUBLISH_MARKER_CONTENT: &[u8] = b"cass-pages-publish-in-progress-v1\n";
 
 /// Integrity entry for a single file
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +298,10 @@ impl BundleBuilder {
         let encrypted_dir = encrypted_dir.as_ref();
         let output_dir = output_dir.as_ref();
 
+        // Heal an interrupted fallback publish before doing potentially long
+        // archive validation/copying work, so a parked prior generation is
+        // returned to the live handle as soon as the next build starts.
+        recover_interrupted_bundle_publish(output_dir)?;
         ensure_replaceable_bundle_output_dir(output_dir)?;
 
         // Validate encrypted_dir has required files
@@ -220,20 +320,33 @@ impl BundleBuilder {
             let file = File::open(&config_path).context("Failed to open config.json")?;
             serde_json::from_reader(BufReader::new(file))?
         };
+        if self.config.generate_qr {
+            if self.config.recovery_secret.is_none() {
+                bail!(
+                    "QR recovery artifacts were requested, but no recovery secret is available; enable recovery-secret generation or disable QR generation"
+                );
+            }
+            if archive_config.as_encrypted().is_none() {
+                bail!(
+                    "QR recovery artifacts were requested for an unencrypted archive, which has no recovery-key slot; disable QR generation"
+                );
+            }
+        }
 
         let temp_output_dir = unique_bundle_dir(output_dir, "tmp")?;
         let final_site_dir = output_dir.join("site");
         let final_private_dir = output_dir.join("private");
-        let mut replace_attempted = false;
+        let mut retain_temp_on_replace_error = false;
         let result = (|| -> Result<BundleResult> {
             progress("setup", "Creating directory structure...");
 
             // Stage the bundle under a unique temp root so reruns do not retain stale files.
+            create_bundle_staging_root(&temp_output_dir)?;
             let site_dir = temp_output_dir.join("site");
             let private_dir = temp_output_dir.join("private");
 
             fs::create_dir_all(&site_dir).context("Failed to create site/ directory")?;
-            fs::create_dir_all(&private_dir).context("Failed to create private/ directory")?;
+            ensure_private_artifact_dir(&private_dir)?;
 
             // Create site subdirectories
             let site_payload_dir = site_dir.join("payload");
@@ -247,6 +360,7 @@ impl BundleBuilder {
                 fs::write(&dest_path, content)
                     .with_context(|| format!("Failed to write {}", name))?;
             }
+            write_pinned_vendor_assets(&site_dir)?;
 
             if let Some(status) = &self.config.analytics_status {
                 let status_json = serde_json::to_vec_pretty(status)
@@ -366,10 +480,14 @@ impl BundleBuilder {
                 write_private_unencrypted_notice(&private_dir)?;
             }
 
+            prepare_bundle_root_for_publish(&temp_output_dir)?;
             sync_tree(&temp_output_dir)?;
-            replace_attempted = true;
-            replace_dir_from_temp(&temp_output_dir, output_dir)
-                .context("Failed to install completed bundle")?;
+            replace_dir_from_temp(
+                &temp_output_dir,
+                output_dir,
+                &mut retain_temp_on_replace_error,
+            )
+            .context("Failed to install completed bundle")?;
 
             progress("complete", "Bundle complete!");
 
@@ -383,11 +501,65 @@ impl BundleBuilder {
             })
         })();
 
-        if result.is_err() && !replace_attempted {
-            let _ = fs::remove_dir_all(&temp_output_dir);
+        match result {
+            Err(build_error) if !retain_temp_on_replace_error => {
+                match cleanup_rejected_bundle_temp(&temp_output_dir) {
+                    Ok(()) => Err(build_error),
+                    Err(cleanup_error) => Err(build_error.context(format!(
+                        "failed to remove rejected staged bundle: {cleanup_error:#}"
+                    ))),
+                }
+            }
+            other => other,
         }
+    }
+}
 
-        result
+fn create_bundle_staging_root(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed creating bundle staging parent {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    #[cfg(unix)]
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path).with_context(|| {
+            format!("failed creating private bundle staging root {}", path.display())
+        })?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!("failed securing bundle staging root {}", path.display())
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path).with_context(|| {
+            format!("failed creating bundle staging root {}", path.display())
+        })?;
+    }
+    Ok(())
+}
+
+fn prepare_bundle_root_for_publish(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("failed setting bundle root permissions on {}", path.display()))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn cleanup_rejected_bundle_temp(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed removing staged bundle {}", path.display())),
     }
 }
 
@@ -395,8 +567,102 @@ fn unique_bundle_dir(path: &Path, suffix: &str) -> Result<PathBuf> {
     unique_bundle_sidecar_path(path, suffix, "pages_bundle")
 }
 
-fn unique_bundle_backup_dir(path: &Path) -> Result<PathBuf> {
-    unique_bundle_sidecar_path(path, "bak", "pages_bundle")
+fn bundle_publish_in_progress_backup_path(path: &Path) -> PathBuf {
+    let mut backup_name = std::ffi::OsString::from(".");
+    backup_name.push(
+        path.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("pages_bundle")),
+    );
+    backup_name.push(".publish-in-progress.bak");
+    path.with_file_name(backup_name)
+}
+
+fn bundle_publish_marker_path(bundle_dir: &Path) -> PathBuf {
+    bundle_dir.join(BUNDLE_PUBLISH_MARKER_NAME)
+}
+
+fn bundle_publish_marker_exists(bundle_dir: &Path) -> Result<bool> {
+    let marker_path = bundle_publish_marker_path(bundle_dir);
+    match fs::symlink_metadata(&marker_path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "bundle publish marker must not be a symlink: {}",
+                    marker_path.display()
+                );
+            }
+            if !file_type.is_file() {
+                bail!(
+                    "bundle publish marker must be a regular file: {}",
+                    marker_path.display()
+                );
+            }
+            let maximum_marker_bytes = u64::try_from(
+                BUNDLE_PUBLISH_MARKER_CONTENT.len().saturating_add(1),
+            )
+            .unwrap_or(u64::MAX);
+            let mut contents = Vec::with_capacity(BUNDLE_PUBLISH_MARKER_CONTENT.len());
+            File::open(&marker_path)
+                .with_context(|| {
+                    format!("failed opening bundle publish marker {}", marker_path.display())
+                })?
+                .take(maximum_marker_bytes)
+                .read_to_end(&mut contents)
+                .with_context(|| {
+                    format!("failed reading bundle publish marker {}", marker_path.display())
+                })?;
+            if contents != BUNDLE_PUBLISH_MARKER_CONTENT {
+                bail!(
+                    "bundle publish marker has unrecognized contents and will not be trusted: {}",
+                    marker_path.display()
+                );
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed inspecting bundle publish marker {}",
+                marker_path.display()
+            )
+        }),
+    }
+}
+
+fn write_bundle_publish_marker(bundle_dir: &Path) -> Result<()> {
+    let marker_path = bundle_publish_marker_path(bundle_dir);
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+        .with_context(|| {
+            format!(
+                "failed creating bundle publish marker {}",
+                marker_path.display()
+            )
+        })?;
+    marker
+        .write_all(BUNDLE_PUBLISH_MARKER_CONTENT)
+        .with_context(|| format!("failed writing bundle publish marker {}", marker_path.display()))?;
+    marker
+        .sync_all()
+        .with_context(|| format!("failed syncing bundle publish marker {}", marker_path.display()))?;
+    sync_parent_directory(&marker_path)
+}
+
+fn remove_bundle_publish_marker(bundle_dir: &Path) -> Result<()> {
+    if !bundle_publish_marker_exists(bundle_dir)? {
+        return Ok(());
+    }
+    let marker_path = bundle_publish_marker_path(bundle_dir);
+    fs::remove_file(&marker_path).with_context(|| {
+        format!(
+            "failed removing completed bundle publish marker {}",
+            marker_path.display()
+        )
+    })?;
+    sync_parent_directory(&marker_path)
 }
 
 fn unique_bundle_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> Result<PathBuf> {
@@ -421,28 +687,30 @@ fn bundle_sidecar_random_nonce() -> Result<u128> {
 }
 
 fn ensure_replaceable_bundle_output_dir(path: &Path) -> Result<bool> {
-    ensure_existing_parent_ancestors_are_real_dirs(path, "bundle output path")?;
+    ensure_bundle_directory_entry(path, "bundle output path")
+}
+
+fn ensure_bundle_directory_entry(path: &Path, label: &str) -> Result<bool> {
+    ensure_existing_parent_ancestors_are_real_dirs(path, label)?;
 
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             let file_type = metadata.file_type();
             if file_type.is_symlink() {
-                bail!(
-                    "bundle output path must not be a symlink: {}",
-                    path.display()
-                );
+                bail!("{label} must not be a symlink: {}", path.display());
             }
             if !file_type.is_dir() {
                 bail!(
-                    "bundle output path points to a file, expected a directory: {}",
+                    "{label} points to a file, expected a directory: {}",
                     path.display()
                 );
             }
             Ok(true)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err)
-            .with_context(|| format!("failed inspecting bundle output path {}", path.display())),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed inspecting {label} {}", path.display()))
+        }
     }
 }
 
@@ -501,7 +769,17 @@ fn is_allowed_system_symlink_ancestor(_path: &Path) -> bool {
     false
 }
 
-fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
+fn replace_dir_from_temp(
+    temp_dir: &Path,
+    final_dir: &Path,
+    retain_temp_on_error: &mut bool,
+) -> Result<()> {
+    *retain_temp_on_error = false;
+    if !ensure_bundle_directory_entry(temp_dir, "staged bundle path")? {
+        bail!("staged bundle path does not exist: {}", temp_dir.display());
+    }
+
+    recover_interrupted_bundle_publish(final_dir)?;
     if !ensure_replaceable_bundle_output_dir(final_dir)? {
         fs::rename(temp_dir, final_dir).with_context(|| {
             format!(
@@ -510,44 +788,388 @@ fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
                 final_dir.display()
             )
         })?;
-        sync_parent_directory(final_dir)?;
+        sync_parent_directory(final_dir).with_context(|| {
+            format!(
+                "completed bundle is live at {}, but its first publication could not be durably synced",
+                final_dir.display()
+            )
+        })?;
         return Ok(());
     }
 
-    let backup_dir = unique_bundle_backup_dir(final_dir)?;
-    fs::rename(final_dir, &backup_dir).with_context(|| {
+    let backup_dir = bundle_publish_in_progress_backup_path(final_dir);
+    // Every replacement candidate carries the same durable ownership marker,
+    // including the non-Linux rename-pair path. Recovery may only remove one
+    // of two simultaneously present trees when this marker identifies which
+    // tree is NEW; an unmarked deterministic sidecar could predate cass and
+    // must never be guessed away.
+    write_bundle_publish_marker(temp_dir)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        if try_publish_linux_bundle_via_atomic_exchange(
+            temp_dir,
+            final_dir,
+            &backup_dir,
+            retain_temp_on_error,
+        )? {
+            return Ok(());
+        }
+    }
+
+    replace_dir_from_temp_via_recoverable_rename_pair(
+        temp_dir,
+        final_dir,
+        &backup_dir,
+        retain_temp_on_error,
+    )
+}
+
+fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
+    let backup_dir = bundle_publish_in_progress_backup_path(final_dir);
+    let final_exists = ensure_replaceable_bundle_output_dir(final_dir)?;
+    let final_has_marker = if final_exists {
+        bundle_publish_marker_exists(final_dir)?
+    } else {
+        false
+    };
+    let backup_exists =
+        ensure_bundle_directory_entry(&backup_dir, "bundle publish recovery backup")?;
+    if !backup_exists {
+        if final_has_marker {
+            remove_bundle_publish_marker(final_dir).with_context(|| {
+                format!(
+                    "the published bundle is live at {}, but its completed publish marker could not be cleaned",
+                    final_dir.display()
+                )
+            })?;
+        }
+        return Ok(());
+    }
+    let backup_has_marker = bundle_publish_marker_exists(&backup_dir)?;
+
+    if !final_exists {
+        if backup_has_marker {
+            bail!(
+                "interrupted atomic bundle publish is missing its prior live handle {}; staged candidate containing private artifacts retained at {}",
+                final_dir.display(),
+                backup_dir.display()
+            );
+        }
+
+        fs::rename(&backup_dir, final_dir).with_context(|| {
+            format!(
+                "failed restoring the only prior live bundle from interrupted-publish backup {} to {}",
+                backup_dir.display(),
+                final_dir.display()
+            )
+        })?;
+        sync_parent_directory(final_dir).with_context(|| {
+            format!(
+                "restored the prior live bundle at {} from {}, but could not durably sync the recovery",
+                final_dir.display(),
+                backup_dir.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    match (final_has_marker, backup_has_marker) {
+        (true, false) => {
+            cleanup_prior_bundle_after_publish(&backup_dir, final_dir)?;
+            remove_bundle_publish_marker(final_dir).with_context(|| {
+                format!(
+                    "new bundle is live at {}, but its completed atomic-publish marker could not be cleaned",
+                    final_dir.display()
+                )
+            })
+        }
+        (false, true) => cleanup_rejected_atomic_staged_bundle(&backup_dir, final_dir),
+        (false, false) => bail!(
+            "ambiguous interrupted bundle publish: live bundle {} and recovery sidecar {} are both unmarked; neither tree was removed",
+            final_dir.display(),
+            backup_dir.display()
+        ),
+        (true, true) => bail!(
+            "ambiguous interrupted bundle publish: both live bundle {} and recovery sidecar {} carry the in-progress marker; neither tree was removed",
+            final_dir.display(),
+            backup_dir.display()
+        ),
+    }
+}
+
+fn cleanup_rejected_atomic_staged_bundle(staged_dir: &Path, final_dir: &Path) -> Result<()> {
+    if !ensure_bundle_directory_entry(staged_dir, "rejected atomic staged bundle path")? {
+        bail!(
+            "prior live bundle remains at {}, but rejected staged bundle path disappeared before cleanup: {}",
+            final_dir.display(),
+            staged_dir.display()
+        );
+    }
+    fs::remove_dir_all(staged_dir).with_context(|| {
         format!(
-            "failed preparing backup {} before replacing {}",
-            backup_dir.display(),
+            "prior live bundle remains at {}, but failed to remove rejected staged bundle containing private artifacts retained at {}",
+            final_dir.display(),
+            staged_dir.display()
+        )
+    })?;
+    sync_parent_directory(final_dir)
+}
+
+fn cleanup_prior_bundle_after_publish(backup_dir: &Path, final_dir: &Path) -> Result<()> {
+    // A closure rather than the bare `fs::remove_dir_all` fn item: the
+    // generic fn monomorphizes with one concrete lifetime and cannot satisfy
+    // the higher-ranked `for<'a> FnOnce(&'a Path)` bound.
+    cleanup_prior_bundle_after_publish_with(backup_dir, final_dir, |path| {
+        fs::remove_dir_all(path)
+    })
+}
+
+fn cleanup_prior_bundle_after_publish_with<F>(
+    backup_dir: &Path,
+    final_dir: &Path,
+    remove_dir: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    if !ensure_bundle_directory_entry(backup_dir, "prior bundle cleanup path")? {
+        bail!(
+            "new bundle is live at {}, but the prior bundle cleanup path disappeared before removal: {}",
+            final_dir.display(),
+            backup_dir.display()
+        );
+    }
+    remove_dir(backup_dir).with_context(|| {
+        format!(
+            "new bundle is live at {}, but failed to remove the prior bundle containing private artifacts retained at {}",
+            final_dir.display(),
+            backup_dir.display()
+        )
+    })?;
+    sync_parent_directory(final_dir).with_context(|| {
+        format!(
+            "removed the prior bundle after publishing {}, but could not durably sync its parent directory",
             final_dir.display()
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn try_publish_linux_bundle_via_atomic_exchange(
+    temp_dir: &Path,
+    final_dir: &Path,
+    backup_dir: &Path,
+    retain_temp_on_error: &mut bool,
+) -> Result<bool> {
+    fs::rename(temp_dir, backup_dir).with_context(|| {
+        format!(
+            "failed moving staged bundle {} to deterministic atomic-exchange path {}",
+            temp_dir.display(),
+            backup_dir.display()
+        )
+    })?;
+    if let Err(sync_error) = sync_parent_directory(backup_dir) {
+        return match restore_linux_atomic_staged_candidate(
+            backup_dir,
+            temp_dir,
+            retain_temp_on_error,
+        ) {
+            Ok(()) => Err(sync_error).with_context(|| {
+                format!(
+                    "failed durably staging bundle at deterministic atomic-exchange path {}; restored candidate at {}",
+                    backup_dir.display(),
+                    temp_dir.display()
+                )
+            }),
+            Err(restore_error) => Err(anyhow!(
+                "failed durably staging bundle at deterministic atomic-exchange path {}: {sync_error:#}; failed restoring staged candidate to {}: {restore_error:#}",
+                backup_dir.display(),
+                temp_dir.display()
+            )),
+        };
+    }
+
+    match crate::indexer::atomic_exchange_paths(final_dir, backup_dir) {
+        Ok(()) => {
+            if let Err(sync_error) = sync_parent_directory(final_dir) {
+                *retain_temp_on_error = true;
+                bail!(
+                    "new bundle is live at {} after atomic exchange, but the parent directory sync failed: {}; prior bundle containing private artifacts retained at {}",
+                    final_dir.display(),
+                    sync_error,
+                    backup_dir.display()
+                );
+            }
+            if let Err(cleanup_error) =
+                cleanup_prior_bundle_after_publish(backup_dir, final_dir)
+            {
+                *retain_temp_on_error = true;
+                return Err(cleanup_error);
+            }
+            remove_bundle_publish_marker(final_dir).with_context(|| {
+                format!(
+                    "new bundle is live at {}, but its completed atomic-publish marker could not be cleaned",
+                    final_dir.display()
+                )
+            })?;
+            Ok(true)
+        }
+        Err(exchange_error)
+            if crate::indexer::linux_atomic_exchange_is_unsupported(&exchange_error) =>
+        {
+            restore_linux_atomic_staged_candidate(
+                backup_dir,
+                temp_dir,
+                retain_temp_on_error,
+            )
+            .context(
+                "atomic bundle exchange is unsupported and the staged candidate could not be restored for rename-pair publication",
+            )?;
+            tracing::info!(
+                live_bundle_path = %final_dir.display(),
+                staged_bundle_path = %temp_dir.display(),
+                "renameat2(RENAME_EXCHANGE) is unsupported for the Pages bundle output; using recoverable rename-pair publication"
+            );
+            Ok(false)
+        }
+        Err(exchange_error) => match restore_linux_atomic_staged_candidate(
+            backup_dir,
+            temp_dir,
+            retain_temp_on_error,
+        ) {
+            Ok(()) => Err(exchange_error).with_context(|| {
+                format!(
+                    "failed atomically exchanging staged bundle {} with live bundle {}",
+                    temp_dir.display(),
+                    final_dir.display()
+                )
+            }),
+            Err(restore_error) => Err(anyhow!(
+                "failed atomically exchanging staged bundle {} with live bundle {}: {exchange_error:#}; failed restoring staged candidate from {}: {restore_error:#}",
+                temp_dir.display(),
+                final_dir.display(),
+                backup_dir.display()
+            )),
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restore_linux_atomic_staged_candidate(
+    backup_dir: &Path,
+    temp_dir: &Path,
+    retain_temp_on_error: &mut bool,
+) -> Result<()> {
+    if let Err(restore_error) = fs::rename(backup_dir, temp_dir) {
+        *retain_temp_on_error = true;
+        bail!(
+            "failed restoring staged bundle from deterministic atomic-exchange path {} to {}; staged bundle containing private artifacts retained at {}: {}",
+            backup_dir.display(),
+            temp_dir.display(),
+            backup_dir.display(),
+            restore_error
+        );
+    }
+    sync_parent_directory(temp_dir).with_context(|| {
+        format!(
+            "restored staged bundle to {}, but could not durably sync the rename from {}",
+            temp_dir.display(),
+            backup_dir.display()
+        )
+    })
+}
+
+fn replace_dir_from_temp_via_recoverable_rename_pair(
+    temp_dir: &Path,
+    final_dir: &Path,
+    backup_dir: &Path,
+    retain_temp_on_error: &mut bool,
+) -> Result<()> {
+    fs::rename(final_dir, backup_dir).with_context(|| {
+        format!(
+            "failed parking live bundle {} at deterministic recovery path {}",
+            final_dir.display(),
+            backup_dir.display()
         )
     })?;
 
+    if let Err(park_sync_error) = sync_parent_directory(final_dir) {
+        return match fs::rename(backup_dir, final_dir) {
+            Ok(()) => {
+                sync_parent_directory(final_dir).with_context(|| {
+                    format!(
+                        "failed syncing recovery after restoring prior live bundle at {}",
+                        final_dir.display()
+                    )
+                })?;
+                Err(park_sync_error).with_context(|| {
+                    format!(
+                        "failed durably parking the prior live bundle at {}; restored it at {}",
+                        backup_dir.display(),
+                        final_dir.display()
+                    )
+                })
+            }
+            Err(restore_error) => {
+                *retain_temp_on_error = true;
+                bail!(
+                    "failed durably parking the prior live bundle at {}: {}; restore to {} also failed: {}; prior bundle retained at {} and staged bundle retained at {}",
+                    backup_dir.display(),
+                    park_sync_error,
+                    final_dir.display(),
+                    restore_error,
+                    backup_dir.display(),
+                    temp_dir.display()
+                )
+            }
+        };
+    }
+
     match fs::rename(temp_dir, final_dir) {
         Ok(()) => {
-            sync_parent_directory(final_dir)?;
-            let _ = fs::remove_dir_all(&backup_dir);
-            sync_parent_directory(final_dir)?;
-            Ok(())
-        }
-        Err(second_err) => match fs::rename(&backup_dir, final_dir) {
-            Ok(()) => {
-                let _ = fs::remove_dir_all(temp_dir);
-                sync_parent_directory(final_dir)?;
+            if let Err(sync_error) = sync_parent_directory(final_dir) {
+                *retain_temp_on_error = true;
                 bail!(
-                    "failed replacing {} with {}: {}; restored original bundle",
+                    "new bundle was moved into place at {}, but the publish could not be durably synced: {}; prior bundle containing private artifacts retained at {}",
                     final_dir.display(),
-                    temp_dir.display(),
-                    second_err
+                    sync_error,
+                    backup_dir.display()
                 );
             }
-            Err(restore_err) => {
+            if let Err(cleanup_error) =
+                cleanup_prior_bundle_after_publish(backup_dir, final_dir)
+            {
+                *retain_temp_on_error = true;
+                return Err(cleanup_error);
+            }
+            remove_bundle_publish_marker(final_dir).with_context(|| {
+                format!(
+                    "new bundle is live at {}, but its completed rename-pair publish marker could not be cleaned",
+                    final_dir.display()
+                )
+            })
+        }
+        Err(publish_error) => match fs::rename(backup_dir, final_dir) {
+            Ok(()) => {
+                sync_parent_directory(final_dir)?;
+                Err(publish_error).with_context(|| {
+                    format!(
+                        "failed publishing staged bundle {} at {}; restored the prior live bundle",
+                        temp_dir.display(),
+                        final_dir.display()
+                    )
+                })
+            }
+            Err(restore_error) => {
+                *retain_temp_on_error = true;
                 bail!(
-                    "failed replacing {} with {}: {}; restore error: {}; temp bundle retained at {}",
-                    final_dir.display(),
+                    "failed publishing staged bundle {} at {}: {}; restore also failed: {}; prior bundle retained at {} and staged bundle retained at {}",
                     temp_dir.display(),
-                    second_err,
-                    restore_err,
+                    final_dir.display(),
+                    publish_error,
+                    restore_error,
+                    backup_dir.display(),
                     temp_dir.display()
                 );
             }
@@ -828,6 +1450,84 @@ fn copy_blobs_directory(src_root: &Path, src_dir: &Path, dest_dir: &Path) -> Res
     Ok(count)
 }
 
+fn validate_embedded_vendor_asset(asset: &PinnedVendorAsset) -> Result<()> {
+    let actual_size = u64::try_from(asset.bytes.len()).context("Vendor asset size overflow")?;
+    if actual_size != asset.size {
+        bail!(
+            "Embedded Pages vendor asset {} has size {}, expected {}",
+            asset.path,
+            actual_size,
+            asset.size
+        );
+    }
+
+    let actual_sha256 = hex::encode(Sha256::digest(asset.bytes));
+    if actual_sha256 != asset.sha256 {
+        bail!(
+            "Embedded Pages vendor asset {} has SHA-256 {}, expected {}",
+            asset.path,
+            actual_sha256,
+            asset.sha256
+        );
+    }
+
+    Ok(())
+}
+
+/// Materialize the exact self-hosted runtime dependency set into `site/vendor`.
+///
+/// The embedded bytes are checked against independent hard-coded pins before
+/// any file is written. This turns accidental vendor replacement into a build
+/// failure instead of silently publishing unreviewed executable code.
+pub(crate) fn write_pinned_vendor_assets(site_dir: &Path) -> Result<()> {
+    for asset in PAGES_VENDOR_ASSETS {
+        validate_embedded_vendor_asset(asset)?;
+    }
+
+    fs::create_dir_all(site_dir.join("vendor"))
+        .context("Failed to create site/vendor directory")?;
+    for asset in PAGES_VENDOR_ASSETS {
+        fs::write(site_dir.join(asset.path), asset.bytes)
+            .with_context(|| format!("Failed to write Pages vendor asset {}", asset.path))?;
+    }
+
+    Ok(())
+}
+
+/// Verify that a materialized bundle contains every pinned vendor file as an
+/// exact regular-file byte match.
+pub(crate) fn validate_pinned_vendor_assets(site_dir: &Path) -> Result<()> {
+    for asset in PAGES_VENDOR_ASSETS {
+        let path = site_dir.join(asset.path);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("Missing Pages vendor asset {}", asset.path))?;
+        if !metadata.file_type().is_file() {
+            bail!("Pages vendor asset {} is not a regular file", asset.path);
+        }
+        if metadata.len() != asset.size {
+            bail!(
+                "Pages vendor asset {} has size {}, expected {}",
+                asset.path,
+                metadata.len(),
+                asset.size
+            );
+        }
+
+        let entry = build_integrity_entry(&path)
+            .with_context(|| format!("Failed to hash Pages vendor asset {}", asset.path))?;
+        if entry.sha256 != asset.sha256 {
+            bail!(
+                "Pages vendor asset {} has SHA-256 {}, expected {}",
+                asset.path,
+                entry.sha256,
+                asset.sha256
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Generate integrity manifest for all files in a directory
 pub(crate) fn generate_integrity_manifest(dir: &Path) -> Result<IntegrityManifest> {
     let mut files = BTreeMap::new();
@@ -994,15 +1694,10 @@ fn ensure_private_artifact_dir(private_dir: &Path) -> Result<()> {
                     private_dir.display()
                 );
             }
-            Ok(())
+            secure_private_artifact_dir(private_dir)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(private_dir).with_context(|| {
-                format!(
-                    "Failed to create private artifact directory {}",
-                    private_dir.display()
-                )
-            })?;
+            create_private_artifact_dir(private_dir)?;
             ensure_private_artifact_dir(private_dir)
         }
         Err(err) => Err(err).with_context(|| {
@@ -1012,6 +1707,41 @@ fn ensure_private_artifact_dir(private_dir: &Path) -> Result<()> {
             )
         }),
     }
+}
+
+fn create_private_artifact_dir(private_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(private_dir).with_context(|| {
+            format!(
+                "Failed to create owner-only private artifact directory {}",
+                private_dir.display()
+            )
+        })?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(private_dir).with_context(|| {
+        format!(
+            "Failed to create private artifact directory {}",
+            private_dir.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn secure_private_artifact_dir(private_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(private_dir, fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "Failed to set owner-only permissions on private artifact directory {}",
+            private_dir.display()
+        )
+    })?;
+    #[cfg(not(unix))]
+    let _ = private_dir;
+    Ok(())
 }
 
 fn reject_symlinked_private_artifact(path: &Path) -> Result<()> {
@@ -1049,16 +1779,16 @@ fn write_private_artifact_file(private_dir: &Path, filename: &str, contents: &[u
     let temp_path = unique_bundle_sidecar_path(&final_path, "tmp", "private_artifact")?;
 
     let write_result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .with_context(|| {
-                format!(
-                    "Failed to create temporary private artifact {}",
-                    temp_path.display()
-                )
-            })?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp_path).with_context(|| {
+            format!(
+                "Failed to create temporary private artifact {}",
+                temp_path.display()
+            )
+        })?;
         file.write_all(contents).with_context(|| {
             format!(
                 "Failed to write temporary private artifact {}",
@@ -1079,17 +1809,131 @@ fn write_private_artifact_file(private_dir: &Path, filename: &str, contents: &[u
         return Err(err);
     }
 
-    if let Err(err) = fs::rename(&temp_path, &final_path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err).with_context(|| {
-            format!(
-                "Failed to install private artifact {}",
-                final_path.display()
-            )
-        });
+    let mut retain_temp_on_replace_error = false;
+    if let Err(err) = replace_private_artifact_from_temp(
+        &temp_path,
+        &final_path,
+        &mut retain_temp_on_replace_error,
+    ) {
+        if !retain_temp_on_replace_error {
+            let _ = fs::remove_file(&temp_path);
+        }
+        return Err(err);
     }
-    sync_parent_directory(&final_path)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn private_artifact_path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err)
+            .with_context(|| format!("Failed to inspect private artifact {}", path.display())),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn replace_private_artifact_from_temp_via_backup(
+    temp_path: &Path,
+    final_path: &Path,
+    first_error: &std::io::Error,
+    retain_temp_on_error: &mut bool,
+) -> Result<()> {
+    *retain_temp_on_error = false;
+    reject_symlinked_private_artifact(final_path)?;
+    let backup_path = unique_bundle_sidecar_path(final_path, "bak", "private_artifact")?;
+    fs::rename(final_path, &backup_path).with_context(|| {
+        format!(
+            "Failed to preserve existing private artifact {} at {} after initial replacement error: {}",
+            final_path.display(),
+            backup_path.display(),
+            first_error
+        )
+    })?;
+
+    match fs::rename(temp_path, final_path) {
+        Ok(()) => {
+            fs::remove_file(&backup_path).with_context(|| {
+                format!(
+                    "Installed private artifact {} but failed to remove prior generation {}",
+                    final_path.display(),
+                    backup_path.display()
+                )
+            })?;
+            sync_parent_directory(final_path)
+        }
+        Err(replace_error) => match fs::rename(&backup_path, final_path) {
+            Ok(()) => {
+                sync_parent_directory(final_path)?;
+                Err(replace_error).with_context(|| {
+                    format!(
+                        "Failed to replace private artifact {} after initial error {}; restored its prior generation",
+                        final_path.display(),
+                        first_error
+                    )
+                })
+            }
+            Err(restore_error) => {
+                *retain_temp_on_error = true;
+                bail!(
+                    "Failed to replace private artifact {} after initial error {}; replacement error: {}; restore error: {}; prior generation retained at {} and new generation retained at {}",
+                    final_path.display(),
+                    first_error,
+                    replace_error,
+                    restore_error,
+                    backup_path.display(),
+                    temp_path.display()
+                )
+            }
+        },
+    }
+}
+
+fn replace_private_artifact_from_temp(
+    temp_path: &Path,
+    final_path: &Path,
+    retain_temp_on_error: &mut bool,
+) -> Result<()> {
+    *retain_temp_on_error = false;
+    #[cfg(windows)]
+    {
+        match fs::rename(temp_path, final_path) {
+            Ok(()) => sync_parent_directory(final_path),
+            Err(first_error)
+                if matches!(
+                    first_error.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                ) && private_artifact_path_entry_exists(final_path)? =>
+            {
+                replace_private_artifact_from_temp_via_backup(
+                    temp_path,
+                    final_path,
+                    &first_error,
+                    retain_temp_on_error,
+                )
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "Failed to install private artifact {} from {}",
+                    final_path.display(),
+                    temp_path.display()
+                )
+            }),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp_path, final_path).with_context(|| {
+            format!(
+                "Failed to install private artifact {} from {}",
+                final_path.display(),
+                temp_path.display()
+            )
+        })?;
+        sync_parent_directory(final_path)
+    }
 }
 
 pub(crate) fn write_private_artifacts_encrypted(
@@ -1099,6 +1943,11 @@ pub(crate) fn write_private_artifacts_encrypted(
     generate_qr: bool,
     cleanup_missing_recovery: bool,
 ) -> Result<()> {
+    if generate_qr && recovery_secret.is_none() {
+        bail!(
+            "QR recovery artifacts were requested, but no recovery secret is available; enable recovery-secret generation or disable QR generation"
+        );
+    }
     ensure_private_artifact_dir(private_dir)?;
 
     let recovery_secret_path = private_dir.join("recovery-secret.txt");
@@ -1185,14 +2034,36 @@ fn write_private_unencrypted_notice(private_dir: &Path) -> Result<()> {
 
 /// Generate QR code images for recovery secret
 fn generate_qr_codes(private_dir: &Path, recovery_b64: &str) -> Result<()> {
-    // Use the qr module from pages if available
-    if let Ok(qr_png) = super::qr::generate_qr_png(recovery_b64) {
-        write_private_artifact_file(private_dir, "qr-code.png", &qr_png)?;
-    }
+    generate_qr_codes_with(
+        private_dir,
+        recovery_b64,
+        super::qr::generate_qr_png,
+        super::qr::generate_qr_svg,
+    )
+}
 
-    if let Ok(qr_svg) = super::qr::generate_qr_svg(recovery_b64) {
-        write_private_artifact_file(private_dir, "qr-code.svg", qr_svg.as_bytes())?;
-    }
+fn generate_qr_codes_with<P, S>(
+    private_dir: &Path,
+    recovery_b64: &str,
+    generate_png: P,
+    generate_svg: S,
+) -> Result<()>
+where
+    P: FnOnce(&str) -> Result<Vec<u8>>,
+    S: FnOnce(&str) -> Result<String>,
+{
+    // Generate both representations before writing either one. If a requested
+    // encoder is unavailable or rejects the payload, callers receive an error
+    // and no partial QR artifact set is published.
+    let qr_png = generate_png(recovery_b64)
+        .context("Failed to generate requested recovery QR PNG artifact")?;
+    let qr_svg = generate_svg(recovery_b64)
+        .context("Failed to generate requested recovery QR SVG artifact")?;
+
+    write_private_artifact_file(private_dir, "qr-code.png", &qr_png)
+        .context("Failed to write requested recovery QR PNG artifact")?;
+    write_private_artifact_file(private_dir, "qr-code.svg", qr_svg.as_bytes())
+        .context("Failed to write requested recovery QR SVG artifact")?;
 
     Ok(())
 }
@@ -1251,6 +2122,22 @@ Host it only on a trusted, private location."#
 - Requires: SharedArrayBuffer (COOP/COEP headers)"#
     };
 
+    let files_section = if is_encrypted {
+        r#"- `index.html` - Entry point
+- `config.json` - Public encryption parameters (no secrets)
+- `integrity.json` - SHA256 hashes for all files
+- `payload/` - Encrypted database chunks
+- `*.js` - Application code
+- `styles.css` - Styling"#
+    } else {
+        r#"- `index.html` - Entry point
+- `config.json` - Plaintext archive metadata and payload location
+- `integrity.json` - SHA256 hashes for all files
+- `payload/data.db` - Unencrypted SQLite database (publicly readable)
+- `*.js` - Application code
+- `styles.css` - Styling"#
+    };
+
     format!(
         r#"# {}
 
@@ -1269,12 +2156,7 @@ generated by [cass](https://github.com/Dicklesworthstone/coding_agent_session_se
 
 ## Files
 
-- `index.html` - Entry point
-- `config.json` - Public encryption parameters (no secrets)
-- `integrity.json` - SHA256 hashes for all files
-- `payload/` - Encrypted database chunks
-- `*.js` - Application code
-- `styles.css` - Styling
+{}
 
 ## Hosting Requirements
 
@@ -1298,6 +2180,7 @@ Generated by cass v{}
         security_section,
         open_section,
         technical_section,
+        files_section,
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -1332,6 +2215,11 @@ mod tests {
     fn encrypted_config_for_files(files: Vec<&str>) -> EncryptionConfig {
         use base64::prelude::*;
         let chunk_count = files.len();
+        let total_plaintext_size = if chunk_count == 0 {
+            0
+        } else {
+            ((chunk_count - 1) * 1024 + 1) as u64
+        };
         EncryptionConfig {
             version: crate::pages::encrypt::SCHEMA_VERSION,
             // The shared payload-format validation decodes these as base64
@@ -1343,11 +2231,19 @@ mod tests {
             payload: crate::pages::encrypt::PayloadMeta {
                 chunk_size: 1024,
                 chunk_count,
-                total_compressed_size: 0,
-                total_plaintext_size: 0,
+                total_compressed_size: chunk_count as u64,
+                total_plaintext_size,
                 files: files.into_iter().map(str::to_string).collect(),
             },
-            key_slots: Vec::new(),
+            key_slots: vec![crate::pages::encrypt::KeySlot {
+                id: 0,
+                slot_type: crate::pages::encrypt::SlotType::Password,
+                kdf: crate::pages::encrypt::KdfAlgorithm::Argon2id,
+                salt: BASE64_STANDARD.encode([0u8; 16]),
+                wrapped_dek: BASE64_STANDARD.encode([0u8; 48]),
+                nonce: BASE64_STANDARD.encode([0u8; 12]),
+                argon2_params: Some(crate::pages::encrypt::Argon2Params::default()),
+            }],
         }
     }
 
@@ -1422,6 +2318,216 @@ mod tests {
         assert_eq!(backup["key_slots"], serde_json::json!([]));
         assert_eq!(backup["note"], MASTER_KEY_BACKUP_NOTE);
         assert_eq!(backup["generated_at"], "2026-04-25T19:08:00Z");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_artifacts_are_owner_only_even_under_permissive_ambient_modes() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new()?;
+        let private_dir = temp.path().join("private");
+        fs::create_dir_all(&private_dir)?;
+        fs::set_permissions(&private_dir, fs::Permissions::from_mode(0o777))?;
+
+        write_private_artifact_file(&private_dir, "recovery-secret.txt", b"unlock material")?;
+
+        let dir_mode = fs::metadata(&private_dir)?.permissions().mode();
+        let file_mode = fs::metadata(private_dir.join("recovery-secret.txt"))?
+            .permissions()
+            .mode();
+        if dir_mode & 0o077 != 0 {
+            return Err(anyhow!("private directory mode was {dir_mode:o}"));
+        }
+        if file_mode & 0o077 != 0 {
+            return Err(anyhow!("private file mode was {file_mode:o}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn private_artifact_writer_replaces_an_existing_generation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let private_dir = temp.path().join("private");
+
+        write_private_artifact_file(&private_dir, "master-key.json", b"old generation")?;
+        write_private_artifact_file(&private_dir, "master-key.json", b"new generation")?;
+
+        let installed = fs::read(private_dir.join("master-key.json"))?;
+        if installed != b"new generation" {
+            return Err(anyhow!("private artifact replacement published stale bytes"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn requested_qr_requires_a_recovery_secret() -> Result<()> {
+        let temp = TempDir::new()?;
+        let private_dir = temp.path().join("private");
+        let config = encrypted_config_for_files(Vec::new());
+
+        let error = write_private_artifacts_encrypted(
+            &private_dir,
+            &config,
+            None,
+            true,
+            false,
+        )
+        .expect_err("a requested QR without a recovery secret must fail closed");
+
+        if !error.to_string().contains("no recovery secret is available") {
+            return Err(anyhow!("unexpected missing-recovery error: {error:#}"));
+        }
+        if private_dir.exists() {
+            return Err(anyhow!(
+                "rejected QR request unexpectedly created a private artifact directory"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn requested_qr_generation_failure_writes_no_partial_artifacts() -> Result<()> {
+        let temp = TempDir::new()?;
+        let private_dir = temp.path().join("private");
+
+        let error = generate_qr_codes_with(
+            &private_dir,
+            "recovery-secret",
+            |_| Ok(vec![1, 2, 3]),
+            |_| Err(anyhow!("SVG encoder unavailable")),
+        )
+        .expect_err("a requested QR encoder failure must propagate");
+
+        let message = format!("{error:#}");
+        if !message.contains("requested recovery QR SVG artifact")
+            || !message.contains("SVG encoder unavailable")
+        {
+            return Err(anyhow!("QR generation error lost its cause: {message}"));
+        }
+        if private_dir.join("qr-code.png").exists()
+            || private_dir.join("qr-code.svg").exists()
+        {
+            return Err(anyhow!(
+                "failed QR generation published a partial artifact set"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn requested_qr_png_generation_failure_writes_no_artifacts() -> Result<()> {
+        let temp = TempDir::new()?;
+        let private_dir = temp.path().join("private");
+
+        let error = generate_qr_codes_with(
+            &private_dir,
+            "recovery-secret",
+            |_| Err(anyhow!("PNG encoder unavailable")),
+            |_| Ok("<svg>recovery</svg>".to_string()),
+        )
+        .expect_err("a requested QR PNG encoder failure must propagate");
+
+        let message = format!("{error:#}");
+        if !message.contains("requested recovery QR PNG artifact")
+            || !message.contains("PNG encoder unavailable")
+        {
+            return Err(anyhow!("QR PNG generation error lost its cause: {message}"));
+        }
+        if private_dir.join("qr-code.png").exists()
+            || private_dir.join("qr-code.svg").exists()
+        {
+            return Err(anyhow!(
+                "failed QR PNG generation published an artifact"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn requested_qr_generation_writes_both_artifacts() -> Result<()> {
+        let temp = TempDir::new()?;
+        let private_dir = temp.path().join("private");
+
+        generate_qr_codes_with(
+            &private_dir,
+            "recovery-secret",
+            |_| Ok(vec![1, 2, 3]),
+            |_| Ok("<svg>recovery</svg>".to_string()),
+        )?;
+
+        if fs::read(private_dir.join("qr-code.png"))? != [1, 2, 3] {
+            return Err(anyhow!("requested QR PNG bytes were not published"));
+        }
+        if fs::read_to_string(private_dir.join("qr-code.svg"))?
+            != "<svg>recovery</svg>"
+        {
+            return Err(anyhow!("requested QR SVG bytes were not published"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn private_artifact_backup_fallback_preserves_then_replaces() -> Result<()> {
+        let temp = TempDir::new()?;
+        let final_path = temp.path().join("master-key.json");
+        let staged_path = temp.path().join("master-key.tmp.json");
+        fs::write(&final_path, b"old generation")?;
+        fs::write(&staged_path, b"new generation")?;
+        let first_error = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        let mut retain_temp_on_error = false;
+
+        replace_private_artifact_from_temp_via_backup(
+            &staged_path,
+            &final_path,
+            &first_error,
+            &mut retain_temp_on_error,
+        )?;
+
+        if retain_temp_on_error {
+            return Err(anyhow!(
+                "successful private artifact fallback requested temp retention"
+            ));
+        }
+        if fs::read(&final_path)? != b"new generation" {
+            return Err(anyhow!(
+                "private artifact fallback did not publish staged bytes"
+            ));
+        }
+        if staged_path.exists() {
+            return Err(anyhow!(
+                "private artifact fallback left the staged path behind"
+            ));
+        }
+        let remaining_entries = fs::read_dir(temp.path())?.collect::<std::io::Result<Vec<_>>>()?;
+        if remaining_entries.len() != 1 {
+            return Err(anyhow!(
+                "private artifact fallback left an unexpected backup sidecar"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundle_staging_root_is_private_until_publish() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new()?;
+        let staging_root = temp.path().join("bundle.staged");
+        create_bundle_staging_root(&staging_root)?;
+
+        let staged_mode = fs::metadata(&staging_root)?.permissions().mode();
+        if staged_mode & 0o077 != 0 {
+            return Err(anyhow!("bundle staging root mode was {staged_mode:o}"));
+        }
+
+        prepare_bundle_root_for_publish(&staging_root)?;
+        let published_mode = fs::metadata(&staging_root)?.permissions().mode();
+        if published_mode & 0o777 != 0o755 {
+            return Err(anyhow!("published bundle root mode was {published_mode:o}"));
+        }
+        Ok(())
     }
 
     #[test]
@@ -1531,10 +2637,16 @@ mod tests {
         assert!(readme.contains("A test archive"));
         assert!(readme.contains("AES-256-GCM"));
         assert!(readme.contains("Argon2id"));
+        assert!(readme.contains("Public encryption parameters"));
+        assert!(readme.contains("Encrypted database chunks"));
 
         let unencrypted = generate_public_readme("Test Archive", "A test archive", false);
         assert!(unencrypted.contains("NOT encrypted"));
         assert!(unencrypted.contains("no password required"));
+        assert!(unencrypted.contains("Plaintext archive metadata"));
+        assert!(unencrypted.contains("Unencrypted SQLite database"));
+        assert!(!unencrypted.contains("Public encryption parameters"));
+        assert!(!unencrypted.contains("Encrypted database chunks"));
     }
 
     #[test]
@@ -1551,6 +2663,68 @@ mod tests {
         // Should include test.txt but not integrity.json
         assert!(manifest.files.contains_key("test.txt"));
         assert!(!manifest.files.contains_key("integrity.json"));
+    }
+
+    #[test]
+    fn pinned_vendor_contract_matches_every_embedded_byte() {
+        for asset in PAGES_VENDOR_ASSETS {
+            validate_embedded_vendor_asset(asset)
+                .unwrap_or_else(|error| panic!("invalid vendor pin for {}: {error:#}", asset.path));
+        }
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            PAGES_VENDOR_ASSETS
+                .iter()
+                .find(|asset| asset.path == "vendor/manifest.json")
+                .expect("vendor manifest pin")
+                .bytes,
+        )
+        .expect("valid vendor manifest JSON");
+        let package_versions = manifest["packages"]
+            .as_array()
+            .expect("vendor package list")
+            .iter()
+            .map(|package| {
+                (
+                    package["name"].as_str().expect("package name"),
+                    package["version"].as_str().expect("package version"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            package_versions.get("@sqlite.org/sqlite-wasm"),
+            Some(&"3.53.0-build1")
+        );
+        assert_eq!(package_versions.get("argon2-browser"), Some(&"1.18.0"));
+        assert_eq!(package_versions.get("fflate"), Some(&"0.8.3"));
+        assert_eq!(package_versions.get("html5-qrcode"), Some(&"2.3.8"));
+    }
+
+    #[test]
+    fn pinned_vendor_contract_rejects_hash_mutations() {
+        let mutated = PinnedVendorAsset {
+            path: "vendor/mutated.js",
+            bytes: b"mutated",
+            size: 7,
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        };
+        let error = validate_embedded_vendor_asset(&mutated).unwrap_err();
+        assert!(error.to_string().contains("SHA-256"));
+    }
+
+    #[test]
+    fn materialized_vendor_validation_rejects_same_size_tampering() {
+        let temp = TempDir::new().unwrap();
+        write_pinned_vendor_assets(temp.path()).unwrap();
+        validate_pinned_vendor_assets(temp.path()).unwrap();
+
+        let fflate_path = temp.path().join("vendor/fflate.js");
+        let mut mutated = fs::read(&fflate_path).unwrap();
+        mutated[0] ^= 0x01;
+        fs::write(fflate_path, mutated).unwrap();
+
+        let error = validate_pinned_vendor_assets(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("SHA-256"));
     }
 
     #[test]
@@ -1790,6 +2964,14 @@ mod tests {
             "unexpected error: {err:#}"
         );
         assert!(!output_parent.path().join("escaped.md").exists());
+        let leftovers = fs::read_dir(output_parent.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "rejected bundle staging directory leaked: {leftovers:?}"
+        );
     }
 
     #[test]
@@ -1975,6 +3157,35 @@ mod tests {
     }
 
     #[test]
+    fn test_build_rejects_requested_qr_for_unencrypted_archive() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let output = temp.path().join("bundle");
+        fs::create_dir_all(&source).unwrap();
+        write_unencrypted_source(&source, "data.db", "plaintext archive");
+
+        let builder = BundleBuilder::with_config(BundleConfig {
+            recovery_secret: Some(vec![7; 32]),
+            generate_qr: true,
+            ..BundleConfig::default()
+        });
+        let error = builder
+            .build(&source, &output, |_, _| {})
+            .expect_err("an unencrypted archive cannot provide recovery QR artifacts");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requested for an unencrypted archive"),
+            "unexpected QR/archive-mode error: {error:#}"
+        );
+        assert!(
+            !output.exists(),
+            "rejected QR request unexpectedly published a bundle"
+        );
+    }
+
+    #[test]
     fn test_replace_dir_from_temp_overwrites_existing_bundle() {
         let temp = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
@@ -1986,19 +3197,328 @@ mod tests {
         fs::create_dir_all(staged_dir.join("site")).unwrap();
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
 
-        replace_dir_from_temp(&staged_dir, &final_dir).unwrap();
+        let mut retain_temp_on_error = false;
+        replace_dir_from_temp(
+            &staged_dir,
+            &final_dir,
+            &mut retain_temp_on_error,
+        )
+        .unwrap();
 
         assert!(!staged_dir.exists());
         assert!(final_dir.join("site/new.txt").exists());
         assert!(!final_dir.join("site/old.txt").exists());
-        let sidecars = fs::read_dir(temp.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
         assert!(
-            !sidecars.iter().any(|name| name.contains(".bundle.bak.")),
-            "backup sidecar should be cleaned up, found: {sidecars:?}"
+            !bundle_publish_in_progress_backup_path(&final_dir).exists(),
+            "deterministic recovery sidecar should be cleaned up"
         );
+        assert!(
+            !bundle_publish_marker_path(&final_dir).exists(),
+            "completed replacement marker should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn test_replace_dir_from_temp_preserves_first_publish_behavior() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+
+        fs::create_dir_all(staged_dir.join("site")).unwrap();
+        fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
+
+        let mut retain_temp_on_error = false;
+        replace_dir_from_temp(
+            &staged_dir,
+            &final_dir,
+            &mut retain_temp_on_error,
+        )
+        .unwrap();
+
+        assert!(!retain_temp_on_error);
+        assert!(!staged_dir.exists());
+        assert_eq!(
+            fs::read_to_string(final_dir.join("site/new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!bundle_publish_in_progress_backup_path(&final_dir).exists());
+    }
+
+    #[test]
+    fn test_recover_interrupted_bundle_publish_restores_parked_only_live_bundle() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+
+        fs::create_dir_all(final_dir.join("private")).unwrap();
+        fs::write(final_dir.join("private/old-private.txt"), "old").unwrap();
+        fs::create_dir_all(staged_dir.join("private")).unwrap();
+        fs::write(staged_dir.join("private/new-private.txt"), "new").unwrap();
+
+        // Failpoint state: the fallback publisher durably parked OLD, then
+        // the process died before installing NEW at the live handle.
+        fs::rename(&final_dir, &backup_dir).unwrap();
+        assert!(!final_dir.exists());
+
+        recover_interrupted_bundle_publish(&final_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(final_dir.join("private/old-private.txt")).unwrap(),
+            "old"
+        );
+        assert!(!backup_dir.exists());
+        assert_eq!(
+            fs::read_to_string(staged_dir.join("private/new-private.txt")).unwrap(),
+            "new",
+            "recovery must not consume the next staged candidate"
+        );
+    }
+
+    #[test]
+    fn test_recover_interrupted_fallback_publish_keeps_new_live_and_cleans_parked_old() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+
+        fs::create_dir_all(final_dir.join("private")).unwrap();
+        fs::write(final_dir.join("private/old-private.txt"), "old").unwrap();
+        fs::create_dir_all(staged_dir.join("private")).unwrap();
+        fs::write(staged_dir.join("private/new-private.txt"), "new").unwrap();
+        fs::write(
+            bundle_publish_marker_path(&staged_dir),
+            BUNDLE_PUBLISH_MARKER_CONTENT,
+        )
+        .unwrap();
+
+        // Failpoint state: OLD was parked and NEW reached the live handle,
+        // then the process died before removing OLD.
+        fs::rename(&final_dir, &backup_dir).unwrap();
+        fs::rename(&staged_dir, &final_dir).unwrap();
+
+        recover_interrupted_bundle_publish(&final_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(final_dir.join("private/new-private.txt")).unwrap(),
+            "new"
+        );
+        assert!(!final_dir.join("private/old-private.txt").exists());
+        assert!(!backup_dir.exists());
+        assert!(!bundle_publish_marker_path(&final_dir).exists());
+    }
+
+    #[test]
+    fn test_recover_interrupted_publish_preserves_unmarked_ambiguous_sidecar() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+
+        fs::create_dir_all(final_dir.join("site")).unwrap();
+        fs::write(final_dir.join("site/live.txt"), "live").unwrap();
+        fs::create_dir_all(backup_dir.join("unrelated")).unwrap();
+        fs::write(backup_dir.join("unrelated/sentinel.txt"), "preserve").unwrap();
+
+        let error = recover_interrupted_bundle_publish(&final_dir)
+            .expect_err("two unmarked trees must be preserved as ambiguous");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("both unmarked"), "unexpected error: {message}");
+        assert_eq!(
+            fs::read_to_string(final_dir.join("site/live.txt")).unwrap(),
+            "live"
+        );
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("unrelated/sentinel.txt")).unwrap(),
+            "preserve"
+        );
+    }
+
+    #[test]
+    fn test_recover_interrupted_atomic_publish_before_exchange_keeps_prior_live() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        let exchange_dir = bundle_publish_in_progress_backup_path(&final_dir);
+
+        fs::create_dir_all(final_dir.join("private")).unwrap();
+        fs::write(final_dir.join("private/old-private.txt"), "old").unwrap();
+        fs::create_dir_all(staged_dir.join("private")).unwrap();
+        fs::write(staged_dir.join("private/new-private.txt"), "new").unwrap();
+        fs::write(
+            bundle_publish_marker_path(&staged_dir),
+            BUNDLE_PUBLISH_MARKER_CONTENT,
+        )
+        .unwrap();
+
+        // Failpoint state: NEW reached the deterministic exchange handle,
+        // but the process died before the atomic exchange committed.
+        fs::rename(&staged_dir, &exchange_dir).unwrap();
+
+        recover_interrupted_bundle_publish(&final_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(final_dir.join("private/old-private.txt")).unwrap(),
+            "old"
+        );
+        assert!(!final_dir.join("private/new-private.txt").exists());
+        assert!(!exchange_dir.exists());
+        assert!(!bundle_publish_marker_path(&final_dir).exists());
+    }
+
+    #[test]
+    fn test_recover_interrupted_atomic_publish_immediately_after_exchange_keeps_new_live() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let exchange_dir = bundle_publish_in_progress_backup_path(&final_dir);
+
+        // Failpoint state immediately after exchange: NEW is live and carries
+        // the marker that moved with it; OLD is discoverable at the canonical
+        // exchange handle and carries no marker.
+        fs::create_dir_all(final_dir.join("private")).unwrap();
+        fs::write(final_dir.join("private/new-private.txt"), "new").unwrap();
+        fs::write(
+            bundle_publish_marker_path(&final_dir),
+            BUNDLE_PUBLISH_MARKER_CONTENT,
+        )
+        .unwrap();
+        fs::create_dir_all(exchange_dir.join("private")).unwrap();
+        fs::write(exchange_dir.join("private/old-private.txt"), "old").unwrap();
+
+        recover_interrupted_bundle_publish(&final_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(final_dir.join("private/new-private.txt")).unwrap(),
+            "new"
+        );
+        assert!(!final_dir.join("private/old-private.txt").exists());
+        assert!(!exchange_dir.exists());
+        assert!(!bundle_publish_marker_path(&final_dir).exists());
+    }
+
+    #[test]
+    fn test_recoverable_rename_pair_replaces_and_cleans_prior_bundle() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+
+        fs::create_dir_all(final_dir.join("site")).unwrap();
+        fs::write(final_dir.join("site/old.txt"), "old").unwrap();
+        fs::create_dir_all(staged_dir.join("site")).unwrap();
+        fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
+        fs::write(
+            bundle_publish_marker_path(&staged_dir),
+            BUNDLE_PUBLISH_MARKER_CONTENT,
+        )
+        .unwrap();
+
+        let mut retain_temp_on_error = false;
+        replace_dir_from_temp_via_recoverable_rename_pair(
+            &staged_dir,
+            &final_dir,
+            &backup_dir,
+            &mut retain_temp_on_error,
+        )
+        .unwrap();
+
+        assert!(!retain_temp_on_error);
+        assert_eq!(
+            fs::read_to_string(final_dir.join("site/new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!backup_dir.exists());
+        assert!(!bundle_publish_marker_path(&final_dir).exists());
+    }
+
+    #[test]
+    fn test_prior_private_bundle_cleanup_failure_names_every_retained_path() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+        fs::create_dir_all(final_dir.join("site")).unwrap();
+        fs::create_dir_all(backup_dir.join("private")).unwrap();
+        fs::write(backup_dir.join("private/recovery-material.txt"), "private").unwrap();
+
+        let error = cleanup_prior_bundle_after_publish_with(
+            &backup_dir,
+            &final_dir,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected cleanup denial",
+                ))
+            },
+        )
+        .expect_err("cleanup failure must fail the publication result");
+        let message = format!("{error:#}");
+
+        assert!(message.contains(&final_dir.display().to_string()));
+        assert!(message.contains(&backup_dir.display().to_string()));
+        assert!(message.contains("injected cleanup denial"));
+        assert!(message.contains("private artifacts retained"));
+        assert!(backup_dir.join("private/recovery-material.txt").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_recover_interrupted_bundle_publish_rejects_symlinked_backup() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+        fs::create_dir_all(outside.path().join("private")).unwrap();
+        fs::write(outside.path().join("private/material.txt"), "private").unwrap();
+        symlink(outside.path(), &backup_dir).unwrap();
+
+        let error = recover_interrupted_bundle_publish(&final_dir)
+            .expect_err("a symlinked recovery backup must fail closed");
+
+        assert!(error.to_string().contains("must not be a symlink"));
+        assert!(error.to_string().contains(&backup_dir.display().to_string()));
+        assert_eq!(
+            fs::read_to_string(outside.path().join("private/material.txt")).unwrap(),
+            "private"
+        );
+        assert!(!final_dir.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_replace_dir_from_temp_rejects_symlinked_staging_tree() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        fs::create_dir_all(final_dir.join("site")).unwrap();
+        fs::write(final_dir.join("site/old.txt"), "old").unwrap();
+        fs::create_dir_all(outside.path().join("site")).unwrap();
+        fs::write(outside.path().join("site/new.txt"), "new").unwrap();
+        symlink(outside.path(), &staged_dir).unwrap();
+
+        let mut retain_temp_on_error = false;
+        let error = replace_dir_from_temp(
+            &staged_dir,
+            &final_dir,
+            &mut retain_temp_on_error,
+        )
+        .expect_err("a symlinked staged bundle must fail closed");
+
+        assert!(error.to_string().contains("must not be a symlink"));
+        assert!(error.to_string().contains(&staged_dir.display().to_string()));
+        assert_eq!(
+            fs::read_to_string(final_dir.join("site/old.txt")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("site/new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!retain_temp_on_error);
     }
 
     #[test]
@@ -2014,12 +3534,22 @@ mod tests {
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
         symlink(temp.path().join("missing-target"), &final_dir).unwrap();
 
-        let err = replace_dir_from_temp(&staged_dir, &final_dir).unwrap_err();
+        let mut retain_temp_on_error = false;
+        let err = replace_dir_from_temp(
+            &staged_dir,
+            &final_dir,
+            &mut retain_temp_on_error,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("must not be a symlink"),
             "unexpected error: {err:#}"
         );
         assert!(staged_dir.join("site/new.txt").exists());
+        assert!(
+            !retain_temp_on_error,
+            "ordinary validation failures do not require recovery retention"
+        );
         assert!(
             fs::symlink_metadata(&final_dir)
                 .unwrap()

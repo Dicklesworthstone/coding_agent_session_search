@@ -58,7 +58,10 @@ const CONTRACTS: &[DependencyContract] = &[
         expected_git: "",
         expected_rev: "",
         expected_version: "0.3.8",
-        expected_features: &["fts5"],
+        // `async-api` exposes frankensqlite::AsyncConnection, which
+        // src/search/query.rs uses (as SearchSqliteConnection) for the
+        // no-hit alternate-agent suggestions without a full storage open.
+        expected_features: &["fts5", "async-api"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
         manifest_rel: "crates/fsqlite/Cargo.toml",

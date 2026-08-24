@@ -325,27 +325,28 @@ const Theme = {
         this.toggle = $('#theme-toggle');
         if (!this.toggle) return;
 
-        // Load saved preference or system preference
-        const saved = localStorage.getItem('cass-theme');
-        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-        const theme = saved || (prefersDark ? 'dark' : 'light');
+        // A saved user choice overrides the export's configured default. Some
+        // browsers deny localStorage access for file:// documents, so storage
+        // is an optional enhancement rather than an initialization dependency.
+        let saved = null;
+        try {
+            saved = localStorage.getItem('cass-theme');
+        } catch (_) {}
+        if (saved !== 'dark' && saved !== 'light') saved = null;
+        const configured = document.documentElement.getAttribute('data-theme');
+        const theme = saved || (configured === 'light' ? 'light' : 'dark');
         document.documentElement.setAttribute('data-theme', theme);
 
         this.toggle.addEventListener('click', () => this.toggleTheme());
-
-        // Listen for system theme changes
-        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
-            if (!localStorage.getItem('cass-theme')) {
-                document.documentElement.setAttribute('data-theme', e.matches ? 'dark' : 'light');
-            }
-        });
     },
 
     toggleTheme() {
         const current = document.documentElement.getAttribute('data-theme');
         const next = current === 'dark' ? 'light' : 'dark';
         document.documentElement.setAttribute('data-theme', next);
-        localStorage.setItem('cass-theme', next);
+        try {
+            localStorage.setItem('cass-theme', next);
+        } catch (_) {}
     }
 };"#
     .to_string()
@@ -855,6 +856,11 @@ if ('ontouchstart' in window) {
 
 fn generate_decryption_js() -> String {
     r#"// Decryption using Web Crypto API
+const CASS_HTML_PBKDF2_ITERATIONS = 600000;
+const CASS_HTML_SALT_BYTES = 16;
+const CASS_HTML_IV_BYTES = 12;
+const CASS_HTML_GCM_TAG_BYTES = 16;
+
 const Crypto = {
     modal: null,
     form: null,
@@ -886,8 +892,19 @@ const Crypto = {
 
             const encryptedData = JSON.parse(encryptedEl.textContent);
             const { salt, iv, ciphertext, iterations } = encryptedData;
-            if (!salt || !iv || !ciphertext || !Number.isInteger(iterations) || iterations <= 0) {
+            if (
+                typeof salt !== 'string'
+                || typeof iv !== 'string'
+                || typeof ciphertext !== 'string'
+                || iterations !== CASS_HTML_PBKDF2_ITERATIONS
+            ) {
                 throw new Error('Invalid encryption parameters');
+            }
+            const saltBytes = this.base64ToBytes(salt, CASS_HTML_SALT_BYTES, 'salt');
+            const ivBytes = this.base64ToBytes(iv, CASS_HTML_IV_BYTES, 'IV');
+            const ciphertextBytes = this.base64ToBytes(ciphertext, null, 'ciphertext');
+            if (ciphertextBytes.byteLength < CASS_HTML_GCM_TAG_BYTES) {
+                throw new Error('Invalid encrypted ciphertext length');
             }
 
             // Derive key from password
@@ -903,7 +920,7 @@ const Crypto = {
             const key = await crypto.subtle.deriveKey(
                 {
                     name: 'PBKDF2',
-                    salt: this.base64ToBytes(salt),
+                    salt: saltBytes,
                     iterations: iterations,
                     hash: 'SHA-256'
                 },
@@ -917,10 +934,10 @@ const Crypto = {
             const decrypted = await crypto.subtle.decrypt(
                 {
                     name: 'AES-GCM',
-                    iv: this.base64ToBytes(iv)
+                    iv: ivBytes
                 },
                 key,
-                this.base64ToBytes(ciphertext)
+                ciphertextBytes
             );
 
             // Replace content
@@ -928,6 +945,9 @@ const Crypto = {
             const plaintext = dec.decode(decrypted);
             const conversation = $('#conversation');
             conversation.innerHTML = plaintext;
+            if (typeof Prism !== 'undefined' && typeof Prism.highlightAllUnder === 'function') {
+                Prism.highlightAllUnder(conversation);
+            }
 
             // Hide modal
             this.modal.hidden = true;
@@ -956,11 +976,21 @@ const Crypto = {
         }
     },
 
-    base64ToBytes(base64) {
+    base64ToBytes(base64, expectedLength = null, fieldName = 'value') {
+        if (
+            typeof base64 !== 'string'
+            || base64.length % 4 !== 0
+            || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)
+        ) {
+            throw new Error(`Invalid base64 ${fieldName}`);
+        }
         const binary = atob(base64);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) {
             bytes[i] = binary.charCodeAt(i);
+        }
+        if (expectedLength !== null && bytes.byteLength !== expectedLength) {
+            throw new Error(`Invalid ${fieldName} length`);
         }
         return bytes;
     }
@@ -1111,7 +1141,15 @@ mod tests {
         let bundle = generate_scripts(&opts);
 
         assert_inline_js_contains!(bundle, "const Theme");
-        assert_inline_js_contains!(bundle, "localStorage.getItem");
+        assert_inline_js_contains!(bundle, "configured === 'light' ? 'light' : 'dark'");
+        assert_inline_js_contains!(
+            bundle,
+            "try {\n            saved = localStorage.getItem('cass-theme');\n        } catch (_) {}"
+        );
+        assert_inline_js_contains!(
+            bundle,
+            "try {\n            localStorage.setItem('cass-theme', next);\n        } catch (_) {}"
+        );
     }
 
     #[test]
@@ -1298,8 +1336,35 @@ mod tests {
         // After decryption, both ToolCalls and ToolPopovers should be reinitialized
         assert_inline_js_contains!(bundle, "ToolCalls.init()");
         assert_inline_js_contains!(bundle, "ToolPopovers.init()");
+        assert_inline_js_contains!(
+            bundle,
+            "typeof Prism !== 'undefined' && typeof Prism.highlightAllUnder === 'function'"
+        );
+        assert_inline_js_contains!(bundle, "Prism.highlightAllUnder(conversation);");
         assert_inline_js_contains!(bundle, "__cassAttachCodeCopyButtons();");
         assert_inline_js_contains!(bundle, "const __cassAttachCodeCopyButtons");
         assert_inline_js_contains!(bundle, "pre.querySelector('.copy-code-btn')");
+    }
+
+    #[test]
+    fn test_decryption_rejects_mutated_or_oversized_kdf_metadata() {
+        let opts = ExportOptions {
+            encrypt: true,
+            ..Default::default()
+        };
+        let bundle = generate_scripts(&opts);
+
+        assert_inline_js_contains!(bundle, "const CASS_HTML_PBKDF2_ITERATIONS = 600000;");
+        assert_inline_js_contains!(bundle, "iterations !== CASS_HTML_PBKDF2_ITERATIONS");
+        assert_inline_js_contains!(
+            bundle,
+            "this.base64ToBytes(salt, CASS_HTML_SALT_BYTES, 'salt')"
+        );
+        assert_inline_js_contains!(
+            bundle,
+            "this.base64ToBytes(iv, CASS_HTML_IV_BYTES, 'IV')"
+        );
+        assert_inline_js_contains!(bundle, "ciphertextBytes.byteLength < CASS_HTML_GCM_TAG_BYTES");
+        assert_inline_js_contains!(bundle, "!/^[A-Za-z0-9+/]*={0,2}$/.test(base64)");
     }
 }

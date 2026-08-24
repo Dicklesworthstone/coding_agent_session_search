@@ -484,7 +484,7 @@ fn test_cli_export_with_options() {
             "--include-tools",
             "--show-timestamps",
             "--theme",
-            "dark",
+            "light",
         ])
         .output()
         .unwrap();
@@ -500,6 +500,10 @@ fn test_cli_export_with_options() {
     assert!(
         html.contains("timestamp") || html.contains("time"),
         "Should include timestamp styling/content"
+    );
+    assert!(
+        html.contains("data-theme=\"light\""),
+        "--theme light should set the exported document's initial theme"
     );
 }
 

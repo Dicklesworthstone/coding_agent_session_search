@@ -36,8 +36,15 @@ pub const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 /// Maximum chunk size (32 MiB)
 pub const MAX_CHUNK_SIZE: usize = 32 * 1024 * 1024;
+/// Minimum recovery-material length accepted by the raw encryption API.
+///
+/// Length alone cannot prove entropy; callers should normally use
+/// [`crate::pages::qr::RecoverySecret::generate`] to obtain 256 random bits.
+pub const MIN_RECOVERY_SECRET_BYTES: usize = 24;
 
 const MAX_ARCHIVE_CHUNKS: u64 = u32::MAX as u64;
+const AES_GCM_TAG_SIZE: u64 = 16;
+const MAX_DEFLATE_OVERHEAD_ALLOWANCE: u64 = 64 * 1024;
 
 fn max_encryptable_plaintext_bytes(chunk_size: usize) -> u64 {
     MAX_ARCHIVE_CHUNKS.saturating_mul(chunk_size as u64)
@@ -63,6 +70,47 @@ fn ensure_can_write_archive_chunk(chunk_index: u32, chunk_size: usize) -> Result
         );
     }
     Ok(())
+}
+
+/// Bound encrypted chunk reads before allocating memory from archive-controlled
+/// metadata. Raw DEFLATE's real worst-case overhead is much smaller than 12.5%;
+/// the additional 64 KiB keeps the limit conservative for tiny chunks and
+/// encoder implementation differences while retaining a hard upper bound.
+pub(crate) fn max_archive_ciphertext_chunk_size(chunk_size: usize) -> u64 {
+    let chunk_size = chunk_size as u64;
+    chunk_size
+        .saturating_add(chunk_size / 8)
+        .saturating_add(MAX_DEFLATE_OVERHEAD_ALLOWANCE)
+        .saturating_add(AES_GCM_TAG_SIZE)
+}
+
+pub(crate) fn decompress_archive_chunk(
+    compressed: &[u8],
+    chunk_size: usize,
+    chunk_index: usize,
+) -> Result<Vec<u8>> {
+    let mut decoder = DeflateDecoder::new(compressed);
+    let read_limit = (chunk_size as u64).saturating_add(1);
+    let mut plaintext = Vec::with_capacity(chunk_size.min(compressed.len().saturating_mul(2)));
+    decoder
+        .by_ref()
+        .take(read_limit)
+        .read_to_end(&mut plaintext)
+        .map_err(|error| {
+            let taxonomy = DecryptError::CorruptPayload(format!(
+                "chunk {chunk_index} deflate stream is invalid: {error}"
+            ));
+            anyhow::Error::new(error).context(taxonomy)
+        })?;
+
+    if plaintext.len() > chunk_size {
+        return Err(DecryptError::CorruptPayload(format!(
+            "chunk {chunk_index} expands to more than the declared {chunk_size}-byte chunk_size"
+        ))
+        .into());
+    }
+
+    Ok(plaintext)
 }
 
 /// Argon2id parameters (from Phase 2 spec)
@@ -207,6 +255,42 @@ pub(crate) fn validate_supported_payload_format(config: &EncryptionConfig) -> Re
         return Err(DecryptError::UnsupportedMetadata("payload.chunk_count".to_string()).into());
     }
 
+    let expected_chunk_count = config
+        .payload
+        .total_plaintext_size
+        .div_ceil(config.payload.chunk_size as u64);
+    if expected_chunk_count != config.payload.chunk_count as u64 {
+        return Err(invalid_archive_format(format!(
+            "payload total_plaintext_size {} requires {expected_chunk_count} chunks at chunk_size {}, but chunk_count is {}",
+            config.payload.total_plaintext_size,
+            config.payload.chunk_size,
+            config.payload.chunk_count
+        )));
+    }
+
+    let max_total_ciphertext_size = (config.payload.chunk_count as u64)
+        .saturating_mul(max_archive_ciphertext_chunk_size(
+            config.payload.chunk_size,
+        ));
+    if config.payload.total_compressed_size > max_total_ciphertext_size {
+        return Err(invalid_archive_format(format!(
+            "payload total_compressed_size {} exceeds the maximum {} bytes for {} chunks",
+            config.payload.total_compressed_size,
+            max_total_ciphertext_size,
+            config.payload.chunk_count
+        )));
+    }
+    if config.payload.chunk_count == 0 && config.payload.total_compressed_size != 0 {
+        return Err(invalid_archive_format(
+            "an empty payload must have total_compressed_size 0",
+        ));
+    }
+    if config.payload.chunk_count > 0 && config.payload.total_compressed_size == 0 {
+        return Err(invalid_archive_format(
+            "a non-empty payload must have a non-zero total_compressed_size",
+        ));
+    }
+
     require_metadata_len("export_id", &config.export_id, 16)?;
     require_metadata_len("base_nonce", &config.base_nonce, 12)?;
 
@@ -215,8 +299,14 @@ pub(crate) fn validate_supported_payload_format(config: &EncryptionConfig) -> Re
         return Err(DecryptError::UnsupportedMetadata("kdf_defaults".to_string()).into());
     }
 
+    if config.key_slots.is_empty() {
+        return Err(invalid_archive_format(
+            "encrypted archive must contain at least one key slot",
+        ));
+    }
+
     let mut slot_ids = std::collections::BTreeSet::new();
-    let mut any_valid_slot = config.key_slots.is_empty();
+    let mut any_valid_slot = false;
     for slot in &config.key_slots {
         if !slot_ids.insert(slot.id) {
             return Err(invalid_archive_format(format!(
@@ -460,6 +550,12 @@ impl EncryptionEngine {
 
     /// Add a recovery secret slot using HKDF-SHA256
     pub fn add_recovery_slot(&mut self, secret: &[u8]) -> Result<u8> {
+        if secret.len() < MIN_RECOVERY_SECRET_BYTES {
+            bail!(
+                "Recovery secret must contain at least {MIN_RECOVERY_SECRET_BYTES} bytes (192 bits)"
+            );
+        }
+
         let slot_id = key_slot_id_for_len(self.key_slots.len())?;
 
         // Generate salt
@@ -500,6 +596,10 @@ impl EncryptionEngine {
     ) -> Result<EncryptionConfig> {
         let input_path = input.as_ref();
         let output_dir = output_dir.as_ref();
+
+        if self.key_slots.is_empty() {
+            bail!("At least one password or recovery key slot is required before encryption");
+        }
 
         ensure_real_archive_output_directory(output_dir, "encrypted archive output directory")?;
         let payload_dir = output_dir.join("payload");
@@ -1052,6 +1152,11 @@ impl DecryptionEngine {
     /// Unlock with recovery secret
     pub fn unlock_with_recovery(config: EncryptionConfig, secret: &[u8]) -> Result<Self> {
         validate_supported_payload_format(&config)?;
+        if secret.len() < MIN_RECOVERY_SECRET_BYTES {
+            bail!(
+                "Recovery secret must contain at least {MIN_RECOVERY_SECRET_BYTES} bytes (192 bits)"
+            );
+        }
 
         let supported_argon2_params = Argon2Params::default();
         for slot in &config.key_slots {
@@ -1102,6 +1207,29 @@ impl DecryptionEngine {
 
         let base_nonce = decode_metadata_field("base_nonce", &self.config.base_nonce)?;
         let export_id = decode_metadata_field("export_id", &self.config.export_id)?;
+        let canonical_encrypted_dir = encrypted_dir.canonicalize().with_context(|| {
+            format!(
+                "Failed to resolve encrypted archive directory {}",
+                encrypted_dir.display()
+            )
+        })?;
+        let payload_dir = encrypted_dir.join("payload");
+        let payload_metadata = std::fs::symlink_metadata(&payload_dir).with_context(|| {
+            format!(
+                "Failed to inspect encrypted archive payload directory {}",
+                payload_dir.display()
+            )
+        })?;
+        if payload_metadata.file_type().is_symlink() {
+            return Err(invalid_archive_format(
+                "encrypted archive payload directory must not be a symlink",
+            ));
+        }
+        if !payload_metadata.file_type().is_dir() {
+            return Err(invalid_archive_format(
+                "encrypted archive payload path must be a directory",
+            ));
+        }
 
         // Validate chunk count doesn't exceed u32 to prevent nonce truncation
         if self.config.payload.files.len() > u32::MAX as usize {
@@ -1112,6 +1240,8 @@ impl DecryptionEngine {
 
         let (mut pending_output, output_file) = PendingDecryptOutput::create(output_path)?;
         let mut writer = BufWriter::new(output_file);
+        let mut total_ciphertext_size = 0u64;
+        let mut total_plaintext_size = 0u64;
 
         for (chunk_index, chunk_file) in self.config.payload.files.iter().enumerate() {
             progress(chunk_index, self.config.payload.chunk_count);
@@ -1124,12 +1254,67 @@ impl DecryptionEngine {
             }
 
             let chunk_path = encrypted_dir.join(chunk_file);
-            let ciphertext = std::fs::read(&chunk_path).map_err(|error| {
+            let chunk_metadata = std::fs::symlink_metadata(&chunk_path).map_err(|error| {
                 let taxonomy = DecryptError::CorruptPayload(format!(
                     "chunk {chunk_index} is missing or unreadable: {error}"
                 ));
                 anyhow::Error::new(error).context(taxonomy)
             })?;
+            if chunk_metadata.file_type().is_symlink() {
+                return Err(DecryptError::CorruptPayload(format!(
+                    "chunk {chunk_index} must not be a symlink"
+                ))
+                .into());
+            }
+            if !chunk_metadata.file_type().is_file() {
+                return Err(DecryptError::CorruptPayload(format!(
+                    "chunk {chunk_index} must be a regular file"
+                ))
+                .into());
+            }
+
+            let canonical_chunk_path = chunk_path.canonicalize().map_err(|error| {
+                let taxonomy = DecryptError::CorruptPayload(format!(
+                    "chunk {chunk_index} is missing or unreadable: {error}"
+                ));
+                anyhow::Error::new(error).context(taxonomy)
+            })?;
+            if !canonical_chunk_path.starts_with(&canonical_encrypted_dir) {
+                return Err(DecryptError::CorruptPayload(format!(
+                    "chunk {chunk_index} resolves outside the encrypted archive"
+                ))
+                .into());
+            }
+
+            let max_ciphertext_size =
+                max_archive_ciphertext_chunk_size(self.config.payload.chunk_size);
+            let chunk_file = File::open(&canonical_chunk_path).map_err(|error| {
+                let taxonomy = DecryptError::CorruptPayload(format!(
+                    "chunk {chunk_index} is missing or unreadable: {error}"
+                ));
+                anyhow::Error::new(error).context(taxonomy)
+            })?;
+            let mut ciphertext = Vec::new();
+            chunk_file
+                .take(max_ciphertext_size.saturating_add(1))
+                .read_to_end(&mut ciphertext)
+                .map_err(|error| {
+                    let taxonomy = DecryptError::CorruptPayload(format!(
+                        "chunk {chunk_index} is unreadable: {error}"
+                    ));
+                    anyhow::Error::new(error).context(taxonomy)
+                })?;
+            if ciphertext.len() as u64 > max_ciphertext_size {
+                return Err(DecryptError::CorruptPayload(format!(
+                    "chunk {chunk_index} exceeds the maximum encrypted size of {max_ciphertext_size} bytes"
+                ))
+                .into());
+            }
+            total_ciphertext_size = total_ciphertext_size
+                .checked_add(ciphertext.len() as u64)
+                .ok_or_else(|| {
+                    invalid_archive_format("payload ciphertext byte count overflowed u64")
+                })?;
 
             // Derive nonce
             let base_nonce: &[u8; 12] = base_nonce
@@ -1162,17 +1347,34 @@ impl DecryptionEngine {
                     anyhow::Error::new(AeadSourceError(error)).context(taxonomy)
                 })?;
 
-            // Decompress
-            let mut decoder = DeflateDecoder::new(&compressed[..]);
-            let mut plaintext = Vec::new();
-            decoder.read_to_end(&mut plaintext).map_err(|error| {
-                let taxonomy = DecryptError::CorruptPayload(format!(
-                    "chunk {chunk_index} deflate stream is invalid: {error}"
-                ));
-                anyhow::Error::new(error).context(taxonomy)
-            })?;
+            // Decompress within the authenticated archive's declared chunk bound.
+            let plaintext = decompress_archive_chunk(
+                &compressed,
+                self.config.payload.chunk_size,
+                chunk_index,
+            )?;
+            total_plaintext_size = total_plaintext_size
+                .checked_add(plaintext.len() as u64)
+                .ok_or_else(|| {
+                    invalid_archive_format("payload plaintext byte count overflowed u64")
+                })?;
 
             writer.write_all(&plaintext)?;
+        }
+
+        if total_ciphertext_size != self.config.payload.total_compressed_size {
+            return Err(DecryptError::CorruptPayload(format!(
+                "encrypted payload contains {total_ciphertext_size} ciphertext bytes; config declares {}",
+                self.config.payload.total_compressed_size
+            ))
+            .into());
+        }
+        if total_plaintext_size != self.config.payload.total_plaintext_size {
+            return Err(DecryptError::CorruptPayload(format!(
+                "decrypted payload contains {total_plaintext_size} plaintext bytes; config declares {}",
+                self.config.payload.total_plaintext_size
+            ))
+            .into());
         }
 
         writer.flush()?;
@@ -1634,6 +1836,51 @@ mod tests {
     }
 
     #[test]
+    fn recovery_slot_enforces_minimum_material_length() {
+        let mut engine = EncryptionEngine::default();
+        let err = engine
+            .add_recovery_slot(&[0xA5; MIN_RECOVERY_SECRET_BYTES - 1])
+            .expect_err("a recovery secret below 192 bits must never create a key slot");
+        assert!(
+            err.to_string().contains("192 bits"),
+            "unexpected short-recovery-secret error: {err:#}"
+        );
+        assert_eq!(engine.key_slot_count(), 0);
+
+        engine
+            .add_recovery_slot(&[0x5A; MIN_RECOVERY_SECRET_BYTES])
+            .expect("the documented 192-bit boundary should be accepted");
+        assert_eq!(engine.key_slot_count(), 1);
+    }
+
+    #[test]
+    fn recovery_unlock_rejects_short_material_before_key_derivation() {
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.txt");
+        let output_dir = temp_dir.path().join("encrypted");
+        std::fs::write(&input_path, b"recovery length validation").unwrap();
+
+        let mut engine = EncryptionEngine::new(1024).unwrap();
+        engine
+            .add_recovery_slot(&[0x5A; MIN_RECOVERY_SECRET_BYTES])
+            .unwrap();
+        let config = engine
+            .encrypt_file(&input_path, &output_dir, |_, _| {})
+            .unwrap();
+
+        let err = DecryptionEngine::unlock_with_recovery(
+            config,
+            &[0x5A; MIN_RECOVERY_SECRET_BYTES - 1],
+        )
+        .err()
+        .expect("short recovery material must be rejected");
+        assert!(
+            err.to_string().contains("192 bits"),
+            "unexpected short-recovery unlock error: {err:#}"
+        );
+    }
+
+    #[test]
     fn test_key_wrap_unwrap() {
         let kek = SecretKey::random();
         let dek = [42u8; 32];
@@ -1707,6 +1954,50 @@ mod tests {
 
         // Verify
         assert_file_bytes(&decrypted_path, test_data);
+    }
+
+    #[test]
+    fn encrypt_file_rejects_missing_key_slots_before_creating_output() {
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.txt");
+        let output_dir = temp_dir.path().join("encrypted");
+        std::fs::write(&input_path, b"must remain encryptable after adding a slot").unwrap();
+
+        let engine = EncryptionEngine::new(1024).unwrap();
+        let err = engine
+            .encrypt_file(&input_path, &output_dir, |_, _| {})
+            .expect_err("an encrypted archive without an unlock slot is unrecoverable");
+
+        assert!(
+            err.to_string().contains("key slot"),
+            "unexpected missing-key-slot error: {err:#}"
+        );
+        assert!(
+            !output_dir.exists(),
+            "missing-slot validation must run before creating archive output"
+        );
+    }
+
+    #[test]
+    fn bounded_chunk_decompression_rejects_expansion_past_declared_size() {
+        let oversized_plaintext = vec![0x41; 1025];
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = DeflateEncoder::new(&mut compressed, Compression::default());
+            encoder.write_all(&oversized_plaintext).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let err = decompress_archive_chunk(&compressed, 1024, 7)
+            .expect_err("decompression must stop at the declared per-chunk plaintext bound");
+        assert!(
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::CorruptPayload(detail))
+                    if detail.contains("chunk 7") && detail.contains("declared 1024-byte")
+            ),
+            "unexpected expansion-bound error: {err:#}"
+        );
     }
 
     #[test]
@@ -1907,7 +2198,8 @@ mod tests {
         let mut engine = EncryptionEngine::new(1024).unwrap();
         engine.add_password_slot("password1").unwrap();
         engine.add_password_slot("password2").unwrap();
-        engine.add_recovery_slot(b"recovery-secret").unwrap();
+        let recovery_secret = [0xA5; 32];
+        engine.add_recovery_slot(&recovery_secret).unwrap();
 
         let config = engine
             .encrypt_file(&input_path, &output_dir, |_, _| {})
@@ -1928,8 +2220,7 @@ mod tests {
         assert_file_bytes(&decrypted_path, test_data);
 
         // Decrypt with recovery secret
-        let d3 =
-            DecryptionEngine::unlock_with_recovery(config.clone(), b"recovery-secret").unwrap();
+        let d3 = DecryptionEngine::unlock_with_recovery(config.clone(), &recovery_secret).unwrap();
         d3.decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
             .unwrap();
         assert_file_bytes(&decrypted_path, test_data);
@@ -2125,6 +2416,24 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_encrypted_archive_without_key_slots() -> Result<()> {
+        let (_temp_dir, _output_dir, mut config) = encrypt_test_file();
+        config.key_slots.clear();
+
+        let err = validate_supported_payload_format(&config)
+            .err()
+            .context("encrypted archive without an unlock slot must fail validation")?;
+        anyhow::ensure!(
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::InvalidFormat(detail)) if detail.contains("key slot")
+            ),
+            "unexpected missing-key-slot taxonomy: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_tampered_chunk_fails_with_corrupt_payload_taxonomy() -> Result<()> {
         let temp_dir = TempDir::new().unwrap();
         let input_path = temp_dir.path().join("input.txt");
@@ -2192,6 +2501,61 @@ mod tests {
             err.downcast_ref::<std::io::Error>().is_some(),
             "missing chunk must preserve the I/O source error: {err:#}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn decrypt_to_file_rejects_plaintext_size_mismatch_without_publishing_output() -> Result<()> {
+        let (_temp_dir, output_dir, mut config) = encrypt_test_file();
+        config.payload.total_plaintext_size += 1;
+        let decrypted_path = output_dir.join("decrypted.txt");
+
+        let decryptor = DecryptionEngine::unlock_with_password(config, "password")?;
+        let err = decryptor
+            .decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
+            .expect_err("authenticated chunks must match the declared plaintext total");
+
+        assert!(
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::CorruptPayload(detail))
+                    if detail.contains("plaintext bytes") && detail.contains("config declares")
+            ),
+            "unexpected plaintext-size error: {err:#}"
+        );
+        assert!(
+            !decrypted_path.exists(),
+            "size-mismatched plaintext must never be published"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn decrypt_to_file_rejects_symlinked_chunk_even_when_target_is_inside_archive() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (_temp_dir, output_dir, config) = encrypt_test_file();
+        let chunk_path = output_dir.join("payload/chunk-00000.bin");
+        let parked_chunk_path = output_dir.join("payload/authenticated-chunk.bin");
+        std::fs::rename(&chunk_path, &parked_chunk_path)?;
+        symlink(&parked_chunk_path, &chunk_path)?;
+        let decrypted_path = output_dir.join("decrypted.txt");
+
+        let decryptor = DecryptionEngine::unlock_with_password(config, "password")?;
+        let err = decryptor
+            .decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
+            .expect_err("archive payload symlinks must be rejected before reading");
+
+        assert!(
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::CorruptPayload(detail))
+                    if detail.contains("chunk 0") && detail.contains("must not be a symlink")
+            ),
+            "unexpected symlinked-chunk error: {err:#}"
+        );
+        assert!(!decrypted_path.exists());
         Ok(())
     }
 

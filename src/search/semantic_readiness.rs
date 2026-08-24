@@ -71,11 +71,11 @@ impl SemanticReadinessReason {
     }
 }
 
-/// Search fallback mode while semantic can't fully refine.
+/// Search fallback mode when semantic refinement cannot contribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FallbackMode {
-    /// Full hybrid refinement is available; no fallback in effect.
+    /// Semantic refinement is available; no fallback is in effect.
     None,
     /// Search falls back to lexical-only results.
     Lexical,
@@ -85,7 +85,7 @@ pub(crate) enum FallbackMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SemanticNextStep {
-    /// Nothing to do; quality tier is ready.
+    /// Nothing to do; a semantic tier is ready and no maintenance is active.
     None,
     /// Re-enable semantic search in policy/config.
     EnableSemanticPolicy,
@@ -134,7 +134,7 @@ pub(crate) struct SemanticSignals {
 impl SemanticSignals {
     /// Classify the single precise reason from these signals, evaluated in
     /// priority order (intentional-off → acquisition → build → stale →
-    /// backfill → ready).
+    /// queryable tiers → backfill-only).
     pub(crate) fn reason(&self) -> SemanticReadinessReason {
         use SemanticReadinessReason as R;
         if !self.policy_enabled {
@@ -152,22 +152,23 @@ impl SemanticSignals {
         if !self.checksum_ok {
             return R::ChecksumMismatch;
         }
-        // A queryable quality tier dominates: even if a fingerprint check is
-        // pending elsewhere, a published+matching quality tier is ready.
-        if self.quality_tier_ready {
-            return R::QualityTierReady;
-        }
         if !self.vector_index_present {
             return R::VectorIndexMissing;
         }
         if self.db_fingerprint_matches == Some(false) {
             return R::DbFingerprintMismatch;
         }
-        if self.backfill_in_progress {
-            return R::BackfillInProgress;
+        // A queryable quality tier may establish readiness while an independent
+        // fingerprint check is still pending, but never after an explicit
+        // mismatch or when the vector index itself is absent.
+        if self.quality_tier_ready {
+            return R::QualityTierReady;
         }
         if self.fast_tier_ready {
             return R::FastTierReady;
+        }
+        if self.backfill_in_progress {
+            return R::BackfillInProgress;
         }
         // Index present, fingerprint not disproven, nothing ready yet and no
         // active backfill flag: treat as backfill-pending rather than ready.
@@ -189,15 +190,19 @@ impl SemanticSignals {
             SearchRefinementLevel::LexicalOnly
         };
 
-        // Full hybrid only when the quality tier is ready; otherwise search
-        // serves correct lexical results while semantic catches up / is off.
-        let fallback_mode = if quality_tier_ready {
+        // Fallback describes whether semantic refinement is unavailable, not
+        // whether the highest-quality tier is ready. Either queryable tier can
+        // refine a search; only non-queryable verdicts are lexical-only.
+        let fallback_mode = if available {
             FallbackMode::None
         } else {
             FallbackMode::Lexical
         };
 
         let next_step = match reason {
+            R::QualityTierReady if self.backfill_in_progress => {
+                SemanticNextStep::WaitForBackfill
+            }
             R::QualityTierReady => SemanticNextStep::None,
             R::PolicyDisabled => SemanticNextStep::EnableSemanticPolicy,
             R::BaselineNoSemantic | R::ModelNotAcquired => SemanticNextStep::InstallModel,
@@ -206,19 +211,33 @@ impl SemanticSignals {
             R::VectorIndexMissing => SemanticNextStep::BuildVectorIndex,
             R::DbFingerprintMismatch => SemanticNextStep::RebuildForCurrentDb,
             R::BackfillInProgress => SemanticNextStep::WaitForBackfill,
-            // Fast tier ready: quality refinement still improving via backfill.
-            R::FastTierReady => SemanticNextStep::WaitForBackfill,
+            R::FastTierReady if self.backfill_in_progress => {
+                SemanticNextStep::WaitForBackfill
+            }
+            R::FastTierReady => SemanticNextStep::None,
+        };
+
+        let state_detail = match (reason, self.backfill_in_progress) {
+            (R::QualityTierReady, true) => {
+                "quality semantic tier ready; residual semantic backfill is still finishing"
+            }
+            (R::FastTierReady, false) => {
+                "fast semantic tier ready; quality tier is not published and no backfill is active"
+            }
+            _ => reason.state_detail(),
         };
 
         SemanticReadinessReport {
             reason,
             available,
-            // `semantic --mode` can run whenever either tier is queryable.
-            semantic_only_search_available: self.fast_tier_ready || self.quality_tier_ready,
+            // `semantic --mode` can run only when the realized verdict says a
+            // current tier is queryable. Raw tier flags may be stale or
+            // policy-blocked and must not override that verdict.
+            semantic_only_search_available: available,
             fallback_mode,
-            fast_tier_ready: self.fast_tier_ready,
+            fast_tier_ready: available && self.fast_tier_ready,
             quality_tier_ready,
-            state_detail: reason.state_detail().to_string(),
+            state_detail: state_detail.to_string(),
             next_step,
             realized_refinement,
         }
@@ -329,6 +348,9 @@ mod tests {
         let r = s.report();
         assert_eq!(r.reason, SemanticReadinessReason::PolicyDisabled);
         assert!(!r.available);
+        assert!(!r.semantic_only_search_available);
+        assert!(!r.fast_tier_ready);
+        assert!(!r.quality_tier_ready);
         assert_eq!(r.fallback_mode, FallbackMode::Lexical);
         assert_eq!(r.next_step, SemanticNextStep::EnableSemanticPolicy);
     }
@@ -392,6 +414,31 @@ mod tests {
     }
 
     #[test]
+    fn explicit_staleness_dominates_claimed_ready_tiers() {
+        let mut s = ready();
+        s.db_fingerprint_matches = Some(false);
+        let r = s.report();
+        assert_eq!(r.reason, SemanticReadinessReason::DbFingerprintMismatch);
+        assert!(!r.available);
+        assert!(!r.semantic_only_search_available);
+        assert!(!r.fast_tier_ready);
+        assert!(!r.quality_tier_ready);
+        assert_eq!(r.fallback_mode, FallbackMode::Lexical);
+        assert_eq!(r.realized_refinement, SearchRefinementLevel::LexicalOnly);
+    }
+
+    #[test]
+    fn missing_vector_index_dominates_claimed_quality_tier() {
+        let mut s = ready();
+        s.vector_index_present = false;
+        let r = s.report();
+        assert_eq!(r.reason, SemanticReadinessReason::VectorIndexMissing);
+        assert!(!r.available);
+        assert!(!r.semantic_only_search_available);
+        assert!(!r.quality_tier_ready);
+    }
+
+    #[test]
     fn backfill_in_progress_waits() {
         let mut s = ready();
         s.quality_tier_ready = false;
@@ -406,16 +453,55 @@ mod tests {
     fn fast_tier_ready_serves_search_while_quality_backfills() {
         let mut s = ready();
         s.quality_tier_ready = false;
+        s.backfill_in_progress = true;
         let r = s.report();
         assert_eq!(r.reason, SemanticReadinessReason::FastTierReady);
         assert!(r.available);
         assert!(r.semantic_only_search_available);
-        assert_eq!(r.fallback_mode, FallbackMode::Lexical);
+        assert_eq!(r.fallback_mode, FallbackMode::None);
         assert_eq!(
             r.realized_refinement,
             SearchRefinementLevel::FastTierRefined
         );
         assert_eq!(r.next_step, SemanticNextStep::WaitForBackfill);
+        assert!(r.state_detail.contains("backfilling"));
+    }
+
+    #[test]
+    fn fast_tier_without_active_backfill_has_no_wait_or_build_action() {
+        let mut s = ready();
+        s.quality_tier_ready = false;
+        let r = s.report();
+        assert_eq!(r.reason, SemanticReadinessReason::FastTierReady);
+        assert!(r.available);
+        assert!(r.semantic_only_search_available);
+        assert!(r.fast_tier_ready);
+        assert!(!r.quality_tier_ready);
+        assert_eq!(r.fallback_mode, FallbackMode::None);
+        assert_eq!(
+            r.realized_refinement,
+            SearchRefinementLevel::FastTierRefined
+        );
+        assert_eq!(r.next_step, SemanticNextStep::None);
+        assert!(r.state_detail.contains("no backfill is active"));
+    }
+
+    #[test]
+    fn quality_tier_remains_queryable_while_residual_backfill_finishes() {
+        let mut s = ready();
+        s.backfill_in_progress = true;
+        let r = s.report();
+        assert_eq!(r.reason, SemanticReadinessReason::QualityTierReady);
+        assert!(r.available);
+        assert!(r.semantic_only_search_available);
+        assert!(r.quality_tier_ready);
+        assert_eq!(r.fallback_mode, FallbackMode::None);
+        assert_eq!(
+            r.realized_refinement,
+            SearchRefinementLevel::FullyHybridRefined
+        );
+        assert_eq!(r.next_step, SemanticNextStep::WaitForBackfill);
+        assert!(r.state_detail.contains("residual semantic backfill"));
     }
 
     #[test]

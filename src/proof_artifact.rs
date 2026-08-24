@@ -40,7 +40,8 @@ pub enum ProofStatus {
     /// Assertions ran and at least one failed (a genuine, attributable failure).
     Fail,
     /// A partial proof: the run started and produced *some* evidence but did not
-    /// complete (e.g. a bounded surface returned partial results).
+    /// prove successful process completion (e.g. a bounded surface returned
+    /// partial results, or the harness never observed an exit status).
     PartialProof,
     /// The run produced/refreshed artifacts but executed NO assertions — evidence
     /// exists but proves nothing about behavior (the "generated-only" trap).
@@ -135,7 +136,7 @@ pub const DEFAULT_STALE_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
 /// Classify a [`ProofRun`] into a [`ProofStatus`] using `stale_after_ms` as the
 /// freshness window. Precedence is deliberate and safety-first:
 /// timeout > skipped > stale > assertions-didn't-run (generated-only) >
-/// failed-exit > incomplete (partial) > pass.
+/// failed-or-missing-exit > incomplete (partial) > pass.
 pub fn classify(run: &ProofRun, stale_after_ms: u64) -> ProofStatus {
     // A timeout outranks everything — even a zero exit code — so a run that timed
     // out before tests ran can never read as a pass.
@@ -157,6 +158,12 @@ pub fn classify(run: &ProofRun, stale_after_ms: u64) -> ProofStatus {
     // Assertions ran; a non-zero exit is a genuine failure.
     if matches!(run.exit_code, Some(code) if code != 0) {
         return ProofStatus::Fail;
+    }
+    // No observed exit status means the harness never proved that the command
+    // completed successfully. Even if it recorded assertions and marked its
+    // own work complete, that evidence is partial rather than a pass.
+    if run.exit_code.is_none() {
+        return ProofStatus::PartialProof;
     }
     if !run.completed {
         return ProofStatus::PartialProof;
@@ -203,6 +210,14 @@ impl ProofArtifact {
             ProofStatus::StaleArtifact => format!(
                 "stale artifact (age {}ms): {}",
                 run.artifact_age_ms.unwrap_or(0),
+                run.command
+            ),
+            ProofStatus::PartialProof if run.exit_code.is_none() && !run.completed => format!(
+                "partial proof (incomplete run; missing process exit status): {}",
+                run.command
+            ),
+            ProofStatus::PartialProof if run.exit_code.is_none() => format!(
+                "partial proof (missing process exit status): {}",
                 run.command
             ),
             ProofStatus::PartialProof => {
@@ -1382,6 +1397,36 @@ mod tests {
         let mut run = base_run();
         run.exit_code = Some(101);
         assert_eq!(classify(&run, DEFAULT_STALE_AFTER_MS), ProofStatus::Fail);
+    }
+
+    #[test]
+    fn missing_exit_status_is_partial_proof_not_pass() {
+        let mut run = base_run();
+        run.exit_code = None;
+        run.assertions_ran = true;
+        run.completed = true;
+        let artifact = ProofArtifact::from_run(run);
+        assert_eq!(artifact.status, ProofStatus::PartialProof);
+        assert!(!artifact.is_trustworthy_pass());
+        assert_eq!(
+            artifact.summary,
+            "partial proof (missing process exit status): cargo test --lib"
+        );
+    }
+
+    #[test]
+    fn incomplete_run_with_missing_exit_reports_both_facts() {
+        let mut run = base_run();
+        run.exit_code = None;
+        run.assertions_ran = true;
+        run.completed = false;
+        let artifact = ProofArtifact::from_run(run);
+        assert_eq!(artifact.status, ProofStatus::PartialProof);
+        assert!(!artifact.is_trustworthy_pass());
+        assert_eq!(
+            artifact.summary,
+            "partial proof (incomplete run; missing process exit status): cargo test --lib"
+        );
     }
 
     #[test]

@@ -372,6 +372,7 @@ impl ExportModalState {
             syntax_highlighting: true,
             include_search: true,
             include_theme_toggle: true,
+            default_theme: "dark".to_string(),
             encrypt: self.encrypt,
             print_styles: true,
             agent_name: Some(self.agent_name.clone()),

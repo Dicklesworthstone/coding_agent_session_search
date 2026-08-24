@@ -1,5 +1,7 @@
 //! First-class Oh My Pi v18 integration gates.
 
+mod util;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +11,8 @@ use coding_agent_search::connectors::{
 };
 use coding_agent_search::sources::sync::path_to_safe_dirname;
 use serde_json::json;
+use serial_test::serial;
+use util::EnvGuard;
 
 fn write_omp_session(agent_root: &Path, id: &str, title: &str) -> PathBuf {
     let session_dir = agent_root.join("sessions/-projects-cass");
@@ -242,25 +246,86 @@ fn sanitized_remote_omp_roots_keep_provider_identity() {
         assert!(pi_conversations.is_empty());
     }
 
-    let absolute_safe_name = path_to_safe_dirname("/home/dev/.omp/agent/sessions");
-    let non_mirror_root = temp.path().join("ordinary-cache").join(absolute_safe_name);
-    write_omp_session(
-        &non_mirror_root,
-        "not-a-mirror",
-        "Non-mirror sanitized lookalike",
+    for (remote_path, id) in [
+        ("~/.omp/agent/sessions", "tilde-lookalike"),
+        ("/home/dev/.omp/agent/sessions", "absolute-lookalike"),
+    ] {
+        let safe_name = path_to_safe_dirname(remote_path);
+        let non_mirror_root = temp.path().join("ordinary-cache").join(safe_name);
+        write_omp_session(
+            &non_mirror_root,
+            id,
+            "Non-mirror sanitized lookalike",
+        );
+        let non_mirror_ctx = ScanContext::with_roots(
+            temp.path().join("cass-state"),
+            vec![ScanRoot::local(non_mirror_root)],
+            None,
+        );
+        assert!(
+            runtime_connector("omp")
+                .scan(&non_mirror_ctx)
+                .expect("apply OMP ownership boundary to non-mirror lookalike")
+                .is_empty(),
+            "a sanitized marker outside remotes/<source>/mirror must not claim OMP ownership"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn cass_omp_data_root_is_an_omp_only_live_override() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let omp_root = temp.path().join("custom-omp-store");
+    let shared_pi_root = temp.path().join("shared-agent");
+    write_omp_session(&omp_root, "omp-only-live-root", "OMP-only override");
+    write_omp_session(&shared_pi_root, "shared-pi-root", "Shared Pi override");
+
+    let _omp_root = EnvGuard::set("CASS_OMP_DATA_ROOT", omp_root.to_string_lossy());
+    let _shared_root = EnvGuard::set(
+        "PI_CODING_AGENT_DIR",
+        shared_pi_root.to_string_lossy(),
     );
-    let non_mirror_ctx = ScanContext::with_roots(
+    let _pi_sessions = EnvGuard::set("PI_SESSIONS_DIR", "");
+    let _omp_sessions = EnvGuard::set("PI_CODING_AGENT_SESSION_DIR", "");
+    let _config_dir = EnvGuard::set("PI_CONFIG_DIR", "");
+    let _profile = EnvGuard::set("OMP_PROFILE", "");
+    let _legacy_profile = EnvGuard::set("PI_PROFILE", "");
+    let _xdg_data_home = EnvGuard::set("XDG_DATA_HOME", "");
+
+    let detection = runtime_connector("omp").detect();
+    assert!(
+        detection.root_paths.iter().any(|root| root == &omp_root),
+        "the public OMP-only override must participate in live detection"
+    );
+
+    let ctx = ScanContext::with_roots(
         temp.path().join("cass-state"),
-        vec![ScanRoot::local(non_mirror_root)],
+        vec![
+            ScanRoot::local(omp_root.clone()),
+            ScanRoot::local(shared_pi_root.clone()),
+        ],
         None,
     );
-    assert!(
-        runtime_connector("omp")
-            .scan(&non_mirror_ctx)
-            .expect("apply OMP ownership boundary to non-mirror lookalike")
-            .is_empty(),
-        "an embedded sanitized marker outside remotes/<source>/mirror must not claim OMP ownership"
-    );
+    let omp_conversations = runtime_connector("omp")
+        .scan(&ctx)
+        .expect("scan the OMP-only override");
+    let pi_conversations = runtime_connector("pi_agent")
+        .scan(&ctx)
+        .expect("scan the ambiguous shared Pi override");
+
+    assert!(omp_conversations.iter().any(|conversation| {
+        conversation.external_id.as_deref() == Some("omp-only-live-root")
+    }));
+    assert!(!omp_conversations.iter().any(|conversation| {
+        conversation.external_id.as_deref() == Some("shared-pi-root")
+    }));
+    assert!(pi_conversations.iter().any(|conversation| {
+        conversation.external_id.as_deref() == Some("shared-pi-root")
+    }));
+    assert!(!pi_conversations.iter().any(|conversation| {
+        conversation.external_id.as_deref() == Some("omp-only-live-root")
+    }));
 }
 
 #[test]

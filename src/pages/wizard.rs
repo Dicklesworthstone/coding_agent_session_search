@@ -3,7 +3,7 @@ use console::{Term, style};
 use dialoguer::{Confirm, Input, MultiSelect, Password, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -16,12 +16,13 @@ use crate::pages::confirmation::{
 };
 use crate::pages::deploy_cloudflare::{CloudflareConfig, CloudflareDeployer};
 use crate::pages::deploy_github::GitHubDeployer;
-use crate::pages::docs::{DocConfig, DocumentationGenerator};
-use crate::pages::encrypt::EncryptionEngine;
+use crate::pages::docs::{ArchiveMode, DocConfig, DocumentationGenerator};
+use crate::pages::encrypt::{EncryptionConfig, EncryptionEngine};
 use crate::pages::export::{ExportEngine, ExportFilter, PathMode};
 use crate::pages::password::{PasswordStrength, format_strength_inline, validate_password};
 use crate::pages::secret_scan::{
-    SecretScanConfig, SecretScanFilters, print_human_report, wizard_secret_scan,
+    SecretScanConfig, SecretScanFilters, print_human_report, scan_staged_export_database,
+    wizard_secret_scan,
 };
 use crate::pages::size::{BundleVerifier, SizeEstimate, SizeLimitResult};
 use crate::pages::summary::{
@@ -178,6 +179,79 @@ fn truncate_sample_title(title: &str) -> String {
         format!("{}...", &title[..title.floor_char_boundary(27)])
     } else {
         title.to_string()
+    }
+}
+
+fn documentation_summary(
+    summary: &PrePublishSummary,
+    encryption_config: Option<&EncryptionConfig>,
+) -> (PrePublishSummary, ArchiveMode) {
+    let mut summary = summary.clone();
+    match encryption_config {
+        Some(config) => {
+            summary.set_encryption_config(&config.key_slots);
+            (summary, ArchiveMode::Encrypted)
+        }
+        None => {
+            summary.encryption_config = None;
+            summary.key_slots.clear();
+            (summary, ArchiveMode::Unencrypted)
+        }
+    }
+}
+
+fn wizard_archive_description(no_encryption: bool) -> &'static str {
+    if no_encryption {
+        "Create a searchable web archive without encryption. Published content will be plaintext."
+    } else {
+        "Create an encrypted, searchable web archive of your AI coding agent conversations."
+    }
+}
+
+fn archive_size_summary_line(no_encryption: bool, estimated_size_bytes: usize) -> String {
+    if no_encryption {
+        "  Archive Size:  calculated from the final unencrypted SQLite file after export"
+            .to_string()
+    } else {
+        format!(
+            "  Archive Size:  ~{} (estimated, compressed + encrypted)",
+            format_size(estimated_size_bytes)
+        )
+    }
+}
+
+fn summary_security_lines(no_encryption: bool, planned_key_slots: usize) -> [String; 3] {
+    if no_encryption {
+        [
+            "Encryption: Disabled (public plaintext)".to_string(),
+            "Key Derivation: Not applicable".to_string(),
+            "Key Slots: 0".to_string(),
+        ]
+    } else {
+        [
+            "Encryption: AES-256-GCM".to_string(),
+            "Key Derivation: Argon2id".to_string(),
+            format!("Planned Key Slots: {planned_key_slots}"),
+        ]
+    }
+}
+
+fn require_verified_manual_deployment(term: &mut Term, site_dir: &Path) -> Result<()> {
+    match crate::pages::verify::ensure_valid_bundle(site_dir, false) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            writeln!(term)?;
+            writeln!(
+                term,
+                "  {} Manual deployment is blocked because the bundle no longer passes full verification.",
+                style("✗").red()
+            )?;
+            writeln!(term, "  Rebuild the export before attempting to deploy it.")?;
+            Err(error).context(format!(
+                "Refusing to recommend manual deployment of invalid Pages bundle at {}",
+                site_dir.display()
+            ))
+        }
     }
 }
 
@@ -375,7 +449,8 @@ impl PagesWizard {
         )?;
         writeln!(
             term,
-            "Create an encrypted, searchable web archive of your AI coding agent conversations."
+            "{}",
+            wizard_archive_description(self.no_encryption_mode)
         )?;
         writeln!(term)?;
         Ok(())
@@ -506,9 +581,14 @@ impl PagesWizard {
         Ok(())
     }
 
-    fn step_secret_scan(&mut self, term: &mut Term, theme: &ColorfulTheme) -> Result<()> {
+    fn step_secret_scan(&mut self, term: &mut Term, _theme: &ColorfulTheme) -> Result<()> {
         writeln!(term, "\n{}", style("Step 2 of 9: Secret Scan").bold())?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
+        writeln!(
+            term,
+            "  {} Preliminary source review; the exact staged export will be scanned again before encryption.",
+            style("ℹ").blue()
+        )?;
 
         let since_ts = self
             .state
@@ -549,16 +629,13 @@ impl PagesWizard {
         if report.summary.has_critical {
             writeln!(
                 term,
-                "  {} Critical secrets detected. Export is blocked without acknowledgement.",
-                style("✗").red()
+                "  {} Critical findings are present in this preliminary review.",
+                style("⚠").yellow()
             )?;
-            let ack: String = Input::with_theme(theme)
-                .with_prompt("Type \"I UNDERSTAND\" to proceed")
-                .interact_text()?;
-            if ack.trim() != "I UNDERSTAND" {
-                bail!("Export cancelled due to critical secrets");
-            }
-            writeln!(term, "  {} Acknowledged", style("✓").green())?;
+            writeln!(
+                term,
+                "  Configuration may continue, but only the later exact staged-artifact scan can authorize encryption or publication."
+            )?;
         }
 
         Ok(())
@@ -748,7 +825,11 @@ impl PagesWizard {
 
         // Generate comprehensive summary from database
         writeln!(term, "\n  Generating summary...")?;
-        let summary = self.generate_prepublish_summary()?;
+        let mut summary = self.generate_prepublish_summary()?;
+        if self.no_encryption_mode {
+            summary.encryption_config = None;
+            summary.key_slots.clear();
+        }
         self.state.last_summary = Some(summary.clone());
 
         // Display content overview
@@ -772,8 +853,11 @@ impl PagesWizard {
         )?;
         writeln!(
             term,
-            "  Archive Size:  ~{} (estimated, compressed + encrypted)",
-            style(format_size(summary.estimated_size_bytes)).yellow()
+            "{}",
+            archive_size_summary_line(
+                self.no_encryption_mode,
+                summary.estimated_size_bytes
+            )
         )?;
 
         // Display date range
@@ -882,32 +966,30 @@ impl PagesWizard {
         // Display security status
         writeln!(term, "\n{}", style("🔒 SECURITY").bold().cyan())?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
-        if let Some(enc) = &summary.encryption_config {
-            writeln!(term, "  Encryption: {}", enc.algorithm)?;
-            writeln!(term, "  Key Derivation: {}", enc.key_derivation)?;
-            writeln!(term, "  Key Slots: {}", enc.key_slot_count)?;
-        } else {
-            writeln!(term, "  Encryption: AES-256-GCM")?;
-            writeln!(term, "  Key Derivation: Argon2id")?;
+        let planned_key_slots = usize::from(self.state.password.is_some())
+            + usize::from(self.state.generate_recovery);
+        for line in summary_security_lines(self.no_encryption_mode, planned_key_slots) {
+            writeln!(term, "  {line}")?;
         }
 
-        // Secret scan status
-        let secret_status = if summary.secret_scan.total_findings == 0 {
-            style("✓ No secrets detected".to_string()).green()
-        } else if summary.secret_scan.has_critical {
+        // This display reflects the preliminary source scan from Step 2. The
+        // exact staged-artifact scan remains the publication authority later.
+        let secret_status = if self.state.secret_scan_count == 0 {
+            style("✓ No potential secrets detected".to_string()).green()
+        } else if self.state.secret_scan_has_critical {
             style(format!(
                 "⚠️  {} issues (CRITICAL)",
-                summary.secret_scan.total_findings
+                self.state.secret_scan_count
             ))
             .red()
         } else {
             style(format!(
                 "⚠️  {} issues found",
-                summary.secret_scan.total_findings
+                self.state.secret_scan_count
             ))
             .yellow()
         };
-        writeln!(term, "  Secret Scan: {}", secret_status)?;
+        writeln!(term, "  Preliminary Secret Scan: {}", secret_status)?;
 
         // Configuration summary
         writeln!(term, "\n{}", style("⚙️  CONFIGURATION").bold().cyan())?;
@@ -1109,9 +1191,12 @@ impl PagesWizard {
         };
 
         let config = ConfirmationConfig {
-            has_secrets: self.state.secret_scan_has_findings,
-            has_critical_secrets: self.state.secret_scan_has_critical,
-            secret_count: self.state.secret_scan_count,
+            // Step 2 inspected a mutable live source and is informational only.
+            // Secret-risk approval is intentionally absent here: execute_export
+            // scans and gates the exact staged artifact after filtering/export.
+            has_secrets: false,
+            has_critical_secrets: false,
+            secret_count: 0,
             target_domain,
             is_remote_publish: self.state.target != DeployTarget::Local,
             password_entropy_bits: self.state.password_entropy_bits,
@@ -1180,7 +1265,7 @@ impl PagesWizard {
 
         writeln!(
             term,
-            "\n  {} All safety checks completed",
+            "\n  {} Pre-export confirmations completed; exact staged-artifact scan remains",
             style("✓").green()
         )?;
         Ok(true)
@@ -1627,16 +1712,21 @@ impl PagesWizard {
             },
         };
 
-        let engine = ExportEngine::new(&self.state.db_path, &export_db_path, filter);
+        let engine = ExportEngine::new(&self.state.db_path, &export_db_path, filter)
+            .with_exclusions(self.state.exclusions.clone());
         let running = Arc::new(AtomicBool::new(true));
 
-        let stats = engine.execute(
+        let staged_scan_config = SecretScanConfig::from_inputs(&[], &[])?;
+        let (stats, staged_secret_scan) = engine.execute_verified(
             |current, total| {
                 if total > 0 {
                     pb.set_message(format!("Exporting... {}/{} conversations", current, total));
                 }
             },
             Some(running),
+            |staged_db_path| {
+                scan_staged_export_database(staged_db_path, &staged_scan_config)
+            },
         )?;
 
         pb.finish_with_message(format!(
@@ -1644,8 +1734,41 @@ impl PagesWizard {
             stats.conversations_processed, stats.messages_processed
         ));
 
+        writeln!(term)?;
+        writeln!(
+            term,
+            "  {} Exact staged-export secret scan",
+            style("🔒").cyan()
+        )?;
+        print_human_report(term, &staged_secret_scan.report, 3)?;
+        self.state.secret_scan_has_findings = staged_secret_scan.report.summary.total > 0;
+        self.state.secret_scan_has_critical = staged_secret_scan.report.summary.has_critical;
+        self.state.secret_scan_count = staged_secret_scan.report.summary.total;
+
+        if staged_secret_scan.report.summary.total > 0 {
+            writeln!(
+                term,
+                "  Artifact SHA-256: {}",
+                style(&staged_secret_scan.artifact_sha256).dim()
+            )?;
+            let theme = ColorfulTheme::default();
+            let acknowledgment: String = Input::with_theme(&theme)
+                .with_prompt(
+                    "Type exactly \"I understand the risks\" to encrypt/publish this staged artifact",
+                )
+                .interact_text()?;
+            if acknowledgment.trim() != "I understand the risks" {
+                bail!("Export cancelled: exact staged secret findings were not acknowledged");
+            }
+            writeln!(
+                term,
+                "  {} Exact staged artifact acknowledged",
+                style("✓").green()
+            )?;
+        }
+
         // Phase 2: Encryption (skip if no_encryption mode)
-        if self.no_encryption_mode {
+        let encryption_config = if self.no_encryption_mode {
             writeln!(term)?;
             writeln!(
                 term,
@@ -1672,6 +1795,7 @@ impl PagesWizard {
                 &config_path,
                 serde_json::to_string_pretty(&config)?.as_bytes(),
             )?;
+            None
         } else {
             let pb2 = ProgressBar::new_spinner();
             let spinner_style = ProgressStyle::default_spinner()
@@ -1707,10 +1831,12 @@ impl PagesWizard {
             }
 
             // Encrypt the database
-            enc_engine.encrypt_file(&export_db_path, &encrypted_dir, |_, _| {})?;
+            let encryption_config =
+                enc_engine.encrypt_file(&export_db_path, &encrypted_dir, |_, _| {})?;
 
             pb2.finish_with_message("✓ Encryption complete");
-        }
+            Some(encryption_config)
+        };
 
         // Phase 3: Build static site bundle
         let pb3 = ProgressBar::new_spinner();
@@ -1723,6 +1849,8 @@ impl PagesWizard {
 
         // Generate documentation
         let generated_docs = if let Some(ref summary) = self.state.last_summary {
+            let (documentation_summary, archive_mode) =
+                documentation_summary(summary, encryption_config.as_ref());
             // Determine target URL based on deployment target
             // Note: GitHub Pages URL requires the username which isn't known until deployment,
             // so we omit the URL for that target. The actual URL will be shown after deployment.
@@ -1736,13 +1864,21 @@ impl PagesWizard {
                 DeployTarget::Local => None,
             };
 
-            let doc_config = if let Some(url) = target_url {
+            let mut doc_config = if let Some(url) = target_url {
                 DocConfig::new().with_url(url)
             } else {
                 DocConfig::new()
-            };
+            }
+            .with_archive_mode(archive_mode);
+            if let Some(config) = encryption_config.as_ref() {
+                doc_config = doc_config.with_argon_params(
+                    config.kdf_defaults.memory_kb,
+                    config.kdf_defaults.iterations,
+                    config.kdf_defaults.parallelism,
+                );
+            }
 
-            let doc_generator = DocumentationGenerator::new(doc_config, summary.clone());
+            let doc_generator = DocumentationGenerator::new(doc_config, documentation_summary);
             doc_generator.generate_all()
         } else {
             Vec::new()
@@ -1766,6 +1902,8 @@ impl PagesWizard {
             builder.build(&encrypted_dir, &self.state.output_dir, |phase, msg| {
                 pb3.set_message(format!("{}: {}", phase, msg));
             })?;
+        crate::pages::verify::ensure_valid_bundle(&bundle_result.site_dir, false)
+            .context("Completed Pages bundle failed full verification")?;
         self.state.final_site_dir = Some(bundle_result.site_dir.clone());
 
         pb3.finish_with_message(format!(
@@ -1908,9 +2046,16 @@ impl PagesWizard {
                 match deployer.check_prerequisites() {
                     Ok(prereqs) if prereqs.is_ready() => {
                         // Deploy with progress output
-                        match deployer.deploy(&site_dir, |_phase, msg| {
-                            let _ = writeln!(term, "    {} {}", style("•").dim(), msg);
-                        }) {
+                        match crate::pages::verify::with_verified_bundle_for_deployment(
+                            &site_dir,
+                            false,
+                            |verified_site_dir| {
+                                deployer.deploy(verified_site_dir, |_phase, msg| {
+                                    let _ =
+                                        writeln!(term, "    {} {}", style("•").dim(), msg);
+                                })
+                            },
+                        ) {
                             Ok(result) => {
                                 writeln!(term)?;
                                 writeln!(
@@ -1929,12 +2074,22 @@ impl PagesWizard {
                             Err(e) => {
                                 writeln!(term)?;
                                 writeln!(term, "  {} Deployment failed: {}", style("✗").red(), e)?;
+                                if let Err(verification_error) =
+                                    require_verified_manual_deployment(term, &site_dir)
+                                {
+                                    return Err(e).context(format!(
+                                        "GitHub Pages deployment failed and manual deployment is blocked: {verification_error:#}"
+                                    ));
+                                }
                                 writeln!(term)?;
                                 writeln!(
                                     term,
                                     "To deploy manually, push the {} directory to a gh-pages branch.",
                                     site_dir.display()
                                 )?;
+                                return Err(e).context(
+                                    "GitHub Pages bundle verification or deployment failed",
+                                );
                             }
                         }
                     }
@@ -1950,6 +2105,7 @@ impl PagesWizard {
                             term,
                             "Please install/configure the missing tools and try again."
                         )?;
+                        require_verified_manual_deployment(term, &site_dir)?;
                         writeln!(
                             term,
                             "To deploy manually after fixing prerequisites, push the {} directory to a gh-pages branch.",
@@ -1964,6 +2120,7 @@ impl PagesWizard {
                             style("⚠").yellow(),
                             e
                         )?;
+                        require_verified_manual_deployment(term, &site_dir)?;
                         writeln!(term)?;
                         writeln!(
                             term,
@@ -1998,9 +2155,16 @@ impl PagesWizard {
                 match deployer.check_prerequisites() {
                     Ok(prereqs) if prereqs.is_ready() => {
                         // Deploy with progress output
-                        match deployer.deploy(&site_dir, |_phase, msg| {
-                            let _ = writeln!(term, "    {} {}", style("•").dim(), msg);
-                        }) {
+                        match crate::pages::verify::with_verified_bundle_for_deployment(
+                            &site_dir,
+                            false,
+                            |verified_site_dir| {
+                                deployer.deploy(verified_site_dir, |_phase, msg| {
+                                    let _ =
+                                        writeln!(term, "    {} {}", style("•").dim(), msg);
+                                })
+                            },
+                        ) {
                             Ok(result) => {
                                 writeln!(term)?;
                                 writeln!(
@@ -2021,6 +2185,13 @@ impl PagesWizard {
                             Err(e) => {
                                 writeln!(term)?;
                                 writeln!(term, "  {} Deployment failed: {}", style("✗").red(), e)?;
+                                if let Err(verification_error) =
+                                    require_verified_manual_deployment(term, &site_dir)
+                                {
+                                    return Err(e).context(format!(
+                                        "Cloudflare Pages deployment failed and manual deployment is blocked: {verification_error:#}"
+                                    ));
+                                }
                                 writeln!(term)?;
                                 writeln!(
                                     term,
@@ -2037,6 +2208,9 @@ impl PagesWizard {
                                     ))
                                     .dim()
                                 )?;
+                                return Err(e).context(
+                                    "Cloudflare Pages bundle verification or deployment failed",
+                                );
                             }
                         }
                     }
@@ -2047,6 +2221,7 @@ impl PagesWizard {
                         for item in &missing {
                             writeln!(term, "    {} {}", style("•").dim(), item)?;
                         }
+                        require_verified_manual_deployment(term, &site_dir)?;
                         writeln!(term)?;
                         writeln!(term, "To deploy manually after meeting prerequisites:")?;
                         writeln!(
@@ -2068,6 +2243,7 @@ impl PagesWizard {
                             style("⚠").yellow(),
                             e
                         )?;
+                        require_verified_manual_deployment(term, &site_dir)?;
                         writeln!(term)?;
                         writeln!(
                             term,
@@ -2158,6 +2334,134 @@ mod tests {
                 "warning": "UNENCRYPTED - All content is publicly readable"
             })
         );
+    }
+
+    #[test]
+    fn manual_deployment_fallback_rechecks_mutated_bundle() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let archive_dir = temp.path().join("archive");
+        let payload_dir = archive_dir.join("payload");
+        std::fs::create_dir_all(&payload_dir)?;
+        let payload = b"SQLite format 3\0test archive bytes";
+        std::fs::write(payload_dir.join("data.db"), payload)?;
+        std::fs::write(
+            archive_dir.join("config.json"),
+            serde_json::to_vec_pretty(&unencrypted_bundle_config(payload.len() as u64))?,
+        )?;
+
+        let output_dir = temp.path().join("bundle");
+        let bundle = BundleBuilder::new().build(&archive_dir, &output_dir, |_, _| {})?;
+        let mut term = Term::buffered_stderr();
+        require_verified_manual_deployment(&mut term, &bundle.site_dir)?;
+
+        std::fs::write(
+            bundle.site_dir.join("recovery-secret.txt"),
+            b"post-build private material",
+        )?;
+        let error = require_verified_manual_deployment(&mut term, &bundle.site_dir)
+            .expect_err("mutated bundle must block manual-deployment guidance");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("Refusing to recommend manual deployment"));
+        assert!(message.contains("no_secrets_in_site"));
+        Ok(())
+    }
+
+    #[test]
+    fn documentation_uses_key_slots_from_the_emitted_encryption_config() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("export.db");
+        let encrypted_dir = temp.path().join("encrypted");
+        std::fs::write(&input, b"committed export bytes")?;
+
+        let mut engine = EncryptionEngine::new(1024)?;
+        engine.add_password_slot("correct horse battery staple")?;
+        engine.add_recovery_slot(&[7_u8; 32])?;
+        let emitted = engine.encrypt_file(&input, &encrypted_dir, |_, _| {})?;
+
+        let summary = PrePublishSummary {
+            total_conversations: 0,
+            total_messages: 0,
+            total_characters: 0,
+            estimated_size_bytes: 0,
+            earliest_timestamp: None,
+            latest_timestamp: None,
+            date_histogram: Vec::new(),
+            workspaces: Vec::new(),
+            agents: Vec::new(),
+            secret_scan: Default::default(),
+            encryption_config: None,
+            key_slots: Vec::new(),
+            generated_at: chrono::Utc::now(),
+        };
+
+        let (documented, mode) = documentation_summary(&summary, Some(&emitted));
+        assert_eq!(mode, ArchiveMode::Encrypted);
+        assert_eq!(documented.key_slots.len(), emitted.key_slots.len());
+        assert_eq!(documented.key_slots.len(), 2);
+        assert_eq!(
+            documented.key_slots[0].slot_type,
+            crate::pages::summary::KeySlotType::Password
+        );
+        assert_eq!(
+            documented.key_slots[1].slot_type,
+            crate::pages::summary::KeySlotType::Recovery
+        );
+        assert_eq!(
+            documented
+                .encryption_config
+                .as_ref()
+                .map(|config| config.key_slot_count),
+            Some(2)
+        );
+
+        let security_doc = DocumentationGenerator::new(
+            DocConfig::new()
+                .with_archive_mode(mode)
+                .with_argon_params(
+                    emitted.kdf_defaults.memory_kb,
+                    emitted.kdf_defaults.iterations,
+                    emitted.kdf_defaults.parallelism,
+                ),
+            documented.clone(),
+        )
+        .generate_security_doc();
+        assert!(security_doc.content.contains(&format!(
+            "m={}KB, t={}, p={}",
+            emitted.kdf_defaults.memory_kb,
+            emitted.kdf_defaults.iterations,
+            emitted.kdf_defaults.parallelism
+        )));
+
+        let (unencrypted, mode) = documentation_summary(&documented, None);
+        assert_eq!(mode, ArchiveMode::Unencrypted);
+        assert!(unencrypted.key_slots.is_empty());
+        assert!(unencrypted.encryption_config.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn unencrypted_summary_copy_never_claims_encrypted_output() {
+        assert!(wizard_archive_description(true).contains("plaintext"));
+
+        let size_line = archive_size_summary_line(true, 1_048_576);
+        assert!(size_line.contains("final unencrypted SQLite file"));
+        assert!(!size_line.contains("compressed + encrypted"));
+
+        let security_lines = summary_security_lines(true, 2).join("\n");
+        assert!(security_lines.contains("Encryption: Disabled (public plaintext)"));
+        assert!(security_lines.contains("Key Derivation: Not applicable"));
+        assert!(security_lines.contains("Key Slots: 0"));
+        assert!(!security_lines.contains("AES-256-GCM"));
+        assert!(!security_lines.contains("Argon2id"));
+    }
+
+    #[test]
+    fn encrypted_summary_copy_reports_planned_slots() {
+        let security_lines = summary_security_lines(false, 2).join("\n");
+        assert!(security_lines.contains("Encryption: AES-256-GCM"));
+        assert!(security_lines.contains("Key Derivation: Argon2id"));
+        assert!(security_lines.contains("Planned Key Slots: 2"));
     }
 
     // =========================

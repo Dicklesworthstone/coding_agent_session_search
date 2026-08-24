@@ -375,7 +375,7 @@ Ingests history from 26 local agents, normalizing them into a unified `Conversat
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
 - **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
 - **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content)
-- **Oh My Pi (`omp`)**: OMP v18's default `~/.omp/agent/sessions`, named profiles under `~/.omp/profiles/<name>/agent/sessions`, XDG stores under `$XDG_DATA_HOME/omp`, and explicit session/agent-directory overrides (pi-family JSONL, including per-session sub-agent transcripts)
+- **Oh My Pi (`omp`)**: OMP v18's default `~/.omp/agent/sessions`, named profiles under `~/.omp/profiles/<name>/agent/sessions`, XDG stores under `$XDG_DATA_HOME/omp`, and explicit OMP-only archive roots via `CASS_OMP_DATA_ROOT` (pi-family JSONL, including per-session sub-agent transcripts)
 - **GitHub Copilot Chat**: VS Code global storage under `github.copilot-chat` (JSON)
 - **Copilot CLI**: `~/.copilot/session-state`, legacy `~/.copilot/history-session-state`, and `gh copilot` config paths (JSONL/JSON)
 - **OpenClaw**: `~/.openclaw/agents/*/sessions` (Session JSONL)
@@ -407,9 +407,9 @@ that the conversation body is unavailable.
 agent identity throughout search, analytics, resume, TUI, and HTML export:
 - **Default and profiles**: `~/.omp/agent/sessions/` and `~/.omp/profiles/<name>/agent/sessions/`; `OMP_PROFILE` selects a profile and takes precedence over legacy `PI_PROFILE`
 - **XDG**: `$XDG_DATA_HOME/omp/sessions/` and `$XDG_DATA_HOME/omp/profiles/<name>/sessions/` when the OMP XDG root exists
-- **Overrides**: `PI_CODING_AGENT_SESSION_DIR` names the exact OMP sessions directory; `PI_CODING_AGENT_DIR` names the agent directory when no named profile is active; `PI_CONFIG_DIR` changes the home-relative `.omp` config directory name
-- **Resume**: named-profile results use `omp --profile <name> --resume <id>`; default XDG and explicit-root results preserve their store with `omp --session-dir <dir> --resume <id>`
-- **Upgrade behavior**: archives created by older cass versions are reclassified once from `pi_agent` to `omp` for canonical `.omp/agent` paths, then the derived lexical index and analytics are rebuilt so a transcript cannot remain attributed to both agents
+- **Overrides and ownership**: `PI_CODING_AGENT_SESSION_DIR` names the exact OMP sessions directory. `CASS_OMP_DATA_ROOT` declares an OMP-only archive/store root and is the right choice for copied, mounted, or custom OMP data. `PI_CODING_AGENT_DIR` is shared by both pi-family programs, so CASS conservatively keeps otherwise-ambiguous paths under that root owned by Pi-Agent; use one of the OMP-specific variables when OMP identity matters. `PI_CONFIG_DIR` changes the home-relative `.omp` config directory name.
+- **Resume**: results in the current live home/config store use `omp [--profile <name>] --resume <id>`; copied profiles, XDG archives, remote mirrors, and explicit roots also carry `--session-dir <dir>` so a canonical-looking archive cannot reopen a different live store
+- **Upgrade behavior**: archives created by older cass versions are reclassified from `pi_agent` to `omp` using the same conservative canonical/XDG/remote-mirror ownership policy as live discovery, then the derived lexical index and analytics are rebuilt so a transcript cannot remain attributed to both agents. The conventional `~/.local/share/omp` shape is durable path evidence; an arbitrary historical custom `$XDG_DATA_HOME/omp` path is reclassified only while that root is currently configured and resolvable. Without provider-qualified evidence, ambiguous historical paths fail closed as Pi-Agent rather than letting a generic `.../omp/sessions` directory steal ownership.
 
 **OpenCode** reads SQLite databases from workspace directories:
 - **Location**: `.opencode/` directories (scans recursively from home)
@@ -3057,8 +3057,9 @@ Update check state is stored in the data directory:
 | `CODING_AGENT_SEARCH_NO_UPDATE_PROMPT` | unset | Disable update notifications |
 | **Connector Overrides** | | |
 | `CASS_AIDER_DATA_ROOT` | `~/.aider.chat.history.md` | Aider history location |
+| `CASS_OMP_DATA_ROOT` | unset | OMP-only archive/store root; assigns OMP identity and preserves the exact sessions root for resume |
 | `PI_SESSIONS_DIR` | unset | Exact Pi-Agent sessions directory |
-| `PI_CODING_AGENT_DIR` | unset | Pi-Agent agent home; also the OMP agent-directory override when no named OMP profile is active |
+| `PI_CODING_AGENT_DIR` | unset | Shared pi-family agent home; ambiguous paths remain Pi-Agent-owned in CASS (use `CASS_OMP_DATA_ROOT` for OMP-only ownership) |
 | `PI_CODING_AGENT_SESSION_DIR` | unset | Exact OMP sessions directory |
 | `OMP_PROFILE` | unset | Active OMP profile; takes precedence over `PI_PROFILE` |
 | `PI_PROFILE` | unset | Legacy OMP profile selector when `OMP_PROFILE` is unset |

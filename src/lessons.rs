@@ -8,18 +8,20 @@
 //! knowledge easy to reuse and hard to lose once session logs grow huge. This
 //! module is the **metadata-first record contract and graph core**: it defines
 //! the durable [`LessonRecord`], computes a content-stable [`LessonRecord::lesson_id`]
-//! (so the same lesson dedupes across runs), and resolves
-//! supersession/staleness within a topic — independent of *how* lessons are
-//! sourced.
+//! (so the same lesson dedupes across runs), and resolves supersession/staleness
+//! within a topic — independent of *how* lessons are sourced. Failed approaches
+//! are retired only by related, fresher reusable decisions on the same topic;
+//! independent current lessons can coexist within a topic.
 //!
-//! ## Redaction boundary (no raw leakage by construction)
+//! ## Redaction trust boundary
 //!
-//! This module **never ingests raw private text**. A [`LessonCandidate`] carries
-//! only an already-`redacted_summary` produced by the extraction/redaction layer
-//! (a separate, reviewed step). There is no field on a candidate or record that
-//! holds raw prompt/session text, so this core cannot leak it — the
-//! redaction policy and the session/commit/bead-artifact mining that fills
-//! candidates are a follow-up that builds on this contract.
+//! Every string-bearing [`LessonCandidate`] field is expected to come from the
+//! reviewed extraction/redaction layer. This graph core does not inspect or
+//! re-redact those strings; it preserves the supplied topic, project,
+//! provenance, applicability, and summary metadata. Production callers must
+//! therefore cross [`crate::lessons_extraction::extract`] before building a
+//! graph. Keeping that boundary explicit avoids implying that the Rust type
+//! alone can distinguish redacted text from raw private text.
 
 use serde::{Deserialize, Serialize};
 
@@ -82,9 +84,9 @@ impl LessonConfidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LessonStatus {
-    /// Current best lesson for its topic.
+    /// Current, independently useful lesson.
     Active,
-    /// Replaced by a fresher lesson on the same topic.
+    /// Failed approach replaced by a related, fresher reusable decision.
     Superseded,
     /// Known to be out of date (advice no longer applies).
     Outdated,
@@ -106,7 +108,8 @@ impl LessonStatus {
 /// private text; this module stores exactly what it is given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LessonCandidate {
-    /// Topic the lesson is about (the dedup/supersession key, with `project`).
+    /// Topic the lesson is about (used with `project` when retiring failed
+    /// approaches).
     pub topic: String,
     /// Project the lesson belongs to.
     pub project: String,
@@ -172,6 +175,63 @@ pub fn stable_lesson_id(topic: &str, project: &str, kind: LessonKind, summary: &
     format!("lsn-{}", &hex[..16])
 }
 
+fn significant_summary_tokens(summary: &str) -> std::collections::BTreeSet<String> {
+    summary
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| {
+            token.len() >= 4
+                && token.bytes().any(|byte| byte.is_ascii_alphabetic())
+                && !matches!(
+                    token.as_str(),
+                    "about"
+                        | "after"
+                        | "before"
+                        | "change"
+                        | "commit"
+                        | "does"
+                        | "digest"
+                        | "email"
+                        | "failed"
+                        | "failure"
+                        | "fixed"
+                        | "fixes"
+                        | "from"
+                        | "have"
+                        | "home"
+                        | "into"
+                        | "invalid"
+                        | "issue"
+                        | "landed"
+                        | "lesson"
+                        | "must"
+                        | "proof"
+                        | "redacted"
+                        | "should"
+                        | "that"
+                        | "this"
+                        | "using"
+                        | "were"
+                        | "when"
+                        | "where"
+                        | "which"
+                        | "while"
+                        | "will"
+                        | "with"
+                        | "without"
+                        | "work"
+                        | "works"
+                )
+        })
+        .collect()
+}
+
+fn summaries_share_replacement_context(left: &str, right: &str) -> bool {
+    let left = significant_summary_tokens(left);
+    let right = significant_summary_tokens(right);
+    left.intersection(&right).take(2).count() >= 2
+}
+
 impl LessonRecord {
     /// Build a record from a candidate, computing the stable id and normalizing
     /// provenance (deduped + sorted). Status starts `Outdated` if the candidate
@@ -215,9 +275,9 @@ impl LessonRecord {
 pub struct LessonsSummary {
     /// Total distinct lessons after dedup.
     pub total: usize,
-    /// Active (current best per topic).
+    /// Active, non-outdated lessons.
     pub active: usize,
-    /// Superseded by a fresher lesson on the same topic.
+    /// Failed approaches superseded by a related fresher reusable decision.
     pub superseded: usize,
     /// Explicitly outdated.
     pub outdated: usize,
@@ -236,9 +296,10 @@ pub struct LessonGraph {
 
 impl LessonGraph {
     /// Build a graph from candidates: dedupe by stable id (merging provenance
-    /// refs and keeping the freshest metadata), then resolve supersession so
-    /// that for each (topic, project) the single freshest non-outdated lesson is
-    /// `Active` and older ones become `Superseded`. Pure and deterministic.
+    /// refs and keeping the freshest metadata), then retire failed approaches
+    /// that have a strictly fresher reusable decision on the same (topic,
+    /// project) with at least two shared significant summary tokens. Independent
+    /// non-outdated lessons remain `Active`. Pure and deterministic.
     pub fn build(candidates: Vec<LessonCandidate>) -> Self {
         use std::collections::BTreeMap;
 
@@ -249,12 +310,12 @@ impl LessonGraph {
             by_id
                 .entry(record.lesson_id.clone())
                 .and_modify(|existing| {
-                    for r in &record.source_refs {
-                        if !existing.source_refs.contains(r) {
-                            existing.source_refs.push(r.clone());
-                        }
-                    }
+                    existing.source_refs.extend(record.source_refs.iter().cloned());
                     existing.source_refs.sort();
+                    existing.source_refs.dedup();
+                    existing.applies_to.extend(record.applies_to.iter().cloned());
+                    existing.applies_to.sort();
+                    existing.applies_to.dedup();
                     if record.freshness_ms > existing.freshness_ms {
                         existing.freshness_ms = record.freshness_ms;
                     }
@@ -272,32 +333,39 @@ impl LessonGraph {
 
         let mut lessons: Vec<LessonRecord> = by_id.into_values().collect();
 
-        // 2) Supersession: per (topic, project), the freshest non-outdated
-        //    lesson stays Active; older non-outdated ones become Superseded.
-        let mut freshest: BTreeMap<(String, String), (u64, String)> = BTreeMap::new();
+        // 2) Supersession is deliberately narrow. A topic is a coarse classifier,
+        //    not an identity key, so distinct current lessons on one topic must
+        //    coexist. Only a failed approach with a strictly fresher reusable
+        //    decision and meaningful summary overlap is known to be replaced.
+        let mut landed_decisions: BTreeMap<(String, String), Vec<(u64, String)>> = BTreeMap::new();
         for l in &lessons {
-            if l.status == LessonStatus::Outdated {
+            if l.status == LessonStatus::Outdated || l.kind != LessonKind::ReusableDecision {
                 continue;
             }
             let key = (l.topic.clone(), l.project.clone());
-            let entry = freshest
+            landed_decisions
                 .entry(key)
-                .or_insert((l.freshness_ms, l.lesson_id.clone()));
-            // Freshest wins; ties broken by lesson_id for determinism.
-            if l.freshness_ms > entry.0 || (l.freshness_ms == entry.0 && l.lesson_id < entry.1) {
-                *entry = (l.freshness_ms, l.lesson_id.clone());
-            }
+                .or_default()
+                .push((l.freshness_ms, l.summary.clone()));
         }
         for l in &mut lessons {
             if l.status == LessonStatus::Outdated {
                 continue;
             }
             let key = (l.topic.clone(), l.project.clone());
-            let is_active = freshest.get(&key).is_some_and(|(_, id)| id == &l.lesson_id);
-            l.status = if is_active {
-                LessonStatus::Active
-            } else {
+            let replaced_failed_approach = l.kind == LessonKind::FailedApproach
+                && landed_decisions
+                    .get(&key)
+                    .is_some_and(|decisions| {
+                        decisions.iter().any(|(freshness, summary)| {
+                            *freshness > l.freshness_ms
+                                && summaries_share_replacement_context(&l.summary, summary)
+                        })
+                    });
+            l.status = if replaced_failed_approach {
                 LessonStatus::Superseded
+            } else {
+                LessonStatus::Active
             };
         }
 
@@ -413,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn fresher_lesson_supersedes_older_on_same_topic() {
+    fn fresher_landed_lesson_supersedes_failed_approach_on_same_topic() {
         // A "failed workaround" replaced by a "high-confidence landed decision".
         let g = LessonGraph::build(vec![
             candidate(
@@ -440,6 +508,95 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].freshness_ms, 300);
         assert_eq!(active[0].kind, LessonKind::ReusableDecision);
+    }
+
+    #[test]
+    fn independent_lessons_on_same_topic_remain_active() {
+        let g = LessonGraph::build(vec![
+            candidate(
+                "search",
+                LessonKind::Gotcha,
+                LessonConfidence::High,
+                100,
+                "cursor pagination must preserve the stable tiebreak",
+                "commit-cursor",
+            ),
+            candidate(
+                "search",
+                LessonKind::ReusableDecision,
+                LessonConfidence::High,
+                300,
+                "hybrid search fails open to lexical",
+                "commit-hybrid",
+            ),
+        ]);
+
+        assert_eq!(g.summary.total, 2);
+        assert_eq!(g.summary.active, 2);
+        assert_eq!(g.summary.superseded, 0);
+        assert!(
+            g.lessons
+                .iter()
+                .all(|lesson| lesson.status == LessonStatus::Active)
+        );
+    }
+
+    #[test]
+    fn newer_gotcha_does_not_supersede_failed_approach() {
+        let g = LessonGraph::build(vec![
+            candidate(
+                "search",
+                LessonKind::FailedApproach,
+                LessonConfidence::High,
+                100,
+                "abandoned an unrelated remote cache experiment",
+                "bead-cache",
+            ),
+            candidate(
+                "search",
+                LessonKind::Gotcha,
+                LessonConfidence::High,
+                300,
+                "cursor pagination must preserve the stable tiebreak",
+                "commit-cursor",
+            ),
+        ]);
+
+        assert_eq!(g.summary.active, 2);
+        assert_eq!(g.summary.superseded, 0);
+    }
+
+    #[test]
+    fn one_shared_topical_word_does_not_supersede_unrelated_failed_approach() {
+        let g = LessonGraph::build(vec![
+            candidate(
+                "search",
+                LessonKind::FailedApproach,
+                LessonConfidence::High,
+                100,
+                "abandoned a search cache experiment after corruption",
+                "bead-cache",
+            ),
+            candidate(
+                "search",
+                LessonKind::ReusableDecision,
+                LessonConfidence::High,
+                300,
+                "hybrid search fails open to lexical",
+                "commit-hybrid",
+            ),
+        ]);
+
+        assert_eq!(g.summary.active, 2);
+        assert_eq!(g.summary.superseded, 0);
+    }
+
+    #[test]
+    fn redaction_placeholders_do_not_create_supersession_overlap() {
+        assert!(!summaries_share_replacement_context(
+            "failed at <home> for <email>",
+            "decision at <home> for <email>"
+        ));
     }
 
     #[test]
@@ -479,10 +636,10 @@ mod tests {
     }
 
     #[test]
-    fn record_stores_only_redacted_summary_no_raw_field_exists() {
-        // No-raw-leakage by construction: the record's only free-text field is
-        // the caller-provided redacted summary; nothing else carries text.
-        let c = candidate(
+    fn record_serializes_only_the_explicit_candidate_metadata() {
+        // Redaction is the caller's contract. The graph neither invents a hidden
+        // raw-text field nor claims to sanitize the explicit metadata itself.
+        let mut c = candidate(
             "topic",
             LessonKind::Gotcha,
             LessonConfidence::Low,
@@ -490,12 +647,63 @@ mod tests {
             "REDACTED-SUMMARY",
             "ref",
         );
+        c.applies_to.push("src/storage".to_string());
         let rec = LessonRecord::from_candidate(c);
         assert_eq!(rec.summary, "REDACTED-SUMMARY");
-        // Serialized form contains only the redacted summary as free text.
-        let json = serde_json::to_string(&rec).unwrap();
-        assert!(json.contains("REDACTED-SUMMARY"));
-        assert!(!json.to_lowercase().contains("raw"));
+        let value = serde_json::to_value(&rec).unwrap();
+        assert_eq!(value["summary"], "REDACTED-SUMMARY");
+        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "applies_to",
+                "confidence",
+                "freshness_ms",
+                "kind",
+                "lesson_id",
+                "project",
+                "schema_version",
+                "source_refs",
+                "status",
+                "summary",
+                "topic",
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_candidates_union_applicability_independent_of_input_order() {
+        let mut first = candidate(
+            "storage",
+            LessonKind::Gotcha,
+            LessonConfidence::Medium,
+            100,
+            "keep one logical transaction",
+            "bead-1",
+        );
+        first.applies_to = vec!["src/storage".to_string(), "src/indexer".to_string()];
+        let mut second = candidate(
+            "storage",
+            LessonKind::Gotcha,
+            LessonConfidence::High,
+            200,
+            "keep one logical transaction",
+            "commit-abc",
+        );
+        second.applies_to = vec!["src/storage".to_string(), "tests/storage".to_string()];
+
+        let forward = LessonGraph::build(vec![first.clone(), second.clone()]);
+        let reverse = LessonGraph::build(vec![second, first]);
+        assert_eq!(forward, reverse, "candidate order must not change the graph");
+        assert_eq!(
+            forward.lessons[0].applies_to,
+            vec![
+                "src/indexer".to_string(),
+                "src/storage".to_string(),
+                "tests/storage".to_string(),
+            ]
+        );
     }
 
     #[test]

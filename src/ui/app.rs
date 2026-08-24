@@ -22915,6 +22915,7 @@ fn export_session_task(
         syntax_highlighting: true,
         include_search: true,
         include_theme_toggle: true,
+        default_theme: "dark".to_string(),
         encrypt,
         print_styles: true,
         agent_name: Some(agent_name.to_string()),

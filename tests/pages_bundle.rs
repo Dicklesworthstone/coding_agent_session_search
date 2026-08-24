@@ -67,6 +67,22 @@ mod tests {
         "settings.js",
     ];
 
+    const EXPECTED_VENDOR_ASSETS: &[&str] = &[
+        "vendor/sqlite3.mjs",
+        "vendor/sqlite3.wasm",
+        "vendor/sqlite3-opfs-async-proxy.js",
+        "vendor/argon2.js",
+        "vendor/argon2-wasm.js",
+        "vendor/argon2.wasm",
+        "vendor/fflate.js",
+        "vendor/html5-qrcode.min.js",
+        "vendor/manifest.json",
+        "vendor/LICENSE-sqlite-wasm.txt",
+        "vendor/LICENSE-argon2-browser.txt",
+        "vendor/LICENSE-fflate.txt",
+        "vendor/LICENSE-html5-qrcode.txt",
+    ];
+
     #[test]
     fn test_bundle_creates_directory_structure() -> Result<()> {
         let temp = TempDir::new()?;
@@ -115,6 +131,12 @@ mod tests {
             assert!(
                 site_dir.join(*expected_asset).exists(),
                 "{expected_asset} should exist"
+            );
+        }
+        for expected_asset in EXPECTED_VENDOR_ASSETS {
+            assert!(
+                site_dir.join(*expected_asset).is_file(),
+                "{expected_asset} should be bundled as a regular file"
             );
         }
 
@@ -236,11 +258,11 @@ mod tests {
         // encrypted archive produced. Missing an imported module produces a
         // deployable bundle whose viewer fails only at browser runtime, so the
         // test names the complete asset set instead of checking a loose count.
+        let minimum_runtime_assets = EXPECTED_PAGE_ASSETS.len() + EXPECTED_VENDOR_ASSETS.len();
         assert!(
-            manifest.files.len() >= EXPECTED_PAGE_ASSETS.len(),
-            "integrity manifest must list at least the {} embedded \
-             PAGES_ASSETS + payload chunks; got {} entries: {:?}",
-            EXPECTED_PAGE_ASSETS.len(),
+            manifest.files.len() >= minimum_runtime_assets,
+            "integrity manifest must list at least the {minimum_runtime_assets} embedded \
+             first-party and vendor runtime assets plus payload chunks; got {} entries: {:?}",
             manifest.files.len(),
             manifest.files.keys().collect::<Vec<_>>()
         );
@@ -251,6 +273,12 @@ mod tests {
                  got keys: {:?}",
                 expected_asset,
                 manifest.files.keys().collect::<Vec<_>>()
+            );
+        }
+        for expected_asset in EXPECTED_VENDOR_ASSETS {
+            assert!(
+                manifest.files.contains_key(*expected_asset),
+                "integrity manifest must list pinned vendor asset `{expected_asset}`"
             );
         }
 
@@ -2352,8 +2380,9 @@ mod tests {
         let crypto_worker_js = include_str!("../src/pages_assets/crypto_worker.js");
         assert!(
             crypto_worker_js.contains("const plaintextChunks = [];")
-                && crypto_worker_js.contains("await decompressDeflate(new Uint8Array(decrypted))")
-                && crypto_worker_js.contains("const dbBytes = concatenateChunks(plaintextChunks);")
+                && crypto_worker_js.contains("const plaintext = await decompressDeflate(")
+                && crypto_worker_js.contains("payload.chunk_size")
+                && crypto_worker_js.contains("dbBytes = concatenateChunks(plaintextChunks);")
                 && !crypto_worker_js
                     .contains("const compressed = concatenateChunks(decryptedChunks);"),
             "crypto worker must inflate each independently-compressed payload chunk before concatenating plaintext"
@@ -2380,6 +2409,8 @@ mod tests {
                 const code = fs.readFileSync('./src/pages_assets/crypto_worker.js', 'utf8');
                 const context = {
                     console,
+                    atob: globalThis.atob,
+                    btoa: globalThis.btoa,
                     self: {
                         location: { href: 'https://example.test/archive/' },
                         postMessage() {},
@@ -2394,8 +2425,30 @@ mod tests {
                     payload: {
                         chunk_size: 32 * 1024 * 1024,
                         chunk_count: 0,
+                        total_compressed_size: 0,
+                        total_plaintext_size: 0,
                         files: [],
                     },
+                    export_id: Buffer.alloc(16).toString('base64'),
+                    base_nonce: Buffer.alloc(12).toString('base64'),
+                    kdf_defaults: {
+                        memory_kb: 65536,
+                        iterations: 3,
+                        parallelism: 4,
+                    },
+                    key_slots: [{
+                        id: 0,
+                        slot_type: 'password',
+                        kdf: 'argon2id',
+                        salt: Buffer.alloc(16).toString('base64'),
+                        wrapped_dek: Buffer.alloc(48).toString('base64'),
+                        nonce: Buffer.alloc(12).toString('base64'),
+                        argon2_params: {
+                            memory_kb: 65536,
+                            iterations: 3,
+                            parallelism: 4,
+                        },
+                    }],
                 };
 
                 context.validateSupportedPayloadFormat(config);
@@ -2416,5 +2469,270 @@ mod tests {
                 }
             "#,
         )
+    }
+
+    #[test]
+    fn crypto_worker_rejects_dangerous_archive_metadata_before_crypto() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const code = fs.readFileSync('./src/pages_assets/crypto_worker.js', 'utf8');
+                const context = {
+                    console,
+                    atob: globalThis.atob,
+                    btoa: globalThis.btoa,
+                    self: {
+                        location: { href: 'https://example.test/archive/' },
+                        postMessage() {},
+                    },
+                };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+
+                const baseConfig = () => ({
+                    version: 2,
+                    compression: 'deflate',
+                    export_id: Buffer.alloc(16).toString('base64'),
+                    base_nonce: Buffer.alloc(12).toString('base64'),
+                    kdf_defaults: {
+                        memory_kb: 65536,
+                        iterations: 3,
+                        parallelism: 4,
+                    },
+                    payload: {
+                        chunk_size: 1024,
+                        chunk_count: 0,
+                        total_compressed_size: 0,
+                        total_plaintext_size: 0,
+                        files: [],
+                    },
+                    key_slots: [{
+                        id: 0,
+                        slot_type: 'password',
+                        kdf: 'argon2id',
+                        salt: Buffer.alloc(16).toString('base64'),
+                        wrapped_dek: Buffer.alloc(48).toString('base64'),
+                        nonce: Buffer.alloc(12).toString('base64'),
+                        argon2_params: {
+                            memory_kb: 65536,
+                            iterations: 3,
+                            parallelism: 4,
+                        },
+                    }],
+                });
+
+                const expectRejected = (mutate, expectedMessage) => {
+                    const config = baseConfig();
+                    mutate(config);
+                    try {
+                        context.validateSupportedPayloadFormat(config);
+                    } catch (error) {
+                        if (!String(error.message).includes(expectedMessage)) {
+                            throw new Error(`expected ${expectedMessage}, got: ${error.message}`);
+                        }
+                        return;
+                    }
+                    throw new Error(`dangerous metadata was accepted: ${expectedMessage}`);
+                };
+
+                context.validateSupportedPayloadFormat(baseConfig());
+                expectRejected(config => { config.key_slots = []; }, 'at least one key slot');
+                expectRejected(config => {
+                    config.key_slots[0].argon2_params.memory_kb = 0x7fffffff;
+                }, 'Unsupported archive key_slots.argon2_params.memory_kb');
+                expectRejected(config => {
+                    config.key_slots.push({ ...config.key_slots[0] });
+                }, 'Duplicate archive key slot id');
+                expectRejected(config => {
+                    config.payload.total_plaintext_size = 1;
+                }, 'expected 1 chunks');
+                expectRejected(config => {
+                    config.payload.files = ['payload/../secret.bin'];
+                    config.payload.chunk_count = 1;
+                    config.payload.total_plaintext_size = 1;
+                    config.payload.total_compressed_size = 17;
+                }, 'Invalid payload file entry 0');
+            "#,
+        )
+    }
+
+    #[test]
+    fn crypto_worker_fflate_fallback_is_input_sliced_and_output_bounded() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const code = fs.readFileSync('./src/pages_assets/crypto_worker.js', 'utf8');
+                const pushes = [];
+                const context = {
+                    console,
+                    atob: globalThis.atob,
+                    btoa: globalThis.btoa,
+                    Uint8Array,
+                    self: {
+                        location: { href: 'https://example.test/archive/' },
+                        postMessage() {},
+                        DecompressionStream: class {
+                            constructor() { throw new Error('deflate-raw unsupported'); }
+                        },
+                        fflate: {
+                            Inflate: class {
+                                constructor(ondata) { this.ondata = ondata; }
+                                push(chunk, final) {
+                                    pushes.push({ length: chunk.byteLength, final });
+                                    this.ondata(new Uint8Array(1), final);
+                                }
+                            },
+                        },
+                    },
+                };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+
+                const inflated = await context.decompressDeflate(
+                    new Uint8Array(40_000),
+                    100_000
+                );
+                if (inflated.byteLength !== 3) {
+                    throw new Error(`expected one output byte per input slice, got ${inflated.byteLength}`);
+                }
+                const expectedLengths = [16_384, 16_384, 7_232];
+                if (JSON.stringify(pushes.map(push => push.length)) !== JSON.stringify(expectedLengths)) {
+                    throw new Error(`expected bounded 16 KiB input slices, got ${JSON.stringify(pushes)}`);
+                }
+                if (pushes.slice(0, -1).some(push => push.final) || !pushes.at(-1).final) {
+                    throw new Error(`only the final fflate input slice may be final: ${JSON.stringify(pushes)}`);
+                }
+
+                let cumulativePushes = 0;
+                context.self.fflate.Inflate = class {
+                    constructor(ondata) { this.ondata = ondata; }
+                    push(_chunk, final) {
+                        cumulativePushes += 1;
+                        this.ondata(new Uint8Array(3), final);
+                    }
+                };
+                let rejected = false;
+                try {
+                    await context.decompressDeflate(new Uint8Array(40), 5);
+                } catch (error) {
+                    if (!String(error.message).includes('5-byte archive limit')) {
+                        throw new Error(`unexpected decompression-bound error: ${error.message}`);
+                    }
+                    rejected = true;
+                }
+                if (!rejected) {
+                    throw new Error('streaming inflater accepted expansion past declared chunk_size');
+                }
+                if (cumulativePushes !== 2) {
+                    throw new Error(`expected cumulative bound to stop after two pushes, got ${cumulativePushes}`);
+                }
+            "#,
+        )
+    }
+
+    #[test]
+    fn crypto_worker_zeroizes_replaced_and_superseded_keys() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const code = fs.readFileSync('./src/pages_assets/crypto_worker.js', 'utf8');
+                const context = {
+                    console,
+                    atob: globalThis.atob,
+                    btoa: globalThis.btoa,
+                    self: {
+                        location: { href: 'https://example.test/archive/' },
+                        postMessage() {},
+                    },
+                };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+                vm.runInContext(`
+                    const first = new Uint8Array(32).fill(0x11);
+                    const firstGeneration = beginUnlockAttempt();
+                    commitUnlockResult(firstGeneration, first, 1);
+                    beginUnlockAttempt();
+                    if (first.some(byte => byte !== 0)) {
+                        throw new Error('beginning a subsequent unlock did not zero the prior DEK');
+                    }
+
+                    const stale = new Uint8Array(32).fill(0x22);
+                    const staleGeneration = activeUnlockGeneration;
+                    beginUnlockAttempt();
+                    let staleRejected = false;
+                    try {
+                        commitUnlockResult(staleGeneration, stale, 2);
+                    } catch (error) {
+                        staleRejected = String(error.message).includes('superseded');
+                    }
+                    if (!staleRejected || stale.some(byte => byte !== 0)) {
+                        throw new Error('superseded unlock result was retained or not zeroized');
+                    }
+
+                    const latest = new Uint8Array(32).fill(0x33);
+                    commitUnlockResult(activeUnlockGeneration, latest, 3);
+                    clearKeys();
+                    if (latest.some(byte => byte !== 0)) {
+                        throw new Error('CLEAR_KEYS did not zero the current DEK');
+                    }
+                `, context);
+            "#,
+        )
+    }
+
+    #[test]
+    fn pages_runtime_uses_pinned_official_vendor_apis() {
+        let database_js = include_str!("../src/pages_assets/database.js");
+        let deserialize_call = database_js
+            .find("sqliteApi.capi.sqlite3_deserialize(")
+            .expect("official sqlite3_deserialize call");
+        let ownership_transfer = database_js
+            .find("sqliteOwnsBytes = true;")
+            .expect("deserialize ownership transfer");
+        let result_check = database_js
+            .find("candidateDb.checkRc(resultCode);")
+            .expect("SQLite result check");
+        assert!(deserialize_call < ownership_transfer && ownership_transfer < result_check);
+        assert!(
+            database_js.contains("SQLITE_DESERIALIZE_FREEONCLOSE")
+                && database_js.contains("SQLITE_DESERIALIZE_READONLY")
+                && database_js.contains("if (wasmPtr && !sqliteOwnsBytes)")
+                && database_js.contains("./vendor/sqlite3.mjs")
+                && database_js.contains("stmt.finalize();")
+                && database_js.contains("stmt.get({})")
+                && database_js.contains("stmt.get(0)")
+                && database_js.contains("sqlite3.wasm.heap8u()")
+                && !database_js.contains("new sqlite3.oo1.OpfsDb")
+                && !database_js.contains("stmt.free()")
+                && !database_js.contains("getAsObject()")
+        );
+
+        let worker_js = include_str!("../src/pages_assets/crypto_worker.js");
+        assert!(
+            worker_js.contains("self.loadArgon2WasmBinary = async () =>")
+                && worker_js.contains("./vendor/argon2.wasm")
+                && worker_js.contains("./vendor/argon2-wasm.js")
+                && worker_js.contains("./vendor/argon2.js")
+                && worker_js.contains("./vendor/fflate.js")
+                && !worker_js.contains("./vendor/fflate.min.js")
+                && !worker_js.contains("./vendor/sqlite3.js")
+                && !worker_js.contains("async function initDatabase(")
+                && !worker_js.contains("let config = null;")
+        );
+
+        let sw_js = include_str!("../src/pages_assets/sw.js");
+        for vendor_asset in EXPECTED_VENDOR_ASSETS {
+            assert!(
+                sw_js.contains(&format!("'./{vendor_asset}'")),
+                "service worker must cache {vendor_asset}"
+            );
+        }
+        assert!(sw_js.contains("Promise.all(STATIC_ASSETS.map(asset => cache.add(asset)))"));
     }
 }

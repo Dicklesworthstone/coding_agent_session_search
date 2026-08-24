@@ -22,7 +22,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-const GOLDEN_BYTES_LABEL: &str = "z2hck-html-export-golden-v1";
+const RETIRED_ENTROPY_OVERRIDE: &str = "must-not-control-html-export-entropy";
 
 fn fixture_phrase() -> String {
     ["golden", "html", "fixture"].join("-")
@@ -106,7 +106,13 @@ fn export_html(
 
     if encrypted {
         let phrase = fixture_phrase();
-        cmd.env("CASS_HTML_EXPORT_GOLDEN_BYTES_LABEL", GOLDEN_BYTES_LABEL)
+        // Regression probe for the retired debug-build entropy hook. Even when
+        // an ambient process supplies its old name, production encryption must
+        // continue to draw fresh salt and nonce bytes from the CSPRNG.
+        cmd.env(
+            "CASS_HTML_EXPORT_GOLDEN_BYTES_LABEL",
+            RETIRED_ENTROPY_OVERRIDE,
+        )
             .arg("--encrypt")
             .arg("--password-stdin")
             .write_stdin(format!("{phrase}\n"));
@@ -190,6 +196,19 @@ fn scrub_html(input: &str, test_home: &Path) -> String {
             )
         })
         .to_string()
+}
+
+fn encrypted_payload(input: &str) -> Value {
+    let marker = "<div id=\"encrypted-content\" hidden>";
+    let payload_start = input
+        .find(marker)
+        .map(|offset| offset + marker.len())
+        .expect("encrypted payload marker");
+    let payload_end = input[payload_start..]
+        .find("</div>")
+        .map(|offset| payload_start + offset)
+        .expect("encrypted payload terminator");
+    serde_json::from_str(&input[payload_start..payload_end]).expect("encrypted payload JSON")
 }
 
 fn assert_golden(name: &str, actual: &str) {
@@ -286,14 +305,29 @@ fn encrypted_export_html_matches_golden() {
         true,
     );
 
-    assert_eq!(
-        first, second,
-        "deterministic golden byte label must produce reproducible encrypted HTML"
+    let first_payload = encrypted_payload(&first);
+    let second_payload = encrypted_payload(&second);
+    assert_ne!(
+        first_payload["salt"], second_payload["salt"],
+        "the retired golden-byte environment variable must not repeat PBKDF2 salt"
+    );
+    assert_ne!(
+        first_payload["iv"], second_payload["iv"],
+        "the retired golden-byte environment variable must not repeat an AES-GCM nonce"
+    );
+    assert_ne!(
+        first_payload["ciphertext"], second_payload["ciphertext"],
+        "the retired golden-byte environment variable must not make ciphertext deterministic"
     );
     assert!(first.contains("id=\"encrypted-content\""));
     assert!(first.contains("crypto.subtle"));
     assert!(!first.contains("return Err(AuthError::ExpiredToken);"));
 
-    let scrubbed = scrub_html(&first, test_home.path());
-    assert_golden("encrypted_export.html.golden", &scrubbed);
+    let first_scrubbed = scrub_html(&first, test_home.path());
+    let second_scrubbed = scrub_html(&second, test_home.path());
+    assert_eq!(
+        first_scrubbed, second_scrubbed,
+        "encrypted exports should differ only in normalized random fields"
+    );
+    assert_golden("encrypted_export.html.golden", &first_scrubbed);
 }

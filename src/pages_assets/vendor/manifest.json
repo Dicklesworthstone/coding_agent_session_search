@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "policy": "Exact upstream release bytes. Update versions, package integrity, sizes, SHA-256 values, licenses, and Rust pins together.",
+  "packages": [
+    {
+      "name": "@sqlite.org/sqlite-wasm",
+      "version": "3.53.0-build1",
+      "source": "https://registry.npmjs.org/@sqlite.org/sqlite-wasm/-/sqlite-wasm-3.53.0-build1.tgz",
+      "npm_integrity": "sha512-PfWPWN2n+/37doa8oh2/oUXk4OOsRYZsxc1W1sDXIGb/Pu5Yrb+f2eyYpgQMGITVX7HVgxhs9P18Rc6I97ym/g==",
+      "tarball_sha256": "fbbd5c542fad22ce1d90df1533025903a00a593f461f4a43b1e43e9897dfad9c",
+      "license": "Apache-2.0",
+      "license_file": "LICENSE-sqlite-wasm.txt",
+      "notes": "The JavaScript/WASM wrapper is Apache-2.0; the embedded SQLite core is public domain."
+    },
+    {
+      "name": "argon2-browser",
+      "version": "1.18.0",
+      "source": "https://registry.npmjs.org/argon2-browser/-/argon2-browser-1.18.0.tgz",
+      "npm_integrity": "sha512-ImVAGIItnFnvET1exhsQB7apRztcoC5TnlSqernMJDUjbc/DLq3UEYeXFrLPrlaIl8cVfwnXb6wX2KpFf2zxHw==",
+      "tarball_sha256": "cdb11795a4971bde095fe6b836aa424de50c4558ed4b9505bc74111eee7f6d35",
+      "license": "MIT",
+      "license_file": "LICENSE-argon2-browser.txt"
+    },
+    {
+      "name": "fflate",
+      "version": "0.8.3",
+      "source": "https://registry.npmjs.org/fflate/-/fflate-0.8.3.tgz",
+      "npm_integrity": "sha512-tbZNuJrLwGUp3zshBtdy4W+ORxZuIh8a5ilyIEQDC5rY1f3U20JMry0Ll3WBzU58EZKsEuJFXhb5gwv8CsPvgA==",
+      "tarball_sha256": "38c2cd824402407b43153c782274aec2ea83ea688e4aa0b743c5f2c305857d92",
+      "license": "MIT",
+      "license_file": "LICENSE-fflate.txt"
+    },
+    {
+      "name": "html5-qrcode",
+      "version": "2.3.8",
+      "source": "https://registry.npmjs.org/html5-qrcode/-/html5-qrcode-2.3.8.tgz",
+      "npm_integrity": "sha512-jsr4vafJhwoLVEDW3n1KvPnCCXWaQfRng0/EEYk1vNcQGcG/htAdhJX0be8YyqMoSz7+hZvOZSTAepsabiuhiQ==",
+      "tarball_sha256": "e215fbfb27f4b027519014f5bf462ceb3faf2a46dbf8d6dbd2df0e4acef0224e",
+      "license": "Apache-2.0",
+      "license_file": "LICENSE-html5-qrcode.txt"
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "sqlite3.mjs",
+      "package": "@sqlite.org/sqlite-wasm",
+      "package_path": "dist/index.mjs",
+      "size": 578559,
+      "sha256": "f80870f0fa03a39a3338d17ed3fbea04808d344c88e724d90d5f37b9b7b83154"
+    },
+    {
+      "path": "sqlite3.wasm",
+      "package": "@sqlite.org/sqlite-wasm",
+      "package_path": "dist/sqlite3.wasm",
+      "size": 864752,
+      "sha256": "02d7e48164395fa68f81c6ec33e9da5461be397dc57602ac0cd89b4bbba1d312"
+    },
+    {
+      "path": "sqlite3-opfs-async-proxy.js",
+      "package": "@sqlite.org/sqlite-wasm",
+      "package_path": "dist/sqlite3-opfs-async-proxy.js",
+      "size": 32289,
+      "sha256": "502762db7bd24130f345df6a42883166ec0a91815207940328c9739bb0f5ec2f"
+    },
+    {
+      "path": "argon2.js",
+      "package": "argon2-browser",
+      "package_path": "lib/argon2.js",
+      "size": 11835,
+      "sha256": "ecfe330a8f3c6d491b92197391088f117ab13ad13c784cb01235a1afb5757a3b"
+    },
+    {
+      "path": "argon2-wasm.js",
+      "package": "argon2-browser",
+      "package_path": "dist/argon2.js",
+      "size": 14215,
+      "sha256": "cdb6ef704dbc287ffa0056376d9af297c8691ddeb985f9137b96fc9b0ddea8b0"
+    },
+    {
+      "path": "argon2.wasm",
+      "package": "argon2-browser",
+      "package_path": "dist/argon2.wasm",
+      "size": 25725,
+      "sha256": "0c2149886c13e4eae4a6ca25ee71d47423c5c8740a874cf04ff816d1b2c901d7"
+    },
+    {
+      "path": "fflate.js",
+      "package": "fflate",
+      "package_path": "umd/index.js",
+      "size": 33044,
+      "sha256": "462ef8041fc970e3615a20a9dd2b2e3047a073b2da729ef4f02b634bba8b7b83"
+    },
+    {
+      "path": "html5-qrcode.min.js",
+      "package": "html5-qrcode",
+      "package_path": "html5-qrcode.min.js",
+      "size": 375364,
+      "sha256": "660b12437b1d747e3e68b8be0685c08cb728140110ad213f167b14b66f8b1d8e"
+    }
+  ],
+  "license_artifacts": [
+    {
+      "path": "LICENSE-sqlite-wasm.txt",
+      "size": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source": "https://www.apache.org/licenses/LICENSE-2.0.txt"
+    },
+    {
+      "path": "LICENSE-argon2-browser.txt",
+      "size": 1058,
+      "sha256": "524a1d77701975a063a590424637abbd7fa519042a113f2bbe2eaf4cde76296d",
+      "source": "argon2-browser@1.18.0/LICENSE"
+    },
+    {
+      "path": "LICENSE-fflate.txt",
+      "size": 1069,
+      "sha256": "0a1df3a083d0c010560aa342e87959c8c1070e6fd54545741f083f22d0c8b551",
+      "source": "fflate@0.8.3/LICENSE"
+    },
+    {
+      "path": "LICENSE-html5-qrcode.txt",
+      "size": 11361,
+      "sha256": "306bc450da41244fefb92fec6fba30f27afb9d9b0eaa72b96372c23e2338c612",
+      "source": "html5-qrcode@2.3.8/LICENSE"
+    }
+  ]
+}

@@ -184,6 +184,35 @@ fn export_html_encrypt_without_password_returns_password_required_envelope() -> 
     )
 }
 
+#[test]
+fn empty_stdin_password_is_rejected_as_password_required() -> TestResult {
+    let tmp = TempDir::new()?;
+    let out_dir = tmp.path().join("out");
+    fs::create_dir_all(&out_dir)?;
+    let session = real_jsonl_session();
+    let output = Command::cargo_bin("cass")?
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .args(["--color=never", "export-html"])
+        .arg(&session)
+        .arg("--output-dir")
+        .arg(&out_dir)
+        .args(["--encrypt", "--password-stdin", "--json"])
+        .write_stdin("\n")
+        .output()?;
+    let outcome = CmdOutcome {
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+
+    assert_error_envelope(
+        "export-html-encrypt-empty-stdin-password",
+        &outcome,
+        6,
+        "password-required",
+    )
+}
+
 #[cfg(unix)]
 #[test]
 fn export_html_unwritable_output_dir_returns_output_not_writable_envelope() -> TestResult {

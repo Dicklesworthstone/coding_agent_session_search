@@ -1225,7 +1225,7 @@ pub enum Commands {
                 \x20 codex\n\
                 \x20 opencode\n\
                 \x20 pi_agent | pi-agent | pi (pi-mono)\n\
-                \x20 omp | oh-my-pi | ohmypi (Oh My Pi; profile/session roots preserved)\n\
+                \x20 omp | oh-my-pi | oh_my_pi | ohmypi (Oh My Pi; profile/session roots preserved)\n\
                 \x20 gemini\n\
                 \x20 antigravity | agy       (resume via `agy --conversation <uuid>`)"
         )]
@@ -1346,7 +1346,7 @@ pub enum Commands {
         include_skills: bool,
 
         /// Default theme (dark or light)
-        #[arg(long, default_value = "dark")]
+        #[arg(long, default_value = "dark", value_parser = ["dark", "light"])]
         theme: String,
 
         /// Validate without writing file
@@ -2416,8 +2416,8 @@ pub enum FleetCommand {
 
 /// Subcommands for the durable lessons graph (bead
 /// coding_agent_session_search-guided-ops-repro-trust-5u82n.4). Lessons are a
-/// derived, advisory surface mined from local cass evidence (landed commit
-/// summaries in live mode; commits/beads/proofs in fixture mode) and reduced to
+/// derived, advisory surface mined from local cass evidence (commits, closed
+/// Beads, and proof manifests in both live and fixture modes) and reduced to
 /// distinct, redacted, supersession-resolved records by
 /// [`crate::lessons::LessonGraph`].
 #[derive(Subcommand, Debug, Clone)]
@@ -7402,11 +7402,13 @@ async fn execute_cli(
                             dry_run,
                             structured_format,
                             verbose,
+                            &secrets_allow,
+                            &secrets_deny,
                         )
                         .map_err(|e| CliError {
                             code: 9,
                             kind: CliErrorKind::Pages.kind_str(),
-                            message: format!("Export failed: {e}"),
+                            message: format!("Export failed: {e:#}"),
                             hint: None,
                             retryable: false,
                         })?;
@@ -7550,6 +7552,28 @@ async fn execute_cli(
                             retryable: false,
                         })?;
                     } else if let Some(output_path) = export_only {
+                        if dry_run {
+                            if let Some(fmt) = structured_format {
+                                output_structured_value(
+                                    serde_json::json!({
+                                        "status": "dry_run",
+                                        "output_path": output_path,
+                                        "secret_scan": {
+                                            "performed": false,
+                                            "complete": false,
+                                            "approval_state": "not_performed_dry_run",
+                                            "artifact_sha256": null,
+                                        },
+                                    }),
+                                    fmt,
+                                )?;
+                            } else {
+                                println!("Dry run: would export to {:?}", output_path);
+                                println!("Secret scan: not performed during dry run");
+                            }
+                            return Ok(());
+                        }
+
                         // Interactive unencrypted export confirmation (non-robot mode)
                         if no_encryption && structured_format.is_none() && !robot_mode_here {
                             use console::style;
@@ -7626,23 +7650,106 @@ async fn execute_cli(
                             }
                         }
 
-                        crate::pages::export::run_pages_export(
-                            cli.db.clone(),
-                            output_path.clone(),
-                            agents.clone(),
-                            workspaces.clone(),
-                            since.clone(),
-                            until.clone(),
-                            path_mode,
-                            dry_run,
-                        )
-                        .map_err(|e| CliError {
-                            code: 9,
-                            kind: CliErrorKind::Pages.kind_str(),
-                            message: format!("Export failed: {e}"),
-                            hint: None,
-                            retryable: false,
-                        })?;
+                        let scan_config =
+                            crate::pages::secret_scan::SecretScanConfig::from_inputs(
+                                &secrets_allow,
+                                &secrets_deny,
+                            )
+                            .map_err(|e| CliError {
+                                code: 9,
+                                kind: CliErrorKind::Pages.kind_str(),
+                                message: format!("Secret scan config error: {e}"),
+                                hint: None,
+                                retryable: false,
+                            })?;
+                        let structured_export = structured_format.is_some() || robot_mode_here;
+                        let (stats, (staged_secret_scan, approval_state)) =
+                            crate::pages::export::export_pages_database_verified(
+                                cli.db.clone(),
+                                output_path.clone(),
+                                agents.clone(),
+                                workspaces.clone(),
+                                since.clone(),
+                                until.clone(),
+                                path_mode,
+                                |_current, _total| {},
+                                |staged_db_path| {
+                                    let scan = crate::pages::secret_scan::scan_staged_export_database(
+                                        staged_db_path,
+                                        &scan_config,
+                                    )?;
+                                    if scan.report.summary.total == 0 {
+                                        return Ok((scan, "clean"));
+                                    }
+                                    if structured_export || fail_on_secrets {
+                                        anyhow::bail!(
+                                            "Staged export contains {} potential secret(s); robot/CI export-only runs fail closed",
+                                            scan.report.summary.total
+                                        );
+                                    }
+
+                                    let mut term = console::Term::stderr();
+                                    crate::pages::secret_scan::print_human_report(
+                                        &mut term,
+                                        &scan.report,
+                                        3,
+                                    )?;
+                                    eprintln!(
+                                        "The report above describes the exact staged export database."
+                                    );
+                                    eprint!(
+                                        "Type exactly \"I understand the risks\" to publish it: "
+                                    );
+                                    use std::io::Write;
+                                    std::io::stderr().flush()?;
+                                    let mut acknowledgment = String::new();
+                                    std::io::stdin().read_line(&mut acknowledgment)?;
+                                    if acknowledgment.trim() != "I understand the risks" {
+                                        anyhow::bail!(
+                                            "Staged export secret findings were not acknowledged"
+                                        );
+                                    }
+                                    Ok((scan, "explicit_interactive_acknowledgment"))
+                                },
+                            )
+                            .map_err(|e| CliError {
+                                code: 9,
+                                kind: CliErrorKind::Pages.kind_str(),
+                                message: format!("Export failed: {e:#}"),
+                                hint: Some(
+                                    "Review findings with `cass pages --scan-secrets`; use --secrets-allow only for confirmed false positives."
+                                        .to_string(),
+                                ),
+                                retryable: false,
+                            })?;
+
+                        if let Some(fmt) = structured_format {
+                            output_structured_value(
+                                serde_json::json!({
+                                    "status": "success",
+                                    "output_path": output_path,
+                                    "stats": {
+                                        "conversations": stats.conversations_processed,
+                                        "messages": stats.messages_processed,
+                                    },
+                                    "secret_scan": staged_secret_scan_json(
+                                        &staged_secret_scan,
+                                        approval_state,
+                                    ),
+                                }),
+                                fmt,
+                            )?;
+                        } else {
+                            println!(
+                                "Export complete! Processed {} conversations, {} messages.",
+                                stats.conversations_processed,
+                                stats.messages_processed
+                            );
+                            println!(
+                                "Secret scan: complete ({approval_state}); artifact SHA-256 {}",
+                                staged_secret_scan.artifact_sha256
+                            );
+                        }
                     } else {
                         let cf_creds_provided = account_id.is_some() || api_token.is_some();
                         let target_is_cloudflare =
@@ -7718,7 +7825,7 @@ async fn execute_cli(
                         wizard.run().map_err(|e| CliError {
                             code: 9,
                             kind: CliErrorKind::Pages.kind_str(),
-                            message: format!("Wizard failed: {e}"),
+                            message: format!("Wizard failed: {e:#}"),
                             hint: None,
                             retryable: false,
                         })?;
@@ -9102,6 +9209,19 @@ fn load_lessons_evidence(path: &Path) -> CliResult<crate::lessons_extraction::Le
     })
 }
 
+/// Accepted records plus the number of malformed records rejected while
+/// gathering one live JSONL source.
+struct GatheredLessonsSource<T> {
+    accepted: Vec<T>,
+    rejected: usize,
+}
+
+/// Normalized repository evidence plus raw-free live-intake diagnostics.
+struct GatheredLessonsEvidence {
+    evidence: crate::lessons_extraction::LessonsEvidence,
+    rejected_records: crate::lessons_extraction::RejectedEvidenceRecords,
+}
+
 /// Gather live lessons evidence from the local repository.
 ///
 /// This is deliberately metadata-first: beads contribute only their lifecycle
@@ -9109,25 +9229,61 @@ fn load_lessons_evidence(path: &Path) -> CliResult<crate::lessons_extraction::Le
 /// outcomes, commands, and timestamps. Raw session text and proof stdout/stderr
 /// artifacts are never read. Closed-session mining remains optional because the
 /// canonical cass database is user history rather than repository metadata.
-fn gather_live_lessons_evidence() -> crate::lessons_extraction::LessonsEvidence {
+fn gather_live_lessons_evidence() -> GatheredLessonsEvidence {
     let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     gather_repository_lessons_evidence(&repo)
+}
+
+/// Resolve `start` to its Git worktree root. Live lessons are repository-local:
+/// invocation from a nested directory must not change the project name or hide
+/// root-local `.beads` and `.cass/proofs` evidence. Non-repositories and hosts
+/// without Git retain the caller-provided path for best-effort behavior.
+fn resolve_lessons_repository_root(start: &Path) -> PathBuf {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    let Ok(output) = output else {
+        return start.to_path_buf();
+    };
+    if !output.status.success() {
+        return start.to_path_buf();
+    }
+    let Ok(stdout) = std::str::from_utf8(&output.stdout) else {
+        return start.to_path_buf();
+    };
+    let root = stdout.trim();
+    if root.is_empty() {
+        start.to_path_buf()
+    } else {
+        PathBuf::from(root)
+    }
 }
 
 /// Gather the same metadata-first evidence as live mode from an explicit
 /// repository root. The trust-correlation layer reuses this helper so lesson
 /// citations and `cass lessons` always derive identical content-stable ids.
-fn gather_repository_lessons_evidence(repo: &Path) -> crate::lessons_extraction::LessonsEvidence {
+fn gather_repository_lessons_evidence(repo: &Path) -> GatheredLessonsEvidence {
+    let repo = resolve_lessons_repository_root(repo);
     let project = repo
         .file_name()
         .and_then(|n| n.to_str())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| "cass".to_string());
-    crate::lessons_extraction::LessonsEvidence {
-        project,
-        commits: gather_git_commit_evidence(repo, 500),
-        beads: gather_closed_bead_evidence(&repo.join(".beads/issues.jsonl")),
-        proofs: gather_proof_evidence(&repo.join(".cass/proofs/proof-manifest.jsonl")),
+    let beads = gather_closed_bead_evidence(&repo.join(".beads/issues.jsonl"));
+    let proofs = gather_proof_evidence(&repo.join(".cass/proofs/proof-manifest.jsonl"));
+    GatheredLessonsEvidence {
+        evidence: crate::lessons_extraction::LessonsEvidence {
+            project,
+            commits: gather_git_commit_evidence(&repo, 500),
+            beads: beads.accepted,
+            proofs: proofs.accepted,
+        },
+        rejected_records: crate::lessons_extraction::RejectedEvidenceRecords {
+            beads: beads.rejected,
+            proofs: proofs.rejected,
+        },
     }
 }
 
@@ -9139,27 +9295,57 @@ fn lessons_rfc3339_millis(value: Option<&str>) -> u64 {
         .unwrap_or(0)
 }
 
-/// Best-effort read of closed Beads. A malformed line is ignored rather than
-/// making the advisory lessons surface unavailable.
-fn gather_closed_bead_evidence(path: &Path) -> Vec<crate::lessons_extraction::BeadEvidence> {
-    let Ok(body) = std::fs::read_to_string(path) else {
-        return Vec::new();
+/// Best-effort read of closed Beads. Malformed records are counted and omitted
+/// rather than making the advisory lessons surface unavailable. Blank lines and
+/// valid non-closed Beads are intentionally ignored, not rejected.
+fn gather_closed_bead_evidence(
+    path: &Path,
+) -> GatheredLessonsSource<crate::lessons_extraction::BeadEvidence> {
+    let mut gathered = GatheredLessonsSource {
+        accepted: Vec::new(),
+        rejected: 0,
     };
-    body.lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|bead| {
-            bead.get("status")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|status| status.eq_ignore_ascii_case("closed"))
-        })
-        .filter_map(|bead| {
-            let id = bead.get("id")?.as_str()?.trim();
-            if id.is_empty() {
-                return None;
-            }
-            let closed_at = bead.get("closed_at").and_then(serde_json::Value::as_str);
-            let updated_at = bead.get("updated_at").and_then(serde_json::Value::as_str);
-            Some(crate::lessons_extraction::BeadEvidence {
+    // Source-read status is separate from record validity. Missing/unreadable
+    // sources remain fail-open here; coding_agent_session_search-98anf.1 tracks
+    // the bounded, raw-free status contract rather than miscounting an I/O
+    // failure as one malformed record.
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return gathered;
+    };
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(bead) = serde_json::from_str::<serde_json::Value>(line) else {
+            gathered.rejected = gathered.rejected.saturating_add(1);
+            continue;
+        };
+        let Some(status) = bead.get("status").and_then(serde_json::Value::as_str) else {
+            gathered.rejected = gathered.rejected.saturating_add(1);
+            continue;
+        };
+        let status = status.trim();
+        if status.is_empty() {
+            gathered.rejected = gathered.rejected.saturating_add(1);
+            continue;
+        }
+        if !status.eq_ignore_ascii_case("closed") {
+            continue;
+        }
+        let Some(id) = bead
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            gathered.rejected = gathered.rejected.saturating_add(1);
+            continue;
+        };
+        let closed_at = bead.get("closed_at").and_then(serde_json::Value::as_str);
+        let updated_at = bead.get("updated_at").and_then(serde_json::Value::as_str);
+        gathered
+            .accepted
+            .push(crate::lessons_extraction::BeadEvidence {
                 id: id.to_string(),
                 title: bead
                     .get("title")
@@ -9187,9 +9373,9 @@ fn gather_closed_bead_evidence(path: &Path) -> Vec<crate::lessons_extraction::Be
                     .collect(),
                 updated_ms: lessons_rfc3339_millis(closed_at)
                     .max(lessons_rfc3339_millis(updated_at)),
-            })
-        })
-        .collect()
+            });
+    }
+    gathered
 }
 
 /// File modification time supplies freshness for lightweight `ProofRun`
@@ -9288,20 +9474,119 @@ fn structured_proof_evidence(
 
 /// Best-effort read of the canonical repository-local proof manifest. Supports
 /// both lightweight `EmittedProof` entries and heavyweight `.12.3` records.
-fn gather_proof_evidence(path: &Path) -> Vec<crate::lessons_extraction::ProofEvidence> {
-    let Ok(body) = std::fs::read_to_string(path) else {
-        return Vec::new();
+/// Blank lines are ignored; malformed JSON or unsupported record shapes are
+/// counted and omitted.
+fn gather_proof_evidence(
+    path: &Path,
+) -> GatheredLessonsSource<crate::lessons_extraction::ProofEvidence> {
+    let mut gathered = GatheredLessonsSource {
+        accepted: Vec::new(),
+        rejected: 0,
     };
-    body.lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter_map(|entry| {
-            if entry.get("scenario_id").is_some() {
-                structured_proof_evidence(&entry)
-            } else {
-                lightweight_proof_evidence(path, &entry)
-            }
-        })
-        .collect()
+    // See coding_agent_session_search-98anf.1: read status must be modeled
+    // separately, so an I/O failure is not fabricated as one rejected record.
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return gathered;
+    };
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            gathered.rejected = gathered.rejected.saturating_add(1);
+            continue;
+        };
+        let evidence = structured_proof_evidence(&entry)
+            .or_else(|| lightweight_proof_evidence(path, &entry));
+        if let Some(evidence) = evidence {
+            gathered.accepted.push(evidence);
+        } else {
+            gathered.rejected = gathered.rejected.saturating_add(1);
+        }
+    }
+    gathered
+}
+
+#[cfg(test)]
+mod lessons_live_evidence_tests {
+    use super::{gather_closed_bead_evidence, gather_proof_evidence};
+
+    #[test]
+    fn bead_gatherer_separates_accepted_ignored_and_rejected_lines(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("issues.jsonl");
+        let closed = serde_json::json!({
+            "id": "bd-closed",
+            "title": "landed",
+            "status": " closed ",
+            "closed_at": "2026-08-24T12:00:00Z"
+        });
+        let open = serde_json::json!({
+            "id": "bd-open",
+            "title": "not eligible",
+            "status": "open"
+        });
+        let missing_status = serde_json::json!({"id": "bd-no-status"});
+        let empty_closed_id = serde_json::json!({"id": "  ", "status": "closed"});
+        std::fs::write(
+            &path,
+            format!(
+                "\n{closed}\n{open}\nnot-json\n{missing_status}\n{empty_closed_id}\n\n"
+            ),
+        )?;
+
+        let gathered = gather_closed_bead_evidence(&path);
+        let accepted: Vec<(&str, &str)> = gathered
+            .accepted
+            .iter()
+            .map(|bead| (bead.id.as_str(), bead.status.as_str()))
+            .collect();
+
+        assert_eq!(accepted, [("bd-closed", "closed")]);
+        assert_eq!(gathered.rejected, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn proof_gatherer_accepts_either_shape_and_rejects_malformed_lines(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("proof-manifest.jsonl");
+        let lightweight_with_structured_hint = serde_json::json!({
+            "scenario_id": null,
+            "label": "lightweight",
+            "status": "pass",
+            "path": "lightweight.proof.json",
+            "command": "cargo test --lib"
+        });
+        let structured = serde_json::json!({
+            "scenario_id": "structured",
+            "outcome": "passed",
+            "finished_at_ms": 42
+        });
+        let unsupported = serde_json::json!({
+            "label": "missing-path",
+            "status": "pass"
+        });
+        std::fs::write(
+            &path,
+            format!(
+                "\n{lightweight_with_structured_hint}\n{structured}\nnot-json\n{unsupported}\n\n"
+            ),
+        )?;
+
+        let gathered = gather_proof_evidence(&path);
+        let names: Vec<&str> = gathered
+            .accepted
+            .iter()
+            .map(|proof| proof.name.as_str())
+            .collect();
+
+        assert_eq!(names, ["lightweight", "structured"]);
+        assert_eq!(gathered.rejected, 2);
+        Ok(())
+    }
 }
 
 /// Best-effort read of the last `max` non-merge commit subjects from `repo`.
@@ -9359,11 +9644,19 @@ fn build_lessons_state(
     &'static str,
 )> {
     let evidence_path = resolve_lessons_fixture_path(fixture, fixture_dir, fixture_id)?;
-    let (evidence, mode) = match evidence_path {
-        Some(path) => (load_lessons_evidence(&path)?, "fixture"),
-        None => (gather_live_lessons_evidence(), "live"),
+    let (evidence, rejected_records, mode) = match evidence_path {
+        Some(path) => (
+            load_lessons_evidence(&path)?,
+            crate::lessons_extraction::RejectedEvidenceRecords::default(),
+            "fixture",
+        ),
+        None => {
+            let gathered = gather_live_lessons_evidence();
+            (gathered.evidence, gathered.rejected_records, "live")
+        }
     };
-    let extraction = crate::lessons_extraction::extract(&evidence);
+    let mut extraction = crate::lessons_extraction::extract(&evidence);
+    extraction.manifest.rejected_records = rejected_records;
     let graph = crate::lessons::LessonGraph::build(extraction.candidates);
     Ok((graph, extraction.manifest, mode))
 }
@@ -9408,13 +9701,31 @@ fn lesson_record_value(record: &crate::lessons::LessonRecord) -> serde_json::Val
     serde_json::to_value(record).unwrap_or(serde_json::Value::Null)
 }
 
+/// Warn once per lessons command when malformed live JSONL records were
+/// omitted. Only bounded source labels and counts are emitted; raw lines,
+/// parser errors, and repository paths never reach diagnostics.
+fn warn_rejected_lessons_evidence(
+    manifest: &crate::lessons_extraction::ExtractionManifest,
+) {
+    let rejected = manifest.rejected_records;
+    let total = rejected.total();
+    if total > 0 {
+        eprintln!(
+            "Warning: lessons evidence is partial; skipped {total} malformed record(s) (Beads: {}, proofs: {}).",
+            rejected.beads, rejected.proofs
+        );
+    }
+}
+
 /// Emit a lessons payload as structured output, or a terse human summary line.
 fn emit_lessons_payload(
     cli: &Cli,
     json: bool,
+    manifest: &crate::lessons_extraction::ExtractionManifest,
     payload: serde_json::Value,
     human: impl FnOnce(&serde_json::Value) -> String,
 ) -> CliResult<()> {
+    warn_rejected_lessons_evidence(manifest);
     if let Some(fmt) = resolve_subcommand_structured_format(cli, json) {
         let fmt = if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
@@ -9523,7 +9834,7 @@ fn run_lessons_list(
         "lessons": lessons,
     });
 
-    emit_lessons_payload(cli, json, payload, |p| {
+    emit_lessons_payload(cli, json, &manifest, payload, |p| {
         format!(
             "Lessons [{}]: {} active / {} total — {} shown",
             p.get("mode")
@@ -9591,7 +9902,7 @@ fn run_lessons_search(
         "lessons": lessons,
     });
 
-    emit_lessons_payload(cli, json, payload, |p| {
+    emit_lessons_payload(cli, json, &manifest, payload, |p| {
         format!(
             "Lessons search [{}] {:?}: {} match(es), {} shown",
             p.get("mode")
@@ -9630,9 +9941,10 @@ fn run_lessons_view(
         "found": found.is_some(),
         "lesson": found.map(lesson_record_value),
         "available_count": graph.lessons.len(),
+        "manifest": serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
     });
 
-    emit_lessons_payload(cli, json, payload, |p| {
+    emit_lessons_payload(cli, json, &manifest, payload, |p| {
         if p.get("found")
             .and_then(serde_json::Value::as_bool)
             .is_some_and(|found| found)
@@ -23482,6 +23794,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  cass search \"api\" --week --agent codex --robot  # Last 7 days, codex only",
         "  cass stats --json                    # Get index statistics",
         "  cass sessions --current --json       # Find current workspace session",
+        "  cass resume <path> --agent omp --json  # OMP aliases: oh-my-pi | oh_my_pi | ohmypi",
         "  cass view /path/file.jsonl -n 42 --json  # View file at line 42",
         "  cass capabilities --json           # First-stop self-description for agents",
         "  cass robot-docs commands            # Machine-readable command list",
@@ -78612,7 +78925,17 @@ mod cli_read_db_tests {
         let target = resolve_resume_target(&session_file, None).expect("resolve");
         assert_eq!(target.agent, "omp");
         assert_eq!(target.session_id.as_deref(), Some("my-omp-id"));
-        assert_eq!(target.argv, vec!["omp", "--resume", "my-omp-id"]);
+        assert_eq!(
+            target.argv,
+            vec![
+                "omp".to_string(),
+                "--session-dir".to_string(),
+                sessions_dir.display().to_string(),
+                "--resume".to_string(),
+                "my-omp-id".to_string(),
+            ],
+            "a copied canonical-looking store must not silently resume from the current user's live home"
+        );
     }
 
     #[test]
@@ -78631,7 +78954,19 @@ mod cli_read_db_tests {
         assert_eq!(target.session_id.as_deref(), Some("omp-work-id"));
         assert_eq!(
             target.argv,
-            vec!["omp", "--profile", "work", "--resume", "omp-work-id"]
+            vec![
+                "omp".to_string(),
+                "--profile".to_string(),
+                "work".to_string(),
+                "--session-dir".to_string(),
+                temp.path()
+                    .join(".omp/profiles/work/agent/sessions")
+                    .display()
+                    .to_string(),
+                "--resume".to_string(),
+                "omp-work-id".to_string(),
+            ],
+            "a copied named-profile store needs both its profile identity and exact archive root"
         );
     }
 
@@ -78660,6 +78995,45 @@ mod cli_read_db_tests {
 
     #[test]
     #[serial]
+    fn resume_does_not_apply_active_profile_to_cass_archive_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive_root = temp.path().join("custom-omp-archive");
+        let sessions_root = archive_root.join("sessions");
+        let sessions_dir = sessions_root.join("-projects-cass");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_file = sessions_dir.join("2026-08-24T00-00-00_archive.jsonl");
+        std::fs::write(&session_file, r#"{"type":"session","id":"omp-archive-id"}"#)
+            .expect("write session file");
+
+        let _pi_sessions = set_env("PI_SESSIONS_DIR", "");
+        let _omp_sessions = set_env("PI_CODING_AGENT_SESSION_DIR", "");
+        let _shared_agent = set_env("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env(
+            "CASS_OMP_DATA_ROOT",
+            archive_root.to_string_lossy().as_ref(),
+        );
+        let _config_dir = set_env("PI_CONFIG_DIR", "");
+        let _active_profile = set_env("OMP_PROFILE", "work");
+        let _legacy_profile = set_env("PI_PROFILE", "");
+        let _xdg = set_env("XDG_DATA_HOME", "");
+
+        let target = resolve_resume_target(&session_file, None).expect("resolve");
+        assert_eq!(target.agent, "omp");
+        assert_eq!(
+            target.argv,
+            vec![
+                "omp".to_string(),
+                "--session-dir".to_string(),
+                sessions_root.display().to_string(),
+                "--resume".to_string(),
+                "omp-archive-id".to_string(),
+            ],
+            "an active local profile must not be grafted onto a CASS archive with no path-encoded profile"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn resume_preserves_omp_explicit_session_dir_and_profile() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sessions_root = temp.path().join("launch-sessions");
@@ -78672,6 +79046,10 @@ mod cli_read_db_tests {
             "PI_CODING_AGENT_SESSION_DIR",
             sessions_root.to_string_lossy().as_ref(),
         );
+        let _pi_sessions = set_env("PI_SESSIONS_DIR", "");
+        let _shared_agent = set_env("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env("CASS_OMP_DATA_ROOT", "");
+        let _xdg = set_env("XDG_DATA_HOME", "");
         let _profile = set_env("OMP_PROFILE", "work");
 
         let target = resolve_resume_target(&session_file, None).expect("resolve");
@@ -78704,6 +79082,10 @@ mod cli_read_db_tests {
             "PI_CODING_AGENT_SESSION_DIR",
             sessions_root.to_string_lossy().as_ref(),
         );
+        let _pi_sessions = set_env("PI_SESSIONS_DIR", "");
+        let _shared_agent = set_env("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env("CASS_OMP_DATA_ROOT", "");
+        let _xdg = set_env("XDG_DATA_HOME", "");
         let _legacy_profile = set_env("PI_PROFILE", "legacy");
         let _canonical_profile = set_env("OMP_PROFILE", "con");
 
@@ -78809,18 +79191,24 @@ mod cli_read_db_tests {
         assert_eq!(target.agent, "codex");
         assert_eq!(target.session_id.as_deref(), Some("abc-123"));
 
-        // `oh-my-pi` is a first-class OMP alias even when the path does not
-        // carry a canonical OMP store marker.
+        // Every documented OMP spelling is exact and first-class even when the
+        // path does not carry a canonical OMP store marker.
         let temp = tempfile::tempdir().expect("tempdir");
         let sess = temp.path().join("2026-04-09T00-00-00_xyz.jsonl");
         std::fs::write(&sess, r#"{"type":"session","id":"ov-42"}"#).expect("write");
-        let target = resolve_resume_target(&sess, Some("oh-my-pi")).expect("resolve");
-        assert_eq!(target.agent, "omp");
-        assert_eq!(
-            target.argv[0], "omp",
-            "--agent oh-my-pi must force the `omp` binary"
-        );
-        assert_eq!(target.session_id.as_deref(), Some("ov-42"));
+        for alias in ["omp", "oh-my-pi", "oh_my_pi", "ohmypi"] {
+            let target = resolve_resume_target(&sess, Some(alias)).expect("resolve OMP alias");
+            assert_eq!(target.agent, "omp", "alias {alias:?}");
+            assert_eq!(
+                target.argv[0], "omp",
+                "--agent {alias} must force the `omp` binary"
+            );
+            assert_eq!(target.session_id.as_deref(), Some("ov-42"));
+        }
+        let err = resolve_resume_target(&sess, Some("oh_my_pipeline"))
+            .expect_err("a near-match must not be accepted as OMP");
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "invalid-agent");
 
         // `pi` alias must force the `pi` binary even when path contains .omp/agent.
         let omp_dir = temp.path().join(".omp/agent/sessions");
@@ -84172,9 +84560,19 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Override Aider session discovery root.",
         ),
         env_var_capability(
+            "CASS_OMP_DATA_ROOT",
+            None,
+            "Declare an OMP-only archive/store root; CASS assigns OMP identity and resume plans preserve its exact sessions root.",
+        ),
+        env_var_capability(
+            "PI_SESSIONS_DIR",
+            None,
+            "Override the exact Pi Agent sessions directory.",
+        ),
+        env_var_capability(
             "PI_CODING_AGENT_DIR",
             None,
-            "Override the Pi-family agent directory; OMP ignores it while a named profile is active.",
+            "Override the shared Pi-family agent directory; ambiguous paths remain Pi Agent-owned. Use CASS_OMP_DATA_ROOT for OMP-only ownership.",
         ),
         env_var_capability(
             "PI_CODING_AGENT_SESSION_DIR",
@@ -84898,6 +85296,20 @@ fn run_introspect(output_format: Option<RobotFormat>) -> CliResult<()> {
     Ok(())
 }
 
+fn staged_secret_scan_json(
+    scan: &crate::pages::secret_scan::StagedSecretScan,
+    approval_state: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "performed": true,
+        "complete": true,
+        "findings": scan.report.summary.total,
+        "has_critical": scan.report.summary.has_critical,
+        "approval_state": approval_state,
+        "artifact_sha256": scan.artifact_sha256.as_str(),
+    })
+}
+
 /// Run export based on JSON config file.
 fn run_config_based_export(
     config: &crate::pages::config_input::PagesConfig,
@@ -84905,7 +85317,9 @@ fn run_config_based_export(
     db_path: &std::path::Path,
     dry_run: bool,
     output_format: Option<RobotFormat>,
-    _verbose: bool,
+    verbose: bool,
+    secrets_allow: &[String],
+    secrets_deny: &[String],
 ) -> anyhow::Result<()> {
     use chrono::DateTime;
     use rand::Rng;
@@ -84918,10 +85332,17 @@ fn run_config_based_export(
                 "status": "dry_run",
                 "output_dir": wizard_state.output_dir,
                 "config_valid": true,
+                "secret_scan": {
+                    "performed": false,
+                    "complete": false,
+                    "approval_state": "not_performed_dry_run",
+                    "artifact_sha256": null,
+                },
             });
             output_structured_value(result, fmt)?;
         } else {
             println!("Dry run: would export to {:?}", wizard_state.output_dir);
+            println!("Secret scan: not performed during dry run");
         }
         return Ok(());
     }
@@ -84953,11 +85374,34 @@ fn run_config_based_export(
         path_mode: config.path_mode(),
     };
 
-    // Run export
+    // Run export and scan the exact committed staging database before it can
+    // be encrypted, bundled, or deployed. Non-interactive config exports are
+    // fail-closed: callers may suppress reviewed false positives with the
+    // existing allowlist inputs, but cannot silently approve live findings.
     let export_engine = crate::pages::export::ExportEngine::new(db_path, &export_db_path, filter);
 
     let running = Arc::new(AtomicBool::new(true));
-    let stats = export_engine.execute(|_current, _total| {}, Some(running))?;
+    let secret_scan_config = crate::pages::secret_scan::SecretScanConfig::from_inputs(
+        secrets_allow,
+        secrets_deny,
+    )?;
+    let (stats, staged_secret_scan) = export_engine.execute_verified(
+        |_current, _total| {},
+        Some(running),
+        |staged_db_path| {
+            let scan = crate::pages::secret_scan::scan_staged_export_database(
+                staged_db_path,
+                &secret_scan_config,
+            )?;
+            if scan.report.summary.total > 0 {
+                anyhow::bail!(
+                    "Staged export contains {} potential secret(s); config-driven exports fail closed. Review with `cass pages --scan-secrets` and use --secrets-allow only for confirmed false positives.",
+                    scan.report.summary.total
+                );
+            }
+            Ok(scan)
+        },
+    )?;
 
     let mut recovery_secret: Option<Vec<u8>> = None;
     let encryption_enabled = !wizard_state.no_encryption;
@@ -85027,6 +85471,10 @@ fn run_config_based_export(
 
     let bundle_builder = crate::pages::bundle::BundleBuilder::with_config(bundle_config);
     let bundle_result = bundle_builder.build(&encrypted_dir, output_dir, |_phase, _msg| {})?;
+    crate::pages::verify::ensure_valid_bundle(&bundle_result.site_dir, false)
+        .map_err(|error| {
+            error.context("Completed config-driven Pages bundle failed full verification")
+        })?;
 
     // Optional deployment
     let deploy_result = match wizard_state.target {
@@ -85037,9 +85485,14 @@ fn run_config_based_export(
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("GitHub deployment requires deployment.repo"))?;
             let deployer = crate::pages::deploy_github::GitHubDeployer::new(repo.clone());
-            Some(serde_json::to_value(
-                deployer.deploy(&bundle_result.site_dir, |_phase, _msg| {})?,
-            )?)
+            let deployed = crate::pages::verify::with_verified_bundle_for_deployment(
+                &bundle_result.site_dir,
+                false,
+                |verified_site_dir| {
+                    deployer.deploy(verified_site_dir, |_phase, _msg| {})
+                },
+            )?;
+            Some(serde_json::to_value(deployed)?)
         }
         crate::pages::wizard::DeployTarget::CloudflarePages => {
             let project_name = wizard_state
@@ -85068,9 +85521,14 @@ fn run_config_based_export(
                     api_token,
                 },
             );
-            Some(serde_json::to_value(
-                deployer.deploy(&bundle_result.site_dir, |_phase, _msg| {})?,
-            )?)
+            let deployed = crate::pages::verify::with_verified_bundle_for_deployment(
+                &bundle_result.site_dir,
+                false,
+                |verified_site_dir| {
+                    deployer.deploy(verified_site_dir, |_phase, _msg| {})
+                },
+            )?;
+            Some(serde_json::to_value(deployed)?)
         }
     };
 
@@ -85083,7 +85541,7 @@ fn run_config_based_export(
         }
     });
 
-    if let Some(_fmt) = structured_format {
+    if let Some(fmt) = structured_format {
         let result = serde_json::json!({
             "status": "success",
             "output_dir": output_dir,
@@ -85094,6 +85552,7 @@ fn run_config_based_export(
                 "conversations": stats.conversations_processed,
                 "messages": stats.messages_processed,
             },
+            "secret_scan": staged_secret_scan_json(&staged_secret_scan, "clean"),
             "encryption": {
                 "enabled": encryption_enabled,
                 "generate_recovery": wizard_state.generate_recovery && encryption_enabled,
@@ -85105,7 +85564,7 @@ fn run_config_based_export(
             },
             "deployment": deploy_result,
         });
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        output_structured_value(result, fmt)?;
     } else {
         println!("Export complete:");
         println!("  Output: {}", output_dir.display());
@@ -85113,6 +85572,13 @@ fn run_config_based_export(
         println!("  Private: {}", bundle_result.private_dir.display());
         println!("  Conversations: {}", stats.conversations_processed);
         println!("  Messages: {}", stats.messages_processed);
+        println!("  Secret scan: complete (clean)");
+        if verbose {
+            println!(
+                "  Scanned artifact SHA-256: {}",
+                staged_secret_scan.artifact_sha256
+            );
+        }
         if encryption_enabled {
             println!("  Encryption: enabled");
         } else {
@@ -95585,10 +96051,7 @@ fn omp_session_dir_from_path(path: &Path) -> Option<PathBuf> {
         return Some(root);
     }
 
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    if normalized.contains("/.omp/agent/sessions/")
-        || crate::connectors::omp::profile_from_session_path(path).is_some()
-    {
+    if crate::connectors::omp::is_resolved_live_config_session_path(path) {
         return None;
     }
 
@@ -96165,10 +96628,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
         "omp" => {
             let id = extract_pi_family_session_id(path, PiFamilyHarness::Omp)?;
             let mut argv = vec!["omp".to_string()];
-            let profile = crate::connectors::omp::profile_from_session_path(path).or_else(|| {
-                crate::connectors::omp::configured_session_root(path)
-                    .and_then(|_| crate::connectors::omp::active_profile_from_env())
-            });
+            let profile = crate::connectors::omp::resume_profile_from_path(path);
             if let Some(profile) = profile {
                 argv.extend(["--profile".to_string(), profile]);
             }
@@ -96897,24 +97357,59 @@ fn strip_stdin_line_ending(mut input: String) -> String {
     input
 }
 
-fn create_unique_export_output_file(
+fn format_export_duration(session_start: Option<i64>, session_end: Option<i64>) -> Option<String> {
+    let (Some(start), Some(end)) = (session_start, session_end) else {
+        return None;
+    };
+    let elapsed_ms = end.checked_sub(start).filter(|elapsed| *elapsed > 0)?;
+    let mins = elapsed_ms / 60_000;
+    if mins >= 60 {
+        Some(format!("{}h {}m", mins / 60, mins % 60))
+    } else if mins > 0 {
+        Some(format!("{}m", mins))
+    } else {
+        Some("< 1m".to_string())
+    }
+}
+
+fn publish_unique_export_output_file(
     output_directory: &Path,
     final_filename: &str,
     output_path: &mut PathBuf,
-) -> io::Result<std::fs::File> {
+    write_staged: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     const OUTPUT_CREATE_ATTEMPTS: usize = 1000;
 
+    let mut staged = tempfile::Builder::new()
+        .prefix(".cass-export-")
+        .suffix(".tmp")
+        .tempfile_in(output_directory)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    write_staged(staged.as_file_mut())?;
+    staged.as_file_mut().flush()?;
+    staged.as_file().sync_all()?;
+
     for _ in 0..OUTPUT_CREATE_ATTEMPTS {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(output_path.as_path())
-        {
-            Ok(file) => return Ok(file),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+        match staged.persist_noclobber(output_path.as_path()) {
+            Ok(published) => {
+                published.sync_all()?;
+                sync_export_parent_directory(output_path)?;
+                return Ok(());
+            }
+            Err(err) if err.error.kind() == io::ErrorKind::AlreadyExists => {
+                staged = err.file;
                 *output_path = html_export::unique_filename(output_directory, final_filename);
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.error),
         }
     }
 
@@ -96922,6 +97417,35 @@ fn create_unique_export_output_file(
         io::ErrorKind::AlreadyExists,
         format!("could not reserve a unique output filename after {OUTPUT_CREATE_ATTEMPTS} tries"),
     ))
+}
+
+fn write_unique_export_output_file(
+    output_directory: &Path,
+    final_filename: &str,
+    output_path: &mut PathBuf,
+    contents: &[u8],
+) -> io::Result<()> {
+    publish_unique_export_output_file(
+        output_directory,
+        final_filename,
+        output_path,
+        |file| file.write_all(contents),
+    )
+}
+
+#[cfg(not(windows))]
+fn sync_export_parent_directory(path: &Path) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_export_parent_directory(_path: &Path) -> io::Result<()> {
+    // Windows does not document FlushFileBuffers for directory handles. The
+    // staged file itself is synced before and after the no-clobber publish.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -97092,7 +97616,7 @@ fn run_export_html(
     }
 
     // --- Get password if encryption requested ---
-    let final_password: Option<String> = if encrypt {
+    let final_password: Option<zeroize::Zeroizing<String>> = if encrypt {
         if password_stdin {
             let mut pwd = String::new();
             io::stdin().read_line(&mut pwd).map_err(|e| CliError {
@@ -97102,7 +97626,19 @@ fn run_export_html(
                 hint: None,
                 retryable: false,
             })?;
-            Some(strip_stdin_line_ending(pwd))
+            let pwd = strip_stdin_line_ending(pwd);
+            if pwd.is_empty() {
+                let err = CliError {
+                    code: 6,
+                    kind: CliErrorKind::PasswordRequired.kind_str(),
+                    message: "Password read from stdin was empty".to_string(),
+                    hint: Some("Provide a non-empty password via --password-stdin".to_string()),
+                    retryable: false,
+                };
+                emit_structured_error(&err);
+                return Err(err);
+            }
+            Some(zeroize::Zeroizing::new(pwd))
         } else {
             let err = CliError {
                 code: 6,
@@ -97523,19 +98059,7 @@ fn run_export_html(
     let message_count = messages.len();
 
     // --- Build metadata ---
-    let duration = match (session_start, session_end) {
-        (Some(start), Some(end)) if end > start => {
-            let mins = (end - start) / 60_000;
-            if mins >= 60 {
-                Some(format!("{}h {}m", mins / 60, mins % 60))
-            } else if mins > 0 {
-                Some(format!("{}m", mins))
-            } else {
-                Some("< 1m".to_string())
-            }
-        }
-        _ => None,
-    };
+    let duration = format_export_duration(session_start, session_end);
 
     let metadata = TemplateMetadata {
         timestamp: session_start.map(|ts| {
@@ -97645,6 +98169,7 @@ fn run_export_html(
         syntax_highlighting: true,
         include_search: true,
         include_theme_toggle: true,
+        default_theme: theme.to_string(),
         encrypt,
         print_styles: true,
         agent_name: agent_name.clone(),
@@ -97660,7 +98185,12 @@ fn run_export_html(
     let message_groups = group_messages_for_export(messages);
 
     let html = exporter
-        .export_messages(title, &message_groups, metadata, final_password.as_deref())
+        .export_messages(
+            title,
+            &message_groups,
+            metadata,
+            final_password.as_ref().map(|password| password.as_str()),
+        )
         .map_err(|e| {
             let err = CliError {
                 code: 5,
@@ -97689,28 +98219,35 @@ fn run_export_html(
         emit_structured_error(&err);
         err
     })?;
-    let mut file =
-        create_unique_export_output_file(&output_directory, &final_filename, &mut output_path)
-            .map_err(|e| {
-                let err = CliError {
-                    code: 4,
-                    kind: CliErrorKind::OutputNotWritable.kind_str(),
-                    message: format!("Could not create output file: {e}"),
-                    hint: Some(format!(
-                        "Check permissions for {}",
-                        output_directory.display()
-                    )),
-                    retryable: false,
-                };
-                emit_structured_error(&err);
-                err
-            })?;
-    file.write_all(html.as_bytes()).map_err(|e| {
+    write_unique_export_output_file(
+        &output_directory,
+        &final_filename,
+        &mut output_path,
+        html.as_bytes(),
+    )
+    .map_err(|e| {
+        let output_unavailable = matches!(
+            e.kind(),
+            io::ErrorKind::PermissionDenied
+                | io::ErrorKind::NotFound
+                | io::ErrorKind::AlreadyExists
+        );
         let err = CliError {
             code: 4,
-            kind: CliErrorKind::WriteFailed.kind_str(),
-            message: format!("Failed to write file: {e}"),
-            hint: None,
+            kind: if output_unavailable {
+                CliErrorKind::OutputNotWritable.kind_str()
+            } else {
+                CliErrorKind::WriteFailed.kind_str()
+            },
+            message: if output_unavailable {
+                format!("Could not create output file: {e}")
+            } else {
+                format!("Failed to publish complete output file: {e}")
+            },
+            hint: Some(format!(
+                "Check permissions and available space for {}",
+                output_directory.display()
+            )),
             retryable: false,
         };
         emit_structured_error(&err);
@@ -98123,6 +98660,43 @@ fn flush_group(
     }
 }
 
+fn tool_result_content(msg: &html_export::Message) -> String {
+    let Some(output) = msg
+        .tool_call
+        .as_ref()
+        .and_then(|tool_call| tool_call.output.as_deref())
+        .filter(|output| !output.is_empty())
+    else {
+        return msg.content.clone();
+    };
+
+    if msg.content.trim().is_empty() {
+        output.to_string()
+    } else if msg.content == output {
+        msg.content.clone()
+    } else {
+        format!("{}\n\n{output}", msg.content)
+    }
+}
+
+fn standalone_tool_result_group(msg: &html_export::Message) -> html_export::MessageGroup {
+    let mut primary = msg.clone();
+    primary.content = tool_result_content(msg);
+
+    if let Some(tool_call) = primary.tool_call.as_ref() {
+        primary.author = Some(match tool_call.status {
+            Some(html_export::ToolStatus::Error) => format!("{} error", tool_call.name),
+            Some(html_export::ToolStatus::Pending) => {
+                format!("{} pending result", tool_call.name)
+            }
+            _ => format!("{} result", tool_call.name),
+        });
+    }
+    primary.role = "tool".to_string();
+    primary.tool_call = None;
+    html_export::MessageGroup::tool_only(primary)
+}
+
 /// Groups flat messages into MessageGroups with tool correlation.
 ///
 /// # Algorithm
@@ -98193,17 +98767,20 @@ pub fn group_messages_for_export(
             }
 
             MessageClassification::AssistantToolOnly => {
-                // Tool-only messages attach to current group or create tool-only group
-                if let Some(ref mut g) = current_group {
-                    // Attach to existing group
-                    if let Some(ref tc) = msg.tool_call {
-                        let corr_id = extract_correlation_id(msg, format);
-                        g.add_tool_call(tc.clone(), corr_id);
-                        g.update_end_timestamp(msg.timestamp.clone());
-                        trace!(tool_name = %tc.name, "Attached tool call to current group");
-                    }
-                } else {
-                    // Create a new tool-only group
+                // A tool-only assistant message may extend an assistant group
+                // or an existing tool-call-only group. It must never be folded
+                // into a user prompt or a standalone orphan-result group.
+                let can_attach = current_group.as_ref().is_some_and(|group| {
+                    matches!(
+                        group.group_type,
+                        html_export::MessageGroupType::Assistant
+                    ) || (matches!(
+                        group.group_type,
+                        html_export::MessageGroupType::ToolOnly
+                    ) && !group.tool_calls.is_empty())
+                });
+                if !can_attach {
+                    flush_group(&mut groups, &mut current_group);
                     let mut group = html_export::MessageGroup::tool_only(msg.clone());
                     if let Some(ref tc) = msg.tool_call {
                         let corr_id = extract_correlation_id(msg, format);
@@ -98211,11 +98788,21 @@ pub fn group_messages_for_export(
                     }
                     current_group = Some(group);
                     trace!("Created new tool-only group");
+                } else if let Some(ref mut group) = current_group
+                    && let Some(ref tc) = msg.tool_call
+                {
+                    let corr_id = extract_correlation_id(msg, format);
+                    group.add_tool_call(tc.clone(), corr_id);
+                    group.update_end_timestamp(msg.timestamp.clone());
+                    trace!(tool_name = %tc.name, "Attached tool call to current assistant group");
                 }
             }
 
             MessageClassification::ToolResult => {
-                // Tool results attach to current group
+                // Tool results attach to the current group when correlation is
+                // unambiguous. Preserve unmatched/orphaned results as their own
+                // transcript group rather than silently dropping source bytes.
+                let mut attached = false;
                 if let Some(ref mut g) = current_group {
                     // Create a ToolResult from the message
                     let tool_name = msg
@@ -98224,11 +98811,7 @@ pub fn group_messages_for_export(
                         .map(|tc| tc.name.clone())
                         .unwrap_or_else(|| "tool_result".to_string());
 
-                    let content = if let Some(ref tc) = msg.tool_call {
-                        tc.output.clone().unwrap_or_else(|| msg.content.clone())
-                    } else {
-                        msg.content.clone()
-                    };
+                    let content = tool_result_content(msg);
 
                     let status = msg
                         .tool_call
@@ -98244,14 +98827,20 @@ pub fn group_messages_for_export(
                         result = result.with_correlation_id(corr_id);
                     }
 
-                    g.add_tool_result(result);
-                    g.update_end_timestamp(msg.timestamp.clone());
-                    trace!(tool_name = %tool_name, "Added tool result to group");
-                } else {
+                    attached = g.add_tool_result(result);
+                    if attached {
+                        g.update_end_timestamp(msg.timestamp.clone());
+                        trace!(tool_name = %tool_name, "Added tool result to group");
+                    }
+                }
+
+                if !attached {
                     debug!(
                         idx = idx,
-                        "Orphan tool result, no current group to attach to"
+                        "Preserving unmatched tool result as a standalone group"
                     );
+                    flush_group(&mut groups, &mut current_group);
+                    current_group = Some(standalone_tool_result_group(msg));
                 }
             }
 
@@ -98573,7 +99162,10 @@ mod opencode_export_tests {
 
 #[cfg(test)]
 mod export_timestamp_tests {
-    use super::{create_unique_export_output_file, extract_message_timestamp, run_export_html};
+    use super::{
+        extract_message_timestamp, format_export_duration, publish_unique_export_output_file,
+        run_export_html, write_unique_export_output_file,
+    };
     use serde_json::json;
     use std::fs;
     use std::io::Write;
@@ -98600,6 +99192,28 @@ mod export_timestamp_tests {
         assert_eq!(
             extract_message_timestamp(&nested_payload),
             Some(1_733_000_123_000)
+        );
+    }
+
+    #[test]
+    fn export_duration_handles_boundaries_without_overflow() {
+        assert_eq!(
+            format_export_duration(Some(0), Some(59_999)).as_deref(),
+            Some("< 1m")
+        );
+        assert_eq!(
+            format_export_duration(Some(0), Some(60_000)).as_deref(),
+            Some("1m")
+        );
+        assert_eq!(
+            format_export_duration(Some(0), Some(3_660_000)).as_deref(),
+            Some("1h 1m")
+        );
+        assert_eq!(format_export_duration(Some(1), Some(1)), None);
+        assert_eq!(format_export_duration(Some(2), Some(1)), None);
+        assert_eq!(
+            format_export_duration(Some(i64::MIN), Some(i64::MAX)),
+            None
         );
     }
 
@@ -98700,11 +99314,13 @@ mod export_timestamp_tests {
 
         fs::write(&output_path, "first writer").expect("create race winner");
 
-        let mut file = create_unique_export_output_file(temp.path(), "out.html", &mut output_path)
-            .expect("retry with suffixed filename");
-        file.write_all(b"second writer")
-            .expect("write retry output");
-        drop(file);
+        write_unique_export_output_file(
+            temp.path(),
+            "out.html",
+            &mut output_path,
+            b"second writer",
+        )
+        .expect("retry with suffixed filename");
 
         assert_eq!(
             fs::read_to_string(temp.path().join("out.html")).expect("read original"),
@@ -98718,6 +99334,62 @@ mod export_timestamp_tests {
             fs::read_to_string(&output_path).expect("read retry output"),
             "second writer"
         );
+    }
+
+    #[test]
+    fn export_output_publish_failure_never_exposes_partial_final_file() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut output_path = temp.path().join("out.html");
+
+        let err = publish_unique_export_output_file(
+            temp.path(),
+            "out.html",
+            &mut output_path,
+            |file| {
+                file.write_all(b"partial bytes")?;
+                Err(std::io::Error::other("injected staged-write failure"))
+            },
+        )
+        .expect_err("injected staged write should fail");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(
+            !output_path.exists(),
+            "a failed staged write must not expose a partial final export"
+        );
+        let retained_entries = fs::read_dir(temp.path())
+            .expect("read output directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            retained_entries.is_empty(),
+            "failed staged export should clean up private temporary files: {retained_entries:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn export_output_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temp dir");
+        let mut output_path = temp.path().join("out.html");
+
+        write_unique_export_output_file(
+            temp.path(),
+            "out.html",
+            &mut output_path,
+            b"private transcript",
+        )
+        .expect("publish private export");
+
+        let mode = fs::metadata(&output_path)
+            .expect("output metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "HTML exports must not be group/world-readable");
     }
 
     #[test]
@@ -101638,14 +102310,113 @@ mod message_grouping_tests {
 
     #[test]
     fn test_orphan_tool_result() {
-        // Tool result without preceding tool call should be handled gracefully
+        // A full archive must preserve a tool result even when no originating
+        // call is available for correlation.
         let msgs = vec![
             msg_user("Hello"),
             msg_tool_result("Read", "orphan result", ToolStatus::Success),
         ];
         let groups = group_messages_for_export(msgs);
-        // Should have user group, orphan tool result might be dropped or attached
-        assert!(!groups.is_empty());
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].group_type, MessageGroupType::User);
+        assert_eq!(groups[1].group_type, MessageGroupType::ToolOnly);
+        assert_eq!(groups[1].primary.content, "orphan result");
+        assert_eq!(groups[1].primary.author.as_deref(), Some("Read result"));
+    }
+
+    #[test]
+    fn assistant_tool_only_message_never_attaches_to_user_prompt() {
+        let groups = group_messages_for_export(vec![
+            msg_user("Inspect the repository"),
+            msg_assistant_with_tool("", "Read", "src/lib.rs"),
+        ]);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].group_type, MessageGroupType::User);
+        assert!(
+            groups[0].tool_calls.is_empty(),
+            "assistant tool calls must not be attributed to the user"
+        );
+        assert_eq!(groups[1].group_type, MessageGroupType::ToolOnly);
+        assert_eq!(groups[1].tool_calls.len(), 1);
+        assert_eq!(groups[1].tool_calls[0].call.name, "Read");
+    }
+
+    #[test]
+    fn assistant_tool_only_message_never_attaches_to_orphan_result() {
+        let groups = group_messages_for_export(vec![
+            msg_tool_result("Read", "orphan output", ToolStatus::Success),
+            msg_assistant_with_tool("", "Bash", "pwd"),
+        ]);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].group_type, MessageGroupType::ToolOnly);
+        assert!(groups[0].tool_calls.is_empty());
+        assert_eq!(groups[0].primary.content, "orphan output");
+        assert_eq!(groups[1].group_type, MessageGroupType::ToolOnly);
+        assert_eq!(groups[1].tool_calls.len(), 1);
+        assert_eq!(groups[1].tool_calls[0].call.name, "Bash");
+    }
+
+    #[test]
+    fn orphan_tool_result_preserves_distinct_message_and_output_content() {
+        let mut result = msg_tool_result("Read", "actual output", ToolStatus::Success);
+        result.content = "provider result envelope".to_string();
+
+        let groups = group_messages_for_export(vec![result]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_type, MessageGroupType::ToolOnly);
+        assert_eq!(
+            groups[0].primary.content,
+            "provider result envelope\n\nactual output"
+        );
+    }
+
+    #[test]
+    fn matched_tool_result_preserves_distinct_message_and_output_content() {
+        let call = msg_assistant_with_tool("Reading a file", "Read", "/expected");
+        let mut result = msg_tool_result("Read", "actual output", ToolStatus::Success);
+        result.content = "provider result envelope".to_string();
+
+        let groups = group_messages_for_export(vec![call, result]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tool_calls.len(), 1);
+        assert_eq!(
+            groups[0].tool_calls[0]
+                .result
+                .as_ref()
+                .map(|result| result.content.as_str()),
+            Some("provider result envelope\n\nactual output")
+        );
+    }
+
+    #[test]
+    fn mismatched_correlated_tool_result_is_preserved_without_wrong_pairing() {
+        let mut call = msg_assistant_with_tool("Reading a file", "Read", "/expected");
+        call.tool_call
+            .as_mut()
+            .expect("tool call")
+            .correlation_id = Some("call-expected".to_string());
+
+        let mut result = msg_tool_result("Read", "different result", ToolStatus::Error);
+        result
+            .tool_call
+            .as_mut()
+            .expect("tool result")
+            .correlation_id = Some("call-other".to_string());
+
+        let groups = group_messages_for_export(vec![call, result]);
+
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups[0].tool_calls[0].result.is_none(),
+            "an explicit mismatched correlation ID must never pair by name"
+        );
+        assert_eq!(groups[1].group_type, MessageGroupType::ToolOnly);
+        assert_eq!(groups[1].primary.content, "different result");
+        assert_eq!(groups[1].primary.author.as_deref(), Some("Read error"));
     }
 
     #[test]
@@ -107449,6 +108220,19 @@ fn resolve_semantic_index_embedder(raw: &str) -> String {
     }
 }
 
+fn semantic_identity_backfill_fingerprint(
+    canonical_db_fingerprint: &str,
+    identity_generation: Option<&str>,
+) -> String {
+    identity_generation.map_or_else(
+        || canonical_db_fingerprint.to_owned(),
+        |generation| {
+            let generation_hash = blake3::hash(generation.as_bytes()).to_hex();
+            format!("identity-v1:{generation_hash}:{canonical_db_fingerprint}")
+        },
+    )
+}
+
 fn run_models_backfill(
     tier_raw: &str,
     embedder_override: Option<&str>,
@@ -107465,7 +108249,7 @@ fn run_models_backfill(
     use crate::search::model_download::ModelManifest;
     use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
     use crate::search::semantic_manifest::{SemanticManifest, TierKind};
-    use crate::storage::sqlite::FrankenStorage;
+    use crate::storage::sqlite::{FrankenStorage, SemanticIdentityTier};
     use colored::Colorize;
 
     if batch_conversations == 0 {
@@ -107576,7 +108360,7 @@ fn run_models_backfill(
             decision.scheduled_batch_conversations
         });
 
-    let db_fingerprint =
+    let canonical_db_fingerprint =
         crate::indexer::lexical_storage_fingerprint_for_db(&db_path).map_err(|e| CliError {
             code: 5,
             kind: CliErrorKind::StorageFingerprint.kind_str(),
@@ -107624,6 +108408,35 @@ fn run_models_backfill(
         }),
         retryable: embedder_type != "hash",
     })?;
+    // Identity invalidation follows the physical vector space that query
+    // serving selects, not the user-facing manifest tier. Tests and operators
+    // may deliberately backfill the quality tier with the hash embedder.
+    let identity_tier = if indexer.embedder_id() == "fnv1a-384" {
+        SemanticIdentityTier::Fast
+    } else {
+        SemanticIdentityTier::Quality
+    };
+    let identity_rebuild_generation = storage
+        .semantic_identity_rebuild_generation(identity_tier)
+        .map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!("Failed to inspect semantic identity rebuild state: {e}"),
+            hint: Some(
+                "Retry the semantic backfill; stale semantic serving remains fail-closed".into(),
+            ),
+            retryable: true,
+        })?;
+    // The ordinary content fingerprint intentionally contains only
+    // counts/max rowids, so a Pi -> OMP identity rewrite does not invalidate
+    // an in-progress checkpoint. Namespace checkpoint and staging identity by
+    // the durable migration generation; a stale Pi-era cursor can then never
+    // resume into the rebuilt artifact. The published manifest is rebound to
+    // the canonical content fingerprint below before serving is re-enabled.
+    let backfill_db_fingerprint = semantic_identity_backfill_fingerprint(
+        &canonical_db_fingerprint,
+        identity_rebuild_generation.as_deref(),
+    );
 
     // Sub-fix 1 for cass#257: open a JSONL progress sink whose
     // destination is taken from `CASS_SEMANTIC_PROGRESS_JSONL`. The
@@ -107642,7 +108455,7 @@ fn run_models_backfill(
             &mut manifest,
             SemanticBackfillStoragePlan {
                 tier,
-                db_fingerprint,
+                db_fingerprint: backfill_db_fingerprint.clone(),
                 model_revision,
                 max_conversations: effective_batch_conversations,
             },
@@ -107657,6 +108470,71 @@ fn run_models_backfill(
             ),
             retryable: true,
         })?;
+
+    if outcome.published && identity_rebuild_generation.is_some() {
+        let published_artifact = match outcome.tier {
+            TierKind::Fast => manifest.fast_tier.as_mut(),
+            TierKind::Quality => manifest.quality_tier.as_mut(),
+        }
+        .ok_or_else(|| CliError {
+            code: 5,
+            kind: CliErrorKind::SemanticManifest.kind_str(),
+            message: "Semantic identity rebuild published without a tier artifact".to_string(),
+            hint: Some(
+                "Retry the semantic backfill; stale semantic serving remains fail-closed".into(),
+            ),
+            retryable: true,
+        })?;
+        if published_artifact.db_fingerprint != backfill_db_fingerprint {
+            return Err(CliError {
+                code: 5,
+                kind: CliErrorKind::SemanticManifest.kind_str(),
+                message: "Semantic identity rebuild published an unexpected generation"
+                    .to_string(),
+                hint: Some(
+                    "Retry the semantic backfill; stale semantic serving remains fail-closed"
+                        .into(),
+                ),
+                retryable: true,
+            });
+        }
+        published_artifact.db_fingerprint = canonical_db_fingerprint.clone();
+        manifest.refresh_backlog(outcome.total_conversations, &canonical_db_fingerprint);
+        manifest.save(&data_dir).map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::SemanticManifest.kind_str(),
+            message: format!("Failed to finalize semantic identity manifest: {e}"),
+            hint: Some(
+                "Retry the semantic backfill; stale semantic serving remains fail-closed".into(),
+            ),
+            retryable: true,
+        })?;
+        crate::indexer::semantic::invalidate_identity_stale_semantic_shards(
+            &data_dir,
+            indexer.embedder_id(),
+        )
+        .map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::SemanticManifest.kind_str(),
+            message: format!("Failed to revoke stale semantic shard generations: {e}"),
+            hint: Some(
+                "Retry the semantic backfill; stale semantic serving remains fail-closed".into(),
+            ),
+            retryable: true,
+        })?;
+        storage
+            .complete_semantic_identity_rebuild(identity_tier)
+            .map_err(|e| CliError {
+                code: 5,
+                kind: CliErrorKind::Storage.kind_str(),
+                message: format!("Failed to complete semantic identity rebuild: {e}"),
+                hint: Some(
+                    "Retry the semantic backfill; stale semantic serving remains fail-closed"
+                        .into(),
+                ),
+                retryable: true,
+            })?;
+    }
 
     let progress_pct = outcome.progress_pct();
     let status = if outcome.published {
@@ -107731,6 +108609,56 @@ fn run_models_backfill(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod semantic_identity_backfill_checkpoint_tests {
+    use super::semantic_identity_backfill_fingerprint;
+    use crate::search::semantic_manifest::{BuildCheckpoint, TierKind};
+
+    fn fast_checkpoint() -> BuildCheckpoint {
+        BuildCheckpoint {
+            tier: TierKind::Fast,
+            embedder_id: "fnv1a-384".to_string(),
+            last_offset: 41,
+            docs_embedded: 41,
+            conversations_processed: 41,
+            total_conversations: 82,
+            db_fingerprint: "content-v1:82:82:820".to_string(),
+            schema_version: 1,
+            chunking_version: 1,
+            saved_at_ms: 1,
+            last_message_id: Some(410),
+            cursor_exhausted: false,
+        }
+    }
+
+    #[test]
+    fn identity_generation_invalidates_count_compatible_semantic_checkpoints() {
+        let canonical = "content-v1:82:82:820";
+        let checkpoint = fast_checkpoint();
+        assert!(checkpoint.is_valid(canonical));
+
+        let first_generation =
+            semantic_identity_backfill_fingerprint(canonical, Some("ownership-context-a"));
+        let second_generation =
+            semantic_identity_backfill_fingerprint(canonical, Some("ownership-context-b"));
+        assert!(
+            !checkpoint.is_valid(&first_generation),
+            "a count/max-id-compatible Pi-era checkpoint must not resume after an OMP identity rewrite"
+        );
+        assert_ne!(first_generation, second_generation);
+        let mut first_generation_checkpoint = checkpoint.clone();
+        first_generation_checkpoint.db_fingerprint = first_generation;
+        assert!(
+            !first_generation_checkpoint.is_valid(&second_generation),
+            "a later ownership-context rewrite must invalidate an earlier partial identity rebuild"
+        );
+        assert_eq!(
+            semantic_identity_backfill_fingerprint(canonical, None),
+            canonical
+        );
+    }
 }
 
 /// Remove model files
