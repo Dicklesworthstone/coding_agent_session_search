@@ -74,6 +74,7 @@ pub enum LazyDbError {
 /// access with a mutex. `AsyncConnection` is the supported cross-thread handle;
 /// these methods keep CASS's synchronous call shape while every engine command
 /// remains on that handle's owner worker.
+#[derive(Debug)]
 pub struct FrankenOwnerConnection(FrankenAsyncConnection);
 
 impl FrankenOwnerConnection {
@@ -4362,6 +4363,17 @@ fn close_franken_in_place_with_busy_retry(
     unreachable!("close retry loop returns on the final attempt")
 }
 
+/// Thread-affine storage owning the primary raw connection and any cached raw
+/// ephemeral writer. Moving it to another OS thread must remain a compile-time
+/// error; use [`FrankenOwnerConnection`] for cross-thread reads instead.
+///
+/// ```compile_fail
+/// use coding_agent_search::storage::sqlite::FrankenStorage;
+/// fn requires_send<T: Send>(_: T) {}
+/// fn raw_storage_must_not_cross_threads(storage: FrankenStorage) {
+///     requires_send(storage);
+/// }
+/// ```
 pub struct FrankenStorage {
     conn: FrankenConnection,
     db_path: PathBuf,

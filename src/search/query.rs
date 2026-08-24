@@ -7756,137 +7756,205 @@ impl SearchClient {
                 .collect()
         }
 
+        fn flush_pending_or_group(
+            pending_or_group: &mut SqliteMessageScanGroup,
+            groups: &mut Vec<SqliteMessageScanGroup>,
+        ) {
+            if !pending_or_group.is_empty() {
+                groups.push(std::mem::take(pending_or_group));
+            }
+        }
+
+        fn apply_operand(
+            operand: SqliteMessageScanOperand,
+            next_negated: &mut bool,
+            in_or_sequence: &mut bool,
+            just_saw_or: &mut bool,
+            pending_or_group: &mut SqliteMessageScanGroup,
+            groups: &mut Vec<SqliteMessageScanGroup>,
+        ) {
+            let alternative = SqliteMessageScanAlternative {
+                operand,
+                negated: *next_negated,
+            };
+
+            if *in_or_sequence && *just_saw_or {
+                if pending_or_group.is_empty()
+                    && let Some(previous_group) = groups.pop()
+                {
+                    // The primary frankensearch builder lifts its preceding
+                    // Must/MustNot clause into the tighter-binding OR group.
+                    // Flattening an already-grouped clause is equivalent and
+                    // also handles permissive malformed forms such as
+                    // `A AND OR B` without changing their established meaning.
+                    pending_or_group.extend(previous_group);
+                }
+                pending_or_group.push(alternative);
+            } else {
+                flush_pending_or_group(pending_or_group, groups);
+                *in_or_sequence = false;
+                groups.push(vec![alternative]);
+            }
+
+            *just_saw_or = false;
+            *next_negated = false;
+        }
+
         let tokens = fs_cass_parse_boolean_query(raw_query);
         if tokens.is_empty() {
             return None;
         }
 
-        let mut include_groups = Vec::new();
+        let mut groups = Vec::new();
         let mut pending_or_group: SqliteMessageScanGroup = Vec::new();
-        let mut exclude_terms = Vec::new();
-        let mut negated = false;
+        let mut next_negated = false;
         let mut in_or_sequence = false;
+        let mut just_saw_or = false;
         for token in tokens {
             match token {
                 FsCassQueryToken::And => {
-                    if !pending_or_group.is_empty() {
-                        include_groups.push(std::mem::take(&mut pending_or_group));
-                    }
+                    flush_pending_or_group(&mut pending_or_group, &mut groups);
                     in_or_sequence = false;
-                    negated = false;
+                    just_saw_or = false;
+                    next_negated = false;
                 }
                 FsCassQueryToken::Or => {
-                    if include_groups.is_empty() && pending_or_group.is_empty() {
-                        continue;
-                    }
-                    if negated {
-                        return None;
-                    }
                     in_or_sequence = true;
+                    just_saw_or = true;
                 }
                 FsCassQueryToken::Not => {
-                    if in_or_sequence {
-                        return None;
+                    if !just_saw_or {
+                        flush_pending_or_group(&mut pending_or_group, &mut groups);
+                        in_or_sequence = false;
+                        just_saw_or = false;
                     }
-                    if !pending_or_group.is_empty() {
-                        include_groups.push(std::mem::take(&mut pending_or_group));
-                    }
-                    negated = true;
-                    in_or_sequence = false;
+                    // Repeated NOT tokens remain one negation in the pinned
+                    // compatibility grammar; they do not toggle polarity.
+                    next_negated = true;
                 }
                 FsCassQueryToken::Term(term) => {
                     let parts = scan_parts(normalize_term_parts(&term));
                     if parts.is_empty() {
                         continue;
                     }
-                    if negated {
-                        exclude_terms.extend(parts);
-                    } else if in_or_sequence {
-                        if pending_or_group.is_empty() {
-                            let previous = include_groups.pop()?;
-                            pending_or_group.extend(previous);
-                        }
-                        pending_or_group.push(parts);
-                    } else {
-                        include_groups.push(vec![parts]);
-                    }
-                    negated = false;
+                    apply_operand(
+                        SqliteMessageScanOperand::Terms(parts),
+                        &mut next_negated,
+                        &mut in_or_sequence,
+                        &mut just_saw_or,
+                        &mut pending_or_group,
+                        &mut groups,
+                    );
                 }
                 FsCassQueryToken::Phrase(phrase) => {
                     let parts = normalize_phrase_terms(&phrase);
                     if parts.is_empty() {
                         continue;
                     }
-                    if negated {
-                        exclude_terms.extend(parts);
-                    } else if in_or_sequence {
-                        if pending_or_group.is_empty() {
-                            let previous = include_groups.pop()?;
-                            pending_or_group.extend(previous);
-                        }
-                        pending_or_group.push(parts);
-                    } else {
-                        include_groups.push(vec![parts]);
-                    }
-                    negated = false;
+                    apply_operand(
+                        SqliteMessageScanOperand::Phrase(parts),
+                        &mut next_negated,
+                        &mut in_or_sequence,
+                        &mut just_saw_or,
+                        &mut pending_or_group,
+                        &mut groups,
+                    );
                 }
             }
         }
 
-        if !pending_or_group.is_empty() {
-            include_groups.push(pending_or_group);
-        }
+        flush_pending_or_group(&mut pending_or_group, &mut groups);
 
-        for group in &mut include_groups {
+        for group in &mut groups {
             for alternative in group.iter_mut() {
-                alternative.sort();
-                alternative.dedup();
+                if let SqliteMessageScanOperand::Terms(parts) = &mut alternative.operand {
+                    parts.sort();
+                    parts.dedup();
+                }
             }
-            group.retain(|alternative| !alternative.is_empty());
             group.sort();
             group.dedup();
         }
-        include_groups.retain(|group| !group.is_empty());
-        exclude_terms.sort();
-        exclude_terms.dedup();
-        if include_groups.is_empty() {
+        groups.retain(|group| !group.is_empty());
+        if groups.is_empty() {
             return None;
         }
 
-        Some(SqliteMessageScanQuery {
-            include_groups,
-            exclude_terms,
-        })
+        Some(SqliteMessageScanQuery { groups })
     }
 
-    fn sqlite_message_scan_score(haystack: &str, scan_query: &SqliteMessageScanQuery) -> f32 {
-        for term in &scan_query.exclude_terms {
-            if haystack.contains(term) {
-                return 0.0;
+    fn sqlite_message_scan_score(
+        haystacks: &[String],
+        scan_query: &SqliteMessageScanQuery,
+    ) -> f32 {
+        let has_phrase = scan_query.groups.iter().flatten().any(|alternative| {
+            matches!(alternative.operand, SqliteMessageScanOperand::Phrase(_))
+        });
+        let tokenized_haystacks = has_phrase.then(|| {
+            haystacks
+                .iter()
+                .map(|haystack| normalize_phrase_terms(haystack))
+                .collect::<Vec<_>>()
+        });
+
+        let operand_score = |operand: &SqliteMessageScanOperand| -> f32 {
+            match operand {
+                SqliteMessageScanOperand::Terms(terms) => {
+                    let mut score = 0.0;
+                    for term in terms {
+                        let matches = haystacks
+                            .iter()
+                            .map(|haystack| haystack.matches(term).count())
+                            .sum::<usize>();
+                        if matches < 1 {
+                            return 0.0;
+                        }
+                        score += matches as f32;
+                    }
+                    score
+                }
+                SqliteMessageScanOperand::Phrase(phrase) => tokenized_haystacks
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|tokens| {
+                        tokens
+                            .windows(phrase.len())
+                            .filter(|window| *window == phrase.as_slice())
+                            .count()
+                    })
+                    .sum::<usize>() as f32,
             }
-        }
+        };
 
         let mut score = 0.0f32;
-        for group in &scan_query.include_groups {
+        for group in &scan_query.groups {
+            let mut group_matched = false;
             let mut group_score = 0.0f32;
             for alternative in group {
-                let mut alternative_score = 0.0f32;
-                for term in alternative {
-                    let matches = haystack.matches(term).count();
-                    if matches < 1 {
-                        alternative_score = 0.0;
-                        break;
+                let alternative_score = operand_score(&alternative.operand);
+                let alternative_matched = if alternative.negated {
+                    alternative_score <= 0.0
+                } else {
+                    alternative_score > 0.0
+                };
+                if alternative_matched {
+                    group_matched = true;
+                    if !alternative.negated {
+                        group_score = group_score.max(alternative_score);
                     }
-                    alternative_score += matches as f32;
                 }
-                group_score = group_score.max(alternative_score);
             }
-            if group_score <= 0.0 {
+            if !group_matched {
                 return 0.0;
             }
             score += group_score;
         }
-        score
+
+        // A negative-only query has no positive relevance contribution, but
+        // its complement matches still need a non-zero sentinel so the caller
+        // does not discard them. Mixed-query negative clauses stay score-neutral.
+        if score > 0.0 { score } else { 1.0 }
     }
 
     fn sqlite_message_scan_query_sql(field_mask: FieldMask) -> String {
@@ -7981,25 +8049,12 @@ impl SearchClient {
             scan_title,
         ) in rows
         {
-            let mut haystack = String::with_capacity(
-                scan_content.len()
-                    + scan_title.len()
-                    + agent.len()
-                    + workspace.len()
-                    + source_path.len()
-                    + 4,
-            );
-            haystack.push_str(&scan_content);
-            haystack.push(' ');
-            haystack.push_str(&scan_title);
-            haystack.push(' ');
-            haystack.push_str(&agent);
-            haystack.push(' ');
-            haystack.push_str(&workspace);
-            haystack.push(' ');
-            haystack.push_str(&source_path);
-            let haystack = haystack.to_lowercase();
-            let score = Self::sqlite_message_scan_score(&haystack, &scan_query);
+            // The primary CASS lexical query targets title/content; agent,
+            // workspace, and source are filters rather than searchable text.
+            // Keep the two text fields separate so a quoted phrase cannot
+            // accidentally bridge the content/title boundary.
+            let scan_haystacks = [scan_content.to_lowercase(), scan_title.to_lowercase()];
+            let score = Self::sqlite_message_scan_score(&scan_haystacks, &scan_query);
             if score <= 0.0 {
                 continue;
             }
@@ -8082,14 +8137,29 @@ impl SearchClient {
             return Ok(Vec::new());
         }
 
-        let fts_query = match transpile_to_fts5(raw_query) {
-            Some(q) if !q.trim().is_empty() => q,
-            _ => return Ok(Vec::new()),
-        };
-
         let sqlite_guard = self.sqlite_guard()?;
         let Some(conn) = sqlite_guard.as_ref() else {
             return Ok(Vec::new());
+        };
+
+        let query_match_type = dominant_match_type(raw_query);
+        let scan_request = SqliteMessageScanRequest {
+            raw_query,
+            filters: &filters,
+            limit,
+            offset,
+            field_mask,
+            query_match_type,
+        };
+        let fts_query = match transpile_to_fts5(raw_query) {
+            Some(q) if !q.trim().is_empty() => q,
+            _ => {
+                tracing::debug!(
+                    query = raw_query,
+                    "query is not faithfully representable in FTS5; using source-table scan fallback"
+                );
+                return self.search_sqlite_message_scan(conn, scan_request);
+            }
         };
 
         let empty_params: [ParamValue; 0] = [];
@@ -8102,18 +8172,8 @@ impl SearchClient {
         .map(|rows| !rows.is_empty())
         .unwrap_or(false);
         if !has_fts {
-            return Ok(Vec::new());
+            return self.search_sqlite_message_scan(conn, scan_request);
         }
-
-        let query_match_type = dominant_match_type(raw_query);
-        let scan_request = SqliteMessageScanRequest {
-            raw_query,
-            filters: &filters,
-            limit,
-            offset,
-            field_mask,
-            query_match_type,
-        };
         if let Err(err) =
             crate::storage::sqlite::validate_fts_messages_integrity_for_async_connection(conn)
         {
@@ -8681,6 +8741,14 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     // salvage a leading AND: ignore it instead of turning the
                     // whole fallback query into an empty result set.
                     continue;
+                }
+                if next_op == "NOT" {
+                    // The pinned parser accepts permissive token sequences such
+                    // as `A NOT OR B` and interprets them as `A OR NOT B`.
+                    // FTS5 has no match-all operand with which to express that
+                    // complement branch, so fail over to the source scan rather
+                    // than silently broadening it to `A OR B`.
+                    return None;
                 }
                 // Start or continue an OR group. Unsupported `OR NOT` forms
                 // are rejected when the subsequent NOT token arrives.
