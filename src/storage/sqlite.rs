@@ -8274,7 +8274,9 @@ impl FrankenStorage {
         };
         let assets_were_pending = state
             .as_deref()
-            .is_some_and(|value| value == "analytics_pending" || value.starts_with("analytics_pending:"))
+            .is_some_and(|value| {
+                value == "analytics_pending" || value.starts_with("analytics_pending:")
+            })
             || previous_state.as_deref() == Some("analytics_pending");
 
         let legacy_agent_id: Option<i64> = self
@@ -8432,6 +8434,13 @@ impl FrankenStorage {
                 fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, complete_state],
             )?;
             return Ok(LegacyOmpReclassificationResult::default());
+        } else {
+            // Bind a legacy/plain or older-context pending marker to the exact
+            // ownership snapshot whose derived assets are about to rebuild.
+            self.conn.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, pending_state],
+            )?;
         }
 
         self.rebuild_analytics()
@@ -8454,9 +8463,26 @@ impl FrankenStorage {
     /// Mark the OMP identity upgrade complete after the indexer has published
     /// a lexical generation rebuilt from the canonical SQLite archive.
     pub fn complete_legacy_omp_reclassification(&self) -> Result<()> {
-        let ownership_context =
-            PiFamilyOwnership::live().archive_reclassification_context();
-        let complete_state = format!("complete:{ownership_context}");
+        let state: Option<String> = self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            bail!("cannot complete legacy OMP reclassification without a pending marker");
+        };
+        if state.starts_with("complete:") {
+            return Ok(());
+        }
+        let Some(context) = state.strip_prefix("analytics_pending:") else {
+            bail!(
+                "cannot complete legacy OMP reclassification from unexpected marker state {state:?}"
+            );
+        };
+        let complete_state = format!("complete:{context}");
         self.conn.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
             fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, complete_state],
@@ -29676,7 +29702,7 @@ mod tests {
         let _config_dir = set_env_var("PI_CONFIG_DIR", "");
         let _profile = set_env_var("OMP_PROFILE", "");
         let _legacy_profile = set_env_var("PI_PROFILE", "");
-        let _xdg = set_env_var("XDG_DATA_HOME", xdg_data_home.to_string_lossy());
+        let _xdg_without_evidence = set_env_var("XDG_DATA_HOME", "");
 
         let storage = SqliteStorage::open(dir.path().join("test.db"))?;
         let pi_agent_id = storage.ensure_agent(&Agent {
@@ -29726,13 +29752,6 @@ mod tests {
             (pi_agent_id, None, &unrelated),
         ])?;
 
-        assert_eq!(
-            storage.reclassify_legacy_omp_conversations()?,
-            LegacyOmpReclassificationResult {
-                conversations_reclassified: 1,
-                lexical_rebuild_required: true,
-            }
-        );
         let slug_for = |external_id: &str| -> anyhow::Result<String> {
             let slug = storage
                 .conn
@@ -29746,8 +29765,66 @@ mod tests {
                 )?;
             Ok(slug)
         };
+
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult::default(),
+            "a historical custom-XDG-looking path stays Pi-owned without current provider-qualified evidence"
+        );
+        assert_eq!(slug_for(custom_xdg_id)?, "pi_agent");
+        let unconfigured_complete_state: String = storage.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+
+        let pending_state = {
+            let _current_xdg =
+                set_env_var("XDG_DATA_HOME", xdg_data_home.to_string_lossy());
+            assert_eq!(
+                storage.reclassify_legacy_omp_conversations()?,
+                LegacyOmpReclassificationResult {
+                    conversations_reclassified: 1,
+                    lexical_rebuild_required: true,
+                },
+                "a changed ownership context must invalidate the completed fast path"
+            );
+            storage.conn.query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+                |row| row.get_typed::<String>(0),
+            )?
+        };
         assert_eq!(slug_for(custom_xdg_id)?, "omp");
         assert_eq!(slug_for(unrelated_id)?, "pi_agent");
+
+        // The current-XDG guard has restored the pre-scan empty value.
+        // Completion must promote the stored scan context, not hash this
+        // changed environment after the lexical publish.
+        storage.complete_legacy_omp_reclassification()?;
+        let completed_state: String = storage.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            completed_state,
+            pending_state.replacen("analytics_pending:", "complete:", 1)
+        );
+        assert_ne!(completed_state, unconfigured_complete_state);
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult::default()
+        );
+        let rebound_state: String = storage.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            rebound_state, unconfigured_complete_state,
+            "a context changed after publish must be rechecked rather than blessed by completion"
+        );
         Ok(())
     }
 

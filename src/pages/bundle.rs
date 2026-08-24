@@ -222,6 +222,18 @@ impl BundleBuilder {
             let file = File::open(&config_path).context("Failed to open config.json")?;
             serde_json::from_reader(BufReader::new(file))?
         };
+        if self.config.generate_qr {
+            if self.config.recovery_secret.is_none() {
+                bail!(
+                    "QR recovery artifacts were requested, but no recovery secret is available; enable recovery-secret generation or disable QR generation"
+                );
+            }
+            if archive_config.as_encrypted().is_none() {
+                bail!(
+                    "QR recovery artifacts were requested for an unencrypted archive, which has no recovery-key slot; disable QR generation"
+                );
+            }
+        }
 
         let temp_output_dir = unique_bundle_dir(output_dir, "tmp")?;
         let final_site_dir = output_dir.join("site");
@@ -1310,6 +1322,11 @@ pub(crate) fn write_private_artifacts_encrypted(
     generate_qr: bool,
     cleanup_missing_recovery: bool,
 ) -> Result<()> {
+    if generate_qr && recovery_secret.is_none() {
+        bail!(
+            "QR recovery artifacts were requested, but no recovery secret is available; enable recovery-secret generation or disable QR generation"
+        );
+    }
     ensure_private_artifact_dir(private_dir)?;
 
     let recovery_secret_path = private_dir.join("recovery-secret.txt");
@@ -1396,14 +1413,36 @@ fn write_private_unencrypted_notice(private_dir: &Path) -> Result<()> {
 
 /// Generate QR code images for recovery secret
 fn generate_qr_codes(private_dir: &Path, recovery_b64: &str) -> Result<()> {
-    // Use the qr module from pages if available
-    if let Ok(qr_png) = super::qr::generate_qr_png(recovery_b64) {
-        write_private_artifact_file(private_dir, "qr-code.png", &qr_png)?;
-    }
+    generate_qr_codes_with(
+        private_dir,
+        recovery_b64,
+        super::qr::generate_qr_png,
+        super::qr::generate_qr_svg,
+    )
+}
 
-    if let Ok(qr_svg) = super::qr::generate_qr_svg(recovery_b64) {
-        write_private_artifact_file(private_dir, "qr-code.svg", qr_svg.as_bytes())?;
-    }
+fn generate_qr_codes_with<P, S>(
+    private_dir: &Path,
+    recovery_b64: &str,
+    generate_png: P,
+    generate_svg: S,
+) -> Result<()>
+where
+    P: FnOnce(&str) -> Result<Vec<u8>>,
+    S: FnOnce(&str) -> Result<String>,
+{
+    // Generate both representations before writing either one. If a requested
+    // encoder is unavailable or rejects the payload, callers receive an error
+    // and no partial QR artifact set is published.
+    let qr_png = generate_png(recovery_b64)
+        .context("Failed to generate requested recovery QR PNG artifact")?;
+    let qr_svg = generate_svg(recovery_b64)
+        .context("Failed to generate requested recovery QR SVG artifact")?;
+
+    write_private_artifact_file(private_dir, "qr-code.png", &qr_png)
+        .context("Failed to write requested recovery QR PNG artifact")?;
+    write_private_artifact_file(private_dir, "qr-code.svg", qr_svg.as_bytes())
+        .context("Failed to write requested recovery QR SVG artifact")?;
 
     Ok(())
 }
@@ -1683,6 +1722,113 @@ mod tests {
         let installed = fs::read(private_dir.join("master-key.json"))?;
         if installed != b"new generation" {
             return Err(anyhow!("private artifact replacement published stale bytes"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn requested_qr_requires_a_recovery_secret() -> Result<()> {
+        let temp = TempDir::new()?;
+        let private_dir = temp.path().join("private");
+        let config = encrypted_config_for_files(Vec::new());
+
+        let error = write_private_artifacts_encrypted(
+            &private_dir,
+            &config,
+            None,
+            true,
+            false,
+        )
+        .expect_err("a requested QR without a recovery secret must fail closed");
+
+        if !error.to_string().contains("no recovery secret is available") {
+            return Err(anyhow!("unexpected missing-recovery error: {error:#}"));
+        }
+        if private_dir.exists() {
+            return Err(anyhow!(
+                "rejected QR request unexpectedly created a private artifact directory"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn requested_qr_generation_failure_writes_no_partial_artifacts() -> Result<()> {
+        let temp = TempDir::new()?;
+        let private_dir = temp.path().join("private");
+
+        let error = generate_qr_codes_with(
+            &private_dir,
+            "recovery-secret",
+            |_| Ok(vec![1, 2, 3]),
+            |_| Err(anyhow!("SVG encoder unavailable")),
+        )
+        .expect_err("a requested QR encoder failure must propagate");
+
+        let message = format!("{error:#}");
+        if !message.contains("requested recovery QR SVG artifact")
+            || !message.contains("SVG encoder unavailable")
+        {
+            return Err(anyhow!("QR generation error lost its cause: {message}"));
+        }
+        if private_dir.join("qr-code.png").exists()
+            || private_dir.join("qr-code.svg").exists()
+        {
+            return Err(anyhow!(
+                "failed QR generation published a partial artifact set"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn requested_qr_png_generation_failure_writes_no_artifacts() -> Result<()> {
+        let temp = TempDir::new()?;
+        let private_dir = temp.path().join("private");
+
+        let error = generate_qr_codes_with(
+            &private_dir,
+            "recovery-secret",
+            |_| Err(anyhow!("PNG encoder unavailable")),
+            |_| Ok("<svg>recovery</svg>".to_string()),
+        )
+        .expect_err("a requested QR PNG encoder failure must propagate");
+
+        let message = format!("{error:#}");
+        if !message.contains("requested recovery QR PNG artifact")
+            || !message.contains("PNG encoder unavailable")
+        {
+            return Err(anyhow!("QR PNG generation error lost its cause: {message}"));
+        }
+        if private_dir.join("qr-code.png").exists()
+            || private_dir.join("qr-code.svg").exists()
+        {
+            return Err(anyhow!(
+                "failed QR PNG generation published an artifact"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn requested_qr_generation_writes_both_artifacts() -> Result<()> {
+        let temp = TempDir::new()?;
+        let private_dir = temp.path().join("private");
+
+        generate_qr_codes_with(
+            &private_dir,
+            "recovery-secret",
+            |_| Ok(vec![1, 2, 3]),
+            |_| Ok("<svg>recovery</svg>".to_string()),
+        )?;
+
+        if fs::read(private_dir.join("qr-code.png"))? != [1, 2, 3] {
+            return Err(anyhow!("requested QR PNG bytes were not published"));
+        }
+        if fs::read_to_string(private_dir.join("qr-code.svg"))?
+            != "<svg>recovery</svg>"
+        {
+            return Err(anyhow!("requested QR SVG bytes were not published"));
         }
         Ok(())
     }
@@ -2311,6 +2457,35 @@ mod tests {
         assert!(
             fs::read_dir(outside.path()).unwrap().next().is_none(),
             "bundle builder must not stage output through a symlinked parent"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_requested_qr_for_unencrypted_archive() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let output = temp.path().join("bundle");
+        fs::create_dir_all(&source).unwrap();
+        write_unencrypted_source(&source, "data.db", "plaintext archive");
+
+        let builder = BundleBuilder::with_config(BundleConfig {
+            recovery_secret: Some(vec![7; 32]),
+            generate_qr: true,
+            ..BundleConfig::default()
+        });
+        let error = builder
+            .build(&source, &output, |_, _| {})
+            .expect_err("an unencrypted archive cannot provide recovery QR artifacts");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requested for an unencrypted archive"),
+            "unexpected QR/archive-mode error: {error:#}"
+        );
+        assert!(
+            !output.exists(),
+            "rejected QR request unexpectedly published a bundle"
         );
     }
 

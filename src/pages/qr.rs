@@ -28,6 +28,8 @@ use chrono::Utc;
 use rand::Rng;
 use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tracing::info;
 use zeroize::Zeroize;
@@ -240,15 +242,37 @@ fn ensure_recovery_artifact_dir(dir: &Path) -> Result<()> {
                     dir.display()
                 );
             }
-            Ok(())
+            secure_recovery_artifact_dir(dir)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder
+                    .create(dir)
+                    .context("Failed to create private directory")?;
+            }
+            #[cfg(not(unix))]
             std::fs::create_dir_all(dir).context("Failed to create private directory")?;
             ensure_recovery_artifact_dir(dir)
         }
         Err(err) => Err(err)
             .with_context(|| format!("Failed to inspect recovery artifact dir {}", dir.display())),
     }
+}
+
+fn secure_recovery_artifact_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "Failed to set owner-only permissions on recovery artifact directory {}",
+            dir.display()
+        )
+    })?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 fn reject_recovery_artifact_symlink(path: &Path) -> Result<()> {
@@ -294,13 +318,13 @@ fn write_recovery_artifact(path: &Path, contents: &[u8]) -> Result<()> {
 
     let mut temp_path = None;
     let mut file = None;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
     for attempt in 0..100 {
         let candidate = recovery_artifact_temp_path(path, attempt);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        match options.open(&candidate) {
             Ok(opened) => {
                 temp_path = Some(candidate);
                 file = Some(opened);
@@ -521,6 +545,30 @@ mod tests {
                 .is_symlink(),
             "rejected recovery secret symlink should be left intact"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_artifact_writer_enforces_owner_only_modes() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new()?;
+        let private_dir = tmp.path().join("private");
+        std::fs::create_dir_all(&private_dir)?;
+        std::fs::set_permissions(&private_dir, std::fs::Permissions::from_mode(0o777))?;
+
+        let artifact_path = private_dir.join("recovery-secret.txt");
+        write_recovery_artifact(&artifact_path, b"private recovery material")?;
+
+        let dir_mode = std::fs::metadata(&private_dir)?.permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&artifact_path)?.permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "private directory mode was {dir_mode:o}");
+        assert_eq!(
+            file_mode & 0o077,
+            0,
+            "recovery artifact exposed group/other permission bits: {file_mode:o}"
+        );
+        Ok(())
     }
 
     #[test]

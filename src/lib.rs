@@ -78995,6 +78995,45 @@ mod cli_read_db_tests {
 
     #[test]
     #[serial]
+    fn resume_does_not_apply_active_profile_to_cass_archive_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let archive_root = temp.path().join("custom-omp-archive");
+        let sessions_root = archive_root.join("sessions");
+        let sessions_dir = sessions_root.join("-projects-cass");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_file = sessions_dir.join("2026-08-24T00-00-00_archive.jsonl");
+        std::fs::write(&session_file, r#"{"type":"session","id":"omp-archive-id"}"#)
+            .expect("write session file");
+
+        let _pi_sessions = set_env("PI_SESSIONS_DIR", "");
+        let _omp_sessions = set_env("PI_CODING_AGENT_SESSION_DIR", "");
+        let _shared_agent = set_env("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env(
+            "CASS_OMP_DATA_ROOT",
+            archive_root.to_string_lossy().as_ref(),
+        );
+        let _config_dir = set_env("PI_CONFIG_DIR", "");
+        let _active_profile = set_env("OMP_PROFILE", "work");
+        let _legacy_profile = set_env("PI_PROFILE", "");
+        let _xdg = set_env("XDG_DATA_HOME", "");
+
+        let target = resolve_resume_target(&session_file, None).expect("resolve");
+        assert_eq!(target.agent, "omp");
+        assert_eq!(
+            target.argv,
+            vec![
+                "omp".to_string(),
+                "--session-dir".to_string(),
+                sessions_root.display().to_string(),
+                "--resume".to_string(),
+                "omp-archive-id".to_string(),
+            ],
+            "an active local profile must not be grafted onto a CASS archive with no path-encoded profile"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn resume_preserves_omp_explicit_session_dir_and_profile() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sessions_root = temp.path().join("launch-sessions");
@@ -79007,6 +79046,10 @@ mod cli_read_db_tests {
             "PI_CODING_AGENT_SESSION_DIR",
             sessions_root.to_string_lossy().as_ref(),
         );
+        let _pi_sessions = set_env("PI_SESSIONS_DIR", "");
+        let _shared_agent = set_env("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env("CASS_OMP_DATA_ROOT", "");
+        let _xdg = set_env("XDG_DATA_HOME", "");
         let _profile = set_env("OMP_PROFILE", "work");
 
         let target = resolve_resume_target(&session_file, None).expect("resolve");
@@ -79039,6 +79082,10 @@ mod cli_read_db_tests {
             "PI_CODING_AGENT_SESSION_DIR",
             sessions_root.to_string_lossy().as_ref(),
         );
+        let _pi_sessions = set_env("PI_SESSIONS_DIR", "");
+        let _shared_agent = set_env("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env("CASS_OMP_DATA_ROOT", "");
+        let _xdg = set_env("XDG_DATA_HOME", "");
         let _legacy_profile = set_env("PI_PROFILE", "legacy");
         let _canonical_profile = set_env("OMP_PROFILE", "con");
 
@@ -96581,10 +96628,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
         "omp" => {
             let id = extract_pi_family_session_id(path, PiFamilyHarness::Omp)?;
             let mut argv = vec!["omp".to_string()];
-            let profile = crate::connectors::omp::profile_from_session_path(path).or_else(|| {
-                crate::connectors::omp::configured_session_root(path)
-                    .and_then(|_| crate::connectors::omp::active_profile_from_env())
-            });
+            let profile = crate::connectors::omp::resume_profile_from_path(path);
             if let Some(profile) = profile {
                 argv.extend(["--profile".to_string(), profile]);
             }
