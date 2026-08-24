@@ -249,13 +249,11 @@ fn is_safe_mirror_hash(value: &str) -> bool {
 }
 
 fn encoded_path_has_marker(encoded: &str, marker: &str) -> bool {
-    let at_start = encoded.strip_prefix(marker);
-    let embedded = encoded
-        .find(&format!("_{marker}"))
-        .map(|index| &encoded[index + marker.len() + 1..]);
-    at_start
-        .or(embedded)
-        .is_some_and(|remainder| remainder.is_empty() || remainder.starts_with('_'))
+    encoded.match_indices(marker).any(|(index, _)| {
+        let end = index + marker.len();
+        (index == 0 || encoded.as_bytes()[index - 1] == b'_')
+            && (end == encoded.len() || encoded.as_bytes()[end] == b'_')
+    })
 }
 
 fn safe_mirror_name_has_omp_layout(name: &str) -> bool {
@@ -293,12 +291,19 @@ fn has_sanitized_omp_mirror_marker(parts: &[String]) -> bool {
 
 fn has_xdg_omp_layout_marker(parts: &[String]) -> bool {
     parts
-        .windows(2)
-        .any(|window| window[0] == "omp" && window[1] == "sessions")
-        || parts.windows(3).any(|window| {
-            window[0] == "omp"
-                && window[1] == "profiles"
-                && normalize_profile_name(&window[2]).is_some()
+        .windows(4)
+        .any(|window| {
+            window[0] == ".local"
+                && window[1] == "share"
+                && window[2] == "omp"
+                && window[3] == "sessions"
+        })
+        || parts.windows(5).any(|window| {
+            window[0] == ".local"
+                && window[1] == "share"
+                && window[2] == "omp"
+                && window[3] == "profiles"
+                && normalize_profile_name(&window[4]).is_some()
         })
 }
 
@@ -311,7 +316,7 @@ fn has_xdg_omp_layout_marker(parts: &[String]) -> bool {
 pub(crate) enum OmpArchivePathClass {
     /// A canonical `.omp` config layout or a production remote-mirror slot.
     ConfigOrMirror,
-    /// An OMP XDG app layout (`.../omp/sessions` or `.../omp/profiles`).
+    /// The conventional `~/.local/share/omp` XDG layout.
     Xdg,
 }
 
@@ -873,6 +878,9 @@ mod tests {
         assert!(!has_omp_layout_marker(Path::new(
             "/home/dev/.omp-cache/agent/sessions/project/session.jsonl"
         )));
+        assert!(!has_omp_layout_marker(Path::new(
+            "/srv/omp/sessions/project/session.jsonl"
+        )));
     }
 
     #[test]
@@ -911,6 +919,21 @@ mod tests {
             None,
             "an unrelated dot-directory must not become OMP merely because its name starts with .omp"
         );
+        for invalid_hash in [
+            "0123456",
+            "0123456789abcdef0",
+            "0123456789abcdeF",
+            "0123456789abcdeg",
+        ] {
+            let path = PathBuf::from("/cass/remotes/build-host/mirror")
+                .join(format!(".omp_agent_sessions_{invalid_hash}"))
+                .join("sessions/session.jsonl");
+            assert_eq!(
+                classify_omp_archive_path(&path),
+                None,
+                "only the lowercase 8-to-16-character hex producer range is valid: {invalid_hash}"
+            );
+        }
     }
 
     #[test]

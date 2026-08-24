@@ -9209,6 +9209,19 @@ fn load_lessons_evidence(path: &Path) -> CliResult<crate::lessons_extraction::Le
     })
 }
 
+/// Accepted records plus the number of malformed records rejected while
+/// gathering one live JSONL source.
+struct GatheredLessonsSource<T> {
+    accepted: Vec<T>,
+    rejected: usize,
+}
+
+/// Normalized repository evidence plus raw-free live-intake diagnostics.
+struct GatheredLessonsEvidence {
+    evidence: crate::lessons_extraction::LessonsEvidence,
+    rejected_records: crate::lessons_extraction::RejectedEvidenceRecords,
+}
+
 /// Gather live lessons evidence from the local repository.
 ///
 /// This is deliberately metadata-first: beads contribute only their lifecycle
@@ -9216,7 +9229,7 @@ fn load_lessons_evidence(path: &Path) -> CliResult<crate::lessons_extraction::Le
 /// outcomes, commands, and timestamps. Raw session text and proof stdout/stderr
 /// artifacts are never read. Closed-session mining remains optional because the
 /// canonical cass database is user history rather than repository metadata.
-fn gather_live_lessons_evidence() -> crate::lessons_extraction::LessonsEvidence {
+fn gather_live_lessons_evidence() -> GatheredLessonsEvidence {
     let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     gather_repository_lessons_evidence(&repo)
 }
@@ -9251,18 +9264,26 @@ fn resolve_lessons_repository_root(start: &Path) -> PathBuf {
 /// Gather the same metadata-first evidence as live mode from an explicit
 /// repository root. The trust-correlation layer reuses this helper so lesson
 /// citations and `cass lessons` always derive identical content-stable ids.
-fn gather_repository_lessons_evidence(repo: &Path) -> crate::lessons_extraction::LessonsEvidence {
+fn gather_repository_lessons_evidence(repo: &Path) -> GatheredLessonsEvidence {
     let repo = resolve_lessons_repository_root(repo);
     let project = repo
         .file_name()
         .and_then(|n| n.to_str())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| "cass".to_string());
-    crate::lessons_extraction::LessonsEvidence {
-        project,
-        commits: gather_git_commit_evidence(&repo, 500),
-        beads: gather_closed_bead_evidence(&repo.join(".beads/issues.jsonl")),
-        proofs: gather_proof_evidence(&repo.join(".cass/proofs/proof-manifest.jsonl")),
+    let beads = gather_closed_bead_evidence(&repo.join(".beads/issues.jsonl"));
+    let proofs = gather_proof_evidence(&repo.join(".cass/proofs/proof-manifest.jsonl"));
+    GatheredLessonsEvidence {
+        evidence: crate::lessons_extraction::LessonsEvidence {
+            project,
+            commits: gather_git_commit_evidence(&repo, 500),
+            beads: beads.accepted,
+            proofs: proofs.accepted,
+        },
+        rejected_records: crate::lessons_extraction::RejectedEvidenceRecords {
+            beads: beads.rejected,
+            proofs: proofs.rejected,
+        },
     }
 }
 
@@ -9274,27 +9295,53 @@ fn lessons_rfc3339_millis(value: Option<&str>) -> u64 {
         .unwrap_or(0)
 }
 
-/// Best-effort read of closed Beads. A malformed line is ignored rather than
-/// making the advisory lessons surface unavailable.
-fn gather_closed_bead_evidence(path: &Path) -> Vec<crate::lessons_extraction::BeadEvidence> {
-    let Ok(body) = std::fs::read_to_string(path) else {
-        return Vec::new();
+/// Best-effort read of closed Beads. Malformed records are counted and omitted
+/// rather than making the advisory lessons surface unavailable. Blank lines and
+/// valid non-closed Beads are intentionally ignored, not rejected.
+fn gather_closed_bead_evidence(
+    path: &Path,
+) -> GatheredLessonsSource<crate::lessons_extraction::BeadEvidence> {
+    let mut gathered = GatheredLessonsSource {
+        accepted: Vec::new(),
+        rejected: 0,
     };
-    body.lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|bead| {
-            bead.get("status")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|status| status.eq_ignore_ascii_case("closed"))
-        })
-        .filter_map(|bead| {
-            let id = bead.get("id")?.as_str()?.trim();
-            if id.is_empty() {
-                return None;
-            }
-            let closed_at = bead.get("closed_at").and_then(serde_json::Value::as_str);
-            let updated_at = bead.get("updated_at").and_then(serde_json::Value::as_str);
-            Some(crate::lessons_extraction::BeadEvidence {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return gathered;
+    };
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(bead) = serde_json::from_str::<serde_json::Value>(line) else {
+            gathered.rejected = gathered.rejected.saturating_add(1);
+            continue;
+        };
+        let Some(status) = bead.get("status").and_then(serde_json::Value::as_str) else {
+            gathered.rejected = gathered.rejected.saturating_add(1);
+            continue;
+        };
+        let status = status.trim();
+        if status.is_empty() {
+            gathered.rejected = gathered.rejected.saturating_add(1);
+            continue;
+        }
+        if !status.eq_ignore_ascii_case("closed") {
+            continue;
+        }
+        let Some(id) = bead
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            gathered.rejected = gathered.rejected.saturating_add(1);
+            continue;
+        };
+        let closed_at = bead.get("closed_at").and_then(serde_json::Value::as_str);
+        let updated_at = bead.get("updated_at").and_then(serde_json::Value::as_str);
+        gathered
+            .accepted
+            .push(crate::lessons_extraction::BeadEvidence {
                 id: id.to_string(),
                 title: bead
                     .get("title")
@@ -9322,9 +9369,9 @@ fn gather_closed_bead_evidence(path: &Path) -> Vec<crate::lessons_extraction::Be
                     .collect(),
                 updated_ms: lessons_rfc3339_millis(closed_at)
                     .max(lessons_rfc3339_millis(updated_at)),
-            })
-        })
-        .collect()
+            });
+    }
+    gathered
 }
 
 /// File modification time supplies freshness for lightweight `ProofRun`
@@ -9423,20 +9470,35 @@ fn structured_proof_evidence(
 
 /// Best-effort read of the canonical repository-local proof manifest. Supports
 /// both lightweight `EmittedProof` entries and heavyweight `.12.3` records.
-fn gather_proof_evidence(path: &Path) -> Vec<crate::lessons_extraction::ProofEvidence> {
-    let Ok(body) = std::fs::read_to_string(path) else {
-        return Vec::new();
+/// Blank lines are ignored; malformed JSON or unsupported record shapes are
+/// counted and omitted.
+fn gather_proof_evidence(
+    path: &Path,
+) -> GatheredLessonsSource<crate::lessons_extraction::ProofEvidence> {
+    let mut gathered = GatheredLessonsSource {
+        accepted: Vec::new(),
+        rejected: 0,
     };
-    body.lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter_map(|entry| {
-            if entry.get("scenario_id").is_some() {
-                structured_proof_evidence(&entry)
-            } else {
-                lightweight_proof_evidence(path, &entry)
-            }
-        })
-        .collect()
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return gathered;
+    };
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            gathered.rejected = gathered.rejected.saturating_add(1);
+            continue;
+        };
+        let evidence = structured_proof_evidence(&entry)
+            .or_else(|| lightweight_proof_evidence(path, &entry));
+        if let Some(evidence) = evidence {
+            gathered.accepted.push(evidence);
+        } else {
+            gathered.rejected = gathered.rejected.saturating_add(1);
+        }
+    }
+    gathered
 }
 
 /// Best-effort read of the last `max` non-merge commit subjects from `repo`.
@@ -9494,11 +9556,19 @@ fn build_lessons_state(
     &'static str,
 )> {
     let evidence_path = resolve_lessons_fixture_path(fixture, fixture_dir, fixture_id)?;
-    let (evidence, mode) = match evidence_path {
-        Some(path) => (load_lessons_evidence(&path)?, "fixture"),
-        None => (gather_live_lessons_evidence(), "live"),
+    let (evidence, rejected_records, mode) = match evidence_path {
+        Some(path) => (
+            load_lessons_evidence(&path)?,
+            crate::lessons_extraction::RejectedEvidenceRecords::default(),
+            "fixture",
+        ),
+        None => {
+            let gathered = gather_live_lessons_evidence();
+            (gathered.evidence, gathered.rejected_records, "live")
+        }
     };
-    let extraction = crate::lessons_extraction::extract(&evidence);
+    let mut extraction = crate::lessons_extraction::extract(&evidence);
+    extraction.manifest.rejected_records = rejected_records;
     let graph = crate::lessons::LessonGraph::build(extraction.candidates);
     Ok((graph, extraction.manifest, mode))
 }
@@ -9543,13 +9613,31 @@ fn lesson_record_value(record: &crate::lessons::LessonRecord) -> serde_json::Val
     serde_json::to_value(record).unwrap_or(serde_json::Value::Null)
 }
 
+/// Warn once per lessons command when malformed live JSONL records were
+/// omitted. Only bounded source labels and counts are emitted; raw lines,
+/// parser errors, and repository paths never reach diagnostics.
+fn warn_rejected_lessons_evidence(
+    manifest: &crate::lessons_extraction::ExtractionManifest,
+) {
+    let rejected = manifest.rejected_records;
+    let total = rejected.total();
+    if total > 0 {
+        eprintln!(
+            "Warning: lessons evidence is partial; skipped {total} malformed record(s) (Beads: {}, proofs: {}).",
+            rejected.beads, rejected.proofs
+        );
+    }
+}
+
 /// Emit a lessons payload as structured output, or a terse human summary line.
 fn emit_lessons_payload(
     cli: &Cli,
     json: bool,
+    manifest: &crate::lessons_extraction::ExtractionManifest,
     payload: serde_json::Value,
     human: impl FnOnce(&serde_json::Value) -> String,
 ) -> CliResult<()> {
+    warn_rejected_lessons_evidence(manifest);
     if let Some(fmt) = resolve_subcommand_structured_format(cli, json) {
         let fmt = if matches!(fmt, RobotFormat::Sessions) {
             RobotFormat::Compact
@@ -9658,7 +9746,7 @@ fn run_lessons_list(
         "lessons": lessons,
     });
 
-    emit_lessons_payload(cli, json, payload, |p| {
+    emit_lessons_payload(cli, json, &manifest, payload, |p| {
         format!(
             "Lessons [{}]: {} active / {} total — {} shown",
             p.get("mode")
@@ -9726,7 +9814,7 @@ fn run_lessons_search(
         "lessons": lessons,
     });
 
-    emit_lessons_payload(cli, json, payload, |p| {
+    emit_lessons_payload(cli, json, &manifest, payload, |p| {
         format!(
             "Lessons search [{}] {:?}: {} match(es), {} shown",
             p.get("mode")
@@ -9765,9 +9853,10 @@ fn run_lessons_view(
         "found": found.is_some(),
         "lesson": found.map(lesson_record_value),
         "available_count": graph.lessons.len(),
+        "manifest": serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
     });
 
-    emit_lessons_payload(cli, json, payload, |p| {
+    emit_lessons_payload(cli, json, &manifest, payload, |p| {
         if p.get("found")
             .and_then(serde_json::Value::as_bool)
             .is_some_and(|found| found)
@@ -78748,7 +78837,17 @@ mod cli_read_db_tests {
         let target = resolve_resume_target(&session_file, None).expect("resolve");
         assert_eq!(target.agent, "omp");
         assert_eq!(target.session_id.as_deref(), Some("my-omp-id"));
-        assert_eq!(target.argv, vec!["omp", "--resume", "my-omp-id"]);
+        assert_eq!(
+            target.argv,
+            vec![
+                "omp".to_string(),
+                "--session-dir".to_string(),
+                sessions_dir.display().to_string(),
+                "--resume".to_string(),
+                "my-omp-id".to_string(),
+            ],
+            "a copied canonical-looking store must not silently resume from the current user's live home"
+        );
     }
 
     #[test]
@@ -78767,7 +78866,19 @@ mod cli_read_db_tests {
         assert_eq!(target.session_id.as_deref(), Some("omp-work-id"));
         assert_eq!(
             target.argv,
-            vec!["omp", "--profile", "work", "--resume", "omp-work-id"]
+            vec![
+                "omp".to_string(),
+                "--profile".to_string(),
+                "work".to_string(),
+                "--session-dir".to_string(),
+                temp.path()
+                    .join(".omp/profiles/work/agent/sessions")
+                    .display()
+                    .to_string(),
+                "--resume".to_string(),
+                "omp-work-id".to_string(),
+            ],
+            "a copied named-profile store needs both its profile identity and exact archive root"
         );
     }
 
@@ -84314,6 +84425,11 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Override Aider session discovery root.",
         ),
         env_var_capability(
+            "CASS_OMP_DATA_ROOT",
+            None,
+            "Declare an OMP-only archive/store root; CASS assigns OMP identity and resume plans preserve its exact sessions root.",
+        ),
+        env_var_capability(
             "PI_SESSIONS_DIR",
             None,
             "Override the exact Pi Agent sessions directory.",
@@ -84321,7 +84437,7 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
         env_var_capability(
             "PI_CODING_AGENT_DIR",
             None,
-            "Override the Pi-family agent directory; OMP ignores it while a named profile is active.",
+            "Override the shared Pi-family agent directory; ambiguous paths remain Pi Agent-owned. Use CASS_OMP_DATA_ROOT for OMP-only ownership.",
         ),
         env_var_capability(
             "PI_CODING_AGENT_SESSION_DIR",
@@ -95800,10 +95916,7 @@ fn omp_session_dir_from_path(path: &Path) -> Option<PathBuf> {
         return Some(root);
     }
 
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    if normalized.contains("/.omp/agent/sessions/")
-        || crate::connectors::omp::profile_from_session_path(path).is_some()
-    {
+    if crate::connectors::omp::is_resolved_live_config_session_path(path) {
         return None;
     }
 

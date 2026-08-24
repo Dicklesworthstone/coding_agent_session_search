@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use crate::lessons::{LessonCandidate, LessonConfidence, LessonKind};
 
 /// Stable schema version for the evidence wire format consumed here.
-pub const LESSONS_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+pub const LESSONS_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 
 /// Local home-directory prefixes, including prefixes embedded in metadata
 /// such as `cwd=/Users/alice/project` or `file:///home/alice/project`.
@@ -430,6 +430,27 @@ pub struct ExtractionResult {
     pub manifest: ExtractionManifest,
 }
 
+/// Malformed live JSONL records omitted before extraction.
+///
+/// These counts stay separate from `*_scanned`: scanned counts describe the
+/// normalized records handed to [`extract`], while rejected counts make a
+/// partial live intake machine-visible without serializing raw input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedEvidenceRecords {
+    /// Malformed records rejected from `.beads/issues.jsonl`.
+    pub beads: usize,
+    /// Malformed records rejected from the repository proof manifest.
+    pub proofs: usize,
+}
+
+impl RejectedEvidenceRecords {
+    /// Total malformed records omitted across supported live JSONL sources.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.beads.saturating_add(self.proofs)
+    }
+}
+
 /// An auditable summary of one extraction pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractionManifest {
@@ -443,6 +464,11 @@ pub struct ExtractionManifest {
     pub beads_scanned: usize,
     /// Proof runs scanned.
     pub proofs_scanned: usize,
+    /// Malformed live JSONL records rejected before extraction.
+    ///
+    /// A non-zero count means the resulting lesson set is partial. Fixture
+    /// inputs use zero because malformed fixture JSON fails before extraction.
+    pub rejected_records: RejectedEvidenceRecords,
     /// Candidates emitted (before dedup in the graph).
     pub candidates_emitted: usize,
     /// Candidate count by [`LessonKind`] wire label (deterministic order).
@@ -605,6 +631,7 @@ pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
         commits_scanned: evidence.commits.len(),
         beads_scanned: evidence.beads.len(),
         proofs_scanned: evidence.proofs.len(),
+        rejected_records: RejectedEvidenceRecords::default(),
         candidates_emitted: candidates.len(),
         by_kind,
         redaction,
@@ -1157,9 +1184,13 @@ mod tests {
             }],
         };
         let result = extract(&evidence);
+        assert_eq!(result.manifest.schema_version, 2);
         assert_eq!(result.manifest.commits_scanned, 2);
         assert_eq!(result.manifest.beads_scanned, 1);
         assert_eq!(result.manifest.proofs_scanned, 1);
+        assert_eq!(result.manifest.rejected_records.beads, 0);
+        assert_eq!(result.manifest.rejected_records.proofs, 0);
+        assert_eq!(result.manifest.rejected_records.total(), 0);
         assert_eq!(result.manifest.candidates_emitted, 4);
         // by_kind is a BTreeMap => alphabetical, deterministic.
         let keys: Vec<&String> = result.manifest.by_kind.keys().collect();

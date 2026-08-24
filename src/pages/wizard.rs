@@ -3,7 +3,7 @@ use console::{Term, style};
 use dialoguer::{Confirm, Input, MultiSelect, Password, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -233,6 +233,25 @@ fn summary_security_lines(no_encryption: bool, planned_key_slots: usize) -> [Str
             "Key Derivation: Argon2id".to_string(),
             format!("Planned Key Slots: {planned_key_slots}"),
         ]
+    }
+}
+
+fn require_verified_manual_deployment(term: &mut Term, site_dir: &Path) -> Result<()> {
+    match crate::pages::verify::ensure_valid_bundle(site_dir, false) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            writeln!(term)?;
+            writeln!(
+                term,
+                "  {} Manual deployment is blocked because the bundle no longer passes full verification.",
+                style("✗").red()
+            )?;
+            writeln!(term, "  Rebuild the export before attempting to deploy it.")?;
+            Err(error).context(format!(
+                "Refusing to recommend manual deployment of invalid Pages bundle at {}",
+                site_dir.display()
+            ))
+        }
     }
 }
 
@@ -2055,6 +2074,13 @@ impl PagesWizard {
                             Err(e) => {
                                 writeln!(term)?;
                                 writeln!(term, "  {} Deployment failed: {}", style("✗").red(), e)?;
+                                if let Err(verification_error) =
+                                    require_verified_manual_deployment(term, &site_dir)
+                                {
+                                    return Err(e).context(format!(
+                                        "GitHub Pages deployment failed and manual deployment is blocked: {verification_error:#}"
+                                    ));
+                                }
                                 writeln!(term)?;
                                 writeln!(
                                     term,
@@ -2079,6 +2105,7 @@ impl PagesWizard {
                             term,
                             "Please install/configure the missing tools and try again."
                         )?;
+                        require_verified_manual_deployment(term, &site_dir)?;
                         writeln!(
                             term,
                             "To deploy manually after fixing prerequisites, push the {} directory to a gh-pages branch.",
@@ -2093,6 +2120,7 @@ impl PagesWizard {
                             style("⚠").yellow(),
                             e
                         )?;
+                        require_verified_manual_deployment(term, &site_dir)?;
                         writeln!(term)?;
                         writeln!(
                             term,
@@ -2157,6 +2185,13 @@ impl PagesWizard {
                             Err(e) => {
                                 writeln!(term)?;
                                 writeln!(term, "  {} Deployment failed: {}", style("✗").red(), e)?;
+                                if let Err(verification_error) =
+                                    require_verified_manual_deployment(term, &site_dir)
+                                {
+                                    return Err(e).context(format!(
+                                        "Cloudflare Pages deployment failed and manual deployment is blocked: {verification_error:#}"
+                                    ));
+                                }
                                 writeln!(term)?;
                                 writeln!(
                                     term,
@@ -2186,6 +2221,7 @@ impl PagesWizard {
                         for item in &missing {
                             writeln!(term, "    {} {}", style("•").dim(), item)?;
                         }
+                        require_verified_manual_deployment(term, &site_dir)?;
                         writeln!(term)?;
                         writeln!(term, "To deploy manually after meeting prerequisites:")?;
                         writeln!(
@@ -2207,6 +2243,7 @@ impl PagesWizard {
                             style("⚠").yellow(),
                             e
                         )?;
+                        require_verified_manual_deployment(term, &site_dir)?;
                         writeln!(term)?;
                         writeln!(
                             term,

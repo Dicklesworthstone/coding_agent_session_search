@@ -91,16 +91,26 @@ fn run_lessons(extra: &[&str]) -> Result<(Value, String, Duration), String> {
     Ok((value, stdout, elapsed))
 }
 
-/// Run the real lessons surface in live mode from `repo`.
-fn run_live_lessons(repo: &std::path::Path) -> Result<(Value, String), String> {
+/// Run one real lessons surface in live mode from `repo`, retaining stderr so
+/// the malformed-evidence warning and its privacy boundary are testable.
+fn run_live_lessons(
+    repo: &std::path::Path,
+    extra: &[&str],
+) -> Result<(Value, String, String), String> {
     let mut command = Command::new(cargo_bin("cass"));
     command
-        .args(["lessons", "list", "--status", "all", "--json"])
+        .arg("lessons")
+        .args(extra)
+        .arg("--json")
         .current_dir(repo)
         .env("NO_COLOR", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
-    let out = spawn_with_timeout_or_diag(command, "lessons-live", Some(repo), SURFACE_BOUND);
+    let label = format!(
+        "lessons-live-{}",
+        extra.first().copied().unwrap_or("list")
+    );
+    let out = spawn_with_timeout_or_diag(command, &label, Some(repo), SURFACE_BOUND);
     if !out.status.success() {
         return Err(format!(
             "live lessons exited {:?}; stderr: {}",
@@ -110,9 +120,11 @@ fn run_live_lessons(repo: &std::path::Path) -> Result<(Value, String), String> {
     }
     let stdout =
         String::from_utf8(out.stdout).map_err(|e| format!("live lessons stdout not UTF-8: {e}"))?;
+    let stderr =
+        String::from_utf8(out.stderr).map_err(|e| format!("live lessons stderr not UTF-8: {e}"))?;
     let value = serde_json::from_str(stdout.trim())
         .map_err(|e| format!("live lessons stdout not JSON: {e}; head: {}", head(&stdout)))?;
-    Ok((value, stdout))
+    Ok((value, stdout, stderr))
 }
 
 fn git(repo: &std::path::Path, args: &[&str]) -> Result<(), String> {
@@ -153,7 +165,7 @@ fn seed_live_lessons_repo() -> Result<TempDir, String> {
     let closed = serde_json::json!({
         "id": "bd-live-closed",
         "title": "Harden live Bead evidence",
-        "status": "closed",
+        "status": " closed ",
         "issue_type": "bug",
         "labels": ["live-lessons"],
         "updated_at": "2026-06-20T16:47:23Z",
@@ -169,7 +181,9 @@ fn seed_live_lessons_repo() -> Result<TempDir, String> {
     });
     std::fs::write(
         beads.join("issues.jsonl"),
-        format!("{closed}\nnot-json\n{open}\n"),
+        format!(
+            "\n{closed}\nnot-json MALFORMED_BEAD_RAW_MARKER_must_not_be_logged\n\n{open}\n"
+        ),
     )
     .map_err(|e| format!("write Beads fixture: {e}"))?;
 
@@ -196,6 +210,7 @@ fn seed_live_lessons_repo() -> Result<TempDir, String> {
     )
     .map_err(|e| format!("write proof artifact: {e}"))?;
     let emitted = serde_json::json!({
+        "scenario_id": null,
         "label": "live-proof",
         "status": "pass",
         "path": "/untrusted/escape/live-proof.proof.json",
@@ -226,9 +241,13 @@ fn seed_live_lessons_repo() -> Result<TempDir, String> {
         },
         "outcome": "passed"
     });
+    let malformed_proof = serde_json::json!({
+        "label": "MALFORMED_PROOF_RAW_MARKER_must_not_be_logged",
+        "status": "pass"
+    });
     std::fs::write(
         proofs.join("proof-manifest.jsonl"),
-        format!("{emitted}\n{structured}\n"),
+        format!("\n{emitted}\n{structured}\n\n{malformed_proof}\n"),
     )
     .map_err(|e| format!("write proof manifest: {e}"))?;
     Ok(repo)
@@ -313,6 +332,9 @@ fn lessons_list_all_has_expected_graph_shape() -> Result<(), String> {
         ("/manifest/commits_scanned", 5),
         ("/manifest/beads_scanned", 3),
         ("/manifest/proofs_scanned", 1),
+        ("/manifest/schema_version", 2),
+        ("/manifest/rejected_records/beads", 0),
+        ("/manifest/rejected_records/proofs", 0),
     ] {
         if u64_at(&v, ptr) != Some(want) {
             failures.push(count_mismatch(ptr, u64_at(&v, ptr), want));
@@ -558,11 +580,20 @@ fn view_round_trips_a_lesson_id() -> Result<(), String> {
     if str_at(&view, "/lesson/lesson_id") != Some(id.as_str()) {
         failures.push("view returned a different lesson id".to_string());
     }
+    if u64_at(&view, "/manifest/schema_version") != Some(2)
+        || u64_at(&view, "/manifest/rejected_records/beads") != Some(0)
+        || u64_at(&view, "/manifest/rejected_records/proofs") != Some(0)
+    {
+        failures.push("fixture view omitted or corrupted its extraction manifest".to_string());
+    }
 
     // A bogus id is a clean not-found, not a crash or stdout pollution.
     let (missing, _r3, _e3) = run_lessons(&["view", "lsn-deadbeefdeadbeef"])?;
     if missing.get("found").and_then(Value::as_bool) != Some(false) {
         failures.push("view of a bogus id should report found=false".to_string());
+    }
+    if u64_at(&missing, "/manifest/schema_version") != Some(2) {
+        failures.push("not-found view omitted its extraction manifest".to_string());
     }
     finish(failures)
 }
@@ -575,7 +606,7 @@ fn live_mode_mines_repository_metadata_without_raw_leakage() -> Result<(), Strin
     let nested = repo.path().join("nested/working/directory");
     std::fs::create_dir_all(&nested)
         .map_err(|e| format!("create nested live invocation directory: {e}"))?;
-    let (v, raw) = run_live_lessons(&nested)?;
+    let (v, raw, stderr) = run_live_lessons(&nested, &["list", "--status", "all"])?;
     let mut failures = Vec::new();
 
     if str_at(&v, "/mode") != Some("live") {
@@ -597,11 +628,20 @@ fn live_mode_mines_repository_metadata_without_raw_leakage() -> Result<(), Strin
         ("/manifest/commits_scanned", 1_u64),
         ("/manifest/beads_scanned", 1),
         ("/manifest/proofs_scanned", 2),
+        ("/manifest/schema_version", 2),
+        ("/manifest/rejected_records/beads", 1),
+        ("/manifest/rejected_records/proofs", 1),
         ("/manifest/candidates_emitted", 4),
     ] {
         if u64_at(&v, ptr) != Some(want) {
             failures.push(count_mismatch(ptr, u64_at(&v, ptr), want));
         }
+    }
+    if !stderr.contains("skipped 2 malformed record(s) (Beads: 1, proofs: 1)") {
+        failures.push(format!(
+            "live stderr omitted bounded malformed-evidence warning: {}",
+            head(&stderr)
+        ));
     }
     let lessons = lessons_array(&v);
     for source_ref in [
@@ -651,18 +691,54 @@ fn live_mode_mines_repository_metadata_without_raw_leakage() -> Result<(), Strin
     }) {
         failures.push("live lesson missing Git commit provenance".to_string());
     }
-    for raw_marker in [
+    let forbidden_markers = [
         "liveprivate",
         "proofprivate",
         "corp.example",
         RAW_DIGEST,
         "OPEN_RAW_MARKER_must_not_be_mined",
         "STRUCTURED_RAW_MARKER_must_not_be_mined",
+        "MALFORMED_BEAD_RAW_MARKER_must_not_be_logged",
+        "MALFORMED_PROOF_RAW_MARKER_must_not_be_logged",
         "/home/never-read/private.json",
-    ] {
-        if raw.contains(raw_marker) {
-            failures.push(leaked_marker_msg("live metadata", raw_marker));
+    ];
+    for &raw_marker in &forbidden_markers {
+        if raw.contains(raw_marker) || stderr.contains(raw_marker) {
+            failures.push(leaked_marker_msg("live stdout/stderr", raw_marker));
         }
+    }
+    if let Some(live_id) = lessons.iter().find_map(|lesson| {
+        lesson
+            .get("lesson_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }) {
+        let (view, view_raw, view_stderr) = run_live_lessons(&nested, &["view", &live_id])?;
+        if view.get("found").and_then(Value::as_bool) != Some(true) {
+            failures.push(format!("live view of {live_id} reported not found"));
+        }
+        for (ptr, want) in [
+            ("/manifest/schema_version", 2_u64),
+            ("/manifest/rejected_records/beads", 1),
+            ("/manifest/rejected_records/proofs", 1),
+        ] {
+            if u64_at(&view, ptr) != Some(want) {
+                failures.push(count_mismatch(ptr, u64_at(&view, ptr), want));
+            }
+        }
+        if !view_stderr.contains("skipped 2 malformed record(s) (Beads: 1, proofs: 1)") {
+            failures.push(format!(
+                "live view stderr omitted bounded malformed-evidence warning: {}",
+                head(&view_stderr)
+            ));
+        }
+        for &raw_marker in &forbidden_markers {
+            if view_raw.contains(raw_marker) || view_stderr.contains(raw_marker) {
+                failures.push(leaked_marker_msg("live view stdout/stderr", raw_marker));
+            }
+        }
+    } else {
+        failures.push("live list returned no lesson id for view manifest coverage".to_string());
     }
     if u64_at(&v, "/redaction/home_paths").unwrap_or(0) < 2
         || u64_at(&v, "/redaction/emails").unwrap_or(0) < 2

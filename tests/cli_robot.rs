@@ -430,6 +430,7 @@ fn capabilities_are_self_describing_for_agents() {
         "CASS_TRACE_FILTER",
         "CASS_TRACE_MAX_BYTES",
         "CASS_TRACE_MAX_EVENTS",
+        "CASS_OMP_DATA_ROOT",
         "PI_SESSIONS_DIR",
     ] {
         assert!(
@@ -445,6 +446,26 @@ fn capabilities_are_self_describing_for_agents() {
         pi_sessions_dir["description"],
         "Override the exact Pi Agent sessions directory.",
         "capabilities must distinguish the exact sessions override from the broader Pi-family agent directory"
+    );
+    let omp_data_root = env_vars
+        .iter()
+        .find(|env_var| env_var["name"] == "CASS_OMP_DATA_ROOT")
+        .expect("CASS_OMP_DATA_ROOT capability");
+    assert!(
+        omp_data_root["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("OMP-only")),
+        "capabilities must expose the provider-qualified OMP ownership override"
+    );
+    let shared_pi_family_root = env_vars
+        .iter()
+        .find(|env_var| env_var["name"] == "PI_CODING_AGENT_DIR")
+        .expect("PI_CODING_AGENT_DIR capability");
+    assert!(
+        shared_pi_family_root["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("Pi Agent-owned")),
+        "the ambiguous shared override must not promise OMP identity"
     );
 
     let workflows = json["workflows"].as_array().expect("workflows array");

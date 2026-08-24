@@ -29436,6 +29436,185 @@ mod tests {
     }
 
     #[test]
+    fn legacy_remote_omp_reclassification_rejects_non_mirror_lookalikes() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path)?;
+        let pi_agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "pi_agent".into(),
+            name: "Pi Agent".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
+            fparams![PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY],
+        )?;
+
+        let safe_name = crate::sources::sync::path_to_safe_dirname("~/.omp/agent/sessions");
+        let remote_external_id = "-projects-cass/remote-legacy-omp";
+        let mut remote = Conversation {
+            id: None,
+            agent_slug: "pi_agent".into(),
+            workspace: None,
+            external_id: Some(remote_external_id.into()),
+            title: Some("Remote legacy OMP".into()),
+            source_path: dir
+                .path()
+                .join("cass/remotes/build-host/mirror")
+                .join(&safe_name)
+                .join("sessions/-projects-cass/remote-legacy-omp.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_001_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"source":"pi_agent"}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Agent,
+                author: Some("openrouter/stealth/ox-alpha".into()),
+                created_at: Some(1_700_000_001_000),
+                content: "remote legacy OMP answer".into(),
+                extra_json: serde_json::json!({"message":{"model":"openrouter/stealth/ox-alpha"}}),
+                snippets: Vec::new(),
+            }],
+            source_id: "build-host".into(),
+            origin_host: Some("build-host.example".into()),
+        };
+        let mut lookalike = remote.clone();
+        lookalike.external_id = Some("-projects-cass/incidental-lookalike".into());
+        lookalike.title = Some("Incidental sanitized lookalike".into());
+        lookalike.source_path = dir
+            .path()
+            .join("ordinary-cache")
+            .join(&safe_name)
+            .join("sessions/-projects-cass/incidental-lookalike.jsonl");
+        storage.insert_conversations_batched(&[
+            (pi_agent_id, None, &remote),
+            (pi_agent_id, None, &lookalike),
+        ])?;
+
+        let remote_conversation_id: i64 = storage.conn.query_row_map(
+            "SELECT id FROM conversations WHERE external_id = ?1",
+            fparams![remote_external_id],
+            |row| row.get_typed(0),
+        )?;
+        let old_lookup = conversation_external_lookup_key(
+            &remote.source_id,
+            pi_agent_id,
+            remote_external_id,
+        );
+        let old_lookup_exists: i64 = storage.conn.query_row_map(
+            "SELECT EXISTS(
+                 SELECT 1 FROM conversation_external_lookup WHERE lookup_key = ?1
+             )",
+            fparams![old_lookup.as_str()],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(old_lookup_exists, 1);
+
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 1,
+                lexical_rebuild_required: true,
+            },
+            "the v2 classifier must run even when the narrower v1 migration was complete"
+        );
+
+        let omp_agent_id: i64 = storage.conn.query_row_map(
+            "SELECT id FROM agents WHERE slug = 'omp'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        let remote_slug: String = storage.conn.query_row_map(
+            "SELECT a.slug
+             FROM conversations c
+             JOIN agents a ON a.id = c.agent_id
+             WHERE c.id = ?1",
+            fparams![remote_conversation_id],
+            |row| row.get_typed(0),
+        )?;
+        let lookalike_slug: String = storage.conn.query_row_map(
+            "SELECT a.slug
+             FROM conversations c
+             JOIN agents a ON a.id = c.agent_id
+             WHERE c.external_id = ?1",
+            fparams!["-projects-cass/incidental-lookalike"],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(remote_slug, "omp");
+        assert_eq!(lookalike_slug, "pi_agent");
+
+        let metadata_json: String = storage.conn.query_row_map(
+            "SELECT metadata_json FROM conversations WHERE id = ?1",
+            fparams![remote_conversation_id],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&metadata_json)?["source"],
+            "omp"
+        );
+        let token_agent_id: i64 = storage.conn.query_row_map(
+            "SELECT agent_id FROM token_usage WHERE conversation_id = ?1 LIMIT 1",
+            fparams![remote_conversation_id],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(token_agent_id, omp_agent_id);
+        let metrics_slug: String = storage.conn.query_row_map(
+            "SELECT agent_slug FROM message_metrics WHERE conversation_id = ?1 LIMIT 1",
+            fparams![remote_conversation_id],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(metrics_slug, "omp");
+
+        let new_lookup = conversation_external_lookup_key(
+            &remote.source_id,
+            omp_agent_id,
+            remote_external_id,
+        );
+        let stale_lookup_exists: i64 = storage.conn.query_row_map(
+            "SELECT EXISTS(
+                 SELECT 1 FROM conversation_external_lookup WHERE lookup_key = ?1
+             )",
+            fparams![old_lookup.as_str()],
+            |row| row.get_typed(0),
+        )?;
+        let canonical_lookup_exists: i64 = storage.conn.query_row_map(
+            "SELECT EXISTS(
+                 SELECT 1 FROM conversation_external_lookup WHERE lookup_key = ?1
+             )",
+            fparams![new_lookup.as_str()],
+            |row| row.get_typed(0),
+        )?;
+        let canonical_tail_lookup_exists: i64 = storage.conn.query_row_map(
+            "SELECT EXISTS(
+                 SELECT 1 FROM conversation_external_tail_lookup WHERE lookup_key = ?1
+             )",
+            fparams![new_lookup.as_str()],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(stale_lookup_exists, 0);
+        assert_eq!(canonical_lookup_exists, 1);
+        assert_eq!(canonical_tail_lookup_exists, 1);
+
+        remote.agent_slug = "omp".into();
+        remote.metadata_json = serde_json::json!({"source":"omp"});
+        storage.insert_conversations_batched(&[(omp_agent_id, None, &remote)])?;
+        let canonical_count: i64 = storage.conn.query_row_map(
+            "SELECT COUNT(*) FROM conversations WHERE external_id = ?1",
+            fparams![remote_external_id],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            canonical_count, 1,
+            "the first first-class OMP ingest must merge into the reclassified row"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn connector_has_conversations_tracks_archived_agent_slug() -> anyhow::Result<()> {
         let dir = TempDir::new()?;
         let db_path = dir.path().join("test.db");
