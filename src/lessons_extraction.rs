@@ -130,13 +130,15 @@ pub struct RedactionReport {
 impl RedactionReport {
     /// Total redactions across all classes.
     pub fn total(self) -> usize {
-        self.home_paths + self.emails + self.digests
+        self.home_paths
+            .saturating_add(self.emails)
+            .saturating_add(self.digests)
     }
 
     fn add(&mut self, other: RedactionReport) {
-        self.home_paths += other.home_paths;
-        self.emails += other.emails;
-        self.digests += other.digests;
+        self.home_paths = self.home_paths.saturating_add(other.home_paths);
+        self.emails = self.emails.saturating_add(other.emails);
+        self.digests = self.digests.saturating_add(other.digests);
     }
 }
 
@@ -221,7 +223,9 @@ pub fn redact(input: &str) -> (String, RedactionReport) {
     if secret_redacted.as_ref() != input {
         let before = input.matches("[REDACTED]").count();
         let after = secret_redacted.matches("[REDACTED]").count();
-        report.digests += after.saturating_sub(before).max(1);
+        report.digests = report
+            .digests
+            .saturating_add(after.saturating_sub(before).max(1));
     }
     let input = secret_redacted.as_ref();
     let mut out = String::with_capacity(input.len());
@@ -251,15 +255,15 @@ fn redact_word(word: &str, report: &mut RedactionReport) -> String {
         return word.to_string();
     }
     if is_email(core) {
-        report.emails += 1;
+        report.emails = report.emails.saturating_add(1);
         return format!("{lead}<email>{trail}");
     }
     if let Some(redacted) = redact_home_path(core) {
-        report.home_paths += 1;
+        report.home_paths = report.home_paths.saturating_add(1);
         return format!("{lead}{redacted}{trail}");
     }
     if is_opaque_digest(core) {
-        report.digests += 1;
+        report.digests = report.digests.saturating_add(1);
         return format!("{lead}<digest>{trail}");
     }
     word.to_string()
@@ -473,15 +477,24 @@ fn redact_field(input: &str, report: &mut RedactionReport) -> String {
 
 fn commit_source_ref(sha: &str, report: &mut RedactionReport) -> String {
     let trimmed = sha.trim();
-    let id = if !trimmed.is_empty()
+    if !trimmed.is_empty()
         && trimmed.len() <= 64
         && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        trimmed.to_string()
+        return format!("commit:{trimmed}");
+    }
+
+    // A malformed commit id is neither useful provenance nor safe metadata.
+    // Scrub it once to account for any recognized secret/PII; if it was merely
+    // an arbitrary opaque value, account for that rejection as a digest-class
+    // redaction. Never serialize the unvalidated source bytes.
+    let (_, field_report) = redact(trimmed);
+    if field_report.total() == 0 && !trimmed.is_empty() {
+        report.digests = report.digests.saturating_add(1);
     } else {
-        redact_field(trimmed, report)
-    };
-    format!("commit:{id}")
+        report.add(field_report);
+    }
+    "commit:<invalid-id>".to_string()
 }
 
 /// Extract redacted [`LessonCandidate`]s from `evidence`. Pure and
@@ -892,7 +905,7 @@ mod tests {
 
     #[test]
     fn every_serialized_metadata_field_crosses_the_redaction_boundary() {
-        let secret_status = ["sk", "proj", &"A".repeat(24)].join("-");
+        let secret_status = format!("sk-proj-{}", "A".repeat(24));
         let evidence = LessonsEvidence {
             project: "/Users/project-owner/private-repo".to_string(),
             commits: vec![CommitEvidence {
@@ -934,6 +947,24 @@ mod tests {
         }
         assert!(json.contains("commit:abc123"), "validated commit id lost: {json}");
         assert!(redaction_total >= 6, "redactions were not audited: {redaction_total}");
+    }
+
+    #[test]
+    fn malformed_commit_identifier_is_not_serialized_as_provenance() {
+        let raw_id = "private-branch-owner";
+        let evidence = LessonsEvidence {
+            project: "cass".to_string(),
+            commits: vec![commit(raw_id, "fix(storage): retain safe provenance", 1)],
+            beads: Vec::new(),
+            proofs: Vec::new(),
+        };
+
+        let result = extract(&evidence);
+        assert_eq!(result.manifest.redaction.digests, 1);
+        let graph = LessonGraph::build(result.candidates);
+        let json = serde_json::to_string(&graph).unwrap();
+        assert!(!json.contains(raw_id), "malformed id leaked: {json}");
+        assert!(json.contains("commit:<invalid-id>"));
     }
 
     #[test]

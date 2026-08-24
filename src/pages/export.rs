@@ -35,6 +35,7 @@ pub struct ExportEngine {
     filter: ExportFilter,
 }
 
+#[derive(Debug)]
 pub struct ExportStats {
     pub conversations_processed: usize,
     pub messages_processed: usize,
@@ -140,12 +141,15 @@ impl ExportEngine {
             let mut src_tx = src
                 .transaction()
                 .context("Failed to start source database read snapshot")?;
-            let message_cols = table_columns_in_transaction(&src_tx, "messages")?;
-            let has_snippets_table = table_exists_in_transaction(&src_tx, "snippets");
-            let msg_query = build_message_export_query(&message_cols);
 
             let export_result = (|| -> Result<(usize, usize)> {
-                let mut tx = dest.transaction()?;
+                let message_cols = table_columns_in_transaction(&src_tx, "messages")?;
+                let has_snippets_table = table_exists_in_transaction(&src_tx, "snippets")?;
+                let msg_query = build_message_export_query(&message_cols);
+                let mut tx = dest
+                    .transaction()
+                    .context("Failed to start destination export transaction")?;
+                let destination_result = (|| -> Result<(usize, usize)> {
 
                 // 3. Create Schema (Split into individual statements)
                 tx.execute(
@@ -461,8 +465,34 @@ impl ExportEngine {
                     params![exported_at.as_str()],
                 )?;
 
-                tx.commit()?;
                 Ok((processed, msg_processed))
+                })();
+
+                match destination_result {
+                    Ok(stats) => match tx.commit().context(
+                        "Failed to commit completed destination export transaction",
+                    ) {
+                        Ok(()) => Ok(stats),
+                        Err(commit_error) => match tx
+                            .rollback()
+                            .context("Failed to roll back destination after commit failure")
+                        {
+                            Ok(()) => Err(commit_error),
+                            Err(rollback_error) => Err(commit_error.context(format!(
+                                "destination rollback also failed: {rollback_error:#}"
+                            ))),
+                        },
+                    },
+                    Err(export_error) => match tx
+                        .rollback()
+                        .context("Failed to roll back incomplete destination export transaction")
+                    {
+                        Ok(()) => Err(export_error),
+                        Err(rollback_error) => Err(export_error.context(format!(
+                            "destination rollback also failed: {rollback_error:#}"
+                        ))),
+                    },
+                }
             })();
             let source_rollback_result = src_tx
                 .rollback()
@@ -556,17 +586,17 @@ fn table_columns_in_transaction(
     .context("Failed to inspect source table schema")
 }
 
-fn table_exists_in_transaction(conn: &Transaction<'_>, table_name: &str) -> bool {
+fn table_exists_in_transaction(conn: &Transaction<'_>, table_name: &str) -> Result<bool> {
     if !table_name
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
     {
-        return false;
+        bail!("invalid SQLite table name: {table_name}");
     }
 
     table_columns_in_transaction(conn, table_name)
         .map(|columns| !columns.is_empty())
-        .unwrap_or(false)
+        .with_context(|| format!("Failed to inspect source table {table_name}"))
 }
 
 fn build_message_export_query(columns: &[String]) -> String {

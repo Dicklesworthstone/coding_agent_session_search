@@ -71,7 +71,7 @@ impl SemanticReadinessReason {
     }
 }
 
-/// Search fallback mode while semantic can't fully refine.
+/// Search fallback mode when semantic refinement cannot contribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FallbackMode {
