@@ -58,7 +58,22 @@ pub fn extract_tokens_for_agent(
     } else {
         agent_slug
     };
-    franken_agent_detection::extract_tokens_for_agent(extraction_slug, extra, content, role)
+    let mut usage =
+        franken_agent_detection::extract_tokens_for_agent(extraction_slug, extra, content, role);
+    if agent_slug == "omp"
+        && usage
+            .provider
+            .as_deref()
+            .is_none_or(|provider| provider == "unknown")
+        && let Some(provider) = usage
+            .model_name
+            .as_deref()
+            .and_then(|model| model.split_once('/').map(|(provider, _)| provider))
+            .filter(|provider| !provider.is_empty())
+    {
+        usage.provider = Some(provider.to_string());
+    }
+    usage
 }
 
 /// Result of a Codex scan-root preflight. The preflight replaces directory
