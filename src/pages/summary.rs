@@ -437,12 +437,15 @@ impl ExclusionSet {
 
     /// Re-compile patterns from strings (for deserialization).
     pub fn compile_patterns(&mut self) -> Result<()> {
-        self.excluded_patterns.clear();
-        for pattern_str in &self.excluded_pattern_strings {
-            let regex = Regex::new(pattern_str)
-                .with_context(|| format!("Invalid exclusion pattern: {}", pattern_str))?;
-            self.excluded_patterns.push(regex);
-        }
+        let compiled = self
+            .excluded_pattern_strings
+            .iter()
+            .map(|pattern_str| {
+                Regex::new(pattern_str)
+                    .with_context(|| format!("Invalid exclusion pattern: {pattern_str}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.excluded_patterns = compiled;
         Ok(())
     }
 }
@@ -1971,6 +1974,20 @@ mod tests {
             error.to_string().contains("Invalid exclusion pattern"),
             "unexpected deserialization error: {error}"
         );
+    }
+
+    #[test]
+    fn exclusion_pattern_recompile_is_atomic_on_error() {
+        let mut exclusions = ExclusionSet::new();
+        exclusions.add_pattern("^keep$").unwrap();
+        exclusions.excluded_pattern_strings.push("[".to_string());
+
+        exclusions
+            .compile_patterns()
+            .expect_err("invalid replacement patterns must be rejected");
+
+        assert_eq!(exclusions.excluded_patterns.len(), 1);
+        assert!(exclusions.is_excluded("keep"));
     }
 
     #[test]

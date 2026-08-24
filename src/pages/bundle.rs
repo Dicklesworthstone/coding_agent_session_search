@@ -224,7 +224,7 @@ impl BundleBuilder {
         let temp_output_dir = unique_bundle_dir(output_dir, "tmp")?;
         let final_site_dir = output_dir.join("site");
         let final_private_dir = output_dir.join("private");
-        let mut replace_attempted = false;
+        let mut retain_temp_on_replace_error = false;
         let result = (|| -> Result<BundleResult> {
             progress("setup", "Creating directory structure...");
 
@@ -367,8 +367,11 @@ impl BundleBuilder {
             }
 
             sync_tree(&temp_output_dir)?;
-            replace_attempted = true;
-            replace_dir_from_temp(&temp_output_dir, output_dir)
+            replace_dir_from_temp(
+                &temp_output_dir,
+                output_dir,
+                &mut retain_temp_on_replace_error,
+            )
                 .context("Failed to install completed bundle")?;
 
             progress("complete", "Bundle complete!");
@@ -383,11 +386,26 @@ impl BundleBuilder {
             })
         })();
 
-        if result.is_err() && !replace_attempted {
-            let _ = fs::remove_dir_all(&temp_output_dir);
+        match result {
+            Err(build_error) if !retain_temp_on_replace_error => {
+                match cleanup_rejected_bundle_temp(&temp_output_dir) {
+                    Ok(()) => Err(build_error),
+                    Err(cleanup_error) => Err(build_error.context(format!(
+                        "failed to remove rejected staged bundle: {cleanup_error:#}"
+                    ))),
+                }
+            }
+            other => other,
         }
+    }
+}
 
-        result
+fn cleanup_rejected_bundle_temp(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed removing staged bundle {}", path.display())),
     }
 }
 
@@ -501,7 +519,12 @@ fn is_allowed_system_symlink_ancestor(_path: &Path) -> bool {
     false
 }
 
-fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
+fn replace_dir_from_temp(
+    temp_dir: &Path,
+    final_dir: &Path,
+    retain_temp_on_error: &mut bool,
+) -> Result<()> {
+    *retain_temp_on_error = false;
     if !ensure_replaceable_bundle_output_dir(final_dir)? {
         fs::rename(temp_dir, final_dir).with_context(|| {
             format!(
@@ -542,6 +565,7 @@ fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
                 );
             }
             Err(restore_err) => {
+                *retain_temp_on_error = true;
                 bail!(
                     "failed replacing {} with {}: {}; restore error: {}; temp bundle retained at {}",
                     final_dir.display(),
@@ -1986,7 +2010,13 @@ mod tests {
         fs::create_dir_all(staged_dir.join("site")).unwrap();
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
 
-        replace_dir_from_temp(&staged_dir, &final_dir).unwrap();
+        let mut retain_temp_on_error = false;
+        replace_dir_from_temp(
+            &staged_dir,
+            &final_dir,
+            &mut retain_temp_on_error,
+        )
+        .unwrap();
 
         assert!(!staged_dir.exists());
         assert!(final_dir.join("site/new.txt").exists());
@@ -2014,12 +2044,22 @@ mod tests {
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
         symlink(temp.path().join("missing-target"), &final_dir).unwrap();
 
-        let err = replace_dir_from_temp(&staged_dir, &final_dir).unwrap_err();
+        let mut retain_temp_on_error = false;
+        let err = replace_dir_from_temp(
+            &staged_dir,
+            &final_dir,
+            &mut retain_temp_on_error,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("must not be a symlink"),
             "unexpected error: {err:#}"
         );
         assert!(staged_dir.join("site/new.txt").exists());
+        assert!(
+            !retain_temp_on_error,
+            "ordinary validation failures do not require recovery retention"
+        );
         assert!(
             fs::symlink_metadata(&final_dir)
                 .unwrap()

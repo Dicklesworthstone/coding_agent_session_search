@@ -564,11 +564,26 @@ fn view_round_trips_a_lesson_id() -> Result<(), String> {
 #[test]
 fn live_mode_mines_repository_metadata_without_raw_leakage() -> Result<(), String> {
     let repo = seed_live_lessons_repo()?;
-    let (v, raw) = run_live_lessons(repo.path())?;
+    let nested = repo.path().join("nested/working/directory");
+    std::fs::create_dir_all(&nested)
+        .map_err(|e| format!("create nested live invocation directory: {e}"))?;
+    let (v, raw) = run_live_lessons(&nested)?;
     let mut failures = Vec::new();
 
     if str_at(&v, "/mode") != Some("live") {
         failures.push(format!("mode != live: {:?}", str_at(&v, "/mode")));
+    }
+    let expected_project = repo
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| "live fixture repository has no UTF-8 basename".to_string())?;
+    if str_at(&v, "/project") != Some(expected_project.as_str()) {
+        failures.push(format!(
+            "nested live invocation project != repository root basename: {:?}",
+            str_at(&v, "/project")
+        ));
     }
     for (ptr, want) in [
         ("/manifest/commits_scanned", 1_u64),

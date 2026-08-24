@@ -2416,8 +2416,8 @@ pub enum FleetCommand {
 
 /// Subcommands for the durable lessons graph (bead
 /// coding_agent_session_search-guided-ops-repro-trust-5u82n.4). Lessons are a
-/// derived, advisory surface mined from local cass evidence (landed commit
-/// summaries in live mode; commits/beads/proofs in fixture mode) and reduced to
+/// derived, advisory surface mined from local cass evidence (commits, closed
+/// Beads, and proof manifests in both live and fixture modes) and reduced to
 /// distinct, redacted, supersession-resolved records by
 /// [`crate::lessons::LessonGraph`].
 #[derive(Subcommand, Debug, Clone)]
@@ -9221,10 +9221,38 @@ fn gather_live_lessons_evidence() -> crate::lessons_extraction::LessonsEvidence 
     gather_repository_lessons_evidence(&repo)
 }
 
+/// Resolve `start` to its Git worktree root. Live lessons are repository-local:
+/// invocation from a nested directory must not change the project name or hide
+/// root-local `.beads` and `.cass/proofs` evidence. Non-repositories and hosts
+/// without Git retain the caller-provided path for best-effort behavior.
+fn resolve_lessons_repository_root(start: &Path) -> PathBuf {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    let Ok(output) = output else {
+        return start.to_path_buf();
+    };
+    if !output.status.success() {
+        return start.to_path_buf();
+    }
+    let Ok(stdout) = std::str::from_utf8(&output.stdout) else {
+        return start.to_path_buf();
+    };
+    let root = stdout.trim();
+    if root.is_empty() {
+        start.to_path_buf()
+    } else {
+        PathBuf::from(root)
+    }
+}
+
 /// Gather the same metadata-first evidence as live mode from an explicit
 /// repository root. The trust-correlation layer reuses this helper so lesson
 /// citations and `cass lessons` always derive identical content-stable ids.
 fn gather_repository_lessons_evidence(repo: &Path) -> crate::lessons_extraction::LessonsEvidence {
+    let repo = resolve_lessons_repository_root(repo);
     let project = repo
         .file_name()
         .and_then(|n| n.to_str())
@@ -9232,7 +9260,7 @@ fn gather_repository_lessons_evidence(repo: &Path) -> crate::lessons_extraction:
         .unwrap_or_else(|| "cass".to_string());
     crate::lessons_extraction::LessonsEvidence {
         project,
-        commits: gather_git_commit_evidence(repo, 500),
+        commits: gather_git_commit_evidence(&repo, 500),
         beads: gather_closed_bead_evidence(&repo.join(".beads/issues.jsonl")),
         proofs: gather_proof_evidence(&repo.join(".cass/proofs/proof-manifest.jsonl")),
     }

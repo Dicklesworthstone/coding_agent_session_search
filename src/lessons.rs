@@ -8,9 +8,10 @@
 //! knowledge easy to reuse and hard to lose once session logs grow huge. This
 //! module is the **metadata-first record contract and graph core**: it defines
 //! the durable [`LessonRecord`], computes a content-stable [`LessonRecord::lesson_id`]
-//! (so the same lesson dedupes across runs), and resolves
-//! supersession/staleness within a topic — independent of *how* lessons are
-//! sourced.
+//! (so the same lesson dedupes across runs), and resolves supersession/staleness
+//! within a topic — independent of *how* lessons are sourced. Failed approaches
+//! are retired only by fresher landed lessons on the same topic; independent
+//! current lessons can coexist within a topic.
 //!
 //! ## Redaction trust boundary
 //!
@@ -19,9 +20,7 @@
 //! re-redact those strings; it preserves the supplied topic, project,
 //! provenance, applicability, and summary metadata. Production callers must
 //! therefore cross [`crate::lessons_extraction::extract`] before building a
-//! graph. Failed approaches are retired only by fresher landed lessons on the
-//! same topic; independent current lessons can coexist within a topic. Keeping
-//! that boundary explicit avoids implying that the Rust type
+//! graph. Keeping that boundary explicit avoids implying that the Rust type
 //! alone can distinguish redacted text from raw private text.
 
 use serde::{Deserialize, Serialize};
@@ -109,7 +108,8 @@ impl LessonStatus {
 /// private text; this module stores exactly what it is given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LessonCandidate {
-    /// Topic the lesson is about (used with `project` when retiring failed approaches).
+    /// Topic the lesson is about (used with `project` when retiring failed
+    /// approaches).
     pub topic: String,
     /// Project the lesson belongs to.
     pub project: String,
