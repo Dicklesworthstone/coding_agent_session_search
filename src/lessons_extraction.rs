@@ -32,12 +32,37 @@
 
 use std::collections::BTreeMap;
 
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::lessons::{LessonCandidate, LessonConfidence, LessonKind};
 
 /// Stable schema version for the evidence wire format consumed here.
 pub const LESSONS_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+/// Local home-directory prefixes, including prefixes embedded in metadata
+/// such as `cwd=/Users/alice/project` or `file:///home/alice/project`.
+static HOME_PATH_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:/(?:home|users)/[a-z0-9._-]+|[a-z]:[\\/]users[\\/][a-z0-9._-]+)")
+        .expect("durable lesson home-path regex")
+});
+
+/// Practical e-mail matcher for redaction. It intentionally favors privacy
+/// over full RFC mailbox validation and also finds addresses after prefixes
+/// such as `owner=` and `mailto:`.
+static EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+    )
+    .expect("durable lesson email regex")
+});
+
+/// Long hex material which may be a content digest, secret, or opaque local
+/// identifier. Short git shas remain useful and are deliberately retained.
+static OPAQUE_HEX_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b[a-f0-9]{32,}\b").expect("durable lesson opaque-hex regex")
+});
 
 fn default_project() -> String {
     "cass".to_string()
@@ -142,76 +167,18 @@ impl RedactionReport {
     }
 }
 
-/// Strip leading/trailing punctuation from a token, returning
-/// `(leading, core, trailing)` so a redacted core can be re-wrapped.
-fn split_affixes(word: &str) -> (&str, &str, &str) {
-    const LEAD: &[char] = &['"', '\'', '(', '<', '[', '{', '`', '=', ':'];
-    const TRAIL: &[char] = &[
-        '"', '\'', ')', '>', ']', '}', '`', ',', '.', ';', ':', '!', '?',
-    ];
-    let core = word.trim_start_matches(LEAD);
-    let lead = &word[..word.len() - core.len()];
-    let core_trimmed = core.trim_end_matches(TRAIL);
-    let trail = &core[core_trimmed.len()..];
-    (lead, core_trimmed, trail)
-}
-
-/// Whether a token core looks like an e-mail address.
-fn is_email(core: &str) -> bool {
-    let Some(at) = core.find('@') else {
-        return false;
-    };
-    let (local, domain) = core.split_at(at);
-    let domain = &domain[1..];
-    !local.is_empty()
-        && domain.contains('.')
-        && !domain.starts_with('.')
-        && !domain.ends_with('.')
-        && !local.contains('@')
-        && !domain.contains('@')
-}
-
-/// Whether a token core is a long opaque digest or key-like string we should
-/// never surface. Precise on purpose: short shas (provenance) are left intact.
-fn is_opaque_digest(core: &str) -> bool {
-    // Known credential-ish prefixes of any length.
-    const PREFIXES: &[&str] = &["ghp_", "gho_", "sk-", "xoxb-", "xoxp-", "AKIA", "ASIA"];
-    if PREFIXES.iter().any(|p| core.starts_with(p)) && core.len() >= 12 {
-        return true;
+fn replace_all_counted(
+    input: String,
+    pattern: &Regex,
+    replacement: &str,
+    counter: &mut usize,
+) -> String {
+    let replacements = pattern.find_iter(&input).count();
+    if replacements == 0 {
+        return input;
     }
-    // A 32+ char all-hex run (blake3/sha256-class digests).
-    core.len() >= 32 && core.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// Redact a home path prefix, returning the rewritten path if it matched.
-fn redact_home_path(core: &str) -> Option<String> {
-    for root in ["/home/", "/Users/", "/users/"] {
-        if let Some(rest) = core.strip_prefix(root) {
-            // Drop the username segment, keep the remaining (project-relative) tail.
-            let tail = rest.split_once('/').map(|(_, tail)| tail).unwrap_or("");
-            return Some(if tail.is_empty() {
-                "<home>".to_string()
-            } else {
-                format!("<home>/{tail}")
-            });
-        }
-    }
-    let bytes = core.as_bytes();
-    if bytes.len() >= 9
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && bytes[2] == b'\\'
-        && bytes[3..9].eq_ignore_ascii_case(b"Users\\")
-    {
-        let rest = &core[9..];
-        let tail = rest.split_once('\\').map(|(_, tail)| tail).unwrap_or("");
-        return Some(if tail.is_empty() {
-            "<home>".to_string()
-        } else {
-            format!("<home>\\{tail}")
-        });
-    }
-    None
+    *counter = counter.saturating_add(replacements);
+    pattern.replace_all(&input, replacement).into_owned()
 }
 
 /// Redact a single text field: removes home-path usernames, e-mails, and opaque
@@ -227,46 +194,11 @@ pub fn redact(input: &str) -> (String, RedactionReport) {
             .digests
             .saturating_add(after.saturating_sub(before).max(1));
     }
-    let input = secret_redacted.as_ref();
-    let mut out = String::with_capacity(input.len());
-    // Walk char by char, preserving whitespace verbatim and transforming each
-    // maximal non-whitespace word as it completes.
-    let mut word = String::new();
-    for c in input.chars() {
-        if c.is_whitespace() {
-            if !word.is_empty() {
-                out.push_str(&redact_word(&word, &mut report));
-                word.clear();
-            }
-            out.push(c);
-        } else {
-            word.push(c);
-        }
-    }
-    if !word.is_empty() {
-        out.push_str(&redact_word(&word, &mut report));
-    }
-    (out, report)
-}
-
-fn redact_word(word: &str, report: &mut RedactionReport) -> String {
-    let (lead, core, trail) = split_affixes(word);
-    if core.is_empty() {
-        return word.to_string();
-    }
-    if is_email(core) {
-        report.emails = report.emails.saturating_add(1);
-        return format!("{lead}<email>{trail}");
-    }
-    if let Some(redacted) = redact_home_path(core) {
-        report.home_paths = report.home_paths.saturating_add(1);
-        return format!("{lead}{redacted}{trail}");
-    }
-    if is_opaque_digest(core) {
-        report.digests = report.digests.saturating_add(1);
-        return format!("{lead}<digest>{trail}");
-    }
-    word.to_string()
+    let output = secret_redacted.into_owned();
+    let output = replace_all_counted(output, &HOME_PATH_RE, "<home>", &mut report.home_paths);
+    let output = replace_all_counted(output, &EMAIL_RE, "<email>", &mut report.emails);
+    let output = replace_all_counted(output, &OPAQUE_HEX_RE, "<digest>", &mut report.digests);
+    (output, report)
 }
 
 /// Security-relevant keywords that override the default classification.
@@ -689,6 +621,24 @@ mod tests {
         assert_eq!(report.home_paths, 1);
     }
 
+    #[test]
+    fn redact_finds_sensitive_substrings_inside_metadata_tokens() {
+        let input = concat!(
+            "cwd=file:///Users/alice/private ",
+            "windows=C:/Users/bob/private ",
+            "owner=alice@example.com ",
+            "digest=0123456789abcdef0123456789abcdef"
+        );
+        let (out, report) = redact(input);
+        assert_eq!(
+            out,
+            "cwd=file://<home>/private windows=<home>/private owner=<email> digest=<digest>"
+        );
+        assert_eq!(report.home_paths, 2);
+        assert_eq!(report.emails, 1);
+        assert_eq!(report.digests, 1);
+    }
+
     // ---- classification ---------------------------------------------------
 
     #[test]
@@ -907,24 +857,24 @@ mod tests {
     fn every_serialized_metadata_field_crosses_the_redaction_boundary() {
         let secret_status = format!("sk-proj-{}", "A".repeat(24));
         let evidence = LessonsEvidence {
-            project: "/Users/project-owner/private-repo".to_string(),
+            project: "repo=file:///Users/project-owner/private-repo".to_string(),
             commits: vec![CommitEvidence {
                 sha: "abc123".to_string(),
-                subject: "fix(/Users/commit-owner/private): keep metadata safe".to_string(),
+                subject: "fix(cwd=/Users/commit-owner/private): keep metadata safe".to_string(),
                 body: String::new(),
                 timestamp_ms: 1,
             }],
             beads: vec![BeadEvidence {
-                id: "bead-owner@example.com".to_string(),
+                id: "owner=bead-owner@example.com".to_string(),
                 title: "metadata boundary".to_string(),
                 close_reason: "landed".to_string(),
                 issue_type: "task".to_string(),
                 status: "closed".to_string(),
-                labels: vec!["/Users/label-owner/private".to_string()],
+                labels: vec!["path=/Users/label-owner/private".to_string()],
                 updated_ms: 2,
             }],
             proofs: vec![ProofEvidence {
-                name: "/Users/proof-owner/private-gate".to_string(),
+                name: "file:///Users/proof-owner/private-gate".to_string(),
                 status: secret_status.clone(),
                 command: String::new(),
                 timestamp_ms: 3,

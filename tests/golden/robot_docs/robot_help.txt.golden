@@ -14,6 +14,7 @@ QUICKSTART (for AI agents):
   cass search "api" --week --agent codex --robot  # Last 7 days, codex only
   cass stats --json                    # Get index statistics
   cass sessions --current --json       # Find current workspace session
+  cass resume <path> --agent omp --json  # OMP aliases: oh-my-pi | oh_my_pi | ohmypi
   cass view /path/file.jsonl -n 42 --json  # View file at line 42
   cass capabilities --json           # First-stop self-description for agents
   cass robot-docs commands            # Machine-readable command list

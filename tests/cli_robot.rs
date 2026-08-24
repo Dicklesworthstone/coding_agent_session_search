@@ -288,7 +288,19 @@ fn robot_help_prints_contract() {
     cmd.assert()
         .success()
         .stdout(contains("cass --robot-help (contract v1)"))
+        .stdout(contains(
+            "OMP aliases: oh-my-pi | oh_my_pi | ohmypi",
+        ))
         .stdout(contains("Exit codes: 0 ok"));
+}
+
+#[test]
+fn resume_help_lists_every_omp_alias() {
+    let mut cmd = base_cmd();
+    cmd.args(["resume", "--help"]);
+    cmd.assert()
+        .success()
+        .stdout(contains("omp | oh-my-pi | oh_my_pi | ohmypi"));
 }
 
 #[test]
@@ -418,12 +430,22 @@ fn capabilities_are_self_describing_for_agents() {
         "CASS_TRACE_FILTER",
         "CASS_TRACE_MAX_BYTES",
         "CASS_TRACE_MAX_EVENTS",
+        "PI_SESSIONS_DIR",
     ] {
         assert!(
             env_vars.iter().any(|env_var| env_var["name"] == expected),
             "capabilities should include env var {expected}"
         );
     }
+    let pi_sessions_dir = env_vars
+        .iter()
+        .find(|env_var| env_var["name"] == "PI_SESSIONS_DIR")
+        .expect("PI_SESSIONS_DIR capability");
+    assert_eq!(
+        pi_sessions_dir["description"],
+        "Override the exact Pi Agent sessions directory.",
+        "capabilities must distinguish the exact sessions override from the broader Pi-family agent directory"
+    );
 
     let workflows = json["workflows"].as_array().expect("workflows array");
     let cold_start = workflows

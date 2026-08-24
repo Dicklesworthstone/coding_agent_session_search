@@ -3449,6 +3449,10 @@
       "description": "Override Aider session discovery root."
     },
     {
+      "name": "PI_SESSIONS_DIR",
+      "description": "Override the exact Pi Agent sessions directory."
+    },
+    {
       "name": "PI_CODING_AGENT_DIR",
       "description": "Override the Pi-family agent directory; OMP ignores it while a named profile is active."
     },

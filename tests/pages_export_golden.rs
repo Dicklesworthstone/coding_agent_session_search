@@ -22,6 +22,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+const RETIRED_ENTROPY_OVERRIDE: &str = "must-not-control-html-export-entropy";
+
 fn fixture_phrase() -> String {
     ["golden", "html", "fixture"].join("-")
 }
@@ -104,7 +106,14 @@ fn export_html(
 
     if encrypted {
         let phrase = fixture_phrase();
-        cmd.arg("--encrypt")
+        // Regression probe for the retired debug-build entropy hook. Even when
+        // an ambient process supplies its old name, production encryption must
+        // continue to draw fresh salt and nonce bytes from the CSPRNG.
+        cmd.env(
+            "CASS_HTML_EXPORT_GOLDEN_BYTES_LABEL",
+            RETIRED_ENTROPY_OVERRIDE,
+        )
+        .arg("--encrypt")
             .arg("--password-stdin")
             .write_stdin(format!("{phrase}\n"));
     }
@@ -298,9 +307,18 @@ fn encrypted_export_html_matches_golden() {
 
     let first_payload = encrypted_payload(&first);
     let second_payload = encrypted_payload(&second);
-    assert_ne!(first_payload["salt"], second_payload["salt"]);
-    assert_ne!(first_payload["iv"], second_payload["iv"]);
-    assert_ne!(first_payload["ciphertext"], second_payload["ciphertext"]);
+    assert_ne!(
+        first_payload["salt"], second_payload["salt"],
+        "the retired golden-byte environment variable must not repeat PBKDF2 salt"
+    );
+    assert_ne!(
+        first_payload["iv"], second_payload["iv"],
+        "the retired golden-byte environment variable must not repeat an AES-GCM nonce"
+    );
+    assert_ne!(
+        first_payload["ciphertext"], second_payload["ciphertext"],
+        "the retired golden-byte environment variable must not make ciphertext deterministic"
+    );
     assert!(first.contains("id=\"encrypted-content\""));
     assert!(first.contains("crypto.subtle"));
     assert!(!first.contains("return Err(AuthError::ExpiredToken);"));

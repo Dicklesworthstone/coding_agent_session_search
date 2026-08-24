@@ -651,6 +651,8 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
             } else {
                 "NULL"
             };
+        let has_model = table_has_column(&conn, "messages", "model")?;
+        let model_projection = if has_model { "m.model" } else { "NULL" };
         let (msg_where, msg_params) = build_where_clause_for_columns(
             filters,
             schema.agent_expression(),
@@ -662,7 +664,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
         )?;
         let msg_high_watermark = table_max_id(&conn, "messages")?;
         let msg_select = format!(
-            "SELECT m.id, m.idx, m.content, {extra_json_projection}, c.id, c.source_path, {}, {}, {extra_bin_projection}, {attachment_refs_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id{}",
+            "SELECT m.id, m.idx, m.content, {extra_json_projection}, c.id, c.source_path, {}, {}, {extra_bin_projection}, {attachment_refs_projection}, m.role, {model_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id{}",
             schema.agent_expression(),
             schema.workspace_expression(),
             schema.conversation_joins(),
@@ -703,6 +705,8 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                 let workspace_path: Option<String> = row.get_typed(7)?;
                 let extra_bin: Option<Vec<u8>> = row.get_typed(8)?;
                 let attachment_refs: Option<String> = row.get_typed(9)?;
+                let role: String = row.get_typed(10)?;
+                let model: Option<String> = row.get_typed(11)?;
                 last_msg_id = Some(msg_id);
 
                 let ctx = ScanContext {
@@ -726,6 +730,20 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                 if let Some(attachment_refs) = attachment_refs.as_deref() {
                     scan_text(
                         attachment_refs,
+                        SecretLocation::MessageMetadata,
+                        &ctx,
+                        config,
+                        &mut findings,
+                        &mut seen,
+                        &mut truncated,
+                    );
+                }
+                for metadata_text in [Some(role.as_str()), model.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    scan_text(
+                        metadata_text,
                         SecretLocation::MessageMetadata,
                         &ctx,
                         config,
@@ -795,7 +813,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
         )?;
         let snip_high_watermark = table_max_id(&conn, "snippets")?;
         let snip_select = format!(
-            "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, {}, {}, s.file_path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id{}",
+            "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, {}, {}, s.file_path, s.language\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id{}",
             schema.agent_expression(),
             schema.workspace_expression(),
             schema.conversation_joins(),
@@ -835,6 +853,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                 let agent_slug: String = row.get_typed(6)?;
                 let workspace_path: Option<String> = row.get_typed(7)?;
                 let snippet_file_path: Option<String> = row.get_typed(8)?;
+                let snippet_language: Option<String> = row.get_typed(9)?;
                 last_snippet_id = Some(snippet_id);
 
                 let ctx = ScanContext {
@@ -858,6 +877,17 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
                 if let Some(snippet_file_path) = snippet_file_path.as_deref() {
                     scan_text(
                         snippet_file_path,
+                        SecretLocation::MessageMetadata,
+                        &ctx,
+                        config,
+                        &mut findings,
+                        &mut seen,
+                        &mut truncated,
+                    );
+                }
+                if let Some(snippet_language) = snippet_language.as_deref() {
+                    scan_text(
+                        snippet_language,
                         SecretLocation::MessageMetadata,
                         &ctx,
                         config,
@@ -2270,7 +2300,7 @@ mod tests {
                 message_count, metadata_json
             ) VALUES (
                 1, 'codex', '/tmp/project', 'safe title',
-                'session.jsonl', 1700000000000, 1, '{}'
+                'session.jsonl', 1700000000000, 2, '{}'
             );
             INSERT INTO messages (
                 id, conversation_id, idx, role, content, created_at
@@ -2278,20 +2308,58 @@ mod tests {
                 7, 1, 0, 'user', 'credential AKIAIOSFODNN7EXAMPLE',
                 1700000000000
             );
+            INSERT INTO messages (
+                id, conversation_id, idx, role, content, created_at, model,
+                attachment_refs
+            ) VALUES (
+                8, 1, 1, 'assistant', 'safe content', 1700000000001,
+                'safe safe safe safe safe safe safe safe safe safe AUX_MODEL_CREDENTIAL',
+                'AUX_ATTACHMENT_CREDENTIAL'
+            );
+            INSERT INTO snippets (
+                id, message_id, file_path, language, snippet_text
+            ) VALUES (
+                9, 8,
+                'safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe AUX_PATH_CREDENTIAL',
+                'safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe safe AUX_LANGUAGE_CREDENTIAL',
+                'safe snippet'
+            );
             "#,
         )?;
         drop(conn);
 
-        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        let config = SecretScanConfig::from_inputs_with_env(
+            &[],
+            &["AUX_(?:MODEL|ATTACHMENT|PATH|LANGUAGE)_CREDENTIAL".to_string()],
+            false,
+        )?;
         let attestation = scan_staged_export_database(&db_path, &config)?;
 
         assert_eq!(attestation.artifact_sha256.len(), 64);
         assert!(!attestation.report.summary.truncated);
-        assert_eq!(attestation.report.summary.total, 1);
-        let finding = &attestation.report.findings[0];
+        let finding = attestation
+            .report
+            .findings
+            .iter()
+            .find(|finding| finding.kind == "aws_access_key_id")
+            .expect("message content credential must be detected");
         assert_eq!(finding.agent.as_deref(), Some("codex"));
         assert_eq!(finding.workspace.as_deref(), Some("/tmp/project"));
         assert_eq!(finding.message_id, Some(7));
+        let auxiliary_findings: Vec<_> = attestation
+            .report
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == CUSTOM_DENYLIST_PATTERN_ID)
+            .collect();
+        assert_eq!(
+            auxiliary_findings.len(),
+            4,
+            "model, attachment, snippet path, and snippet language must all be scanned"
+        );
+        assert!(auxiliary_findings.iter().all(|finding| {
+            finding.message_id == Some(8) && finding.location == SecretLocation::MessageMetadata
+        }));
         Ok(())
     }
 

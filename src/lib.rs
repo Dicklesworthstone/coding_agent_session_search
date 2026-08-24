@@ -1225,7 +1225,7 @@ pub enum Commands {
                 \x20 codex\n\
                 \x20 opencode\n\
                 \x20 pi_agent | pi-agent | pi (pi-mono)\n\
-                \x20 omp | oh-my-pi | ohmypi (Oh My Pi; profile/session roots preserved)\n\
+                \x20 omp | oh-my-pi | oh_my_pi | ohmypi (Oh My Pi; profile/session roots preserved)\n\
                 \x20 gemini\n\
                 \x20 antigravity | agy       (resume via `agy --conversation <uuid>`)"
         )]
@@ -23589,6 +23589,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  cass search \"api\" --week --agent codex --robot  # Last 7 days, codex only",
         "  cass stats --json                    # Get index statistics",
         "  cass sessions --current --json       # Find current workspace session",
+        "  cass resume <path> --agent omp --json  # OMP aliases: oh-my-pi | oh_my_pi | ohmypi",
         "  cass view /path/file.jsonl -n 42 --json  # View file at line 42",
         "  cass capabilities --json           # First-stop self-description for agents",
         "  cass robot-docs commands            # Machine-readable command list",
@@ -78916,18 +78917,24 @@ mod cli_read_db_tests {
         assert_eq!(target.agent, "codex");
         assert_eq!(target.session_id.as_deref(), Some("abc-123"));
 
-        // `oh-my-pi` is a first-class OMP alias even when the path does not
-        // carry a canonical OMP store marker.
+        // Every documented OMP spelling is exact and first-class even when the
+        // path does not carry a canonical OMP store marker.
         let temp = tempfile::tempdir().expect("tempdir");
         let sess = temp.path().join("2026-04-09T00-00-00_xyz.jsonl");
         std::fs::write(&sess, r#"{"type":"session","id":"ov-42"}"#).expect("write");
-        let target = resolve_resume_target(&sess, Some("oh-my-pi")).expect("resolve");
-        assert_eq!(target.agent, "omp");
-        assert_eq!(
-            target.argv[0], "omp",
-            "--agent oh-my-pi must force the `omp` binary"
-        );
-        assert_eq!(target.session_id.as_deref(), Some("ov-42"));
+        for alias in ["omp", "oh-my-pi", "oh_my_pi", "ohmypi"] {
+            let target = resolve_resume_target(&sess, Some(alias)).expect("resolve OMP alias");
+            assert_eq!(target.agent, "omp", "alias {alias:?}");
+            assert_eq!(
+                target.argv[0], "omp",
+                "--agent {alias} must force the `omp` binary"
+            );
+            assert_eq!(target.session_id.as_deref(), Some("ov-42"));
+        }
+        let err = resolve_resume_target(&sess, Some("oh_my_pipeline"))
+            .expect_err("a near-match must not be accepted as OMP");
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "invalid-agent");
 
         // `pi` alias must force the `pi` binary even when path contains .omp/agent.
         let omp_dir = temp.path().join(".omp/agent/sessions");
@@ -84279,6 +84286,11 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Override Aider session discovery root.",
         ),
         env_var_capability(
+            "PI_SESSIONS_DIR",
+            None,
+            "Override the exact Pi Agent sessions directory.",
+        ),
+        env_var_capability(
             "PI_CODING_AGENT_DIR",
             None,
             "Override the Pi-family agent directory; OMP ignores it while a named profile is active.",
@@ -85051,6 +85063,7 @@ fn run_config_based_export(
             output_structured_value(result, fmt)?;
         } else {
             println!("Dry run: would export to {:?}", wizard_state.output_dir);
+            println!("Secret scan: not performed during dry run");
         }
         return Ok(());
     }
@@ -85235,7 +85248,7 @@ fn run_config_based_export(
         }
     });
 
-    if let Some(_fmt) = structured_format {
+    if let Some(fmt) = structured_format {
         let result = serde_json::json!({
             "status": "success",
             "output_dir": output_dir,
@@ -85258,7 +85271,7 @@ fn run_config_based_export(
             },
             "deployment": deploy_result,
         });
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        output_structured_value(result, fmt)?;
     } else {
         println!("Export complete:");
         println!("  Output: {}", output_dir.display());
