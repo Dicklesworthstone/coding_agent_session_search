@@ -1176,17 +1176,131 @@ fn write_private_artifact_file(private_dir: &Path, filename: &str, contents: &[u
         return Err(err);
     }
 
-    if let Err(err) = fs::rename(&temp_path, &final_path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err).with_context(|| {
-            format!(
-                "Failed to install private artifact {}",
-                final_path.display()
-            )
-        });
+    let mut retain_temp_on_replace_error = false;
+    if let Err(err) = replace_private_artifact_from_temp(
+        &temp_path,
+        &final_path,
+        &mut retain_temp_on_replace_error,
+    ) {
+        if !retain_temp_on_replace_error {
+            let _ = fs::remove_file(&temp_path);
+        }
+        return Err(err);
     }
-    sync_parent_directory(&final_path)?;
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn private_artifact_path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err)
+            .with_context(|| format!("Failed to inspect private artifact {}", path.display())),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn replace_private_artifact_from_temp_via_backup(
+    temp_path: &Path,
+    final_path: &Path,
+    first_error: &std::io::Error,
+    retain_temp_on_error: &mut bool,
+) -> Result<()> {
+    *retain_temp_on_error = false;
+    reject_symlinked_private_artifact(final_path)?;
+    let backup_path = unique_bundle_sidecar_path(final_path, "bak", "private_artifact")?;
+    fs::rename(final_path, &backup_path).with_context(|| {
+        format!(
+            "Failed to preserve existing private artifact {} at {} after initial replacement error: {}",
+            final_path.display(),
+            backup_path.display(),
+            first_error
+        )
+    })?;
+
+    match fs::rename(temp_path, final_path) {
+        Ok(()) => {
+            fs::remove_file(&backup_path).with_context(|| {
+                format!(
+                    "Installed private artifact {} but failed to remove prior generation {}",
+                    final_path.display(),
+                    backup_path.display()
+                )
+            })?;
+            sync_parent_directory(final_path)
+        }
+        Err(replace_error) => match fs::rename(&backup_path, final_path) {
+            Ok(()) => {
+                sync_parent_directory(final_path)?;
+                Err(replace_error).with_context(|| {
+                    format!(
+                        "Failed to replace private artifact {} after initial error {}; restored its prior generation",
+                        final_path.display(),
+                        first_error
+                    )
+                })
+            }
+            Err(restore_error) => {
+                *retain_temp_on_error = true;
+                bail!(
+                    "Failed to replace private artifact {} after initial error {}; replacement error: {}; restore error: {}; prior generation retained at {} and new generation retained at {}",
+                    final_path.display(),
+                    first_error,
+                    replace_error,
+                    restore_error,
+                    backup_path.display(),
+                    temp_path.display()
+                )
+            }
+        },
+    }
+}
+
+fn replace_private_artifact_from_temp(
+    temp_path: &Path,
+    final_path: &Path,
+    retain_temp_on_error: &mut bool,
+) -> Result<()> {
+    *retain_temp_on_error = false;
+    #[cfg(windows)]
+    {
+        match fs::rename(temp_path, final_path) {
+            Ok(()) => sync_parent_directory(final_path),
+            Err(first_error)
+                if matches!(
+                    first_error.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                ) && private_artifact_path_entry_exists(final_path)? =>
+            {
+                replace_private_artifact_from_temp_via_backup(
+                    temp_path,
+                    final_path,
+                    &first_error,
+                    retain_temp_on_error,
+                )
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "Failed to install private artifact {} from {}",
+                    final_path.display(),
+                    temp_path.display()
+                )
+            }),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp_path, final_path).with_context(|| {
+            format!(
+                "Failed to install private artifact {} from {}",
+                final_path.display(),
+                temp_path.display()
+            )
+        })?;
+        sync_parent_directory(final_path)
+    }
 }
 
 pub(crate) fn write_private_artifacts_encrypted(
@@ -1348,6 +1462,22 @@ Host it only on a trusted, private location."#
 - Requires: SharedArrayBuffer (COOP/COEP headers)"#
     };
 
+    let files_section = if is_encrypted {
+        r#"- `index.html` - Entry point
+- `config.json` - Public encryption parameters (no secrets)
+- `integrity.json` - SHA256 hashes for all files
+- `payload/` - Encrypted database chunks
+- `*.js` - Application code
+- `styles.css` - Styling"#
+    } else {
+        r#"- `index.html` - Entry point
+- `config.json` - Plaintext archive metadata and payload location
+- `integrity.json` - SHA256 hashes for all files
+- `payload/data.db` - Unencrypted SQLite database (publicly readable)
+- `*.js` - Application code
+- `styles.css` - Styling"#
+    };
+
     format!(
         r#"# {}
 
@@ -1366,12 +1496,7 @@ generated by [cass](https://github.com/Dicklesworthstone/coding_agent_session_se
 
 ## Files
 
-- `index.html` - Entry point
-- `config.json` - Public encryption parameters (no secrets)
-- `integrity.json` - SHA256 hashes for all files
-- `payload/` - Encrypted database chunks
-- `*.js` - Application code
-- `styles.css` - Styling
+{}
 
 ## Hosting Requirements
 
@@ -1395,6 +1520,7 @@ Generated by cass v{}
         security_section,
         open_section,
         technical_section,
+        files_section,
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -1547,6 +1673,62 @@ mod tests {
     }
 
     #[test]
+    fn private_artifact_writer_replaces_an_existing_generation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let private_dir = temp.path().join("private");
+
+        write_private_artifact_file(&private_dir, "master-key.json", b"old generation")?;
+        write_private_artifact_file(&private_dir, "master-key.json", b"new generation")?;
+
+        let installed = fs::read(private_dir.join("master-key.json"))?;
+        if installed != b"new generation" {
+            return Err(anyhow!("private artifact replacement published stale bytes"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn private_artifact_backup_fallback_preserves_then_replaces() -> Result<()> {
+        let temp = TempDir::new()?;
+        let final_path = temp.path().join("master-key.json");
+        let staged_path = temp.path().join("master-key.tmp.json");
+        fs::write(&final_path, b"old generation")?;
+        fs::write(&staged_path, b"new generation")?;
+        let first_error = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        let mut retain_temp_on_error = false;
+
+        replace_private_artifact_from_temp_via_backup(
+            &staged_path,
+            &final_path,
+            &first_error,
+            &mut retain_temp_on_error,
+        )?;
+
+        if retain_temp_on_error {
+            return Err(anyhow!(
+                "successful private artifact fallback requested temp retention"
+            ));
+        }
+        if fs::read(&final_path)? != b"new generation" {
+            return Err(anyhow!(
+                "private artifact fallback did not publish staged bytes"
+            ));
+        }
+        if staged_path.exists() {
+            return Err(anyhow!(
+                "private artifact fallback left the staged path behind"
+            ));
+        }
+        let remaining_entries = fs::read_dir(temp.path())?.collect::<std::io::Result<Vec<_>>>()?;
+        if remaining_entries.len() != 1 {
+            return Err(anyhow!(
+                "private artifact fallback left an unexpected backup sidecar"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
     #[cfg(unix)]
     fn bundle_staging_root_is_private_until_publish() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
@@ -1675,10 +1857,16 @@ mod tests {
         assert!(readme.contains("A test archive"));
         assert!(readme.contains("AES-256-GCM"));
         assert!(readme.contains("Argon2id"));
+        assert!(readme.contains("Public encryption parameters"));
+        assert!(readme.contains("Encrypted database chunks"));
 
         let unencrypted = generate_public_readme("Test Archive", "A test archive", false);
         assert!(unencrypted.contains("NOT encrypted"));
         assert!(unencrypted.contains("no password required"));
+        assert!(unencrypted.contains("Plaintext archive metadata"));
+        assert!(unencrypted.contains("Unencrypted SQLite database"));
+        assert!(!unencrypted.contains("Public encryption parameters"));
+        assert!(!unencrypted.contains("Encrypted database chunks"));
     }
 
     #[test]
