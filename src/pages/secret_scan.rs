@@ -884,9 +884,23 @@ fn structured_field_has_text_detector(
     value: &serde_json::Value,
     config: &SecretScanConfig,
 ) -> bool {
-    let mut object = serde_json::Map::new();
-    object.insert(field.to_string(), value.clone());
-    let text = serde_json::Value::Object(object).to_string();
+    let Ok(field_text) = serde_json::to_string(field) else {
+        return false;
+    };
+    let Ok(value_text) = serde_json::to_string(value) else {
+        return false;
+    };
+    let mut text = String::with_capacity(
+        field_text
+            .len()
+            .saturating_add(value_text.len())
+            .saturating_add(3),
+    );
+    text.push('{');
+    text.push_str(&field_text);
+    text.push(':');
+    text.push_str(&value_text);
+    text.push('}');
 
     if config
         .denylist

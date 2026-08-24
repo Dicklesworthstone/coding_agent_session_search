@@ -19158,6 +19158,10 @@ mod tests {
             transpile_to_fts5("foo NOT bar-baz"),
             Some("foo NOT (bar AND baz)".to_string())
         );
+        assert_eq!(
+            transpile_to_fts5("foo OR bar NOT baz"),
+            Some("(foo OR bar) NOT baz".to_string())
+        );
     }
 
     #[test]
@@ -23606,6 +23610,17 @@ mod tests {
         assert_eq!(
             transpile_to_fts5("A OR B OR C"),
             Some("(A OR B OR C)".to_string())
+        );
+
+        // An implicit conjunction ends the OR sequence just like an explicit
+        // AND. Remaining in OR mode here would silently broaden the query.
+        assert_eq!(
+            transpile_to_fts5("A OR B C"),
+            Some("(A OR B) AND C".to_string())
+        );
+        assert_eq!(
+            transpile_to_fts5("A OR B C OR D"),
+            Some("(A OR B) AND (C OR D)".to_string())
         );
 
         // Phrases
