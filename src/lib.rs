@@ -17240,10 +17240,81 @@ fn run_analytics_tokens(
 // analytics rebuild (br-z9fse.3.4)
 // ---------------------------------------------------------------------------
 
+/// Resolve the rebuild window from `--days` / `--since`, and reject the
+/// `AnalyticsCommon` filters a rebuild cannot honor.
+///
+/// `--until`, `--agent`, `--workspace` and `--source` are query-time filters;
+/// applying them to a rebuild would leave the rollup tables partially
+/// populated with no way to tell. Refusing is better than the previous
+/// behavior of accepting and ignoring them (GH #412).
+fn analytics_rebuild_since_ms(common: &AnalyticsCommon) -> CliResult<Option<i64>> {
+    let mut unsupported: Vec<&str> = Vec::new();
+    if common.until.is_some() {
+        unsupported.push("--until");
+    }
+    if !common.agent.is_empty() {
+        unsupported.push("--agent");
+    }
+    if !common.workspace.is_empty() {
+        unsupported.push("--workspace");
+    }
+    if common.source.is_some() {
+        unsupported.push("--source");
+    }
+    if !unsupported.is_empty() {
+        return Err(CliError::usage(
+            format!(
+                "analytics rebuild does not support {}: rollups are rebuilt for every agent, workspace and source",
+                unsupported.join(", ")
+            ),
+            Some(
+                "Use --since <date|-Nd> or --days N to limit the rebuild to recent days, or omit filters for a full rebuild."
+                    .into(),
+            ),
+        ));
+    }
+
+    if let Some(days) = common.days {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        return Ok(Some(
+            now_ms.saturating_sub(i64::from(days).saturating_mul(86_400_000)),
+        ));
+    }
+
+    match common.since.as_deref() {
+        None => Ok(None),
+        Some(raw) => parse_datetime_str(raw).map(Some).ok_or_else(|| {
+            CliError::usage(
+                format!("could not parse --since value {raw:?}"),
+                Some(
+                    "Use an ISO date (YYYY-MM-DD), a keyword (today/yesterday), or a relative offset (-7d, -24h)."
+                        .into(),
+                ),
+            )
+        }),
+    }
+}
+
+/// Human-readable UTC day label for the rebuild cutoff (day-aligned, matching
+/// what the storage layer actually rescans).
+fn format_rebuild_cutoff(since_ms: i64) -> String {
+    use crate::storage::sqlite::SqliteStorage;
+    let day_start_ms =
+        SqliteStorage::millis_from_day_id(SqliteStorage::day_id_from_millis(since_ms));
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(day_start_ms)
+        .map(|dt| dt.format("%Y-%m-%d UTC").to_string())
+        .unwrap_or_else(|| format!("{day_start_ms} ms"))
+}
+
 /// Run `cass analytics rebuild` — rebuild analytics rollup tables.
 ///
-/// Currently rebuilds Track A (message_metrics + usage_hourly + usage_daily).
-/// Track B rebuild will be wired when z9fse.13 lands.
+/// Track A (message_metrics + usage_hourly + usage_daily +
+/// usage_models_daily) is rebuilt from `messages`, optionally windowed by
+/// `--since`/`--days` (GH #412). Track B (token_daily_stats) is rebuilt from
+/// the `token_usage` ledger and is always full.
 fn run_analytics_rebuild(
     common: &AnalyticsCommon,
     _force: bool,
@@ -17284,16 +17355,37 @@ fn run_analytics_rebuild(
     let mut tracks_rebuilt: Vec<&str> = Vec::new();
     let mut payload = serde_json::Map::new();
 
+    // GH #412: `--since` / `--days` used to be parsed and then dropped on the
+    // floor, so a "cheap daily refresh" silently became a full rescan.
+    let since_ms = analytics_rebuild_since_ms(common)?;
+    // The window only ever applies to Track A; advertising it in the JSON
+    // payload for a Track-B-only run would tell automation a window was
+    // honored when it was not.
+    if let Some(ms) = since_ms.filter(|_| rebuild_a) {
+        let cutoff_day = crate::storage::sqlite::SqliteStorage::day_id_from_millis(ms);
+        let cutoff_ms = crate::storage::sqlite::SqliteStorage::millis_from_day_id(cutoff_day);
+        payload.insert("since_ms".into(), serde_json::json!(cutoff_ms));
+        payload.insert("since_day_id".into(), serde_json::json!(cutoff_day));
+    }
+
     if rebuild_a {
         // Progress diagnostics go to stderr.
-        eprintln!("Rebuilding analytics (Track A)...");
-        let result = storage.rebuild_analytics().map_err(|e| CliError {
-            code: 9,
-            kind: CliErrorKind::RebuildError.kind_str(),
-            message: format!("Analytics rebuild failed: {e}"),
-            hint: Some("Check database integrity with 'cass health --json'.".into()),
-            retryable: true,
-        })?;
+        match since_ms {
+            Some(ms) => eprintln!(
+                "Rebuilding analytics (Track A) for messages since {}...",
+                format_rebuild_cutoff(ms)
+            ),
+            None => eprintln!("Rebuilding analytics (Track A)..."),
+        }
+        let result = storage
+            .rebuild_analytics_since(since_ms)
+            .map_err(|e| CliError {
+                code: 9,
+                kind: CliErrorKind::RebuildError.kind_str(),
+                message: format!("Analytics rebuild failed: {e}"),
+                hint: Some("Check database integrity with 'cass health --json'.".into()),
+                retryable: true,
+            })?;
         eprintln!(
             "Track A complete: {} message_metrics, {} hourly, {} daily rows in {}ms ({:.0} msg/sec)",
             result.message_metrics_rows,
@@ -17320,7 +17412,16 @@ fn run_analytics_rebuild(
         // #397: `analytics validate` has recommended `--track all` for Track B
         // drift since the two-track split; this is the path that actually
         // rebuilds token_daily_stats from the token_usage ledger.
-        eprintln!("Rebuilding analytics (Track B: token_daily_stats)...");
+        if since_ms.is_some() {
+            // Track B is derived from the `token_usage` ledger with its own
+            // checkpointing (GH #386); it has no windowed mode, so say so
+            // rather than let `--since` look like it applied.
+            eprintln!(
+                "Rebuilding analytics (Track B: token_daily_stats; --since/--days do not apply to Track B, rebuilding fully)..."
+            );
+        } else {
+            eprintln!("Rebuilding analytics (Track B: token_daily_stats)...");
+        }
         let track_b_start = std::time::Instant::now();
         let rows_created = storage.rebuild_token_daily_stats().map_err(|e| CliError {
             code: 9,
