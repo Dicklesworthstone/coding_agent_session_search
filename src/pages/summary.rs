@@ -164,6 +164,28 @@ pub struct ScanReportSummary {
 }
 
 impl ScanReportSummary {
+    fn status_message(total: usize, has_critical: bool, truncated: bool) -> String {
+        if truncated {
+            if total == 0 {
+                return "Scan incomplete: results truncated before findings were recorded"
+                    .to_string();
+            }
+            let critical = if has_critical {
+                " (including CRITICAL)"
+            } else {
+                ""
+            };
+            return format!("At least {total} issues found{critical}; results truncated");
+        }
+        if total == 0 {
+            "No secrets detected".to_string()
+        } else if has_critical {
+            format!("{total} issues found (including CRITICAL)")
+        } else {
+            format!("{total} issues found")
+        }
+    }
+
     /// Create from a full secret scan report.
     pub fn from_report(report: &SecretScanReport) -> Self {
         let by_severity: HashMap<String, usize> = report
@@ -173,13 +195,11 @@ impl ScanReportSummary {
             .map(|(k, v)| (k.label().to_string(), *v))
             .collect();
 
-        let status_message = if report.summary.total == 0 {
-            "No secrets detected".to_string()
-        } else if report.summary.has_critical {
-            format!("{} issues found (including CRITICAL)", report.summary.total)
-        } else {
-            format!("{} issues found", report.summary.total)
-        };
+        let status_message = Self::status_message(
+            report.summary.total,
+            report.summary.has_critical,
+            report.summary.truncated,
+        );
 
         Self {
             total_findings: report.summary.total,
@@ -198,13 +218,8 @@ impl ScanReportSummary {
             .map(|(k, v)| (k.label().to_string(), *v))
             .collect();
 
-        let status_message = if summary.total == 0 {
-            "No secrets detected".to_string()
-        } else if summary.has_critical {
-            format!("{} issues found (including CRITICAL)", summary.total)
-        } else {
-            format!("{} issues found", summary.total)
-        };
+        let status_message =
+            Self::status_message(summary.total, summary.has_critical, summary.truncated);
 
         Self {
             total_findings: summary.total,
@@ -295,7 +310,7 @@ impl KeySlotSummary {
 }
 
 /// Set of exclusions to apply before export.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ExclusionSet {
     /// Workspaces to exclude (full paths).
     pub excluded_workspaces: HashSet<String>,
@@ -306,6 +321,35 @@ pub struct ExclusionSet {
     pub excluded_patterns: Vec<Regex>,
     /// Raw pattern strings (for serialization).
     pub excluded_pattern_strings: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SerializedExclusionSet {
+    #[serde(default)]
+    excluded_workspaces: HashSet<String>,
+    #[serde(default)]
+    excluded_conversations: HashSet<i64>,
+    #[serde(default)]
+    excluded_pattern_strings: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for ExclusionSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let serialized = SerializedExclusionSet::deserialize(deserializer)?;
+        let mut exclusions = Self {
+            excluded_workspaces: serialized.excluded_workspaces,
+            excluded_conversations: serialized.excluded_conversations,
+            excluded_patterns: Vec::new(),
+            excluded_pattern_strings: serialized.excluded_pattern_strings,
+        };
+        exclusions
+            .compile_patterns()
+            .map_err(serde::de::Error::custom)?;
+        Ok(exclusions)
+    }
 }
 
 impl ExclusionSet {
@@ -1816,6 +1860,22 @@ mod tests {
     }
 
     #[test]
+    fn truncated_scan_summary_is_never_presented_as_clean() {
+        let scan = SecretScanSummary {
+            total: 0,
+            by_severity: Default::default(),
+            has_critical: false,
+            truncated: true,
+        };
+
+        let summary = ScanReportSummary::from_summary(&scan);
+
+        assert!(summary.truncated);
+        assert!(!summary.status_message.contains("No secrets detected"));
+        assert!(summary.status_message.contains("incomplete"));
+    }
+
+    #[test]
     fn test_encryption_summary() {
         let enc = EncryptionSummary::default();
         assert_eq!(enc.algorithm, "AES-256-GCM");
@@ -1881,6 +1941,36 @@ mod tests {
 
         assert_eq!(exclusions.excluded_patterns.len(), 1);
         assert!(exclusions.is_excluded("test123pattern"));
+    }
+
+    #[test]
+    fn exclusion_set_round_trip_recompiles_patterns() {
+        let mut exclusions = ExclusionSet::new();
+        exclusions.exclude_workspace("/private/project");
+        exclusions.exclude_conversation(41);
+        exclusions.add_pattern("(?i)^private:").unwrap();
+
+        let encoded = serde_json::to_string(&exclusions).unwrap();
+        let decoded: ExclusionSet = serde_json::from_str(&encoded).unwrap();
+
+        assert!(decoded.should_exclude(Some("/private/project"), 1, "public"));
+        assert!(decoded.should_exclude(Some("/public/project"), 41, "public"));
+        assert!(decoded.should_exclude(Some("/public/project"), 1, "Private: notes"));
+        assert_eq!(decoded.exclusion_counts(), (1, 1, 1));
+        assert!(decoded.has_exclusions());
+    }
+
+    #[test]
+    fn exclusion_set_deserialization_rejects_invalid_patterns() {
+        let error = serde_json::from_str::<ExclusionSet>(
+            r#"{"excluded_pattern_strings":["["]}"#,
+        )
+        .expect_err("an invalid persisted exclusion must fail closed");
+
+        assert!(
+            error.to_string().contains("Invalid exclusion pattern"),
+            "unexpected deserialization error: {error}"
+        );
     }
 
     #[test]
