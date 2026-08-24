@@ -252,11 +252,7 @@ fn sanitized_remote_omp_roots_keep_provider_identity() {
     ] {
         let safe_name = path_to_safe_dirname(remote_path);
         let non_mirror_root = temp.path().join("ordinary-cache").join(safe_name);
-        write_omp_session(
-            &non_mirror_root,
-            id,
-            "Non-mirror sanitized lookalike",
-        );
+        write_omp_session(&non_mirror_root, id, "Non-mirror sanitized lookalike");
         let non_mirror_ctx = ScanContext::with_roots(
             temp.path().join("cass-state"),
             vec![ScanRoot::local(non_mirror_root)],
@@ -282,10 +278,7 @@ fn cass_omp_data_root_is_an_omp_only_live_override() {
     write_omp_session(&shared_pi_root, "shared-pi-root", "Shared Pi override");
 
     let _omp_root = EnvGuard::set("CASS_OMP_DATA_ROOT", omp_root.to_string_lossy());
-    let _shared_root = EnvGuard::set(
-        "PI_CODING_AGENT_DIR",
-        shared_pi_root.to_string_lossy(),
-    );
+    let _shared_root = EnvGuard::set("PI_CODING_AGENT_DIR", shared_pi_root.to_string_lossy());
     let _pi_sessions = EnvGuard::set("PI_SESSIONS_DIR", "");
     let _omp_sessions = EnvGuard::set("PI_CODING_AGENT_SESSION_DIR", "");
     let _config_dir = EnvGuard::set("PI_CONFIG_DIR", "");
@@ -314,18 +307,34 @@ fn cass_omp_data_root_is_an_omp_only_live_override() {
         .scan(&ctx)
         .expect("scan the ambiguous shared Pi override");
 
-    assert!(omp_conversations.iter().any(|conversation| {
-        conversation.external_id.as_deref() == Some("omp-only-live-root")
-    }));
-    assert!(!omp_conversations.iter().any(|conversation| {
-        conversation.external_id.as_deref() == Some("shared-pi-root")
-    }));
-    assert!(pi_conversations.iter().any(|conversation| {
-        conversation.external_id.as_deref() == Some("shared-pi-root")
-    }));
-    assert!(!pi_conversations.iter().any(|conversation| {
-        conversation.external_id.as_deref() == Some("omp-only-live-root")
-    }));
+    assert!(
+        omp_conversations.iter().any(|conversation| {
+            conversation.external_id.as_deref() == Some("omp-only-live-root")
+        }),
+        "OMP-only live-root conversation missing; scan returned: {:?}",
+        omp_conversations
+            .iter()
+            .map(|conversation| (
+                conversation.external_id.clone(),
+                conversation.source_path.clone()
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !omp_conversations
+            .iter()
+            .any(|conversation| { conversation.external_id.as_deref() == Some("shared-pi-root") })
+    );
+    assert!(
+        pi_conversations
+            .iter()
+            .any(|conversation| { conversation.external_id.as_deref() == Some("shared-pi-root") })
+    );
+    assert!(
+        !pi_conversations.iter().any(|conversation| {
+            conversation.external_id.as_deref() == Some("omp-only-live-root")
+        })
+    );
 }
 
 #[test]

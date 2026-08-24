@@ -77,6 +77,7 @@ impl Connector for PiAgentConnector {
         conversations.retain(|conversation| {
             ownership.owner(&conversation.source_path) != super::omp::PiFamilyOwner::Omp
         });
+        super::omp::promote_transcript_session_ids(&mut conversations);
         Ok(conversations)
     }
 

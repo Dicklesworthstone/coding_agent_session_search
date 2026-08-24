@@ -241,10 +241,26 @@ impl PiFamilyOwnership {
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"cass-pi-family-ownership-v1\0");
-        add_path(&mut hasher, "pi_sessions_dir", self.pi_sessions_dir.as_deref());
-        add_path(&mut hasher, "omp_session_dir", self.omp_session_dir.as_deref());
-        add_path(&mut hasher, "shared_agent_dir", self.shared_agent_dir.as_deref());
-        add_path(&mut hasher, "omp_config_root", self.omp_config_root.as_deref());
+        add_path(
+            &mut hasher,
+            "pi_sessions_dir",
+            self.pi_sessions_dir.as_deref(),
+        );
+        add_path(
+            &mut hasher,
+            "omp_session_dir",
+            self.omp_session_dir.as_deref(),
+        );
+        add_path(
+            &mut hasher,
+            "shared_agent_dir",
+            self.shared_agent_dir.as_deref(),
+        );
+        add_path(
+            &mut hasher,
+            "omp_config_root",
+            self.omp_config_root.as_deref(),
+        );
         for (root, _) in &self.omp_store_roots {
             add_path(&mut hasher, "omp_store_root", Some(root));
         }
@@ -366,21 +382,18 @@ fn has_sanitized_omp_mirror_marker(parts: &[String]) -> bool {
 }
 
 fn has_xdg_omp_layout_marker(parts: &[String]) -> bool {
-    parts
-        .windows(4)
-        .any(|window| {
-            window[0] == ".local"
-                && window[1] == "share"
-                && window[2] == "omp"
-                && window[3] == "sessions"
-        })
-        || parts.windows(5).any(|window| {
-            window[0] == ".local"
-                && window[1] == "share"
-                && window[2] == "omp"
-                && window[3] == "profiles"
-                && normalize_profile_name(&window[4]).is_some()
-        })
+    parts.windows(4).any(|window| {
+        window[0] == ".local"
+            && window[1] == "share"
+            && window[2] == "omp"
+            && window[3] == "sessions"
+    }) || parts.windows(5).any(|window| {
+        window[0] == ".local"
+            && window[1] == "share"
+            && window[2] == "omp"
+            && window[3] == "profiles"
+            && normalize_profile_name(&window[4]).is_some()
+    })
 }
 
 /// Durable OMP evidence encoded in an archived transcript path.
@@ -662,12 +675,7 @@ pub(crate) fn is_resolved_live_config_session_path(path: &Path) -> bool {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| ".omp".to_string());
     let active_profile = active_profile_from_env();
-    path_is_in_resolved_config_store_from(
-        path,
-        &home,
-        &config_name,
-        active_profile.as_deref(),
-    )
+    path_is_in_resolved_config_store_from(path, &home, &config_name, active_profile.as_deref())
 }
 
 /// True when an unambiguous OMP layout or OMP-only environment override owns
@@ -738,6 +746,32 @@ fn fad_recognizes_explicit_root(path: &Path) -> bool {
     path.file_name()
         .is_some_and(|name| name == "sessions" || name == "omp")
         || path.to_string_lossy().contains(".omp")
+}
+
+/// Prefer the transcript's own session id (parsed from the `session` header
+/// and recorded in metadata by franken-agent-detection) over the
+/// path-derived fallback `external_id`.
+///
+/// `external_id` is one third of the conversation identity key
+/// (`UNIQUE(source_id, agent_id, external_id)`), and the embedded id is
+/// stable when a session file is moved or its store is relocated; the
+/// path-derived fallback is not. Both pi-family connectors promote so the
+/// scheme stays uniform across the shared wire format; for sessions indexed
+/// before the promotion, appended messages merge under the new key while the
+/// old row keeps the already-indexed history (the merge key is external-id
+/// first, so nothing is lost or double-indexed retroactively).
+pub(crate) fn promote_transcript_session_ids(conversations: &mut [NormalizedConversation]) {
+    for conversation in conversations {
+        let session_id = conversation
+            .metadata
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        if let Some(session_id) = session_id {
+            conversation.external_id = Some(session_id);
+        }
+    }
 }
 
 fn unrecognized_direct_session_roots(
@@ -847,6 +881,7 @@ impl Connector for OmpConnector {
             ownership.owner(&conversation.source_path) == PiFamilyOwner::Omp
         });
         fill_missing_profiles(&mut conversations, &ownership);
+        promote_transcript_session_ids(&mut conversations);
         Ok(conversations)
     }
 
@@ -1048,8 +1083,7 @@ mod tests {
 
     #[test]
     fn sanitized_omp_markers_require_the_exact_production_mirror_slot() {
-        let tilde_name =
-            crate::sources::sync::path_to_safe_dirname("~/.omp/agent/sessions");
+        let tilde_name = crate::sources::sync::path_to_safe_dirname("~/.omp/agent/sessions");
         let absolute_name = crate::sources::sync::path_to_safe_dirname(
             "/home/dev/.local/share/omp/profiles/work/sessions",
         );
@@ -1121,9 +1155,7 @@ mod tests {
             Some("work"),
         ));
         assert!(path_is_in_resolved_config_store_from(
-            Path::new(
-                "/home/dev/custom/profiles/work/agent/sessions/project/session.jsonl"
-            ),
+            Path::new("/home/dev/custom/profiles/work/agent/sessions/project/session.jsonl"),
             home,
             "custom",
             Some("other"),
@@ -1192,13 +1224,12 @@ mod tests {
         let profile_root = temp.path().join("share/omp/profiles/work");
         write_session(&profile_root, "profile-authority");
         let ctx = ScanContext::local_default(temp.path().join("cass-state"), None);
-        let mut conversations =
-            franken_agent_detection::connectors::pi_wire::scan_homes_tagged(
-                &[(profile_root, Some("other".to_string()))],
-                &ctx,
-                "omp",
-            )
-            .expect("scan deliberately mistagged profile root");
+        let mut conversations = franken_agent_detection::connectors::pi_wire::scan_homes_tagged(
+            &[(profile_root, Some("other".to_string()))],
+            &ctx,
+            "omp",
+        )
+        .expect("scan deliberately mistagged profile root");
         assert_eq!(conversations[0].metadata["profile"], "other");
 
         let ownership = ownership(None, None, None, Vec::new(), None);
@@ -1219,13 +1250,7 @@ mod tests {
             "omp",
         )
         .expect("scan untagged CASS archive");
-        let archive_policy = ownership(
-            None,
-            None,
-            None,
-            vec![archive_root],
-            Some("local-profile"),
-        );
+        let archive_policy = ownership(None, None, None, vec![archive_root], Some("local-profile"));
 
         fill_missing_profiles(&mut archived, &archive_policy);
 
@@ -1263,13 +1288,7 @@ mod tests {
     fn only_the_live_session_override_inherits_the_active_profile() {
         let local_profile = Some("local-profile");
         let archive_root = PathBuf::from("/cass/archives/custom-store");
-        let archive_policy = ownership(
-            None,
-            None,
-            None,
-            vec![archive_root.clone()],
-            local_profile,
-        );
+        let archive_policy = ownership(None, None, None, vec![archive_root.clone()], local_profile);
         let local_archive = ScanRoot::local(archive_root);
         assert_eq!(direct_root_profile(&local_archive, &archive_policy), None);
 
