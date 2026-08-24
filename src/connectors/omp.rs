@@ -245,10 +245,8 @@ impl PiFamilyOwnership {
         add_path(&mut hasher, "omp_session_dir", self.omp_session_dir.as_deref());
         add_path(&mut hasher, "shared_agent_dir", self.shared_agent_dir.as_deref());
         add_path(&mut hasher, "omp_config_root", self.omp_config_root.as_deref());
-        for (root, profile) in &self.omp_store_roots {
+        for (root, _) in &self.omp_store_roots {
             add_path(&mut hasher, "omp_store_root", Some(root));
-            hasher.update(profile.as_deref().unwrap_or_default().as_bytes());
-            hasher.update(b"\0");
         }
         hasher.finalize().to_hex().to_string()
     }
@@ -991,6 +989,35 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn archive_context_tracks_ownership_roots_not_profile_metadata() {
+        let root = PathBuf::from("/srv/omp-sessions");
+        let mut work = ownership(
+            None,
+            Some(root.clone()),
+            None,
+            vec![root.clone()],
+            Some("work"),
+        );
+        work.omp_store_roots[0].1 = Some("work".to_string());
+        let mut review = work.clone();
+        review.active_profile = Some("review".to_string());
+        review.omp_store_roots[0].1 = Some("review".to_string());
+        assert_eq!(
+            work.archive_reclassification_context(),
+            review.archive_reclassification_context(),
+            "profile tags change metadata and resume behavior, not archive ownership"
+        );
+
+        let mut moved = review;
+        moved.omp_session_dir = Some(PathBuf::from("/srv/other-omp-sessions"));
+        assert_ne!(
+            work.archive_reclassification_context(),
+            moved.archive_reclassification_context(),
+            "a provider-qualified ownership root change must invalidate migration completion"
+        );
     }
 
     #[test]
