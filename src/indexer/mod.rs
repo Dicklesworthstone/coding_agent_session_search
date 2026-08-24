@@ -59,8 +59,8 @@ use crate::connectors::{
     clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
     copilot::CopilotConnector, copilot_cli::CopilotCliConnector, cursor::CursorConnector,
     factory::FactoryConnector, gemini::GeminiConnector, grok::GrokConnector, kimi::KimiConnector,
-    openclaw::OpenClawConnector, opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
-    qwen::QwenConnector, vibe::VibeConnector,
+    omp::OmpConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
+    pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
 };
 use crate::model::conversation_packet::{
     CONVERSATION_PACKET_VERSION, ConversationPacket, ConversationPacketHashes,
@@ -3589,6 +3589,7 @@ const WATCH_STARTUP_SUB_PHASE_TAXONOMY: &[&str] = &[
     "watch_startup:count_total_messages",
     "watch_startup:published_index_validate",
     "watch_startup:scan_entry",
+    "watch_startup:reclassify_legacy_omp",
 ];
 
 /// Lookup the taxonomy step index for a sub-phase string. Returns
@@ -13387,14 +13388,21 @@ fn connector_local_scan_since_ts_map(
                 .get(*name)
                 .copied()
                 .unwrap_or((None, false));
-            Ok((
-                *name,
+            // OMP is newly split from the legacy Pi Agent identity. The
+            // archive upgrade can legitimately create `omp` rows before the
+            // dedicated connector has ever completed a scan; do one full OMP
+            // scan until its own watermark exists so older profile/XDG roots
+            // are not skipped by the global Pi-era cutoff.
+            let local_since_ts = if *name == "omp" && connector_last_scan_ts.is_none() {
+                None
+            } else {
                 connector_local_scan_since_ts_from_state(
                     fallback_since_ts,
                     connector_last_scan_ts,
                     connector_has_conversations,
-                ),
-            ))
+                )
+            };
+            Ok((*name, local_since_ts))
         })
         .collect()
 }
@@ -13800,6 +13808,18 @@ pub fn run_index(
     }
     complete_preflight_phase!();
 
+    preflight_phase!("watch_startup:reclassify_legacy_omp");
+    let legacy_omp_upgrade = storage
+        .reclassify_legacy_omp_conversations()
+        .with_context(|| "reclassifying legacy Pi-labeled OMP archive rows")?;
+    if legacy_omp_upgrade.conversations_reclassified > 0 {
+        tracing::info!(
+            conversations = legacy_omp_upgrade.conversations_reclassified,
+            "reclassified legacy Pi-labeled OMP conversations and rebuilt analytics"
+        );
+    }
+    complete_preflight_phase!();
+
     if opts.full
         && !opened_fresh_for_full
         && let Some(reason) = full_rebuild_existing_storage_integrity_problem(&storage)?
@@ -14125,8 +14145,8 @@ pub fn run_index(
         tracing::info!(db_path = %opts.db_path.display(), "skipping live Tantivy reader preflight");
     }
     complete_preflight_phase!();
-    let mut needs_rebuild =
-        should_force_authoritative_rebuild(canonical_storage_rebuilt, tantivy_requires_rebuild);
+    let mut needs_rebuild = legacy_omp_upgrade.lexical_rebuild_required
+        || should_force_authoritative_rebuild(canonical_storage_rebuilt, tantivy_requires_rebuild);
     // #289: pass the real `tantivy_requires_rebuild` instead of hardcoding
     // `authoritative_rebuild_required: true`. The hardcoded value made every
     // plain populated incremental over the automatic-repair DB-size cap
@@ -14136,13 +14156,17 @@ pub fn run_index(
     // bootstrap that rewrites a missing `.lexical-rebuild-state.json` — so a
     // lost checkpoint could never converge on large archives.
     let large_incremental_authoritative_lexical_repair_probe_deferred =
-        should_defer_incremental_authoritative_lexical_repair(
-            &opts,
-            canonical_storage_rebuilt,
-            initial_canonical_sessions_before_salvage,
-            tantivy_requires_rebuild,
-            observed_tantivy_docs,
-        );
+        if legacy_omp_upgrade.lexical_rebuild_required {
+            None
+        } else {
+            should_defer_incremental_authoritative_lexical_repair(
+                &opts,
+                canonical_storage_rebuilt,
+                initial_canonical_sessions_before_salvage,
+                tantivy_requires_rebuild,
+                observed_tantivy_docs,
+            )
+        };
     let deferred_incremental_authoritative_lexical_repair =
         large_incremental_authoritative_lexical_repair_probe_deferred;
     if let Some(deferred) = &deferred_incremental_authoritative_lexical_repair {
@@ -14582,6 +14606,11 @@ pub fn run_index(
                             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                             deferred.reason,
                         )
+                    } else if legacy_omp_upgrade.lexical_rebuild_required {
+                        (
+                            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                            "legacy_omp_identity_upgrade_requires_authoritative_db_rebuild",
+                        )
                     } else {
                         resolve_lexical_population_strategy(
                             needs_rebuild,
@@ -14795,7 +14824,9 @@ pub fn run_index(
                 }
 
                 if !scan_lexical_update_deferred
-                    && (opts.full || historical_salvage.messages_imported > 0)
+                    && (opts.full
+                        || historical_salvage.messages_imported > 0
+                        || legacy_omp_upgrade.lexical_rebuild_required)
                 {
                     let post_scan_observed_tantivy_docs =
                         observed_tantivy_docs_for_post_full_scan_skip(
@@ -14873,6 +14904,12 @@ pub fn run_index(
 
         t_index
     };
+
+    if legacy_omp_upgrade.lexical_rebuild_required {
+        storage
+            .complete_legacy_omp_reclassification()
+            .with_context(|| "finalizing legacy OMP identity upgrade after lexical publish")?;
+    }
 
     if stale_index_ingest_quarantine_retry_attempted && scan_watermark_preservation_active() {
         tracing::info!(
@@ -24021,6 +24058,7 @@ impl ConnectorKind {
             "cursor" => Some(Self::Cursor),
             "chatgpt" => Some(Self::ChatGpt),
             "pi_agent" => Some(Self::PiAgent),
+            "omp" => Some(Self::Omp),
             "factory" => Some(Self::Factory),
             "openclaw" => Some(Self::OpenClaw),
             "copilot" => Some(Self::Copilot),
@@ -24047,6 +24085,7 @@ impl ConnectorKind {
             Self::Cursor => "cursor",
             Self::ChatGpt => "chatgpt",
             Self::PiAgent => "pi_agent",
+            Self::Omp => "omp",
             Self::Factory => "factory",
             Self::OpenClaw => "openclaw",
             Self::Copilot => "copilot",
@@ -24074,6 +24113,7 @@ impl ConnectorKind {
             Self::Cursor => Box::new(CursorConnector::new()),
             Self::ChatGpt => Box::new(ChatGptConnector::new()),
             Self::PiAgent => Box::new(PiAgentConnector::new()),
+            Self::Omp => Box::new(OmpConnector::new()),
             Self::Factory => Box::new(FactoryConnector::new()),
             Self::OpenClaw => Box::new(OpenClawConnector::new()),
             Self::Copilot => Box::new(CopilotConnector::new()),
@@ -25150,6 +25190,8 @@ enum ConnectorKind {
     ChatGpt,
     #[serde(rename = "pi", alias = "PiAgent")]
     PiAgent,
+    #[serde(rename = "om", alias = "Omp")]
+    Omp,
     #[serde(rename = "fa", alias = "Factory")]
     Factory,
     #[serde(rename = "ow", alias = "OpenClaw")]
@@ -25431,6 +25473,8 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
         Some(ConnectorKind::Claude)
     } else if has_pair(".gemini", "tmp") {
         Some(ConnectorKind::Gemini)
+    } else if components.iter().any(|component| component == ".omp") || has_pair("share", "omp") {
+        Some(ConnectorKind::Omp)
     } else {
         None
     }
@@ -25465,7 +25509,20 @@ fn classify_paths(
                 if p.starts_with(&root.path) {
                     matched_root = true;
                     let scan_path = if prefer_explicit_paths {
-                        p.clone()
+                        // FAD accepts a direct `.omp` transcript as an
+                        // explicit root, but an XDG transcript path has no
+                        // `.omp` marker. Retain the nearest `sessions` root so
+                        // OMP's v18 resolver can recognize and scan it.
+                        if *kind == ConnectorKind::Omp && !p.to_string_lossy().contains(".omp") {
+                            p.ancestors()
+                                .find(|ancestor| {
+                                    ancestor.file_name().is_some_and(|name| name == "sessions")
+                                })
+                                .unwrap_or(&p)
+                                .to_path_buf()
+                        } else {
+                            p.clone()
+                        }
                     } else {
                         root.path.clone()
                     };
@@ -48076,6 +48133,26 @@ mod tests {
     }
 
     #[test]
+    fn classify_paths_keeps_omp_xdg_sessions_root_for_watch_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_root = tmp.path().join("share/omp/sessions");
+        let session = sessions_root
+            .join("-projects-cass")
+            .join("2026-08-23T12-00-00_omp.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+        let roots = vec![(ConnectorKind::Omp, ScanRoot::local(sessions_root.clone()))];
+
+        let classified = classify_paths(vec![session], &roots, true);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::Omp);
+        assert_eq!(classified[0].1.path, sessions_root);
+        assert!(classified[0].2.is_some());
+        assert!(classified[0].3.is_some());
+    }
+
+    #[test]
     #[serial]
     fn reindex_paths_watch_once_indexes_explicit_codex_path_without_detected_root() {
         let tmp = tempfile::tempdir().unwrap();
@@ -48999,6 +49076,7 @@ mod tests {
         state.insert(ConnectorKind::Codex, 123);
         state.insert(ConnectorKind::Gemini, 456);
         state.insert(ConnectorKind::Grok, 789);
+        state.insert(ConnectorKind::Omp, 987);
 
         save_watch_state(&data_dir, &state).unwrap();
 
@@ -49006,6 +49084,7 @@ mod tests {
         assert_eq!(loaded.get(&ConnectorKind::Codex), Some(&123));
         assert_eq!(loaded.get(&ConnectorKind::Gemini), Some(&456));
         assert_eq!(loaded.get(&ConnectorKind::Grok), Some(&789));
+        assert_eq!(loaded.get(&ConnectorKind::Omp), Some(&987));
     }
 
     #[test]
@@ -49019,6 +49098,21 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ConnectorKind>("\"Grok\"").unwrap(),
             ConnectorKind::Grok,
+            "legacy human-readable watch-state keys remain accepted"
+        );
+    }
+
+    #[test]
+    fn omp_connector_kind_maps_runtime_slug_and_compact_wire_key() {
+        assert_eq!(ConnectorKind::from_slug("omp"), Some(ConnectorKind::Omp));
+        assert_eq!(ConnectorKind::Omp.slug(), "omp");
+        assert_eq!(
+            serde_json::to_string(&ConnectorKind::Omp).unwrap(),
+            "\"om\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ConnectorKind>("\"Omp\"").unwrap(),
+            ConnectorKind::Omp,
             "legacy human-readable watch-state keys remain accepted"
         );
     }

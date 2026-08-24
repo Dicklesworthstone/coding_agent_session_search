@@ -63,6 +63,7 @@ pub(crate) fn agent_name_key(name: &str) -> String {
 fn normalize_agent_config_name(name: &str) -> Option<String> {
     let normalized = match agent_name_key(name).as_str() {
         "claude_code" => "claude".to_string(),
+        "oh_my_pi" | "ohmypi" => "omp".to_string(),
         "open_claw" => "openclaw".to_string(),
         other => other.to_string(),
     };
@@ -689,6 +690,9 @@ pub fn get_preset_paths(preset: &str) -> Result<Vec<String>, ConfigError> {
             "~/.gemini/tmp".into(),
             "~/.gemini/antigravity-cli".into(),
             "~/.pi/agent/sessions".into(),
+            "~/.omp/agent/sessions".into(),
+            "~/.omp/profiles".into(),
+            "~/.local/share/omp".into(),
             "~/Library/Application Support/opencode/storage".into(),
             "~/.continue/sessions".into(),
             "~/.aider.chat.history.md".into(),
@@ -704,6 +708,9 @@ pub fn get_preset_paths(preset: &str) -> Result<Vec<String>, ConfigError> {
             "~/.gemini/tmp".into(),
             "~/.gemini/antigravity-cli".into(),
             "~/.pi/agent/sessions".into(),
+            "~/.omp/agent/sessions".into(),
+            "~/.omp/profiles".into(),
+            "~/.local/share/omp".into(),
             "~/.local/share/opencode/storage".into(),
             "~/.continue/sessions".into(),
             "~/.aider.chat.history.md".into(),
@@ -2140,10 +2147,16 @@ paths = ["~/.claude/projects"]
         // Antigravity (agy) history is synced from its own subtree, distinct
         // from the legacy Gemini CLI's ~/.gemini/tmp.
         assert!(macos.iter().any(|p| p.contains("antigravity-cli")));
+        assert!(macos.iter().any(|p| p == "~/.omp/agent/sessions"));
+        assert!(macos.iter().any(|p| p == "~/.omp/profiles"));
+        assert!(macos.iter().any(|p| p == "~/.local/share/omp"));
 
         let linux = get_preset_paths("linux-defaults").unwrap();
         assert!(!linux.is_empty());
         assert!(linux.iter().any(|p| p.contains("antigravity-cli")));
+        assert!(linux.iter().any(|p| p == "~/.omp/agent/sessions"));
+        assert!(linux.iter().any(|p| p == "~/.omp/profiles"));
+        assert!(linux.iter().any(|p| p == "~/.local/share/omp"));
 
         assert!(get_preset_paths("unknown").is_err());
     }
@@ -2637,7 +2650,11 @@ Host production !legacy-prod
         assert!(config.exclude_agent_from_indexing("claude-code").unwrap());
         assert!(config.is_agent_disabled("claude"));
         assert!(config.is_agent_disabled("claude_code"));
-        assert_eq!(config.configured_disabled_agents(), vec!["claude"]);
+        assert!(config.exclude_agent_from_indexing("oh-my-pi").unwrap());
+        assert!(!config.exclude_agent_from_indexing("oh_my_pi").unwrap());
+        assert!(config.is_agent_disabled("omp"));
+        assert!(config.is_agent_disabled("ohmypi"));
+        assert_eq!(config.configured_disabled_agents(), vec!["claude", "omp"]);
     }
 
     #[test]

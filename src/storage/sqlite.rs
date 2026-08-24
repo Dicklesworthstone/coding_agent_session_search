@@ -3318,6 +3318,13 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 /// Public schema version constant for external checks.
 pub const CURRENT_SCHEMA_VERSION: i64 = 20;
 pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
+const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyOmpReclassificationResult {
+    pub conversations_reclassified: usize,
+    pub lexical_rebuild_required: bool,
+}
 
 /// Result of checking schema compatibility.
 #[derive(Debug, Clone)]
@@ -7975,6 +7982,229 @@ impl FrankenStorage {
             }
         }
         Ok(false)
+    }
+
+    /// Reclassify OMP sessions indexed by pre-0.2 FAD releases as `pi_agent`.
+    ///
+    /// Older detector releases intentionally scanned `~/.omp/agent` through
+    /// the Pi Agent connector. FAD 0.2 gives OMP a dedicated identity; this
+    /// one-time upgrade runs before connector watermarks are planned so the
+    /// first OMP scan merges into the existing canonical rows instead of
+    /// creating a second copy under another agent id. Analytics are derived
+    /// from canonical messages and rebuilt after the identity swap.
+    pub fn reclassify_legacy_omp_conversations(&self) -> Result<LegacyOmpReclassificationResult> {
+        const LEGACY_PATH_PREDICATE: &str = r"(
+            REPLACE(c.source_path, '\', '/') LIKE '%/.omp/agent/%'
+            OR REPLACE(c.source_path, '\', '/') LIKE '.omp/agent/%'
+        )";
+
+        let state: Option<String> = self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        if state.as_deref() == Some("complete") {
+            return Ok(LegacyOmpReclassificationResult::default());
+        }
+        let assets_were_pending = state.as_deref() == Some("analytics_pending");
+
+        let legacy_agent_id: Option<i64> = self
+            .conn
+            .query_row_map(
+                "SELECT id FROM agents WHERE slug = 'pi_agent'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        let legacy_count = if let Some(agent_id) = legacy_agent_id {
+            self.conn.query_row_map(
+                &format!(
+                    "SELECT COUNT(*) FROM conversations c
+                     WHERE c.agent_id = ?1 AND {LEGACY_PATH_PREDICATE}"
+                ),
+                fparams![agent_id],
+                |row| row.get_typed::<i64>(0),
+            )?
+        } else {
+            0
+        };
+
+        if legacy_count > 0 {
+            let omp_agent_id = self.ensure_agent(&Agent {
+                id: None,
+                slug: "omp".to_string(),
+                name: "omp".to_string(),
+                version: None,
+                kind: AgentKind::Cli,
+            })?;
+            let legacy_agent_id = legacy_agent_id.expect("positive legacy count requires agent id");
+            let conflicting_rows: i64 = self.conn.query_row_map(
+                &format!(
+                    "SELECT COUNT(*)
+                     FROM conversations legacy
+                     JOIN conversations current
+                       ON current.source_id = legacy.source_id
+                      AND current.agent_id = ?1
+                      AND current.external_id = legacy.external_id
+                     WHERE legacy.agent_id = ?2
+                       AND {}",
+                    LEGACY_PATH_PREDICATE.replace("c.", "legacy.")
+                ),
+                fparams![omp_agent_id, legacy_agent_id],
+                |row| row.get_typed(0),
+            )?;
+            if conflicting_rows > 0 {
+                return Err(anyhow!(
+                    "cannot reclassify {conflicting_rows} legacy OMP conversation(s): matching first-class OMP rows already exist; run a source-path duplicate audit before indexing"
+                ));
+            }
+
+            let metadata_updates: Vec<(i64, String)> = self.conn.query_map_collect(
+                &format!(
+                    "SELECT c.id, c.metadata_json, c.metadata_bin
+                     FROM conversations c
+                     WHERE c.agent_id = ?1 AND {LEGACY_PATH_PREDICATE}"
+                ),
+                fparams![legacy_agent_id],
+                |row| {
+                    let id: i64 = row.get_typed(0)?;
+                    let metadata_json: Option<String> = row.get_typed(1)?;
+                    let metadata_bin: Option<Vec<u8>> = row.get_typed(2)?;
+                    let mut metadata = metadata_bin
+                        .as_deref()
+                        .and_then(|bytes| rmp_serde::from_slice(bytes).ok())
+                        .or_else(|| {
+                            metadata_json
+                                .as_deref()
+                                .and_then(|json| serde_json::from_str(json).ok())
+                        })
+                        .unwrap_or(serde_json::Value::Null);
+                    if let Some(object) = metadata.as_object_mut()
+                        && object.get("source").and_then(serde_json::Value::as_str)
+                            == Some("pi_agent")
+                    {
+                        object.insert("source".into(), serde_json::Value::String("omp".into()));
+                    }
+                    Ok((
+                        id,
+                        serde_json::to_string(&metadata).unwrap_or_else(|_| "null".into()),
+                    ))
+                },
+            )?;
+
+            let mut tx = self.conn.transaction()?;
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'analytics_pending')",
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+            )?;
+            tx.execute_compat(
+                &format!(
+                    "UPDATE conversations SET agent_id = ?1
+                     WHERE agent_id = ?2 AND {}",
+                    LEGACY_PATH_PREDICATE.replace("c.", "")
+                ),
+                fparams![omp_agent_id, legacy_agent_id],
+            )?;
+            for (conversation_id, metadata_json) in metadata_updates {
+                tx.execute_compat(
+                    "UPDATE conversations
+                     SET metadata_json = ?1, metadata_bin = NULL
+                     WHERE id = ?2",
+                    fparams![metadata_json, conversation_id],
+                )?;
+            }
+            tx.execute_compat(
+                &format!(
+                    "UPDATE token_usage SET agent_id = ?1
+                     WHERE conversation_id IN (
+                         SELECT c.id FROM conversations c
+                         WHERE c.agent_id = ?1 AND {LEGACY_PATH_PREDICATE}
+                     )"
+                ),
+                fparams![omp_agent_id],
+            )?;
+            tx.execute_compat(
+                &format!(
+                    "DELETE FROM conversation_external_lookup
+                     WHERE conversation_id IN (
+                         SELECT c.id FROM conversations c
+                         WHERE c.agent_id = ?1 AND {LEGACY_PATH_PREDICATE}
+                     )"
+                ),
+                fparams![omp_agent_id],
+            )?;
+            tx.execute_compat(
+                &format!(
+                    "DELETE FROM conversation_external_tail_lookup
+                     WHERE conversation_id IN (
+                         SELECT c.id FROM conversations c
+                         WHERE c.agent_id = ?1 AND {LEGACY_PATH_PREDICATE}
+                     )"
+                ),
+                fparams![omp_agent_id],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO conversation_external_lookup (lookup_key, conversation_id)
+                 SELECT
+                     CAST(length(c.source_id) AS TEXT) || ':' || c.source_id || ':' ||
+                     CAST(c.agent_id AS TEXT) || ':' ||
+                     CAST(length(c.external_id) AS TEXT) || ':' || c.external_id,
+                     c.id
+                 FROM conversations c
+                 WHERE c.agent_id = (SELECT id FROM agents WHERE slug = 'omp')
+                   AND c.external_id IS NOT NULL",
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO conversation_external_tail_lookup (
+                     lookup_key, conversation_id, ended_at, last_message_idx, last_message_created_at
+                 )
+                 SELECT
+                     CAST(length(c.source_id) AS TEXT) || ':' || c.source_id || ':' ||
+                     CAST(c.agent_id AS TEXT) || ':' ||
+                     CAST(length(c.external_id) AS TEXT) || ':' || c.external_id,
+                     c.id, ts.ended_at, ts.last_message_idx, ts.last_message_created_at
+                 FROM conversations c
+                 LEFT JOIN conversation_tail_state ts ON ts.conversation_id = c.id
+                 WHERE c.agent_id = (SELECT id FROM agents WHERE slug = 'omp')
+                   AND c.external_id IS NOT NULL",
+            )?;
+            tx.commit()?;
+        } else if state.as_deref() != Some("analytics_pending") {
+            self.conn.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+            )?;
+            return Ok(LegacyOmpReclassificationResult::default());
+        }
+
+        self.rebuild_analytics()
+            .with_context(|| "rebuilding analytics after legacy OMP identity upgrade")?;
+        self.rebuild_token_daily_stats()
+            .with_context(|| "rebuilding token rollups after legacy OMP identity upgrade")?;
+        self.rebuild_daily_stats()
+            .with_context(|| "rebuilding daily stats after legacy OMP identity upgrade")?;
+
+        Ok(LegacyOmpReclassificationResult {
+            conversations_reclassified: legacy_count.max(0) as usize,
+            // The transaction commits the canonical identity change before
+            // rebuilding derived assets. If a prior run stopped in that
+            // window, `legacy_count` is already zero on retry, but the live
+            // lexical generation still carries the old `pi_agent` identity.
+            lexical_rebuild_required: legacy_count > 0 || assets_were_pending,
+        })
+    }
+
+    /// Mark the OMP identity upgrade complete after the indexer has published
+    /// a lexical generation rebuilt from the canonical SQLite archive.
+    pub fn complete_legacy_omp_reclassification(&self) -> Result<()> {
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+        )?;
+        Ok(())
     }
 
     /// Get the timestamp of the last successful index completion.
@@ -28533,6 +28763,94 @@ mod tests {
             Some(expected_ts)
         );
         assert_eq!(storage.get_connector_last_scan_ts("claude-code")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_omp_reclassification_preserves_one_canonical_conversation() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path)?;
+        let pi_agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "pi_agent".into(),
+            name: "Pi Agent".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "pi_agent".into(),
+            workspace: None,
+            external_id: Some("-projects-cass/legacy-omp".into()),
+            title: Some("Legacy OMP".into()),
+            source_path: dir
+                .path()
+                .join("home/.omp/agent/sessions/-projects-cass/legacy-omp.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_001_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"source":"pi_agent"}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Agent,
+                author: Some("openrouter/stealth/ox-alpha".into()),
+                created_at: Some(1_700_000_001_000),
+                content: "legacy OMP answer".into(),
+                extra_json: serde_json::json!({"message":{"model":"openrouter/stealth/ox-alpha"}}),
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(pi_agent_id, None, &conversation)?;
+
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 1,
+                lexical_rebuild_required: true,
+            }
+        );
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 0,
+                lexical_rebuild_required: true,
+            }
+        );
+
+        let conversations = storage.list_conversations(10, 0)?;
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].agent_slug, "omp");
+        assert_eq!(conversations[0].metadata_json["source"], "omp");
+        let omp_agent_id: i64 = storage.conn.query_row_map(
+            "SELECT id FROM agents WHERE slug = 'omp'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        let token_agent_id: i64 = storage.conn.query_row_map(
+            "SELECT agent_id FROM token_usage LIMIT 1",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(token_agent_id, omp_agent_id);
+        let metrics_slug: String = storage.conn.query_row_map(
+            "SELECT agent_slug FROM message_metrics LIMIT 1",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(metrics_slug, "omp");
+
+        // Completing the marker is deliberately separate from the identity
+        // transaction: the indexer calls this only after the canonical
+        // SQLite-to-lexical publish succeeds.
+        storage.complete_legacy_omp_reclassification()?;
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult::default()
+        );
         Ok(())
     }
 

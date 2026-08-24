@@ -245,6 +245,7 @@ const INPUT_AUTOCOMPLETE_AGENT_HINTS: &[&str] = &[
     "kimi",
     "opencode",
     "openclaw",
+    "omp",
     "pi_agent",
     "qwen",
     "vibe",
@@ -3073,6 +3074,7 @@ fn legacy_agent_color(agent: &str) -> ftui::PackedRgba {
         "gemini" | "gemini_cli" => ftui::PackedRgba::rgb(66, 133, 244), // blue
         "cline" => ftui::PackedRgba::rgb(138, 43, 226), // violet
         "opencode" => ftui::PackedRgba::rgb(50, 205, 50), // lime
+        "omp" => ftui::PackedRgba::rgb(245, 158, 66),  // warm amber
         "amp" => ftui::PackedRgba::rgb(255, 99, 71),   // tomato
         "cursor" => ftui::PackedRgba::rgb(147, 112, 219), // purple
         "chatgpt" => ftui::PackedRgba::rgb(16, 163, 127), // chatgpt green
@@ -12415,9 +12417,11 @@ impl CassApp {
                     .into(),
                 "  remotes/ - Synced session data from remote sources".into(),
                 "Config: ~/.config/cass/sources.toml (remote sources)".into(),
-                "Agents: Claude Code, Codex, Gemini, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent"
+                "Agents: Claude Code, Codex, Gemini, Antigravity, Cline, OpenCode, Amp, Cursor"
                     .into(),
-                "        Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Kimi, Qwen, Factory"
+                "        ChatGPT, Aider, Pi Agent, Oh My Pi, Copilot, Copilot CLI, OpenClaw, ClawdBot"
+                    .into(),
+                "        Vibe, Crush, Factory, Goose, Grok, Hermes, Kimi, Muse Code, OpenHands, Qwen"
                     .into(),
             ],
         );

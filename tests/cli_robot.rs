@@ -3644,7 +3644,7 @@ fn diag_json_reports_paths_and_connectors() {
         .map(str::to_string)
         .collect();
 
-    for expected in ["aider", "pi_agent", "claude_code"] {
+    for expected in ["aider", "pi_agent", "omp", "claude_code"] {
         assert!(
             connector_names.contains(expected),
             "diag connectors missing expected entry: {expected}"
