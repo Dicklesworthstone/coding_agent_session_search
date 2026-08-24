@@ -16132,10 +16132,13 @@ mod swarm_status_cli_tests {
     #[test]
     fn failure_pattern_redaction_handles_nested_structured_credentials() {
         let provider_token = ["ghp_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let second_token = ["sk-", "ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"].concat();
         let mut nested = serde_json::Map::new();
         nested.insert("pin".to_string(), json!(1234));
         nested.insert("credentials".to_string(), json!({"value": "short"}));
         nested.insert("keyframe".to_string(), json!(7));
+        nested.insert(provider_token.clone(), json!("first"));
+        nested.insert(second_token.clone(), json!("second"));
         nested.insert(
             "message".to_string(),
             json!(format!("provider rejected {provider_token}")),
@@ -16144,9 +16147,17 @@ mod swarm_status_cli_tests {
         let redacted = swarm_failure_pattern_redact_value(&json!([{"nested": nested}]));
         let serialized = serde_json::to_string(&redacted).expect("serialize redacted value");
         assert!(!serialized.contains(&provider_token));
+        assert!(!serialized.contains(&second_token));
         assert_eq!(redacted[0]["nested"]["pin"], "[REDACTED]");
         assert_eq!(redacted[0]["nested"]["credentials"], "[REDACTED]");
         assert_eq!(redacted[0]["nested"]["keyframe"], 7);
+        assert_eq!(
+            redacted[0]["nested"]
+                .as_object()
+                .expect("redacted nested object")
+                .len(),
+            6
+        );
     }
 
     #[test]

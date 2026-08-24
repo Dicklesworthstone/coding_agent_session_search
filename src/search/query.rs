@@ -7990,6 +7990,26 @@ impl SearchClient {
         filters: &SearchFilters,
         scan_limit: usize,
     ) -> (String, Vec<ParamValue>) {
+        let mut session_paths = filters
+            .session_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        session_paths.sort_unstable();
+        Self::sqlite_message_scan_query_sql_for_session_paths(
+            field_mask,
+            filters,
+            session_paths.as_slice(),
+            scan_limit,
+        )
+    }
+
+    fn sqlite_message_scan_query_sql_for_session_paths(
+        field_mask: FieldMask,
+        filters: &SearchFilters,
+        session_paths: &[&str],
+        scan_limit: usize,
+    ) -> (String, Vec<ParamValue>) {
         let title_expr = if field_mask.wants_title() {
             "COALESCE(c.title, '')"
         } else {
@@ -8075,13 +8095,13 @@ impl SearchClient {
             }
         }
 
-        if !filters.session_paths.is_empty() {
-            let placeholders = sql_placeholders(filters.session_paths.len());
+        if !session_paths.is_empty() {
+            let placeholders = sql_placeholders(session_paths.len());
             sql.push_str(&format!(
                 " AND COALESCE(c.source_path, '') IN ({placeholders})"
             ));
-            for source_path in &filters.session_paths {
-                params.push(ParamValue::from(source_path.as_str()));
+            for source_path in session_paths {
+                params.push(ParamValue::from(*source_path));
             }
         }
 
@@ -8099,13 +8119,64 @@ impl SearchClient {
             return Ok(Vec::new());
         };
 
-        let (sql, params) = Self::sqlite_message_scan_query_sql(
-            request.field_mask,
-            request.filters,
-            request.scan_limit,
-        );
-        let rows: Vec<(SqliteFtsMessageRow, String, String)> =
-            franken_query_map_collect_retry(conn, &sql, &params, |row| {
+        let fixed_param_count = request
+            .filters
+            .agents
+            .len()
+            .saturating_add(request.filters.workspaces.len())
+            .saturating_add(if request.filters.created_from.is_some() {
+                1
+            } else {
+                0
+            })
+            .saturating_add(if request.filters.created_to.is_some() {
+                1
+            } else {
+                0
+            })
+            .saturating_add(if matches!(
+                &request.filters.source_filter,
+                SourceFilter::SourceId(_)
+            ) {
+                1
+            } else {
+                0
+            })
+            .saturating_add(1); // scan LIMIT
+        if fixed_param_count > SQLITE_MAX_VARIABLE_NUMBER {
+            bail!(
+                "SQLite source-scan filters require {fixed_param_count} fixed parameters; maximum is {SQLITE_MAX_VARIABLE_NUMBER}"
+            );
+        }
+
+        let mut session_paths = request
+            .filters
+            .session_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        session_paths.sort_unstable();
+        let session_path_chunk_size = SQLITE_MAX_VARIABLE_NUMBER - fixed_param_count;
+        if !session_paths.is_empty() && session_path_chunk_size == 0 {
+            bail!(
+                "SQLite source-scan filters leave no bind-variable capacity for session paths"
+            );
+        }
+
+        let mut rows: Vec<(SqliteFtsMessageRow, String, String)> = Vec::new();
+        let session_path_chunks = if session_paths.is_empty() {
+            vec![session_paths.as_slice()]
+        } else {
+            session_paths.chunks(session_path_chunk_size).collect()
+        };
+        for session_path_chunk in session_path_chunks {
+            let (sql, params) = Self::sqlite_message_scan_query_sql_for_session_paths(
+                request.field_mask,
+                request.filters,
+                session_path_chunk,
+                request.scan_limit,
+            );
+            let mut chunk_rows = franken_query_map_collect_retry(conn, &sql, &params, |row| {
                 Ok((
                     (
                         row.get_typed(0)?,
@@ -8125,6 +8196,13 @@ impl SearchClient {
                     row.get_typed(13)?,
                 ))
             })?;
+            rows.append(&mut chunk_rows);
+            if rows.len() > request.scan_limit {
+                rows.sort_by_key(|row| row.0.0);
+                rows.truncate(request.scan_limit);
+            }
+        }
+        rows.sort_by_key(|row| row.0.0);
 
         let mut scored_hits = Vec::new();
         for (

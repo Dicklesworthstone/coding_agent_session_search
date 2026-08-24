@@ -195,6 +195,55 @@ mod tests {
         Ok(())
     }
 
+    fn setup_db_without_agent(path: &Path, message_content: &str) -> Result<()> {
+        let conn = open_db(path)?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL
+            );
+            CREATE TABLE workspaces (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL
+            );
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                started_at INTEGER,
+                metadata_json TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                extra_json TEXT
+            );
+            "#,
+        )?;
+
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/tmp/project')")?;
+        conn.execute(
+            r#"INSERT INTO conversations (
+                id, agent_id, workspace_id, title, source_path, started_at, metadata_json
+            ) VALUES (
+                1, NULL, 1, 'Unknown agent', '/tmp/project/session.json',
+                1700000000000, '{}'
+            )"#,
+        )?;
+        conn.execute_compat(
+            r#"INSERT INTO messages (id, conversation_id, idx, content, extra_json)
+             VALUES (1, 1, 0, ?1, '{}')"#,
+            fparams![message_content],
+        )?;
+
+        Ok(())
+    }
+
     fn no_filters() -> SecretScanFilters {
         SecretScanFilters {
             agents: None,
@@ -898,6 +947,125 @@ mod tests {
     }
 
     #[test]
+    fn structured_metadata_text_findings_use_opaque_context() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let short_pin = ["12", "34"].concat();
+        let token = oai_fixture();
+        let metadata_bin = rmp_serde::to_vec(&serde_json::json!({
+            "pin": short_pin.clone(),
+            "diagnostic_token": token.clone(),
+        }))?;
+        let safe_extra = rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
+        setup_db_with_binary_metadata(&db_path, "{}", &metadata_bin, "{}", &safe_extra)?;
+
+        let report = scan(&db_path)?;
+        let metadata_findings = report
+            .findings
+            .iter()
+            .filter(|finding| finding.location == SecretLocation::ConversationMetadata)
+            .collect::<Vec<_>>();
+        assert!(
+            metadata_findings
+                .iter()
+                .any(|finding| finding.kind == "openai_key"),
+            "the token detector must still report authoritative metadata"
+        );
+        assert!(
+            metadata_findings
+                .iter()
+                .all(|finding| finding.context == "structured metadata: [redacted]"),
+            "structured metadata must never be copied into report context: {metadata_findings:#?}"
+        );
+
+        let serialized = serde_json::to_string(&report)?;
+        assert!(!serialized.contains(&short_pin));
+        assert!(!serialized.contains(&token));
+        Ok(())
+    }
+
+    #[test]
+    fn lower_severity_metadata_heuristic_does_not_suppress_structural_floor() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let low_severity_assignment = generic_kv_line(&fixture(&["abc", "defgh"]));
+        let metadata = serde_json::json!({
+            "password": low_severity_assignment,
+        })
+        .to_string();
+        setup_db_full(
+            &db_path,
+            "codex",
+            "/tmp/proj",
+            "Clean title",
+            &metadata,
+            1700000000000,
+            &[(0, "safe content", None)],
+        )?;
+
+        let report = scan(&db_path)?;
+        assert!(
+            report.findings.iter().any(|finding| {
+                finding.location == SecretLocation::ConversationMetadata
+                    && finding.kind == "generic_api_key"
+                    && finding.severity == SecretSeverity::Low
+            }),
+            "the low-severity text heuristic should provide its own finding"
+        );
+        assert!(
+            report.findings.iter().any(|finding| {
+                finding.location == SecretLocation::ConversationMetadata
+                    && finding.kind == "sensitive_metadata_field"
+                    && finding.severity == SecretSeverity::High
+            }),
+            "a low-severity text heuristic must not suppress the high structural floor"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structured_allowlist_must_match_the_entire_scalar() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let prefix = fixture(&["SAFE"]);
+        let value = fixture(&["SAFE", "-real-secret"]);
+        let metadata = serde_json::json!({ "password": value.clone() }).to_string();
+        setup_db_full(
+            &db_path,
+            "codex",
+            "/tmp/proj",
+            "Clean title",
+            &metadata,
+            1700000000000,
+            &[(0, "safe content", None)],
+        )?;
+
+        let prefix_config =
+            SecretScanConfig::from_inputs_with_env(std::slice::from_ref(&prefix), &[], false)?;
+        let prefix_report =
+            scan_database(&db_path, &no_filters(), &prefix_config, None, None)?;
+        assert!(
+            prefix_report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "sensitive_metadata_field"),
+            "a matching substring must not allowlist the rest of a sensitive scalar"
+        );
+
+        let exact_config =
+            SecretScanConfig::from_inputs_with_env(std::slice::from_ref(&value), &[], false)?;
+        let exact_report = scan_database(&db_path, &no_filters(), &exact_config, None, None)?;
+        assert!(
+            !exact_report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "sensitive_metadata_field"),
+            "an exact full-scalar allowlist should suppress the structural finding"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn legacy_json_detects_short_sensitive_fields() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
@@ -985,6 +1153,56 @@ mod tests {
         assert!(
             error.to_string().contains("messages.extra_bin"),
             "error should identify malformed authoritative column: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_nonempty_legacy_metadata_json_fails_closed() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let short_pin = ["12", "34"].concat();
+        let malformed = format!(r#"{{"pin":"{short_pin}""#);
+        setup_db_full(
+            &db_path,
+            "codex",
+            "/tmp/proj",
+            "Clean title",
+            &malformed,
+            1700000000000,
+            &[(0, "safe content", None)],
+        )?;
+
+        let error = scan(&db_path).expect_err("malformed legacy metadata must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("conversations.metadata_json"), "{error:#}");
+        assert!(!message.contains(&short_pin), "diagnostic leaked metadata value");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_nonempty_legacy_extra_json_fails_closed() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let short_cookie = ["s", "id"].concat();
+        let malformed = format!(r#"{{"cookie":"{short_cookie}""#);
+        let messages = [(0, "safe content", Some(malformed.as_str()))];
+        setup_db_full(
+            &db_path,
+            "codex",
+            "/tmp/proj",
+            "Clean title",
+            "{}",
+            1700000000000,
+            &messages,
+        )?;
+
+        let error = scan(&db_path).expect_err("malformed legacy message metadata must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("messages.extra_json"), "{error:#}");
+        assert!(
+            !message.contains(&short_cookie),
+            "diagnostic leaked message metadata value"
         );
         Ok(())
     }
@@ -1175,6 +1393,30 @@ mod tests {
             0,
             "wrong agent filter should produce no findings"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_agent_filter_includes_null_agent_conversations() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let payload = oai_fixture();
+        setup_db_without_agent(&db_path, &payload)?;
+        let filters = SecretScanFilters {
+            agents: Some(vec!["unknown".to_string()]),
+            workspaces: None,
+            since_ts: None,
+            until_ts: None,
+        };
+
+        let report = scan_database(&db_path, &filters, &default_config(), None, None)?;
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.kind == "openai_key")
+            .expect("the unknown-agent filter must include NULL-agent rows");
+        assert_eq!(finding.agent.as_deref(), Some("unknown"));
+        assert_eq!(finding.conversation_id, Some(1));
         Ok(())
     }
 
@@ -1457,6 +1699,44 @@ mod tests {
                 finding.context,
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn serialized_findings_redact_matches_and_secret_bearing_provenance() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let provenance_secret = oai_fixture();
+        let focal_secret = aws_access_fixture();
+        let workspace_path = format!("/tmp/{provenance_secret}/workspace");
+        let messages = [(0, focal_secret.as_str(), None)];
+        setup_db_full(
+            &db_path,
+            &provenance_secret,
+            &workspace_path,
+            "Clean title",
+            "{}",
+            1700000000000,
+            &messages,
+        )?;
+        let source_path = format!("/tmp/{provenance_secret}/session.jsonl");
+        open_db(&db_path)?.execute_compat(
+            "UPDATE conversations SET source_path = ?1 WHERE id = 1",
+            fparams![source_path],
+        )?;
+
+        let report = scan(&db_path)?;
+        assert!(!report.findings.is_empty());
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.match_redacted == "[redacted]"),
+            "every match must be fully opaque"
+        );
+        let serialized = serde_json::to_string(&report)?;
+        assert!(!serialized.contains(&focal_secret));
+        assert!(!serialized.contains(&provenance_secret));
         Ok(())
     }
 
