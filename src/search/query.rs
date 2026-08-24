@@ -7888,7 +7888,10 @@ impl SearchClient {
         scan_query: &SqliteMessageScanQuery,
     ) -> f32 {
         let has_phrase = scan_query.groups.iter().flatten().any(|alternative| {
-            matches!(alternative.operand, SqliteMessageScanOperand::Phrase(_))
+            matches!(
+                &alternative.operand,
+                SqliteMessageScanOperand::Phrase(_)
+            )
         });
         let tokenized_haystacks = has_phrase.then(|| {
             haystacks
@@ -14183,52 +14186,158 @@ mod tests {
 
     #[test]
     fn sqlite_message_scan_preserves_boolean_or_precedence() {
+        fn score(haystack: &str, query: &SqliteMessageScanQuery) -> f32 {
+            SearchClient::sqlite_message_scan_score(&[haystack.to_lowercase()], query)
+        }
+
         let simple_or =
             SearchClient::sqlite_message_scan_query("alpha OR beta").expect("simple OR scan query");
-        assert!(SearchClient::sqlite_message_scan_score("alpha", &simple_or) > 0.0);
-        assert!(SearchClient::sqlite_message_scan_score("beta", &simple_or) > 0.0);
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("gamma", &simple_or),
-            0.0
-        );
+        assert!(score("alpha", &simple_or) > 0.0);
+        assert!(score("beta", &simple_or) > 0.0);
+        assert_eq!(score("gamma", &simple_or), 0.0);
 
         let and_then_or = SearchClient::sqlite_message_scan_query("alpha AND beta OR gamma")
             .expect("AND followed by OR scan query");
         assert!(
-            SearchClient::sqlite_message_scan_score("alpha gamma", &and_then_or) > 0.0,
+            score("alpha gamma", &and_then_or) > 0.0,
             "alpha AND (beta OR gamma) should accept the gamma branch"
         );
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("alpha", &and_then_or),
-            0.0
-        );
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("beta gamma", &and_then_or),
-            0.0
-        );
+        assert_eq!(score("alpha", &and_then_or), 0.0);
+        assert_eq!(score("beta gamma", &and_then_or), 0.0);
 
         let or_then_and = SearchClient::sqlite_message_scan_query("alpha OR beta AND gamma")
             .expect("OR followed by AND scan query");
         assert!(
-            SearchClient::sqlite_message_scan_score("alpha gamma", &or_then_and) > 0.0,
+            score("alpha gamma", &or_then_and) > 0.0,
             "(alpha OR beta) AND gamma should accept the alpha branch"
         );
         assert!(
-            SearchClient::sqlite_message_scan_score("beta gamma", &or_then_and) > 0.0,
+            score("beta gamma", &or_then_and) > 0.0,
             "(alpha OR beta) AND gamma should accept the beta branch"
         );
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("alpha", &or_then_and),
-            0.0
-        );
+        assert_eq!(score("alpha", &or_then_and), 0.0);
 
         let binary_not =
             SearchClient::sqlite_message_scan_query("alpha NOT beta").expect("NOT scan query");
-        assert!(SearchClient::sqlite_message_scan_score("alpha", &binary_not) > 0.0);
+        assert!(score("alpha", &binary_not) > 0.0);
+        assert_eq!(score("alpha beta", &binary_not), 0.0);
+    }
+
+    #[test]
+    fn sqlite_message_scan_matches_primary_negated_or_truth_tables() {
+        fn score(haystack: &str, query: &SqliteMessageScanQuery) -> f32 {
+            SearchClient::sqlite_message_scan_score(&[haystack.to_lowercase()], query)
+        }
+
+        // OR binds tighter than the implicit conjunction around NOT, so this
+        // is `alpha AND (NOT beta OR gamma)` in the pinned primary builder.
+        let nested = SearchClient::sqlite_message_scan_query("alpha NOT beta OR gamma")
+            .expect("nested negated OR scan query");
+        assert!(score("alpha", &nested) > 0.0);
+        assert_eq!(score("alpha beta", &nested), 0.0);
+        assert!(score("alpha beta gamma", &nested) > 0.0);
+        assert_eq!(score("gamma", &nested), 0.0);
+
+        let or_not = SearchClient::sqlite_message_scan_query("alpha OR NOT beta")
+            .expect("OR-NOT scan query");
+        assert!(score("alpha beta", &or_not) > 0.0);
+        assert_eq!(score("gamma beta", &or_not), 0.0);
+        assert!(score("gamma delta", &or_not) > 0.0);
+
+        let standalone_not =
+            SearchClient::sqlite_message_scan_query("NOT beta").expect("standalone NOT query");
+        assert!(score("alpha", &standalone_not) > 0.0);
+        assert_eq!(score("alpha beta", &standalone_not), 0.0);
+    }
+
+    #[test]
+    fn sqlite_message_scan_preserves_phrase_adjacency_within_one_field() {
+        fn score(fields: &[&str], query: &SqliteMessageScanQuery) -> f32 {
+            let fields = fields
+                .iter()
+                .map(|field| field.to_lowercase())
+                .collect::<Vec<_>>();
+            SearchClient::sqlite_message_scan_score(&fields, query)
+        }
+
+        let phrase = SearchClient::sqlite_message_scan_query("\"alpha beta\"")
+            .expect("phrase scan query");
+        assert!(score(&["alpha beta"], &phrase) > 0.0);
+        assert!(score(&["alpha, beta"], &phrase) > 0.0);
+        assert_eq!(score(&["alpha x beta"], &phrase), 0.0);
         assert_eq!(
-            SearchClient::sqlite_message_scan_score("alpha beta", &binary_not),
-            0.0
+            score(&["alpha", "beta"], &phrase),
+            0.0,
+            "phrase must not bridge content and title"
         );
+    }
+
+    #[test]
+    fn sqlite_fts_fallback_scans_untranspilable_negated_or_query() -> Result<()> {
+        let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER,
+                content TEXT NOT NULL,
+                created_at INTEGER
+             );
+             CREATE TABLE fts_messages (marker TEXT);
+             INSERT INTO sources(id, kind) VALUES('local', 'local');
+             INSERT INTO agents(id, slug) VALUES(1, 'codex');
+             INSERT INTO workspaces(id, path) VALUES(1, '/workspace');
+             INSERT INTO conversations(
+                id, agent_id, workspace_id, source_id, origin_host, title, source_path
+             ) VALUES(1, 1, 1, 'local', NULL, 'fallback title', '/tmp/fallback.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES
+                (1, 1, 0, 'alpha beta', 1),
+                (2, 1, 1, 'gamma beta', 2),
+                (3, 1, 2, 'gamma delta', 3);",
+        )?;
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(conn.into_connection())),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: false,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:negated-or-fallback"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        };
+
+        let hits = client.search_sqlite_fts5(
+            Path::new(":memory:"),
+            "alpha OR NOT beta",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
+        let contents = hits
+            .iter()
+            .map(|hit| hit.content.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(contents, HashSet::from(["alpha beta", "gamma delta"]));
+        Ok(())
     }
 
     #[test]
@@ -18925,6 +19034,11 @@ mod tests {
     fn transpile_to_fts5_rejects_or_not_forms_it_cannot_represent() {
         assert_eq!(transpile_to_fts5("foo OR NOT bar"), None);
         assert_eq!(transpile_to_fts5("foo NOT bar OR baz"), None);
+        assert_eq!(
+            transpile_to_fts5("foo NOT OR bar"),
+            None,
+            "permissive NOT-before-OR syntax must not broaden to foo OR bar"
+        );
     }
 
     #[test]
@@ -19726,6 +19840,20 @@ mod tests {
         let exp = QueryExplanation::analyze("foo bar", &SearchFilters::default());
         assert!(exp.parsed.implicit_and);
         assert_eq!(exp.parsed.terms.len(), 2);
+
+        let term_and_phrase =
+            QueryExplanation::analyze("foo \"bar baz\"", &SearchFilters::default());
+        assert!(term_and_phrase.parsed.implicit_and);
+        assert_eq!(term_and_phrase.parsed.terms.len(), 1);
+        assert_eq!(term_and_phrase.parsed.phrases.len(), 1);
+
+        let two_phrases =
+            QueryExplanation::analyze("\"foo bar\" \"baz qux\"", &SearchFilters::default());
+        assert!(two_phrases.parsed.implicit_and);
+        assert_eq!(two_phrases.parsed.phrases.len(), 2);
+
+        let one_phrase = QueryExplanation::analyze("\"foo bar\"", &SearchFilters::default());
+        assert!(!one_phrase.parsed.implicit_and);
     }
 
     #[test]
