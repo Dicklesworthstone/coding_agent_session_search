@@ -7552,6 +7552,28 @@ async fn execute_cli(
                             retryable: false,
                         })?;
                     } else if let Some(output_path) = export_only {
+                        if dry_run {
+                            if let Some(fmt) = structured_format {
+                                output_structured_value(
+                                    serde_json::json!({
+                                        "status": "dry_run",
+                                        "output_path": output_path,
+                                        "secret_scan": {
+                                            "performed": false,
+                                            "complete": false,
+                                            "approval_state": "not_performed_dry_run",
+                                            "artifact_sha256": null,
+                                        },
+                                    }),
+                                    fmt,
+                                )?;
+                            } else {
+                                println!("Dry run: would export to {:?}", output_path);
+                                println!("Secret scan: not performed during dry run");
+                            }
+                            return Ok(());
+                        }
+
                         // Interactive unencrypted export confirmation (non-robot mode)
                         if no_encryption && structured_format.is_none() && !robot_mode_here {
                             use console::style;
@@ -7628,23 +7650,106 @@ async fn execute_cli(
                             }
                         }
 
-                        crate::pages::export::run_pages_export(
-                            cli.db.clone(),
-                            output_path.clone(),
-                            agents.clone(),
-                            workspaces.clone(),
-                            since.clone(),
-                            until.clone(),
-                            path_mode,
-                            dry_run,
-                        )
-                        .map_err(|e| CliError {
-                            code: 9,
-                            kind: CliErrorKind::Pages.kind_str(),
-                            message: format!("Export failed: {e}"),
-                            hint: None,
-                            retryable: false,
-                        })?;
+                        let scan_config =
+                            crate::pages::secret_scan::SecretScanConfig::from_inputs(
+                                &secrets_allow,
+                                &secrets_deny,
+                            )
+                            .map_err(|e| CliError {
+                                code: 9,
+                                kind: CliErrorKind::Pages.kind_str(),
+                                message: format!("Secret scan config error: {e}"),
+                                hint: None,
+                                retryable: false,
+                            })?;
+                        let structured_export = structured_format.is_some() || robot_mode_here;
+                        let (stats, (staged_secret_scan, approval_state)) =
+                            crate::pages::export::export_pages_database_verified(
+                                cli.db.clone(),
+                                output_path.clone(),
+                                agents.clone(),
+                                workspaces.clone(),
+                                since.clone(),
+                                until.clone(),
+                                path_mode,
+                                |_current, _total| {},
+                                |staged_db_path| {
+                                    let scan = crate::pages::secret_scan::scan_staged_export_database(
+                                        staged_db_path,
+                                        &scan_config,
+                                    )?;
+                                    if scan.report.summary.total == 0 {
+                                        return Ok((scan, "clean"));
+                                    }
+                                    if structured_export || fail_on_secrets {
+                                        anyhow::bail!(
+                                            "Staged export contains {} potential secret(s); robot/CI export-only runs fail closed",
+                                            scan.report.summary.total
+                                        );
+                                    }
+
+                                    let mut term = console::Term::stderr();
+                                    crate::pages::secret_scan::print_human_report(
+                                        &mut term,
+                                        &scan.report,
+                                        3,
+                                    )?;
+                                    eprintln!(
+                                        "The report above describes the exact staged export database."
+                                    );
+                                    eprint!(
+                                        "Type exactly \"I understand the risks\" to publish it: "
+                                    );
+                                    use std::io::Write;
+                                    std::io::stderr().flush()?;
+                                    let mut acknowledgment = String::new();
+                                    std::io::stdin().read_line(&mut acknowledgment)?;
+                                    if acknowledgment.trim() != "I understand the risks" {
+                                        anyhow::bail!(
+                                            "Staged export secret findings were not acknowledged"
+                                        );
+                                    }
+                                    Ok((scan, "explicit_interactive_acknowledgment"))
+                                },
+                            )
+                            .map_err(|e| CliError {
+                                code: 9,
+                                kind: CliErrorKind::Pages.kind_str(),
+                                message: format!("Export failed: {e}"),
+                                hint: Some(
+                                    "Review findings with `cass pages --scan-secrets`; use --secrets-allow only for confirmed false positives."
+                                        .to_string(),
+                                ),
+                                retryable: false,
+                            })?;
+
+                        if let Some(fmt) = structured_format {
+                            output_structured_value(
+                                serde_json::json!({
+                                    "status": "success",
+                                    "output_path": output_path,
+                                    "stats": {
+                                        "conversations": stats.conversations_processed,
+                                        "messages": stats.messages_processed,
+                                    },
+                                    "secret_scan": staged_secret_scan_json(
+                                        &staged_secret_scan,
+                                        approval_state,
+                                    ),
+                                }),
+                                fmt,
+                            )?;
+                        } else {
+                            println!(
+                                "Export complete! Processed {} conversations, {} messages.",
+                                stats.conversations_processed,
+                                stats.messages_processed
+                            );
+                            println!(
+                                "Secret scan: complete ({approval_state}); artifact SHA-256 {}",
+                                staged_secret_scan.artifact_sha256
+                            );
+                        }
                     } else {
                         let cf_creds_provided = account_id.is_some() || api_token.is_some();
                         let target_is_cloudflare =
@@ -84910,7 +85015,7 @@ fn staged_secret_scan_json(
         "findings": scan.report.summary.total,
         "has_critical": scan.report.summary.has_critical,
         "approval_state": approval_state,
-        "artifact_sha256": scan.artifact_sha256,
+        "artifact_sha256": scan.artifact_sha256.as_str(),
     })
 }
 

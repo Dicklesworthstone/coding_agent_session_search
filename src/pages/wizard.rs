@@ -21,7 +21,8 @@ use crate::pages::encrypt::EncryptionEngine;
 use crate::pages::export::{ExportEngine, ExportFilter, PathMode};
 use crate::pages::password::{PasswordStrength, format_strength_inline, validate_password};
 use crate::pages::secret_scan::{
-    SecretScanConfig, SecretScanFilters, print_human_report, wizard_secret_scan,
+    SecretScanConfig, SecretScanFilters, print_human_report, scan_staged_export_database,
+    wizard_secret_scan,
 };
 use crate::pages::size::{BundleVerifier, SizeEstimate, SizeLimitResult};
 use crate::pages::summary::{
@@ -509,6 +510,11 @@ impl PagesWizard {
     fn step_secret_scan(&mut self, term: &mut Term, theme: &ColorfulTheme) -> Result<()> {
         writeln!(term, "\n{}", style("Step 2 of 9: Secret Scan").bold())?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
+        writeln!(
+            term,
+            "  {} Preliminary source review; the exact staged export will be scanned again before encryption.",
+            style("ℹ").blue()
+        )?;
 
         let since_ts = self
             .state
@@ -1630,19 +1636,56 @@ impl PagesWizard {
         let engine = ExportEngine::new(&self.state.db_path, &export_db_path, filter);
         let running = Arc::new(AtomicBool::new(true));
 
-        let stats = engine.execute(
+        let staged_scan_config = SecretScanConfig::from_inputs(&[], &[])?;
+        let (stats, staged_secret_scan) = engine.execute_verified(
             |current, total| {
                 if total > 0 {
                     pb.set_message(format!("Exporting... {}/{} conversations", current, total));
                 }
             },
             Some(running),
+            |staged_db_path| {
+                scan_staged_export_database(staged_db_path, &staged_scan_config)
+            },
         )?;
 
         pb.finish_with_message(format!(
             "✓ Exported {} conversations, {} messages",
             stats.conversations_processed, stats.messages_processed
         ));
+
+        writeln!(term)?;
+        writeln!(
+            term,
+            "  {} Exact staged-export secret scan",
+            style("🔒").cyan()
+        )?;
+        print_human_report(term, &staged_secret_scan.report, 3)?;
+        self.state.secret_scan_has_findings = staged_secret_scan.report.summary.total > 0;
+        self.state.secret_scan_has_critical = staged_secret_scan.report.summary.has_critical;
+        self.state.secret_scan_count = staged_secret_scan.report.summary.total;
+
+        if staged_secret_scan.report.summary.total > 0 {
+            writeln!(
+                term,
+                "  Artifact SHA-256: {}",
+                style(&staged_secret_scan.artifact_sha256).dim()
+            )?;
+            let theme = ColorfulTheme::default();
+            let acknowledgment: String = Input::with_theme(&theme)
+                .with_prompt(
+                    "Type exactly \"I understand the risks\" to encrypt/publish this staged artifact",
+                )
+                .interact_text()?;
+            if acknowledgment.trim() != "I understand the risks" {
+                bail!("Export cancelled: exact staged secret findings were not acknowledged");
+            }
+            writeln!(
+                term,
+                "  {} Exact staged artifact acknowledged",
+                style("✓").green()
+            )?;
+        }
 
         // Phase 2: Encryption (skip if no_encryption mode)
         if self.no_encryption_mode {
