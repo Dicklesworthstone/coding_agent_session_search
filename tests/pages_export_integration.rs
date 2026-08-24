@@ -779,6 +779,20 @@ fn export_engine_preserves_existing_output_when_staged_verifier_rejects() {
         std::fs::read(&output_path).unwrap(),
         b"previous approved generation"
     );
+    let rejected_sidecars: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".export.db.tmp.")
+        })
+        .collect();
+    assert!(
+        rejected_sidecars.is_empty(),
+        "rejected secret-bearing stage must not remain beside the prior output: {rejected_sidecars:?}"
+    );
 }
 
 #[test]

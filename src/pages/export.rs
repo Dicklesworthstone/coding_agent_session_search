@@ -537,11 +537,17 @@ impl ExportEngine {
             ))
         })();
 
-        if result.is_err() && !replace_attempted {
-            cleanup_sqlite_temp_artifacts(&temp_output_path);
+        match result {
+            Err(export_error) if !replace_attempted => {
+                match cleanup_sqlite_temp_artifacts(&temp_output_path) {
+                    Ok(()) => Err(export_error),
+                    Err(cleanup_error) => Err(export_error.context(format!(
+                        "failed to remove rejected staged export artifacts: {cleanup_error:#}"
+                    ))),
+                }
+            }
+            other => other,
         }
-
-        result
     }
 
     fn transform_path(&self, path: &str, workspace: &Option<String>) -> String {
@@ -722,10 +728,27 @@ fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) ->
     ))
 }
 
-fn cleanup_sqlite_temp_artifacts(path: &Path) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(sidecar_path(path, "-wal"));
-    let _ = std::fs::remove_file(sidecar_path(path, "-shm"));
+fn cleanup_sqlite_temp_artifacts(path: &Path) -> Result<()> {
+    let mut first_error = None;
+    for artifact in [
+        path.to_path_buf(),
+        sidecar_path(path, "-wal"),
+        sidecar_path(path, "-shm"),
+    ] {
+        match std::fs::remove_file(&artifact) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow::Error::new(err).context(format!(
+                        "failed removing staged SQLite artifact {}",
+                        artifact.display()
+                    )));
+                }
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {

@@ -7408,7 +7408,7 @@ async fn execute_cli(
                         .map_err(|e| CliError {
                             code: 9,
                             kind: CliErrorKind::Pages.kind_str(),
-                            message: format!("Export failed: {e}"),
+                            message: format!("Export failed: {e:#}"),
                             hint: None,
                             retryable: false,
                         })?;
@@ -7715,7 +7715,7 @@ async fn execute_cli(
                             .map_err(|e| CliError {
                                 code: 9,
                                 kind: CliErrorKind::Pages.kind_str(),
-                                message: format!("Export failed: {e}"),
+                                message: format!("Export failed: {e:#}"),
                                 hint: Some(
                                     "Review findings with `cass pages --scan-secrets`; use --secrets-allow only for confirmed false positives."
                                         .to_string(),
@@ -7825,7 +7825,7 @@ async fn execute_cli(
                         wizard.run().map_err(|e| CliError {
                             code: 9,
                             kind: CliErrorKind::Pages.kind_str(),
-                            message: format!("Wizard failed: {e}"),
+                            message: format!("Wizard failed: {e:#}"),
                             hint: None,
                             retryable: false,
                         })?;
