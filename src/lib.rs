@@ -18416,6 +18416,113 @@ struct StateDbSnapshot {
     /// the last reason. `None` streak when the last run did not defer.
     lexical_repair_deferred_runs: Option<i64>,
     lexical_repair_deferred_reason: Option<String>,
+    /// i6upe: result of the bounded real-column integrity probe. `None` when
+    /// the probe did not run (watermarks-only health path, unopened DB) or
+    /// could not classify (busy/transient error). A probe, not a proof:
+    /// corruption on unprobed pages still needs `cass doctor --check`.
+    integrity: Option<StateDbIntegrity>,
+    /// The corruption error text when `integrity` is `Corrupt`.
+    integrity_detail: Option<String>,
+}
+
+/// i6upe: verdict of the bounded real-column integrity probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateDbIntegrity {
+    Ok,
+    Corrupt,
+}
+
+/// True for FrankenError classes that mean the archive's stored pages are
+/// malformed — never for busy/locked/transient classes.
+fn corruption_class_franken_error(err: &crate::franken_sync::FrankenError) -> bool {
+    use crate::franken_sync::FrankenError as E;
+    if matches!(
+        err,
+        E::DatabaseCorrupt { .. } | E::NotADatabase { .. } | E::WalCorrupt { .. }
+    ) {
+        return true;
+    }
+    let lower = err.to_string().to_ascii_lowercase();
+    lower.contains("malformed") || lower.contains("disk image")
+}
+
+/// i6upe: bounded real-column corruption probe.
+///
+/// `SELECT COUNT(*)` is answered from index B-trees without touching table
+/// pages, so a DB whose table pages are malformed counts perfectly and only
+/// fails when real columns are read (proven on ts2/csd 2026-07-26, where
+/// counts matched while every projection failed). Each probe here projects
+/// real columns from a single row at both ends of the two hot tables —
+/// `id` is `INTEGER PRIMARY KEY` (the rowid), so `ORDER BY id`/`DESC` with
+/// `LIMIT 1` is an O(log n) B-tree edge descent, not a scan.
+///
+/// Returns `(Some(Ok), None)` when every probe reads (or the table is
+/// empty), `(Some(Corrupt), Some(detail))` on a corruption-class error, and
+/// `(None, None)` when a transient error prevents classification — never a
+/// false-positive `Corrupt` from a busy archive.
+fn probe_state_db_integrity(
+    conn: &crate::franken_sync::Connection,
+) -> (Option<StateDbIntegrity>, Option<String>) {
+    use crate::franken_sync::compat::RowExt;
+    use crate::franken_sync::params;
+    const PROBES: [&str; 4] = [
+        "SELECT id, title, source_path FROM conversations ORDER BY id LIMIT 1",
+        "SELECT id, title, source_path FROM conversations ORDER BY id DESC LIMIT 1",
+        "SELECT id, conversation_id, role FROM messages ORDER BY id LIMIT 1",
+        "SELECT id, conversation_id, role FROM messages ORDER BY id DESC LIMIT 1",
+    ];
+    for sql in PROBES {
+        match franken_query_row_map_retry(conn, sql, params![], |row| {
+            row.get_typed::<i64>(0).map(|_| ())
+        }) {
+            Ok(()) => {}
+            Err(crate::franken_sync::FrankenError::QueryReturnedNoRows) => {}
+            Err(err) if corruption_class_franken_error(&err) => {
+                return (Some(StateDbIntegrity::Corrupt), Some(err.to_string()));
+            }
+            Err(_) => return (None, None),
+        }
+    }
+    (Some(StateDbIntegrity::Ok), None)
+}
+
+/// i6upe: open the canonical DB read-only and run the bounded corruption
+/// probe. `Some(detail)` when the archive is malformed; `None` when the
+/// probe passed or could not run/classify (missing DB, busy archive).
+///
+/// This is the pre-index guard's entry: rebuilding on top of a malformed
+/// archive is the worst response to it (`--force-rebuild` also READS the
+/// canonical DB), so `cass index` refuses and points at recovery instead.
+pub(crate) fn bounded_canonical_db_corruption_probe(
+    db_path: &Path,
+    reason: &str,
+) -> Option<String> {
+    if !db_path.is_file() {
+        return None;
+    }
+    let conn = open_franken_cli_read_db(db_path.to_path_buf(), reason, STATE_DB_OPEN_TIMEOUT);
+    match conn {
+        Ok(conn) => {
+            let (integrity, detail) = probe_state_db_integrity(&conn);
+            let _ = close_franken_cli_read_db(conn, db_path, reason);
+            match integrity {
+                Some(StateDbIntegrity::Corrupt) => {
+                    Some(detail.unwrap_or_else(|| "corruption-class read failure".to_owned()))
+                }
+                _ => None,
+            }
+        }
+        Err(err) if !err.retryable => {
+            // A hard open failure on an EXISTING regular file is itself the
+            // corrupt-header/not-a-database class; a busy archive is not.
+            let lower = err.message.to_ascii_lowercase();
+            (lower.contains("malformed")
+                || lower.contains("disk image")
+                || lower.contains("not a database"))
+            .then_some(err.message)
+        }
+        Err(_) => None,
+    }
 }
 
 fn probe_state_db(
@@ -18537,6 +18644,15 @@ fn probe_state_db_modes(
     )
     .ok()
     .filter(|reason| !reason.is_empty());
+    // i6upe: bounded real-column integrity probe on the STATUS surface only.
+    // The watermarks-only health path keeps its <50ms d0rmo/gi4oy contract
+    // untouched. Runs even when counts are skipped for big archives — the
+    // exact configuration in which corruption previously had NO fast signal.
+    if !watermarks_only {
+        let (integrity, integrity_detail) = probe_state_db_integrity(&conn);
+        snapshot.integrity = integrity;
+        snapshot.integrity_detail = integrity_detail;
+    }
     if include_counts && !watermarks_only {
         snapshot.conversation_count = franken_query_row_map_retry(
             &conn,
@@ -19256,6 +19372,20 @@ fn state_meta_json_inner(
     let db_open_retryable = db_snapshot.open_retryable;
     let counts_skipped = db_snapshot.counts_skipped;
     let open_skipped = db_snapshot.open_skipped;
+    // i6upe: distinct corruption signal, separate from staleness. "unknown"
+    // covers both "probe not run" (health-contract watermark path, unopened
+    // DB) and "probe could not classify" (busy archive).
+    let db_integrity = match db_snapshot.integrity {
+        Some(StateDbIntegrity::Ok) => "ok",
+        Some(StateDbIntegrity::Corrupt) => "corrupt",
+        None => "unknown",
+    };
+    let db_integrity_detail = db_snapshot.integrity_detail.clone();
+    let db_integrity_hint = (db_snapshot.integrity == Some(StateDbIntegrity::Corrupt)).then(|| {
+        "the archive's stored pages are malformed; do NOT run 'cass index' (it rebuilds on top of \
+         the damage) — run 'cass doctor --check' and recover with sqlite3 '.recover' first"
+            .to_owned()
+    });
     let fallback_fts_repair_pending = db_snapshot.fallback_repair_pending.clone();
     let lexical_repair_deferred_runs = db_snapshot.lexical_repair_deferred_runs;
     let lexical_repair_deferred_reason = db_snapshot.lexical_repair_deferred_reason.clone();
@@ -19647,7 +19777,10 @@ fn state_meta_json_inner(
             "open_error": db_open_error,
             "open_retryable": db_open_retryable,
             "counts_skipped": counts_skipped,
-            "open_skipped": open_skipped
+            "open_skipped": open_skipped,
+            "integrity": db_integrity,
+            "integrity_detail": db_integrity_detail,
+            "integrity_hint": db_integrity_hint
         },
         "pending": {
             "sessions": lexical.pending_sessions,
@@ -20005,6 +20138,29 @@ fn refresh_state_database_counts_if_needed(
         "counts_skipped".to_string(),
         serde_json::Value::Bool(refreshed.counts_skipped),
     );
+    // i6upe: the refresh probe also ran the bounded integrity probe; a
+    // classified verdict upgrades a prior "unknown" (never downgrades a
+    // known verdict to unknown — a transient busy refresh proves nothing).
+    if let Some(integrity) = refreshed.integrity {
+        database.insert(
+            "integrity".to_string(),
+            serde_json::Value::String(
+                match integrity {
+                    StateDbIntegrity::Ok => "ok",
+                    StateDbIntegrity::Corrupt => "corrupt",
+                }
+                .to_string(),
+            ),
+        );
+        database.insert(
+            "integrity_detail".to_string(),
+            refreshed
+                .integrity_detail
+                .clone()
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
 }
 
 fn readiness_snapshot_from_state(
@@ -74429,7 +74585,26 @@ fn run_status(
         .and_then(|q| q.get("recommended_action"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    // i6upe: live bounded real-column probe verdict (milliseconds), the fast
+    // complement to the persisted #331 deep-probe attestation below.
+    let db_integrity = state
+        .get("database")
+        .and_then(|d| d.get("integrity"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let db_integrity_hint = state
+        .get("database")
+        .and_then(|d| d.get("integrity_hint"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let live_integrity_corrupt = db_integrity == "corrupt";
     let mut warnings = Vec::<String>::new();
+    if live_integrity_corrupt {
+        warnings.push(db_integrity_hint.clone().unwrap_or_else(|| {
+            "the canonical archive's stored pages are malformed (bounded real-column probe); do NOT run 'cass index' — run 'cass doctor --check' and recover first".to_string()
+        }));
+    }
     if ingest_quarantine_critical {
         warnings.push(format!(
             "{recent_quarantined_conversations} recent conversation quarantine(s) triggered the ingest quarantine circuit breaker; search coverage is suspect until the watcher/source path is inspected"
@@ -74469,7 +74644,8 @@ fn run_status(
         && !rebuild_active
         && !index_empty_with_messages
         && !ingest_quarantine_critical
-        && !attested_integrity_failure;
+        && !attested_integrity_failure
+        && !live_integrity_corrupt;
     // Stalled rebuilds are reported as a distinct status so operators
     // can tell a wedged indexer apart from a slow-but-progressing one
     // (issue #258). `stalled` implies `rebuild_active=true`, but it
@@ -74479,7 +74655,7 @@ fn run_status(
         "stalled"
     } else if rebuild_active {
         "rebuilding"
-    } else if ingest_quarantine_critical {
+    } else if ingest_quarantine_critical || live_integrity_corrupt {
         "unhealthy"
     } else if healthy {
         "healthy"
@@ -74500,6 +74676,10 @@ fn run_status(
         Some("Index rebuild is wedged; see `cass status --json | jq .rebuild` for the stall age and capture a stack trace with `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` for issue #258".to_string())
     } else if rebuild_active {
         Some("Index rebuild is already in progress".to_string())
+    } else if live_integrity_corrupt {
+        // i6upe: staleness advice ('run cass index') is the WORST action on a
+        // malformed archive — recovery must come first.
+        Some("The canonical archive is malformed; do NOT run 'cass index'. Run 'cass doctor check --json', then recover the database (sqlite3 agent_search.db '.recover') before reindexing".to_string())
     } else if not_initialized {
         Some(cass_not_initialized_recommended_action())
     } else if !db_exists {
@@ -74642,6 +74822,11 @@ fn run_status(
                 "open_retryable": db_open_retryable,
                 "counts_skipped": counts_skipped,
                 "open_skipped": open_skipped,
+                // i6upe: live bounded real-column probe verdict — the fast,
+                // distinct corruption signal (never conflated with `stale`).
+                "integrity": db_integrity,
+                "integrity_detail": state.get("database").and_then(|d| d.get("integrity_detail")).cloned().unwrap_or(serde_json::Value::Null),
+                "integrity_hint": db_integrity_hint,
             }),
             "pending": state.get("pending").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
@@ -74753,6 +74938,19 @@ fn run_status(
 
     println!();
     println!("Database:");
+    if live_integrity_corrupt {
+        println!("  Integrity: MALFORMED (bounded real-column probe)");
+        if let Some(detail) = state
+            .get("database")
+            .and_then(|d| d.get("integrity_detail"))
+            .and_then(|v| v.as_str())
+        {
+            println!("  Detail: {detail}");
+        }
+        println!(
+            "  Do NOT run 'cass index' — run 'cass doctor check --json' and recover the database first"
+        );
+    }
     if db_exists {
         if db_opened {
             if open_skipped {
@@ -107692,5 +107890,133 @@ mod cli_models_resolution_tests {
              agree on the on-disk directory"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod state_db_integrity_probe_tests {
+    use super::*;
+
+    /// Build a minimal canonical-shaped DB (the two tables the bounded probe
+    /// projects) with one real row each.
+    fn seed_probe_shaped_db(db_path: &Path) {
+        let conn = crate::franken_sync::Connection::open(db_path.display().to_string())
+            .expect("create probe fixture db");
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                 id INTEGER PRIMARY KEY,
+                 title TEXT,
+                 source_path TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 conversation_id INTEGER NOT NULL,
+                 role TEXT NOT NULL
+             );
+             INSERT INTO conversations (id, title, source_path)
+                 VALUES (1, 'probe fixture', '/tmp/fixture.jsonl');
+             INSERT INTO messages (id, conversation_id, role)
+                 VALUES (1, 1, 'user');",
+        )
+        .expect("seed probe fixture rows");
+        // Explicit close runs the final passive WAL checkpoint so the table
+        // pages land in the MAIN file — the corruption test smashes those
+        // pages, and a dropped-not-closed connection leaves them in the WAL
+        // sidecar (observed: a 4096-byte single-page main file).
+        conn.close().expect("checkpoint fixture into the main file");
+    }
+
+    /// i6upe: the bounded probe reports nothing for a missing or healthy DB —
+    /// it must never manufacture a corruption verdict.
+    #[test]
+    fn bounded_corruption_probe_passes_missing_and_healthy_dbs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("agent_search.db");
+        assert_eq!(
+            bounded_canonical_db_corruption_probe(&db_path, "i6upe-missing"),
+            None,
+            "a missing DB is not corrupt"
+        );
+
+        seed_probe_shaped_db(&db_path);
+        assert_eq!(
+            bounded_canonical_db_corruption_probe(&db_path, "i6upe-healthy"),
+            None,
+            "a healthy DB with real rows must pass the probe"
+        );
+    }
+
+    /// i6upe: smashing the table B-tree pages (while leaving the header
+    /// intact) must surface as a corruption verdict — the exact class that
+    /// `SELECT COUNT(*)` cannot see because counts are answered from index
+    /// pages without reading table pages.
+    #[test]
+    fn bounded_corruption_probe_flags_smashed_table_pages() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("agent_search.db");
+        seed_probe_shaped_db(&db_path);
+
+        let len = std::fs::metadata(&db_path).expect("stat fixture").len();
+        assert!(
+            len > 4096,
+            "fixture must span multiple pages for a mid-file smash (len={len})"
+        );
+        let mut db = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .expect("open fixture for corruption");
+        db.seek(SeekFrom::Start(4096)).expect("seek past page 1");
+        let garbage = vec![0xFF_u8; (len - 4096) as usize];
+        db.write_all(&garbage).expect("smash table pages");
+        drop(db);
+
+        // The WAL sidecar can still hold valid frames that overlay the
+        // smashed main pages (observed: every probe read succeeded via WAL
+        // replay). Smash it too so reads must hit the malformed pages.
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        if let Ok(wal_len) = std::fs::metadata(&wal_path).map(|m| m.len())
+            && wal_len > 0
+        {
+            let mut wal = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_path)
+                .expect("open wal sidecar for corruption");
+            wal.write_all(&vec![0xFF_u8; wal_len as usize])
+                .expect("smash wal frames");
+            drop(wal);
+        }
+
+        let verdict = bounded_canonical_db_corruption_probe(&db_path, "i6upe-corrupt");
+        if verdict.is_none() {
+            // Surface what the reader actually said so a classifier gap is
+            // diagnosable from the failure output alone.
+            let mut observed = Vec::new();
+            match open_franken_cli_read_db(db_path.clone(), "i6upe-debug", Duration::from_secs(2)) {
+                Ok(conn) => {
+                    use crate::franken_sync::compat::RowExt;
+                    use crate::franken_sync::params;
+                    for sql in [
+                        "SELECT id, title, source_path FROM conversations ORDER BY id LIMIT 1",
+                        "SELECT id, title, source_path FROM conversations ORDER BY id DESC LIMIT 1",
+                    ] {
+                        let outcome = franken_query_row_map_retry(&conn, sql, params![], |row| {
+                            row.get_typed::<i64>(0).map(|_| ())
+                        });
+                        observed.push(format!("{sql} -> {outcome:?}"));
+                    }
+                    let _ = close_franken_cli_read_db(conn, &db_path, "i6upe-debug");
+                }
+                Err(err) => observed.push(format!(
+                    "open failed: retryable={} message={}",
+                    err.retryable, err.message
+                )),
+            }
+            panic!(
+                "smashed table pages must produce a corruption verdict; observed: {}",
+                observed.join(" | ")
+            );
+        }
     }
 }

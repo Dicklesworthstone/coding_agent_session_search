@@ -13479,6 +13479,28 @@ pub fn run_index(
     } else {
         maintenance_job_kind_for_mode(initial_lock_mode)
     };
+    // i6upe: refuse to rebuild ON TOP of a malformed canonical archive.
+    // Every index mode reads the canonical DB (`--force-rebuild` performs a
+    // READONLY authoritative rebuild from it), so indexing a corrupt archive
+    // at best fails confusingly and at worst rewrites over recoverable
+    // pages. The probe is bounded (single-row real-column projections at
+    // both B-tree edges of the two hot tables — COUNT(*) is answered from
+    // index pages and cannot see this class); a busy or missing DB never
+    // trips it. CASS_INDEX_ALLOW_MALFORMED_DB=1 bypasses for emergency
+    // flows that knowingly operate on a damaged archive.
+    if !dotenvy::var("CASS_INDEX_ALLOW_MALFORMED_DB").is_ok_and(|v| v == "1")
+        && let Some(detail) =
+            crate::bounded_canonical_db_corruption_probe(&opts.db_path, "index-preflight")
+    {
+        return Err(anyhow::anyhow!(
+            "refusing to index: the canonical archive at {} is malformed ({detail}). \
+             Rebuilding on top of a corrupt database destroys recoverable data. \
+             Run 'cass doctor check --json', recover the database first \
+             (sqlite3 <db> '.recover'), or set CASS_INDEX_ALLOW_MALFORMED_DB=1 \
+             to proceed anyway",
+            opts.db_path.display()
+        ));
+    }
     let mut index_run_lock = acquire_index_run_lock_with_job_kind(
         &opts.data_dir,
         &opts.db_path,
