@@ -2337,6 +2337,37 @@ mod tests {
     }
 
     #[test]
+    fn manual_deployment_fallback_rechecks_mutated_bundle() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let archive_dir = temp.path().join("archive");
+        let payload_dir = archive_dir.join("payload");
+        std::fs::create_dir_all(&payload_dir)?;
+        let payload = b"SQLite format 3\0test archive bytes";
+        std::fs::write(payload_dir.join("data.db"), payload)?;
+        std::fs::write(
+            archive_dir.join("config.json"),
+            serde_json::to_vec_pretty(&unencrypted_bundle_config(payload.len() as u64))?,
+        )?;
+
+        let output_dir = temp.path().join("bundle");
+        let bundle = BundleBuilder::new().build(&archive_dir, &output_dir, |_, _| {})?;
+        let mut term = Term::buffered_stderr();
+        require_verified_manual_deployment(&mut term, &bundle.site_dir)?;
+
+        std::fs::write(
+            bundle.site_dir.join("recovery-secret.txt"),
+            b"post-build private material",
+        )?;
+        let error = require_verified_manual_deployment(&mut term, &bundle.site_dir)
+            .expect_err("mutated bundle must block manual-deployment guidance");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("Refusing to recommend manual deployment"));
+        assert!(message.contains("no_secrets_in_site"));
+        Ok(())
+    }
+
+    #[test]
     fn documentation_uses_key_slots_from_the_emitted_encryption_config() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let input = temp.path().join("export.db");

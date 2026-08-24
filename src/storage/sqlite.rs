@@ -1,6 +1,6 @@
 //! `SQLite` backend: schema, pragmas, and migrations.
 
-use crate::connectors::omp::classify_omp_archive_path;
+use crate::connectors::omp::{PiFamilyOwner, PiFamilyOwnership};
 use crate::franken_sync::{
     Connection as FrankenConnection, Row as FrankenRow, SqliteValue,
     compat::{
@@ -8219,12 +8219,13 @@ impl FrankenStorage {
 
     /// Reclassify OMP sessions indexed by pre-0.2 FAD releases as `pi_agent`.
     ///
-    /// Older detector releases intentionally scanned `~/.omp/agent` through
-    /// the Pi Agent connector. FAD 0.2 gives OMP a dedicated identity; this
-    /// one-time upgrade runs before connector watermarks are planned so the
-    /// first OMP scan merges into the existing canonical rows instead of
-    /// creating a second copy under another agent id. Analytics are derived
-    /// from canonical messages and rebuilt after the identity swap.
+    /// Older detector releases scanned OMP config roots and configured remote
+    /// mirrors through the Pi Agent connector. FAD 0.2 gives OMP a dedicated
+    /// identity; this versioned upgrade uses the same structural classifier as
+    /// live ownership before connector watermarks are planned, so the first OMP scan merges
+    /// into the existing canonical rows instead of creating a second copy
+    /// under another agent id. Analytics are derived from canonical messages
+    /// and rebuilt after the identity swap.
     pub fn reclassify_legacy_omp_conversations(&self) -> Result<LegacyOmpReclassificationResult> {
         self.reclassify_legacy_omp_conversations_inner(false)
     }
@@ -8233,8 +8234,8 @@ impl FrankenStorage {
     ///
     /// A completed marker only describes the canonical archive as it existed
     /// when the marker was written. Historical salvage can subsequently add
-    /// older Pi-labeled `.omp/agent` rows, so the importer must bypass the
-    /// normal fast path once after it has actually imported messages.
+    /// older Pi-labeled OMP rows, so the importer must bypass the normal fast
+    /// path once after it has actually imported messages.
     pub(crate) fn reclassify_legacy_omp_conversations_after_historical_import(
         &self,
     ) -> Result<LegacyOmpReclassificationResult> {
@@ -8245,6 +8246,10 @@ impl FrankenStorage {
         &self,
         recheck_complete_archive: bool,
     ) -> Result<LegacyOmpReclassificationResult> {
+        let ownership = PiFamilyOwnership::live();
+        let ownership_context = ownership.archive_reclassification_context();
+        let complete_state = format!("complete:{ownership_context}");
+        let pending_state = format!("analytics_pending:{ownership_context}");
         let state: Option<String> = self
             .conn
             .query_row_map(
@@ -8253,7 +8258,7 @@ impl FrankenStorage {
                 |row| row.get_typed(0),
             )
             .optional()?;
-        if state.as_deref() == Some("complete") && !recheck_complete_archive {
+        if state.as_deref() == Some(complete_state.as_str()) && !recheck_complete_archive {
             return Ok(LegacyOmpReclassificationResult::default());
         }
         let previous_state: Option<String> = if state.is_none() {
@@ -8267,7 +8272,9 @@ impl FrankenStorage {
         } else {
             None
         };
-        let assets_were_pending = state.as_deref() == Some("analytics_pending")
+        let assets_were_pending = state
+            .as_deref()
+            .is_some_and(|value| value == "analytics_pending" || value.starts_with("analytics_pending:"))
             || previous_state.as_deref() == Some("analytics_pending");
 
         let legacy_agent_id: Option<i64> = self
@@ -8289,8 +8296,7 @@ impl FrankenStorage {
                 )?
                 .into_iter()
                 .filter_map(|(id, source_path)| {
-                    classify_omp_archive_path(Path::new(&source_path))
-                        .is_some()
+                    (ownership.owner(Path::new(&source_path)) == PiFamilyOwner::Omp)
                         .then_some(id)
                 })
                 .collect::<Vec<_>>()
@@ -8366,8 +8372,8 @@ impl FrankenStorage {
 
             let mut tx = self.conn.transaction()?;
             tx.execute_compat(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'analytics_pending')",
-                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, pending_state],
             )?;
             for (conversation_id, metadata_json) in metadata_updates {
                 tx.execute_compat(
@@ -8422,8 +8428,8 @@ impl FrankenStorage {
             tx.commit()?;
         } else if !assets_were_pending {
             self.conn.execute_compat(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
-                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, complete_state],
             )?;
             return Ok(LegacyOmpReclassificationResult::default());
         }
@@ -8448,9 +8454,12 @@ impl FrankenStorage {
     /// Mark the OMP identity upgrade complete after the indexer has published
     /// a lexical generation rebuilt from the canonical SQLite archive.
     pub fn complete_legacy_omp_reclassification(&self) -> Result<()> {
+        let ownership_context =
+            PiFamilyOwnership::live().archive_reclassification_context();
+        let complete_state = format!("complete:{ownership_context}");
         self.conn.execute_compat(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
-            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, complete_state],
         )?;
         Ok(())
     }
@@ -29490,9 +29499,27 @@ mod tests {
             .join("ordinary-cache")
             .join(&safe_name)
             .join("sessions/-projects-cass/incidental-lookalike.jsonl");
+        let windows_external_id = "-projects-cass/windows-legacy-omp";
+        let mut windows_legacy = remote.clone();
+        windows_legacy.external_id = Some(windows_external_id.into());
+        windows_legacy.title = Some("Windows legacy OMP".into());
+        windows_legacy.source_path = PathBuf::from(
+            r"C:\Users\dev\.omp\agent\sessions\-projects-cass\windows-legacy-omp.jsonl",
+        );
+        windows_legacy.source_id = "windows-host".into();
+        windows_legacy.origin_host = Some("windows-host.example".into());
+        let windows_lookalike_external_id = "-projects-cass/windows-lookalike";
+        let mut windows_lookalike = windows_legacy.clone();
+        windows_lookalike.external_id = Some(windows_lookalike_external_id.into());
+        windows_lookalike.title = Some("Windows sanitized lookalike".into());
+        windows_lookalike.source_path = PathBuf::from(format!(
+            r"C:\ordinary-cache\{safe_name}\sessions\-projects-cass\windows-lookalike.jsonl"
+        ));
         storage.insert_conversations_batched(&[
             (pi_agent_id, None, &remote),
             (pi_agent_id, None, &lookalike),
+            (pi_agent_id, None, &windows_legacy),
+            (pi_agent_id, None, &windows_lookalike),
         ])?;
 
         let remote_conversation_id: i64 = storage.conn.query_row_map(
@@ -29517,7 +29544,7 @@ mod tests {
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,
             LegacyOmpReclassificationResult {
-                conversations_reclassified: 1,
+                conversations_reclassified: 2,
                 lexical_rebuild_required: true,
             },
             "the v2 classifier must run even when the narrower v1 migration was complete"
@@ -29544,8 +29571,26 @@ mod tests {
             fparams!["-projects-cass/incidental-lookalike"],
             |row| row.get_typed(0),
         )?;
+        let windows_slug: String = storage.conn.query_row_map(
+            "SELECT a.slug
+             FROM conversations c
+             JOIN agents a ON a.id = c.agent_id
+             WHERE c.external_id = ?1",
+            fparams![windows_external_id],
+            |row| row.get_typed(0),
+        )?;
+        let windows_lookalike_slug: String = storage.conn.query_row_map(
+            "SELECT a.slug
+             FROM conversations c
+             JOIN agents a ON a.id = c.agent_id
+             WHERE c.external_id = ?1",
+            fparams![windows_lookalike_external_id],
+            |row| row.get_typed(0),
+        )?;
         assert_eq!(remote_slug, "omp");
         assert_eq!(lookalike_slug, "pi_agent");
+        assert_eq!(windows_slug, "omp");
+        assert_eq!(windows_lookalike_slug, "pi_agent");
 
         let metadata_json: String = storage.conn.query_row_map(
             "SELECT metadata_json FROM conversations WHERE id = ?1",
@@ -29563,7 +29608,11 @@ mod tests {
         )?;
         assert_eq!(token_agent_id, omp_agent_id);
         let metrics_slug: String = storage.conn.query_row_map(
-            "SELECT agent_slug FROM message_metrics WHERE conversation_id = ?1 LIMIT 1",
+            "SELECT mm.agent_slug
+             FROM message_metrics mm
+             JOIN messages m ON m.id = mm.message_id
+             WHERE m.conversation_id = ?1
+             LIMIT 1",
             fparams![remote_conversation_id],
             |row| row.get_typed(0),
         )?;
@@ -29610,6 +29659,114 @@ mod tests {
         assert_eq!(
             canonical_count, 1,
             "the first first-class OMP ingest must merge into the reclassified row"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_omp_reclassification_honors_current_custom_xdg_root() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let xdg_data_home = dir.path().join("custom-xdg");
+        std::fs::create_dir_all(xdg_data_home.join("omp/sessions"))?;
+        let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");
+        let _omp_sessions = set_env_var("PI_CODING_AGENT_SESSION_DIR", "");
+        let _shared_agent = set_env_var("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env_var("CASS_OMP_DATA_ROOT", "");
+        let _config_dir = set_env_var("PI_CONFIG_DIR", "");
+        let _profile = set_env_var("OMP_PROFILE", "");
+        let _legacy_profile = set_env_var("PI_PROFILE", "");
+        let _xdg = set_env_var("XDG_DATA_HOME", xdg_data_home.to_string_lossy());
+
+        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let pi_agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "pi_agent".into(),
+            name: "Pi Agent".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let conversation = |external_id: &str, source_path: PathBuf| Conversation {
+            id: None,
+            agent_slug: "pi_agent".into(),
+            workspace: None,
+            external_id: Some(external_id.into()),
+            title: Some(external_id.into()),
+            source_path,
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_001_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"source":"pi_agent"}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: external_id.into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        let custom_xdg_id = "custom-xdg-legacy-omp";
+        let unrelated_id = "unrelated-omp-directory";
+        let custom_xdg = conversation(
+            custom_xdg_id,
+            xdg_data_home.join("omp/sessions/project/custom-xdg.jsonl"),
+        );
+        let unrelated = conversation(
+            unrelated_id,
+            dir.path()
+                .join("srv/omp/sessions/project/unrelated.jsonl"),
+        );
+        storage.insert_conversations_batched(&[
+            (pi_agent_id, None, &custom_xdg),
+            (pi_agent_id, None, &unrelated),
+        ])?;
+
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 1,
+                lexical_rebuild_required: true,
+            }
+        );
+        let slug_for = |external_id: &str| -> anyhow::Result<String> {
+            let slug = storage
+                .conn
+                .query_row_map(
+                    "SELECT a.slug
+                     FROM conversations c
+                     JOIN agents a ON a.id = c.agent_id
+                     WHERE c.external_id = ?1",
+                    fparams![external_id],
+                    |row| row.get_typed(0),
+                )?;
+            Ok(slug)
+        };
+        assert_eq!(slug_for(custom_xdg_id)?, "omp");
+        assert_eq!(slug_for(unrelated_id)?, "pi_agent");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_omp_v2_preserves_a_pending_v1_derived_asset_rebuild() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        storage.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'analytics_pending')",
+            fparams![PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY],
+        )?;
+
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 0,
+                lexical_rebuild_required: true,
+            },
+            "versioning the path classifier must not forget a crash between the v1 identity swap and lexical publish"
         );
         Ok(())
     }

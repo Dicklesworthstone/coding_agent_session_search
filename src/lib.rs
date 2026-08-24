@@ -9305,6 +9305,10 @@ fn gather_closed_bead_evidence(
         accepted: Vec::new(),
         rejected: 0,
     };
+    // Source-read status is separate from record validity. Missing/unreadable
+    // sources remain fail-open here; coding_agent_session_search-98anf.1 tracks
+    // the bounded, raw-free status contract rather than miscounting an I/O
+    // failure as one malformed record.
     let Ok(body) = std::fs::read_to_string(path) else {
         return gathered;
     };
@@ -9479,6 +9483,8 @@ fn gather_proof_evidence(
         accepted: Vec::new(),
         rejected: 0,
     };
+    // See coding_agent_session_search-98anf.1: read status must be modeled
+    // separately, so an I/O failure is not fabricated as one rejected record.
     let Ok(body) = std::fs::read_to_string(path) else {
         return gathered;
     };
@@ -9499,6 +9505,88 @@ fn gather_proof_evidence(
         }
     }
     gathered
+}
+
+#[cfg(test)]
+mod lessons_live_evidence_tests {
+    use super::{gather_closed_bead_evidence, gather_proof_evidence};
+
+    #[test]
+    fn bead_gatherer_separates_accepted_ignored_and_rejected_lines(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("issues.jsonl");
+        let closed = serde_json::json!({
+            "id": "bd-closed",
+            "title": "landed",
+            "status": " closed ",
+            "closed_at": "2026-08-24T12:00:00Z"
+        });
+        let open = serde_json::json!({
+            "id": "bd-open",
+            "title": "not eligible",
+            "status": "open"
+        });
+        let missing_status = serde_json::json!({"id": "bd-no-status"});
+        let empty_closed_id = serde_json::json!({"id": "  ", "status": "closed"});
+        std::fs::write(
+            &path,
+            format!(
+                "\n{closed}\n{open}\nnot-json\n{missing_status}\n{empty_closed_id}\n\n"
+            ),
+        )?;
+
+        let gathered = gather_closed_bead_evidence(&path);
+        let accepted: Vec<(&str, &str)> = gathered
+            .accepted
+            .iter()
+            .map(|bead| (bead.id.as_str(), bead.status.as_str()))
+            .collect();
+
+        assert_eq!(accepted, [("bd-closed", "closed")]);
+        assert_eq!(gathered.rejected, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn proof_gatherer_accepts_either_shape_and_rejects_malformed_lines(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("proof-manifest.jsonl");
+        let lightweight_with_structured_hint = serde_json::json!({
+            "scenario_id": null,
+            "label": "lightweight",
+            "status": "pass",
+            "path": "lightweight.proof.json",
+            "command": "cargo test --lib"
+        });
+        let structured = serde_json::json!({
+            "scenario_id": "structured",
+            "outcome": "passed",
+            "finished_at_ms": 42
+        });
+        let unsupported = serde_json::json!({
+            "label": "missing-path",
+            "status": "pass"
+        });
+        std::fs::write(
+            &path,
+            format!(
+                "\n{lightweight_with_structured_hint}\n{structured}\nnot-json\n{unsupported}\n\n"
+            ),
+        )?;
+
+        let gathered = gather_proof_evidence(&path);
+        let names: Vec<&str> = gathered
+            .accepted
+            .iter()
+            .map(|proof| proof.name.as_str())
+            .collect();
+
+        assert_eq!(names, ["lightweight", "structured"]);
+        assert_eq!(gathered.rejected, 2);
+        Ok(())
+    }
 }
 
 /// Best-effort read of the last `max` non-merge commit subjects from `repo`.

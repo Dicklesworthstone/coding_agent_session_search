@@ -199,6 +199,35 @@ impl PiFamilyOwnership {
         dedupe_paths(&mut roots);
         roots
     }
+
+    /// Stable, non-reversible identity of the live inputs that can change
+    /// archive ownership. Storage binds its completed legacy-migration marker
+    /// to this value so adding a custom XDG/CASS root later cannot strand an
+    /// old Pi-labelled OMP row behind a stale fast path.
+    #[must_use]
+    pub(crate) fn archive_reclassification_context(&self) -> String {
+        fn add_path(hasher: &mut blake3::Hasher, label: &str, path: Option<&Path>) {
+            hasher.update(label.as_bytes());
+            hasher.update(b"\0");
+            if let Some(path) = path {
+                hasher.update(path.to_string_lossy().as_bytes());
+            }
+            hasher.update(b"\0");
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"cass-pi-family-ownership-v1\0");
+        add_path(&mut hasher, "pi_sessions_dir", self.pi_sessions_dir.as_deref());
+        add_path(&mut hasher, "omp_session_dir", self.omp_session_dir.as_deref());
+        add_path(&mut hasher, "shared_agent_dir", self.shared_agent_dir.as_deref());
+        add_path(&mut hasher, "omp_config_root", self.omp_config_root.as_deref());
+        for (root, profile) in &self.omp_store_roots {
+            add_path(&mut hasher, "omp_store_root", Some(root));
+            hasher.update(profile.as_deref().unwrap_or_default().as_bytes());
+            hasher.update(b"\0");
+        }
+        hasher.finalize().to_hex().to_string()
+    }
 }
 
 fn nonempty_env_path(key: &str) -> Option<PathBuf> {
@@ -218,8 +247,14 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
 }
 
 fn path_parts(path: &Path) -> Vec<String> {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+    // Archived paths may have been written on another operating system. Split
+    // both separator styles explicitly instead of letting the current host's
+    // `Path::components` reinterpret a Windows path as one Unix component.
+    path.as_os_str()
+        .to_string_lossy()
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty() && *component != ".")
+        .map(str::to_owned)
         .collect()
 }
 
@@ -880,6 +915,12 @@ mod tests {
         )));
         assert!(!has_omp_layout_marker(Path::new(
             "/srv/omp/sessions/project/session.jsonl"
+        )));
+        assert!(has_omp_layout_marker(Path::new(
+            r"C:\Users\dev\.omp\agent\sessions\project\session.jsonl"
+        )));
+        assert!(!has_omp_layout_marker(Path::new(
+            r"C:\Users\dev\.omp-cache\agent\sessions\project\session.jsonl"
         )));
     }
 
