@@ -310,11 +310,8 @@ impl FindingOccurrence {
     }
 }
 
-fn ensure_secret_scan_running(running: &Option<Arc<AtomicBool>>) -> Result<()> {
-    if running
-        .as_ref()
-        .is_some_and(|flag| !flag.load(Ordering::Relaxed))
-    {
+fn ensure_secret_scan_running(cancellation_requested: &mut impl FnMut() -> bool) -> Result<()> {
+    if cancellation_requested() {
         bail!("Secret scan cancelled before completion");
     }
     Ok(())
@@ -327,13 +324,27 @@ pub fn scan_database<P: AsRef<Path>>(
     running: Option<Arc<AtomicBool>>,
     progress: Option<&ProgressBar>,
 ) -> Result<SecretScanReport> {
+    scan_database_with_cancel_check(db_path, filters, config, progress, || {
+        running
+            .as_ref()
+            .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+    })
+}
+
+fn scan_database_with_cancel_check<P: AsRef<Path>>(
+    db_path: P,
+    filters: &SecretScanFilters,
+    config: &SecretScanConfig,
+    progress: Option<&ProgressBar>,
+    mut cancellation_requested: impl FnMut() -> bool,
+) -> Result<SecretScanReport> {
     // Cancellation must never be represented as a complete (and potentially
     // false-clean) report. Check before opening the database as well as at
     // every query/row boundary below, and return a distinct error on abort.
-    ensure_secret_scan_running(&running)?;
+    ensure_secret_scan_running(&mut cancellation_requested)?;
     let conn = super::open_existing_sqlite_db(db_path.as_ref())
         .context("Failed to open database for secret scan")?;
-    ensure_secret_scan_running(&running)?;
+    ensure_secret_scan_running(&mut cancellation_requested)?;
 
     let mut findings: Vec<SecretFinding> = Vec::new();
     let mut seen = Vec::new();
@@ -349,14 +360,14 @@ pub fn scan_database<P: AsRef<Path>>(
         "NULL"
     };
     let (conv_where, conv_params) = build_where_clause(filters)?;
-    ensure_secret_scan_running(&running)?;
+    ensure_secret_scan_running(&mut cancellation_requested)?;
     let conv_high_watermark = table_max_id(&conn, "conversations")?;
     let conv_select = format!(
         "SELECT c.id, c.title, c.metadata_json, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {metadata_bin_projection}\n         FROM conversations c\n         LEFT JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id"
     );
     let mut last_conv_id = None;
     while !truncated {
-        ensure_secret_scan_running(&running)?;
+        ensure_secret_scan_running(&mut cancellation_requested)?;
         let page_where = bounded_keyset_page_where(&conv_where, "c.id", last_conv_id);
         let conv_sql = format!(
             "{conv_select}{page_where} ORDER BY c.id LIMIT {SCAN_PAGE_ROWS}"
@@ -374,7 +385,7 @@ pub fn scan_database<P: AsRef<Path>>(
         let page_len = conv_rows.len();
 
         for row in &conv_rows {
-            ensure_secret_scan_running(&running)?;
+            ensure_secret_scan_running(&mut cancellation_requested)?;
             let conv_id: i64 = row.get_typed(0)?;
             let title: Option<String> = row.get_typed(1)?;
             let metadata_json: Option<String> = row.get_typed(2)?;
@@ -447,20 +458,20 @@ pub fn scan_database<P: AsRef<Path>>(
             break;
         }
     }
-    ensure_secret_scan_running(&running)?;
+    ensure_secret_scan_running(&mut cancellation_requested)?;
 
     if !truncated {
         let has_extra_bin = table_has_column(&conn, "messages", "extra_bin")?;
         let extra_bin_projection = if has_extra_bin { "m.extra_bin" } else { "NULL" };
         let (msg_where, msg_params) = build_where_clause(filters)?;
-        ensure_secret_scan_running(&running)?;
+        ensure_secret_scan_running(&mut cancellation_requested)?;
         let msg_high_watermark = table_max_id(&conn, "messages")?;
         let msg_select = format!(
             "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {extra_bin_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id"
         );
         let mut last_msg_id = None;
         while !truncated {
-            ensure_secret_scan_running(&running)?;
+            ensure_secret_scan_running(&mut cancellation_requested)?;
             let page_where = bounded_keyset_page_where(&msg_where, "m.id", last_msg_id);
             let msg_sql =
                 format!("{msg_select}{page_where} ORDER BY m.id LIMIT {SCAN_PAGE_ROWS}");
@@ -477,7 +488,7 @@ pub fn scan_database<P: AsRef<Path>>(
             let page_len = msg_rows.len();
 
             for row in &msg_rows {
-                ensure_secret_scan_running(&running)?;
+                ensure_secret_scan_running(&mut cancellation_requested)?;
                 let msg_id: i64 = row.get_typed(0)?;
                 let msg_idx: i64 = row.get_typed(1)?;
                 let content: String = row.get_typed(2)?;
@@ -551,16 +562,16 @@ pub fn scan_database<P: AsRef<Path>>(
             }
         }
     }
-    ensure_secret_scan_running(&running)?;
+    ensure_secret_scan_running(&mut cancellation_requested)?;
 
     if !truncated && table_exists(&conn, "snippets")? {
         let (snip_where, snip_params) = build_where_clause(filters)?;
-        ensure_secret_scan_running(&running)?;
+        ensure_secret_scan_running(&mut cancellation_requested)?;
         let snip_high_watermark = table_max_id(&conn, "snippets")?;
         let snip_select = "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id";
         let mut last_snippet_id = None;
         while !truncated {
-            ensure_secret_scan_running(&running)?;
+            ensure_secret_scan_running(&mut cancellation_requested)?;
             let page_where = bounded_keyset_page_where(&snip_where, "s.id", last_snippet_id);
             let snip_sql =
                 format!("{snip_select}{page_where} ORDER BY s.id LIMIT {SCAN_PAGE_ROWS}");
@@ -577,7 +588,7 @@ pub fn scan_database<P: AsRef<Path>>(
             let page_len = snip_rows.len();
 
             for row in &snip_rows {
-                ensure_secret_scan_running(&running)?;
+                ensure_secret_scan_running(&mut cancellation_requested)?;
                 let snippet_id: i64 = row.get_typed(0)?;
                 let snippet_text: String = row.get_typed(1)?;
                 let msg_id: i64 = row.get_typed(2)?;
@@ -621,7 +632,7 @@ pub fn scan_database<P: AsRef<Path>>(
             }
         }
     }
-    ensure_secret_scan_running(&running)?;
+    ensure_secret_scan_running(&mut cancellation_requested)?;
 
     findings.sort_by(|a, b| {
         a.severity
