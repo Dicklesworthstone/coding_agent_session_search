@@ -28,13 +28,32 @@ fn write_omp_session(agent_root: &Path, id: &str, title: &str) -> PathBuf {
     path
 }
 
+fn write_omp_subagent(main_session: &Path, id: &str) -> PathBuf {
+    let subagent_dir = main_session.with_extension("");
+    fs::create_dir_all(&subagent_dir).expect("create OMP sub-agent directory");
+    let path = subagent_dir.join("Researcher.jsonl");
+    let transcript = [
+        json!({"type":"session","version":3,"id":id,"timestamp":"2026-08-23T12:01:00Z","cwd":"/projects/cass"}),
+        json!({"type":"model_change","timestamp":"2026-08-23T12:01:01Z","model":"openrouter/stealth/ox-alpha"}),
+        json!({"type":"message","timestamp":"2026-08-23T12:01:02Z","message":{"role":"user","content":"OMP sub-agent task"}}),
+        json!({"type":"message","timestamp":"2026-08-23T12:01:03Z","message":{"role":"assistant","model":"openrouter/stealth/ox-alpha","content":"sub-agent done"}}),
+    ]
+    .into_iter()
+    .map(|entry| entry.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    fs::write(&path, format!("{transcript}\n")).expect("write OMP sub-agent session");
+    path
+}
+
 #[test]
 fn omp_v18_profiles_are_first_class_and_not_scanned_by_pi_agent() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("copied-home");
     let default_agent = home.join(".omp/agent");
     let profile_agent = home.join(".omp/profiles/work/agent");
-    write_omp_session(&default_agent, "omp-default", "Default OMP session");
+    let default_session = write_omp_session(&default_agent, "omp-default", "Default OMP session");
+    write_omp_subagent(&default_session, "omp-default-researcher");
     write_omp_session(&profile_agent, "omp-work", "Profile OMP session");
 
     let ctx = ScanContext::with_roots(
@@ -45,17 +64,30 @@ fn omp_v18_profiles_are_first_class_and_not_scanned_by_pi_agent() {
     let mut conversations = OmpConnector::new().scan(&ctx).expect("scan OMP fixtures");
     conversations.sort_by(|left, right| left.external_id.cmp(&right.external_id));
 
-    assert_eq!(conversations.len(), 2);
+    assert_eq!(conversations.len(), 3);
     for conversation in &conversations {
         assert_eq!(conversation.agent_slug, "omp");
         assert_eq!(conversation.metadata["source"], "omp");
-        assert_eq!(conversation.metadata["model_id"], "openrouter/stealth/ox-alpha");
+        assert_eq!(
+            conversation.metadata["model_id"],
+            "openrouter/stealth/ox-alpha"
+        );
     }
     let profile = conversations
         .iter()
         .find(|conversation| conversation.title.as_deref() == Some("Profile OMP session"))
         .expect("profile conversation");
     assert_eq!(profile.metadata["profile"], "work");
+    assert!(
+        conversations.iter().any(|conversation| {
+            conversation.source_path.ends_with("Researcher.jsonl")
+                && conversation
+                    .messages
+                    .iter()
+                    .any(|message| message.content == "OMP sub-agent task")
+        }),
+        "OMP sub-agent transcripts must remain independently searchable"
+    );
 
     let pi_conversations = PiAgentConnector::new()
         .scan(&ctx)
@@ -98,6 +130,9 @@ fn omp_token_extraction_uses_the_pi_family_model_schema() {
         "answer",
         "assistant",
     );
-    assert_eq!(usage.model_name.as_deref(), Some("openrouter/stealth/ox-alpha"));
+    assert_eq!(
+        usage.model_name.as_deref(),
+        Some("openrouter/stealth/ox-alpha")
+    );
     assert_eq!(usage.provider.as_deref(), Some("openrouter"));
 }

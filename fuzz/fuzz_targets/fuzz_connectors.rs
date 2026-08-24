@@ -124,8 +124,12 @@ fn write_connector_layout(root: &Path, slug: &str, payload: &[u8]) {
                 root.join(".pi/agent/sessions/project/2025-12-01T10-00-00_fuzz.jsonl"),
                 payload,
             );
+        }
+        "omp" => {
             write_payload(
-                root.join(".omp/agent/sessions/project/2025-12-01T10-00-00_fuzz.jsonl"),
+                root.join(
+                    ".omp/profiles/fuzz/agent/sessions/project/2025-12-01T10-00-00_fuzz.jsonl",
+                ),
                 payload,
             );
         }
