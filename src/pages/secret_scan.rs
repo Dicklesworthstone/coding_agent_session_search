@@ -1189,6 +1189,13 @@ fn compile_regexes(patterns: &[String], label: &str) -> Result<Vec<Regex>> {
 mod tests {
     use super::*;
 
+    fn redact_context_for_test(text: &str, start: usize, end: usize, window: usize) -> String {
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)
+            .expect("construct test secret-scan config");
+        let redactions = collect_context_redactions(text, &config);
+        redact_context(text, start, end, window, &redactions)
+    }
+
     // =========================================================================
     // Shannon entropy tests
     // =========================================================================
@@ -1264,7 +1271,7 @@ mod tests {
 
     #[test]
     fn redact_context_empty_text_returns_empty() {
-        assert_eq!(redact_context("", 0, 0, 120, "[REDACTED]"), "");
+        assert_eq!(redact_context_for_test("", 0, 0, 120), "");
     }
 
     #[test]
@@ -1272,8 +1279,8 @@ mod tests {
         let text = "The key is sk-ABCDEFGHIJ and more";
         let start = 11;
         let end = 25;
-        let result = redact_context(text, start, end, 120, "[REDACTED]");
-        assert!(result.contains("[REDACTED]"), "result: {}", result);
+        let result = redact_context_for_test(text, start, end, 120);
+        assert!(result.contains(REDACTED_CONTEXT), "result: {}", result);
         assert!(
             !result.contains("sk-ABCDEFGHIJ"),
             "secret should be removed: {}",
@@ -1284,20 +1291,64 @@ mod tests {
     #[test]
     fn redact_context_match_at_start() {
         let text = "sk-SECRET rest of the text";
-        let result = redact_context(text, 0, 9, 120, "[R]");
-        assert!(result.starts_with("[R]"), "result: {}", result);
+        let result = redact_context_for_test(text, 0, 9, 120);
+        assert!(result.starts_with(REDACTED_CONTEXT), "result: {}", result);
     }
 
     #[test]
     fn redact_context_match_at_end() {
         let text = "prefix sk-SECRET";
-        let result = redact_context(text, 7, 16, 120, "[R]");
-        assert!(result.ends_with("[R]"), "result: {}", result);
+        let result = redact_context_for_test(text, 7, 16, 120);
+        assert!(result.ends_with(REDACTED_CONTEXT), "result: {}", result);
     }
 
     #[test]
     fn redact_context_start_beyond_text_returns_empty() {
-        assert_eq!(redact_context("short", 10, 15, 120, "[R]"), "");
+        assert_eq!(redact_context_for_test("short", 10, 15, 120), "");
+    }
+
+    #[test]
+    fn redact_context_masks_private_key_body_and_adjacent_secret_classes() {
+        let focal = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789";
+        let private_body = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAA";
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature_123456789";
+        let entropy = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let text = format!(
+            "before {focal} middle -----BEGIN OPENSSH PRIVATE KEY-----\n{private_body}\n-----END OPENSSH PRIVATE KEY----- after {jwt} tail {entropy}"
+        );
+        let start = text.find(focal).expect("focal fixture offset");
+        let result = redact_context_for_test(&text, start, start + focal.len(), text.len() * 2);
+
+        for raw_secret in [focal, private_body, jwt, entropy] {
+            assert!(
+                !result.contains(raw_secret),
+                "context leaked adjacent secret {raw_secret:?}: {result}"
+            );
+        }
+        assert!(
+            result.matches(REDACTED_CONTEXT).count() >= 3,
+            "distinct secret ranges should be visibly masked: {result}"
+        );
+    }
+
+    #[test]
+    fn redact_context_masks_allowlisted_and_custom_denylist_neighbors() {
+        let allowlisted = "sk-ALLOWLISTabcdefghijklmnopqrstuvwxyz012345";
+        let denied = "INTERNAL_SECRET_ABC123XYZ789";
+        let focal = "AKIAIOSFODNN7EXAMPLE";
+        let text = format!("{allowlisted} before {focal} after {denied}");
+        let config = SecretScanConfig::from_inputs_with_env(
+            &["sk-ALLOWLIST.*".to_string()],
+            &["INTERNAL_SECRET_[A-Z0-9]+".to_string()],
+            false,
+        )
+        .expect("construct test secret-scan config");
+        let redactions = collect_context_redactions(&text, &config);
+        let start = text.find(focal).expect("focal fixture offset");
+        let result = redact_context(&text, start, start + focal.len(), text.len() * 2, &redactions);
+
+        assert!(!result.contains(allowlisted), "allowlisted neighbor leaked");
+        assert!(!result.contains(denied), "denylisted neighbor leaked");
     }
 
     // =========================================================================

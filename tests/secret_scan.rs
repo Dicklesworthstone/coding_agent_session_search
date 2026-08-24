@@ -135,6 +135,65 @@ mod tests {
         Ok(())
     }
 
+    fn setup_db_with_binary_metadata(
+        path: &Path,
+        metadata_json: &str,
+        metadata_bin: &[u8],
+        extra_json: &str,
+        extra_bin: &[u8],
+    ) -> Result<()> {
+        let conn = open_db(path)?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL
+            );
+            CREATE TABLE workspaces (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL
+            );
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                workspace_id INTEGER,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                started_at INTEGER,
+                metadata_json TEXT,
+                metadata_bin BLOB
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                extra_json TEXT,
+                extra_bin BLOB
+            );
+            "#,
+        )?;
+
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/tmp/project')")?;
+        conn.execute_compat(
+            r#"INSERT INTO conversations (
+                id, agent_id, workspace_id, title, source_path, started_at,
+                metadata_json, metadata_bin
+            ) VALUES (1, 1, 1, 'Binary metadata', '/tmp/project/session.json',
+                1700000000000, ?1, ?2)"#,
+            fparams![metadata_json, metadata_bin],
+        )?;
+        conn.execute_compat(
+            r#"INSERT INTO messages (
+                id, conversation_id, idx, content, extra_json, extra_bin
+            ) VALUES (1, 1, 0, 'safe content', ?1, ?2)"#,
+            fparams![extra_json, extra_bin],
+        )?;
+
+        Ok(())
+    }
+
     fn no_filters() -> SecretScanFilters {
         SecretScanFilters {
             agents: None,
@@ -182,6 +241,33 @@ mod tests {
 
     fn gh_fixture() -> String {
         fixture(&["ghp_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"])
+    }
+
+    fn fine_grained_gh_fixture() -> String {
+        fixture(&["github", "_pat_", "11AA22bb33CC44dd55EE66ff77GG88hh"])
+    }
+
+    fn project_oai_fixture() -> String {
+        fixture(&["sk-", "proj-", "AbCdEfGhIjKlMnOpQrStUvWxYz_12345"])
+    }
+
+    fn segmented_anthropic_fixture() -> String {
+        fixture(&["sk-", "ant-", "api03-", "AbCdEfGhIjKlMnOpQrStUvWxYz_12345"])
+    }
+
+    fn aws_session_fixture() -> String {
+        fixture(&[
+            "IQoJb3JpZ2luX2VjEExampleSessionToken",
+            "1234567890+/=",
+        ])
+    }
+
+    fn slack_xoxo_fixture() -> String {
+        fixture(&["xox", "o-", "1234567890-ABCDEFGHIJ"])
+    }
+
+    fn stripe_live_fixture() -> String {
+        fixture(&["sk_", "live_", "AbCdEfGhIjKlMnOpQrStUvWxYz123456"])
     }
 
     fn jwt_fixture() -> String {
@@ -537,6 +623,65 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn detects_current_segmented_and_provider_credential_formats() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let mongodb_url = database_url_fixture(
+            "mongodb+srv",
+            "service:credential",
+            "cluster.example.net",
+            "production",
+        );
+        let amqp_url = database_url_fixture(
+            "amqp",
+            "worker:credential",
+            "queue.example.net",
+            "vhost",
+        );
+        let content = format!(
+            "{} {} {} aws_session_token={} {} {} {} {}",
+            project_oai_fixture(),
+            segmented_anthropic_fixture(),
+            fine_grained_gh_fixture(),
+            aws_session_fixture(),
+            slack_xoxo_fixture(),
+            stripe_live_fixture(),
+            mongodb_url,
+            amqp_url,
+        );
+        setup_db(&db_path, &content)?;
+
+        let report = scan(&db_path)?;
+        for expected_kind in [
+            "openai_key",
+            "anthropic_key",
+            "github_pat",
+            "aws_session_token",
+            "slack_token",
+            "stripe_key",
+        ] {
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.kind == expected_kind),
+                "scanner missed current credential kind {expected_kind}: {:#?}",
+                report.findings
+            );
+        }
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|finding| finding.kind == "database_url")
+                .count(),
+            2,
+            "mongodb+srv and amqp credential URLs should both be detected"
+        );
+        Ok(())
+    }
+
     // =========================================================================
     // Scanning location tests (br-ig84)
     // =========================================================================
@@ -649,6 +794,93 @@ mod tests {
         assert!(
             extra_finding.is_some(),
             "should detect secret in message extra_json"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn binary_metadata_is_authoritative_and_scanned_before_legacy_json() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let metadata_bin = rmp_serde::to_vec(&serde_json::json!({
+            "credential": aws_access_fixture(),
+        }))?;
+        let extra_bin = rmp_serde::to_vec(&serde_json::json!({
+            "credential": fine_grained_gh_fixture(),
+        }))?;
+        let legacy_metadata = serde_json::json!({ "credential": oai_fixture() }).to_string();
+        let legacy_extra =
+            serde_json::json!({ "credential": segmented_anthropic_fixture() }).to_string();
+        setup_db_with_binary_metadata(
+            &db_path,
+            &legacy_metadata,
+            &metadata_bin,
+            &legacy_extra,
+            &extra_bin,
+        )?;
+
+        let report = scan(&db_path)?;
+        assert!(
+            report.findings.iter().any(|finding| {
+                finding.kind == "aws_access_key_id"
+                    && finding.location
+                        == coding_agent_search::pages::secret_scan::SecretLocation::ConversationMetadata
+            }),
+            "authoritative metadata_bin secret should be scanned"
+        );
+        assert!(
+            report.findings.iter().any(|finding| {
+                finding.kind == "github_pat"
+                    && finding.location
+                        == coding_agent_search::pages::secret_scan::SecretLocation::MessageMetadata
+            }),
+            "authoritative extra_bin secret should be scanned"
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "openai_key"),
+            "legacy metadata_json must not override a non-empty metadata_bin"
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "anthropic_key"),
+            "legacy extra_json must not override a non-empty extra_bin"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_nonempty_metadata_bin_fails_closed() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let malformed = [0xc1_u8];
+        let safe_extra = rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
+        setup_db_with_binary_metadata(&db_path, "{}", &malformed, "{}", &safe_extra)?;
+
+        let error = scan(&db_path).expect_err("malformed authoritative metadata must fail");
+        assert!(
+            error.to_string().contains("conversations.metadata_bin"),
+            "error should identify malformed authoritative column: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_nonempty_extra_bin_fails_closed() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let safe_metadata = rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
+        let malformed = [0xc1_u8];
+        setup_db_with_binary_metadata(&db_path, "{}", &safe_metadata, "{}", &malformed)?;
+
+        let error = scan(&db_path).expect_err("malformed authoritative message metadata must fail");
+        assert!(
+            error.to_string().contains("messages.extra_bin"),
+            "error should identify malformed authoritative column: {error:#}"
         );
         Ok(())
     }
@@ -968,6 +1200,65 @@ mod tests {
                 finding.context,
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn finding_context_and_pattern_are_safe_for_adjacent_secret_classes() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let focal = project_oai_fixture();
+        let private_body = fixture(&[
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAA",
+            "Bbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQyNTUxOQ",
+        ]);
+        let private_block = format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{private_body}\n-----END OPENSSH PRIVATE KEY-----"
+        );
+        let denied_secret = "INTERNAL_SECRET_ABC123XYZ789";
+        let entropy_secret =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let content = format!(
+            "safe prefix {focal} private {private_block} denied {denied_secret} entropy {entropy_secret} safe suffix"
+        );
+        setup_db(&db_path, &content)?;
+
+        let raw_denylist = "INTERNAL_SECRET_[A-Z0-9]+".to_string();
+        let mut config =
+            SecretScanConfig::from_inputs_with_env(&[], std::slice::from_ref(&raw_denylist), false)?;
+        config.context_bytes = content.len() * 2;
+        let report = scan_database(&db_path, &no_filters(), &config, None, None)?;
+        assert!(
+            report.findings.iter().any(|finding| {
+                finding.kind == "denylist" && finding.pattern == "custom_denylist"
+            }),
+            "custom denylist finding should use an opaque pattern identifier"
+        );
+
+        for finding in &report.findings {
+            for raw_secret in [
+                focal.as_str(),
+                private_body.as_str(),
+                denied_secret,
+                entropy_secret,
+            ] {
+                assert!(
+                    !finding.context.contains(raw_secret),
+                    "{} context leaked adjacent secret {raw_secret:?}: {}",
+                    finding.kind,
+                    finding.context,
+                );
+            }
+        }
+
+        let serialized = serde_json::to_string(&report)?;
+        assert!(
+            !serialized.contains(&raw_denylist),
+            "report serialized raw custom denylist regex"
+        );
+        assert!(!serialized.contains(&private_body));
+        assert!(!serialized.contains(denied_secret));
+        assert!(!serialized.contains(entropy_secret));
         Ok(())
     }
 
