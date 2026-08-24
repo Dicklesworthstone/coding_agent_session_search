@@ -17558,6 +17558,49 @@ mod analytics_rebuild_since_tests {
         assert!(err.message.contains("--until"), "{}", err.message);
         assert!(err.message.contains("--agent"), "{}", err.message);
     }
+
+    /// The window only applies to Track A, so the JSON payload must advertise
+    /// `since_ms`/`since_day_id` exactly when Track A ran with one — never for
+    /// a Track-B-only run, where automation would otherwise read a window as
+    /// honored (GH #412).
+    #[test]
+    fn payload_advertises_window_only_when_track_a_used_it() {
+        use crate::storage::sqlite::{FrankenStorage, SqliteStorage};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        drop(FrankenStorage::open(&db_path).expect("create empty canonical db"));
+
+        let mut windowed = common();
+        windowed.days = Some(2);
+
+        for (track, expect_window) in [
+            (AnalyticsTrack::A, true),
+            (AnalyticsTrack::All, true),
+            (AnalyticsTrack::B, false),
+        ] {
+            let payload = run_analytics_rebuild(&windowed, false, track, Some(&db_path))
+                .unwrap_or_else(|e| panic!("{track:?}: {}", e.message));
+            let has_ms = payload.get("since_ms").is_some();
+            let has_day = payload.get("since_day_id").is_some();
+            assert_eq!(has_ms, expect_window, "{track:?}: {payload}");
+            assert_eq!(has_day, expect_window, "{track:?}: {payload}");
+            if expect_window {
+                // Both fields describe the same day-aligned cutoff.
+                let ms = payload["since_ms"].as_i64().unwrap();
+                let day = payload["since_day_id"].as_i64().unwrap();
+                assert_eq!(SqliteStorage::millis_from_day_id(day), ms, "{payload}");
+                assert_eq!(SqliteStorage::day_id_from_millis(ms), day, "{payload}");
+            }
+        }
+
+        // No window requested => never advertised, whichever track ran.
+        let payload = run_analytics_rebuild(&common(), false, AnalyticsTrack::All, Some(&db_path))
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        assert!(payload.get("since_ms").is_none(), "{payload}");
+        assert!(payload.get("since_day_id").is_none(), "{payload}");
+        assert_eq!(payload["tracks_rebuilt"], serde_json::json!(["a", "b"]));
+    }
 }
 
 #[cfg(test)]
@@ -78003,6 +78046,38 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    #[serial]
+    fn resume_rejects_invalid_canonical_omp_profile_without_falling_back_to_pi_profile() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions_root = temp.path().join("launch-sessions");
+        let sessions_dir = sessions_root.join("-projects-cass");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_file = sessions_dir.join("2026-08-23T00-00-00_custom.jsonl");
+        std::fs::write(&session_file, r#"{"type":"session","id":"omp-custom-id"}"#)
+            .expect("write session file");
+        let _session_dir = set_env(
+            "PI_CODING_AGENT_SESSION_DIR",
+            sessions_root.to_string_lossy().as_ref(),
+        );
+        let _legacy_profile = set_env("PI_PROFILE", "legacy");
+        let _canonical_profile = set_env("OMP_PROFILE", "con");
+
+        let target = resolve_resume_target(&session_file, None).expect("resolve");
+        assert_eq!(target.agent, "omp");
+        assert_eq!(
+            target.argv,
+            vec![
+                "omp".to_string(),
+                "--session-dir".to_string(),
+                sessions_root.display().to_string(),
+                "--resume".to_string(),
+                "omp-custom-id".to_string(),
+            ],
+            "invalid OMP_PROFILE must select the default profile and suppress PI_PROFILE fallback"
+        );
+    }
+
+    #[test]
     fn resume_detects_pi_mono_from_pi_path_and_reads_session_id() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sessions_dir = temp.path().join(".pi/agent/sessions");
@@ -94718,13 +94793,39 @@ struct DetectedAgent {
     reason: String,
 }
 
+fn normalize_omp_profile_name(profile: &str) -> Option<String> {
+    let name = profile.trim();
+    if name.is_empty() || name == "default" || name == "." || name == ".." {
+        return None;
+    }
+    if name.ends_with('.') || name.len() > 64 {
+        return None;
+    }
+    let mut chars = name.chars();
+    if !chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
+    {
+        return None;
+    }
+    let base = name.split('.').next().unwrap_or(name);
+    let upper = base.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit());
+    (!reserved).then(|| name.to_string())
+}
+
 fn active_omp_profile_from_env() -> Option<String> {
     let raw = match dotenvy::var("OMP_PROFILE") {
         Ok(value) => Some(value),
         Err(_) => dotenvy::var("PI_PROFILE").ok(),
     }?;
-    let profile = raw.trim();
-    (!profile.is_empty() && profile != "default").then(|| profile.to_string())
+    normalize_omp_profile_name(&raw)
 }
 
 fn configured_omp_session_root(path: &Path) -> Option<PathBuf> {
