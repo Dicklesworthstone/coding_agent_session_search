@@ -188,7 +188,7 @@ fn test_wrong_recovery_key_error() {
         create_test_archive_with_recovery(temp_dir.path(), TEST_PASSWORD, TEST_RECOVERY_SECRET);
 
     let config = load_config(&archive_dir).expect("Should load config");
-    let result = DecryptionEngine::unlock_with_recovery(config, b"wrong-recovery-key");
+    let result = DecryptionEngine::unlock_with_recovery(config, &[0xEE; 32]);
 
     assert!(result.is_err(), "Should fail with wrong recovery key");
 }

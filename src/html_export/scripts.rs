@@ -325,27 +325,28 @@ const Theme = {
         this.toggle = $('#theme-toggle');
         if (!this.toggle) return;
 
-        // Load saved preference or system preference
-        const saved = localStorage.getItem('cass-theme');
-        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-        const theme = saved || (prefersDark ? 'dark' : 'light');
+        // A saved user choice overrides the export's configured default. Some
+        // browsers deny localStorage access for file:// documents, so storage
+        // is an optional enhancement rather than an initialization dependency.
+        let saved = null;
+        try {
+            saved = localStorage.getItem('cass-theme');
+        } catch (_) {}
+        if (saved !== 'dark' && saved !== 'light') saved = null;
+        const configured = document.documentElement.getAttribute('data-theme');
+        const theme = saved || (configured === 'light' ? 'light' : 'dark');
         document.documentElement.setAttribute('data-theme', theme);
 
         this.toggle.addEventListener('click', () => this.toggleTheme());
-
-        // Listen for system theme changes
-        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
-            if (!localStorage.getItem('cass-theme')) {
-                document.documentElement.setAttribute('data-theme', e.matches ? 'dark' : 'light');
-            }
-        });
     },
 
     toggleTheme() {
         const current = document.documentElement.getAttribute('data-theme');
         const next = current === 'dark' ? 'light' : 'dark';
         document.documentElement.setAttribute('data-theme', next);
-        localStorage.setItem('cass-theme', next);
+        try {
+            localStorage.setItem('cass-theme', next);
+        } catch (_) {}
     }
 };"#
     .to_string()
@@ -928,6 +929,9 @@ const Crypto = {
             const plaintext = dec.decode(decrypted);
             const conversation = $('#conversation');
             conversation.innerHTML = plaintext;
+            if (typeof Prism !== 'undefined' && typeof Prism.highlightAllUnder === 'function') {
+                Prism.highlightAllUnder(conversation);
+            }
 
             // Hide modal
             this.modal.hidden = true;
@@ -1111,7 +1115,15 @@ mod tests {
         let bundle = generate_scripts(&opts);
 
         assert_inline_js_contains!(bundle, "const Theme");
-        assert_inline_js_contains!(bundle, "localStorage.getItem");
+        assert_inline_js_contains!(bundle, "configured === 'light' ? 'light' : 'dark'");
+        assert_inline_js_contains!(
+            bundle,
+            "try {\n            saved = localStorage.getItem('cass-theme');\n        } catch (_) {}"
+        );
+        assert_inline_js_contains!(
+            bundle,
+            "try {\n            localStorage.setItem('cass-theme', next);\n        } catch (_) {}"
+        );
     }
 
     #[test]
@@ -1298,6 +1310,11 @@ mod tests {
         // After decryption, both ToolCalls and ToolPopovers should be reinitialized
         assert_inline_js_contains!(bundle, "ToolCalls.init()");
         assert_inline_js_contains!(bundle, "ToolPopovers.init()");
+        assert_inline_js_contains!(
+            bundle,
+            "typeof Prism !== 'undefined' && typeof Prism.highlightAllUnder === 'function'"
+        );
+        assert_inline_js_contains!(bundle, "Prism.highlightAllUnder(conversation);");
         assert_inline_js_contains!(bundle, "__cassAttachCodeCopyButtons();");
         assert_inline_js_contains!(bundle, "const __cassAttachCodeCopyButtons");
         assert_inline_js_contains!(bundle, "pre.querySelector('.copy-code-btn')");

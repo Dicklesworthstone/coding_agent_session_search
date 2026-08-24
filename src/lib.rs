@@ -1346,7 +1346,7 @@ pub enum Commands {
         include_skills: bool,
 
         /// Default theme (dark or light)
-        #[arg(long, default_value = "dark")]
+        #[arg(long, default_value = "dark", value_parser = ["dark", "light"])]
         theme: String,
 
         /// Validate without writing file
@@ -98169,6 +98169,7 @@ fn run_export_html(
         syntax_highlighting: true,
         include_search: true,
         include_theme_toggle: true,
+        default_theme: theme.to_string(),
         encrypt,
         print_styles: true,
         agent_name: agent_name.clone(),
@@ -108149,7 +108150,7 @@ fn run_models_backfill(
     use crate::search::model_download::ModelManifest;
     use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
     use crate::search::semantic_manifest::{SemanticManifest, TierKind};
-    use crate::storage::sqlite::FrankenStorage;
+    use crate::storage::sqlite::{FrankenStorage, SemanticIdentityTier};
     use colored::Colorize;
 
     if batch_conversations == 0 {
@@ -108341,6 +108342,38 @@ fn run_models_backfill(
             ),
             retryable: true,
         })?;
+
+    if outcome.published {
+        let identity_tier = match outcome.tier {
+            TierKind::Fast => SemanticIdentityTier::Fast,
+            TierKind::Quality => SemanticIdentityTier::Quality,
+        };
+        if storage
+            .semantic_identity_rebuild_required(identity_tier)
+            .map_err(|e| CliError {
+                code: 5,
+                kind: CliErrorKind::Storage.kind_str(),
+                message: format!("Failed to inspect semantic identity rebuild state: {e}"),
+                hint: Some(
+                    "Retry the semantic backfill; the published artifact is preserved".into(),
+                ),
+                retryable: true,
+            })?
+        {
+            storage
+                .complete_semantic_identity_rebuild(identity_tier)
+                .map_err(|e| CliError {
+                    code: 5,
+                    kind: CliErrorKind::Storage.kind_str(),
+                    message: format!("Failed to complete semantic identity rebuild: {e}"),
+                    hint: Some(
+                        "Retry the semantic backfill; stale semantic serving remains fail-closed"
+                            .into(),
+                    ),
+                    retryable: true,
+                })?;
+        }
+    }
 
     let progress_pct = outcome.progress_pct();
     let status = if outcome.published {

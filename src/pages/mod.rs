@@ -134,8 +134,10 @@ fn sqlite_wal_segment_artifact_paths(path: &Path) -> Result<Vec<PathBuf>> {
         .ok_or_else(|| {
             anyhow::anyhow!("SQLite artifact path has no file name: {}", path.display())
         })?;
-    let mut segment_prefix = db_name.to_os_string();
-    segment_prefix.push("-wal-seg-");
+    // `fsqlite-wal` 0.3.8's `segment_path` and `list_segments` both derive
+    // this filename through `to_string_lossy()`. Mirror that producer rule so
+    // a non-UTF-8 database basename cannot hide its actual UTF-8 segment name.
+    let segment_prefix = format!("{}-wal-seg-", db_name.to_string_lossy());
 
     let entries = std::fs::read_dir(parent).with_context(|| {
         format!(
@@ -163,8 +165,8 @@ fn sqlite_wal_segment_artifact_paths(path: &Path) -> Result<Vec<PathBuf>> {
         })?;
         if entry
             .file_name()
-            .as_encoded_bytes()
-            .starts_with(segment_prefix.as_encoded_bytes())
+            .to_string_lossy()
+            .starts_with(&segment_prefix)
         {
             if matches.len() >= SQLITE_WAL_SEGMENT_MATCH_LIMIT {
                 bail!(
@@ -353,6 +355,27 @@ mod tests {
         let mut expected = vec![first, malformed_epoch];
         expected.sort_unstable();
         assert_eq!(sqlite_wal_segment_artifact_paths(&db)?, expected);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_wal_segment_paths_mirror_lossy_non_utf8_producer_basename() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir()?;
+        let db = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"export-\xff.db".to_vec()));
+        let producer_segment = temp.path().join("export-\u{fffd}.db-wal-seg-42");
+        std::fs::write(&db, b"main")?;
+        std::fs::write(&producer_segment, b"segment")?;
+
+        assert_eq!(
+            sqlite_wal_segment_artifact_paths(&db)?,
+            vec![producer_segment],
+            "scanner must mirror fsqlite-wal 0.3.8's lossy segment basename"
+        );
         Ok(())
     }
 

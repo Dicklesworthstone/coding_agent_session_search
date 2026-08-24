@@ -2044,6 +2044,11 @@ mod tests {
     fn encrypted_config_for_files(files: Vec<&str>) -> EncryptionConfig {
         use base64::prelude::*;
         let chunk_count = files.len();
+        let total_plaintext_size = if chunk_count == 0 {
+            0
+        } else {
+            ((chunk_count - 1) * 1024 + 1) as u64
+        };
         EncryptionConfig {
             version: crate::pages::encrypt::SCHEMA_VERSION,
             // The shared payload-format validation decodes these as base64
@@ -2055,11 +2060,19 @@ mod tests {
             payload: crate::pages::encrypt::PayloadMeta {
                 chunk_size: 1024,
                 chunk_count,
-                total_compressed_size: 0,
-                total_plaintext_size: 0,
+                total_compressed_size: chunk_count as u64,
+                total_plaintext_size,
                 files: files.into_iter().map(str::to_string).collect(),
             },
-            key_slots: Vec::new(),
+            key_slots: vec![crate::pages::encrypt::KeySlot {
+                id: 0,
+                slot_type: crate::pages::encrypt::SlotType::Password,
+                kdf: crate::pages::encrypt::KdfAlgorithm::Argon2id,
+                salt: BASE64_STANDARD.encode([0u8; 16]),
+                wrapped_dek: BASE64_STANDARD.encode([0u8; 48]),
+                nonce: BASE64_STANDARD.encode([0u8; 12]),
+                argon2_params: Some(crate::pages::encrypt::Argon2Params::default()),
+            }],
         }
     }
 

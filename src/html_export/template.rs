@@ -46,6 +46,9 @@ pub struct ExportOptions {
     /// Include theme toggle (light/dark)
     pub include_theme_toggle: bool,
 
+    /// Initial theme used when the browser has no saved export preference
+    pub default_theme: String,
+
     /// Encrypt the conversation content
     pub encrypt: bool,
 
@@ -199,6 +202,7 @@ impl Default for ExportOptions {
             syntax_highlighting: true,
             include_search: true,
             include_theme_toggle: true,
+            default_theme: "dark".to_string(),
             encrypt: false,
             print_styles: true,
             agent_name: None,
@@ -384,10 +388,15 @@ impl HtmlTemplate {
         } else {
             ""
         };
+        let default_theme = if options.default_theme.trim().eq_ignore_ascii_case("light") {
+            "light"
+        } else {
+            "dark"
+        };
 
         format!(
             r#"<!DOCTYPE html>
-<html lang="en" data-theme="dark"{html_classes}>
+<html lang="en" data-theme="{default_theme}"{html_classes}>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -426,6 +435,7 @@ impl HtmlTemplate {
 </body>
 </html>"#,
             title = html_escape(&self.title),
+            default_theme = default_theme,
             critical_css = critical_css,
             cdn_scripts = cdn_scripts,
             print_styles = print_styles,
@@ -824,6 +834,7 @@ mod tests {
         assert!(opts.include_cdn);
         assert!(opts.syntax_highlighting);
         assert!(!opts.encrypt);
+        assert_eq!(opts.default_theme, "dark");
     }
 
     #[test]
@@ -880,10 +891,14 @@ mod tests {
             metadata: TemplateMetadata::default(),
         };
 
-        let html = template.render(&ExportOptions::default());
+        let html = template.render(&ExportOptions {
+            default_theme: "light".to_string(),
+            ..ExportOptions::default()
+        });
 
         assert!(html.starts_with("<!DOCTYPE html>"));
         assert!(html.contains("<html lang=\"en\""));
+        assert!(html.contains("data-theme=\"light\""));
         assert!(html.contains("Test Session"));
         assert!(html.contains("Hello, World!"));
         assert!(html.contains("background: #1a1b26"));

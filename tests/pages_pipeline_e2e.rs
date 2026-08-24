@@ -18,7 +18,7 @@ use util::ConversationFixtureBuilder;
 
 const TEST_PASSWORD: &str = "test-password";
 const TEST_PASSWORD_2: &str = "second-password";
-const TEST_RECOVERY_SECRET: &[u8] = b"recovery-secret-bytes";
+const TEST_RECOVERY_SECRET: &[u8] = b"recovery-secret-bytes-32-padding!";
 
 struct PipelineArtifacts {
     export_db_path: std::path::PathBuf,

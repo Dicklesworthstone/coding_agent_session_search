@@ -1,9 +1,8 @@
-use super::{
-    sqlite_artifact_paths, sqlite_content_artifact_paths, sqlite_runtime_artifact_paths,
-    sqlite_wal_segment_artifact_paths,
-};
+use super::sqlite_artifact_paths;
 #[cfg(test)]
-use super::sqlite_fixed_artifact_paths;
+use super::{
+    sqlite_content_artifact_paths, sqlite_fixed_artifact_paths, sqlite_runtime_artifact_paths,
+};
 use crate::franken_sync::compat::{
     ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt,
 };
@@ -17,7 +16,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -565,9 +564,12 @@ impl ExportEngine {
             dest.close()
                 .context("Failed to close and checkpoint Pages export builder")?;
             enforce_private_candidate_permissions(&temp_output_path)?;
+            // Cleanup may remove the main path before reporting a companion
+            // error. Relinquish pathname ownership before it starts so an
+            // error path never retries against a possible replacement entry.
+            builder_owned = false;
             cleanup_sqlite_temp_artifacts(&builder_path)
                 .context("Failed to remove closed Pages export builder artifacts")?;
-            builder_owned = false;
             finalize_staged_sqlite_sidecars(&temp_output_path)
                 .context("Failed to finalize staged Pages export as one SQLite main file")?;
 
@@ -825,9 +827,9 @@ fn unpredictable_atomic_sidecar_path(
     )))
 }
 
-fn cleanup_sqlite_sidecars(path: &Path) -> Result<()> {
+fn cleanup_sqlite_sidecars(artifacts: Vec<PathBuf>) -> Result<()> {
     let mut first_error = None;
-    for artifact in sqlite_artifact_paths(path)? {
+    for artifact in artifacts {
         match std::fs::remove_file(&artifact) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -845,56 +847,19 @@ fn cleanup_sqlite_sidecars(path: &Path) -> Result<()> {
 }
 
 fn finalize_staged_sqlite_sidecars(path: &Path) -> Result<()> {
-    // Rollback journals, WAL/SHM, FrankenSQLite's WAL-FEC recovery files,
-    // parallel-WAL commit certificates, and migration marker files can
-    // describe state that does not belong to a standalone main file. The
-    // publishable path is a VACUUM INTO image, which should emit none of them;
-    // any survivor therefore blocks publication rather than being discarded.
-    for sidecar in sqlite_content_artifact_paths(path) {
-        match std::fs::symlink_metadata(&sidecar) {
-            Ok(_) => {
-                bail!(
-                    "staged Pages export retained content-bearing SQLite sidecar {}; refusing main-file-only publication",
-                    sidecar.display()
-                );
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed inspecting staged SQLite sidecar before verification: {}",
-                        sidecar.display()
-                    )
-                });
-            }
-        }
-    }
-    for segment in sqlite_wal_segment_artifact_paths(path)? {
-        bail!(
-            "staged Pages export retained content-bearing SQLite WAL segment {}; refusing main-file-only publication",
-            segment.display()
-        );
-    }
-
-    let mut first_error = None;
-    for sidecar in sqlite_runtime_artifact_paths(path) {
-        match std::fs::remove_file(&sidecar) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                if first_error.is_none() {
-                    first_error = Some(anyhow::Error::new(err).context(format!(
-                        "failed removing closed staged SQLite runtime sidecar {}",
-                        sidecar.display()
-                    )));
-                }
-            }
-        }
-    }
-    first_error.map_or(Ok(()), Err)
+    // The publishable path is a VACUUM INTO image and is never opened through
+    // a read-write FrankenSQLite connection. It therefore owns no companion
+    // artifacts at all. Even namespace or lock files at this random pathname
+    // are unexpected entries, not builder residue, so preserve and reject
+    // them. Only the separately owned, explicitly closed builder is cleaned.
+    reject_existing_sqlite_sidecars(path, "staged VACUUM candidate")
 }
 
 fn cleanup_sqlite_temp_artifacts(path: &Path) -> Result<()> {
+    // Resolve the complete exact family before removing the main path. If the
+    // bounded directory scan cannot prove the dynamic WAL-segment set, fail
+    // without mutation rather than losing the namespace anchor first.
+    let sidecars = sqlite_artifact_paths(path)?;
     let main_result = match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -903,7 +868,7 @@ fn cleanup_sqlite_temp_artifacts(path: &Path) -> Result<()> {
             path.display()
         ))),
     };
-    let sidecar_result = cleanup_sqlite_sidecars(path);
+    let sidecar_result = cleanup_sqlite_sidecars(sidecars);
     match (main_result, sidecar_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -939,6 +904,12 @@ fn enforce_private_candidate_permissions(path: &Path) -> Result<()> {
     if !metadata.file_type().is_file() {
         bail!("staged Pages export is not a regular file: {}", path.display());
     }
+    if (path_metadata.dev(), path_metadata.ino()) != (metadata.dev(), metadata.ino()) {
+        bail!(
+            "staged Pages export {} changed identity before permission enforcement",
+            path.display()
+        );
+    }
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed setting staged export {} to mode 0600", path.display()))?;
     file.sync_all().with_context(|| {
@@ -955,6 +926,21 @@ fn enforce_private_candidate_permissions(path: &Path) -> Result<()> {
     if mode & 0o077 != 0 {
         bail!(
             "staged Pages export {} retained non-owner permission bits after chmod: {mode:o}",
+            path.display()
+        );
+    }
+    let final_path_metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed re-inspecting staged export {} after setting mode 0600",
+            path.display()
+        )
+    })?;
+    if !final_path_metadata.file_type().is_file()
+        || (final_path_metadata.dev(), final_path_metadata.ino())
+            != (metadata.dev(), metadata.ino())
+    {
+        bail!(
+            "staged Pages export {} changed identity during permission enforcement",
             path.display()
         );
     }
@@ -1948,16 +1934,23 @@ mod tests {
     }
 
     #[test]
-    fn staged_finalization_removes_closed_runtime_sidecars() -> Result<()> {
+    fn staged_finalization_rejects_runtime_sidecars_without_mutation() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let staged_path = temp_dir.path().join("export.tmp.db");
         std::fs::write(&staged_path, b"staged main")?;
         let runtime_sidecars = sqlite_runtime_artifact_paths(&staged_path);
         for sidecar in &runtime_sidecars {
-            std::fs::write(sidecar, b"closed runtime sentinel")?;
+            std::fs::write(sidecar, b"unowned runtime sentinel")?;
         }
 
-        finalize_staged_sqlite_sidecars(&staged_path)?;
+        let error = finalize_staged_sqlite_sidecars(&staged_path)
+            .expect_err("a VACUUM candidate must not consume runtime sidecars");
+        assert!(
+            runtime_sidecars
+                .iter()
+                .any(|sidecar| format!("{error:#}").contains(&sidecar.display().to_string())),
+            "runtime-sidecar rejection omitted the exact conflicting path"
+        );
 
         if std::fs::read(&staged_path)? != b"staged main" {
             return Err(anyhow::anyhow!(
@@ -1965,9 +1958,9 @@ mod tests {
             ));
         }
         for sidecar in runtime_sidecars {
-            if std::fs::symlink_metadata(&sidecar).is_ok() {
+            if std::fs::read(&sidecar)? != b"unowned runtime sentinel" {
                 return Err(anyhow::anyhow!(
-                    "closed runtime sidecar survived staged finalization: {}",
+                    "staged finalization mutated runtime sidecar {}",
                     sidecar.display()
                 ));
             }
