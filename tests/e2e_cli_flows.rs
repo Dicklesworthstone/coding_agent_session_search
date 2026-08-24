@@ -1581,3 +1581,84 @@ fn search_across_multiple_agents() {
         json
     );
 }
+
+/// GH#414: a `--sessions-from` filter that matches zero indexed sessions must
+/// be distinguishable from a genuine query miss — the robot payload reports
+/// how the filter resolved, warns when it provably matched nothing, and the
+/// broaden-the-query suggestion (which points at the one thing that was NOT
+/// the problem) is suppressed in exactly that case.
+#[test]
+fn search_sessions_from_reports_filter_resolution_and_suppresses_query_suggestions() {
+    let tracker = tracker_for(
+        "search_sessions_from_reports_filter_resolution_and_suppresses_query_suggestions",
+    );
+    let command_env = tracker.command_environment();
+    let fixture = setup_pack_archive_fixture(&tracker);
+
+    let run_search = |sessions_from: Option<&PathBuf>| -> Value {
+        let mut cmd = base_cmd(&command_env);
+        cmd.args(["search", "checkout", "--robot", "--data-dir"])
+            .arg(&fixture.data_dir)
+            .env("HOME", fixture.tmp.path());
+        if let Some(list) = sessions_from {
+            cmd.arg("--sessions-from").arg(list);
+        }
+        let output = cmd.output().expect("run cass search e2e");
+        assert!(
+            output.status.success(),
+            "search must exit 0: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())
+            .expect("search stdout is valid JSON")
+    };
+
+    // Control: the query genuinely matches the fixture, and with no
+    // --sessions-from the payload carries no sessions_filter block.
+    let control = run_search(None);
+    let control_count = control["count"].as_u64().expect("count");
+    assert!(control_count > 0, "control query must hit the fixture");
+    assert!(
+        control.get("sessions_filter").is_none(),
+        "sessions_filter must be absent without --sessions-from"
+    );
+
+    // A filter naming an indexed session resolves matched=1 and still hits.
+    let good_list = fixture.artifact_dir.join("sessions-good.txt");
+    fs::write(
+        &good_list,
+        format!("{}\n", fixture.source_files[0].0.display()),
+    )
+    .expect("write good session list");
+    let filtered = run_search(Some(&good_list));
+    assert_eq!(filtered["sessions_filter"]["requested"], 1);
+    assert_eq!(filtered["sessions_filter"]["matched"], 1);
+    assert!(
+        filtered.get("sessions_filter_warning").is_none(),
+        "a matched filter must not warn"
+    );
+
+    // The reported case: a filter naming a never-indexed path. Same query,
+    // same archive — the zero must be attributed to the filter.
+    let bogus_list = fixture.artifact_dir.join("sessions-bogus.txt");
+    fs::write(&bogus_list, "/nonexistent/path/never-indexed.jsonl\n")
+        .expect("write bogus session list");
+    let unmatched = run_search(Some(&bogus_list));
+    assert_eq!(unmatched["count"], 0, "bogus filter yields zero hits");
+    assert_eq!(unmatched["sessions_filter"]["requested"], 1);
+    assert_eq!(
+        unmatched["sessions_filter"]["matched"], 0,
+        "matched must be 0, not null: the resolution ran and proved the miss"
+    );
+    assert!(
+        unmatched["sessions_filter_warning"]
+            .as_str()
+            .is_some_and(|w| w.contains("--sessions-from")),
+        "the payload must say the filter, not the query, explains the zero"
+    );
+    assert!(
+        unmatched.get("suggestions").is_none(),
+        "broaden-the-query suggestions must be suppressed when the filter \
+         provably matched no indexed session"
+    );
+}

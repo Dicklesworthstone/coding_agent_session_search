@@ -25941,6 +25941,14 @@ fn run_cli_search(
         })?;
         filters.session_paths = session_paths;
     }
+    // GH#414: resolve how many requested session paths the index has seen, so
+    // "your filter selected zero sessions" is distinguishable from "your
+    // query found zero hits". `matched: None` renders as unknown.
+    let sessions_filter_stats: Option<SessionsFilterStats> =
+        sessions_from.as_ref().map(|_| SessionsFilterStats {
+            requested: filters.session_paths.len(),
+            matched: count_indexed_session_paths(&db_path, &filters.session_paths),
+        });
 
     // Apply cursor overrides (base64-encoded JSON { "offset": usize, "limit": usize })
     let mut limit_val = *limit;
@@ -27049,9 +27057,25 @@ fn run_cli_search(
             mode_meta,
             search_ms,
             rerank_ms,
+            sessions_filter_stats,
         )?;
     } else if display_result.hits.is_empty() {
-        eprintln!("No results found.");
+        // GH#414: when the --sessions-from filter provably selected zero
+        // indexed sessions, say so — the empty result reflects the filter,
+        // and the natural (wrong) recovery is to broaden the query, doubt
+        // the index, and rebuild it before ever suspecting the filter.
+        if let Some(stats) = sessions_filter_stats
+            && stats.provably_unmatched()
+        {
+            eprintln!(
+                "No results: none of the {} path(s) supplied via --sessions-from match an \
+                 indexed session. The empty result reflects the filter, not the query — index \
+                 the sessions first (cass index) or check the paths.",
+                stats.requested
+            );
+        } else {
+            eprintln!("No results found.");
+        }
     } else if let Some(display) = display_format {
         // Human-readable display formats
         output_display_results(&display_result.hits, display, wrap, query, highlight)?;
@@ -29194,6 +29218,25 @@ fn trust_value_for_hit(
 
 /// Output search results in robot-friendly format
 #[allow(clippy::too_many_arguments, unused_variables)]
+/// GH#414: resolution of a `--sessions-from` filter against the index.
+#[derive(Debug, Clone, Copy)]
+struct SessionsFilterStats {
+    /// Distinct paths the filter file supplied.
+    requested: usize,
+    /// How many of them the index has actually seen; `None` = undetermined
+    /// (DB busy/missing or resolution deadline hit), which must never be
+    /// rendered as zero.
+    matched: Option<usize>,
+}
+
+impl SessionsFilterStats {
+    /// True only when the filter PROVABLY selected no indexed session — the
+    /// case where an empty result says nothing about the query.
+    fn provably_unmatched(self) -> bool {
+        self.matched == Some(0) && self.requested > 0
+    }
+}
+
 fn output_robot_results(
     query: &str,
     limit: usize,
@@ -29230,6 +29273,8 @@ fn output_robot_results(
     search_mode_meta: SearchModeMeta,
     search_ms: u64,
     rerank_ms: u64,
+    // GH#414: present iff --sessions-from was supplied.
+    sessions_filter: Option<SessionsFilterStats>,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
 
@@ -29741,8 +29786,38 @@ fn output_robot_results(
                 "budget": budget,
             });
 
-            // Add suggestions if present
+            // GH#414: report how the --sessions-from filter resolved, so a
+            // filter selecting zero indexed sessions is distinguishable from
+            // a genuine miss. `matched: null` means undetermined, not zero.
+            if let (Some(stats), serde_json::Value::Object(map)) =
+                (sessions_filter, &mut payload)
+            {
+                map.insert(
+                    "sessions_filter".to_string(),
+                    serde_json::json!({
+                        "requested": stats.requested,
+                        "matched": stats.matched,
+                    }),
+                );
+                if stats.provably_unmatched() {
+                    map.insert(
+                        "sessions_filter_warning".to_string(),
+                        serde_json::Value::String(
+                            "no indexed session matches the paths supplied via --sessions-from; \
+                             the empty result reflects the filter, not the query. Index the \
+                             sessions first (cass index) or check the paths."
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+
+            // Add suggestions if present. When the --sessions-from filter
+            // provably matched zero indexed sessions, the query is
+            // demonstrably not the cause of an empty result, so the
+            // broaden-the-query suggestion would mislead (GH#414).
             if !result.suggestions.is_empty()
+                && !sessions_filter.is_some_and(SessionsFilterStats::provably_unmatched)
                 && let serde_json::Value::Object(ref mut map) = payload
             {
                 map.insert(
@@ -30080,8 +30155,38 @@ fn output_robot_results(
                 "budget": budget,
             });
 
-            // Add suggestions if present
+            // GH#414: report how the --sessions-from filter resolved, so a
+            // filter selecting zero indexed sessions is distinguishable from
+            // a genuine miss. `matched: null` means undetermined, not zero.
+            if let (Some(stats), serde_json::Value::Object(map)) =
+                (sessions_filter, &mut payload)
+            {
+                map.insert(
+                    "sessions_filter".to_string(),
+                    serde_json::json!({
+                        "requested": stats.requested,
+                        "matched": stats.matched,
+                    }),
+                );
+                if stats.provably_unmatched() {
+                    map.insert(
+                        "sessions_filter_warning".to_string(),
+                        serde_json::Value::String(
+                            "no indexed session matches the paths supplied via --sessions-from; \
+                             the empty result reflects the filter, not the query. Index the \
+                             sessions first (cass index) or check the paths."
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+
+            // Add suggestions if present. When the --sessions-from filter
+            // provably matched zero indexed sessions, the query is
+            // demonstrably not the cause of an empty result, so the
+            // broaden-the-query suggestion would mislead (GH#414).
             if !result.suggestions.is_empty()
+                && !sessions_filter.is_some_and(SessionsFilterStats::provably_unmatched)
                 && let serde_json::Value::Object(ref mut map) = payload
             {
                 map.insert(
@@ -30223,8 +30328,38 @@ fn output_robot_results(
                 "budget": budget,
             });
 
-            // Add suggestions if present
+            // GH#414: report how the --sessions-from filter resolved, so a
+            // filter selecting zero indexed sessions is distinguishable from
+            // a genuine miss. `matched: null` means undetermined, not zero.
+            if let (Some(stats), serde_json::Value::Object(map)) =
+                (sessions_filter, &mut payload)
+            {
+                map.insert(
+                    "sessions_filter".to_string(),
+                    serde_json::json!({
+                        "requested": stats.requested,
+                        "matched": stats.matched,
+                    }),
+                );
+                if stats.provably_unmatched() {
+                    map.insert(
+                        "sessions_filter_warning".to_string(),
+                        serde_json::Value::String(
+                            "no indexed session matches the paths supplied via --sessions-from; \
+                             the empty result reflects the filter, not the query. Index the \
+                             sessions first (cass index) or check the paths."
+                                .to_string(),
+                        ),
+                    );
+                }
+            }
+
+            // Add suggestions if present. When the --sessions-from filter
+            // provably matched zero indexed sessions, the query is
+            // demonstrably not the cause of an empty result, so the
+            // broaden-the-query suggestion would mislead (GH#414).
             if !result.suggestions.is_empty()
+                && !sessions_filter.is_some_and(SessionsFilterStats::provably_unmatched)
                 && let serde_json::Value::Object(ref mut map) = payload
             {
                 map.insert(
@@ -94488,6 +94623,58 @@ fn read_session_paths(source: &str) -> Result<std::collections::HashSet<String>,
     }
 
     Ok(paths)
+}
+
+/// GH#414: how many of the requested `--sessions-from` paths the index has
+/// actually seen. A filter that resolves to ZERO indexed sessions makes an
+/// empty result byte-identical to a genuine miss, and the natural (wrong)
+/// recovery is to broaden the query and then doubt the archive — the filter
+/// is the one part that looks like it could not have gone wrong.
+///
+/// Point lookups against `conversations.source_path` (indexed by the schema),
+/// bounded by a wall-clock deadline so a pathological million-line filter
+/// file can never stall the search it decorates. `None` means "could not
+/// determine" (DB missing/busy, deadline exceeded) — callers must render
+/// that as unknown, never as zero.
+fn count_indexed_session_paths(
+    db_path: &Path,
+    requested: &std::collections::HashSet<String>,
+) -> Option<usize> {
+    use crate::franken_sync::compat::RowExt;
+    if requested.is_empty() || !db_path.is_file() {
+        return None;
+    }
+    let conn = open_franken_cli_read_db(
+        db_path.to_path_buf(),
+        "sessions-from-resolution",
+        Duration::from_secs(2),
+    )
+    .ok()?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let mut matched = 0_usize;
+    let mut complete = true;
+    for path in requested {
+        if std::time::Instant::now() >= deadline {
+            complete = false;
+            break;
+        }
+        let exists = franken_query_row_map_retry(
+            &conn,
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE source_path = ?1)",
+            &[crate::franken_sync::compat::ParamValue::from(path.as_str())],
+            |row| row.get_typed::<i64>(0),
+        );
+        match exists {
+            Ok(flag) if flag != 0 => matched += 1,
+            Ok(_) => {}
+            Err(_) => {
+                complete = false;
+                break;
+            }
+        }
+    }
+    let _ = close_franken_cli_read_db(conn, db_path, "sessions-from-resolution");
+    complete.then_some(matched)
 }
 
 async fn maybe_prompt_for_update(once: bool) -> Result<()> {
