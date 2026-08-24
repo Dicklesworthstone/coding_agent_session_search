@@ -14606,6 +14606,11 @@ pub fn run_index(
                             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                             deferred.reason,
                         )
+                    } else if legacy_omp_upgrade.lexical_rebuild_required {
+                        (
+                            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                            "legacy_omp_identity_upgrade_requires_authoritative_db_rebuild",
+                        )
                     } else {
                         resolve_lexical_population_strategy(
                             needs_rebuild,
@@ -14819,7 +14824,9 @@ pub fn run_index(
                 }
 
                 if !scan_lexical_update_deferred
-                    && (opts.full || historical_salvage.messages_imported > 0)
+                    && (opts.full
+                        || historical_salvage.messages_imported > 0
+                        || legacy_omp_upgrade.lexical_rebuild_required)
                 {
                     let post_scan_observed_tantivy_docs =
                         observed_tantivy_docs_for_post_full_scan_skip(
@@ -14897,6 +14904,12 @@ pub fn run_index(
 
         t_index
     };
+
+    if legacy_omp_upgrade.lexical_rebuild_required {
+        storage
+            .complete_legacy_omp_reclassification()
+            .with_context(|| "finalizing legacy OMP identity upgrade after lexical publish")?;
+    }
 
     if stale_index_ingest_quarantine_retry_attempted && scan_watermark_preservation_active() {
         tracing::info!(

@@ -8186,10 +8186,6 @@ impl FrankenStorage {
             .with_context(|| "rebuilding token rollups after legacy OMP identity upgrade")?;
         self.rebuild_daily_stats()
             .with_context(|| "rebuilding daily stats after legacy OMP identity upgrade")?;
-        self.conn.execute_compat(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
-            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
-        )?;
 
         Ok(LegacyOmpReclassificationResult {
             conversations_reclassified: legacy_count.max(0) as usize,
@@ -8199,6 +8195,16 @@ impl FrankenStorage {
             // lexical generation still carries the old `pi_agent` identity.
             lexical_rebuild_required: legacy_count > 0 || assets_were_pending,
         })
+    }
+
+    /// Mark the OMP identity upgrade complete after the indexer has published
+    /// a lexical generation rebuilt from the canonical SQLite archive.
+    pub fn complete_legacy_omp_reclassification(&self) -> Result<()> {
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+        )?;
+        Ok(())
     }
 
     /// Get the timestamp of the last successful index completion.
@@ -29029,7 +29035,10 @@ mod tests {
         );
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,
-            LegacyOmpReclassificationResult::default()
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 0,
+                lexical_rebuild_required: true,
+            }
         );
 
         let conversations = storage.list_conversations(10, 0)?;
@@ -29054,21 +29063,10 @@ mod tests {
         )?;
         assert_eq!(metrics_slug, "omp");
 
-        // Simulate a crash after the canonical identity transaction committed
-        // but before the derived lexical publish completed. The retry must
-        // retain the lexical-rebuild signal even though no Pi-labeled rows
-        // remain to reclassify.
-        storage.conn.execute_compat(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'analytics_pending')",
-            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
-        )?;
-        assert_eq!(
-            storage.reclassify_legacy_omp_conversations()?,
-            LegacyOmpReclassificationResult {
-                conversations_reclassified: 0,
-                lexical_rebuild_required: true,
-            }
-        );
+        // Completing the marker is deliberately separate from the identity
+        // transaction: the indexer calls this only after the canonical
+        // SQLite-to-lexical publish succeeds.
+        storage.complete_legacy_omp_reclassification()?;
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,
             LegacyOmpReclassificationResult::default()
