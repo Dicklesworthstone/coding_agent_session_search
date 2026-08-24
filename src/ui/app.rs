@@ -3074,7 +3074,7 @@ fn legacy_agent_color(agent: &str) -> ftui::PackedRgba {
         "gemini" | "gemini_cli" => ftui::PackedRgba::rgb(66, 133, 244), // blue
         "cline" => ftui::PackedRgba::rgb(138, 43, 226), // violet
         "opencode" => ftui::PackedRgba::rgb(50, 205, 50), // lime
-        "omp" => ftui::PackedRgba::rgb(245, 158, 66), // warm amber
+        "omp" => ftui::PackedRgba::rgb(245, 158, 66),  // warm amber
         "amp" => ftui::PackedRgba::rgb(255, 99, 71),   // tomato
         "cursor" => ftui::PackedRgba::rgb(147, 112, 219), // purple
         "chatgpt" => ftui::PackedRgba::rgb(16, 163, 127), // chatgpt green

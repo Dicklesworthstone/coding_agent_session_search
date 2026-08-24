@@ -17279,7 +17279,9 @@ fn analytics_rebuild_since_ms(common: &AnalyticsCommon) -> CliResult<Option<i64>
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        return Ok(Some(now_ms.saturating_sub(i64::from(days).saturating_mul(86_400_000))));
+        return Ok(Some(
+            now_ms.saturating_sub(i64::from(days).saturating_mul(86_400_000)),
+        ));
     }
 
     match common.since.as_deref() {
@@ -17300,7 +17302,8 @@ fn analytics_rebuild_since_ms(common: &AnalyticsCommon) -> CliResult<Option<i64>
 /// what the storage layer actually rescans).
 fn format_rebuild_cutoff(since_ms: i64) -> String {
     use crate::storage::sqlite::SqliteStorage;
-    let day_start_ms = SqliteStorage::millis_from_day_id(SqliteStorage::day_id_from_millis(since_ms));
+    let day_start_ms =
+        SqliteStorage::millis_from_day_id(SqliteStorage::day_id_from_millis(since_ms));
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(day_start_ms)
         .map(|dt| dt.format("%Y-%m-%d UTC").to_string())
         .unwrap_or_else(|| format!("{day_start_ms} ms"))
@@ -17374,13 +17377,15 @@ fn run_analytics_rebuild(
             ),
             None => eprintln!("Rebuilding analytics (Track A)..."),
         }
-        let result = storage.rebuild_analytics_since(since_ms).map_err(|e| CliError {
-            code: 9,
-            kind: CliErrorKind::RebuildError.kind_str(),
-            message: format!("Analytics rebuild failed: {e}"),
-            hint: Some("Check database integrity with 'cass health --json'.".into()),
-            retryable: true,
-        })?;
+        let result = storage
+            .rebuild_analytics_since(since_ms)
+            .map_err(|e| CliError {
+                code: 9,
+                kind: CliErrorKind::RebuildError.kind_str(),
+                message: format!("Analytics rebuild failed: {e}"),
+                hint: Some("Check database integrity with 'cass health --json'.".into()),
+                retryable: true,
+            })?;
         eprintln!(
             "Track A complete: {} message_metrics, {} hourly, {} daily rows in {}ms ({:.0} msg/sec)",
             result.message_metrics_rows,
@@ -94784,8 +94789,7 @@ fn omp_session_dir_from_path(path: &Path) -> Option<PathBuf> {
     }
 
     let normalized = path.to_string_lossy().replace('\\', "/");
-    if normalized.contains("/.omp/agent/sessions/")
-        || omp_profile_from_session_path(path).is_some()
+    if normalized.contains("/.omp/agent/sessions/") || omp_profile_from_session_path(path).is_some()
     {
         return None;
     }

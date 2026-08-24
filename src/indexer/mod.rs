@@ -59,7 +59,7 @@ use crate::connectors::{
     clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
     copilot::CopilotConnector, copilot_cli::CopilotCliConnector, cursor::CursorConnector,
     factory::FactoryConnector, gemini::GeminiConnector, grok::GrokConnector, kimi::KimiConnector,
-    openclaw::OpenClawConnector, omp::OmpConnector, opencode::OpenCodeConnector,
+    omp::OmpConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
     pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
 };
 use crate::model::conversation_packet::{
@@ -13402,10 +13402,7 @@ fn connector_local_scan_since_ts_map(
                     connector_has_conversations,
                 )
             };
-            Ok((
-                *name,
-                local_since_ts,
-            ))
+            Ok((*name, local_since_ts))
         })
         .collect()
 }
@@ -13812,12 +13809,12 @@ pub fn run_index(
     complete_preflight_phase!();
 
     preflight_phase!("watch_startup:reclassify_legacy_omp");
-    let legacy_omp_reclassified = storage
+    let legacy_omp_upgrade = storage
         .reclassify_legacy_omp_conversations()
         .with_context(|| "reclassifying legacy Pi-labeled OMP archive rows")?;
-    if legacy_omp_reclassified > 0 {
+    if legacy_omp_upgrade.conversations_reclassified > 0 {
         tracing::info!(
-            conversations = legacy_omp_reclassified,
+            conversations = legacy_omp_upgrade.conversations_reclassified,
             "reclassified legacy Pi-labeled OMP conversations and rebuilt analytics"
         );
     }
@@ -14148,7 +14145,7 @@ pub fn run_index(
         tracing::info!(db_path = %opts.db_path.display(), "skipping live Tantivy reader preflight");
     }
     complete_preflight_phase!();
-    let mut needs_rebuild = legacy_omp_reclassified > 0
+    let mut needs_rebuild = legacy_omp_upgrade.lexical_rebuild_required
         || should_force_authoritative_rebuild(canonical_storage_rebuilt, tantivy_requires_rebuild);
     // #289: pass the real `tantivy_requires_rebuild` instead of hardcoding
     // `authoritative_rebuild_required: true`. The hardcoded value made every
@@ -14158,19 +14155,18 @@ pub fn run_index(
     // lexical checkpoint refresh — including the cheap metadata-only
     // bootstrap that rewrites a missing `.lexical-rebuild-state.json` — so a
     // lost checkpoint could never converge on large archives.
-    let large_incremental_authoritative_lexical_repair_probe_deferred = if legacy_omp_reclassified
-        > 0
-    {
-        None
-    } else {
-        should_defer_incremental_authoritative_lexical_repair(
-            &opts,
-            canonical_storage_rebuilt,
-            initial_canonical_sessions_before_salvage,
-            tantivy_requires_rebuild,
-            observed_tantivy_docs,
-        )
-    };
+    let large_incremental_authoritative_lexical_repair_probe_deferred =
+        if legacy_omp_upgrade.lexical_rebuild_required {
+            None
+        } else {
+            should_defer_incremental_authoritative_lexical_repair(
+                &opts,
+                canonical_storage_rebuilt,
+                initial_canonical_sessions_before_salvage,
+                tantivy_requires_rebuild,
+                observed_tantivy_docs,
+            )
+        };
     let deferred_incremental_authoritative_lexical_repair =
         large_incremental_authoritative_lexical_repair_probe_deferred;
     if let Some(deferred) = &deferred_incremental_authoritative_lexical_repair {
@@ -25464,9 +25460,7 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
         Some(ConnectorKind::Claude)
     } else if has_pair(".gemini", "tmp") {
         Some(ConnectorKind::Gemini)
-    } else if components.iter().any(|component| component == ".omp")
-        || has_pair("share", "omp")
-    {
+    } else if components.iter().any(|component| component == ".omp") || has_pair("share", "omp") {
         Some(ConnectorKind::Omp)
     } else {
         None
@@ -25506,9 +25500,7 @@ fn classify_paths(
                         // explicit root, but an XDG transcript path has no
                         // `.omp` marker. Retain the nearest `sessions` root so
                         // OMP's v18 resolver can recognize and scan it.
-                        if *kind == ConnectorKind::Omp
-                            && !p.to_string_lossy().contains(".omp")
-                        {
+                        if *kind == ConnectorKind::Omp && !p.to_string_lossy().contains(".omp") {
                             p.ancestors()
                                 .find(|ancestor| {
                                     ancestor.file_name().is_some_and(|name| name == "sessions")

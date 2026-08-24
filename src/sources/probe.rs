@@ -1406,8 +1406,14 @@ CASS_VERSION=0.4.2
         assert!(script.contains("~/.vibe"), "missing vibe path");
         assert!(script.contains("sourcegraph.amp"), "missing amp path");
         assert!(script.contains("~/.omp/agent"), "missing omp default path");
-        assert!(script.contains("~/.omp/profiles"), "missing omp profile path");
-        assert!(script.contains("~/.local/share/omp"), "missing omp XDG path");
+        assert!(
+            script.contains("~/.omp/profiles"),
+            "missing omp profile path"
+        );
+        assert!(
+            script.contains("~/.local/share/omp"),
+            "missing omp XDG path"
+        );
         // Verify script structure
         assert!(script.contains("===PROBE_START==="));
         assert!(script.contains("===PROBE_END==="));
@@ -1429,10 +1435,16 @@ CASS_VERSION=0.4.2
         );
         assert_eq!(infer_agent_type("~/.pi/agent/sessions"), "pi_agent");
         assert_eq!(infer_agent_type("~/.omp/agent/sessions"), "omp");
-        assert_eq!(infer_agent_type("~/.omp/profiles/work/agent/sessions"), "omp");
+        assert_eq!(
+            infer_agent_type("~/.omp/profiles/work/agent/sessions"),
+            "omp"
+        );
         assert_eq!(infer_agent_type("~/.local/share/omp/sessions"), "omp");
         assert_eq!(infer_agent_type("~/.local/share/omp"), "omp");
-        assert_eq!(infer_agent_type("/srv/xdg/omp/profiles/work/sessions"), "omp");
+        assert_eq!(
+            infer_agent_type("/srv/xdg/omp/profiles/work/sessions"),
+            "omp"
+        );
     }
 
     // =========================================================================
