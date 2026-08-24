@@ -968,20 +968,23 @@ mod tests {
             "#,
         )?;
 
-        // The production scanner pages at 128 rows. Put each only finding on
-        // row 129 so every table must advance its keyset before detecting it.
-        for id in 1_i64..=129 {
-            let title = if id == 129 {
+        // The production scanner pages at 128 rows. Use negative primary keys
+        // so a zero cursor sentinel would skip the entire scan, and put each
+        // only finding on row 129 so every table must advance its keyset before
+        // detecting it.
+        for ordinal in 1_i64..=129 {
+            let id = ordinal - 130;
+            let title = if ordinal == 129 {
                 "PAGE_CONVERSATION_SECRET"
             } else {
                 "safe title"
             };
-            let content = if id == 129 {
+            let content = if ordinal == 129 {
                 "PAGE_MESSAGE_SECRET"
             } else {
                 "safe content"
             };
-            let snippet = if id == 129 {
+            let snippet = if ordinal == 129 {
                 "PAGE_SNIPPET_SECRET"
             } else {
                 "safe snippet"
@@ -1005,19 +1008,32 @@ mod tests {
 
         let denylist = vec!["PAGE_(?:CONVERSATION|MESSAGE|SNIPPET)_SECRET".to_string()];
         let config = SecretScanConfig::from_inputs_with_env(&[], &denylist, false)?;
-        let report = scan_database(&db_path, &no_filters(), &config, None, None)?;
+        let filters = SecretScanFilters {
+            agents: Some(vec!["codex".to_string()]),
+            workspaces: Some(vec![PathBuf::from("/tmp/project")]),
+            since_ts: Some(1_699_999_999_999),
+            until_ts: Some(1_700_000_000_001),
+        };
+        let report = scan_database(&db_path, &filters, &config, None, None)?;
+        assert_eq!(report.summary.total, 3);
+        assert!(!report.summary.truncated);
 
-        for location in [
-            SecretLocation::ConversationTitle,
-            SecretLocation::MessageContent,
-            SecretLocation::MessageSnippet,
+        for (location, expected_message_id, expected_message_idx) in [
+            (SecretLocation::ConversationTitle, None, None),
+            (SecretLocation::MessageContent, Some(-1), Some(0)),
+            (SecretLocation::MessageSnippet, Some(-1), Some(0)),
         ] {
-            assert!(
-                report
-                    .findings
-                    .iter()
-                    .any(|finding| finding.location == location),
-                "keyset paging missed {location:?}"
+            let finding = report
+                .findings
+                .iter()
+                .find(|finding| finding.location == location)
+                .ok_or_else(|| anyhow::anyhow!("keyset paging missed {location:?}"))?;
+            assert_eq!(finding.conversation_id, Some(-1));
+            assert_eq!(finding.message_id, expected_message_id);
+            assert_eq!(finding.message_idx, expected_message_idx);
+            assert_eq!(
+                finding.source_path.as_deref(),
+                Some("/tmp/project/session--1.jsonl")
             );
         }
         Ok(())
