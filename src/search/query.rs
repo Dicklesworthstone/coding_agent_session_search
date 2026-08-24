@@ -119,6 +119,44 @@ impl SearchSqliteConnectionExt for SearchSqliteConnection {
     }
 }
 
+#[cfg(test)]
+trait SearchSqliteFixtureExt {
+    fn execute(
+        &self,
+        sql: &str,
+    ) -> Result<usize, crate::franken_sync::FrankenError>;
+
+    fn execute_with_params(
+        &self,
+        sql: &str,
+        params: &[crate::franken_sync::SqliteValue],
+    ) -> Result<usize, crate::franken_sync::FrankenError>;
+
+    fn execute_batch(&self, sql: &str) -> Result<(), crate::franken_sync::FrankenError>;
+}
+
+#[cfg(test)]
+impl SearchSqliteFixtureExt for SearchSqliteConnection {
+    fn execute(
+        &self,
+        sql: &str,
+    ) -> Result<usize, crate::franken_sync::FrankenError> {
+        self.execute_sync(sql)
+    }
+
+    fn execute_with_params(
+        &self,
+        sql: &str,
+        params: &[crate::franken_sync::SqliteValue],
+    ) -> Result<usize, crate::franken_sync::FrankenError> {
+        self.execute_with_params_sync(sql, params)
+    }
+
+    fn execute_batch(&self, sql: &str) -> Result<(), crate::franken_sync::FrankenError> {
+        self.execute_batch_sync(sql)
+    }
+}
+
 /// Read snapshot whose rollback obligation remains on the dedicated owner.
 ///
 /// Search hydration deliberately takes an explicit transaction so related
@@ -9542,7 +9580,7 @@ mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
     use crate::franken_sync::Connection as FrankenConnection;
-    use crate::franken_sync::compat::ParamValue;
+    use crate::franken_sync::compat::{ConnectionExt as FrankenConnectionExt, ParamValue};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::tantivy::TantivyIndex;
     use crate::search::vector_index::VectorIndex;
@@ -9602,10 +9640,10 @@ mod tests {
         }
     }
 
-    fn cass_layer_b_test_client(connection: Option<FrankenConnection>) -> SearchClient {
+    fn cass_layer_b_test_client(connection: Option<SearchSqliteConnection>) -> SearchClient {
         SearchClient {
             reader: None,
-            sqlite: Mutex::new(connection.map(SendConnection)),
+            sqlite: Mutex::new(connection),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -10789,7 +10827,7 @@ mod tests {
         let workspace_id = 1_i64;
         let source_id = crate::sources::provenance::LOCAL_SOURCE_ID;
         let source_hash = crc32fast::hash(source_id.as_bytes());
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             r#"
             CREATE TABLE agents (
@@ -10999,7 +11037,7 @@ mod tests {
             });
         let client = SearchClient {
             reader,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -12528,10 +12566,10 @@ mod tests {
     #[test]
     fn sqlite_backend_skips_wildcard_queries() -> Result<()> {
         // Build a client with SQLite only; wildcard queries should short-circuit without errors.
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -12557,7 +12595,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_handles_null_workspace() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -12610,7 +12648,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -12636,7 +12674,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_supports_legacy_fts_message_id_schema() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -12696,7 +12734,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -12739,7 +12777,7 @@ mod tests {
             "test fixture should open a Tantivy reader even with an empty index"
         );
 
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -12798,7 +12836,7 @@ mod tests {
 
         let client = SearchClient {
             reader,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13146,7 +13184,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_orders_hits_by_bm25_score() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
@@ -13217,7 +13255,7 @@ mod tests {
         )?;
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13317,7 +13355,7 @@ mod tests {
     #[test]
     fn tantivy_fallback_hydration_narrows_by_normalized_source_before_message_lookup() -> Result<()>
     {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
@@ -13353,7 +13391,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13386,7 +13424,7 @@ mod tests {
 
     #[test]
     fn exact_content_hydration_returns_only_requested_message_indices() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
@@ -13431,7 +13469,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_generates_snippet_from_content() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
@@ -13486,7 +13524,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13512,7 +13550,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_respects_source_filter() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -13584,7 +13622,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13632,7 +13670,7 @@ mod tests {
     #[test]
     fn sqlite_backend_remote_source_filter_matches_blank_source_id_with_origin_host() -> Result<()>
     {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -13711,7 +13749,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13774,7 +13812,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_workspace_filter_matches_null_workspace_as_empty_string() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -13847,7 +13885,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13931,7 +13969,7 @@ mod tests {
 
     #[test]
     fn browse_by_date_treats_null_workspace_and_source_as_local() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -13965,7 +14003,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14002,7 +14040,7 @@ mod tests {
     #[test]
     fn hydrate_semantic_hits_with_ids_snippet_only_uses_full_content_for_snippets_and_identity()
     -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -14057,7 +14095,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14419,7 +14457,7 @@ mod tests {
 
     #[test]
     fn cass_layer_b_projection_rejects_ambiguous_historical_identity() -> Result<()> {
-        let conn = FrankenConnection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
@@ -14459,7 +14497,7 @@ mod tests {
 
     #[test]
     fn hydrate_semantic_hits_with_ids_normalizes_trimmed_local_source_metadata() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -14499,7 +14537,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14531,7 +14569,7 @@ mod tests {
 
     #[test]
     fn hydrate_semantic_hits_with_ids_preserves_remote_origin_without_source_row() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -14571,7 +14609,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14605,7 +14643,7 @@ mod tests {
     #[test]
     fn resolve_semantic_doc_ids_for_hits_distinguishes_same_source_path_line_by_content_hash()
     -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -14659,7 +14697,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14735,7 +14773,7 @@ mod tests {
 
     #[test]
     fn hydrate_semantic_hits_with_ids_keeps_missing_title_empty() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -14775,7 +14813,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14807,7 +14845,7 @@ mod tests {
     #[test]
     fn resolve_semantic_doc_ids_for_hits_prefers_conversation_id_over_ambiguous_provenance()
     -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -14860,7 +14898,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14913,7 +14951,7 @@ mod tests {
 
     #[test]
     fn resolve_semantic_doc_ids_for_hits_treats_null_source_as_local() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -14952,7 +14990,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14995,7 +15033,7 @@ mod tests {
 
     #[test]
     fn resolve_semantic_doc_ids_for_hits_matches_trimmed_local_source_id() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -15034,7 +15072,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -15077,7 +15115,7 @@ mod tests {
 
     #[test]
     fn resolve_semantic_doc_ids_for_hits_normalizes_blank_local_source_id() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -15116,7 +15154,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -15160,7 +15198,7 @@ mod tests {
     #[test]
     fn resolve_semantic_doc_ids_for_hits_infers_remote_source_from_origin_host_when_source_id_blank()
     -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -15199,7 +15237,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -15242,7 +15280,7 @@ mod tests {
 
     #[test]
     fn browse_by_date_snippet_only_uses_full_content_for_hit_identity() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -15295,7 +15333,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -18716,7 +18754,7 @@ mod tests {
     ///    split could break by hydrating before honoring the limit).
     #[test]
     fn search_sqlite_fts5_rank_and_hydrate_split_preserves_limit_prefix_invariant() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteConnection::open_sync(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -18802,7 +18840,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn)),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: false,

@@ -885,6 +885,52 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn metadata_bin_with_trailing_bytes_fails_closed() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let mut metadata_with_trailing =
+            rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
+        metadata_with_trailing.push(0xc1);
+        let safe_extra = rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
+        setup_db_with_binary_metadata(
+            &db_path,
+            "{}",
+            &metadata_with_trailing,
+            "{}",
+            &safe_extra,
+        )?;
+
+        let error = scan(&db_path).expect_err("trailing metadata bytes must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("conversations.metadata_bin"), "{error:#}");
+        assert!(message.contains("trailing bytes"), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn extra_bin_with_trailing_bytes_fails_closed() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let safe_metadata = rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
+        let mut extra_with_trailing =
+            rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
+        extra_with_trailing.push(0xc1);
+        setup_db_with_binary_metadata(
+            &db_path,
+            "{}",
+            &safe_metadata,
+            "{}",
+            &extra_with_trailing,
+        )?;
+
+        let error = scan(&db_path).expect_err("trailing message metadata bytes must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("messages.extra_bin"), "{error:#}");
+        assert!(message.contains("trailing bytes"), "{error:#}");
+        Ok(())
+    }
+
     // =========================================================================
     // Filter tests (br-ig84)
     // =========================================================================
