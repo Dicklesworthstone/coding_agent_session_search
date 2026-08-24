@@ -63,62 +63,129 @@ pub enum LazyDbError {
 }
 
 // -------------------------------------------------------------------------
-// LazyFrankenDb — lazy wrapper around FrankenConnection
+// LazyFrankenDb — lazy wrapper around a dedicated-owner connection
 // -------------------------------------------------------------------------
 
-/// Wrapper around `FrankenConnection` that implements `Send`.
+/// Synchronous dispatch facade whose raw FrankenSQLite connection is born,
+/// used, closed, and dropped on one dedicated owner thread.
 ///
-/// `FrankenConnection` is `!Send` because it uses `Rc` internally.
-/// However, the `Rc` values are entirely self-contained within the Connection
-/// and are not shared externally.  When wrapped in a `Mutex`,
-/// exclusive access is guaranteed, making cross-thread transfer safe.
-pub struct SendFrankenConnection(FrankenConnection, i64, u64);
+/// Pinned fsqlite 0.3.x deliberately makes its raw `Connection` `!Send`: its
+/// internal `Rc<RefCell<_>>` state is thread-affine even when callers serialize
+/// access with a mutex. `AsyncConnection` is the supported cross-thread handle;
+/// these methods keep CASS's synchronous call shape while every engine command
+/// remains on that handle's owner worker.
+pub struct FrankenOwnerConnection(FrankenAsyncConnection);
 
-// Safety: Rc fields inside FrankenConnection are not cloned or shared externally.
-// The Mutex<Option<SendFrankenConnection>> ensures exclusive access.
-unsafe impl Send for SendFrankenConnection {}
-
-impl SendFrankenConnection {
-    pub(crate) fn new(conn: FrankenConnection) -> Self {
-        Self(
-            conn,
-            UNSET_INDEX_WRITER_CHECKPOINT_PAGES,
-            UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS,
-        )
+impl FrankenOwnerConnection {
+    fn open(path: impl Into<String>) -> std::result::Result<Self, crate::franken_sync::FrankenError> {
+        FrankenAsyncConnection::open_sync(path).map(Self)
     }
 
-    pub(crate) fn new_with_index_writer_state(
-        conn: FrankenConnection,
-        checkpoint_pages: i64,
-        busy_timeout_ms: u64,
-    ) -> Self {
-        Self(conn, checkpoint_pages, busy_timeout_ms)
+    pub fn execute(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<usize, crate::franken_sync::FrankenError> {
+        self.0.execute_sync(sql)
     }
 
-    pub(crate) fn into_parts(self) -> (FrankenConnection, i64, u64) {
-        (self.0, self.1, self.2)
+    pub fn execute_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> std::result::Result<usize, crate::franken_sync::FrankenError> {
+        self.0.execute_with_params_sync(sql, params)
+    }
+
+    pub fn execute_batch(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<(), crate::franken_sync::FrankenError> {
+        self.0.execute_batch_sync(sql)
+    }
+
+    pub fn query(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError> {
+        self.0.query_sync(sql)
+    }
+
+    pub fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError> {
+        self.0.query_with_params_sync(sql, params)
+    }
+
+    pub fn query_row_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> std::result::Result<FrankenRow, crate::franken_sync::FrankenError> {
+        self.0.query_row_with_params_sync(sql, params)
+    }
+
+    pub fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> std::result::Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(&FrankenRow) -> std::result::Result<T, crate::franken_sync::FrankenError>,
+    {
+        let values = param_slice_to_values(params);
+        let row = self.0.query_row_with_params_sync(sql, &values)?;
+        map(&row)
+    }
+
+    pub fn query_map_collect<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        mut map: F,
+    ) -> std::result::Result<Vec<T>, crate::franken_sync::FrankenError>
+    where
+        F: FnMut(&FrankenRow) -> std::result::Result<T, crate::franken_sync::FrankenError>,
+    {
+        let values = param_slice_to_values(params);
+        let rows = self.0.query_with_params_sync(sql, &values)?;
+        rows.iter().map(&mut map).collect()
+    }
+
+    pub fn execute_compat(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+    ) -> std::result::Result<usize, crate::franken_sync::FrankenError> {
+        let values = param_slice_to_values(params);
+        self.0.execute_with_params_sync(sql, &values)
+    }
+
+    fn close_sync(&mut self) -> std::result::Result<(), Arc<crate::franken_sync::FrankenError>> {
+        self.0.close_sync()
+    }
+
+    fn close_without_checkpoint_sync(
+        &mut self,
+    ) -> std::result::Result<(), Arc<crate::franken_sync::FrankenError>> {
+        self.0.close_without_checkpoint_sync()
     }
 }
 
-impl std::ops::Deref for SendFrankenConnection {
-    type Target = FrankenConnection;
-    fn deref(&self) -> &FrankenConnection {
-        &self.0
-    }
-}
-
-/// Lazy-opening wrapper for `FrankenConnection` (frankensqlite).
+/// Lazy-opening wrapper for a dedicated-owner FrankenSQLite connection.
 ///
 /// Constructing a `LazyFrankenDb` is cheap (no I/O).  The underlying
-/// `FrankenConnection` is opened on the first call to [`get`].
+/// raw connection is opened on its owner worker on the first call to [`get`].
 /// Subsequent calls return the cached connection.
 pub struct LazyFrankenDb {
     path: PathBuf,
-    conn: parking_lot::Mutex<Option<SendFrankenConnection>>,
+    conn: parking_lot::Mutex<Option<FrankenOwnerConnection>>,
 }
 
-/// RAII guard that dereferences to the inner `FrankenConnection`.
-pub struct LazyFrankenDbGuard<'a>(parking_lot::MutexGuard<'a, Option<SendFrankenConnection>>);
+/// RAII guard that dereferences to the dedicated-owner dispatch facade.
+pub struct LazyFrankenDbGuard<'a>(parking_lot::MutexGuard<'a, Option<FrankenOwnerConnection>>);
 
 impl std::fmt::Debug for LazyFrankenDbGuard<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -129,8 +196,8 @@ impl std::fmt::Debug for LazyFrankenDbGuard<'_> {
 }
 
 impl std::ops::Deref for LazyFrankenDbGuard<'_> {
-    type Target = FrankenConnection;
-    fn deref(&self) -> &FrankenConnection {
+    type Target = FrankenOwnerConnection;
+    fn deref(&self) -> &FrankenOwnerConnection {
         self.0
             .as_ref()
             .expect("LazyFrankenDb connection must be initialized before access")
@@ -174,8 +241,8 @@ impl LazyFrankenDb {
                 path: self.path.clone(),
                 source: crate::franken_sync::FrankenError::Internal(err.to_string()),
             })?;
-            let conn =
-                FrankenConnection::open(self.path.to_string_lossy().into_owned()).map_err(|e| {
+            let conn = FrankenOwnerConnection::open(self.path.to_string_lossy().into_owned())
+                .map_err(|e| {
                     LazyDbError::FrankenOpenFailed {
                         path: self.path.clone(),
                         source: e,
@@ -188,7 +255,7 @@ impl LazyFrankenDb {
                 reason = reason,
                 "lazily opened FrankenSQLite database"
             );
-            *guard = Some(SendFrankenConnection::new(conn));
+            *guard = Some(conn);
         }
         Ok(LazyFrankenDbGuard(guard))
     }
@@ -223,8 +290,7 @@ impl LazyFrankenDb {
                             return;
                         }
                     };
-                let _ =
-                    tx.send(FrankenConnection::open(path_owned).map(SendFrankenConnection::new));
+                let _ = tx.send(FrankenOwnerConnection::open(path_owned));
             });
             let conn = rx
                 .recv_timeout(timeout)
