@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use super::{
-    Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, ScanContext,
-    ScanRoot,
+    Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, ScanContext, ScanRoot,
 };
 
 pub struct OmpConnector {
@@ -280,10 +279,7 @@ impl Connector for OmpConnector {
                 ctx,
                 "omp",
             )?;
-            append_missing_conversations(
-                &mut conversations,
-                fallback,
-            );
+            append_missing_conversations(&mut conversations, fallback);
         }
         fill_missing_profiles(&mut conversations);
         Ok(conversations)
