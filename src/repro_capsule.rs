@@ -486,7 +486,7 @@ mod tests {
                 (second_secret_key.clone()): "second",
             },
             "health_excerpt": {
-                "nested": { "pin": ["12", "34"].concat() },
+                "nested": { "pin": (["12", "34"].concat()) },
             },
         });
 

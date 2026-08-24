@@ -824,7 +824,12 @@ fn cleanup_rejected_atomic_staged_bundle(staged_dir: &Path, final_dir: &Path) ->
 }
 
 fn cleanup_prior_bundle_after_publish(backup_dir: &Path, final_dir: &Path) -> Result<()> {
-    cleanup_prior_bundle_after_publish_with(backup_dir, final_dir, fs::remove_dir_all)
+    // A closure rather than the bare `fs::remove_dir_all` fn item: the
+    // generic fn monomorphizes with one concrete lifetime and cannot satisfy
+    // the higher-ranked `for<'a> FnOnce(&'a Path)` bound.
+    cleanup_prior_bundle_after_publish_with(backup_dir, final_dir, |path| {
+        fs::remove_dir_all(path)
+    })
 }
 
 fn cleanup_prior_bundle_after_publish_with<F>(

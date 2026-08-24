@@ -540,6 +540,10 @@ impl ExportEngine {
                     ))),
                 },
             };
+            // The transaction commits/rolls back through `&mut self`, so the
+            // binding still borrows `dest` until it is dropped — and
+            // `dest.close()` below moves the connection. End the borrow here.
+            drop(tx);
             let source_rollback_result = src_tx
                 .rollback()
                 .context("Failed to close source database read snapshot");

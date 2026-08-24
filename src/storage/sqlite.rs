@@ -29589,7 +29589,7 @@ mod tests {
         let _profile = set_env_var("OMP_PROFILE", "");
         let _legacy_profile = set_env_var("PI_PROFILE", "");
         let _xdg = set_env_var("XDG_DATA_HOME", "");
-        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
         let pi_agent_id = storage.ensure_agent(&Agent {
             id: None,
             slug: "pi_agent".into(),
@@ -29654,7 +29654,7 @@ mod tests {
         let _profile = set_env_var("OMP_PROFILE", "");
         let _legacy_profile = set_env_var("PI_PROFILE", "");
         let _xdg = set_env_var("XDG_DATA_HOME", "");
-        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
         let pi_agent_id = storage.ensure_agent(&Agent {
             id: None,
             slug: "pi_agent".into(),
@@ -29712,7 +29712,7 @@ mod tests {
         let _profile = set_env_var("OMP_PROFILE", "");
         let _legacy_profile = set_env_var("PI_PROFILE", "");
         let _xdg = set_env_var("XDG_DATA_HOME", "");
-        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
         let pi_agent_id = storage.ensure_agent(&Agent {
             id: None,
             slug: "pi_agent".into(),
@@ -29787,7 +29787,7 @@ mod tests {
         let _profile = set_env_var("OMP_PROFILE", "");
         let _legacy_profile = set_env_var("PI_PROFILE", "");
         let _xdg = set_env_var("XDG_DATA_HOME", "");
-        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
         let pi_agent_id = storage.ensure_agent(&Agent {
             id: None,
             slug: "pi_agent".into(),
@@ -29921,7 +29921,7 @@ mod tests {
         let _profile = set_env_var("OMP_PROFILE", "");
         let _legacy_profile = set_env_var("PI_PROFILE", "");
         let _xdg = set_env_var("XDG_DATA_HOME", "");
-        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
         storage.conn.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
             fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
@@ -30186,7 +30186,7 @@ mod tests {
         let _legacy_profile = set_env_var("PI_PROFILE", "");
         let _xdg_without_evidence = set_env_var("XDG_DATA_HOME", "");
 
-        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
         let pi_agent_id = storage.ensure_agent(&Agent {
             id: None,
             slug: "pi_agent".into(),
@@ -30322,7 +30322,7 @@ mod tests {
         let _profile = set_env_var("OMP_PROFILE", "");
         let _legacy_profile = set_env_var("PI_PROFILE", "");
         let _xdg = set_env_var("XDG_DATA_HOME", "");
-        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
         storage.conn.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'analytics_pending')",
             fparams![PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY],
