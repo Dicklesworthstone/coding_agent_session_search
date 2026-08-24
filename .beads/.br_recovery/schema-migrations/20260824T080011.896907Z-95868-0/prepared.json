@@ -1,0 +1,154 @@
+{
+  "schema_version": "br.doctor.schema_migration.prepared.v1",
+  "run_id": "20260824T080011.896907Z-95868-0",
+  "database_path": "/Users/jemanuel/projects/coding_agent_session_search/.beads/beads.db",
+  "plan_token": "891f797039ff2ffe3e1d2cf74c7ecfaf3e40beaaab9db30c9de1dd44466647a7",
+  "marked_at": "2026-08-24T08:00:11.961350+00:00",
+  "forecast": {
+    "from_version": 16,
+    "to_version": 17,
+    "content_hash_rows_rebuilt": 0,
+    "gate_result_history_created": false,
+    "post_migration_maintenance": true
+  },
+  "raw_before": {
+    "components": [
+      {
+        "suffix": "",
+        "present": true,
+        "length": 22003712,
+        "sha256": "e603abb3af452f9736560c3bcd45b384513f993650b19187f1e2a19c5eb0d488",
+        "unix_mode": 33188
+      },
+      {
+        "suffix": "-wal",
+        "present": true,
+        "length": 32,
+        "sha256": "fa0b30dfa95c3ebda5d5d374b4af8dd821f2392a6104d112b9086440781b4eb3",
+        "unix_mode": 33188
+      },
+      {
+        "suffix": "-shm",
+        "present": true,
+        "length": 32768,
+        "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+        "unix_mode": 33188
+      },
+      {
+        "suffix": "-journal",
+        "present": false,
+        "length": null,
+        "sha256": null,
+        "unix_mode": null
+      }
+    ]
+  },
+  "logical_before": {
+    "user_version": 16,
+    "integrity_check": "ok",
+    "schema_sha256": "1a20922e620244bbc6d19f5df44477d1c222af88dc63fd212017a1a1dd2c850a",
+    "contents_sha256": "ca4c875925d417d1fd0c509515299dd8eaba3d906f177c63df320abfb2dffc3f",
+    "tables": [
+      {
+        "name": "blocked_issues_cache",
+        "row_count": 30,
+        "rows_sha256": "70892c4598c1749dca30c111e872d5c889cb4c2622efd44e8854a868c223aedd"
+      },
+      {
+        "name": "capacity_exemption_history",
+        "row_count": 0,
+        "rows_sha256": "093b079b9c2a552c936ecb3e31471049f83bf52d3bd9fd2a3c21733d9cd125c1"
+      },
+      {
+        "name": "capacity_exemptions",
+        "row_count": 0,
+        "rows_sha256": "fbda7353fb3baafd599889c90557842a503be99c1dcb186eca832ad2794cb7b4"
+      },
+      {
+        "name": "child_counters",
+        "row_count": 16,
+        "rows_sha256": "020fd2661c678b563854e40ebfa6832079150b397c268a4b1ea3ee7e44ced548"
+      },
+      {
+        "name": "close_metadata",
+        "row_count": 0,
+        "rows_sha256": "fd96e66f70122d836c45823be36b8d96be0a7423a9149ec2dd05f16c4263d31f"
+      },
+      {
+        "name": "comments",
+        "row_count": 114,
+        "rows_sha256": "853978dddaced7b32d88f597482aa312562a19ed068ea0167ec7bf89128914d2"
+      },
+      {
+        "name": "compaction_snapshots",
+        "row_count": 0,
+        "rows_sha256": "1a151b6e71625c98aadb85f442a0166a4eaeb3d8bd7bcacfc6cb2c3702d110bb"
+      },
+      {
+        "name": "config",
+        "row_count": 13,
+        "rows_sha256": "fb37e9f6eea781a4c28a77d44d8632f22c0743b86236747bafe0cb2833701322"
+      },
+      {
+        "name": "dependencies",
+        "row_count": 1400,
+        "rows_sha256": "dd6e1acd3140d3bb90ef37e8e626b4d41838ba48a2b4b0cecfb2e6b2550ce555"
+      },
+      {
+        "name": "dirty_issues",
+        "row_count": 0,
+        "rows_sha256": "cc278c69726f5a1f8dcdb479e985171f764ae8c4d8d41b8280826baf1b1be1ba"
+      },
+      {
+        "name": "events",
+        "row_count": 3578,
+        "rows_sha256": "64afb2f2c0bb35de98e1caafbddcd33edcd521ddf510f8672837a96166fcfca3"
+      },
+      {
+        "name": "export_hashes",
+        "row_count": 1217,
+        "rows_sha256": "527d626e06580e294b713977cc628274b97490eee723313a98f52f13b8a11aae"
+      },
+      {
+        "name": "gate_result_history",
+        "row_count": 0,
+        "rows_sha256": "ade6edf42bcd9c1b088917fba2152530722844ee57e6447eafe84fd20f177162"
+      },
+      {
+        "name": "gate_results",
+        "row_count": 0,
+        "rows_sha256": "a360c72db907c2936d5c05af4e653445922cc0355d2a23543f62c22716ab7f3a"
+      },
+      {
+        "name": "issue_snapshots",
+        "row_count": 0,
+        "rows_sha256": "36a0c72d58517a0005b7c6e3cd9cd8a8694665e70372c88b8fe1f0e12245c4e4"
+      },
+      {
+        "name": "issues",
+        "row_count": 1217,
+        "rows_sha256": "82a3557b1b01929bce8c1f37ae4ea77e94c9d33de571c619da919118b37eccc5"
+      },
+      {
+        "name": "labels",
+        "row_count": 458,
+        "rows_sha256": "b5006ee31a53bc65f3e8ce0d4db59b3df974fdda6b9fde25223605692c11c6c5"
+      },
+      {
+        "name": "metadata",
+        "row_count": 10,
+        "rows_sha256": "cca417a0589f4a64ac48f54e3d6ec5e3416d6b3ed717c805f12d34eb7bcf4f79"
+      },
+      {
+        "name": "repo_mtimes",
+        "row_count": 0,
+        "rows_sha256": "aa8c1004f9030523981734591bf61f7c9f38c51b868cf29fa9baff17a7d513bb"
+      },
+      {
+        "name": "sqlite_sequence",
+        "row_count": 2,
+        "rows_sha256": "64992366f2697379072141422e15f007ab5cf873c13597c67d2d14ff1a35d6af"
+      }
+    ]
+  }
+}
