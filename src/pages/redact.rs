@@ -190,7 +190,7 @@ impl SwarmEvidenceRedactor {
     }
 
     pub fn redact_sensitive_path(&mut self, value: &str) -> String {
-        let redacted = self.engine.redact_path(value);
+        let redacted = redact_swarm_scalar_with_engine(&self.engine, value);
         self.record(
             SwarmEvidenceField::SensitivePath,
             redacted.changes.len(),
@@ -200,7 +200,7 @@ impl SwarmEvidenceRedactor {
     }
 
     pub fn redact_command_argument(&mut self, value: &str) -> String {
-        let redacted = self.engine.redact_text(value);
+        let redacted = redact_swarm_scalar_with_engine(&self.engine, value);
         self.record(
             SwarmEvidenceField::CommandArgument,
             redacted.changes.len(),
@@ -223,7 +223,7 @@ impl SwarmEvidenceRedactor {
             return SWARM_MAIL_BODY_OMITTED.to_string();
         }
 
-        let redacted = self.engine.redact_text(value);
+        let redacted = redact_swarm_scalar_with_engine(&self.engine, value);
         if !redacted.changes.is_empty() || value != redacted.output {
             self.report.redaction_applied = true;
         }
@@ -231,7 +231,7 @@ impl SwarmEvidenceRedactor {
     }
 
     pub fn redact_evidence_reference(&mut self, value: &str) -> String {
-        let redacted = self.engine.redact_text(value);
+        let redacted = redact_swarm_scalar_with_engine(&self.engine, value);
         self.record(
             SwarmEvidenceField::EvidenceReference,
             redacted.changes.len(),
@@ -469,7 +469,7 @@ pub fn swarm_evidence_redaction_config() -> RedactionConfig {
 
 pub fn redact_swarm_text(input: &str) -> String {
     let engine = RedactionEngine::new(swarm_evidence_redaction_config());
-    engine.redact_text(input).output
+    redact_swarm_scalar_with_engine(&engine, input).output
 }
 
 pub fn redact_swarm_json_value(value: &Value) -> Value {
@@ -503,9 +503,31 @@ fn insert_redacted_swarm_entry(
     }
 }
 
+/// Apply the canonical ingestion-time secret policy before the swarm-specific
+/// path, identity, and PII policy. Swarm output includes live operational data
+/// that did not necessarily pass through ingestion, so relying on the latter
+/// privacy transforms alone would leak supported secret classes such as
+/// private-key blocks, raw JWTs, service tokens, and credential URLs.
+fn redact_swarm_scalar_with_engine(engine: &RedactionEngine, input: &str) -> RedactedString {
+    let secret_redacted = crate::indexer::redact_secrets::redact_text(input);
+    let canonical_secret_changed = secret_redacted.as_ref() != input;
+    let mut redacted = engine.redact_text(secret_redacted.as_ref());
+    if canonical_secret_changed {
+        // `changes` counts pattern-class passes rather than individual matches.
+        // Record one safe synthetic entry so the swarm evidence report remains
+        // truthful without retaining any source secret bytes.
+        redacted.changes.push(RedactionChange {
+            kind: RedactionKind::CustomPattern,
+            original: "canonical_secret_pattern".to_string(),
+            redacted: "[REDACTED]".to_string(),
+        });
+    }
+    redacted
+}
+
 fn redact_swarm_json_value_with_engine(engine: &RedactionEngine, value: &Value) -> Value {
     match value {
-        Value::String(text) => Value::String(engine.redact_text(text).output),
+        Value::String(text) => Value::String(redact_swarm_scalar_with_engine(engine, text).output),
         Value::Array(items) => Value::Array(
             items
                 .iter()
@@ -519,7 +541,7 @@ fn redact_swarm_json_value_with_engine(engine: &RedactionEngine, value: &Value) 
                 insert_redacted_swarm_entry(
                     &mut redacted,
                     &mut next_suffixes,
-                    engine.redact_text(key).output,
+                    redact_swarm_scalar_with_engine(engine, key).output,
                     redact_swarm_json_value_with_engine(engine, value),
                 );
             }
@@ -950,6 +972,56 @@ mod tests {
         assert!(snippet.contains("[REDACTED_PATH]"));
         assert!(!snippet.contains("alice@example.com"));
         assert!(!snippet.contains("/home/alice"));
+    }
+
+    #[test]
+    fn strict_swarm_redaction_applies_the_canonical_secret_floor() {
+        let private_key = "before\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA";
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.cGF5bG9hZDEyMzQ1Njc4OTA.c2lnbmF0dXJlMTIzNDU2Nzg5MA";
+        let stripe = format!("{}_{}", "sk_live", "ABCdef0123456789AAAAbbbb0007");
+
+        for (input, leaked_fragment) in [
+            (private_key, "b3BlbnNzaC1rZXktdjE"),
+            (jwt, "cGF5bG9hZDEyMzQ1Njc4OTA"),
+            (&stripe, "ABCdef0123456789AAAAbbbb0007"),
+        ] {
+            let output = redact_swarm_text(input);
+            assert!(output.contains("[REDACTED]"));
+            assert!(
+                !output.contains(leaked_fragment),
+                "strict swarm text leaked canonical secret bytes: {output}"
+            );
+        }
+
+        let nested = redact_swarm_json_value(&serde_json::json!({
+            private_key: {
+                "jwt": jwt,
+                "stripe": &stripe,
+            }
+        }));
+        let serialized = serde_json::to_string(&nested).expect("redacted swarm JSON must serialize");
+        for leaked_fragment in [
+            "b3BlbnNzaC1rZXktdjE",
+            "cGF5bG9hZDEyMzQ1Njc4OTA",
+            "ABCdef0123456789AAAAbbbb0007",
+        ] {
+            assert!(!serialized.contains(leaked_fragment));
+        }
+
+        let mut report_redactor = SwarmEvidenceRedactor::new(SwarmEvidenceRedactionConfig {
+            include_mail_body_snippets: true,
+            include_raw_session_content: false,
+        });
+        let command = report_redactor.redact_command_argument(private_key);
+        let mail = report_redactor.redact_mail_body_snippet(jwt);
+        let evidence = report_redactor.redact_evidence_reference(&stripe);
+        assert!(!command.contains("b3BlbnNzaC1rZXktdjE"));
+        assert!(!mail.contains("cGF5bG9hZDEyMzQ1Njc4OTA"));
+        assert!(!evidence.contains("ABCdef0123456789AAAAbbbb0007"));
+        let report = report_redactor.report();
+        assert!(report.redaction_applied);
+        assert!(report.command_arguments_scrubbed > 0);
+        assert!(report.evidence_references_scrubbed > 0);
     }
 
     #[test]

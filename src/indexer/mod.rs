@@ -27985,13 +27985,11 @@ pub mod persist {
             ended_at: conv.ended_at,
             approx_tokens: None,
             metadata_json: if should_redact {
-                let s = serde_json::to_string(&conv.metadata).unwrap_or_default();
-                let redacted = if let Some(r) = redactor.as_mut() {
-                    r.redact_text(&s)
+                if let Some(r) = redactor.as_mut() {
+                    r.redact_json(&conv.metadata)
                 } else {
-                    super::redact_secrets::redact_text(&s).into_owned()
-                };
-                serde_json::from_str(&redacted).unwrap_or_else(|_| conv.metadata.clone())
+                    super::redact_secrets::redact_json(&conv.metadata)
+                }
             } else {
                 conv.metadata.clone()
             },
@@ -28626,6 +28624,49 @@ pub mod persist {
             // The heartbeat-free path stays a no-op (no progress handle).
             let unmapped = map_to_internal_with_redactor(&conv, None);
             assert_eq!(unmapped.messages.len(), message_count);
+        }
+
+        #[test]
+        #[serial]
+        fn conversation_metadata_redaction_is_structural_and_fail_closed() {
+            let _redact_guard = set_env("CASS_INDEX_REDACTION", "full");
+            let metadata = serde_json::json!({
+                "api_key=abcdefgh12345678": "first", // ubs:ignore -- synthetic collision fixture, not a credential.
+                "password=abcdefgh12345678": "second", // ubs:ignore -- synthetic collision fixture, not a credential.
+                "private_material": "prefix\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA",
+            });
+            let conv = crate::connectors::NormalizedConversation {
+                agent_slug: "codex".to_string(),
+                external_id: Some("metadata-redaction".to_string()),
+                title: None,
+                workspace: None,
+                source_path: std::path::PathBuf::from("/log/metadata-redaction.jsonl"),
+                started_at: None,
+                ended_at: None,
+                metadata,
+                messages: Vec::new(),
+            };
+
+            let plain = map_to_internal_with_redactor(&conv, None).metadata_json;
+            let mut redactor = super::super::redact_secrets::MemoizingRedactor::with_capacity(8);
+            let memoized =
+                map_to_internal_with_redactor(&conv, Some(&mut redactor)).metadata_json;
+            assert_eq!(plain, memoized, "memoized and plain metadata paths diverged");
+
+            let object = plain.as_object().expect("metadata must remain an object");
+            assert_eq!(object.len(), 3, "redacted key collision discarded a value");
+            let serialized = serde_json::to_string(&plain).expect("redacted metadata must serialize");
+            assert!(!serialized.contains("abcdefgh12345678"));
+            assert!(!serialized.contains("b3BlbnNzaC1rZXktdjE"));
+            assert!(serialized.contains("prefix\\n[REDACTED]"));
+
+            let mut preserved_values = object
+                .values()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|value| matches!(*value, "first" | "second"))
+                .collect::<Vec<_>>();
+            preserved_values.sort_unstable();
+            assert_eq!(preserved_values, ["first", "second"]);
         }
 
         #[test]
