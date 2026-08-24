@@ -2,6 +2,7 @@ use crate::franken_sync::compat::{
     ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt,
 };
 use crate::franken_sync::{Connection, Row as FrankenRow, params};
+use crate::pages::summary::ExclusionSet;
 use crate::ui::time_parser::parse_time_input;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -33,6 +34,7 @@ pub struct ExportEngine {
     source_db_path: PathBuf,
     output_path: PathBuf,
     filter: ExportFilter,
+    exclusions: ExclusionSet,
 }
 
 #[derive(Debug)]
@@ -55,7 +57,17 @@ impl ExportEngine {
             source_db_path: source_db_path.to_path_buf(),
             output_path: output_path.to_path_buf(),
             filter,
+            exclusions: ExclusionSet::new(),
         }
+    }
+
+    /// Apply wizard review exclusions to the rows eligible for this export.
+    ///
+    /// Direct and config-driven exports do not call this method, so their
+    /// existing positive-filter behavior remains unchanged.
+    pub fn with_exclusions(mut self, exclusions: ExclusionSet) -> Self {
+        self.exclusions = exclusions;
+        self
     }
 
     pub fn execute<F>(&self, progress: F, running: Option<Arc<AtomicBool>>) -> Result<ExportStats>
@@ -299,13 +311,6 @@ impl ExportEngine {
              ORDER BY c.id"
                 );
 
-                let mut count_query = String::from("SELECT COUNT(*)");
-                count_query.push_str(&from_where);
-                let total_convs: usize =
-                    src_tx.query_row_map(&count_query, &params, |row: &FrankenRow| {
-                        row.get_typed::<i64>(0).map(|v| v as usize)
-                    })?;
-
                 // Execute Main Query - collect all conversation rows
                 type ConversationExportRow = (
                     i64,
@@ -318,7 +323,7 @@ impl ExportEngine {
                     i64,
                     Option<String>,
                 );
-                let conv_rows: Vec<ConversationExportRow> =
+                let mut conv_rows: Vec<ConversationExportRow> =
                     src_tx.query_map_collect(&query, &params, |row: &FrankenRow| {
                         Ok((
                             row.get_typed::<i64>(0)?,
@@ -332,6 +337,14 @@ impl ExportEngine {
                             row.get_typed::<Option<String>>(8)?,
                         ))
                     })?;
+                conv_rows.retain(|(id, _, workspace, title, _, _, _, _, _)| {
+                    !self.exclusions.should_exclude(
+                        workspace.as_deref(),
+                        *id,
+                        title.as_deref().unwrap_or(""),
+                    )
+                });
+                let total_convs = conv_rows.len();
 
                 let mut processed = 0;
                 let mut msg_processed = 0;

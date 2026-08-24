@@ -7,6 +7,7 @@ use chrono::{TimeZone, Utc};
 use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 use coding_agent_search::franken_sync::{Connection, Row as FrankenRow, params as fparams};
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
+use coding_agent_search::pages::summary::ExclusionSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -423,6 +424,157 @@ fn export_engine_combined_filters() {
     // Only conversation 3 matches (claude + project-b)
     assert_eq!(stats.conversations_processed, 1);
     assert_eq!(stats.messages_processed, 4);
+}
+
+#[test]
+fn export_engine_applies_review_exclusions_before_writing_any_payload_surface() {
+    let tmp = TempDir::new().unwrap();
+    let source_path = tmp.path().join("source.db");
+    let output_path = tmp.path().join("export.db");
+
+    let src_conn = open_db(&source_path).unwrap();
+    create_source_db(&src_conn).unwrap();
+    insert_test_data(&src_conn).unwrap();
+
+    src_conn
+        .execute(
+            "UPDATE conversations SET title = 'DropWorkspace7xy' WHERE id = 1",
+        )
+        .unwrap();
+    src_conn
+        .execute(
+            "UPDATE conversations SET title = 'DropConversation7xy' WHERE id = 3",
+        )
+        .unwrap();
+    src_conn
+        .execute("UPDATE conversations SET title = 'DropPattern7xy' WHERE id = 4")
+        .unwrap();
+    src_conn
+        .execute("UPDATE messages SET content = 'DropWorkspace7xy' WHERE id = 1")
+        .unwrap();
+    src_conn
+        .execute("UPDATE messages SET content = 'DropConversation7xy' WHERE id = 6")
+        .unwrap();
+    src_conn
+        .execute("UPDATE messages SET content = 'DropPattern7xy' WHERE id = 10")
+        .unwrap();
+    src_conn
+        .execute_batch(
+            "INSERT INTO snippets (message_id, snippet_text) VALUES (1, 'DropWorkspace7xy');
+             INSERT INTO snippets (message_id, snippet_text) VALUES (6, 'DropConversation7xy');
+             INSERT INTO snippets (message_id, snippet_text) VALUES (10, 'DropPattern7xy');
+             INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
+             VALUES (5, 1, 2, 'KeepNeighbor7xy', '/home/user/project-b/sessions/keep.jsonl', 1718704800000, 1);
+             INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
+             VALUES (15, 5, 0, 'user', 'KeepNeighbor7xy', 1718704800000);
+             INSERT INTO snippets (message_id, snippet_text) VALUES (15, 'KeepNeighbor7xy');",
+        )
+        .unwrap();
+    drop(src_conn);
+
+    let filter = ExportFilter {
+        agents: None,
+        workspaces: None,
+        since: None,
+        until: None,
+        path_mode: PathMode::Full,
+    };
+    let mut exclusions = ExclusionSet::new();
+    exclusions.exclude_workspace("/home/user/project-a");
+    exclusions.exclude_conversation(3);
+    exclusions.add_pattern("^DropPattern7xy$").unwrap();
+
+    let progress_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let progress_observer = Arc::clone(&progress_calls);
+    let engine = ExportEngine::new(&source_path, &output_path, filter).with_exclusions(exclusions);
+    let stats = engine
+        .execute(
+            move |current, total| {
+                progress_observer.lock().unwrap().push((current, total));
+            },
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(stats.conversations_processed, 1);
+    assert_eq!(stats.messages_processed, 1);
+    assert_eq!(progress_calls.lock().unwrap().as_slice(), &[(1, 1)]);
+
+    let out_conn = open_db(&output_path).unwrap();
+    assert_eq!(
+        query_strings(&out_conn, "SELECT title FROM conversations ORDER BY id").unwrap(),
+        vec!["KeepNeighbor7xy"]
+    );
+    assert_eq!(
+        query_strings(&out_conn, "SELECT content FROM messages ORDER BY id").unwrap(),
+        vec!["KeepNeighbor7xy"]
+    );
+    assert_eq!(
+        query_strings(&out_conn, "SELECT snippet_text FROM snippets ORDER BY id").unwrap(),
+        vec!["KeepNeighbor7xy"]
+    );
+
+    assert_eq!(
+        query_i64(
+            &out_conn,
+            "SELECT COUNT(*) FROM conversations
+             WHERE title IN ('DropWorkspace7xy', 'DropConversation7xy', 'DropPattern7xy')",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            &out_conn,
+            "SELECT COUNT(*) FROM messages
+             WHERE content IN ('DropWorkspace7xy', 'DropConversation7xy', 'DropPattern7xy')",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            &out_conn,
+            "SELECT COUNT(*) FROM snippets
+             WHERE snippet_text IN ('DropWorkspace7xy', 'DropConversation7xy', 'DropPattern7xy')",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            &out_conn,
+            "SELECT COUNT(*) FROM messages_fts
+             WHERE messages_fts MATCH 'dropworkspace7xy OR dropconversation7xy OR droppattern7xy'",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            &out_conn,
+            "SELECT COUNT(*) FROM messages_code_fts
+             WHERE messages_code_fts MATCH 'dropworkspace7xy OR dropconversation7xy OR droppattern7xy'",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            &out_conn,
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'keepneighbor7xy'",
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        query_i64(
+            &out_conn,
+            "SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH 'keepneighbor7xy'",
+        )
+        .unwrap(),
+        1
+    );
 }
 
 // =============================================================================

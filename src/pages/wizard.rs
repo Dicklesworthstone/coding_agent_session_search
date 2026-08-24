@@ -1633,7 +1633,8 @@ impl PagesWizard {
             },
         };
 
-        let engine = ExportEngine::new(&self.state.db_path, &export_db_path, filter);
+        let engine = ExportEngine::new(&self.state.db_path, &export_db_path, filter)
+            .with_exclusions(self.state.exclusions.clone());
         let running = Arc::new(AtomicBool::new(true));
 
         let staged_scan_config = SecretScanConfig::from_inputs(&[], &[])?;

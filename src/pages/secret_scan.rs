@@ -480,7 +480,41 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
     let conn = super::open_existing_sqlite_db(db_path.as_ref())
         .context("Failed to open database for secret scan")?;
     ensure_secret_scan_running(&mut cancellation_requested, SecretScanCheckpoint::AfterOpen)?;
-    let schema = SecretScanSchema::detect(&conn)?;
+    conn.execute("BEGIN TRANSACTION")
+        .context("Failed to start secret-scan read snapshot")?;
+
+    let scan_result = scan_database_snapshot(
+        &conn,
+        filters,
+        config,
+        progress,
+        |checkpoint| cancellation_requested(checkpoint),
+    );
+    let rollback_result = conn
+        .execute("ROLLBACK")
+        .map(|_| ())
+        .context("Failed to close secret-scan read snapshot");
+    match (scan_result, rollback_result) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(scan_error), Ok(())) => Err(scan_error),
+        (Ok(_), Err(rollback_error)) => Err(rollback_error),
+        (Err(scan_error), Err(rollback_error)) => Err(scan_error.context(format!(
+            "secret-scan read-snapshot rollback also failed: {rollback_error:#}"
+        ))),
+    }
+}
+
+/// Read every secret-scan surface from the caller-owned transaction.
+/// High-water marks bound inserts, but the transaction also prevents updates
+/// to already-scanned rows from producing a mixed, false-clean report.
+fn scan_database_snapshot(
+    conn: &crate::franken_sync::Connection,
+    filters: &SecretScanFilters,
+    config: &SecretScanConfig,
+    progress: Option<&ProgressBar>,
+    mut cancellation_requested: impl FnMut(SecretScanCheckpoint) -> bool,
+) -> Result<SecretScanReport> {
+    let schema = SecretScanSchema::detect(conn)?;
 
     let mut findings: Vec<SecretFinding> = Vec::new();
     let mut seen = Vec::new();
@@ -489,7 +523,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
     // LEFT JOIN + COALESCE on agents so secret scanning also covers legacy
     // conversations with NULL agent_id — dropping them would hide credential
     // leaks rather than exposing them.
-    let has_metadata_bin = table_has_column(&conn, "conversations", "metadata_bin")?;
+    let has_metadata_bin = table_has_column(conn, "conversations", "metadata_bin")?;
     let metadata_bin_projection = if has_metadata_bin {
         "c.metadata_bin"
     } else {
@@ -504,7 +538,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
         &mut cancellation_requested,
         SecretScanCheckpoint::BeforeConversationHighWatermark,
     )?;
-    let conv_high_watermark = table_max_id(&conn, "conversations")?;
+    let conv_high_watermark = table_max_id(conn, "conversations")?;
     let conv_select = format!(
         "SELECT c.id, c.title, c.metadata_json, c.source_path, {}, {}, {metadata_bin_projection}\n         FROM conversations c{}",
         schema.agent_expression(),
@@ -639,19 +673,19 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
     )?;
 
     if !truncated {
-        let has_extra_json = table_has_column(&conn, "messages", "extra_json")?;
+        let has_extra_json = table_has_column(conn, "messages", "extra_json")?;
         let extra_json_projection = if has_extra_json { "m.extra_json" } else { "NULL" };
-        let has_extra_bin = table_has_column(&conn, "messages", "extra_bin")?;
+        let has_extra_bin = table_has_column(conn, "messages", "extra_bin")?;
         let extra_bin_projection = if has_extra_bin { "m.extra_bin" } else { "NULL" };
         let has_attachment_refs =
-            table_has_column(&conn, "messages", "attachment_refs")?;
+            table_has_column(conn, "messages", "attachment_refs")?;
         let attachment_refs_projection =
             if schema == SecretScanSchema::PagesExport && has_attachment_refs {
                 "m.attachment_refs"
             } else {
                 "NULL"
             };
-        let has_model = table_has_column(&conn, "messages", "model")?;
+        let has_model = table_has_column(conn, "messages", "model")?;
         let model_projection = if has_model { "m.model" } else { "NULL" };
         let (msg_where, msg_params) = build_where_clause_for_columns(
             filters,
@@ -662,7 +696,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
             &mut cancellation_requested,
             SecretScanCheckpoint::BeforeMessageHighWatermark,
         )?;
-        let msg_high_watermark = table_max_id(&conn, "messages")?;
+        let msg_high_watermark = table_max_id(conn, "messages")?;
         let msg_select = format!(
             "SELECT m.id, m.idx, m.content, {extra_json_projection}, c.id, c.source_path, {}, {}, {extra_bin_projection}, {attachment_refs_projection}, m.role, {model_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id{}",
             schema.agent_expression(),
@@ -801,7 +835,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
         SecretScanCheckpoint::AfterMessages,
     )?;
 
-    if !truncated && table_exists(&conn, "snippets")? {
+    if !truncated && table_exists(conn, "snippets")? {
         let (snip_where, snip_params) = build_where_clause_for_columns(
             filters,
             schema.agent_expression(),
@@ -811,7 +845,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
             &mut cancellation_requested,
             SecretScanCheckpoint::BeforeSnippetHighWatermark,
         )?;
-        let snip_high_watermark = table_max_id(&conn, "snippets")?;
+        let snip_high_watermark = table_max_id(conn, "snippets")?;
         let snip_select = format!(
             "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, {}, {}, s.file_path, s.language\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id{}",
             schema.agent_expression(),
