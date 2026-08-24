@@ -2350,7 +2350,7 @@ mod tests {
             .report
             .findings
             .iter()
-            .filter(|finding| finding.kind == CUSTOM_DENYLIST_PATTERN_ID)
+            .filter(|finding| finding.pattern == CUSTOM_DENYLIST_PATTERN_ID)
             .collect();
         assert_eq!(
             auxiliary_findings.len(),

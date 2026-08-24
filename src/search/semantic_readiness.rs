@@ -75,7 +75,7 @@ impl SemanticReadinessReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FallbackMode {
-    /// Full hybrid refinement is available; no fallback in effect.
+    /// Semantic refinement is available; no fallback is in effect.
     None,
     /// Search falls back to lexical-only results.
     Lexical,
@@ -85,7 +85,7 @@ pub(crate) enum FallbackMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SemanticNextStep {
-    /// Nothing to do; quality tier is ready.
+    /// Nothing to do; a semantic tier is ready and no maintenance is active.
     None,
     /// Re-enable semantic search in policy/config.
     EnableSemanticPolicy,
@@ -214,7 +214,7 @@ impl SemanticSignals {
             R::FastTierReady if self.backfill_in_progress => {
                 SemanticNextStep::WaitForBackfill
             }
-            R::FastTierReady => SemanticNextStep::BuildVectorIndex,
+            R::FastTierReady => SemanticNextStep::None,
         };
 
         let state_detail = match (reason, self.backfill_in_progress) {
@@ -468,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_tier_without_active_backfill_requests_quality_build() {
+    fn fast_tier_without_active_backfill_has_no_wait_or_build_action() {
         let mut s = ready();
         s.quality_tier_ready = false;
         let r = s.report();
@@ -479,7 +479,7 @@ mod tests {
             r.realized_refinement,
             SearchRefinementLevel::FastTierRefined
         );
-        assert_eq!(r.next_step, SemanticNextStep::BuildVectorIndex);
+        assert_eq!(r.next_step, SemanticNextStep::None);
         assert!(r.state_detail.contains("no backfill is active"));
     }
 

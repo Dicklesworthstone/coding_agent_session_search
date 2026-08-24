@@ -113,7 +113,7 @@ fn export_html(
             "CASS_HTML_EXPORT_GOLDEN_BYTES_LABEL",
             RETIRED_ENTROPY_OVERRIDE,
         )
-        .arg("--encrypt")
+            .arg("--encrypt")
             .arg("--password-stdin")
             .write_stdin(format!("{phrase}\n"));
     }

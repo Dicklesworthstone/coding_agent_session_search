@@ -12,14 +12,15 @@
 //! supersession/staleness within a topic — independent of *how* lessons are
 //! sourced.
 //!
-//! ## Redaction boundary (no raw leakage by construction)
+//! ## Redaction trust boundary
 //!
-//! This module **never ingests raw private text**. A [`LessonCandidate`] carries
-//! only an already-`redacted_summary` produced by the extraction/redaction layer
-//! (a separate, reviewed step). There is no field on a candidate or record that
-//! holds raw prompt/session text, so this core cannot leak it — the
-//! redaction policy and the session/commit/bead-artifact mining that fills
-//! candidates are a follow-up that builds on this contract.
+//! Every string-bearing [`LessonCandidate`] field is expected to come from the
+//! reviewed extraction/redaction layer. This graph core does not inspect or
+//! re-redact those strings; it preserves the supplied topic, project,
+//! provenance, applicability, and summary metadata. Production callers must
+//! therefore cross [`crate::lessons_extraction::extract`] before building a
+//! graph. Keeping that boundary explicit avoids implying that the Rust type
+//! alone can distinguish redacted text from raw private text.
 
 use serde::{Deserialize, Serialize};
 
@@ -249,12 +250,12 @@ impl LessonGraph {
             by_id
                 .entry(record.lesson_id.clone())
                 .and_modify(|existing| {
-                    for r in &record.source_refs {
-                        if !existing.source_refs.contains(r) {
-                            existing.source_refs.push(r.clone());
-                        }
-                    }
+                    existing.source_refs.extend(record.source_refs.iter().cloned());
                     existing.source_refs.sort();
+                    existing.source_refs.dedup();
+                    existing.applies_to.extend(record.applies_to.iter().cloned());
+                    existing.applies_to.sort();
+                    existing.applies_to.dedup();
                     if record.freshness_ms > existing.freshness_ms {
                         existing.freshness_ms = record.freshness_ms;
                     }
@@ -479,10 +480,10 @@ mod tests {
     }
 
     #[test]
-    fn record_stores_only_redacted_summary_no_raw_field_exists() {
-        // No-raw-leakage by construction: the record's only free-text field is
-        // the caller-provided redacted summary; nothing else carries text.
-        let c = candidate(
+    fn record_serializes_only_the_explicit_candidate_metadata() {
+        // Redaction is the caller's contract. The graph neither invents a hidden
+        // raw-text field nor claims to sanitize the explicit metadata itself.
+        let mut c = candidate(
             "topic",
             LessonKind::Gotcha,
             LessonConfidence::Low,
@@ -490,12 +491,63 @@ mod tests {
             "REDACTED-SUMMARY",
             "ref",
         );
+        c.applies_to.push("src/storage".to_string());
         let rec = LessonRecord::from_candidate(c);
         assert_eq!(rec.summary, "REDACTED-SUMMARY");
-        // Serialized form contains only the redacted summary as free text.
-        let json = serde_json::to_string(&rec).unwrap();
-        assert!(json.contains("REDACTED-SUMMARY"));
-        assert!(!json.to_lowercase().contains("raw"));
+        let value = serde_json::to_value(&rec).unwrap();
+        assert_eq!(value["summary"], "REDACTED-SUMMARY");
+        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "applies_to",
+                "confidence",
+                "freshness_ms",
+                "kind",
+                "lesson_id",
+                "project",
+                "schema_version",
+                "source_refs",
+                "status",
+                "summary",
+                "topic",
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_candidates_union_applicability_independent_of_input_order() {
+        let mut first = candidate(
+            "storage",
+            LessonKind::Gotcha,
+            LessonConfidence::Medium,
+            100,
+            "keep one logical transaction",
+            "bead-1",
+        );
+        first.applies_to = vec!["src/storage".to_string(), "src/indexer".to_string()];
+        let mut second = candidate(
+            "storage",
+            LessonKind::Gotcha,
+            LessonConfidence::High,
+            200,
+            "keep one logical transaction",
+            "commit-abc",
+        );
+        second.applies_to = vec!["src/storage".to_string(), "tests/storage".to_string()];
+
+        let forward = LessonGraph::build(vec![first.clone(), second.clone()]);
+        let reverse = LessonGraph::build(vec![second, first]);
+        assert_eq!(forward, reverse, "candidate order must not change the graph");
+        assert_eq!(
+            forward.lessons[0].applies_to,
+            vec![
+                "src/indexer".to_string(),
+                "src/storage".to_string(),
+                "tests/storage".to_string(),
+            ]
+        );
     }
 
     #[test]
