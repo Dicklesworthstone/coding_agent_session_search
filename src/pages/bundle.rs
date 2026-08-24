@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
@@ -229,11 +231,12 @@ impl BundleBuilder {
             progress("setup", "Creating directory structure...");
 
             // Stage the bundle under a unique temp root so reruns do not retain stale files.
+            create_bundle_staging_root(&temp_output_dir)?;
             let site_dir = temp_output_dir.join("site");
             let private_dir = temp_output_dir.join("private");
 
             fs::create_dir_all(&site_dir).context("Failed to create site/ directory")?;
-            fs::create_dir_all(&private_dir).context("Failed to create private/ directory")?;
+            ensure_private_artifact_dir(&private_dir)?;
 
             // Create site subdirectories
             let site_payload_dir = site_dir.join("payload");
@@ -366,6 +369,7 @@ impl BundleBuilder {
                 write_private_unencrypted_notice(&private_dir)?;
             }
 
+            prepare_bundle_root_for_publish(&temp_output_dir)?;
             sync_tree(&temp_output_dir)?;
             replace_dir_from_temp(
                 &temp_output_dir,
@@ -398,6 +402,45 @@ impl BundleBuilder {
             other => other,
         }
     }
+}
+
+fn create_bundle_staging_root(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed creating bundle staging parent {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    #[cfg(unix)]
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path).with_context(|| {
+            format!("failed creating private bundle staging root {}", path.display())
+        })?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!("failed securing bundle staging root {}", path.display())
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path).with_context(|| {
+            format!("failed creating bundle staging root {}", path.display())
+        })?;
+    }
+    Ok(())
+}
+
+fn prepare_bundle_root_for_publish(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("failed setting bundle root permissions on {}", path.display()))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn cleanup_rejected_bundle_temp(path: &Path) -> Result<()> {
@@ -1018,7 +1061,7 @@ fn ensure_private_artifact_dir(private_dir: &Path) -> Result<()> {
                     private_dir.display()
                 );
             }
-            Ok(())
+            secure_private_artifact_dir(private_dir)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir_all(private_dir).with_context(|| {
@@ -1036,6 +1079,19 @@ fn ensure_private_artifact_dir(private_dir: &Path) -> Result<()> {
             )
         }),
     }
+}
+
+fn secure_private_artifact_dir(private_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(private_dir, fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "Failed to set owner-only permissions on private artifact directory {}",
+            private_dir.display()
+        )
+    })?;
+    #[cfg(not(unix))]
+    let _ = private_dir;
+    Ok(())
 }
 
 fn reject_symlinked_private_artifact(path: &Path) -> Result<()> {
@@ -1073,16 +1129,16 @@ fn write_private_artifact_file(private_dir: &Path, filename: &str, contents: &[u
     let temp_path = unique_bundle_sidecar_path(&final_path, "tmp", "private_artifact")?;
 
     let write_result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .with_context(|| {
-                format!(
-                    "Failed to create temporary private artifact {}",
-                    temp_path.display()
-                )
-            })?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp_path).with_context(|| {
+            format!(
+                "Failed to create temporary private artifact {}",
+                temp_path.display()
+            )
+        })?;
         file.write_all(contents).with_context(|| {
             format!(
                 "Failed to write temporary private artifact {}",
@@ -1446,6 +1502,53 @@ mod tests {
         assert_eq!(backup["key_slots"], serde_json::json!([]));
         assert_eq!(backup["note"], MASTER_KEY_BACKUP_NOTE);
         assert_eq!(backup["generated_at"], "2026-04-25T19:08:00Z");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_artifacts_are_owner_only_even_under_permissive_ambient_modes() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new()?;
+        let private_dir = temp.path().join("private");
+        fs::create_dir_all(&private_dir)?;
+        fs::set_permissions(&private_dir, fs::Permissions::from_mode(0o777))?;
+
+        write_private_artifact_file(&private_dir, "recovery-secret.txt", b"unlock material")?;
+
+        let dir_mode = fs::metadata(&private_dir)?.permissions().mode();
+        let file_mode = fs::metadata(private_dir.join("recovery-secret.txt"))?
+            .permissions()
+            .mode();
+        if dir_mode & 0o077 != 0 {
+            return Err(anyhow!("private directory mode was {dir_mode:o}"));
+        }
+        if file_mode & 0o077 != 0 {
+            return Err(anyhow!("private file mode was {file_mode:o}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bundle_staging_root_is_private_until_publish() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new()?;
+        let staging_root = temp.path().join("bundle.staged");
+        create_bundle_staging_root(&staging_root)?;
+
+        let staged_mode = fs::metadata(&staging_root)?.permissions().mode();
+        if staged_mode & 0o077 != 0 {
+            return Err(anyhow!("bundle staging root mode was {staged_mode:o}"));
+        }
+
+        prepare_bundle_root_for_publish(&staging_root)?;
+        let published_mode = fs::metadata(&staging_root)?.permissions().mode();
+        if published_mode & 0o777 != 0o755 {
+            return Err(anyhow!("published bundle root mode was {published_mode:o}"));
+        }
+        Ok(())
     }
 
     #[test]

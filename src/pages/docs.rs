@@ -47,6 +47,8 @@ pub struct GeneratedDoc {
 /// Configuration for documentation generation.
 #[derive(Debug, Clone, Default)]
 pub struct DocConfig {
+    /// Whether the published payload requires decryption before it can be read.
+    pub archive_mode: ArchiveMode,
     /// Target URL where the archive will be hosted.
     pub target_url: Option<String>,
     /// Repository URL for CASS source.
@@ -59,10 +61,21 @@ pub struct DocConfig {
     pub argon_parallelism: u32,
 }
 
+/// Security mode of the generated public archive documentation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ArchiveMode {
+    /// The payload is protected by the configured encryption key slots.
+    #[default]
+    Encrypted,
+    /// The SQLite payload is intentionally published as plaintext.
+    Unencrypted,
+}
+
 impl DocConfig {
     /// Create a new DocConfig with default CASS repo URL.
     pub fn new() -> Self {
         Self {
+            archive_mode: ArchiveMode::Encrypted,
             target_url: None,
             cass_repo_url: "https://github.com/Dicklesworthstone/coding_agent_session_search"
                 .to_string(),
@@ -75,6 +88,12 @@ impl DocConfig {
     /// Set the target URL.
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
         self.target_url = Some(url.into());
+        self
+    }
+
+    /// Describe the security mode of the payload these documents accompany.
+    pub fn with_archive_mode(mut self, archive_mode: ArchiveMode) -> Self {
+        self.archive_mode = archive_mode;
         self
     }
 
@@ -142,7 +161,11 @@ impl DocumentationGenerator {
         let slot_count = self.summary.key_slots.len();
         let date = Utc::now().format(DOC_DATE_FORMAT);
 
-        let content = README_TEMPLATE
+        let template = match self.config.archive_mode {
+            ArchiveMode::Encrypted => README_TEMPLATE,
+            ArchiveMode::Unencrypted => UNENCRYPTED_README_TEMPLATE,
+        };
+        let content = template
             .replace("{url}", url_display)
             .replace(
                 "{conversation_count}",
@@ -165,6 +188,16 @@ impl DocumentationGenerator {
 
     /// Generate SECURITY.md with threat model documentation.
     pub fn generate_security_doc(&self) -> GeneratedDoc {
+        if self.config.archive_mode == ArchiveMode::Unencrypted {
+            return GeneratedDoc {
+                filename: "SECURITY.md".to_string(),
+                content: UNENCRYPTED_SECURITY_TEMPLATE
+                    .replace("{repo_url}", &self.config.cass_repo_url)
+                    .replace("{version}", CASS_VERSION),
+                location: DocLocation::RepoRoot,
+            };
+        }
+
         let slot_descriptions = self
             .summary
             .key_slots
@@ -217,13 +250,25 @@ impl DocumentationGenerator {
     pub fn generate_help_html(&self) -> GeneratedDoc {
         GeneratedDoc {
             filename: "help.html".to_string(),
-            content: HELP_HTML_TEMPLATE.to_string(),
+            content: match self.config.archive_mode {
+                ArchiveMode::Encrypted => HELP_HTML_TEMPLATE,
+                ArchiveMode::Unencrypted => UNENCRYPTED_HELP_HTML_TEMPLATE,
+            }
+            .to_string(),
             location: DocLocation::WebRoot,
         }
     }
 
     /// Generate recovery.html with password recovery instructions.
     pub fn generate_recovery_html(&self) -> GeneratedDoc {
+        if self.config.archive_mode == ArchiveMode::Unencrypted {
+            return GeneratedDoc {
+                filename: "recovery.html".to_string(),
+                content: UNENCRYPTED_RECOVERY_HTML_TEMPLATE.to_string(),
+                location: DocLocation::WebRoot,
+            };
+        }
+
         let has_recovery_slot = self
             .summary
             .key_slots
@@ -252,7 +297,11 @@ impl DocumentationGenerator {
         let conversation_count = self.summary.total_conversations.to_string();
         let date = Utc::now().format(DOC_DATE_FORMAT);
 
-        let content = ABOUT_TXT_TEMPLATE
+        let template = match self.config.archive_mode {
+            ArchiveMode::Encrypted => ABOUT_TXT_TEMPLATE,
+            ArchiveMode::Unencrypted => UNENCRYPTED_ABOUT_TXT_TEMPLATE,
+        };
+        let content = template
             .replace("{url}", url_display)
             .replace("{conversation_count}", &conversation_count)
             .replace("{date}", &date.to_string())

@@ -10,8 +10,8 @@
 //! the durable [`LessonRecord`], computes a content-stable [`LessonRecord::lesson_id`]
 //! (so the same lesson dedupes across runs), and resolves supersession/staleness
 //! within a topic — independent of *how* lessons are sourced. Failed approaches
-//! are retired only by fresher landed lessons on the same topic; independent
-//! current lessons can coexist within a topic.
+//! are retired only by related, fresher reusable decisions on the same topic;
+//! independent current lessons can coexist within a topic.
 //!
 //! ## Redaction trust boundary
 //!
@@ -86,7 +86,7 @@ impl LessonConfidence {
 pub enum LessonStatus {
     /// Current, independently useful lesson.
     Active,
-    /// Failed approach replaced by a fresher landed lesson on the same topic.
+    /// Failed approach replaced by a related, fresher reusable decision.
     Superseded,
     /// Known to be out of date (advice no longer applies).
     Outdated,
@@ -175,6 +175,63 @@ pub fn stable_lesson_id(topic: &str, project: &str, kind: LessonKind, summary: &
     format!("lsn-{}", &hex[..16])
 }
 
+fn significant_summary_tokens(summary: &str) -> std::collections::BTreeSet<String> {
+    summary
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| {
+            token.len() >= 4
+                && token.bytes().any(|byte| byte.is_ascii_alphabetic())
+                && !matches!(
+                    token.as_str(),
+                    "about"
+                        | "after"
+                        | "before"
+                        | "change"
+                        | "commit"
+                        | "does"
+                        | "digest"
+                        | "email"
+                        | "failed"
+                        | "failure"
+                        | "fixed"
+                        | "fixes"
+                        | "from"
+                        | "have"
+                        | "home"
+                        | "into"
+                        | "invalid"
+                        | "issue"
+                        | "landed"
+                        | "lesson"
+                        | "must"
+                        | "proof"
+                        | "redacted"
+                        | "should"
+                        | "that"
+                        | "this"
+                        | "using"
+                        | "were"
+                        | "when"
+                        | "where"
+                        | "which"
+                        | "while"
+                        | "will"
+                        | "with"
+                        | "without"
+                        | "work"
+                        | "works"
+                )
+        })
+        .collect()
+}
+
+fn summaries_share_replacement_context(left: &str, right: &str) -> bool {
+    let left = significant_summary_tokens(left);
+    let right = significant_summary_tokens(right);
+    left.intersection(&right).take(2).count() >= 2
+}
+
 impl LessonRecord {
     /// Build a record from a candidate, computing the stable id and normalizing
     /// provenance (deduped + sorted). Status starts `Outdated` if the candidate
@@ -218,9 +275,9 @@ impl LessonRecord {
 pub struct LessonsSummary {
     /// Total distinct lessons after dedup.
     pub total: usize,
-    /// Active (current best per topic).
+    /// Active, non-outdated lessons.
     pub active: usize,
-    /// Superseded by a fresher lesson on the same topic.
+    /// Failed approaches superseded by a related fresher reusable decision.
     pub superseded: usize,
     /// Explicitly outdated.
     pub outdated: usize,
@@ -240,8 +297,9 @@ pub struct LessonGraph {
 impl LessonGraph {
     /// Build a graph from candidates: dedupe by stable id (merging provenance
     /// refs and keeping the freshest metadata), then retire failed approaches
-    /// that have a strictly fresher landed lesson on the same (topic, project).
-    /// Independent non-outdated lessons remain `Active`. Pure and deterministic.
+    /// that have a strictly fresher reusable decision on the same (topic,
+    /// project) with at least two shared significant summary tokens. Independent
+    /// non-outdated lessons remain `Active`. Pure and deterministic.
     pub fn build(candidates: Vec<LessonCandidate>) -> Self {
         use std::collections::BTreeMap;
 
@@ -277,18 +335,18 @@ impl LessonGraph {
 
         // 2) Supersession is deliberately narrow. A topic is a coarse classifier,
         //    not an identity key, so distinct current lessons on one topic must
-        //    coexist. Only a failed approach with a strictly fresher landed
-        //    lesson on the same topic is known to have been replaced.
-        let mut freshest_decision: BTreeMap<(String, String), u64> = BTreeMap::new();
+        //    coexist. Only a failed approach with a strictly fresher reusable
+        //    decision and meaningful summary overlap is known to be replaced.
+        let mut landed_decisions: BTreeMap<(String, String), Vec<(u64, String)>> = BTreeMap::new();
         for l in &lessons {
             if l.status == LessonStatus::Outdated || l.kind != LessonKind::ReusableDecision {
                 continue;
             }
             let key = (l.topic.clone(), l.project.clone());
-            freshest_decision
+            landed_decisions
                 .entry(key)
-                .and_modify(|freshness| *freshness = (*freshness).max(l.freshness_ms))
-                .or_insert(l.freshness_ms);
+                .or_default()
+                .push((l.freshness_ms, l.summary.clone()));
         }
         for l in &mut lessons {
             if l.status == LessonStatus::Outdated {
@@ -296,9 +354,14 @@ impl LessonGraph {
             }
             let key = (l.topic.clone(), l.project.clone());
             let replaced_failed_approach = l.kind == LessonKind::FailedApproach
-                && freshest_decision
+                && landed_decisions
                     .get(&key)
-                    .is_some_and(|freshness| *freshness > l.freshness_ms);
+                    .is_some_and(|decisions| {
+                        decisions.iter().any(|(freshness, summary)| {
+                            *freshness > l.freshness_ms
+                                && summaries_share_replacement_context(&l.summary, summary)
+                        })
+                    });
             l.status = if replaced_failed_approach {
                 LessonStatus::Superseded
             } else {
@@ -501,6 +564,39 @@ mod tests {
 
         assert_eq!(g.summary.active, 2);
         assert_eq!(g.summary.superseded, 0);
+    }
+
+    #[test]
+    fn one_shared_topical_word_does_not_supersede_unrelated_failed_approach() {
+        let g = LessonGraph::build(vec![
+            candidate(
+                "search",
+                LessonKind::FailedApproach,
+                LessonConfidence::High,
+                100,
+                "abandoned a search cache experiment after corruption",
+                "bead-cache",
+            ),
+            candidate(
+                "search",
+                LessonKind::ReusableDecision,
+                LessonConfidence::High,
+                300,
+                "hybrid search fails open to lexical",
+                "commit-hybrid",
+            ),
+        ]);
+
+        assert_eq!(g.summary.active, 2);
+        assert_eq!(g.summary.superseded, 0);
+    }
+
+    #[test]
+    fn redaction_placeholders_do_not_create_supersession_overlap() {
+        assert!(!summaries_share_replacement_context(
+            "failed at <home> for <email>",
+            "decision at <home> for <email>"
+        ));
     }
 
     #[test]
