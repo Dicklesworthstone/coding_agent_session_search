@@ -7379,7 +7379,7 @@ fn franken_find_existing_conversation_with_tail_by_key(
         if let Some(existing) = franken_find_external_conversation_tail_lookup(tx, &lookup_key)? {
             return Ok(Some(existing));
         }
-        if let Some(existing) = franken_promote_omp_external_identity_by_source_path(
+        if let Some(existing) = franken_promote_pi_family_external_identity_by_source_path(
             tx,
             source_id,
             *agent_id,
@@ -14535,23 +14535,26 @@ fn franken_insert_external_conversation_tail_lookup(
     )
 }
 
-/// Recover the first first-class OMP ingest after a legacy Pi-owned row was
-/// reclassified with an absent or older external id.
+/// Recover the first pi-family ingest after a previously indexed transcript
+/// acquires the stable session id embedded in its header.
 ///
-/// OMP external ids are paths relative to the particular discovery root. The
-/// same transcript can therefore acquire a different external id when a newer
-/// detector selects a more-specific root. The transcript's source-qualified
-/// absolute path plus the normal source-path merge evidence is the durable
-/// identity in that upgrade case. Keep this fallback OMP-only: other providers
-/// may legitimately reuse a source path for unrelated external sessions.
-fn franken_promote_omp_external_identity_by_source_path(
+/// Older Pi Agent and OMP connectors derived external ids from paths relative
+/// to a discovery root. The same transcript can therefore acquire a different
+/// external id when the connector starts preferring its embedded session id or
+/// a newer detector selects a more-specific root. The transcript's
+/// source-qualified absolute path plus the normal source-path merge evidence
+/// is the durable identity in that upgrade case. Keep this fallback restricted
+/// to the pi family: other providers may legitimately reuse a source path for
+/// unrelated external sessions.
+fn franken_promote_pi_family_external_identity_by_source_path(
     tx: &FrankenTransaction<'_>,
     source_id: &str,
     agent_id: i64,
     external_id: &str,
     conv: Option<&Conversation>,
 ) -> Result<Option<ExistingConversationWithTail>> {
-    let Some(conv) = conv.filter(|conv| conv.agent_slug == "omp") else {
+    let Some(conv) = conv.filter(|conv| matches!(conv.agent_slug.as_str(), "omp" | "pi_agent"))
+    else {
         return Ok(None);
     };
 
@@ -14585,7 +14588,7 @@ fn franken_promote_omp_external_identity_by_source_path(
             [_] => {}
             _ => {
                 bail!(
-                    "cannot promote OMP external identity for source_id={source_id} path={source_path}: multiple canonical conversations share the source-qualified path"
+                    "cannot promote pi-family external identity for source_id={source_id} path={source_path}: multiple canonical conversations share the source-qualified path"
                 );
             }
         }
@@ -14786,7 +14789,7 @@ fn franken_find_existing_conversation_by_key_impl(
             if let Some(existing_id) = franken_find_external_conversation_lookup(tx, &lookup_key)? {
                 return Ok(Some(existing_id));
             }
-            if let Some(existing) = franken_promote_omp_external_identity_by_source_path(
+            if let Some(existing) = franken_promote_pi_family_external_identity_by_source_path(
                 tx,
                 source_id,
                 *agent_id,
@@ -30069,6 +30072,111 @@ mod tests {
                 assert_eq!(stale_lookup_count, 0);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn pi_agent_embedded_session_id_upgrade_rekeys_in_place() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
+        let pi_agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "pi_agent".into(),
+            name: "Pi Agent".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let source_path = dir
+            .path()
+            .join("home/.pi/agent/sessions/project/session.jsonl");
+        let first_message = Message {
+            id: None,
+            idx: 0,
+            role: MessageRole::User,
+            author: None,
+            created_at: Some(1_000),
+            content: "initial Pi message".into(),
+            extra_json: serde_json::Value::Null,
+            snippets: Vec::new(),
+        };
+        let legacy = Conversation {
+            id: None,
+            agent_slug: "pi_agent".into(),
+            workspace: None,
+            external_id: Some("project/session.jsonl".into()),
+            title: Some("Legacy Pi session".into()),
+            source_path: source_path.clone(),
+            started_at: Some(1_000),
+            ended_at: Some(1_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"source":"pi_agent"}),
+            messages: vec![first_message.clone()],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        let legacy_outcome = storage.insert_conversation_tree(pi_agent_id, None, &legacy)?;
+        assert!(legacy_outcome.conversation_inserted);
+
+        let current = Conversation {
+            external_id: Some("stable-embedded-session-id".into()),
+            title: Some("Current Pi session".into()),
+            ended_at: Some(2_000),
+            messages: vec![
+                first_message,
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: Some(2_000),
+                    content: "appended Pi answer".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            ..legacy
+        };
+        let current_outcome = storage.insert_conversation_tree(pi_agent_id, None, &current)?;
+        assert!(!current_outcome.conversation_inserted);
+        assert_eq!(current_outcome.conversation_id, legacy_outcome.conversation_id);
+        assert_eq!(current_outcome.inserted_indices, vec![1]);
+
+        let rows: Vec<(i64, String)> = storage.conn.query_map_collect(
+            "SELECT c.id, c.external_id
+             FROM conversations c
+             WHERE c.source_id = ?1 AND c.agent_id = ?2 AND c.source_path = ?3",
+            fparams![
+                LOCAL_SOURCE_ID,
+                pi_agent_id,
+                source_path.to_string_lossy().as_ref()
+            ],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
+        assert_eq!(
+            rows,
+            vec![(
+                legacy_outcome.conversation_id,
+                "stable-embedded-session-id".into()
+            )],
+            "the identity upgrade must not leave a path-keyed Pi twin"
+        );
+        let message_count: i64 = storage.conn.query_row_map(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+            fparams![legacy_outcome.conversation_id],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(message_count, 2);
+
+        let stale_lookup_key =
+            conversation_external_lookup_key(LOCAL_SOURCE_ID, pi_agent_id, "project/session.jsonl");
+        let stale_lookup_count: i64 = storage.conn.query_row_map(
+            "SELECT COUNT(*)
+             FROM conversation_external_tail_lookup
+             WHERE lookup_key = ?1",
+            fparams![stale_lookup_key.as_str()],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(stale_lookup_count, 0);
         Ok(())
     }
 

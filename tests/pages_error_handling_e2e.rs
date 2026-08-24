@@ -1607,7 +1607,7 @@ fn browser_session_teardown_survives_partial_storage_failures() {
             sessionStorage.failedSetKeys.add(expiryKey);
             let startRejected = false;
             try {
-                await failedStartManager.startSession(new Uint8Array([9, 8, 7, 6]), true);
+                await failedStartManager.startSession(new Uint8Array(32).fill(9), true);
             } catch {
                 startRejected = true;
             }
@@ -1634,6 +1634,266 @@ fn browser_session_teardown_survives_partial_storage_failures() {
     assert!(
         output.status.success(),
         "browser session teardown assertions failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn browser_session_rejects_invalid_or_uncommitted_state() {
+    let script = r#"
+        class StorageMock {
+            constructor() {
+                this.data = new Map();
+                this.ignoredSetKeys = new Set();
+            }
+
+            getItem(key) {
+                return this.data.has(key) ? this.data.get(key) : null;
+            }
+
+            setItem(key, value) {
+                if (!this.ignoredSetKeys.has(key)) {
+                    this.data.set(key, String(value));
+                }
+            }
+
+            removeItem(key) {
+                this.data.delete(key);
+            }
+        }
+
+        const originalWindow = globalThis.window;
+        const originalDocument = globalThis.document;
+        const originalLocalStorage = globalThis.localStorage;
+        const originalSessionStorage = globalThis.sessionStorage;
+
+        globalThis.window = {
+            location: { href: 'https://example.com/archive/index.html#/' },
+            addEventListener() {},
+            removeEventListener() {},
+        };
+        globalThis.document = {
+            hidden: false,
+            addEventListener() {},
+            removeEventListener() {},
+        };
+        globalThis.localStorage = new StorageMock();
+        globalThis.sessionStorage = new StorageMock();
+
+        const bytes = (value) => new Uint8Array(32).fill(value);
+        const encode = (value) => btoa(String.fromCharCode(...value));
+        const expectConstructorFailure = (options, label, SessionManager) => {
+            let rejected = false;
+            try {
+                new SessionManager(options);
+            } catch {
+                rejected = true;
+            }
+            if (!rejected) {
+                throw new Error(`${label} must be rejected by the constructor`);
+            }
+        };
+
+        try {
+            const { SessionManager, SESSION_CONFIG, createSessionManager } =
+                await import('./src/pages_assets/session.js');
+            const { getArchiveScopeId } = await import('./src/pages_assets/storage.js');
+            const scopeId = getArchiveScopeId();
+            const tokenKey = `${SESSION_CONFIG.KEY_SESSION_TOKEN}_${scopeId}`;
+            const expiryKey = `${SESSION_CONFIG.KEY_EXPIRY}_${scopeId}`;
+
+            for (const duration of [0, -1, NaN, Infinity, 2_147_483_648]) {
+                expectConstructorFailure({ duration }, `duration ${duration}`, SessionManager);
+            }
+            for (const storage of ['', 'unknown', 'persistent']) {
+                expectConstructorFailure({ storage }, `storage ${storage}`, SessionManager);
+            }
+            let factoryRejected = false;
+            try {
+                createSessionManager({ duration: 0 });
+            } catch {
+                factoryRejected = true;
+            }
+            if (!factoryRejected) {
+                throw new Error('the session factory must not replace an explicit invalid duration');
+            }
+
+            const invalidDekManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_MEMORY,
+                duration: 60_000,
+            });
+            let invalidDekRejected = false;
+            try {
+                await invalidDekManager.startSession(new Uint8Array(31));
+            } catch {
+                invalidDekRejected = true;
+            }
+            if (!invalidDekRejected || invalidDekManager.isActive()) {
+                throw new Error('startSession must reject every non-32-byte DEK');
+            }
+
+            const replacementManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_MEMORY,
+                duration: 60_000,
+            });
+            const originalDek = bytes(3);
+            await replacementManager.startSession(originalDek);
+            const priorManagedDek = replacementManager.getDek();
+            await replacementManager.startSession(priorManagedDek);
+            if (priorManagedDek.some((byte) => byte !== 0)) {
+                throw new Error('restarting with the active DEK object must zeroize the prior key');
+            }
+            if (
+                replacementManager.getDek() === priorManagedDek
+                || replacementManager.getDek().some((byte) => byte !== 3)
+            ) {
+                throw new Error('same-object restart must publish a preserved copy, not the zeroized old key');
+            }
+            replacementManager.endSession();
+
+            const unverifiedStartManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+                duration: 60_000,
+            });
+            sessionStorage.ignoredSetKeys.add(expiryKey);
+            let unverifiedStartRejected = false;
+            try {
+                await unverifiedStartManager.startSession(bytes(4), true);
+            } catch {
+                unverifiedStartRejected = true;
+            }
+            sessionStorage.ignoredSetKeys.delete(expiryKey);
+            if (!unverifiedStartRejected || unverifiedStartManager.isActive()) {
+                throw new Error('a no-op persistent write must not publish a session');
+            }
+            if (sessionStorage.getItem(tokenKey) !== null || sessionStorage.getItem(expiryKey) !== null) {
+                throw new Error('an unverified session start must remove partial durable state');
+            }
+
+            const restoreManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+                duration: 60_000,
+            });
+            const validToken = encode(bytes(5));
+            const invalidExpiries = [
+                'NaN',
+                '0',
+                '-1',
+                '1.5',
+                String(Date.now() - 1),
+                String(Date.now() + 2_147_483_647 + 10_000),
+                String(Number.MAX_SAFE_INTEGER + 1),
+            ];
+            for (const invalidExpiry of invalidExpiries) {
+                sessionStorage.setItem(tokenKey, validToken);
+                sessionStorage.setItem(expiryKey, invalidExpiry);
+                if (await restoreManager.restoreSession() !== null || restoreManager.isActive()) {
+                    throw new Error(`restoreSession must reject invalid expiry ${invalidExpiry}`);
+                }
+                if (sessionStorage.getItem(tokenKey) !== null || sessionStorage.getItem(expiryKey) !== null) {
+                    throw new Error('rejected restore state must be cleared');
+                }
+            }
+
+            for (const length of [0, 31, 33]) {
+                sessionStorage.setItem(tokenKey, encode(new Uint8Array(length)));
+                sessionStorage.setItem(expiryKey, String(Date.now() + 60_000));
+                if (await restoreManager.restoreSession() !== null || restoreManager.isActive()) {
+                    throw new Error(`restoreSession must reject a ${length}-byte DEK`);
+                }
+            }
+
+            const restoreReplacementManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+                duration: 60_000,
+            });
+            await restoreReplacementManager.startSession(bytes(6), false);
+            const replacedDek = restoreReplacementManager.getDek();
+            sessionStorage.setItem(tokenKey, encode(bytes(7)));
+            sessionStorage.setItem(expiryKey, String(Date.now() + 60_000));
+            const restoredDek = await restoreReplacementManager.restoreSession();
+            if (replacedDek.some((byte) => byte !== 0)) {
+                throw new Error('restoreSession must zeroize the previous active DEK');
+            }
+            if (!restoredDek || restoredDek.length !== 32 || restoredDek.some((byte) => byte !== 7)) {
+                throw new Error('restoreSession must publish only the validated replacement DEK');
+            }
+            restoreReplacementManager.endSession();
+
+            const extensionManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_MEMORY,
+                duration: 60_000,
+            });
+            await extensionManager.startSession(bytes(8));
+            const originalExpiry = extensionManager.expiryTs;
+            for (const extension of [0, -1, NaN, Infinity, 2_147_483_648, 2_147_483_647]) {
+                if (extensionManager.extendSession(extension) !== false) {
+                    throw new Error(`invalid or overflowing extension ${extension} must be rejected`);
+                }
+                if (!extensionManager.isActive() || extensionManager.expiryTs !== originalExpiry) {
+                    throw new Error('a rejected extension must preserve the previously committed session');
+                }
+            }
+            extensionManager.endSession();
+
+            const failedExtensionManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+                duration: 60_000,
+            });
+            await failedExtensionManager.startSession(bytes(9), true);
+            const failedExtensionDek = failedExtensionManager.getDek();
+            sessionStorage.ignoredSetKeys.add(expiryKey);
+            if (failedExtensionManager.extendSession(1_000) !== false) {
+                throw new Error('an unverified persistent expiry extension must fail');
+            }
+            sessionStorage.ignoredSetKeys.delete(expiryKey);
+            if (failedExtensionManager.isActive() || failedExtensionDek.some((byte) => byte !== 0)) {
+                throw new Error('ambiguous persistent extension failure must fail closed and zeroize');
+            }
+            if (sessionStorage.getItem(tokenKey) !== null || sessionStorage.getItem(expiryKey) !== null) {
+                throw new Error('ambiguous persistent extension state must be removed');
+            }
+
+            const unloadMemoryManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+                duration: 60_000,
+            });
+            await unloadMemoryManager.startSession(bytes(10), false);
+            const unloadMemoryDek = unloadMemoryManager.getDek();
+            unloadMemoryManager.handleBeforeUnload();
+            if (unloadMemoryManager.isActive() || unloadMemoryDek.some((byte) => byte !== 0)) {
+                throw new Error('unload must wipe an actually non-persistent session');
+            }
+
+            const unloadPersistentManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+                duration: 60_000,
+            });
+            await unloadPersistentManager.startSession(bytes(11), true);
+            const unloadPersistentDek = unloadPersistentManager.getDek();
+            unloadPersistentManager.handleBeforeUnload();
+            if (!unloadPersistentManager.isActive() || unloadPersistentDek.some((byte) => byte !== 11)) {
+                throw new Error('unload must preserve a session that was actually persisted');
+            }
+            unloadPersistentManager.endSession();
+        } finally {
+            globalThis.window = originalWindow;
+            globalThis.document = originalDocument;
+            globalThis.localStorage = originalLocalStorage;
+            globalThis.sessionStorage = originalSessionStorage;
+        }
+    "#;
+
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run invalid browser session assertions with node");
+
+    assert!(
+        output.status.success(),
+        "invalid browser session assertions failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

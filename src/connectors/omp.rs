@@ -756,16 +756,16 @@ fn fad_recognizes_explicit_root(path: &Path) -> bool {
 /// (`UNIQUE(source_id, agent_id, external_id)`), and the embedded id is
 /// stable when a session file is moved or its store is relocated; the
 /// path-derived fallback is not. Both pi-family connectors promote so the
-/// scheme stays uniform across the shared wire format; for sessions indexed
-/// before the promotion, appended messages merge under the new key while the
-/// old row keeps the already-indexed history (the merge key is external-id
-/// first, so nothing is lost or double-indexed retroactively).
+/// scheme stays uniform across the shared wire format. Storage recognizes this
+/// pi-family identity upgrade by source-qualified path plus message overlap and
+/// rekeys the existing conversation in place before merging appended messages.
 pub(crate) fn promote_transcript_session_ids(conversations: &mut [NormalizedConversation]) {
     for conversation in conversations {
         let session_id = conversation
             .metadata
             .get("session_id")
             .and_then(|value| value.as_str())
+            .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(str::to_owned);
         if let Some(session_id) = session_id {

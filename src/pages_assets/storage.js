@@ -296,6 +296,9 @@ export async function setItem(key, value) {
         case StorageMode.SESSION:
             try {
                 sessionStorage.setItem(fullKey, serialized);
+                if (sessionStorage.getItem(fullKey) !== serialized) {
+                    throw new Error(`sessionStorage write verification failed for ${fullKey}`);
+                }
                 memoryStore.delete(fullKey);
                 return true;
             } catch (e) {
@@ -307,6 +310,9 @@ export async function setItem(key, value) {
         case StorageMode.LOCAL:
             try {
                 localStorage.setItem(fullKey, serialized);
+                if (localStorage.getItem(fullKey) !== serialized) {
+                    throw new Error(`localStorage write verification failed for ${fullKey}`);
+                }
                 memoryStore.delete(fullKey);
                 return true;
             } catch (e) {
