@@ -128,6 +128,137 @@ fn omp_direct_profile_root_preserves_profile_metadata() {
 }
 
 #[test]
+fn direct_pi_sessions_root_is_never_parsed_as_omp() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pi_agent = temp.path().join(".pi/agent");
+    write_omp_session(&pi_agent, "pi-only", "Pi-only session");
+    let ctx = ScanContext::with_roots(
+        temp.path().join("cass-state"),
+        vec![ScanRoot::local(pi_agent.join("sessions"))],
+        None,
+    );
+
+    let pi_conversations = runtime_connector("pi_agent")
+        .scan(&ctx)
+        .expect("scan direct Pi sessions root");
+    let omp_conversations = runtime_connector("omp")
+        .scan(&ctx)
+        .expect("apply OMP ownership boundary to direct Pi sessions root");
+
+    assert_eq!(pi_conversations.len(), 1);
+    assert_eq!(pi_conversations[0].agent_slug, "pi_agent");
+    assert!(
+        omp_conversations.is_empty(),
+        "a basename of `sessions` alone must not make a canonical Pi store OMP"
+    );
+}
+
+#[test]
+fn explicit_xdg_omp_root_is_never_parsed_as_pi_agent() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let xdg_app = temp.path().join(".local/share/omp");
+    write_omp_session(&xdg_app, "omp-xdg", "XDG OMP session");
+    let ctx = ScanContext::with_roots(
+        temp.path().join("cass-state"),
+        vec![ScanRoot::local(xdg_app)],
+        None,
+    );
+
+    let omp_conversations = runtime_connector("omp")
+        .scan(&ctx)
+        .expect("scan explicit OMP XDG root");
+    let pi_conversations = runtime_connector("pi_agent")
+        .scan(&ctx)
+        .expect("apply Pi ownership boundary to OMP XDG root");
+
+    assert_eq!(omp_conversations.len(), 1);
+    assert_eq!(omp_conversations[0].agent_slug, "omp");
+    assert!(
+        pi_conversations.is_empty(),
+        "the shared pi-family wire format must not let Pi duplicate an XDG OMP session"
+    );
+}
+
+#[test]
+fn sanitized_remote_omp_roots_keep_provider_identity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let default_mirror = temp.path().join(".omp_agent_sessions_01234567");
+    let xdg_mirror = temp.path().join(".local_share_omp_89abcdef");
+    write_omp_session(
+        &default_mirror,
+        "omp-sanitized-default",
+        "Sanitized default mirror",
+    );
+    write_omp_session(
+        &xdg_mirror.join("omp"),
+        "omp-sanitized-xdg",
+        "Sanitized XDG mirror",
+    );
+
+    for (root, expected_title) in [
+        (default_mirror, "Sanitized default mirror"),
+        (xdg_mirror, "Sanitized XDG mirror"),
+    ] {
+        let ctx = ScanContext::with_roots(
+            temp.path().join("cass-state"),
+            vec![ScanRoot::remote(
+                root,
+                Origin::remote_with_host("build-host", "build-host.example"),
+                Some(Platform::Linux),
+            )],
+            None,
+        );
+        let omp_conversations = runtime_connector("omp")
+            .scan(&ctx)
+            .expect("scan sanitized OMP mirror root");
+        let pi_conversations = runtime_connector("pi_agent")
+            .scan(&ctx)
+            .expect("apply Pi boundary to sanitized OMP mirror root");
+
+        assert_eq!(omp_conversations.len(), 1);
+        assert_eq!(omp_conversations[0].title.as_deref(), Some(expected_title));
+        assert!(pi_conversations.is_empty());
+    }
+}
+
+#[test]
+fn broad_root_partitions_pi_and_omp_sessions_once_each() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("copied-home");
+    write_omp_session(
+        &home.join(".pi/agent"),
+        "pi-in-broad-root",
+        "Broad-root Pi session",
+    );
+    write_omp_session(
+        &home.join(".omp/agent"),
+        "omp-in-broad-root",
+        "Broad-root OMP session",
+    );
+    let ctx = ScanContext::with_roots(
+        temp.path().join("cass-state"),
+        vec![ScanRoot::local(home)],
+        None,
+    );
+
+    let pi_conversations = runtime_connector("pi_agent")
+        .scan(&ctx)
+        .expect("scan Pi from broad copied home");
+    let omp_conversations = runtime_connector("omp")
+        .scan(&ctx)
+        .expect("scan OMP from broad copied home");
+
+    assert_eq!(pi_conversations.len(), 1);
+    assert_eq!(pi_conversations[0].agent_slug, "pi_agent");
+    assert_eq!(omp_conversations.len(), 1);
+    assert_eq!(omp_conversations[0].agent_slug, "omp");
+    assert_ne!(
+        pi_conversations[0].source_path,
+        omp_conversations[0].source_path
+    );
+}
+
+#[test]
 fn omp_remote_discovery_preserves_origin_and_platform() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("remote-home");
