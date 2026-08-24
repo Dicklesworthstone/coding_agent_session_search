@@ -135,7 +135,7 @@ pub const DEFAULT_STALE_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
 /// Classify a [`ProofRun`] into a [`ProofStatus`] using `stale_after_ms` as the
 /// freshness window. Precedence is deliberate and safety-first:
 /// timeout > skipped > stale > assertions-didn't-run (generated-only) >
-/// failed-exit > incomplete (partial) > pass.
+/// failed-or-missing-exit > incomplete (partial) > pass.
 pub fn classify(run: &ProofRun, stale_after_ms: u64) -> ProofStatus {
     // A timeout outranks everything — even a zero exit code — so a run that timed
     // out before tests ran can never read as a pass.
@@ -157,6 +157,12 @@ pub fn classify(run: &ProofRun, stale_after_ms: u64) -> ProofStatus {
     // Assertions ran; a non-zero exit is a genuine failure.
     if matches!(run.exit_code, Some(code) if code != 0) {
         return ProofStatus::Fail;
+    }
+    // No observed exit status means the harness never proved that the command
+    // completed successfully. Even if it recorded assertions and marked its
+    // own work complete, that evidence is partial rather than a pass.
+    if run.exit_code.is_none() {
+        return ProofStatus::PartialProof;
     }
     if !run.completed {
         return ProofStatus::PartialProof;
@@ -1382,6 +1388,17 @@ mod tests {
         let mut run = base_run();
         run.exit_code = Some(101);
         assert_eq!(classify(&run, DEFAULT_STALE_AFTER_MS), ProofStatus::Fail);
+    }
+
+    #[test]
+    fn missing_exit_status_is_partial_proof_not_pass() {
+        let mut run = base_run();
+        run.exit_code = None;
+        run.assertions_ran = true;
+        run.completed = true;
+        let artifact = ProofArtifact::from_run(run);
+        assert_eq!(artifact.status, ProofStatus::PartialProof);
+        assert!(!artifact.is_trustworthy_pass());
     }
 
     #[test]
