@@ -138,9 +138,9 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | crates.io `=0.3.8` (0.3.0 asupersync-0.4.3 migration + GH#333/GH#334 fix wave incl. cass#393 st_dev namespace-sidecar repair, + 0.3.1 allocator/freelist/concurrent-writer correctness wave; carries the FTS5 overlong-term skip cap [cass#362]) |
-| `franken-agent-detection` | `17f28ad8` (2026-08-19 head: Muse Code + VS Code Copilot connectors on the fsqlite 0.3.x + asupersync 0.4.x line) |
+| `franken-agent-detection` | `82424dc8` (v0.2.1, 2026-08-23: first-class Oh My Pi v18 connector/profile/XDG discovery plus pi-family remote-provenance preservation, on the fsqlite 0.3.x + asupersync 0.4.x line) |
 | `asupersync` | `=0.4.9` (crates.io; fsqlite 0.3.x requires the 0.4.x line; asupersync 0.3.x and 0.4.x are non-interchangeable; 0.4.x preserves the 0.4.3 public API) |
-| `frankensearch` | `14d1480a` (remote head 2026-08-13, aligned with fsqlite 0.3.0 + asupersync 0.4.3; explicit `cass-compat` → `lexical-tantivy`; pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308, bd-8nqz.5) |
+| `frankensearch` | `22859f74` (the v1.7.0 tag commit, 2026-08-23, aligned with fsqlite 0.3.8 + asupersync 0.4.9; explicit `cass-compat` → `lexical-tantivy`; pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308, bd-8nqz.5) |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
 | `toon` (`tru`) | `d7185c78` (0.2.3) |
 
@@ -383,7 +383,7 @@ rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target cargo test --all-fea
 
 | Directory / File | Focus Areas |
 |-----------------|-------------|
-| `tests/connector_*.rs` | Per-provider session parsing (Claude, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, Pi Agent, Copilot, OpenClaw, ClawdBot, Vibe) |
+| `tests/connector_*.rs` | Per-provider session parsing (Claude, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, Pi Agent, Oh My Pi, Copilot, OpenClaw, ClawdBot, Vibe) |
 | `tests/search_*.rs` | Search pipeline, caching, filters, wildcard fallback |
 | `tests/semantic_integration.rs` | Semantic search, embeddings, two-tier search |
 | `tests/e2e_*.rs` | End-to-end CLI flows, filters, search, sources, TUI, deploy |
@@ -411,7 +411,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ## cass — Coding Agent Session Search
 
-**This is the project you're working on.** cass indexes conversations from Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, Pi Agent, Copilot, OpenClaw, ClawdBot, Vibe, and more into a unified, searchable index with a TUI and robot-mode CLI.
+**This is the project you're working on.** cass indexes conversations from Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, Pi Agent, Oh My Pi, Copilot, OpenClaw, ClawdBot, Vibe, and more into a unified, searchable index with a TUI and robot-mode CLI.
 
 **NEVER run bare `cass`** — it launches an interactive TUI. Always use `--robot` or `--json`.
 
@@ -470,6 +470,7 @@ coding_agent_session_search/
 │   │   ├── cline.rs              # Cline sessions
 │   │   ├── opencode.rs           # OpenCode sessions
 │   │   ├── pi_agent.rs           # Pi Agent sessions
+│   │   ├── omp.rs                # Oh My Pi sessions
 │   │   ├── copilot.rs            # Copilot sessions
 │   │   ├── copilot_cli.rs        # Copilot CLI sessions
 │   │   ├── openclaw.rs           # OpenClaw sessions
@@ -560,6 +561,7 @@ cass robot-docs guide         # LLM-optimized docs
 | Cline | `cline.rs` | JSONL |
 | OpenCode | `opencode.rs` | JSONL |
 | Pi Agent | `pi_agent.rs` | JSONL |
+| Oh My Pi | `omp.rs` | JSONL |
 | Copilot | `copilot.rs` | JSONL |
 | Copilot CLI | `copilot_cli.rs` | JSONL |
 | OpenClaw | `openclaw.rs` | JSONL |
