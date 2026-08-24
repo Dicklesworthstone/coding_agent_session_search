@@ -15,12 +15,13 @@
 //!
 //! ## No raw leakage (by construction)
 //!
-//! Every free-text field that becomes a candidate's `redacted_summary` first
-//! passes through [`redact`], which removes home-directory paths (the part that
-//! reveals a username), e-mail addresses, and long opaque digests. The
+//! Every free-text field that reaches a serialized lesson first passes through
+//! [`redact`], which removes credential patterns, home-directory paths (the part
+//! that reveals a username), e-mail addresses, and long opaque digests. The
 //! [`RedactionReport`] counts what was removed so a reviewer can audit the pass.
-//! Provenance (commit sha, bead id, proof name) flows into `source_refs`, never
-//! into the summary, so identifiers stay attributable without smuggling text.
+//! Provenance flows into `source_refs`, but untrusted bead/proof identifiers are
+//! redacted there too; only validated hexadecimal commit ids are preserved
+//! verbatim.
 //!
 //! ## Pure and deterministic
 //!
@@ -182,7 +183,7 @@ fn is_opaque_digest(core: &str) -> bool {
 
 /// Redact a home path prefix, returning the rewritten path if it matched.
 fn redact_home_path(core: &str) -> Option<String> {
-    for root in ["/home/", "/Users/"] {
+    for root in ["/home/", "/Users/", "/users/"] {
         if let Some(rest) = core.strip_prefix(root) {
             // Drop the username segment, keep the remaining (project-relative) tail.
             let tail = rest.split_once('/').map(|(_, tail)| tail).unwrap_or("");
@@ -201,6 +202,13 @@ fn redact_home_path(core: &str) -> Option<String> {
 /// string and a per-class [`RedactionReport`].
 pub fn redact(input: &str) -> (String, RedactionReport) {
     let mut report = RedactionReport::default();
+    let secret_redacted = crate::indexer::redact_secrets::redact_text(input);
+    if secret_redacted.as_ref() != input {
+        let before = input.matches("[REDACTED]").count();
+        let after = secret_redacted.matches("[REDACTED]").count();
+        report.digests += after.saturating_sub(before).max(1);
+    }
+    let input = secret_redacted.as_ref();
     let mut out = String::with_capacity(input.len());
     // Walk char by char, preserving whitespace verbatim and transforming each
     // maximal non-whitespace word as it completes.
@@ -316,7 +324,10 @@ fn first_word(text: &str) -> String {
     text.split_whitespace()
         .next()
         .unwrap_or("general")
-        .trim_matches(|c: char| !c.is_alphanumeric())
+        // Preserve path separators until the redaction pass sees them. Removing
+        // a leading slash here would turn `/Users/alice/...` into an
+        // unrecognizable relative token before the home-path scrubber runs.
+        .trim_matches(|c: char| !c.is_alphanumeric() && !matches!(c, '/' | '\\'))
         .to_ascii_lowercase()
 }
 
@@ -439,19 +450,40 @@ pub struct ExtractionManifest {
     pub redaction: RedactionReport,
 }
 
+fn redact_field(input: &str, report: &mut RedactionReport) -> String {
+    let (redacted, field_report) = redact(input);
+    report.add(field_report);
+    redacted
+}
+
+fn commit_source_ref(sha: &str, report: &mut RedactionReport) -> String {
+    let trimmed = sha.trim();
+    let id = if !trimmed.is_empty()
+        && trimmed.len() <= 64
+        && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        trimmed.to_string()
+    } else {
+        redact_field(trimmed, report)
+    };
+    format!("commit:{id}")
+}
+
 /// Extract redacted [`LessonCandidate`]s from `evidence`. Pure and
 /// deterministic: no I/O, stable ordering, identical output for identical input.
 pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
-    let project = if evidence.project.trim().is_empty() {
+    let raw_project = if evidence.project.trim().is_empty() {
         default_project()
     } else {
         evidence.project.clone()
     };
     let mut candidates: Vec<LessonCandidate> = Vec::new();
     let mut redaction = RedactionReport::default();
+    let project = redact_field(&raw_project, &mut redaction);
 
     for commit in &evidence.commits {
-        let (kind, topic) = classify_commit(commit);
+        let (kind, raw_topic) = classify_commit(commit);
+        let topic = redact_field(&raw_topic, &mut redaction);
         let (subject, r1) = redact(&commit.subject);
         redaction.add(r1);
         let body_line = first_line(&commit.body);
@@ -464,7 +496,7 @@ pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
             topic,
             project: project.clone(),
             kind,
-            source_refs: vec![format!("commit:{}", commit.sha)],
+            source_refs: vec![commit_source_ref(&commit.sha, &mut redaction)],
             confidence: LessonConfidence::High,
             freshness_ms: commit.timestamp_ms,
             outdated: false,
@@ -474,7 +506,8 @@ pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
     }
 
     for bead in &evidence.beads {
-        let (kind, topic, outdated) = classify_bead(bead);
+        let (kind, raw_topic, outdated) = classify_bead(bead);
+        let topic = redact_field(&raw_topic, &mut redaction);
         let (reason, r1) = redact(&bead.close_reason);
         redaction.add(r1);
         let (title, r2) = redact(&bead.title);
@@ -488,15 +521,19 @@ pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
         } else {
             LessonConfidence::Medium
         };
-        let mut applies_to: Vec<String> =
-            bead.labels.iter().map(|l| l.to_ascii_lowercase()).collect();
+        let mut applies_to: Vec<String> = bead
+            .labels
+            .iter()
+            .map(|label| redact_field(&label.to_ascii_lowercase(), &mut redaction))
+            .collect();
         applies_to.sort();
         applies_to.dedup();
+        let bead_id = redact_field(&bead.id, &mut redaction);
         candidates.push(LessonCandidate {
             topic,
             project: project.clone(),
             kind,
-            source_refs: vec![format!("bead:{}", bead.id)],
+            source_refs: vec![format!("bead:{bead_id}")],
             confidence,
             freshness_ms: bead.updated_ms,
             outdated,
@@ -506,13 +543,15 @@ pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
     }
 
     for proof in &evidence.proofs {
-        let (kind, topic) = classify_proof(proof);
+        let (kind, raw_topic) = classify_proof(proof);
+        let topic = redact_field(&raw_topic, &mut redaction);
+        let proof_name = redact_field(proof.name.trim(), &mut redaction);
         let (command, r1) = redact(&proof.command);
         redaction.add(r1);
-        let status = proof.status.to_ascii_lowercase();
+        let status = redact_field(&proof.status.to_ascii_lowercase(), &mut redaction);
         let summary = match summary_from(&[&command]) {
             Some(cmd) => format!("{cmd} → {status}"),
-            None => format!("{} → {status}", proof.name.trim()),
+            None => format!("{proof_name} → {status}"),
         };
         let confidence = if matches!(status.as_str(), "pass" | "ok" | "passed" | "green") {
             LessonConfidence::High
@@ -523,7 +562,7 @@ pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
             topic,
             project: project.clone(),
             kind,
-            source_refs: vec![format!("proof:{}", proof.name)],
+            source_refs: vec![format!("proof:{proof_name}")],
             confidence,
             freshness_ms: proof.timestamp_ms,
             outdated: false,
