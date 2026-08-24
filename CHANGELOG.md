@@ -17,6 +17,12 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## [Unreleased]
 
+## [v0.7.0] -- 2026-08-24
+
+> Note: this section accumulated since **v0.6.25**. `v0.6.26` was tagged
+> without moving its notes out of `[Unreleased]`, so the entries below cover
+> both the v0.6.26 line and the work released here.
+
 ### Added
 
 - **First-class Oh My Pi (`omp`) v18 support** ([#411](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/411)).
@@ -50,6 +56,28 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ### Changed
 
+- **FrankenSQLite family pin `=0.3.4` -> `=0.3.8`**
+  ([`5a09be4e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5a09be4e)).
+  This is the engine uptake several open reports were explicitly waiting on.
+  0.3.6/0.3.7 carried the FTS5 open-path hydration and lazy-lifecycle work
+  (frankensqlite#358/#359), but cass could not move off `=0.3.4` because
+  `fsqlite-ext-json` 0.3.6+ enabled serde_json's viral `arbitrary_precision`
+  feature (frankensqlite#375), which breaks float fields in cass's tagged
+  enums. 0.3.8 puts that behind an opt-in gate, so this is the first cass
+  release able to carry the hydration fixes. Issues gated on this uptake and
+  now eligible for re-measurement:
+  [#320](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/320),
+  [#349](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/349),
+  [#379](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/379),
+  [#381](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/381),
+  [#382](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/382),
+  [#390](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/390),
+  [#398](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/398),
+  [#401](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/401),
+  [#402](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/402),
+  [#406](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/406).
+  Re-measurement is what closes them; the pin alone is not evidence.
+
 - **Lexical backend flipped from Tantivy to Quill; a one-time `cass index
   --full` is required after upgrading** ([`ac2fe916`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ac2fe916),
   follow-ups through [#400](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/400)).
@@ -65,6 +93,15 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
   (#400) no longer exists.
 
 ### Fixed
+
+- **`main` did not build: the committed `Cargo.lock` resolved `fsqlite-error`
+  at `0.3.9` while `build.rs` requires a single `0.3.8` engine family**, so
+  every build aborted with `dependency source contract violation`. Only
+  `fsqlite` and `fsqlite-types` carry `=` exact pins; the other 18 family
+  members ride caret ranges, so a bare `cargo update` can float one member
+  off-pin. Repinned with `cargo update -p fsqlite-error --precise 0.3.8`;
+  all 20 family members now resolve uniformly at 0.3.8. The check in
+  `build.rs` was deliberately left as-is rather than relaxed.
 
 - **`analytics rebuild --since`/`--days` were parsed and silently ignored;
   every run was a full rescan with quadratic pagination and no progress**
